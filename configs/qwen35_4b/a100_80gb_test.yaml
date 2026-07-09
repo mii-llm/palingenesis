@@ -1,0 +1,167 @@
+# Qwen3.5-4B │ A100-80GB │ Single GPU — TUNED RUN (Opus-4.6-Reasoning-2100x-formatted)
+# ─────────────────────────────────────────────────────────────────────────────
+# Tuned from the smoke runs (50 and ~460 steps). What the 460-step run showed:
+#   • best eval/loss (~0.70) around step ~200, then steady overfit → 0.85
+#   • the whole run sat INSIDE warmup: max_steps was unset, so the scheduler
+#     assumed 100k steps and LR only crawled to ~4e-6 (peak never reached).
+#     FIXED in code: total_steps is now derived from epochs × dataset size
+#     when max_steps is 0 — this config relies on that.
+#   • output entropy collapsed 0.8 → 0.2 (RL-readiness warning fired):
+#     use the `best` checkpoint, not `final`, for any RL that follows.
+#
+# Tuning consequences applied below:
+#   • epochs: 1 (the 460-step run overfit within ~1 epoch even at tiny LR)
+#   • learning_rate: 3e-6 — the 1e-5 attempt DEGRADED the model outright
+#     (train CE + eval CE both rose from step ~10). Lion is sign-based, so
+#     lr = per-step weight drift. The 460-step run showed eval improving at
+#     LR 1.5-2.5e-6 and degrading past ~3e-6 → peak at the top of that zone.
+#   • max_steps: 0 → auto-derived (~365 steps: 1450 samples / batch 4)
+#     warmup = 5% ≈ 18 steps, then power-decay to 3e-7
+#
+# WORKFLOW (preprocessing is wired into this same config):
+#   1. pgs prepare --config configs/qwen35_4b/a100_80gb_test.yaml
+#      → scores with Qwen3.5-4B perplexity, filters outliers, reserves the
+#        50-sample eval holdout, selects the J-shaped optimal mix
+#      RE-RUN THIS ONCE: the existing prepared/ dir predates eval_holdout,
+#      so it has no eval_data.parquet yet (and its training set may overlap
+#      what will become the holdout).
+#   2. pgs train --config configs/qwen35_4b/a100_80gb_test.yaml
+#
+# Memory budget:
+#   Weights: 8GB │ Lion8bit: 1GB │ Grads: 8GB (release OFF for full telemetry)
+#   Activations: 4GB │ Total: ~21GB → batch=4 fits easily on 80GB
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa       # flash-attn is not installed in this env
+                                  # (see fla/causal-conv1d fallback warnings);
+                                  # sdpa is validated and fine at seq 4096
+  use_liger_kernel: true          # RE-ENABLED: data pipeline is validated,
+                                  # take the throughput back
+  compile: true                   # RE-ENABLED: ~365 steps amortizes warmup
+  compile_mode: default
+
+data:
+  dataset: agent-data/Opus-4.6-Reasoning-2100x-formatted   # RAW dataset;
+                                  # scored by `pgs prepare`, then training
+                                  # uses the prepared parquet (preprocess.enabled)
+  dataset_split: train
+  streaming: false
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 4                  # RE-ENABLED: loader validated, parallel again
+  packing: false                  # keep OFF: auto-derived total_steps assumes
+                                  # 1 sample = 1 slot; packing would make the
+                                  # LR schedule an over-estimate (slower decay).
+                                  # Enable + set max_steps manually if you want it.
+  include_observations: true      # ECHO: train on tool observations
+  turn_scaling: progressive       # later turns get more weight
+  # eval_dataset intentionally EMPTY — `pgs prepare` reserves 50 never-trained
+  # samples (preprocess.eval_holdout) in eval_data.parquet and training
+  # auto-uses them. True held-out, same-distribution eval.
+  eval_samples: 50
+  eval_every: 25                  # ~14 evals over the run; enough resolution
+                                  # to catch the overfit inflection early
+
+# Same config drives scoring (model.name_or_path) and selection (this section).
+preprocess:
+  enabled: true                   # training consumes the prepared parquet
+  output_dir: ./prepared/qwen35_4b-opus46-reasoning
+  format: parquet                 # order-preserving, fast, direct-loadable
+  budget: 1500                    # IMPORTANT: must be < dataset size (~2100)
+                                  # or selection is skipped and ALL samples are
+                                  # kept — the J-shape only applies when the
+                                  # budget forces a choice. 1500/2100 ≈ 70%.
+  strategy: optimal               # J-shape: 20% easy / 50% medium / 25% hard /
+                                  # ~5% very-hard (hardest surviving samples —
+                                  # see select_by_budget in prepare.py)
+  eval_holdout: 50                # reserve 50 samples as eval_data.parquet —
+                                  # random draw, excluded from training, auto-
+                                  # consumed by training as the eval set
+  batch_size: 64                  # max samples per scoring forward (length-sorted,
+                                  # padded batches; the token cap below bounds memory)
+  max_batch_tokens: 32768         # padded tokens per forward. 32K ≈ 10GB bf16 logits
+                                  # (150K vocab) — comfortable on A100-80GB with a 4B model
+  hes: false                      # HES annotates scores but select_by_budget
+                                  # doesn't consume it yet — a second scoring
+                                  # pass would buy nothing here
+
+train:
+  output_dir: ./checkpoints/qwen35_4b-opus46-reasoning
+  epochs: 1                       # CHANGED: was 3 — the 460-step run showed
+                                  # overfit setting in within ~1 epoch; more
+                                  # epochs on 1.5k samples = pure memorization
+  max_steps: 0                    # auto: derived from epochs × dataset size
+                                  # (~365 steps). Warmup and decay now scale to
+                                  # the ACTUAL run length — this was the bug
+                                  # that kept the previous run inside warmup.
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 1
+  learning_rate: 3e-6             # CHANGED: was 1e-5, which DEGRADED the model
+                                  # (train CE and eval CE both rising from step
+                                  # ~10, grad_norm 2-4 vs 1.1-1.6). Lion is
+                                  # sign-based: every param moves ±lr per step,
+                                  # so lr directly sets weight drift. Empirics
+                                  # from the 460-step run: eval improved while
+                                  # LR was 1.5-2.5e-6 and degraded once it
+                                  # crossed ~3e-6. Peak 3e-6 + power decay keeps
+                                  # most of the run inside the proven-good zone.
+  min_learning_rate: 3e-7         # scaled with the peak (10%)
+  weight_decay: 0.1
+  warmup_ratio: 0.05              # ≈ 18 steps of the ~365-step run
+  lr_scheduler: power_decay       # optimal power-decay γ=4 (arxiv:2602.06797)
+  optimizer: lion8bit             # 4 bytes/param, element-wise
+  gradient_checkpointing: selective
+  adagc: true                     # per-tensor adaptive gradient clipping
+  adagc_lambda: 1.5
+  adagc_beta: 0.95
+  spike_detection: false          # AdaGC subsumes spike detection
+  adamc: true                     # corrected WD for normalized layers
+  ema: true
+  ema_decay: 0.999
+  ema_every: 10
+  base_merge: true                # SLERP merge with base (anti-forgetting).
+                                  # Visible in the 460-step run: the drift dip
+                                  # + eval improvement right after step 400.
+  base_merge_ratio: 0.1
+  base_merge_every: 180           # CHANGED: was 200 — fires once mid-run on a
+                                  # ~365-step schedule instead of near the end
+  base_merge_method: slerp
+  freeze_non_attention: true      # MANDATORY for Qwen3.5 (arxiv:2604.22127)
+  save_steps: 100                 # CHANGED: was 25 — 3 checkpoints over the
+                                  # run; `best` is tracked separately anyway
+  logging_steps: 5
+  bf16: true
+  # Hyperball: enable for scale-invariant weight matrices (attention+MLP)
+  # Constrains norms → replaces weight decay role → 20-30% convergence speedup
+  hyperball: true
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  gradient_release: false         # keep OFF: grad_cosine_sim and gw_ratio
+                                  # telemetry is worth ~8GB on an 80GB card
+  selective_diff: true            # skip activation saving for frozen layers
+
+plugins:
+  deft: true                      # parameter-free token weighting (arxiv:2602.11424)
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  project: palingenesis
+  run_name: qwen35-4b-opus46-e1-lr3e6   # CHANGED: new name → fresh wandb run,
+                                  # encodes what changed (1 epoch, peak 3e-6)
+  use_wandb: true
+  use_trackio: false              # wandb only
+  # Both cadences must be multiples of logging_steps (5).
+  health_tier2_every: 10          # grad cosine sim, GNS, CUDA memory
+  health_tier3_every: 50          # weight norms, stable rank, drift — ~7× per run
+  rl_readiness: true              # monitor output entropy for RL handoff
+  rl_entropy_floor: 1.5           # warn if entropy collapses (SFT→RL planning)

@@ -1,0 +1,73 @@
+# Qwen3.5-4B │ A100-40GB / RTX 3090/4090 │ Single GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# TIGHT fit. Every byte counts.
+# Weights: 8GB │ Lion8bit: 1GB │ Grads: 0GB │ Activations: ~3GB
+# Total: ~14GB → batch=2 safe on 40GB, batch=3 possible with seq=2048.
+#
+# Key: gradient_release + selective_diff + lion8bit makes this fit on 40GB.
+# Without these optimizations this model would NOT fit for full finetune.
+#
+# NEW: power_decay scheduler + Hyperball (zero memory overhead, better convergence)
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: false
+  max_seq_length: 2048           # shorter seq to fit batch=2 on 40GB
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+
+train:
+  output_dir: ./checkpoints/qwen35_4b
+  epochs: 3
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 4.5e-5
+  min_learning_rate: 4.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay      # better than cosine, zero cost
+  optimizer: lion8bit
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 10
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  hyperball: true                # zero memory overhead, better convergence
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  gradient_release: true
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.5

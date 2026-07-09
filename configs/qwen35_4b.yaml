@@ -1,0 +1,118 @@
+# Qwen3.5-4B — Hybrid Architecture Agentic SFT
+#
+# Architecture: 4B dense, HYBRID attention (Gated DeltaNet + Gated Attention)
+#   - 3:1 ratio: 3 DeltaNet (linear attention) blocks per 1 full attention block
+#   - ~36 total blocks (9 groups of 4)
+#   - Hidden: 2560, Intermediate: ~8960
+#   - GQA within the full-attention layers
+#   - Vocab: 151,936
+#   - Context: 128K (DeltaNet enables long context at O(n) cost)
+#   - Multimodal (text + image + video), SFT here is text-only
+#   - Released Feb 2026
+#
+# Memory (bf16): 4B * 2 = 8 GB params
+#   Optimizer: 4B * 8 = 32 GB
+#   Total: ~45 GB with activations -> fits single A100-80GB
+#   Also fits on 2x RTX 4090 (24GB each) with FSDP
+#
+# HYBRID ARCHITECTURE TRAINING DYNAMICS:
+#   From research (arxiv:2604.01168 "Zero-Overhead Adaptation of Hybrid Models"):
+#   - DeltaNet layers have DIFFERENT gradient dynamics than attention layers
+#   - The gated recurrent state acts as compressed memory -- harder to update
+#   - Full attention layers adapt faster (direct token access)
+#   - Implication: The 3:1 DeltaNet/Attention ratio means most params are in
+#     layers that are harder to fine-tune. Need slightly higher LR than pure
+#     transformer of same size, OR longer training.
+#
+#   CRITICAL (arxiv:2604.22127 "Where Should LoRA Go?"):
+#   - Adapting DeltaNet layers is DESTRUCTIVE in sequential hybrids (-14.8pp!)
+#   - ONLY the attention layers (25% of blocks) should be adapted
+#   - Attention pathway outperforms full-model LoRA with 5-10x fewer params
+#   - For full fine-tune: use very aggressive LLRD to nearly freeze DeltaNet layers
+#
+#   From community (HF model card for Qwen3.5-0.8B fine-tune):
+#   - LR=2e-5 works on H100 with linear schedule, warmup=100, seq=4096
+#   - bf16 + SDPA confirmed working
+#
+#   Strategy:
+#   - LLRD=0.85 (nearly freezes early DeltaNet, adapts later attention blocks)
+#   - 3 epochs (attention layers need repeated exposure since they're minority)
+#   - SymNoise helps: compressed DeltaNet state benefits from regularization
+#   - InfoSFT: focus learning signal on the tokens that matter most
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa  # Used for the full-attention layers (1 in 4 blocks)
+  use_liger_kernel: true     # Patches norms + activations; attention layers get SDPA
+  compile: true
+  compile_backend: inductor
+  compile_mode: default
+
+data:
+  dataset: your-org/agentic-traces
+  dataset_split: train
+  streaming: true
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 4
+  packing: false
+  seed: 42
+
+train:
+  output_dir: ./checkpoints/qwen35-4b-sft
+  # DeltaNet layers need more exposure than pure attention: 3 epochs
+  epochs: 3
+  max_steps: -1
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 8  # Effective batch = 16
+  # Hybrid models: slightly lower LR than pure transformers (DeltaNet stability)
+  learning_rate: 1.5e-5
+  min_learning_rate: 1.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+  spike_detection: true
+  spike_z_threshold: 5.0
+  # BEST OPTION: freeze DeltaNet entirely, only train attention + lm_head
+  # From : attention-only adaptation outperforms full-model
+  # with 5-10x fewer trainable params. No LLRD needed when using this.
+  freeze_non_attention: true
+  # With freeze_non_attention=true, LLRD is unnecessary (frozen params ignored)
+  # Set to 1.0 (off) — all trainable attention blocks get equal LR
+  llrd_decay: 1.0
+
+parallel:
+  fsdp: false  # Fits on single A100-80GB
+  context_parallel: false
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  # 151K vocab * 4096 seq * batch2 = 4.7 GB -> chunk
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  float8_training: false
+
+plugins:
+  sym_noise: true          # DeltaNet's compressed state benefits from regularization
+  sym_noise_alpha: 5.0
+  info_sft: true           # Focus learning on informative tokens
+  info_sft_pbar: 0.93
+  schedule_free: false
+  pre_rl: false
+
+logging:
+  project: agentic-sft
+  run_name: qwen35-4b-agentic
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

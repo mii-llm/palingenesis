@@ -1,0 +1,246 @@
+/* ═══════════════════════════════════════════════════════════════════
+   palingenesis — Tufte-inspired documentation
+   
+   Principles (from Tufte):
+   - Content first, chrome last
+   - High data-to-ink ratio
+   - Sidenotes over footnotes
+   - Let the typography do the work
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── Fonts: ET Book (Tufte's choice) via Google Fonts fallback ──── */
+@import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300;400;500&display=swap');
+
+/* ── Color: near-invisible chrome, content speaks ──────────────── */
+:root,
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #fffff8;
+  --md-primary-fg-color--light: #fffff8;
+  --md-primary-fg-color--dark: #f4f4ec;
+  --md-primary-bg-color: #111;
+  --md-accent-fg-color: #a00000;
+  --md-typeset-a-color: #a00000;
+  --md-default-bg-color: #fffff8;
+  --md-default-fg-color: #111;
+  --md-default-fg-color--light: #454545;
+  --md-default-fg-color--lighter: #777;
+  --md-default-fg-color--lightest: #ccc;
+  --md-code-bg-color: #f7f7f0;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #151515;
+  --md-primary-fg-color--light: #1a1a1a;
+  --md-primary-fg-color--dark: #0a0a0a;
+  --md-primary-bg-color: #ddd;
+  --md-accent-fg-color: #c86450;
+  --md-typeset-a-color: #c86450;
+  --md-default-bg-color: #151515;
+  --md-default-fg-color: #ddd4c8;
+  --md-default-fg-color--light: #a09888;
+  --md-default-fg-color--lighter: #706860;
+  --md-default-fg-color--lightest: #333;
+  --md-code-bg-color: #1c1c1c;
+}
+
+/* ── Typography: Newsreader (modern Tufte-ish serif) ───────────── */
+.md-typeset {
+  font-family: 'Newsreader', 'ET Book', Palatino, 'Palatino Linotype', 
+               'Palatino LT STD', 'Book Antiqua', Georgia, serif;
+  font-size: 0.88rem;
+  line-height: 1.8;
+  letter-spacing: 0.003em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tufte: titles are light, not screaming */
+.md-typeset h1 {
+  font-weight: 300;
+  font-size: 2.2rem;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin-top: 0;
+  margin-bottom: 1.5rem;
+  font-style: italic;
+}
+
+.md-typeset h2 {
+  font-weight: 400;
+  font-size: 1.3rem;
+  font-style: italic;
+  margin-top: 3rem;
+  margin-bottom: 0.6rem;
+  border-bottom: none;
+}
+
+.md-typeset h3 {
+  font-weight: 400;
+  font-size: 1rem;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-variant: small-caps;
+  margin-top: 2rem;
+}
+
+/* Tufte: paragraphs have generous width, not full bleed */
+.md-content {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+/* ── Links: subtle, discoverable ───────────────────────────────── */
+.md-typeset a {
+  text-decoration: none;
+  background-image: linear-gradient(var(--md-accent-fg-color), var(--md-accent-fg-color));
+  background-position: 0% 93%;
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  transition: background-size 0.15s ease;
+}
+
+.md-typeset a:hover {
+  background-size: 100% 2px;
+}
+
+/* ── Code: quiet, functional ───────────────────────────────────── */
+.md-typeset code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.76rem;
+  font-weight: 400;
+  padding: 0.15em 0.4em;
+  border-radius: 2px;
+  border: none;
+}
+
+.md-typeset pre {
+  border-radius: 0;
+  border: none;
+  border-left: 3px solid var(--md-default-fg-color--lightest);
+  box-shadow: none;
+  padding: 1em 1.2em;
+  margin: 1.5em 0;
+}
+
+.md-typeset pre code {
+  font-size: 0.74rem;
+  line-height: 1.6;
+}
+
+/* ── Tables: Tufte-style minimal (no vertical lines, minimal horizontal) */
+.md-typeset table:not([class]) {
+  font-size: 0.78rem;
+  border-collapse: collapse;
+  border: none;
+  box-shadow: none;
+  width: 100%;
+}
+
+.md-typeset table:not([class]) thead {
+  border-bottom: 2px solid var(--md-default-fg-color);
+}
+
+.md-typeset table:not([class]) th {
+  font-weight: 400;
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+  text-align: left;
+  padding: 0.5em 1em 0.5em 0;
+  border: none;
+  background: none;
+}
+
+.md-typeset table:not([class]) td {
+  padding: 0.4em 1em 0.4em 0;
+  border: none;
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+}
+
+.md-typeset table:not([class]) tr:last-child td {
+  border-bottom: none;
+}
+
+/* ── Admonitions: Tufte sidenote style ─────────────────────────── */
+.md-typeset .admonition,
+.md-typeset details {
+  border: none;
+  border-left: 2px solid var(--md-default-fg-color--lighter);
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  font-size: 0.82rem;
+  padding: 0.2em 0 0.2em 1.2em;
+  margin: 1.5em 0;
+}
+
+.md-typeset .admonition-title,
+.md-typeset details summary {
+  font-variant: small-caps;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  background: none !important;
+  border: none;
+  padding-left: 0;
+  margin: 0;
+}
+
+.md-typeset .admonition-title::before,
+.md-typeset details summary::before {
+  display: none;
+}
+
+/* ── Horizontal rules: Tufte ornament ──────────────────────────── */
+.md-typeset hr {
+  border: none;
+  text-align: center;
+  margin: 3em 0;
+}
+
+.md-typeset hr::after {
+  content: "⁂";
+  font-size: 1.2rem;
+  color: var(--md-default-fg-color--lighter);
+}
+
+/* ── Header: minimal, retreats ─────────────────────────────────── */
+.md-header {
+  box-shadow: none;
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+}
+
+/* ── Navigation: lighter presence ──────────────────────────────── */
+.md-nav__item .md-nav__link {
+  font-size: 0.74rem;
+  letter-spacing: 0.01em;
+}
+
+.md-tabs__link {
+  font-size: 0.72rem;
+  font-variant: small-caps;
+  letter-spacing: 0.06em;
+  text-transform: lowercase;
+}
+
+/* ── Footer: nearly invisible ──────────────────────────────────── */
+.md-footer {
+  opacity: 0.4;
+  transition: opacity 0.3s;
+}
+.md-footer:hover {
+  opacity: 1;
+}
+
+/* ── Blockquotes: Tufte epigraph style ─────────────────────────── */
+.md-typeset blockquote {
+  border-left: none;
+  font-style: italic;
+  padding: 0 0 0 1em;
+  margin: 2em 0 2em 1em;
+  font-size: 0.92em;
+  opacity: 0.85;
+}
+
+/* ── Selection color ───────────────────────────────────────────── */
+::selection {
+  background: rgba(160, 0, 0, 0.15);
+}

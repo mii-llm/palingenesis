@@ -1,0 +1,68 @@
+# Agentic trace training — tool-use, reasoning, multi-turn
+#
+# Data format: standard HF chat messages with system/user/assistant/tool roles.
+# Only assistant turns are trained on. Agentic traces are typically long
+# (tool calls, reasoning chains, multi-step outputs).
+#
+# Example:
+#   [
+#     {"role": "system", "content": "You are an agent with tools..."},
+#     {"role": "user", "content": "Find recent papers on X"},
+#     {"role": "assistant", "content": "<think>...</think>\n<tool_call>search(...)"},
+#     {"role": "tool", "content": "{\"results\": [...]}"},
+#     {"role": "assistant", "content": "Based on my search..."},
+#   ]
+
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+
+data:
+  dataset: your-org/agentic-traces
+  dataset_split: train
+  streaming: true
+  max_seq_length: 16384  # Agentic loops are long
+  messages_field: messages
+  num_workers: 4
+  packing: false
+
+train:
+  output_dir: ./checkpoints/agentic-8b
+  epochs: 3
+  max_steps: -1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32  # Large effective batch with long seqs
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 250
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+
+parallel:
+  fsdp: true
+  context_parallel: false  # Enable if > 32k seq
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8
+  float32_matmul_precision: high
+
+logging:
+  project: palingenesis
+  run_name: agentic-llama3-8b
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

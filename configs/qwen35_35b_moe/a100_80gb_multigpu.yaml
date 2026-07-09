@@ -1,0 +1,84 @@
+# Qwen3.5-35B-MoE │ A100-80GB │ Multi-GPU (4-8×)
+# ─────────────────────────────────────────────────────────────────────────────
+# The RECOMMENDED config for 35B MoE. FSDP shards across 4-8 GPUs.
+#
+# Memory per GPU (8× A100-80GB, FSDP):
+#   Weights shard: ~9GB │ Optimizer shard (lion8bit): ~1GB │ Activations: ~8GB
+#   Total per GPU: ~20GB → batch=2 fits comfortably per GPU
+#   Effective batch: 8 GPUs × 2 = 16
+#
+# MoE considerations:
+#   - Expert routing is data-dependent → can't use fullgraph compile
+#   - Expert parallelism not needed at this scale (FSDP sufficient)
+#   - freeze_non_attention: freeze all recurrent layers, only train attention + experts + head
+#
+# Muon works here because memory is split across GPUs (no gradient_release needed).
+
+model:
+  name_or_path: Qwen/Qwen3.5-35B-A22B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: false  # MoE routing breaks fullgraph
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: true
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 8
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  eval_every: 50
+
+train:
+  output_dir: ./checkpoints/qwen35_35b_moe
+  epochs: 2
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 2   # effective = 8 GPUs × 2 × 2 = 32
+  learning_rate: 1e-5
+  min_learning_rate: 1e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay     # better than cosine for large models
+  optimizer: muon          # memory split by FSDP, Muon for speed
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 20            # less frequent for large model
+  base_merge: true
+  base_merge_ratio: 0.08   # gentler for large model
+  base_merge_every: 300
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 300
+  logging_steps: 1
+  bf16: true
+  hyperball: true          # zero overhead, 20-30% speedup
+  mona: true               # curvature-aware acceleration
+  mona_beta_a: 0.98        # slightly higher β_a for larger model
+  mona_lite: true
+
+parallel:
+  fsdp: true
+  context_parallel: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8
+  gradient_release: false
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.0

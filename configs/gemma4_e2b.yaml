@@ -1,0 +1,121 @@
+# Gemma 4 E2B — Agentic SFT Configuration
+#
+# Architecture: 5.1B total params, ~2.3B effective (Per-Layer Embeddings)
+#   - PLE architecture: learned per-layer specialization (NOT MoE)
+#   - Each decoder layer receives a 256-dim PLE signal (token identity + hidden state)
+#   - PLE embedding table alone ~4.7GB — dominates the parameter count
+#   - 18 decoder layers (smallest Gemma 4)
+#   - Context: 128K tokens
+#   - Vocab: 262,144 (very large — chunked loss MANDATORY)
+#   - Designed for EDGE: phones, Raspberry Pi, Jetson Orin
+#   - Apache 2.0 license
+#
+# Memory (bf16):
+#   Params: 5.1B * 2 = 10.2 GB
+#   Optimizer: 5.1B * 8 = 40.8 GB (AdamW states)
+#   Activations: ~5 GB (selective AC, seq=2048, batch=4)
+#   Total: ~56 GB -> fits single A100-80GB
+#   On 2x RTX 4090 24GB: FSDP + cpu_offload
+#   On single RTX 4090 24GB: cpu_offload=true + full AC + batch=1
+#
+# PLE TRAINING DYNAMICS:
+#   The PLE table is enormous relative to the model (~50% of total params).
+#   It was heavily pretrained and acts like a "second embedding" — very fragile.
+#   Aggressive LLRD (0.88) protects PLE from being corrupted by SFT gradients.
+#   The "effective" 2.3B is the compute per forward token; memory is the full 5.1B.
+#
+#   Edge model training strategy:
+#   - Conservative LR (5e-6): small models are fragile, overfit fast
+#   - Short training (1-2 epochs): Gemma 4 is very good OOB, minimal adaptation
+#   - Aggressive LLRD (0.88): layer 0 gets 0.88^18 = 9.8% of peak LR
+#   - Higher batch (4): short sequences + small model allows it, reduces noise
+#   - SymNoise alpha=7: stronger regularization for small model (overfits easily)
+#   - InfoSFT: essential for small models (focus learning budget on hard tokens)
+#
+# 262K VOCAB MEMORY:
+#   Even at seq=2048, batch=4: logits = 4 * 2048 * 262144 * 4 = 8.6 GB
+#   -> chunked loss is NON-NEGOTIABLE. 4 chunks keeps peak at ~2.1 GB.
+
+model:
+  name_or_path: google/gemma-4-E2B-it
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  # Liger supports gemma2 kernels which cover gemma4 architecture family
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+  compile_mode: default
+
+data:
+  dataset: your-org/agentic-traces
+  dataset_split: train
+  streaming: true
+  # Edge model: shorter sequences match deployment profile
+  # E2B will typically serve on-device with 2-4K context
+  max_seq_length: 2048
+  messages_field: messages
+  num_workers: 4
+  packing: false
+  seed: 42
+
+train:
+  output_dir: ./checkpoints/gemma4-e2b-sft
+  # Small model: 1-2 epochs max (overfits quickly, Gemma 4 is strong OOB)
+  epochs: 2
+  max_steps: -1
+  # Short seq + small model -> can fit batch=4 on single A100
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 4  # Effective batch = 4*4 = 16
+  # Edge model: very conservative LR to prevent catastrophic forgetting
+  # Scaling law: lr ~ N^{-0.5} * C, with N=5.1B -> ~5e-6
+  # PLE fragility demands staying low
+  learning_rate: 5.0e-6
+  min_learning_rate: 5.0e-7
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+  spike_detection: true
+  spike_z_threshold: 5.0
+  # LLRD: 18 layers, decay=0.88 -> layer 0 gets 0.88^18 = 9.8% of peak
+  # Protects PLE embeddings (concentrated in early layers) from corruption
+  llrd_decay: 0.88
+
+parallel:
+  # Fits on single A100-80GB without FSDP
+  fsdp: false
+  context_parallel: false
+  cpu_offload: false  # Set true for RTX 4090 (24GB)
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  # 262K vocab: logits = 4 * 2048 * 262144 * 4 = 8.6 GB -> MUST chunk
+  # 4 chunks: each chunk ~2.1 GB peak
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  float8_training: false  # Gemma 4 PLE not validated with float8
+
+plugins:
+  # SymNoise: stronger alpha for small models (more regularization needed)
+  sym_noise: true
+  sym_noise_alpha: 7.0
+  # InfoSFT: critical for small models — focus learning on informative tokens
+  # Prevents wasting capacity on easy/repetitive tokens
+  info_sft: true
+  info_sft_pbar: 0.93
+  schedule_free: false
+  pre_rl: false
+
+logging:
+  project: palingenesis
+  run_name: gemma4-e2b-agentic
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

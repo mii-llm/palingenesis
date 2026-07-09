@@ -1,0 +1,95 @@
+# Gemma 4 12B — Agentic SFT Configuration
+#
+# Architecture: 12B dense parameters
+#   - Multimodal (text + image + audio), but SFT here is text-only
+#   - Context window: 256K tokens (with rope scaling)
+#   - Vocab: 262,144 (very large — chunked loss essential)
+#   - Hidden size: 3584, 36 layers, 16 heads
+#   - Apache 2.0 license
+#
+# Key characteristics:
+#   - Designed for agentic workflows (native function calling)
+#   - Large vocab (262K) means logit tensor is huge -> chunked loss critical
+#   - 12B in bf16 = 24 GB params -> fits on 1x A100-80GB with optimizations
+#   - With FSDP on 2+ GPUs: very comfortable
+#
+# Memory on single A100-80GB:
+#   Params: 24 GB | Optim: 96 GB -> NEED FSDP or CPU offload
+#   With 2x A100: 12 GB/GPU params, 48 GB/GPU optim = 60 GB/GPU, fits
+#   With 4x A100: 6 GB/GPU params, 24 GB/GPU optim = ~35 GB/GPU, plenty
+#
+# For single A100: use gradient_checkpointing=full + cpu_offload=true
+
+model:
+  name_or_path: google/gemma-4-12B-it
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  # Liger supports gemma2 kernels which cover gemma4 architecture
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+  compile_mode: default
+
+data:
+  dataset: your-org/agentic-traces
+  dataset_split: train
+  streaming: true
+  max_seq_length: 8192
+  messages_field: messages
+  num_workers: 4
+  packing: false
+  seed: 42
+
+train:
+  output_dir: ./checkpoints/gemma4-12b-sft
+  epochs: 3
+  max_steps: -1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  # 12B model: from scaling law lr ~ 12^{-0.5} * C ~ 1.5e-5
+  learning_rate: 1.5e-5
+  min_learning_rate: 1.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+  spike_detection: true
+  spike_z_threshold: 5.0
+  # LLRD: Gemma benefits strongly from layer-wise decay
+  # 36 layers: layer 0 gets lr * 0.9^36 = 2.3% of peak
+  llrd_decay: 0.9
+
+parallel:
+  fsdp: true
+  context_parallel: false
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  # 262K vocab is HUGE: full logits = 1*8192*262144*4 = 8.6 GB per sample!
+  # Need aggressive chunking
+  loss_num_chunks: 16
+  float32_matmul_precision: high
+  float8_training: false  # Gemma 4 architecture not yet validated with float8
+
+plugins:
+  sym_noise: true
+  sym_noise_alpha: 5.0
+  info_sft: true
+  info_sft_pbar: 0.93
+  schedule_free: false
+  pre_rl: false
+
+logging:
+  project: palingenesis
+  run_name: gemma4-12b-agentic
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

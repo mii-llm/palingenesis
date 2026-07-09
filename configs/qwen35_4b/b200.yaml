@@ -1,0 +1,84 @@
+# Qwen3.5-4B │ B200 (192GB HBM3e) │ Single or Multi-GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# B200 Blackwell: 192GB HBM3e, FP4 native, 2× H100 bandwidth.
+# For a 4B model this is absurdly overpowered — maximize throughput.
+#
+# Strategy: max batch, FP8, max-autotune, longest sequences, all optimizations.
+# The 4B model with all optimizations uses ~15GB. On 192GB we have 170GB headroom.
+# → batch=32 × seq=8192 = 262K tokens per step. Converges in minutes.
+#
+# Full stack: Muon + MONA + Hyperball + WSD + no gradient checkpointing (not needed)
+# Seq-len curriculum: start at 2048 to burn through easy patterns fast, ramp to 8192.
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: max-autotune
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: true
+  max_seq_length: 8192
+  messages_field: messages
+  num_workers: 8
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  # Seq-len curriculum (arxiv:2405.13226): start short for speed, ramp to full length
+  # B200 has so much memory we can afford any seq length, but short seqs = faster attention
+  seq_len_curriculum: true
+  seq_len_curriculum_min: 2048
+  seq_len_curriculum_ramp_steps: 500  # ramp from 2048→8192 over first 500 steps
+
+train:
+  output_dir: ./checkpoints/qwen35_4b_b200
+  epochs: 3
+  per_device_batch_size: 32      # 192GB = massive batch
+  gradient_accumulation_steps: 1
+  learning_rate: 1.5e-5
+  min_learning_rate: 1.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.03
+  lr_scheduler: wsd              # WSD: anytime stopping during stable phase
+  optimizer: muon
+  gradient_checkpointing: none   # 192GB: no need to checkpoint activations
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 5
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 100
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 100
+  logging_steps: 1
+  bf16: true
+  hyperball: true
+  mona: true
+  mona_beta_a: 0.975
+  mona_lite: true
+
+parallel:
+  fsdp: false                    # single B200: no need
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 2
+  float8_training: true
+  gradient_release: false        # Muon incompatible; also irrelevant on 192GB
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.5

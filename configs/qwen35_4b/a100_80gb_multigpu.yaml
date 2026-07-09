@@ -1,0 +1,84 @@
+# Qwen3.5-4B │ A100-80GB │ Multi-GPU (2-8×)
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-GPU maximizes THROUGHPUT: Muon + MONA + Hyperball + FSDP.
+# For 4B on 8 GPUs, memory is abundant → use the FASTEST optimizer stack.
+#
+# Optimizer stack (new):
+#   Muon + MONA acceleration + Hyperball projection
+#   = spectral steepest descent + curvature awareness + norm constraint
+#   = theoretically optimal angular learning for scale-invariant layers
+#
+# With 8 GPUs: effective_batch = 8 × 8 = 64 sequences (excellent signal).
+# Muon's Newton-Schulz is per-GPU (no extra communication vs AdamW).
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: reduce-overhead
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: true
+  max_seq_length: 8192
+  messages_field: messages
+  num_workers: 8
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  eval_every: 50
+
+train:
+  output_dir: ./checkpoints/qwen35_4b_multigpu
+  epochs: 3
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 1
+  # Muon: 1.5× faster convergence (AdamW-equivalent LR; Muon scales 10× internally)
+  learning_rate: 1.5e-5
+  min_learning_rate: 1.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay      # power-decay γ=4 > cosine for LLM capacity
+  optimizer: muon                 # Muon for 2D weights, AdamW for 1D
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 10
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 200
+  logging_steps: 1
+  bf16: true
+  # Hyperball: project Muon updates to hypersphere (20-30% speedup at scale)
+  hyperball: true
+  # MONA: curvature-aware acceleration pre-orthogonalization
+  mona: true
+  mona_beta_a: 0.975
+  mona_lite: true
+
+parallel:
+  fsdp: true
+  context_parallel: false        # not needed for 8K seq on multiple GPUs
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  gradient_release: false        # Muon incompatible with gradient release
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.5

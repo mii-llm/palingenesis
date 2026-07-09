@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+.coverage
+htmlcov/
+.DS_Store
+checkpoints/
+logs/
+wandb/
+outputs/
+torchtitan/
+*.pt
+*.bin
+*.safetensors
+
+
+# MkDocs build output
+site/

@@ -1,0 +1,62 @@
+# Qwen3.5-0.8B │ A100-40GB │ Single GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# Same as 80GB but model is tiny so nothing changes except slightly smaller batch.
+
+model:
+  name_or_path: Qwen/Qwen3.5-0.8B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: max-autotune
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: false
+  max_seq_length: 2048
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+
+train:
+  output_dir: ./checkpoints/qwen35_08b
+  epochs: 3
+  per_device_batch_size: 8   # still comfortable on 40GB
+  gradient_accumulation_steps: 2
+  learning_rate: 3e-5
+  min_learning_rate: 3e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: cosine
+  optimizer: adamw
+  gradient_checkpointing: none
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 5
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 2
+  gradient_release: false  # GA=2 so can't use gradient release
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 7.0

@@ -1,0 +1,106 @@
+# Qwen3.5-4B │ A100-80GB │ Single GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# THE flagship config. Every optimization stacked.
+# Memory budget:
+#   Weights: 8GB │ Lion8bit: 1GB │ Grads: 0GB (released) │ Activations: 4GB
+#   Total: ~15GB → batch=4 fits easily, headroom for seq=8192
+#
+# NEW in this version:
+#   - power_decay scheduler (arxiv:2602.06797): avoids cosine capacity saturation
+#   - Hyperball projection (arxiv:2606.16899): 20-30% speedup for scale-invariant layers
+#   - RL-readiness monitoring (arxiv:2606.18487): track entropy for SFT→RL handoff
+#   - TFP-ready data pipeline: sorted packing + semantic ordering in data prep
+#
+# Throughput: Liger + compile + packing + lion8bit = near-peak GPU utilization.
+# Quality: DEFT + ECHO + SLERP + EMA + AdaGC + Hyperball = state-of-the-art SFT.
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: default
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: false
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  include_observations: true     # ECHO: train on tool observations
+  turn_scaling: progressive      # later turns get more weight
+  eval_every: 50
+
+train:
+  output_dir: ./checkpoints/qwen35_4b
+  epochs: 3
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 1
+  learning_rate: 4.5e-5          # Peak LR applied as-is (no hidden lion8bit ×3
+                                  # anymore). Lion paper: use 3-10× SMALLER LR
+                                  # than AdamW — 4.5e-5 is already on the hot side.
+  min_learning_rate: 4.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay      # NEW: optimal power-decay γ=4 (arxiv:2602.06797)
+  optimizer: lion8bit             # 4 bytes/param, element-wise → gradient release compatible
+  gradient_checkpointing: selective
+  adagc: true                    # per-tensor adaptive gradient clipping
+  adagc_lambda: 1.5
+  adagc_beta: 0.95
+  adamc: true                    # corrected WD for normalized layers
+  ema: true
+  ema_decay: 0.999
+  ema_every: 10
+  base_merge: true               # SLERP merge with base (anti-forgetting)
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  freeze_non_attention: true     # MANDATORY for Qwen3.5 (arxiv:2604.22127)
+  save_steps: 200
+  logging_steps: 1
+  bf16: true
+  # Hyperball: enable for scale-invariant weight matrices (attention+MLP)
+  # Constrains norms → replaces weight decay role → 20-30% convergence speedup
+  hyperball: true
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  gradient_release: true         # fuse optimizer into backward (saves ~8GB)
+  selective_diff: true           # skip activation saving for frozen layers
+
+plugins:
+  deft: true                     # parameter-free token weighting (arxiv:2602.11424)
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+# Offline data preparation — run `pgs prepare --config <this file>` first.
+# Scores data.dataset with model.name_or_path perplexity, filters, selects,
+# and dumps parquet to output_dir. With enabled=true, training automatically
+# uses the prepared parquet instead of the raw dataset.
+preprocess:
+  enabled: false                 # set true after running `pgs prepare`
+  output_dir: ./prepared/qwen35_4b
+  format: parquet                # parquet (fast, order-preserving) or jsonl
+  budget: 0                      # samples to keep after scoring (0 = all)
+  strategy: optimal              # optimal | curriculum | balanced | flow | ...
+  eval_holdout: 100              # reserve N samples as a held-out eval set
+                                  # (eval_data.parquet, never trained on; training
+                                  # auto-uses it when data.eval_dataset is empty)
+  batch_size: 64                 # max samples per scoring forward (length-sorted,
+                                 # padded batches; token cap below bounds memory)
+  max_batch_tokens: 32768        # padded tokens per forward (~10GB bf16 logits @150K vocab)
+  hes: false                     # HES reasoning-quality scoring (slower)
+
+logging:
+  rl_readiness: true             # NEW: monitor output entropy for RL handoff
+  rl_entropy_floor: 1.5          # warn if entropy collapses (SFT→RL planning)

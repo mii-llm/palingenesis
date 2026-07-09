@@ -1,0 +1,195 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Qwen3.5-4B — Optimal Agentic SFT on Single A100-80GB (or even 24GB!)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# This config stacks EVERY applicable optimization from 348 papers (2024-2026).
+# It is the culmination of our entire research pass.
+#
+# ═══ MEMORY STRATEGY ═══
+# We use "Strategy A" (memory-first):
+#   - Lion 8-bit: 4 bytes/param optimizer memory (vs 16 for AdamW)
+#   - freeze_non_attention: only 25% of params trainable (DeltaNet frozen)
+#   - selective_diff: frozen layers don't store activations (arxiv:2404.12406)
+#   - gradient_release: gradients freed per-param during backward (FORGE, arxiv:2606.22932)
+#   - CCE/chunked loss: zero logit materialization (152K vocab)
+#
+# Memory budget (A100-80GB):
+#   Weights (bf16):            8.0 GB
+#   Lion 8-bit states:         1.0 GB  (only trainable 25% × 4 bytes/param)
+#   Gradients:                 0.0 GB  (gradient release — freed per-param)
+#   Activations (selective):   4.0 GB  (75% frozen layers skip saving)
+#   Overhead:                  2.0 GB
+#   ─────────────────────────────────
+#   TOTAL:                   ~15 GB   ← fits on RTX 3090/4090 (24GB)!
+#
+# With batch_size=4, seq=4096: ~23 GB  ← still fits 24GB
+# With batch_size=8, seq=4096: ~35 GB  ← fits 40GB A100
+#
+# ═══ QUALITY STRATEGY ═══
+#   - DEFT loss: parameter-free adaptive (arxiv:2602.11424, paper reports +70% on math)
+#   - ECHO: train on tool outputs → world model for free (arxiv:2605.24517)
+#   - Progressive turn scaling: later turns weighted more
+#   - SymNoise: Bernoulli embedding regularization (arxiv:2312.01523)
+#   - EMA on CPU: better final checkpoint (zero GPU cost)
+#   - Base-merge SLERP: periodic anti-forgetting pull-back
+#   - AdaGC: per-tensor gradient clipping (zero spikes, arxiv:2502.11034)
+#   - AdamC: corrected weight decay prevents end-of-training explosion
+#
+# ═══ POST-TRAINING ═══
+#   - S0 Tuning: +23pp on code tasks with 48 verified samples (zero overhead)
+#
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  # HYBRID MODEL: DeltaNet layers use their own linear attention
+  # flex_attention crashes DeltaNet; SDPA handles the attention subset correctly
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+  compile_mode: default
+
+data:
+  dataset: ./projects/qwen35_4b_agentic/prepared/scored_data.jsonl
+  dataset_split: train
+  streaming: false
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  seed: 42
+  # ECHO: train on tool/observation outputs (world model for free)
+  # From ICML 2026 (arxiv:2605.24517): doubles pass rate on terminal tasks
+  include_observations: true
+  # Progressive turn scaling: later turns (error recovery, iteration) get more weight
+  turn_scaling: progressive
+  # Pretraining replay: 10% generic data IMPROVES target task (arxiv:2603.04964)
+  pretrain_replay_dataset: ""  # set to HF dataset name for anti-forgetting boost
+  pretrain_replay_weight: 0.10
+  # Validation
+  eval_dataset: ""  # set to your eval dataset
+  eval_split: test
+  eval_samples: 200
+  eval_every: 50
+
+train:
+  output_dir: ./projects/qwen35_4b_agentic/checkpoints
+  epochs: 3
+  max_steps: -1
+  # ═══ BATCH STRATEGY (memory-first) ═══
+  # With gradient_release: GA must be 1, so we use a larger real batch.
+  # The freed gradient memory (~2GB) + selective_diff (~6GB) allow batch=4 easily.
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 1  # MUST be 1 for gradient_release
+  ga_ramp_start: 0               # disabled (incompatible with gradient_release)
+  # ═══ OPTIMIZER ═══
+  # Lion 8-bit: absolute minimum memory (4 bytes/param = 1GB for trainable 25%)
+  # Lion's sign-based update is element-wise → compatible with gradient_release
+  # LR: Lion needs ~3× AdamW LR (sign-based has different magnitude)
+  learning_rate: 4.5e-5          # 1.5e-5 × 3 (Lion scaling)
+  min_learning_rate: 4.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  optimizer: lion8bit
+  seed: 42
+  save_steps: 200
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+  # ═══ STABILITY ═══
+  # AdaGC: per-tensor adaptive clipping (ICML 2026, zero spike score)
+  # Compatible with gradient_release (per-tensor, not global)
+  adagc: true
+  adagc_lambda: 1.5
+  adagc_beta: 0.95
+  spike_detection: false  # AdaGC subsumes spike detection
+  # AdamC: corrected weight decay (prevents gradient explosion at end of cosine)
+  adamc: true
+  # ═══ ANTI-FORGETTING ═══
+  # EMA on CPU: better final checkpoint generalization (zero GPU memory)
+  ema: true
+  ema_decay: 0.999
+  ema_every: 10
+  # Base-merge SLERP: periodically pull toward pretrained weights
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  # ═══ HYBRID-SPECIFIC ═══
+  # Freeze DeltaNet layers: only attention (25%) + lm_head + norms train
+  # From arxiv:2604.22127: adapting DeltaNet is destructive (-14.8pp)
+  freeze_non_attention: true
+  llrd_decay: 1.0  # no LLRD needed with freeze (all trainable at same depth)
+
+parallel:
+  fsdp: false
+  context_parallel: false
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  # CCE for zero logit memory (152K vocab × 4096 seq = 2.4GB saved without this)
+  chunked_loss: true
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  float8_training: false  # A100 doesn't support FP8
+  # ═══ MEMORY OPTIMIZATIONS (NEW) ═══
+  # Gradient Release (FORGE, arxiv:2606.22932): fuse optimizer into backward
+  # Eliminates gradient buffer entirely. Only works with GA=1 + element-wise optimizer.
+  gradient_release: true
+  # Selective Differentiation (arxiv:2404.12406): frozen layers skip activation saving
+  # With freeze_non_attention=true, saves ~6GB of activation memory
+  selective_diff: true
+
+plugins:
+  # DEFT: THE optimal loss (parameter-free, adaptive trust gate)
+  # Automatically NLL on uncertain tokens, DFT on confident tokens
+  deft: true
+  # SymNoise: Bernoulli embedding regularization (prevents overfitting)
+  sym_noise: true
+  sym_noise_alpha: 5.0
+  # No pre_rl (direct agentic deployment, not preparing for GRPO)
+  pre_rl: false
+
+logging:
+  project: palingenesis
+  run_name: qwen35-4b-optimal-v2
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MEMORY COMPARISON (this config vs naive)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Component            │ Naive (AdamW, no opt) │ This Config       │ Saved
+# ─────────────────────┼───────────────────────┼───────────────────┼──────
+# Weights (bf16)       │ 8 GB                  │ 8 GB              │ —
+# Optimizer states     │ 16 GB (AdamW fp32)    │ 1 GB (Lion8bit)   │ 15 GB
+# Gradients (bf16)     │ 8 GB (all params)     │ 0 GB (released)   │ 8 GB
+# Activations          │ 12 GB                 │ 4 GB (selective)  │ 8 GB
+# Logit peak           │ 2.4 GB                │ 0 GB (CCE/chunk)  │ 2.4 GB
+# ─────────────────────┼───────────────────────┼───────────────────┼──────
+# TOTAL                │ ~46 GB                │ ~13-15 GB         │ ~31 GB
+#                      │                       │                   │ (3× reduction)
+#
+# This is comparable to Unsloth's memory reduction WITHOUT any custom CUDA kernels.
+# Fits on a single RTX 3090/4090 (24GB) with batch=2, seq=4096!
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-TRAINING: S0 Tuning (optional, +10-23pp on code tasks)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# After SFT, apply S0 tuning with ~50 execution-verified solutions:
+#   palingenesis s0-tune \
+#       --model ./projects/qwen35_4b_agentic/checkpoints/final \
+#       --data verified_solutions.jsonl \
+#       --output s0_code.pt \
+#       --alpha 0.07 --epochs 50
+#
+# Result: +23.6pp on HumanEval with zero inference overhead (48MB state file).
+# Task switching = loading a different s0 file (no model reload needed).

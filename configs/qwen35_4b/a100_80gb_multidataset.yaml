@@ -1,0 +1,96 @@
+# Qwen3.5-4B │ A100-80GB │ Single GPU │ Multi-Dataset with Adaptive Weighting
+# ─────────────────────────────────────────────────────────────────────────────
+# Same memory strategy as single-dataset, but with:
+# - Multiple data sources with weighted mixing
+# - MSFT adaptive per-source weight scheduling (arxiv:2603.21606)
+# - Pretraining replay for anti-forgetting (arxiv:2603.04964)
+# - TFP-ready: pre-order each source with semantic packing before training
+#
+# Data preparation (run once before training):
+#   python -m palingenesis.tfp --input prepared/agentic_traces/scored_data.jsonl \
+#                             --output prepared/agentic_traces/scored_data_tfp.jsonl
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+
+data:
+  sources:
+    - dataset: ./prepared/agentic_traces/scored_data.jsonl
+      name: agentic
+      weight: 0.65
+      mode: sft
+      messages_field: messages
+    - dataset: ./prepared/general_instruct/scored_data.jsonl
+      name: general
+      weight: 0.20
+      mode: sft
+      messages_field: messages
+    - dataset: ./prepared/code_verified/scored_data.jsonl
+      name: code
+      weight: 0.15
+      mode: sft
+      messages_field: messages
+  max_seq_length: 4096
+  num_workers: 4
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  # Pretraining replay: 10% generic data improves target task (arxiv:2603.04964)
+  pretrain_replay_dataset: ""  # set to e.g. HuggingFaceH4/ultrachat_200k
+  pretrain_replay_weight: 0.10
+  # MSFT adaptive source weighting
+  msft_tracking: true
+  msft_eval_every: 50
+  msft_decay_factor: 0.7
+  msft_recovery_factor: 1.15
+  msft_floor_ratio: 0.1
+  eval_every: 50
+
+train:
+  output_dir: ./checkpoints/qwen35_4b_multi
+  epochs: 3
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 1
+  learning_rate: 4.5e-5
+  min_learning_rate: 4.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay       # power-decay avoids cosine capacity saturation
+  optimizer: lion8bit
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 10
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 200
+  logging_steps: 1
+  bf16: true
+  hyperball: true
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  gradient_release: true
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.5

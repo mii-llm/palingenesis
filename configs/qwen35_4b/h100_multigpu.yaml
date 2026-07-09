@@ -1,0 +1,84 @@
+# Qwen3.5-4B │ H100-80GB │ Multi-GPU (2-8×)
+# ─────────────────────────────────────────────────────────────────────────────
+# MAXIMUM THROUGHPUT configuration.
+# H100 × 8 = 640GB total, FP8, 3.2 TB/s bandwidth each.
+# For a 4B model this converges in minutes on large datasets.
+#
+# Full optimizer stack:
+#   Muon + MONA + Hyperball + FP8 + max-autotune compile
+#   + WSD scheduler (for maximum stable-phase throughput)
+#
+# WSD scheduler keeps peak LR for 80% of training → maximum token throughput
+# during the stable phase, then power-decay to lock in quality at the end.
+# Best for large-scale runs where you want to stop anytime during stable phase.
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: max-autotune
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: true
+  max_seq_length: 8192
+  messages_field: messages
+  num_workers: 8
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  eval_every: 25                 # evaluate more frequently with fast hardware
+
+train:
+  output_dir: ./checkpoints/qwen35_4b_h100_multi
+  epochs: 3
+  per_device_batch_size: 16      # FP8 + H100 = huge batch per GPU
+  gradient_accumulation_steps: 1
+  learning_rate: 1.5e-5
+  min_learning_rate: 1.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.03            # shorter warmup (fast hardware, many steps/epoch)
+  lr_scheduler: wsd              # WSD: stable-phase anytime stopping + power decay end
+  optimizer: muon
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 5                   # more frequent EMA on fast hardware
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 100
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 100
+  logging_steps: 1
+  bf16: true
+  hyperball: true
+  mona: true
+  mona_beta_a: 0.975
+  mona_lite: true
+
+parallel:
+  fsdp: true
+  context_parallel: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 2             # fewer chunks needed with large memory
+  float32_matmul_precision: high
+  float8_training: true
+  gradient_release: false
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.5

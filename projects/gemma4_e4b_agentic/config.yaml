@@ -1,0 +1,128 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Gemma 4 E4B — Optimal Agentic SFT on Single A100-80GB
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# MEMORY-CRITICAL CONFIG: 8B params + 262K vocab on 80GB is TIGHT.
+# Every optimization matters here. CCE + Muon make it possible.
+#
+# Key innovations applied:
+#   - Muon optimizer (ESSENTIAL: makes 8B fit on single A100 without FSDP)
+#   - CCE/chunked loss (ESSENTIAL: 262K vocab = 4.3GB logits without this)
+#   - DEFT loss (adaptive token weighting)
+#   - ECHO observation loss (world model)
+#   - LLRD 0.9 (protects PLE layers from corruption)
+#   - Base-merge SLERP (anti-forgetting for fragile PLE)
+#   - AdaGC + AdamC (stability)
+#   - Packing with FlexAttention (throughput)
+
+model:
+  name_or_path: google/gemma-4-E4B-it
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flex_attention
+  # Liger supports gemma2 architecture family (covers gemma4)
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+  compile_mode: default
+
+data:
+  dataset: ./projects/gemma4_e4b_agentic/prepared/scored_data.jsonl
+  dataset_split: train
+  streaming: false
+  # 4096 seq is the sweet spot: longer would OOM (262K vocab scales badly)
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  seed: 42
+  # ECHO: train on tool outputs → model predicts tool behavior
+  include_observations: true
+  turn_scaling: progressive
+  # Validation
+  eval_dataset: your-org/agentic-traces
+  eval_split: test
+  eval_samples: 150
+  eval_every: 50
+
+train:
+  output_dir: ./projects/gemma4_e4b_agentic/checkpoints
+  # 3 epochs (PLE models benefit from multiple passes but not too many)
+  epochs: 3
+  max_steps: -1
+  # BATCH=1 is necessary: 8B + 262K vocab + activations fills 72GB
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16  # effective batch = 16
+  # GA ramp: small batch early (exploration), large batch late (convergence)
+  ga_ramp_start: 4  # starts at effective_batch=4, ramps to 16
+  # LR calibrated for 8B model: N^{-0.5} scaling → ~2e-5
+  learning_rate: 2.0e-5
+  min_learning_rate: 2.0e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  # Lion 8-bit: absolute minimum memory (2 bytes/param)
+  # ESSENTIAL for 8B model on single A100 without FSDP
+  optimizer: lion8bit
+  seed: 42
+  save_steps: 250
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+  # AdaGC: eliminates loss spikes (important for PLE stability)
+  adagc: true
+  adagc_lambda: 1.5
+  adagc_beta: 0.95
+  spike_detection: true
+  spike_z_threshold: 5.0
+  # EMA on CPU: better final model
+  ema: true
+  ema_decay: 0.999
+  ema_every: 10
+  # Base-merge SLERP: CRITICAL for Gemma 4 — PLE drift is hard to recover
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 250
+  base_merge_method: slerp
+  # AdamC: prevents gradient explosion at end of cosine decay
+  adamc: true
+  # LLRD: protect PLE (early layers) from aggressive updates
+  # 26 layers: layer 0 gets 0.9^26 = 7% of peak LR
+  llrd_decay: 0.9
+  # NOT hybrid: don't freeze anything (standard dense transformer)
+  freeze_non_attention: false
+
+parallel:
+  # Single A100: fits with Muon (no FSDP needed)
+  fsdp: false
+  context_parallel: false
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  # CRITICAL: 262K vocab makes chunked loss MANDATORY
+  # Without it: logits = 1 × 4096 × 262144 × 4 = 4.3 GB per sample
+  # With CCE: ~0 GB. With chunks=8: ~0.5 GB peak
+  chunked_loss: true
+  # 8 chunks: each chunk handles 262K × 512 = safe peak
+  loss_num_chunks: 8
+  float32_matmul_precision: high
+  # FP8: A100 does NOT support FP8 (needs H100 SM89+)
+  float8_training: false
+
+plugins:
+  # DEFT: parameter-free adaptive loss (THE best for SFT)
+  deft: true
+  # SymNoise: embedding regularization (standard alpha for 8B)
+  sym_noise: true
+  sym_noise_alpha: 5.0
+  # No pre_rl (direct agentic deployment, not prepping for GRPO)
+  pre_rl: false
+
+logging:
+  project: palingenesis
+  run_name: gemma4-e4b-optimal-agentic
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

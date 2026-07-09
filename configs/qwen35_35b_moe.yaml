@@ -1,0 +1,94 @@
+# Qwen3.5-35B-A3B (MoE) — Agentic SFT Configuration
+#
+# Architecture: 35B total params, ~3B active per token
+#   - 128 routed experts, top-8 activated
+#   - 48 transformer layers
+#   - Hidden size: 2048 (MoE intermediate ~varies)
+#   - Context: 131K (YaRN), recommended SFT: 8K-32K
+#   - Vocab: 151,936
+#
+# Memory profile (bf16, all experts loaded):
+#   - Params: 35B * 2 bytes = 70 GB
+#   - With FSDP on 8x A100-80GB: ~9 GB/GPU for params
+#   - Optimizer: 35B * 8 bytes / 8 = ~35 GB/GPU (tight!)
+#   - Solution: FSDP + selective AC + chunked loss
+#
+# Key MoE training considerations:
+#   - ALL experts must be loaded (even inactive ones need gradients)
+#   - Expert load balancing is handled by the model's router
+#   - Per-token compute is only 3B params (fast forward pass)
+#   - But memory holds all 35B (must shard)
+#
+# Recommended hardware: 8x A100-80GB or 4x H100-80GB minimum
+
+model:
+  name_or_path: Qwen/Qwen3.5-35B-A3B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+  compile_mode: default  # max-autotune adds long compile for MoE
+
+data:
+  dataset: your-org/agentic-traces
+  dataset_split: train
+  streaming: true
+  max_seq_length: 8192
+  messages_field: messages
+  num_workers: 4
+  packing: false
+  seed: 42
+
+train:
+  output_dir: ./checkpoints/qwen35-35b-moe-sft
+  epochs: 3
+  max_steps: -1
+  # MoE: bs=1 because all 35B params need memory even though only 3B compute
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16  # Effective batch = 1*16*8 = 128 sequences
+  # LR: lower than dense model because MoE routing is sensitive
+  # From scaling law: 35B^{-0.5} ~ 5e-3, adjusted for SFT ~ 8e-6
+  learning_rate: 8.0e-6
+  min_learning_rate: 8.0e-7
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 200
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+  spike_detection: true
+  spike_z_threshold: 4.0  # MoE can have router instability -> slightly more aggressive
+  # LLRD: important for MoE — early layers stable, late layers adapt
+  llrd_decay: 0.92
+
+parallel:
+  fsdp: true              # MUST shard: 70GB model doesn't fit on 1 GPU
+  context_parallel: false  # Not needed at 8K seq
+  cpu_offload: false       # Keep on GPU for speed (use if OOM)
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8      # 151K vocab * 8192 seq = big logits
+  float32_matmul_precision: high
+  float8_training: false   # MoE + float8 interaction untested, stay safe
+
+plugins:
+  sym_noise: true          # Free quality boost
+  sym_noise_alpha: 5.0
+  info_sft: true           # Smart token weighting (great for MoE)
+  info_sft_pbar: 0.93
+  schedule_free: false     # Use cosine for stability with MoE
+  pre_rl: false
+
+logging:
+  project: palingenesis
+  run_name: qwen35-35b-moe-agentic
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

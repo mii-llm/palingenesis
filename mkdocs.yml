@@ -1,0 +1,111 @@
+site_name: palingenesis
+site_description: Fire-and-forget LLM fine-tuning with state-of-the-art defaults.
+site_url: https://your-org.github.io/palingenesis
+
+repo_name: your-org/palingenesis
+repo_url: https://github.com/your-org/palingenesis
+
+docs_dir: mkdocs_docs
+
+theme:
+  name: material
+  custom_dir: mkdocs_docs/overrides
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+  font: false
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/fire
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+
+plugins:
+  - search
+  - tags
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.keys
+  - pymdownx.mark
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - toc:
+      permalink: "¶"
+      toc_depth: 3
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/your-org/palingenesis
+  generator: false
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/install.md
+    - Quickstart: getting-started/quickstart.md
+    - Your First Training: getting-started/first-training.md
+  - Guides:
+    - Data Preparation: guides/data.md
+    - Agentic & Reasoning Models: guides/agentic-training.md
+    - Single GPU: guides/single-gpu.md
+    - Multi-GPU: guides/multi-gpu.md
+    - Multi-Node & SLURM: guides/multi-node.md
+    - Autopilot: guides/autopilot.md
+    - SFT → RL Transition: guides/sft-to-rl.md
+  - Reference:
+    - Configuration: reference/configuration.md
+    - Optimizers: reference/optimizers.md
+    - Loss Functions: reference/loss.md
+    - Plugins: reference/plugins.md
+    - Health Monitoring: reference/health.md
+    - CLI: reference/cli.md
+  - Architecture:
+    - Overview: architecture/overview.md
+    - Philosophy: architecture/philosophy.md
+    - Research: architecture/research.md
+  - Contributing: contributing.md

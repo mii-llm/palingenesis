@@ -1,0 +1,78 @@
+# Qwen3.5-35B-MoE │ A100-80GB │ Single GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# 35B total params, ~8B active per token (MoE with top-k routing).
+# On single A100-80GB this is VERY tight. Requires aggressive memory optimization.
+#
+# Memory budget:
+#   Weights (bf16): ~70GB (full model must be on GPU for forward pass)
+#   → DOES NOT FIT without FSDP or CPU offload!
+#
+# Strategy: CPU offload for weights not currently in use + lion8bit.
+# This will be SLOW but functional for fine-tuning.
+# Recommend multi-GPU config instead for serious training.
+#
+# Scheduler: WSD preferred here — if training is slow, you want to stop
+# anytime during the stable phase and still have a good checkpoint.
+# Hyperball: YES — zero memory overhead, helps convergence on any scale.
+
+model:
+  name_or_path: Qwen/Qwen3.5-35B-A22B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: false             # MoE routing breaks torch.compile fullgraph
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: true
+  max_seq_length: 2048       # Keep short to minimize activation memory
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+
+train:
+  output_dir: ./checkpoints/qwen35_35b_moe
+  epochs: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  ga_ramp_start: 4           # batch ramp: 4→16 over training
+  learning_rate: 1e-5
+  min_learning_rate: 1e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: wsd          # WSD: anytime stopping (important for slow runs)
+  optimizer: lion8bit         # Absolute minimum optimizer memory
+  gradient_checkpointing: full  # Maximum activation savings
+  adagc: true
+  adamc: true
+  ema: false                 # No CPU-side EMA (35B = 70GB CPU RAM for shadow)
+  base_merge: false          # Same reason: 70GB CPU for base weights
+  freeze_non_attention: true
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  hyperball: true            # zero memory overhead, helps at any scale
+
+parallel:
+  fsdp: false
+  cpu_offload: true          # ESSENTIAL: offload inactive params to CPU
+  context_parallel: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8
+  gradient_release: false    # GA=16 so incompatible
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.0     # MoE models have lower baseline entropy

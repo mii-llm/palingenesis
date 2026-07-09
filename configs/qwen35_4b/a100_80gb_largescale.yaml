@@ -1,0 +1,84 @@
+# Qwen3.5-4B │ A100-80GB │ Large-Scale Training (2.2M+ samples × 3 epochs)
+# ─────────────────────────────────────────────────────────────────────────────
+# Long training runs for knowledge absorption. 6.6M+ training steps.
+# Key considerations for large-scale:
+#   - WSD scheduler: stable LR for most of training (anytime checkpointing)
+#   - Higher ema_decay (longer window for quality averaging)
+#   - Less frequent base_merge (model drifts further in long runs)
+#   - RL-readiness monitoring critical (easy to overtrain on 3 epochs)
+#
+# From arxiv:2602.11149: 400 samples × 128 epochs > 51,200 samples × 1 epoch
+# Data repetition WORKS for SFT. This config leverages that finding.
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: default
+
+data:
+  dataset: your-data-here        # 2.2M+ samples
+  dataset_split: train
+  streaming: true                # streaming for large datasets
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 8
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  eval_every: 100
+  # Pretraining replay: mix 10% generic data (arxiv:2603.04964)
+  # Critical for long runs: prevents catastrophic forgetting of general knowledge
+  pretrain_replay_dataset: your-org/generic-corpus
+  pretrain_replay_weight: 0.1
+
+train:
+  output_dir: ./checkpoints/qwen35_4b_largescale
+  epochs: 3
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 1
+  learning_rate: 3.0e-5          # slightly lower LR for stability over long training
+  min_learning_rate: 3.0e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.02            # shorter warmup ratio (more total steps)
+  lr_scheduler: wsd              # WSD: stable phase allows anytime checkpointing
+  optimizer: lion8bit
+  gradient_checkpointing: selective
+  adagc: true
+  adagc_lambda: 1.5
+  adagc_beta: 0.95
+  adamc: true
+  ema: true
+  ema_decay: 0.9999             # longer EMA window for large-scale (10K step window)
+  ema_every: 10
+  base_merge: true
+  base_merge_ratio: 0.05        # less aggressive merge (model should drift more)
+  base_merge_every: 500
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  hyperball: true
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  gradient_release: true
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.0         # lower floor for long training (entropy drops more)

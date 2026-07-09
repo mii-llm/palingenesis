@@ -1,0 +1,99 @@
+[project]
+name = "palingenesis"
+version = "0.3.0"
+description = "Fire-and-forget LLM fine-tuning with state-of-the-art defaults."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "palingenesis contributors" },
+]
+keywords = ["llm", "sft", "finetuning", "training", "pytorch", "palingenesis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch==2.8.0",
+    "transformers>=4.48.0",
+    "datasets==5.0.0",
+    "accelerate==1.14.0",
+    "pyyaml>=6.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+# Core training (what you need to actually train)
+train = [
+    "liger-kernel>=0.5.0",
+    "torchao>=0.8.0",
+    "bitsandbytes==0.49.2",
+]
+# Logging backends
+logging = [
+    "trackio>=0.25.0",
+    "wandb>=0.19.0",
+]
+# Advanced loss functions
+loss = [
+    "cut-cross-entropy>=25.1.0",
+]
+# Advanced optimizers
+optim = [
+    "schedulefree>=1.4.0",
+]
+# Data preparation (offline, not needed at train time)
+prepare = [
+    "sentence-transformers>=3.0.0",
+]
+# Everything
+all = [
+    "palingenesis[train,logging,loss,optim,prepare]",
+]
+# Development
+dev = [
+    "palingenesis[all]",
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+palingenesis = "palingenesis.cli:main"
+pgs = "palingenesis.cli:main"
+
+[project.urls]
+Repository = "https://github.com/your-org/palingenesis"
+Documentation = "https://github.com/your-org/palingenesis/tree/main/docs"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# agent_tooling ships in the wheel so `pgs diagnose/inspect/validate/...`
+# work from any directory, not just a source checkout.
+packages = ["src/palingenesis", "agent_tooling"]
+
+[tool.uv]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,70 @@
+# Qwen3.5-35B-MoE │ B200 (192GB HBM3e) │ Single or Multi-GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# B200 with 192GB: the 35B MoE FITS on a single GPU!
+# Weights (bf16): ~70GB. With 192GB → 120GB headroom for optimizer + activations.
+#
+# This is the only single-GPU config where 35B MoE trains at full speed.
+# Muon: ~18GB optimizer → total ~95GB → batch=4 with seq=4096.
+#
+# On multi-B200: FSDP with massive batches for fastest possible convergence.
+
+model:
+  name_or_path: Qwen/Qwen3.5-35B-A22B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: false  # MoE routing
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: true
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 8
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  eval_every: 50
+
+train:
+  output_dir: ./checkpoints/qwen35_35b_moe_b200
+  epochs: 2
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 4    # effective = 16
+  ga_ramp_start: 2
+  learning_rate: 1e-5
+  min_learning_rate: 1e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: cosine
+  optimizer: muon
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 20
+  base_merge: true
+  base_merge_ratio: 0.08
+  base_merge_every: 300
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 300
+  logging_steps: 1
+  bf16: true
+
+parallel:
+  fsdp: false      # single B200 fits the model
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8
+  float8_training: true
+  gradient_release: false  # Muon + GA > 1
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0

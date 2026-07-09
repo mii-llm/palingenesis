@@ -1,0 +1,82 @@
+# Mixed training: SFT + pretraining data for anti-forgetting
+#
+# Strategy from "Scaling Laws for Forgetting" (NeurIPS 2025):
+# Inject 1-5% pretraining data to prevent catastrophic forgetting.
+#
+# This config trains on:
+#   80% agentic SFT data (assistant-only masking)
+#   15% general instruct data (assistant-only masking, keeps general skills)
+#   5% pretraining text (loss on all tokens, prevents forgetting)
+
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: true
+  compile: true
+
+data:
+  max_seq_length: 8192
+  num_workers: 4
+  packing: false
+  seed: 42
+  sources:
+    - dataset: your-org/agentic-traces
+      split: train
+      weight: 0.80
+      mode: sft
+      messages_field: messages
+    - dataset: HuggingFaceH4/ultrachat_200k
+      split: train_sft
+      weight: 0.15
+      mode: sft
+      messages_field: messages
+    - dataset: allenai/c4
+      split: train
+      weight: 0.05
+      mode: pretrain
+      text_field: text
+
+train:
+  output_dir: ./checkpoints/mixed-agentic
+  epochs: 3
+  max_steps: -1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+
+parallel:
+  fsdp: true
+  context_parallel: false
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8
+  float32_matmul_precision: high
+  float8_training: false
+
+plugins:
+  sym_noise: true
+  sym_noise_alpha: 5.0
+  info_sft: false  # Not compatible with pretrain sources (needs logits)
+  schedule_free: false
+
+logging:
+  project: palingenesis
+  run_name: mixed-agentic-antiforgetting
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

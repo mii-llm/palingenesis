@@ -1,0 +1,64 @@
+# Single A100 (80GB) config — maximum optimization for 1 GPU
+#
+# On 1 GPU we can't use CP or FSDP, so we rely on:
+#   - Chunked CE loss (no full logit materialization)
+#   - Selective activation checkpointing
+#   - Liger fused kernels
+#   - torch.compile
+#   - Gradient accumulation for effective batch size
+#
+# This trains 8B at 8192 seq on a single A100 comfortably.
+
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+
+data:
+  dataset: HuggingFaceH4/ultrachat_200k
+  dataset_split: train_sft
+  streaming: true
+  max_seq_length: 8192
+  messages_field: messages
+  num_workers: 4
+  packing: false
+
+train:
+  output_dir: ./checkpoints/single-gpu-sft
+  epochs: 1
+  max_steps: 5000
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-5
+  min_learning_rate: 2.0e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 1000
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+
+parallel:
+  fsdp: false            # Only 1 GPU
+  context_parallel: false
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8
+  float32_matmul_precision: high
+
+logging:
+  project: palingenesis
+  run_name: single-gpu-8b-sft
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

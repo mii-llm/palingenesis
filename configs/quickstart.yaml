@@ -1,0 +1,58 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUICKSTART — Your first training run in 30 seconds
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Just change `model.name_or_path` and `data.dataset`, then run:
+#
+#   uv run pgs train --config configs/quickstart.yaml
+#
+# This config works on ANY GPU with 24+ GB VRAM (RTX 3090/4090, A100, H100).
+# All optimizations are auto-tuned. You don't need to understand them.
+#
+# What it does:
+#   - Loads your model in bf16
+#   - Trains only on assistant responses (proper chat masking)
+#   - Uses DEFT loss (parameter-free, improves math reasoning per arxiv:2602.11424)
+#   - Saves checkpoints every 200 steps
+#   - Logs to console (wandb/trackio optional)
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+model:
+  name_or_path: Qwen/Qwen2.5-3B-Instruct  # Change to your model
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa   # Works everywhere. Use flash_attention_2 if installed.
+
+data:
+  dataset: HuggingFaceH4/ultrachat_200k   # Change to your dataset
+  dataset_split: train_sft
+  max_seq_length: 4096
+  messages_field: messages
+  packing: true              # 2-3x throughput improvement
+  streaming: true
+
+train:
+  output_dir: ./output
+  epochs: 1
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 8   # effective batch = 16
+  learning_rate: 2e-5
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay        # Better than cosine (arxiv:2602.06797)
+  optimizer: adamw                  # Safe default. Use lion8bit for memory savings.
+  gradient_checkpointing: selective
+  save_steps: 200
+  bf16: true
+
+memory:
+  chunked_loss: true               # Never OOMs on large vocab
+  loss_num_chunks: 4
+
+plugins:
+  deft: true                       # State-of-the-art token weighting, zero config
+
+logging:
+  use_wandb: false                 # Set to true if you have wandb configured
+  use_trackio: false               # Set to true for trackio

@@ -1,0 +1,76 @@
+# Qwen3.5-0.8B │ A100-80GB │ Single GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# Tiny hybrid model. Fits easily — maximize batch & throughput.
+# Memory: ~5GB total → can use huge batch (16) for fast convergence.
+# Strategy: large batch + no GA needed + all quality optimizations.
+#
+# NOTE: Small model + long CoT = degradation (arxiv:2506.07712).
+# Keep seq_length ≤ 4096 for ≤3B models.
+#
+# For 0.8B: Hyperball still applies (scale-invariant layers benefit at any size).
+# MONA skipped: overhead not justified for tiny model that's already fast.
+
+model:
+  name_or_path: Qwen/Qwen3.5-0.8B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: max-autotune     # small model = fast compile, big gains
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: false
+  max_seq_length: 2048           # ≤3B: keep short (Long CoT Degradation)
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+
+train:
+  output_dir: ./checkpoints/qwen35_08b
+  epochs: 3
+  per_device_batch_size: 16      # tiny model = huge batch fits
+  gradient_accumulation_steps: 1
+  learning_rate: 3e-5
+  min_learning_rate: 3e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay      # power-decay: better than cosine across all scales
+  optimizer: adamw               # model so small, AdamW memory is negligible
+  gradient_checkpointing: none   # not needed (model is tiny)
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 5
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  hyperball: true                # zero overhead, helps at all scales
+
+parallel:
+  fsdp: false
+  context_parallel: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 2
+  gradient_release: true
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 7.0           # stronger for small models (overfit faster)
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.5

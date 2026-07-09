@@ -1,0 +1,75 @@
+# Qwen3.5-35B-MoE │ H100-80GB │ Multi-GPU (4-8×)
+# ─────────────────────────────────────────────────────────────────────────────
+# The BEST config for 35B MoE. H100 + FP8 + FSDP + Muon.
+#
+# H100 advantages over A100:
+#   - FP8: 1.5× matmul throughput (critical for MoE's many expert FFNs)
+#   - Higher HBM bandwidth: faster FSDP all-gather/reduce-scatter
+#   - NVLink 4.0: 900 GB/s between GPUs (2× A100)
+#
+# Memory per GPU (8× H100-80GB):
+#   Weights shard: ~9GB │ Muon states: ~2GB │ Activations: ~10GB
+#   Total per GPU: ~25GB → batch=4 per GPU
+#   Effective batch: 8 × 4 = 32 (excellent gradient signal)
+
+model:
+  name_or_path: Qwen/Qwen3.5-35B-A22B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: false  # MoE routing
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: true
+  max_seq_length: 4096
+  messages_field: messages
+  num_workers: 8
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  eval_every: 50
+
+train:
+  output_dir: ./checkpoints/qwen35_35b_moe_h100
+  epochs: 2
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 1
+  learning_rate: 1e-5
+  min_learning_rate: 1e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: cosine
+  optimizer: muon
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 20
+  base_merge: true
+  base_merge_ratio: 0.08
+  base_merge_every: 300
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 300
+  logging_steps: 1
+  bf16: true
+
+parallel:
+  fsdp: true
+  context_parallel: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 8
+  float8_training: true   # H100: 1.5× throughput on MoE expert FFNs
+  gradient_release: false
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0

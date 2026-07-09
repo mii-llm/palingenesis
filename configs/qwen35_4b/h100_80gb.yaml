@@ -1,0 +1,83 @@
+# Qwen3.5-4B │ H100-80GB │ Single GPU
+# ─────────────────────────────────────────────────────────────────────────────
+# H100 advantage: Float8 training (1.5× throughput over A100).
+# SM89+ enables FP8 matmuls → compute-bound ops run 2× faster.
+# Same memory optimizations as A100, plus float8.
+#
+# Throughput estimate: ~2× A100 for same config (FP8 + higher HBM bandwidth).
+#
+# NEW: power_decay + Hyperball + MONA acceleration (memory is abundant here)
+# MONA adds curvature-aware acceleration to Lion (escapes sharp minima).
+# On H100 the extra bf16 buffer for MONA-Lite is negligible vs 80GB.
+
+model:
+  name_or_path: Qwen/Qwen3.5-4B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+  compile_mode: max-autotune     # H100 benefits more from autotuning
+
+data:
+  dataset: your-data-here
+  dataset_split: train
+  streaming: false
+  max_seq_length: 8192           # H100 bandwidth handles longer seq efficiently
+  messages_field: messages
+  num_workers: 4
+  packing: true
+  include_observations: true
+  turn_scaling: progressive
+  eval_every: 50
+
+train:
+  output_dir: ./checkpoints/qwen35_4b_h100
+  epochs: 3
+  per_device_batch_size: 8       # FP8 reduces activation memory → bigger batch
+  gradient_accumulation_steps: 1
+  learning_rate: 4.5e-5
+  min_learning_rate: 4.5e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  lr_scheduler: power_decay
+  optimizer: lion8bit
+  gradient_checkpointing: selective
+  adagc: true
+  adamc: true
+  ema: true
+  ema_every: 10
+  base_merge: true
+  base_merge_ratio: 0.1
+  base_merge_every: 200
+  base_merge_method: slerp
+  freeze_non_attention: true
+  save_steps: 200
+  logging_steps: 1
+  bf16: true
+  hyperball: true
+  # MONA: curvature-aware acceleration (arxiv:2605.26842)
+  # H100 has memory headroom for the bf16 acceleration buffer
+  mona: true
+  mona_beta_a: 0.975
+  mona_lite: true                # bf16 buffers, streaming computation
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  float8_training: true          # H100 SM89+: 1.5× throughput boost
+  gradient_release: true
+  selective_diff: true
+
+plugins:
+  deft: true
+  sym_noise: true
+  sym_noise_alpha: 5.0
+
+logging:
+  rl_readiness: true
+  rl_entropy_floor: 1.5

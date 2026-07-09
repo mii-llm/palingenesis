@@ -1,0 +1,65 @@
+# Ultra-long context training config
+# Designed for 32k-128k+ sequences on multi-GPU
+#
+# Memory budget for 8B model at 64k seq:
+#   - Chunked loss: avoids [B, 64k, 128k_vocab] tensor (~16GB saved)
+#   - Selective AC: saves ~50% activation memory
+#   - Context Parallel on 8 GPUs: each GPU sees 8k tokens of attention
+#   - FSDP: model weights sharded across GPUs
+#
+# With all optimizations: 8B model trains at 64k seq on 8x A100-80GB
+
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+
+data:
+  dataset: your-org/long-context-agentic-data
+  dataset_split: train
+  streaming: true
+  max_seq_length: 65536
+  messages_field: messages
+  num_workers: 4
+  packing: false  # Long seqs don't benefit from packing
+
+train:
+  output_dir: ./checkpoints/llama3-8b-long
+  epochs: 1
+  max_steps: 2000
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-6
+  min_learning_rate: 5.0e-7
+  weight_decay: 0.1
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+
+parallel:
+  fsdp: true
+  context_parallel: true      # CRITICAL for long sequences
+  cp_rotate_method: allgather  # allgather for Llama-style models
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 16     # More chunks for very long sequences
+  float32_matmul_precision: high
+
+logging:
+  project: palingenesis
+  run_name: llama3-8b-longctx-64k
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

@@ -1,0 +1,105 @@
+# Qwen3-0.6B — Tiny Model Agentic SFT Configuration
+#
+# Architecture: 0.6B (often called 0.8B class) dense parameters
+#   - 28 layers, GQA (16 query heads, 8 KV heads)
+#   - Hidden size: 1024
+#   - Vocab: 151,936
+#   - Context: 32K native
+#   - Apache 2.0
+#
+# Memory (bf16): 0.6B * 2 = 1.2 GB params
+#   Optimizer: 0.6B * 8 = 4.8 GB
+#   Total: ~8 GB -> runs on ANY modern GPU (even RTX 3060 12GB)
+#   No FSDP needed, no CPU offload needed
+#
+# CRITICAL: Tiny models are extremely fragile for SFT.
+# Research findings for sub-1B SFT:
+#   - Can LOSE performance from SFT if not careful (arxiv:2506.07712)
+#   - Very low LR required (2e-6 to 5e-6)
+#   - 1 epoch MAXIMUM (overfits in steps, not epochs)
+#   - Short sequences only (model can't handle long context well)
+#   - Data quality is EVERYTHING: 1K perfect samples > 100K noisy ones
+#   - LLRD essential: most layers should barely move
+#   - SymNoise important: prevents sharp minima overfitting
+#   - Consider: is this model big enough for your task?
+#
+# Best use cases for 0.6B:
+#   - Simple format adaptation (JSON output, tool call syntax)
+#   - Single-skill specialization (one task, done well)
+#   - Rapid prototyping before scaling to larger model
+#   - Edge deployment where every byte matters
+
+model:
+  name_or_path: Qwen/Qwen3-0.6B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+  compile_mode: default
+
+data:
+  dataset: your-org/agentic-traces
+  dataset_split: train
+  streaming: true
+  # Short seq for tiny model: less activation memory, faster iteration
+  max_seq_length: 2048
+  messages_field: messages
+  num_workers: 4
+  packing: false  # Quality > throughput at this scale
+  seed: 42
+
+train:
+  output_dir: ./checkpoints/qwen3-06b-sft
+  # ONE epoch only: tiny models overfit in hundreds of steps
+  epochs: 1
+  max_steps: 2000  # Hard cap: don't overtrain
+  # Tiny model: large batch fits easily, gives smoother gradients
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 2  # Effective batch = 16
+  # Very conservative LR: tiny models are fragile
+  learning_rate: 5.0e-6
+  min_learning_rate: 5.0e-7
+  weight_decay: 0.1
+  warmup_ratio: 0.1  # Longer warmup for stability
+  max_grad_norm: 0.5  # Tighter clipping for tiny model
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: none  # Not needed: 0.6B fits easily
+  spike_detection: true
+  spike_z_threshold: 4.0  # More aggressive: tiny models can't survive spikes
+  # Very aggressive LLRD: protect almost everything
+  # 28 layers: layer 0 gets 0.85^28 = 0.8% of peak LR
+  llrd_decay: 0.85
+
+parallel:
+  fsdp: false   # Not needed for 0.6B
+  context_parallel: false
+  cpu_offload: false
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  # 151K vocab * 2048 seq * batch8 = 9.4 GB -> chunk
+  loss_num_chunks: 4
+  float32_matmul_precision: high
+  float8_training: false
+
+plugins:
+  sym_noise: true          # Essential: prevents overfitting at this scale
+  sym_noise_alpha: 7.0     # Slightly higher alpha for more regularization
+  info_sft: true           # Focus on informative tokens (tiny model can't learn everything)
+  info_sft_pbar: 0.93
+  schedule_free: false
+  pre_rl: false
+
+logging:
+  project: palingenesis
+  run_name: qwen3-06b-agentic
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true

@@ -1,0 +1,93 @@
+# Gemma 4 E4B — Agentic SFT Configuration
+#
+# Architecture: 8B total params, ~4.5B effective (Per-Layer Embeddings)
+#   - PLE architecture: learned per-layer specialization (NOT MoE)
+#   - 26 decoder layers
+#   - Context: 128K tokens
+#   - Vocab: 262,144 (very large — chunked loss needed)
+#   - Multimodal capable (text + image + audio), SFT here is text-only
+#   - Apache 2.0 license
+#   - Designed for edge/mobile: efficient and fast
+#
+# Memory (bf16):
+#   Params: 8B * 2 = 16 GB
+#   Optimizer: 8B * 8 = 64 GB
+#   -> Single A100 80GB: TIGHT (16+64 = 80, no room for activations)
+#   -> Single A100 with selective AC: barely fits (activations ~10GB)
+#   -> 2x A100 with FSDP: comfortable (40 GB/GPU)
+#   -> Single 4090 24GB: needs cpu_offload + full AC
+#
+# Note: Despite being called "E4B" (edge 4B), it has 8B total parameters.
+# The "4B effective" refers to the compute per token due to PLE sparsity.
+# For training, ALL 8B params need gradients -> treat as an 8B model.
+
+model:
+  name_or_path: google/gemma-4-E4B-it
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: true
+  compile: true
+  compile_backend: inductor
+  compile_mode: default
+
+data:
+  dataset: your-org/agentic-traces
+  dataset_split: train
+  streaming: true
+  max_seq_length: 4096  # Conservative for single-GPU; increase with FSDP
+  messages_field: messages
+  num_workers: 4
+  packing: false
+  seed: 42
+
+train:
+  output_dir: ./checkpoints/gemma4-e4b-sft
+  epochs: 3
+  max_steps: -1
+  per_device_batch_size: 2  # Small model, can fit 2
+  gradient_accumulation_steps: 8  # Effective batch = 2*8 = 16 per GPU
+  # 8B model: lr ~ 8^{-0.5} * C ~ 2e-5
+  learning_rate: 2.0e-5
+  min_learning_rate: 2.0e-6
+  weight_decay: 0.1
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  seed: 42
+  save_steps: 500
+  logging_steps: 1
+  bf16: true
+  gradient_checkpointing: selective
+  spike_detection: true
+  spike_z_threshold: 5.0
+  # LLRD: 26 layers, decay=0.9 -> layer 0 gets 0.9^26 = 6.5% of peak
+  llrd_decay: 0.9
+
+parallel:
+  fsdp: true  # Recommended even on 1 GPU for memory (enables cpu_offload)
+  context_parallel: false
+  cpu_offload: false  # Set true for single consumer GPU (24GB)
+  reshard_after_forward: true
+
+memory:
+  chunked_loss: true
+  # 262K vocab: logits = 2 * 4096 * 262144 * 4 = 8.6 GB -> MUST chunk
+  loss_num_chunks: 8
+  float32_matmul_precision: high
+  float8_training: false
+
+plugins:
+  sym_noise: true
+  sym_noise_alpha: 5.0
+  info_sft: true
+  info_sft_pbar: 0.93
+  schedule_free: false
+  pre_rl: false
+
+logging:
+  project: palingenesis
+  run_name: gemma4-e4b-agentic
+  use_wandb: true
+  use_trackio: true
+  log_grad_norm: true
