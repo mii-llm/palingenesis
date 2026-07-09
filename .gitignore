@@ -24,3 +24,10 @@ torchtitan/
 
 # MkDocs build output
 site/
+
+# Project training artifacts & local/proprietary data
+projects/*/base_chat/
+projects/*/checkpoints/
+projects/*/checkpoints_cpt/
+projects/*/data/
+projects/*/prepared/

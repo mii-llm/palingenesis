@@ -424,11 +424,31 @@ def train(config: Config):
     )
 
     # ── Best Model Tracker (saves best eval-loss checkpoint) ──────────────
-    _best_tracker = BestModelTracker(config.train.output_dir) if config.data.eval_dataset else None
+    # Driven by either the single eval_dataset OR the multi-source composite score.
+    _best_tracker = (
+        BestModelTracker(config.train.output_dir)
+        if (config.data.eval_dataset or config.data.eval_sources)
+        else None
+    )
+
+    # ── Multi-source eval (per-capability losses + weighted composite) ─────
+    # When eval_sources is set it REPLACES the single eval_dataset for eval +
+    # best-model tracking (arxiv:2603.21606): each source is scored independently
+    # (e.g. eval/italian_lm/loss, eval/italic/loss) and a weighted composite drives
+    # BestModelTracker — immune to the token-count domination that a single mixed
+    # eval_dataset suffers. Every rank evaluates the same fixed set identically.
+    _multi_evaluator = None
+    if config.data.eval_sources:
+        from palingenesis.multi_eval import MultiEvaluator
+
+        _multi_evaluator = MultiEvaluator(
+            config.data.eval_sources, tokenizer, config.data.max_seq_length, device
+        )
 
     # ── Validation Set (optional) ─────────────────────────────────────────
+    # Skipped when eval_sources is configured (the multi-evaluator takes over).
     eval_batches: list | None = None
-    if config.data.eval_dataset:
+    if config.data.eval_dataset and not config.data.eval_sources:
         logger.info(f"Loading eval dataset: {config.data.eval_dataset} (split={config.data.eval_split})")
         eval_ds = _load_dataset_source(config.data.eval_dataset, config.data.eval_split, streaming=True)
         from palingenesis.data import ChatDataset, _collate_fn
@@ -884,6 +904,30 @@ def train(config: Config):
                         # Best model tracking: save if eval loss is new minimum
                         if _best_tracker is not None:
                             _best_tracker.update(eval_loss, global_step, model, tokenizer, is_fsdp)
+
+                    # ── Multi-source Validation (per-capability + composite) ──
+                    elif _multi_evaluator is not None and global_step % config.data.eval_every == 0:
+                        me = _multi_evaluator.evaluate(model, dtype=model_dtype)
+                        # Guard: if every source loaded empty (e.g. missing files),
+                        # score is a meaningless 0.0 — don't log it or (falsely) save
+                        # it as the best checkpoint.
+                        if me.per_source:
+                            # Composite (weighted) score → the headline eval loss.
+                            metrics["eval/loss"] = me.score
+                            metrics["eval/ppl"] = math.exp(min(me.score, 20.0))
+                            # Per-source losses: e.g. eval/italian_lm/loss, eval/italic/loss.
+                            for _name, _loss in me.per_source.items():
+                                metrics[f"eval/{_name}/loss"] = _loss
+                                metrics[f"eval/{_name}/ppl"] = math.exp(min(_loss, 20.0))
+                            if me.regressions:
+                                metrics["eval/regressions"] = len(me.regressions)
+                            if ce_loss is not None:
+                                metrics["eval/gap"] = me.score - ce_loss
+                            elif _objective_is_ce:
+                                metrics["eval/gap"] = me.score - step_loss
+                            # Best model tracking on the composite score.
+                            if _best_tracker is not None:
+                                _best_tracker.update(me.score, global_step, model, tokenizer, is_fsdp)
 
                     tracker.log(metrics, step=global_step)
                     if is_main():
