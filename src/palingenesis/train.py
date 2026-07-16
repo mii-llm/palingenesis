@@ -704,7 +704,9 @@ def train(config: Config):
         batch_iter = CUDAPrefetcher(dataloader, device)
         _accum_counter = 0  # tracks micro-steps within current accumulation window
 
+        epoch_saw_batch = False
         for micro_step, batch in enumerate(batch_iter):
+            epoch_saw_batch = True
             # Fast-skip: count steps without processing (O(1) per skip on streaming)
             if micro_step < skip_count:
                 continue
@@ -1068,6 +1070,19 @@ def train(config: Config):
 
                 if config.train.max_steps > 0 and global_step >= config.train.max_steps:
                     break
+
+        # An epoch that produced ZERO batches means the data pipeline is empty — fail
+        # loudly instead of "finishing" instantly with 0 steps. Usual causes: every
+        # source yielded 0 usable examples (wrong messages/text field, format, or
+        # split), or — with packing — the whole stream was shorter than one packed
+        # block. Check the per-source "yielded 0 usable examples" warnings above.
+        if not epoch_saw_batch and global_step == 0:
+            raise RuntimeError(
+                "Data pipeline produced 0 batches — nothing to train on. "
+                "Check each data source's field/format/split (see any 'yielded 0 usable "
+                "examples' warnings above). With data.packing=true, also confirm the total "
+                "token count exceeds one packed block (data.max_seq_length)."
+            )
 
         if config.train.max_steps > 0 and global_step >= config.train.max_steps:
             break

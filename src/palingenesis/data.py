@@ -823,25 +823,51 @@ class MixedDataset(IterableDataset):
     Each source can be either SFT (chat masking) or pretrain (all-token loss).
     """
 
-    def __init__(self, sources: list[IterableDataset], weights: list[float], seed: int = 42):
+    def __init__(
+        self,
+        sources: list[IterableDataset],
+        weights: list[float],
+        seed: int = 42,
+        names: list[str] | None = None,
+    ):
         assert len(sources) == len(weights)
         assert all(w >= 0 for w in weights)
         total = sum(weights)
         self.sources = sources
         self.probs = [w / total for w in weights]
         self.seed = seed
+        self.names = names or [f"source[{i}]" for i in range(len(sources))]
 
     def __iter__(self):
         rng = random.Random(self.seed)
         iterators = [iter(s) for s in self.sources]
         indices = list(range(len(self.sources)))
+        active = list(indices)
+        yielded = [0] * len(self.sources)
 
-        while True:
-            idx = rng.choices(indices, weights=self.probs, k=1)[0]
+        while active:
+            # When every source is still active this is identical to sampling over
+            # `indices` with `self.probs` (determinism preserved for the healthy case).
+            probs = [self.probs[i] for i in active]
+            idx = rng.choices(active, weights=probs, k=1)[0]
             try:
-                yield next(iterators[idx])
+                item = next(iterators[idx])
+                yielded[idx] += 1
+                yield item
             except StopIteration:
-                break  # Epoch boundary: first source exhausted
+                if yielded[idx] == 0:
+                    # A source that produced NOTHING is a misconfiguration (wrong
+                    # field/format/split, empty file), not an epoch boundary. Drop
+                    # it loudly and keep training on the rest instead of silently
+                    # ending the epoch (which, with packing, yields 0 steps).
+                    logger.warning(
+                        "Data source '%s' yielded 0 usable examples — dropping it from the "
+                        "mix. Check its messages/text field, format and split.",
+                        self.names[idx],
+                    )
+                    active.remove(idx)
+                    continue
+                break  # A non-empty source exhausted → epoch boundary.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -958,6 +984,19 @@ class PackedDataset(IterableDataset):
         else:
             yield from self._sequential_packing()
 
+    @staticmethod
+    def _pack_block(ids: list[int], labels: list[int], positions: list[int]) -> dict[str, torch.Tensor]:
+        """Build one packed block. May be shorter than max_len (trailing remainder);
+        the collator pads it — dropping it would silently lose data (and can zero out
+        a short run entirely)."""
+        n = len(ids)
+        return {
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "attention_mask": torch.ones(n, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "position_ids": torch.tensor(positions, dtype=torch.long),
+        }
+
     def _sequential_packing(self):
         """Original sequential packing: concatenate in arrival order."""
         buf_ids: list[int] = []
@@ -974,15 +1013,14 @@ class PackedDataset(IterableDataset):
             buf_positions.extend(range(doc_len))
 
             while len(buf_ids) >= self.max_len:
-                yield {
-                    "input_ids": torch.tensor(buf_ids[: self.max_len], dtype=torch.long),
-                    "attention_mask": torch.ones(self.max_len, dtype=torch.long),
-                    "labels": torch.tensor(buf_labels[: self.max_len], dtype=torch.long),
-                    "position_ids": torch.tensor(buf_positions[: self.max_len], dtype=torch.long),
-                }
+                yield self._pack_block(buf_ids[: self.max_len], buf_labels[: self.max_len], buf_positions[: self.max_len])
                 buf_ids = buf_ids[self.max_len :]
                 buf_labels = buf_labels[self.max_len :]
                 buf_positions = buf_positions[self.max_len :]
+
+        # Emit the trailing remainder (< max_len) instead of discarding it.
+        if buf_ids:
+            yield self._pack_block(buf_ids, buf_labels, buf_positions)
 
     def _sorted_packing(self):
         """Sorted bin packing: accumulate buffer, sort by length, pack greedily.
@@ -993,28 +1031,35 @@ class PackedDataset(IterableDataset):
           - Less wasted space (short+short fills better than short+long that overflows)
           - More consistent compute per batch (no one sequence dominating)
           - ~2× packing efficiency improvement over random concatenation
+
+        The sub-max_len remainder is carried across buffer flushes (and emitted as a
+        final partial block at the end) so no tokens are silently dropped.
         """
         buffer: list[dict] = []
+        carry: tuple[list[int], list[int], list[int]] = ([], [], [])
 
         for ex in self.base:
             buffer.append(ex)
-
             if len(buffer) >= self.sort_buffer:
-                yield from self._flush_buffer(buffer)
+                carry = yield from self._flush_buffer(buffer, carry)
                 buffer = []
 
-        # Flush remaining
         if buffer:
-            yield from self._flush_buffer(buffer)
+            carry = yield from self._flush_buffer(buffer, carry)
 
-    def _flush_buffer(self, buffer: list[dict]):
-        """Sort buffer by length and pack greedily into max_len blocks."""
+        ids, labels, positions = carry
+        if ids:
+            yield self._pack_block(ids, labels, positions)
+
+    def _flush_buffer(self, buffer: list[dict], carry: tuple[list[int], list[int], list[int]]):
+        """Sort buffer by length and pack greedily into max_len blocks.
+
+        Returns the leftover (ids, labels, positions) below max_len so the caller can
+        carry it into the next flush instead of discarding it."""
         # Sort by sequence length (shortest first → best packing)
         buffer.sort(key=lambda ex: ex["input_ids"].size(0))
 
-        buf_ids: list[int] = []
-        buf_labels: list[int] = []
-        buf_positions: list[int] = []
+        buf_ids, buf_labels, buf_positions = list(carry[0]), list(carry[1]), list(carry[2])
 
         for ex in buffer:
             doc_ids = ex["input_ids"].tolist()
@@ -1028,36 +1073,17 @@ class PackedDataset(IterableDataset):
                 doc_labels = doc_labels[: self.max_len]
                 doc_len = self.max_len
 
-            # If adding this doc would overflow, try to yield what we have
-            # and start fresh (greedy bin packing)
-            if len(buf_ids) + doc_len > self.max_len and len(buf_ids) > 0:
-                # Yield current buffer (may be shorter than max_len — pad or yield partial)
-                if len(buf_ids) >= self.max_len:
-                    yield {
-                        "input_ids": torch.tensor(buf_ids[: self.max_len], dtype=torch.long),
-                        "attention_mask": torch.ones(self.max_len, dtype=torch.long),
-                        "labels": torch.tensor(buf_labels[: self.max_len], dtype=torch.long),
-                        "position_ids": torch.tensor(buf_positions[: self.max_len], dtype=torch.long),
-                    }
-                    buf_ids = buf_ids[self.max_len :]
-                    buf_labels = buf_labels[self.max_len :]
-                    buf_positions = buf_positions[self.max_len :]
-
             buf_ids.extend(doc_ids)
             buf_labels.extend(doc_labels)
             buf_positions.extend(range(doc_len))
 
-            # Yield complete blocks
             while len(buf_ids) >= self.max_len:
-                yield {
-                    "input_ids": torch.tensor(buf_ids[: self.max_len], dtype=torch.long),
-                    "attention_mask": torch.ones(self.max_len, dtype=torch.long),
-                    "labels": torch.tensor(buf_labels[: self.max_len], dtype=torch.long),
-                    "position_ids": torch.tensor(buf_positions[: self.max_len], dtype=torch.long),
-                }
+                yield self._pack_block(buf_ids[: self.max_len], buf_labels[: self.max_len], buf_positions[: self.max_len])
                 buf_ids = buf_ids[self.max_len :]
                 buf_labels = buf_labels[self.max_len :]
                 buf_positions = buf_positions[self.max_len :]
+
+        return (buf_ids, buf_labels, buf_positions)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1174,6 +1200,7 @@ def build_dataset(
         # Multi-dataset mode: build each source and mix
         source_datasets = []
         weights = []
+        names = []
         for src in config.sources:
             raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=config.streaming)
             # IterableDataset.shuffle needs a buffer_size; map-style Dataset.shuffle does not.
@@ -1207,8 +1234,9 @@ def build_dataset(
 
             source_datasets.append(ds)
             weights.append(src.get("weight", 1.0))
+            names.append(str(src.get("name", src.get("dataset", f"source[{len(names)}]"))))
 
-        final_ds: IterableDataset = MixedDataset(source_datasets, weights, seed=config.seed)
+        final_ds: IterableDataset = MixedDataset(source_datasets, weights, seed=config.seed, names=names)
     elif hasattr(dataset_or_config, "__iter__") and not isinstance(dataset_or_config, DataConfig):
         # Pre-loaded HF dataset object passed directly
         raw = dataset_or_config
@@ -1263,6 +1291,7 @@ def build_dataset(
             [final_ds, replay_ds],
             [1.0 - w, w],
             seed=config.seed,
+            names=["target_mix", f"replay:{config.pretrain_replay_dataset} (text_field='text')"],
         )
 
     # Optional packing
