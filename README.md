@@ -1,5 +1,9 @@
 # palingenesis
 
+<p align="center">
+  <img src="./assets/pgs.png" alt="palingenesis" width="100%">
+</p>
+
 **Fire-and-forget LLM fine-tuning with state-of-the-art defaults.**
 
 Papers distilled into one command. Every optimization applied automatically.

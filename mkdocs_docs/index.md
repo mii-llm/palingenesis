@@ -5,11 +5,39 @@ hide:
 ---
 
 <style>
+/* Full-bleed banner background for the landing hero */
+.md-content__inner::before {
+  display: none;
+}
+.md-content__inner > .hero:first-child {
+  margin-top: -1.2rem;
+}
 .hero {
+  position: relative;
+  /* break out of the centered content column to span the full viewport width */
+  width: 100vw;
+  margin-left: calc(50% - 50vw);
+  margin-right: calc(50% - 50vw);
+  margin-bottom: 2rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   text-align: center;
-  padding: 4rem 1rem 3rem;
+  padding: 7rem 1.5rem 6rem;
+  overflow: hidden;
+  background-image:
+    linear-gradient(180deg, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.35) 45%, rgba(0,0,0,0.7) 100%),
+    url("assets/pgs.png");
+  background-size: cover;
+  background-position: center 40%;
+  color: #f4f1ec;
+}
+.hero > * {
   max-width: 680px;
-  margin: 0 auto;
+  width: 100%;
+}
+.hero .headerlink {
+  display: none;
 }
 .hero h1 {
   font-size: 3.2rem !important;
@@ -18,10 +46,12 @@ hide:
   letter-spacing: -0.03em;
   margin-bottom: 0.3em;
   line-height: 1.1;
+  color: #ffffff !important;
+  text-shadow: 0 2px 24px rgba(0,0,0,0.6);
 }
 .hero .subtitle {
   font-size: 1.1rem;
-  opacity: 0.6;
+  opacity: 0.85;
   margin-bottom: 2.5rem;
   font-style: italic;
 }
@@ -29,12 +59,16 @@ hide:
   font-size: 1.05rem;
   line-height: 1.7;
   margin-bottom: 2.5rem;
+  color: #f4f1ec;
+  text-shadow: 0 1px 12px rgba(0,0,0,0.55);
 }
 .hero code {
   font-size: 0.85rem !important;
   padding: 0.8em 1.5em !important;
   display: inline-block;
   margin: 1rem 0;
+  background: rgba(0,0,0,0.45) !important;
+  color: #ffffff !important;
 }
 .pillars {
   display: grid;
