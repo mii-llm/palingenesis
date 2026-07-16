@@ -46,7 +46,7 @@ The papers that passed all three filters were implemented. The rest are catalogu
 
 | Technique | Paper | Key insight |
 |-----------|-------|-------------|
-| DEFT | Wu et al., Feb 2026 | Token weight = f(model confidence). Parameter-free. Subsumes NLL and DFT. +70% math (original paper, not reproduced externally). |
+| DEFT | Wu et al., Feb 2026 | Token weight = f(model confidence). Parameter-free. Subsumes NLL and DFT. Reports math-reasoning gains (original paper, not reproduced externally). |
 | Chunked CE | Aligned with torchtitan | Split [B,S,V] logit computation into N chunks. FSDP-aware reshard management. |
 | Cut Cross-Entropy | Apple, ICLR 2025 | Computes CE without materializing logits. O(1) memory. Triton kernel. |
 

@@ -38,7 +38,7 @@ The answers, backed by papers:
 
 | Decision | Standard default | Our default | Why |
 |----------|-----------------|-------------|-----|
-| Loss | Cross-entropy | **DEFT** | +70% math per original paper; parameter-free; subsumes CE |
+| Loss | Cross-entropy | **DEFT** | math-reasoning gains per original paper (not reproduced); parameter-free; subsumes CE |
 | Scheduler | Cosine | **Power-decay** | Provably optimal when β > 3 (always true for LLMs) |
 | Gradient handling | Store all | **Release immediately** | Saves 2× param memory, zero accuracy cost |
 | Optimizer | AdamW (16 B/param) | **Lion8bit** (4 B/param) or **Muon** (fastest) | 4× less memory or 2× faster convergence |

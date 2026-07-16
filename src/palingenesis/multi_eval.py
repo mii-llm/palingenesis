@@ -127,8 +127,35 @@ class MultiEvaluator:
                 logger.warning(f"MultiEval: cannot load source '{dataset_path}', skipping")
                 return []
 
-        messages_field = src_config.get("messages_field", "messages")
-        ds = ChatDataset(raw, tokenizer, max_seq_length, messages_field, rank=0, world_size=1)
+        # mode mirrors the training `sources`: "sft" = chat-templated messages with
+        # assistant-only loss; "pretrain" = raw text with all-token loss (no template).
+        # Use "pretrain" for language-modeling eval (e.g. held-out Italian docs) so the
+        # measured CE/ppl is true next-token LM, not ppl conditioned on a chat wrapper.
+        mode = src_config.get("mode", "sft")
+        if mode == "pretrain":
+            from palingenesis.data import PretrainDataset
+
+            ds = PretrainDataset(
+                raw,
+                tokenizer,
+                max_seq_length,
+                text_field=src_config.get("text_field", "text"),
+                rank=0,
+                world_size=1,
+            )
+        elif mode == "sft":
+            ds = ChatDataset(
+                raw,
+                tokenizer,
+                max_seq_length,
+                src_config.get("messages_field", "messages"),
+                rank=0,
+                world_size=1,
+                last_turn_only=src_config.get("last_turn_only", False),
+            )
+        else:
+            logger.warning(f"MultiEval: unknown mode '{mode}' for source '{src_config.get('name', '?')}', skipping")
+            return []
 
         batches = []
         count = 0

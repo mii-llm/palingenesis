@@ -36,7 +36,9 @@
 | `include_observations` | bool | `false` | **ECHO mode**: include tool/observation role tokens in loss. Teaches the model to predict tool outputs (world model). |
 | `train_on_reasoning` | bool | `true` | Include reasoning traces (`<think>` blocks / `reasoning_content`) in the loss. Required for distilling reasoning behavior. Set `false` to train only on the post-reasoning response. |
 | `turn_scaling` | str | `uniform` | Per-turn loss weight. `uniform` (equal), `progressive` (later turns heavier, √(idx/total)), `last_heavy` (final turn 2×). |
-| `eval_dataset` | str | `""` | Validation dataset. Enables best-model tracking. Empty = no validation. |
+| `last_turn_only` | bool | `false` | Mask every assistant turn except the final one — in training, loss only on the last answer; in `eval_sources`, score only the last answer. Phase-neutral name (no `train_`/`eval_` prefix) since the same mask serves both. Use when earlier assistant turns are a fixed context you must not fit/score (e.g. few-shot exemplar answers in eval-format SFT). No-op for single-turn data. Overridable per source in `sources`/`eval_sources`. |
+| `eval_dataset` | str | `""` | Single validation dataset. Enables best-model tracking. Empty = no validation. Superseded by `eval_sources` when set. |
+| `eval_sources` | list | `[]` | Per-capability eval: each source is scored independently (no cross-contamination) and combined into a weighted composite for best-model tracking. Per-source keys below. |
 | `eval_split` | str | `test` | Validation split. |
 | `eval_samples` | int | `200` | Number of validation samples (fixed subset). |
 | `eval_every` | int | `100` | Evaluate every N optimizer steps. |
@@ -50,6 +52,40 @@
 | `seq_len_curriculum` | bool | `false` | Ramp max sequence length from short to full over training. |
 | `seq_len_curriculum_min` | int | `1024` | Starting max sequence length during curriculum. |
 | `seq_len_curriculum_ramp_steps` | int | `1000` | Steps to ramp from min to full `max_seq_length`. |
+
+!!! note "Reasoning / thinking modes"
+    `train_on_reasoning` is the **only** training-time control for `<think>` content:
+    `true` (default) puts loss on both the reasoning block *and* the final answer
+    (needed to distil reasoning); `false` trains only the post-`</think>` answer.
+
+    There is deliberately **no** `enable_thinking` option here. `enable_thinking` is a
+    *chat-template inference toggle* — it makes reasoning models scaffold a `<think>`
+    block **during generation** — and has zero effect on which tokens receive loss.
+    Non-reasoning models ignore it entirely.
+
+    **For evaluation** you don't need it either: the in-training eval (`eval_sources`)
+    is teacher-forced cross-entropy over the same masked tokens as training
+    (`last_turn_only` decides which), so it never generates. Only an external
+    *generation* harness needs to suppress thinking — an MCQA harness typically sets
+    `enable_thinking=False` (with a `strip_think` fallback) to force a bare-letter
+    answer. Where to look: the model's `tokenizer_config.json` chat template (does it
+    define a thinking branch?) and the `enable_thinking=` argument in your eval harness.
+
+!!! note "`eval_sources` per-source keys — and pick the right `mode`"
+    Each entry in `eval_sources` accepts: `name`, `dataset`, `split`, `weight`
+    (composite importance), `samples` (fixed subset size), `regression_floor`
+    (optional alarm), and — mirroring the training `sources` — a **`mode`**:
+
+    - **`mode: pretrain`** (+ `text_field`): raw-text, all-token CE/ppl, **no chat
+      template**. Use this for language-modeling eval (e.g. held-out Italian docs). It
+      matches how CPT actually trains, so the number is a true next-token perplexity.
+    - **`mode: sft`** (default, + `messages_field`, optional `last_turn_only`):
+      chat-templated, assistant-only CE. Use for genuine chat/MCQA tasks (e.g. an
+      n-shot MCQA proxy: system + user + gold-letter assistant turn).
+
+    Do **not** wrap plain LM text as an `assistant` message just to eval it — that
+    conditions perplexity on the chat-template scaffolding and no longer measures raw
+    LM. Use `mode: pretrain` with `text_field` instead.
 
 ---
 
@@ -127,7 +163,7 @@
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `deft` | bool | `false` | **DEFT**: Dynamic Entropy Fine-Tuning. Parameter-free adaptive token weighting. +70% math per original paper (not independently reproduced). Recommended for reasoning tasks. |
+| `deft` | bool | `false` | **DEFT**: Dynamic Entropy Fine-Tuning. Parameter-free adaptive token weighting. Reports math-reasoning gains per the original paper (not independently reproduced). Recommended for reasoning tasks. |
 | `dft` | bool | `false` | DFT: Dynamic Fine-Tuning. Token weight = model confidence. Predecessor to DEFT. |
 | `cadft` | bool | `false` | Compatibility-Aware DFT. DFT + sample-level compatibility scoring. |
 | `cadft_beta` | float | `1.0` | CADFT compatibility sensitivity. |

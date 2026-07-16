@@ -13,7 +13,7 @@ plugins:
   deft: true
 ```
 
-No hyperparameters. Subsumes standard CE (α→0) and DFT (α=1). On math benchmarks: +70% over vanilla SFT per the original paper (arxiv:2602.11424; not independently reproduced). On code: +15-25% (same caveat).
+No hyperparameters. Subsumes standard CE (α→0) and DFT (α=1). The original paper (arxiv:2602.11424) reports gains on math and code reasoning, but these have not been independently reproduced.
 
 The mechanism: `weight_t = -log(p_t)^α` where α is learned implicitly from the gradient dynamics. Hard tokens (low p_t) get exponentially more influence. Easy tokens (high p_t) contribute less noise.
 

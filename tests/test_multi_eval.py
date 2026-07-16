@@ -108,6 +108,77 @@ def test_multi_eval_with_real_model():
     print("✓ test_multi_eval_with_real_model PASSED\n")
 
 
+def test_multi_eval_pretrain_mode():
+    """A `mode: pretrain` source scores raw-text CE with all-token loss and no chat
+    template — so it works even with a tokenizer that has no chat template (GPT-2)."""
+    import json
+    import tempfile
+    from transformers import AutoTokenizer
+
+    docs = [
+        {"text": "Roma è la capitale d'Italia e un importante centro culturale."},
+        {"text": "La fisica quantistica descrive il comportamento delle particelle."},
+        {"text": "Il Rinascimento fu un periodo di grande fioritura artistica."},
+    ]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        for d in docs:
+            f.write(json.dumps(d) + "\n")
+        eval_path = f.name
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    except Exception:
+        print("  Skipped (gpt2 tokenizer not available)")
+        return
+
+    eval_sources = [
+        {
+            "name": "italian_lm",
+            "dataset": eval_path,
+            "mode": "pretrain",
+            "text_field": "text",
+            "weight": 1.0,
+            "samples": 3,
+            "split": "train",
+        },
+    ]
+
+    device = torch.device("cpu")
+    model = TinyModel(vocab=tokenizer.vocab_size, hidden=32)
+    evaluator = MultiEvaluator(eval_sources, tokenizer, max_seq_length=128, device=device)
+
+    # Unlike the SFT/chat path, pretrain mode must NOT be skipped on a template-less tokenizer.
+    assert evaluator.sources and evaluator.sources[0]["batches"], "pretrain source produced no batches"
+
+    result = evaluator.evaluate(model, dtype=torch.float32)
+    assert result.score > 0 and result.tokens_total > 0
+    assert "italian_lm" in result.per_source
+    print(f"  pretrain-mode score: {result.score:.4f}, tokens: {result.tokens_total}")
+    print("✓ test_multi_eval_pretrain_mode PASSED\n")
+
+
+def test_multi_eval_unknown_mode_skips():
+    """An unknown mode is skipped gracefully rather than crashing."""
+    import json
+    import tempfile
+
+    class FakeTok:
+        pad_token_id = 0
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write(json.dumps({"text": "x"}) + "\n")
+        p = f.name
+
+    ev = MultiEvaluator(
+        [{"name": "bad", "dataset": p, "mode": "nonsense", "weight": 1.0, "samples": 1, "split": "train"}],
+        FakeTok(), max_seq_length=32, device=torch.device("cpu"),
+    )
+    assert ev.sources[0]["batches"] == []
+    print("✓ test_multi_eval_unknown_mode_skips PASSED\n")
+
+
 def test_multi_eval_best_model_integration():
     """MultiEval score integrates with BestModelTracker correctly."""
     import tempfile
@@ -142,6 +213,8 @@ if __name__ == "__main__":
     test_multi_eval_weighted_score()
     test_multi_eval_regression_detection()
     test_multi_eval_with_real_model()
+    test_multi_eval_pretrain_mode()
+    test_multi_eval_unknown_mode_skips()
     test_multi_eval_best_model_integration()
 
     print("=" * 60)

@@ -98,7 +98,6 @@ One command. State-of-the-art quality. RTX 4090 to multi-node clusters.
 <div class="numbers">
   <div class="num"><span class="value">352</span><span class="label">papers read</span></div>
   <div class="num"><span class="value">15 GB</span><span class="label">for 4B full ft</span></div>
-  <div class="num"><span class="value">+70%</span><span class="label">math (paper-reported)</span></div>
   <div class="num"><span class="value">62</span><span class="label">tests passing</span></div>
 </div>
 
@@ -120,7 +119,7 @@ A 4-billion parameter model trains in 15 GB. Full fine-tune, not LoRA. Gradient 
 
 ### Quality
 
-DEFT loss gives +70% on math benchmarks (per the original paper; your mileage may vary on non-math tasks). Hyperball adds 20-30% convergence speed (single paper, experimental). Power-decay schedule is provably optimal for the easy-task regime. All on by default in flagship configs.
+DEFT loss is a parameter-free token weighting aimed at reasoning tasks (the original paper reports gains, not independently reproduced; results vary by model and data). Hyperball adds 20-30% convergence speed (single paper, experimental). Power-decay schedule is provably optimal for the easy-task regime. All on by default in flagship configs.
 
 [The research →](architecture/research.md)
 

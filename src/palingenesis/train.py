@@ -434,7 +434,7 @@ def train(config: Config):
     # ── Multi-source eval (per-capability losses + weighted composite) ─────
     # When eval_sources is set it REPLACES the single eval_dataset for eval +
     # best-model tracking (arxiv:2603.21606): each source is scored independently
-    # (e.g. eval/italian_lm/loss, eval/italic/loss) and a weighted composite drives
+    # (e.g. eval/lm/loss, eval/mcqa/loss) and a weighted composite drives
     # BestModelTracker — immune to the token-count domination that a single mixed
     # eval_dataset suffers. Every rank evaluates the same fixed set identically.
     _multi_evaluator = None
@@ -468,6 +468,7 @@ def train(config: Config):
             world_size=1,
             include_observations=config.data.include_observations,
             train_on_reasoning=config.data.train_on_reasoning,
+            last_turn_only=config.data.last_turn_only,
         )
         # Pre-collect fixed eval samples (no streaming randomness)
         eval_batches = []
@@ -915,7 +916,7 @@ def train(config: Config):
                             # Composite (weighted) score → the headline eval loss.
                             metrics["eval/loss"] = me.score
                             metrics["eval/ppl"] = math.exp(min(me.score, 20.0))
-                            # Per-source losses: e.g. eval/italian_lm/loss, eval/italic/loss.
+                            # Per-source losses: e.g. eval/lm/loss, eval/mcqa/loss.
                             for _name, _loss in me.per_source.items():
                                 metrics[f"eval/{_name}/loss"] = _loss
                                 metrics[f"eval/{_name}/ppl"] = math.exp(min(_loss, 20.0))

@@ -115,6 +115,7 @@ class ChatDataset(IterableDataset):
         include_observations: bool = False,
         turn_scaling: str = "uniform",
         train_on_reasoning: bool = True,
+        last_turn_only: bool = False,
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -125,6 +126,11 @@ class ChatDataset(IterableDataset):
         self.include_observations = include_observations
         self.turn_scaling = turn_scaling
         self.train_on_reasoning = train_on_reasoning
+        # last_turn_only: mask every assistant turn except the final one. Selects which
+        # turns get loss (training) / are scored (eval). Use for eval-format SFT where
+        # earlier assistant turns are a FIXED few-shot prefix (e.g. n-shot MCQA
+        # exemplars) that must not receive loss.
+        self.last_turn_only = last_turn_only
 
     def __iter__(self):
         dataset = _shard_streaming_dataset(self.dataset, self.rank, self.world_size)
@@ -132,6 +138,25 @@ class ChatDataset(IterableDataset):
             result = self._process(example)
             if result is not None:
                 yield result
+
+    @staticmethod
+    def _keep_last_segment(mask: torch.Tensor) -> torch.Tensor:
+        """Zero all True runs except the last contiguous one.
+
+        The template marks EVERY assistant turn's content as True; for last-turn-only
+        training we keep just the final contiguous run (the real answer) and mask the
+        earlier runs (e.g. fixed few-shot exemplar answers)."""
+        idx = torch.nonzero(mask, as_tuple=False).flatten()
+        if idx.numel() == 0:
+            return mask
+        # Gaps > 1 between consecutive True indices separate turns.
+        breaks = (idx[1:] - idx[:-1] > 1).nonzero(as_tuple=False).flatten()
+        if breaks.numel() == 0:
+            return mask  # single assistant span already
+        last_run_start = int(idx[int(breaks[-1]) + 1].item())
+        new_mask = torch.zeros_like(mask)
+        new_mask[last_run_start:] = mask[last_run_start:]
+        return new_mask
 
     def _process(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
         messages = example.get(self.messages_field)
@@ -183,6 +208,14 @@ class ChatDataset(IterableDataset):
         if assistant_mask.sum() == 0:
             return self._fallback(messages)
 
+        # Last-turn-only: drop every assistant span but the final contiguous one.
+        # train_on_reasoning is respected downstream by the fallback path; here the
+        # template's own mask already includes any <think> block for the kept turn.
+        if self.last_turn_only:
+            assistant_mask = self._keep_last_segment(assistant_mask)
+            if assistant_mask.sum() == 0:
+                return self._fallback(messages)
+
         labels = input_ids.clone()
         labels[~assistant_mask] = IGNORE_INDEX
         labels[attn_mask == 0] = IGNORE_INDEX
@@ -196,10 +229,199 @@ class ChatDataset(IterableDataset):
             return None
         return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
-    def _fallback(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
-        """Fallback masking: progressive tokenization to find exact turn boundaries.
+    @staticmethod
+    def _split_reasoning(msg: dict) -> tuple[str | None, str]:
+        """Return (reasoning_raw, answer_raw): strings expected to appear verbatim in the
+        rendered text. reasoning_raw is None when the turn carries no reasoning. Handles
+        both the `reasoning_content` field and `<think>...</think>` embedded in content."""
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        rc = msg.get("reasoning_content")
+        if isinstance(rc, str) and rc.strip():
+            return rc.strip(), content.strip()
+        if "</think>" in content:
+            head, _, tail = content.partition("</think>")
+            reasoning = head.split("<think>")[-1].strip()
+            return (reasoning or None), tail.strip()
+        return None, content.strip()
 
-        Used when return_assistant_tokens_mask is unavailable (e.g., Qwen3.5).
+    def _fallback(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
+        """Mask assistant tokens when the template has no `{% generation %}` span.
+
+        Fast tokenizers use the robust offset-based masker (`_fallback_offsets`), which
+        makes NO prefix-consistency assumption and therefore handles templates that
+        rewrite history -- e.g. Qwen3.x dropping <think> from past assistant turns, or
+        MiniMax-M2 interleaved thinking. Slow tokenizers (no offset mapping) use the
+        legacy progressive-tokenization masker, which is correct for the prefix-consistent
+        templates they ship.
+        """
+        if getattr(self.tokenizer, "is_fast", False):
+            try:
+                res = self._fallback_offsets(messages)
+            except Exception:
+                res = None
+            if res is not None:
+                return res
+        return self._fallback_progressive(messages)
+
+    def _fallback_offsets(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
+        """Robust, template-agnostic masking via offset mapping + forward text search.
+
+        Renders the conversation once, tokenizes with offsets, then locates each trained
+        turn's reasoning/answer text by advancing a cursor through the rendered string.
+        Because it relies only on text that ACTUALLY appears in the final render (never on
+        render(messages[:i]) being a token-prefix of render(messages)), it is correct for
+        history-rewriting templates that break the progressive masker.
+
+        Requires a fast tokenizer (offset mapping). Returns None on any anomaly so the
+        caller can fall back to the progressive masker.
+        """
+        full = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        enc = self.tokenizer(
+            full,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=self.max_seq_length,
+        )
+        offsets = enc.get("offset_mapping")
+        if not offsets:
+            return None
+        input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
+        attn_mask = torch.tensor(enc.get("attention_mask", [1] * len(enc["input_ids"])), dtype=torch.long)
+        n_tok = len(input_ids)
+        if n_tok == 0:
+            return None
+        labels = torch.full_like(input_ids, IGNORE_INDEX)
+        special_ids = set(self.tokenizer.all_special_ids or [])
+
+        train_roles = {"assistant"}
+        if self.include_observations:
+            train_roles.update({"tool", "observation", "ipython", "function"})
+
+        def toks_in(c0: int, c1: int) -> list[int]:
+            # Overlap (not strict containment): captures a SentencePiece token that merges
+            # a leading space into the first content char (o0 == c0 - 1).
+            if c1 <= c0:
+                return []
+            return [ti for ti, (o0, o1) in enumerate(offsets) if o1 > o0 and o0 < c1 and o1 > c0]
+
+        def first_tok_at(c: int) -> int:
+            for ti, (o0, o1) in enumerate(offsets):
+                if o1 > o0 and o0 >= c:
+                    return ti
+            return n_tok
+
+        def is_ws(ti: int) -> bool:
+            o0, o1 = offsets[ti]
+            return o1 > o0 and full[o0:o1].strip() == ""
+
+        n_assist = sum(1 for m in messages if m.get("role") == "assistant")
+        assist_seen = 0
+        cursor = 0
+        turn_boundaries: list[tuple[set[int], int]] = []  # (token indices, assistant_turn_idx)
+
+        for msg in messages:
+            role = msg.get("role")
+            reasoning_raw, answer_raw = self._split_reasoning(msg)
+
+            # Advance the cursor past this turn's reasoning + answer text, for EVERY role,
+            # so later searches never match backwards into an earlier turn.
+            r0 = r1 = -1
+            if reasoning_raw:
+                p = full.find(reasoning_raw, cursor)
+                if p != -1:
+                    r0, r1 = p, p + len(reasoning_raw)
+                    cursor = r1
+            a0 = a1 = -1
+            if answer_raw:
+                p = full.find(answer_raw, cursor)
+                if p != -1:
+                    a0, a1 = p, p + len(answer_raw)
+                    cursor = a1
+
+            if role not in train_roles:
+                continue
+
+            tset: set[int] = set()
+            if role == "assistant" and self.train_on_reasoning and reasoning_raw and r0 != -1:
+                # Include the '<think>' opener + reasoning + the '</think>' wrapper up to
+                # the answer, so the whole generated block is one contiguous trained span.
+                think_open = full.rfind("<think>", 0, r0)
+                rstart = think_open if think_open != -1 else r0
+                tset.update(toks_in(rstart, r1))
+                if a0 != -1:
+                    tset.update(toks_in(r1, a0))
+            if a0 != -1:
+                tset.update(toks_in(a0, a1))
+
+            # Terminator: skip whitespace, include ONE end-of-turn special token (+ a
+            # trailing newline). Stops before the next turn's header special token.
+            anchor = a1 if a1 != -1 else r1
+            if anchor != -1:
+                ti = first_tok_at(anchor)
+                while ti < n_tok and is_ws(ti):
+                    tset.add(ti)
+                    ti += 1
+                if ti < n_tok and int(input_ids[ti]) in special_ids:
+                    tset.add(ti)
+                    ti += 1
+                    if ti < n_tok and is_ws(ti):
+                        tset.add(ti)
+
+            if role == "assistant":
+                turn_boundaries.append((tset, assist_seen))
+                assist_seen += 1
+            else:
+                # tool/observation ECHO turn: always trained, never gated by last_turn_only
+                for ti in tset:
+                    labels[ti] = input_ids[ti]
+
+        keep = turn_boundaries
+        if self.last_turn_only and n_assist > 1:
+            keep = [(ts, idx) for (ts, idx) in turn_boundaries if idx == n_assist - 1]
+        for tset, _idx in keep:
+            for ti in tset:
+                labels[ti] = input_ids[ti]
+
+        labels[attn_mask == 0] = IGNORE_INDEX
+
+        if self.include_observations:
+            labels = self._apply_echo_from_text(input_ids, labels, messages)
+
+        if (labels != IGNORE_INDEX).sum() == 0:
+            return None
+
+        result = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
+
+        if self.turn_scaling != "uniform" and n_assist > 1 and turn_boundaries:
+            loss_weights = torch.ones_like(input_ids, dtype=torch.float32)
+            loss_weights[labels == IGNORE_INDEX] = 0.0
+            if self.turn_scaling == "progressive":
+                for tset, idx in turn_boundaries:
+                    w = ((idx + 1) / n_assist) ** 0.5
+                    for ti in tset:
+                        loss_weights[ti] = w
+            elif self.turn_scaling == "last_heavy":
+                for tset, idx in turn_boundaries:
+                    w = 2.0 if idx == n_assist - 1 else 1.0
+                    for ti in tset:
+                        loss_weights[ti] = w
+            valid = loss_weights > 0
+            if valid.any():
+                loss_weights[valid] /= loss_weights[valid].mean()
+            result["loss_weights"] = loss_weights
+
+        return result
+
+    def _fallback_progressive(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
+        """Legacy fallback masking: progressive tokenization to find exact turn boundaries.
+
+        Used for slow tokenizers (no offset mapping). Assumes the template is
+        prefix-consistent: render(messages[:i+1]) is a token-prefix of render(messages).
+        This holds for the templates slow tokenizers ship, but NOT for history-rewriting
+        templates (Qwen3.x) -- those require a fast tokenizer + `_fallback_offsets`.
 
         Strategy for precise boundaries:
         1. Tokenize full conversation to get input_ids
@@ -302,6 +524,14 @@ class ChatDataset(IterableDataset):
                     assistant_turn_idx += 1
 
             prev_len = curr_len
+
+        # Last-turn-only: re-mask every assistant span except the final one. Runs on
+        # the assistant turn_boundaries, so ECHO tool/observation spans are untouched.
+        if self.last_turn_only and total_assistant_turns > 1:
+            last_idx = total_assistant_turns - 1
+            for s, e, idx in turn_boundaries:
+                if idx != last_idx:
+                    labels[s:e] = IGNORE_INDEX
 
         # ECHO: Also unmask <tool_response> regions inside user messages
         if self.include_observations:
@@ -876,6 +1106,7 @@ def build_dataloader(
                     include_observations=config.include_observations,
                     turn_scaling=config.turn_scaling,
                     train_on_reasoning=getattr(config, "train_on_reasoning", True),
+                    last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
                 )
             elif mode == "pretrain":
                 ds = PretrainDataset(
@@ -906,6 +1137,7 @@ def build_dataloader(
             include_observations=config.include_observations,
             turn_scaling=config.turn_scaling,
             train_on_reasoning=getattr(config, "train_on_reasoning", True),
+            last_turn_only=getattr(config, "last_turn_only", False),
         )
     else:
         # Single dataset from config
@@ -922,6 +1154,7 @@ def build_dataloader(
             include_observations=config.include_observations,
             turn_scaling=config.turn_scaling,
             train_on_reasoning=getattr(config, "train_on_reasoning", True),
+            last_turn_only=getattr(config, "last_turn_only", False),
         )
 
     # ── Pretraining Replay (arxiv:2603.04964) ─────────────────────────────────

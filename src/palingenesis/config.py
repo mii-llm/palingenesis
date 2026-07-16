@@ -63,6 +63,14 @@ class DataConfig:
     # "last_heavy": final turn gets 2x weight, others 1x
     #   Rationale: final answer quality matters most
     turn_scaling: str = "uniform"
+    # Train ONLY on the final assistant turn; mask all earlier assistant turns.
+    # Use when earlier assistant turns are a FIXED context you must not fit — e.g.
+    # n-shot MCQA prompts where the exemplar answers are constant and only the final
+    # answer is the target. For single-turn data this is a no-op. Overridable per
+    # source via the source dict.
+    # Phase-neutral: in training it selects which turns get loss; in eval sources it
+    # selects which turns are scored. (Named without a train_/eval_ prefix on purpose.)
+    last_turn_only: bool = False
     # Validation / evaluation
     eval_dataset: str = ""  # HF dataset or path for validation (empty = no eval)
     eval_split: str = "test"  # Split to use for evaluation
