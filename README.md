@@ -22,7 +22,7 @@ pgs autopilot --model Qwen/Qwen3.5-4B --dataset your_data.jsonl
 ## What you get
 
 - **4B full fine-tune in 15 GB**: no LoRA compromise needed (RTX 4090 compatible)
-- **DEFT loss**: parameter-free token weighting, +70% on math benchmarks (reported in arxiv:2602.11424)
+- **DEFT loss**: parameter-free token weighting; the original paper (arxiv:2602.11424) reports math-reasoning gains, not independently reproduced
 - **Hyperball optimizer**: 20-30% convergence speedup via norm constraints (arxiv:2606.16899, single paper)
 - **Power-decay scheduler**: theoretically optimal (better than cosine at all scales)
 - **Best-model tracking**: automatically saves the checkpoint with lowest eval loss
