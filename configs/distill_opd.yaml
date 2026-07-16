@@ -1,0 +1,62 @@
+# On-policy distillation: the student samples, the teacher scores, reverse-KL update.
+# Worked example: nesso-0.4B-agentic (ChatML) <- nesso-3B (Llama-3 template),
+# multiple-choice QA in the ITALIC benchmark's exact prompt format.
+#
+#   pgs distill --config configs/distill_opd.yaml
+#   pgs distill --config configs/distill_opd.yaml --train.learning_rate 5e-6
+
+model:
+  student: mii-llm/nesso-0.4B-agentic
+  teacher: Coloss/nesso-3B
+  # teacher_device: "cuda:1"      # uncomment on a multi-GPU node
+  gradient_checkpointing: false   # enable if student + teacher OOM one GPU
+
+bridge:
+  # Student <|im_end|> and teacher <|eot_id|> both mean "end of turn": the
+  # student's probability mass on <|im_end|> is scored against the teacher's
+  # <|eot_id|> slot, so the teacher also supervises WHEN to stop.
+  # Set explicitly — auto-detection uses the teacher's configured eos, which
+  # for base models is <|end_of_text|>, not the conversational terminator.
+  eos_map:
+    "<|im_end|>": "<|eot_id|>"
+  extra_stop_tokens: ["<|end_of_text|>"]
+
+data:
+  prompts_path: data/prompts.jsonl   # pool-row JSONL (see palingenesis.opd.pool)
+  shots_path: data/5_shots.jsonl     # the benchmark's official few-shot file
+  dev_size: 500
+  # Shot-regime mixture: official shots / 1-k random pool shots / zero-shot
+  p_reference_shots: 0.5
+  p_pool_shots: 0.25
+  pool_shots_max_k: 5
+
+sampling:
+  batch_prompts: 32
+  group_size: 1          # fast-mode completions are ~1 token; groups add nothing
+  temperature: 1.0
+  max_new_tokens: 16
+  cot_fraction: 0.0      # raise (e.g. 0.3) to also distill the CoT template; then
+  cot_max_new_tokens: 300  # consider group_size 2-4 and a smaller batch_prompts
+  gen_micro_seqs: 64
+
+train:
+  output_dir: runs/opd
+  steps: 2000
+  learning_rate: 1.0e-5
+  warmup_steps: 50
+  lr_scheduler: cosine
+  max_grad_norm: 1.0
+  loss_fn: full_kl       # or sampled_rkl (tinker-style REINFORCE on sampled tokens)
+  seed: 0
+  score_micro_seqs: 32   # memory knob: sequences per scoring forward. On an 80GB
+                         # A100 with cot_fraction > 0, drop to 8 and also set
+                         # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  eval_every: 200
+  eval_dev_samples: 200
+  save_steps: 500
+  keep_checkpoints: 3
+
+logging:
+  log_every: 10
+  use_wandb: false
+  project: palingenesis-opd
