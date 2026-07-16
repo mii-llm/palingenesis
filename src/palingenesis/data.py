@@ -74,10 +74,48 @@ def _load_dataset_source(dataset_id: str, split: str, streaming: bool):
 
 
 def _shard_streaming_dataset(dataset, rank: int, world_size: int):
+    """Shard a dataset across processes (rank) and dataloader workers.
+
+    Two dataset shapes need different handling:
+
+    * **Streaming** (``datasets.IterableDataset``): calling ``.shard(num_shards=N)``
+      with ``N`` greater than the dataset's own ``num_shards`` (e.g. a single-file
+      JSONL has 1 shard) creates empty sub-shards that crash on ``.features``
+      (``IndexError: list index out of range``). So we shard across processes with
+      ``split_dataset_by_node`` (which degrades to a strided skip when there are
+      fewer shards than nodes) and let HF's own DataLoader integration handle the
+      per-worker split — it assigns shards to workers when possible and otherwise
+      stops the surplus workers, which is exactly what we want.
+    * **Map-style** (``datasets.Dataset``): contiguous ``.shard()`` is safe and
+      cheap for both rank and worker, so we keep the original behaviour.
+    """
     worker_info = torch.utils.data.get_worker_info()
+
+    try:
+        from datasets import IterableDataset as _HFIterableDataset
+
+        is_streaming = isinstance(dataset, _HFIterableDataset)
+    except Exception:
+        is_streaming = False
+
+    if is_streaming:
+        # Per-worker sharding is handled automatically by HF when this streaming
+        # dataset is iterated inside a worker, so we only shard across processes.
+        if world_size > 1:
+            try:
+                from datasets.distributed import split_dataset_by_node
+
+                dataset = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
+            except Exception:
+                # Best-effort fallback; never over-shard (that is what crashes).
+                num_shards = getattr(dataset, "num_shards", None) or getattr(dataset, "n_shards", None)
+                if hasattr(dataset, "shard") and (num_shards is None or num_shards >= world_size):
+                    dataset = dataset.shard(num_shards=world_size, index=rank)
+        return dataset
+
+    # Map-style dataset: contiguous shard across both rank and worker.
     shard_index = rank
     shard_count = world_size
-
     if worker_info is not None and worker_info.num_workers > 1:
         shard_index = shard_index * worker_info.num_workers + worker_info.id
         shard_count *= worker_info.num_workers
@@ -1133,8 +1171,9 @@ def build_dataloader(
         source_datasets = []
         weights = []
         for src in config.sources:
-            raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=True)
-            raw = raw.shuffle(seed=config.seed, buffer_size=10_000)
+            raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=config.streaming)
+            # IterableDataset.shuffle needs a buffer_size; map-style Dataset.shuffle does not.
+            raw = raw.shuffle(seed=config.seed, buffer_size=10_000) if config.streaming else raw.shuffle(seed=config.seed)
 
             mode = src.get("mode", "sft")
             if mode == "sft":

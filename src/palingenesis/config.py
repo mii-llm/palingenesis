@@ -283,26 +283,53 @@ class Config:
 
     @classmethod
     def from_cli(cls, args: list[str] | None = None) -> "Config":
-        """Parse --config file.yaml and --section.field value overrides."""
+        """Parse the config file and --section.field value overrides.
+
+        The config file may be passed either as ``--config file.yaml`` or as a
+        bare positional ``file.yaml`` / ``file.yml`` path (so both
+        ``pgs train --config cpt.yaml`` and ``pgs train cpt.yaml`` work). If no
+        config file is found, the built-in demo defaults are used and a loud
+        warning is emitted — silently training the default model is never intended.
+        """
+        import logging
         import sys
 
         args = args or sys.argv[1:]
         config = cls()
+        config_source: str | None = None
 
-        # First pass: load YAML if specified
+        # First pass: load YAML from --config <path> OR a positional *.yaml/*.yml
         i = 0
         while i < len(args):
             if args[i] == "--config" and i + 1 < len(args):
                 config = cls.from_yaml(args[i + 1])
+                config_source = args[i + 1]
                 i += 2
+            elif not args[i].startswith("--") and args[i].lower().endswith((".yaml", ".yml")):
+                config = cls.from_yaml(args[i])
+                config_source = args[i]
+                i += 1
             else:
                 i += 1
+
+        if config_source is None:
+            logging.getLogger(__name__).warning(
+                "No config file passed — falling back to built-in demo defaults "
+                "(model=%s, dataset=%s). Pass one with `--config <file>.yaml` or a "
+                "positional `<file>.yaml`; this is almost never what you want for a real run.",
+                config.model.name_or_path,
+                config.data.dataset,
+            )
 
         # Second pass: apply overrides
         i = 0
         while i < len(args):
             if args[i] == "--config":
                 i += 2
+                continue
+            # Skip the positional config path (already consumed above).
+            if not args[i].startswith("--") and args[i].lower().endswith((".yaml", ".yml")):
+                i += 1
                 continue
             if args[i].startswith("--") and i + 1 < len(args):
                 key, value = args[i][2:], args[i + 1]
