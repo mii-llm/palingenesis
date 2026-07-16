@@ -40,9 +40,18 @@ from palingenesis.checkpoint import (
     save_checkpoint,
     save_final,
 )
-from palingenesis.config import Config
+from palingenesis.config import Config, ConfigError
 from palingenesis.context_parallel import enable_context_parallel, shard_for_context_parallel
-from palingenesis.data import IGNORE_INDEX, _load_dataset_source, build_dataloader
+from palingenesis.data import (
+    IGNORE_INDEX,
+    _load_dataset_source,
+    build_dataloader,
+    build_dataset,
+    build_pretokenized_dataloader,
+    materialize_pretokenized,
+    pretokenize_fingerprint,
+    pretokenized_cache_valid,
+)
 from palingenesis.distributed import apply_fsdp, build_mesh, cleanup_distributed, is_main, setup_distributed
 from palingenesis.health import HealthMonitor
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel
@@ -92,41 +101,79 @@ def _dynamic_num_chunks(batch_tokens: int, vocab_size: int, target_gb: float = L
     return max(1, min(64, math.ceil(logit_gb / target_gb)))
 
 
-def _resolve_total_steps(config: Config, dataset_len: int | None, world_size: int) -> int:
-    """Total optimizer steps for the LR schedule (warmup length + decay horizon).
+def _resolve_total_steps(config: Config, world_size: int, make_dataloader, device=None) -> int:
+    """EXACT number of optimizer steps for the LR schedule (warmup + decay horizon).
 
-    Priority:
-      1. train.max_steps if set
-      2. derived from epochs × dataset size (map-style datasets)
-      3. 100k fallback (streaming without max_steps — warn loudly, because a
-         short run would otherwise sit inside warmup forever and never reach
-         peak LR, let alone decay)
+    We never guess. There are exactly two outcomes:
+
+      1. ``train.max_steps`` is set (> 0) → used verbatim.
+      2. Epoch-based (``max_steps <= 0``) → the exact step count is derived by
+         scanning the fully-assembled, deterministic (map-style) data pipeline
+         once and counting the micro-batches it yields. Packing, per-sample
+         filtering and weighted multi-source mixing all make the step count
+         data-dependent, so scanning the real pipeline is the only correct way
+         to know it. The scan matches the training loop's accounting exactly:
+         ``steps/epoch = floor(micro_batches / GA)`` (the DataLoader drops the
+         trailing partial batch via ``drop_last``; the loop drops the trailing
+         partial accumulation window), times ``epochs``.
+
+    When the count cannot be known ahead of time we refuse to fabricate one and
+    raise ``ConfigError`` telling the user to set ``train.max_steps``:
+      * ``data.streaming: true`` — a stream has no bounded, knowable length; or
+      * ``train.ga_ramp_start`` set — GA ramps with training *progress*, which
+        depends on the total step count (circular).
     """
     if config.train.max_steps > 0:
         logger.info(f"LR schedule: total_steps={config.train.max_steps} (from train.max_steps)")
         return config.train.max_steps
 
-    if dataset_len is not None:
-        samples_per_step = (
-            config.train.per_device_batch_size * world_size * config.train.gradient_accumulation_steps
+    grad_accum = config.train.gradient_accumulation_steps
+    ga_ramp_enabled = 0 < config.train.ga_ramp_start < grad_accum
+    if ga_ramp_enabled:
+        raise ConfigError(
+            "train.max_steps must be set when train.ga_ramp_start is used: the "
+            "gradient-accumulation factor ramps with training progress, which itself "
+            "depends on the total step count (circular). Set train.max_steps explicitly."
         )
-        steps_per_epoch = max(1, math.ceil(dataset_len / samples_per_step))
-        total_steps = steps_per_epoch * config.train.epochs
-        note = " (upper bound: packing reduces actual steps)" if config.data.packing else ""
-        logger.info(
-            f"LR schedule: total_steps={total_steps} derived from "
-            f"{config.train.epochs} epoch(s) × {steps_per_epoch} steps/epoch "
-            f"({dataset_len} samples / {samples_per_step} per step){note}"
+    if config.data.streaming:
+        raise ConfigError(
+            "train.max_steps must be set when data.streaming: true — a streaming "
+            "dataset has no bounded length known ahead of time, so the LR schedule "
+            "(warmup + decay horizon) cannot be calibrated. Either set train.max_steps, "
+            "or set data.streaming: false so the exact step count can be computed."
         )
-        return total_steps
 
-    logger.warning(
-        "train.max_steps is not set and the dataset is streaming (no length): "
-        "assuming 100,000 steps for the LR schedule. With warmup_ratio="
-        f"{config.train.warmup_ratio} that means {int(100_000 * config.train.warmup_ratio)} warmup steps — "
-        "short runs will NEVER leave warmup or reach peak LR. Set train.max_steps explicitly."
+    logger.info(
+        "Counting exact training steps: scanning the data pipeline once "
+        "(packing/filtering/mixing make this the only exact method; "
+        "set train.max_steps to skip this scan)…"
     )
-    return 100_000
+    micro_per_epoch = sum(1 for _ in make_dataloader())
+    # Trailing partial batch is dropped by DataLoader(drop_last=True); the trailing
+    # partial accumulation window is dropped by the training loop → floor division.
+    steps_per_epoch = micro_per_epoch // grad_accum
+
+    # Multi-rank: ranks step in lockstep, so the run is bounded by the rank with
+    # the fewest steps. Agree on the minimum so the schedule matches every rank.
+    if device is not None and dist.is_available() and dist.is_initialized() and world_size > 1:
+        t = torch.tensor([steps_per_epoch], dtype=torch.long, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        steps_per_epoch = int(t.item())
+
+    total_steps = steps_per_epoch * config.train.epochs
+    if total_steps < 1:
+        raise ConfigError(
+            f"Computed 0 optimizer steps: {micro_per_epoch} micro-batch(es)/epoch with "
+            f"gradient_accumulation_steps={grad_accum} gives <1 step/epoch. The dataset is "
+            "too small for a single optimizer step at this batch size × GA — reduce "
+            "gradient_accumulation_steps / per_device_batch_size, or add more data."
+        )
+    logger.info(
+        f"LR schedule: total_steps={total_steps} (EXACT: {steps_per_epoch} optimizer "
+        f"step(s)/epoch × {config.train.epochs} epoch(s); counted {micro_per_epoch} "
+        f"micro-batch(es)/epoch ÷ GA {grad_accum})"
+    )
+    return total_steps
 
 
 def train(config: Config):
@@ -227,16 +274,60 @@ def train(config: Config):
 
     # ── Dataset ───────────────────────────────────────────────────────────
     logger.info("Loading dataset(s)")
-    if config.data.sources:
+    if config.data.pretokenize:
+        # Materialize the fully-assembled (tokenized → masked → mixed → packed)
+        # stream once, then load tensors directly. Cache is fingerprinted, so any
+        # change to tokenizer/template/seqlen/sources/masking rebuilds it.
+        cache_dir = config.data.pretokenize_path
+        fingerprint = pretokenize_fingerprint(config, tokenizer)
+        valid, reason = pretokenized_cache_valid(cache_dir, fingerprint)
+        if valid:
+            logger.info(f"  Pre-tokenized cache: reusing {cache_dir} (fingerprint match)")
+        else:
+            if rank == 0:
+                logger.info(f"  Pre-tokenizing dataset → {cache_dir} (reason: {reason})…")
+                bs = config.train.per_device_batch_size
+                if config.data.sources:
+                    def _factory():
+                        # world_size=1 → materialize the COMPLETE stream; sharding
+                        # happens at load time across ranks/workers.
+                        return build_dataset(config.data, tokenizer, config.data, 0, 1, bs)
+                else:
+                    src = _load_dataset_source(
+                        config.data.dataset, config.data.dataset_split, config.data.streaming
+                    )
+                    src = (
+                        src.shuffle(seed=config.train.seed, buffer_size=10_000)
+                        if config.data.streaming
+                        else src.shuffle(seed=config.train.seed)
+                    )
+
+                    def _factory():
+                        return build_dataset(src, tokenizer, config.data, 0, 1, bs)
+
+                n = materialize_pretokenized(_factory, cache_dir, fingerprint, config, tokenizer)
+                logger.info(f"  Pre-tokenized {n} sequence(s) → {cache_dir}")
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+
+        def _make_dataloader():
+            return build_pretokenized_dataloader(
+                cache_dir, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
+            )
+
+        dataloader = _make_dataloader()
+    elif config.data.sources:
         logger.info(f"  Multi-source mode: {len(config.data.sources)} datasets")
         for src in config.data.sources:
             logger.info(
                 f"    {src.get('dataset', '?')} (weight={src.get('weight', 1.0)}, mode={src.get('mode', 'sft')})"
             )
-        dataloader = build_dataloader(
-            config.data, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
-        )
-        dataset_len = None
+        def _make_dataloader():
+            return build_dataloader(
+                config.data, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
+            )
+
+        dataloader = _make_dataloader()
     else:
         # Preprocess integration: when enabled, train on the prepared output
         # (produced by `pgs prepare --config <same config>`) instead of the raw dataset.
@@ -272,10 +363,6 @@ def train(config: Config):
 
         logger.info(f"  Single dataset: {dataset_id}")
         dataset = _load_dataset_source(dataset_id, config.data.dataset_split, config.data.streaming)
-        try:
-            dataset_len = len(dataset)  # map-style (non-streaming) only
-        except TypeError:
-            dataset_len = None
         if not preserve_order:
             if config.data.streaming:
                 dataset = dataset.shuffle(seed=config.train.seed, buffer_size=10_000)
@@ -283,12 +370,16 @@ def train(config: Config):
                 # Map-style datasets were previously NEVER shuffled — samples
                 # arrived in file order every epoch (bad for optimization).
                 dataset = dataset.shuffle(seed=config.train.seed)
-        dataloader = build_dataloader(
-            dataset, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
-        )
+
+        def _make_dataloader():
+            return build_dataloader(
+                dataset, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
+            )
+
+        dataloader = _make_dataloader()
 
     # ── Optimizer + Scheduler ─────────────────────────────────────────────
-    total_steps = _resolve_total_steps(config, dataset_len, world_size)
+    total_steps = _resolve_total_steps(config, world_size, _make_dataloader, device)
     if config.plugins.schedule_free:
         warmup_steps = int(total_steps * config.train.warmup_ratio)
         optimizer = build_schedule_free_optimizer(

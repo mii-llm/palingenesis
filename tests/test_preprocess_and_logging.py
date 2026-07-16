@@ -73,38 +73,76 @@ def test_preprocess_incompatible_with_sources():
 
 
 def test_resolve_total_steps():
-    """LR schedule horizon: explicit max_steps wins; otherwise derived from
-    epochs × dataset size; streaming without max_steps falls back to 100k.
+    """LR schedule horizon is EXACT or the run is refused.
 
-    Regression for the silent-100k bug: a ~460-step run with max_steps unset
-    got warmup_ratio 0.05 × 100k = 5000 warmup steps, so the ENTIRE run sat
-    inside warmup and never reached peak LR.
+    - explicit train.max_steps wins;
+    - otherwise the exact count is obtained by scanning the assembled pipeline
+      once: steps/epoch = floor(micro_batches / GA), times epochs;
+    - streaming or a GA ramp (unbounded / circular) raises ConfigError instead
+      of silently fabricating a 100k horizon.
+
+    Regression for the silent-100k bug: a ~460-step run with max_steps unset got
+    warmup_ratio 0.05 × 100k = 5000 warmup steps, so the ENTIRE run sat inside
+    warmup and never reached peak LR. We now never guess.
     """
-    from palingenesis.config import Config
+    from palingenesis.config import Config, ConfigError
     from palingenesis.train import _resolve_total_steps
 
     cfg = Config()
+    cfg.data.streaming = False
     cfg.train.per_device_batch_size = 4
     cfg.train.gradient_accumulation_steps = 1
     cfg.train.epochs = 1
 
-    # 1. Explicit max_steps always wins
+    # A fake assembled dataloader yielding N micro-batches per epoch.
+    def make_dl(n):
+        return lambda: (object() for _ in range(n))
+
+    # 1. Explicit max_steps always wins (no scan needed).
     cfg.train.max_steps = 50
-    assert _resolve_total_steps(cfg, dataset_len=1450, world_size=1) == 50
+    assert _resolve_total_steps(cfg, world_size=1, make_dataloader=make_dl(1450)) == 50
 
-    # 2. Derived: ceil(1450 / 4) = 363 steps/epoch
+    # 2. Exact scan: 363 micro-batches, GA=1 → 363 steps/epoch.
     cfg.train.max_steps = 0
-    assert _resolve_total_steps(cfg, dataset_len=1450, world_size=1) == 363
+    assert _resolve_total_steps(cfg, world_size=1, make_dataloader=make_dl(363)) == 363
 
-    # Scales with epochs, world size and grad accumulation
+    # Scales exactly with epochs.
     cfg.train.epochs = 3
-    assert _resolve_total_steps(cfg, dataset_len=1450, world_size=1) == 3 * 363
-    cfg.train.epochs = 1
-    cfg.train.gradient_accumulation_steps = 2
-    assert _resolve_total_steps(cfg, dataset_len=1450, world_size=2) == 91  # ceil(1450/16)
+    assert _resolve_total_steps(cfg, world_size=1, make_dataloader=make_dl(363)) == 3 * 363
 
-    # 3. Streaming (no length) without max_steps → 100k fallback
-    assert _resolve_total_steps(cfg, dataset_len=None, world_size=1) == 100_000
+    # GA reduces steps by floor division (trailing partial window dropped).
+    cfg.train.epochs = 1
+    cfg.train.gradient_accumulation_steps = 8
+    assert _resolve_total_steps(cfg, world_size=1, make_dataloader=make_dl(363)) == 363 // 8
+
+    # 3. Streaming without max_steps → refuse (no silent 100k).
+    cfg.train.gradient_accumulation_steps = 1
+    cfg.data.streaming = True
+    try:
+        _resolve_total_steps(cfg, world_size=1, make_dataloader=make_dl(363))
+        raise AssertionError("streaming without max_steps must raise ConfigError")
+    except ConfigError:
+        pass
+
+    # 4. GA ramp without max_steps → refuse (circular).
+    cfg.data.streaming = False
+    cfg.train.gradient_accumulation_steps = 8
+    cfg.train.ga_ramp_start = 2
+    try:
+        _resolve_total_steps(cfg, world_size=1, make_dataloader=make_dl(363))
+        raise AssertionError("ga_ramp without max_steps must raise ConfigError")
+    except ConfigError:
+        pass
+
+    # 5. Too little data for one optimizer step → refuse (don't return 0).
+    cfg.train.ga_ramp_start = 0
+    cfg.train.gradient_accumulation_steps = 4
+    try:
+        _resolve_total_steps(cfg, world_size=1, make_dataloader=make_dl(3))
+        raise AssertionError("0-step run must raise ConfigError")
+    except ConfigError:
+        pass
+
     print("✓ test_resolve_total_steps PASSED")
 
 

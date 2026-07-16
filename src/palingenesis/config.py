@@ -101,6 +101,14 @@ class DataConfig:
     seq_len_curriculum: bool = False
     seq_len_curriculum_min: int = 1024  # Starting max sequence length
     seq_len_curriculum_ramp_steps: int = 1000  # Steps to ramp from min to max_seq_length
+    # Pre-tokenized cache: materialize the fully-assembled (tokenized → masked → mixed
+    # → packed) training stream to disk once, then load tensors directly on later runs
+    # (skips per-step tokenization AND makes the exact step count a cheap read). A
+    # fingerprint over tokenizer/template/seqlen/sources/masking invalidates a stale
+    # cache and triggers an automatic rebuild. Incompatible with msft_tracking and
+    # seq_len_curriculum (both change the stream during training).
+    pretokenize: bool = False
+    pretokenize_path: str = "./pretokenized"
 
 
 @dataclass(slots=True)
@@ -435,6 +443,22 @@ class Config:
                 "For multi-source preparation use 'pgs prepare-multi' and point data.sources "
                 "at the per-source scored files."
             )
+
+        if self.data.pretokenize:
+            if self.data.msft_tracking:
+                errors.append(
+                    "data.pretokenize=true is incompatible with data.msft_tracking=true. "
+                    "MSFT adjusts per-source sampling weights DURING training, so the token "
+                    "stream is not static and cannot be baked into a pre-tokenized cache. "
+                    "Disable one of them (drop pretokenize to keep adaptive weighting, or "
+                    "drop msft_tracking to cache a fixed stream)."
+                )
+            if self.data.seq_len_curriculum:
+                errors.append(
+                    "data.pretokenize=true is incompatible with data.seq_len_curriculum=true. "
+                    "The curriculum changes the sequence length as training progresses, so a "
+                    "single fixed pre-tokenized stream can't represent it. Disable one of them."
+                )
 
         # ── Soft warnings (untested combinations) ─────────────────────────
         if self.memory.gradient_release and self.train.hyperball:

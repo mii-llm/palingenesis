@@ -1146,15 +1146,15 @@ def _collate_fn(
 collate_fn = _collate_fn
 
 
-def build_dataloader(
+def build_dataset(
     dataset_or_config,
     tokenizer: PreTrainedTokenizerBase,
     config: DataConfig,
     rank: int,
     world_size: int,
     batch_size: int,
-) -> DataLoader:
-    """Build the complete data pipeline.
+) -> IterableDataset:
+    """Assemble the final training IterableDataset (everything the DataLoader wraps).
 
     Handles three cases:
     1. Pre-built dataset object (backward compat)
@@ -1164,6 +1164,10 @@ def build_dataloader(
     Also handles:
     4. Pretraining replay: auto-mixes generic data to prevent forgetting AND improve target task
        (arxiv:2603.04964, Stanford/Liang 2026)
+
+    The returned stream yields per-sequence dicts (input_ids/attention_mask/labels,
+    plus position_ids when packed) — i.e. tokenization, masking, mixing and packing
+    are already applied.
     """
     # Determine the final IterableDataset
     if config.sources:
@@ -1275,13 +1279,241 @@ def build_dataloader(
             f"(cuts pad-token compute; set data.length_group_buffer: 0 to disable)"
         )
 
+    return final_ds
+
+
+def _dataloader_from_dataset(
+    final_ds: IterableDataset, tokenizer: PreTrainedTokenizerBase, num_workers: int, batch_size: int
+) -> DataLoader:
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     return DataLoader(
         final_ds,
         batch_size=batch_size,
         collate_fn=lambda b: collate_fn(b, pad_id, pad_to_multiple=64),
-        num_workers=config.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=2 if config.num_workers > 0 else None,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
+
+
+def build_dataloader(
+    dataset_or_config,
+    tokenizer: PreTrainedTokenizerBase,
+    config: DataConfig,
+    rank: int,
+    world_size: int,
+    batch_size: int,
+) -> DataLoader:
+    """Build the complete data pipeline (assemble the dataset, then wrap in a DataLoader)."""
+    final_ds = build_dataset(dataset_or_config, tokenizer, config, rank, world_size, batch_size)
+    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRE-TOKENIZED CACHE
+# ══════════════════════════════════════════════════════════════════════════════
+# Materialize the fully-assembled (tokenized → masked → mixed → packed) training
+# stream to disk once, then on later runs load the tensors directly — skipping all
+# per-step tokenization AND making the exact step count a cheap read. A fingerprint
+# over every input that affects the tokens invalidates a stale cache automatically.
+# Incompatible with dynamic-weight training (MSFT) and seq-len curriculum, which
+# can't be baked into a static stream — those are rejected in Config.validate().
+
+PRETOK_DATA = "train.parquet"
+PRETOK_META = "pretokenized_meta.json"
+
+
+def pretokenize_fingerprint(config, tokenizer) -> str:
+    """Stable SHA-256 over everything that changes the materialized token stream."""
+    import hashlib
+    import json as _json
+
+    d = config.data
+
+    def _src_sig(src: dict) -> dict:
+        p = Path(src.get("dataset", ""))
+        stat = None
+        try:
+            if p.exists():
+                st = p.stat()
+                stat = [st.st_size, int(st.st_mtime)]
+        except OSError:
+            stat = None
+        return {
+            "dataset": src.get("dataset", ""),
+            "split": src.get("split", "train"),
+            "weight": src.get("weight", 1.0),
+            "mode": src.get("mode", "sft"),
+            "messages_field": src.get("messages_field", "messages"),
+            "text_field": src.get("text_field", "text"),
+            "last_turn_only": src.get("last_turn_only", getattr(d, "last_turn_only", False)),
+            "stat": stat,
+        }
+
+    if d.sources:
+        sources_sig = [_src_sig(s) for s in d.sources]
+    else:
+        sources_sig = [
+            _src_sig({"dataset": d.dataset, "split": d.dataset_split, "messages_field": d.messages_field})
+        ]
+
+    payload = {
+        "version": 1,
+        "tokenizer": getattr(tokenizer, "name_or_path", ""),
+        "chat_template": getattr(tokenizer, "chat_template", None),
+        "vocab_size": getattr(tokenizer, "vocab_size", None),
+        "eos_token_id": tokenizer.eos_token_id,
+        "max_seq_length": d.max_seq_length,
+        "packing": d.packing,
+        "length_group_buffer": getattr(d, "length_group_buffer", 0),
+        "train_on_reasoning": getattr(d, "train_on_reasoning", True),
+        "turn_scaling": getattr(d, "turn_scaling", "uniform"),
+        "include_observations": getattr(d, "include_observations", False),
+        "seq_len_curriculum": getattr(d, "seq_len_curriculum", False),
+        "seed": d.seed,
+        "replay": [d.pretrain_replay_dataset, d.pretrain_replay_weight],
+        "sources": sources_sig,
+    }
+    blob = _json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def pretokenized_cache_valid(cache_dir, fingerprint: str) -> tuple[bool, str]:
+    """(is_valid, reason). Valid iff the cache files exist and the fingerprint matches."""
+    import json as _json
+
+    meta = Path(cache_dir) / PRETOK_META
+    data = Path(cache_dir) / PRETOK_DATA
+    if not meta.exists() or not data.exists():
+        return False, "no cache found"
+    try:
+        m = _json.loads(meta.read_text())
+    except Exception:
+        return False, "unreadable cache metadata"
+    if m.get("fingerprint") != fingerprint:
+        return False, "config/data/tokenizer changed since cache was built"
+    return True, "valid"
+
+
+def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, config, tokenizer) -> int:
+    """Iterate the assembled (masked/mixed/packed) stream once and write tensors to parquet.
+
+    Writes ``{cache_dir}/train.parquet`` (columns: input_ids, attention_mask, labels,
+    and position_ids when packed) plus ``pretokenized_meta.json`` with the fingerprint
+    and exact sequence count. Returns the number of sequences written.
+    """
+    import json as _json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out = Path(cache_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    tmp = out / (PRETOK_DATA + ".tmp")
+    meta_path = out / PRETOK_META
+
+    final_ds = final_ds_factory()
+    writer: "pq.ParquetWriter | None" = None
+    count = 0
+    has_pos: bool | None = None
+    buf: dict[str, list] = {"input_ids": [], "attention_mask": [], "labels": [], "position_ids": []}
+
+    def _flush():
+        nonlocal writer
+        if not buf["input_ids"]:
+            return
+        cols = {
+            "input_ids": buf["input_ids"],
+            "attention_mask": buf["attention_mask"],
+            "labels": buf["labels"],
+        }
+        if has_pos:
+            cols["position_ids"] = buf["position_ids"]
+        table = pa.table(cols)
+        if writer is None:
+            writer = pq.ParquetWriter(str(tmp), table.schema)
+        writer.write_table(table)
+        for v in buf.values():
+            v.clear()
+
+    try:
+        for ex in final_ds:
+            if has_pos is None:
+                has_pos = "position_ids" in ex
+            buf["input_ids"].append(ex["input_ids"].tolist())
+            buf["attention_mask"].append(ex["attention_mask"].tolist())
+            buf["labels"].append(ex["labels"].tolist())
+            if has_pos:
+                buf["position_ids"].append(ex["position_ids"].tolist())
+            count += 1
+            if len(buf["input_ids"]) >= 1000:
+                _flush()
+        _flush()
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if count == 0:
+        raise ValueError(
+            "Pre-tokenization produced 0 sequences — the data pipeline yielded nothing. "
+            "Check the source paths/fields and masking settings."
+        )
+
+    tmp.replace(out / PRETOK_DATA)
+    meta = {
+        "fingerprint": fingerprint,
+        "num_sequences": count,
+        "max_seq_length": config.data.max_seq_length,
+        "packing": config.data.packing,
+        "has_position_ids": bool(has_pos),
+    }
+    meta_path.write_text(_json.dumps(meta, indent=2))
+    return count
+
+
+class PretokenizedDataset(IterableDataset):
+    """Yields already-tokenized/packed tensors from a cached parquet, sharded by rank/worker.
+
+    No tokenization, masking, mixing or packing — the cached rows are the final
+    training sequences produced by an earlier ``materialize_pretokenized`` pass.
+    """
+
+    def __init__(self, dataset, rank: int = 0, world_size: int = 1):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        dataset = _shard_streaming_dataset(self.dataset, self.rank, self.world_size)
+        for ex in dataset:
+            out = {
+                "input_ids": torch.as_tensor(ex["input_ids"], dtype=torch.long),
+                "attention_mask": torch.as_tensor(ex["attention_mask"], dtype=torch.long),
+                "labels": torch.as_tensor(ex["labels"], dtype=torch.long),
+            }
+            pos = ex.get("position_ids")
+            if pos is not None:
+                out["position_ids"] = torch.as_tensor(pos, dtype=torch.long)
+            yield out
+
+
+def build_pretokenized_dataloader(cache_dir, tokenizer, config: DataConfig, rank, world_size, batch_size) -> DataLoader:
+    """Load the cached pre-tokenized parquet and wrap it in a DataLoader (no re-tokenization).
+
+    Packed caches are all-max-length (no padding), so length grouping is a no-op there.
+    For non-packed caches we re-apply length-grouped batching (honoring
+    ``length_group_buffer``) so the cache doesn't lose the pad-token throughput win.
+    """
+    from datasets import load_dataset
+
+    data_file = Path(cache_dir) / PRETOK_DATA
+    ds = load_dataset("parquet", data_files=str(data_file), split="train", streaming=False)
+    final_ds: IterableDataset = PretokenizedDataset(ds, rank=rank, world_size=world_size)
+
+    if not config.packing and batch_size > 1 and getattr(config, "length_group_buffer", 512) > 0:
+        final_ds = LengthGroupedDataset(
+            final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed
+        )
+
+    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)
