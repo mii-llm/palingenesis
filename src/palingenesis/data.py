@@ -36,6 +36,7 @@ Config examples:
 import logging
 import math
 import random
+import re
 from pathlib import Path
 from typing import Any
 
@@ -209,8 +210,6 @@ class ChatDataset(IterableDataset):
             return self._fallback(messages)
 
         # Last-turn-only: drop every assistant span but the final contiguous one.
-        # train_on_reasoning is respected downstream by the fallback path; here the
-        # template's own mask already includes any <think> block for the kept turn.
         if self.last_turn_only:
             assistant_mask = self._keep_last_segment(assistant_mask)
             if assistant_mask.sum() == 0:
@@ -219,6 +218,15 @@ class ChatDataset(IterableDataset):
         labels = input_ids.clone()
         labels[~assistant_mask] = IGNORE_INDEX
         labels[attn_mask == 0] = IGNORE_INDEX
+
+        # train_on_reasoning=False: the template's generation span includes any <think>
+        # block, so the mask above trains it. Strip those spans back out to match the
+        # documented behavior (loss only on the post-</think> answer) — same semantics
+        # the fallback path applies. Only affects already-trained tokens, so it respects
+        # last_turn_only and never touches user/system regions.
+        if not self.train_on_reasoning:
+            full_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            labels = self._strip_reasoning_labels(input_ids, labels, full_text)
 
         # ECHO: if include_observations, also unmask tool_response regions within user messages
         # Some models (Qwen3.5) wrap tool outputs as <tool_response>...</tool_response> inside user turns
@@ -245,6 +253,40 @@ class ChatDataset(IterableDataset):
             reasoning = head.split("<think>")[-1].strip()
             return (reasoning or None), tail.strip()
         return None, content.strip()
+
+    def _strip_reasoning_labels(self, input_ids: torch.Tensor, labels: torch.Tensor, full_text: str) -> torch.Tensor:
+        """Set labels to IGNORE across every `<think>...</think>` span (+ trailing
+        whitespace) in the render. Used on the fast path when train_on_reasoning=False so
+        reasoning doesn't receive loss even though the template's generation span encloses
+        it. Only flips tokens that are currently trained, so it respects last_turn_only and
+        leaves user/system regions untouched.
+
+        Needs a fast tokenizer (offset mapping) and offsets that align with input_ids; on
+        any mismatch it returns labels unchanged (reasoning stays trained — safe no-op).
+        """
+        if not getattr(self.tokenizer, "is_fast", False) or "</think>" not in full_text:
+            return labels
+        try:
+            enc = self.tokenizer(
+                full_text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+                truncation=True,
+                max_length=self.max_seq_length,
+            )
+        except Exception:
+            return labels
+        offsets = enc.get("offset_mapping")
+        if not offsets or enc["input_ids"] != input_ids.tolist():
+            return labels
+        for m in re.finditer(r"<think>.*?</think>", full_text, flags=re.DOTALL):
+            c0, c1 = m.start(), m.end()
+            while c1 < len(full_text) and full_text[c1] in " \t\r\n":
+                c1 += 1
+            for ti, (o0, o1) in enumerate(offsets):
+                if o1 > o0 and o0 < c1 and o1 > c0 and int(labels[ti]) != IGNORE_INDEX:
+                    labels[ti] = IGNORE_INDEX
+        return labels
 
     def _fallback(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
         """Mask assistant tokens when the template has no `{% generation %}` span.

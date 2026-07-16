@@ -34,7 +34,7 @@
 | `seed` | int | `42` | Random seed for data shuffling. |
 | `sources` | list | `[]` | Multi-dataset mode. List of `{dataset, split, weight, mode, messages_field}` dicts. |
 | `include_observations` | bool | `false` | **ECHO mode**: include tool/observation role tokens in loss. Teaches the model to predict tool outputs (world model). |
-| `train_on_reasoning` | bool | `true` | Include reasoning traces (`<think>` blocks / `reasoning_content`) in the loss. Required for distilling reasoning behavior. Set `false` to train only on the post-reasoning response. |
+| `train_on_reasoning` | bool | `true` | Include reasoning traces (`<think>` blocks / `reasoning_content`) in the loss. Required for distilling reasoning behavior. Set `false` to train only on the post-`</think>` response. Honored identically whether the chat template uses a `{% generation %}` span (fast path) or not (fallback path). |
 | `turn_scaling` | str | `uniform` | Per-turn loss weight. `uniform` (equal), `progressive` (later turns heavier, √(idx/total)), `last_heavy` (final turn 2×). |
 | `last_turn_only` | bool | `false` | Mask every assistant turn except the final one — in training, loss only on the last answer; in `eval_sources`, score only the last answer. Phase-neutral name (no `train_`/`eval_` prefix) since the same mask serves both. Use when earlier assistant turns are a fixed context you must not fit/score (e.g. few-shot exemplar answers in eval-format SFT). No-op for single-turn data. Overridable per source in `sources`/`eval_sources`. |
 | `eval_dataset` | str | `""` | Single validation dataset. Enables best-model tracking. Empty = no validation. Superseded by `eval_sources` when set. |
@@ -57,6 +57,11 @@
     `train_on_reasoning` is the **only** training-time control for `<think>` content:
     `true` (default) puts loss on both the reasoning block *and* the final answer
     (needed to distil reasoning); `false` trains only the post-`</think>` answer.
+
+    This holds **regardless of the chat template**. When the template's `{% generation %}`
+    span encloses the `<think>` block (so the fast masker would otherwise train it),
+    `false` strips those tokens back out; templates without a generation span reach the
+    same result through the fallback masker. The two paths are behaviorally identical.
 
     There is deliberately **no** `enable_thinking` option here. `enable_thinking` is a
     *chat-template inference toggle* — it makes reasoning models scaffold a `<think>`

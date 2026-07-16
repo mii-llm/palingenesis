@@ -19,7 +19,6 @@ deterministic; GPT-2 + the `{% generation %}` template yields real assistant mas
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -28,7 +27,7 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from palingenesis.data import ChatDataset, IGNORE_INDEX  # noqa: E402
+from palingenesis.data import IGNORE_INDEX, ChatDataset  # noqa: E402
 
 # ── the REAL baked template (verbatim shape from the zagreus export script) ─────
 DEFAULT_SYSTEM_MESSAGE = "Sei un assistente utile."
@@ -125,6 +124,32 @@ def test_fast_think_scaffold_is_trained():
 
 
 @needs_tok
+def test_fast_train_on_reasoning_false_strips_think():
+    """FAST path (template's {% generation %} span encloses <think>): train_on_reasoning
+    must be honored here too -- False strips the reasoning, True keeps it. Regression for
+    the bug where the flag was silently ignored on the fast path."""
+    msgs = [{"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "<think>because 6*7=42</think>The answer is 42"}]
+    on = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=True)._process({"messages": msgs}))
+    off = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=False)._process({"messages": msgs}))
+    assert on == "<think>\nbecause 6*7=42\n</think>\n\nThe answer is 42<|im_end|>\n", on
+    assert off == "The answer is 42<|im_end|>\n", off
+
+
+@needs_tok
+def test_fast_train_on_reasoning_false_multiturn_and_last_turn():
+    """The strip only touches trained tokens, so it composes with last_turn_only and
+    leaves each answer intact across turns."""
+    msgs = [{"role": "user", "content": "Q1"}, {"role": "assistant", "content": "first", "reasoning_content": "r1"},
+            {"role": "user", "content": "Q2"}, {"role": "assistant", "content": "final", "reasoning_content": "r2"}]
+    default = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=False)._process({"messages": msgs}))
+    last = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=False, last_turn_only=True)._process({"messages": msgs}))
+    assert default == "first<|im_end|>\nfinal<|im_end|>\n", default
+    assert last == "final<|im_end|>\n", last
+    assert "r1" not in default and "r2" not in default
+
+
+@needs_tok
 def test_fast_single_turn_is_noop():
     single = [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "ONLY"}]
     a = _trained_text(TOK, ChatDataset(None, TOK, 4096, last_turn_only=False)._process({"messages": single}))
@@ -200,7 +225,7 @@ def test_pipeline_pretrain_mode_all_tokens(tmp_path):
         max_seq_length=512, packing=False, num_workers=0, length_group_buffer=0, streaming=True,
     )
     batch = _one_batch(cfg)
-    ids, lab = batch["input_ids"][0], batch["attention_mask"][0]
+    lab = batch["attention_mask"][0]
     # pretrain = all real (non-pad) tokens get loss
     n_labeled = int((batch["labels"][0] != IGNORE_INDEX).sum())
     assert n_labeled == int(lab.sum()) and n_labeled > 0

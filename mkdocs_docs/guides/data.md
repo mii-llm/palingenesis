@@ -218,9 +218,39 @@ This prevents the common failure mode where one high-quality but small source ge
 
 ---
 
+## What gets loss (SFT masking)
+
+A sample is one of two shapes, and each is scored differently:
+
+- **`{"text": "..."}` (pretrain / raw LM):** *every* token gets loss. There is no masking — the whole string is next-token prediction. Selected per source with `mode: pretrain` + `text_field`.
+- **`{"messages": [...]}` (SFT / chat):** only **assistant** tokens get loss; system and user turns are masked out. Selected with `mode: sft` (the default) + `messages_field`.
+
+!!! warning "Don't feed a rendered conversation as `text`"
+    A full ChatML string (`<|im_start|>user…assistant…`) shoved into a `text` field trains on the *entire prompt* — question included — because pretrain mode masks nothing. For "loss only on the answer," use `messages` + `mode: sft`.
+
+### How assistant tokens are located
+
+Palingenesis masks purely from the model's own chat template, two ways:
+
+1. **Fast path** — templates with a `{% generation %}` span expose Hugging Face's native assistant mask; that mask defines the trained tokens exactly.
+2. **Fallback path** — templates without a generation span are masked by locating each assistant turn's text in the rendered string via offset mapping. This makes **no prefix-consistency assumption**, so it stays correct for templates that rewrite history — e.g. Qwen3.x dropping `<think>` from past turns, or MiniMax-M2 interleaved thinking — which naive boundary-diffing gets wrong. The turn's end-of-turn token is included so the model learns to stop.
+
+Both paths honor the same two knobs, identically:
+
+| Option | Effect |
+|--------|--------|
+| `train_on_reasoning` (default `true`) | `true`: loss on the `<think>` block **and** the answer (distils reasoning). `false`: loss only on the post-`</think>` answer — the reasoning is stripped even when the template's generation span encloses it. |
+| `last_turn_only` (default `false`) | Loss only on the **final** assistant turn; earlier assistant turns are masked. Use when earlier turns are a fixed context you must not fit — e.g. n-shot MCQA exemplar answers. No-op for single-turn data. |
+
+An **empty** `<think>\n\n</think>` scaffold (as Qwen fast-format emits) carries no reasoning, so nothing inside it is trained regardless of `train_on_reasoning`; loss lands on the answer + terminator.
+
+Both are set globally under `data:`. `last_turn_only` can additionally be overridden per source (in `sources` and `eval_sources` entries); `train_on_reasoning` is global-only.
+
+---
+
 ## Validation data
 
-Always, always, always have validation data.
+Always, always, always have validation data. The simplest form is a single held-out set:
 
 ```yaml
 data:
@@ -237,6 +267,41 @@ Without it:
 - No RL-readiness entropy tracking
 
 With it: palingenesis continuously evaluates and saves the best checkpoint. The cost is negligible (200 samples, no gradient, every 50 steps ≈ 2 seconds of overhead per hour of training).
+
+### Per-capability eval (`eval_sources`)
+
+A single mixed `eval_dataset` gets token-dominated by whichever source has the longest sequences, so one number hides per-capability regressions. `eval_sources` scores each source **independently** and combines them into a weighted composite that drives best-model tracking (logged as `eval/<name>/loss` + `eval/loss`):
+
+```yaml
+data:
+  eval_every: 50
+  eval_sources:
+    # raw-text language modeling — all-token CE/perplexity, no chat template
+    - name: lm
+      dataset: ./eval/heldout_docs.jsonl
+      split: test
+      mode: pretrain          # {"text": "..."}
+      text_field: text
+      weight: 0.4
+      samples: 200
+    # chat/MCQA proxy — assistant-only CE
+    - name: mcqa
+      dataset: ./eval/mcqa_heldout.jsonl
+      split: test
+      mode: sft               # {"messages": [...]}
+      messages_field: messages
+      last_turn_only: true    # score only the final answer (n-shot prefix ignored)
+      weight: 0.6
+      samples: 100
+```
+
+Per-source keys: `name`, `dataset`, `split`, `weight` (composite importance), `samples` (subset size), `regression_floor` (optional alarm), and **`mode`**:
+
+- **`mode: pretrain`** (+ `text_field`): raw-text, all-token CE/ppl, no chat template. Matches how CPT actually trains, so the number is a true next-token perplexity. Use it for held-out LM text.
+- **`mode: sft`** (default, + `messages_field`, optional `last_turn_only`): chat-templated, assistant-only CE. Use for genuine chat/MCQA tasks.
+
+!!! warning "Measure raw LM as `text`, not as a fake assistant turn"
+    Wrapping plain LM text in an `{"role": "assistant"}` message conditions perplexity on the chat-template scaffolding and no longer measures raw next-token LM. Use `mode: pretrain` with `text_field` instead.
 
 ---
 
