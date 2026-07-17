@@ -39,10 +39,17 @@ Answer:
 LETTER_RE = re.compile(r"\b([A-J])\b")
 
 
-def extract_letter(text: str) -> str | None:
-    """First standalone A-J letter in a completion, or None."""
-    m = LETTER_RE.search(text)
-    return m.group(1) if m else None
+def extract_letter(text: str, last: bool = False) -> str | None:
+    """First (default) or last standalone A-J letter in a completion, or None.
+
+    Use last=True for CoT outputs: reasoning text often contains incidental
+    standalone capitals ("A causa di...", "I think..."), but models conclude
+    with their answer, so the final letter is the reliable one.
+    """
+    matches = LETTER_RE.findall(text)
+    if not matches:
+        return None
+    return matches[-1] if last else matches[0]
 
 
 def letter_token_ids(tok, letters: str = "ABCDEFGHIJ") -> dict[str, int]:

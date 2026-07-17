@@ -310,6 +310,10 @@ def test_extract_letter():
     assert extract_letter("Risposta: B") == "B"
     assert extract_letter("A") == "A"
     assert extract_letter("nessuna lettera") is None
+    # CoT: incidental capitals early, answer at the end
+    cot = "A causa della regola X, la risposta corretta è B"
+    assert extract_letter(cot) == "A"          # first (wrong for CoT)
+    assert extract_letter(cot, last=True) == "B"
 
 
 def test_letter_token_ids():
@@ -395,9 +399,29 @@ def test_mcqa_source(tmp_path):
     # FakeEngine answers 'A'; half the dev rows have answer 'A'
     assert engine.calls == [("greedy", 4, 8)]
     assert 0.0 <= metrics["dev_acc"] <= 1.0
+    assert "dev_acc_cot" not in metrics  # cot_fraction=0: fast eval only
 
     stats = source.batch_stats([(meta, "A"), (meta, "boh niente lettera")])
     assert stats["format_ok"] == 0.5
+
+
+def test_mcqa_source_cot_eval(tmp_path):
+    """With cot_fraction > 0 the dev metric covers both modes."""
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.opd.sources import McqaPoolSource
+
+    config = OPDConfig()
+    config.data.prompts_path = str(write_mcqa_pool(tmp_path))
+    config.data.dev_size = 4
+    config.train.eval_dev_samples = 4
+    config.sampling.cot_fraction = 0.3
+    config.sampling.cot_max_new_tokens = 300
+
+    source = McqaPoolSource(config, rng=random.Random(0))
+    engine = FakeEngine()
+    metrics = source.evaluate(engine)
+    assert engine.calls == [("greedy", 4, 8), ("greedy", 4, 300)]
+    assert set(metrics) == {"dev_acc", "dev_acc_cot"}
 
 
 def test_messages_source(tmp_path):

@@ -14,7 +14,7 @@ Package: `palingenesis.opd` (`config.py`, `trainer.py`, `sources.py`, `token_bri
 
 | `data.format` | prompts | dev metric |
 |---|---|---|
-| `mcqa` (default) | pool-row JSONL, shot regimes, fast/CoT templates | letter accuracy (`dev_acc`) |
+| `mcqa` (default) | pool-row JSONL, shot regimes, fast/CoT templates | letter accuracy (`dev_acc`, plus `dev_acc_cot` when `cot_fraction` > 0) |
 | `messages` | JSONL of `{"messages": [...]}`, last turn = user | held-out reverse KL (`dev_kl`) + length |
 
 A custom source is any object with `sample()` / `evaluate(engine)` / `batch_stats()`; pass it as `OPDTrainer(config, source=...)`.

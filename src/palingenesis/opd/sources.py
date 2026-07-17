@@ -99,17 +99,30 @@ class McqaPoolSource:
         return messages, mnt, {"row": row, "fast": fast}
 
     def evaluate(self, engine: Engine) -> dict[str, float]:
-        """Greedy few-shot fast-mode accuracy on the held-out dev slice."""
+        """Greedy few-shot dev accuracy: fast mode always, CoT mode too when trained.
+
+        CoT answers are read as the LAST standalone letter (reasoning text
+        contains incidental capitals; models conclude with their answer).
+        """
         rows = self.dev_rows[: self.config.train.eval_dev_samples]
-        prompts = [
-            build_messages(r, few_shots=self.reference_shots, fast=True,
-                           system_message=self.config.data.system_message or None,
-                           template=self.fast_template)
-            for r in rows
-        ]
-        texts = engine.greedy_generate(prompts, max_new_tokens=8)
-        correct = sum(1 for r, text in zip(rows, texts) if extract_letter(text) == r["answer"])
-        return {"dev_acc": correct / max(1, len(rows))}
+
+        def _acc(fast: bool, template, max_new_tokens: int, last: bool) -> float:
+            prompts = [
+                build_messages(r, few_shots=self.reference_shots, fast=fast,
+                               system_message=self.config.data.system_message or None,
+                               template=template)
+                for r in rows
+            ]
+            texts = engine.greedy_generate(prompts, max_new_tokens=max_new_tokens)
+            correct = sum(1 for r, t in zip(rows, texts) if extract_letter(t, last=last) == r["answer"])
+            return correct / max(1, len(rows))
+
+        metrics = {"dev_acc": _acc(True, self.fast_template, 8, last=False)}
+        if self.config.sampling.cot_fraction > 0:
+            metrics["dev_acc_cot"] = _acc(
+                False, self.cot_template, self.config.sampling.cot_max_new_tokens, last=True
+            )
+        return metrics
 
     def batch_stats(self, rollouts):
         if not rollouts:
