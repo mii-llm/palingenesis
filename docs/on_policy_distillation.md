@@ -73,7 +73,7 @@ The pool is a JSONL of multiple-choice rows (`palingenesis.opd.pool`):
  "category": "storia", "source": "mmlu_italian"}
 ```
 
-**Dedup against the target benchmark is not optional.** Training pools are often drawn from the same corpora a benchmark was curated from; hash every candidate question (`question_hash` — lowercased, accent-stripped, alphanumeric-only) against the benchmark set (`load_benchmark_hashes`) before it enters the pool. Adapters for common Italian MCQA sources ship in `pool.py` (`normalize_pinocchio`, `normalize_mmlu_pro_ita`, `normalize_mmlu_italian`).
+**Dedup against the target benchmark is not optional.** Training pools are often drawn from the same corpora a benchmark was curated from; hash every candidate question (`question_hash` — lowercased, accent-stripped, alphanumeric-only) against the benchmark set (`load_benchmark_hashes`) before it enters the pool. Converting a raw dataset into the pool schema is an *adapter*, and adapters are experiment policy — write them next to your experiment (each is a small function: map fields, letter the options, check with `valid_row`, dedup). The [zagreus ITALIC experiment](https://github.com/giux78/zagreus_0.4_competition) carries worked examples for three Italian sources.
 
 The train/dev split is deterministic by question hash — stable across runs and input order.
 

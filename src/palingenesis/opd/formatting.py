@@ -104,10 +104,11 @@ def build_messages(
 
 
 def load_reference_shots(path: str) -> list[dict[str, Any]]:
-    """Load a benchmark's official few-shot file (options as [{"A": "text"}, ...] per row).
+    """Load a benchmark's official few-shot file.
 
-    This is ITALIC's 5_shots.jsonl layout; files already in the pool-row
-    layout (options as [["A", "text"], ...]) are accepted too.
+    Accepts rows with options as a list of one-key dicts ([{"A": "text"}, ...],
+    a common benchmark layout) or already in the pool-row layout
+    (options as [["A", "text"], ...]).
     """
     shots = []
     with open(path) as f:

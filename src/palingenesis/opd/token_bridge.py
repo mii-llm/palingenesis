@@ -24,14 +24,15 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 # Tokenization-identity probes for check_compatible. Deliberately mixed:
-# plain prose, accented characters (both precomposed forms and ones that
-# byte-level BPEs split aggressively), code, and an instruction-style line.
+# plain prose with digits/punctuation, accented characters across languages
+# (both precomposed forms and ones that byte-level BPEs split aggressively),
+# apostrophes/quotes, and code. Benchmark- or language-specific probes can be
+# added per run via bridge.probe_texts.
 DEFAULT_PROBE_TEXTS = (
     "The quick brown fox jumps over the lazy dog. 12,345.67!",
-    "Rispondi alla seguente domanda a scelta multipla sull'argomento 'storia'.",
-    "La Divina Commedia è composta da tre cantiche: Inferno, Purgatorio e Paradiso.",
-    "Perché l'ossigeno è più elettronegativo dell'azoto? Risposta: A",
-    "x = [n**2 for n in range(10)]  # città, però, così",
+    "Perché città, così — l'aquila d'oro? È già qui: 'sì', naïve café.",
+    "Wo wäre die größte Straße? ¿Dónde está la número três? Ç'est ça.",
+    "x = [n**2 for n in range(10)]  # docstring: \"answer: A\"",
 )
 
 

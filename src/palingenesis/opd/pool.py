@@ -1,8 +1,14 @@
-"""Prompt-pool construction, dedup, and loading for OPD.
+"""Prompt-pool schema, dedup, and loading for OPD.
 
 Pool row schema (prompts.jsonl):
   {"question": str, "options": [["A", "text"], ...], "answer": "A",
    "category": str, "source": str}
+
+Converting a raw dataset into this schema is an adapter, and adapters are
+experiment policy — they live next to the experiment, not here (each is a
+small function: map fields, letter the options, run `valid_row`, dedup with
+`load_benchmark_hashes`). This module ships the mechanism only: row
+validation, benchmark dedup, and the deterministic train/dev split.
 
 Dedup matters more than usual here: training pools are often drawn from the
 same corpora a target benchmark was curated from, so every row must be checked
@@ -14,11 +20,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import string
 import unicodedata
 from typing import Any, Iterable
-
-LETTERS = string.ascii_uppercase
 
 
 def norm_text(s: str) -> str:
@@ -43,7 +46,7 @@ def load_benchmark_hashes(path: str, field: str = "question") -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Per-source adapters -> pool row or None (row rejected)
+# Row validation (for adapter authors)
 # ---------------------------------------------------------------------------
 
 def valid_row(question: str, options: list[tuple[str, str]], answer: str) -> bool:
@@ -56,56 +59,6 @@ def valid_row(question: str, options: list[tuple[str, str]], answer: str) -> boo
     if len(question) > 1500 or sum(len(t) for _, t in options) > 2000:
         return False
     return True
-
-
-def normalize_pinocchio(raw: dict[str, Any]) -> dict[str, Any] | None:
-    """mii-llm/pinocchio-raw quiz row -> pool row."""
-    # skip anything that needs an image/table/context to answer
-    if raw.get("image") or raw.get("table") or raw.get("context"):
-        return None
-    if any(o.get("image") for o in raw.get("options", [])):
-        return None
-    options = [(o["value"], o["text"].strip()) for o in raw.get("options", [])]
-    question = (raw.get("question") or "").strip()
-    answer = raw.get("answer", "")
-    # topic string like ITALIC's category field, e.g. "archeologia_topografia_romana"
-    gen_code = raw.get("genCode") or ""
-    category = gen_code.split("__", 1)[1] if "__" in gen_code else (raw.get("macro") or "quiz").lower()
-    if not valid_row(question, options, answer):
-        return None
-    return {"question": question, "options": options, "answer": answer,
-            "category": category, "source": "pinocchio"}
-
-
-def normalize_mmlu_pro_ita(raw: dict[str, Any]) -> dict[str, Any] | None:
-    """efederici/MMLU-Pro-ita row -> pool row."""
-    question = (raw.get("question") or "").strip()
-    opts = raw.get("options") or []
-    options = [(LETTERS[i], str(t).strip()) for i, t in enumerate(opts)]
-    answer = raw.get("answer", "")
-    category = str(raw.get("category") or "conoscenze generali").lower().replace(" ", "_")
-    if not valid_row(question, options, answer):
-        return None
-    return {"question": question, "options": options, "answer": answer,
-            "category": category, "source": "mmlu_pro_ita"}
-
-
-def normalize_mmlu_italian(raw: dict[str, Any]) -> dict[str, Any] | None:
-    """sapienzanlp/mmlu_italian row -> pool row."""
-    question = (raw.get("input_translation") or "").strip()
-    choices = raw.get("choices_translation") or []
-    options = [(LETTERS[i], str(t).strip()) for i, t in enumerate(choices)]
-    gold = raw.get("label")
-    if gold is None or not (0 <= int(gold) < len(options)):
-        return None
-    answer = LETTERS[int(gold)]
-    meta = raw.get("metadata") or {}
-    subject = meta.get("subject") if isinstance(meta, dict) else None
-    category = str(subject or "conoscenze generali").lower().replace(" ", "_")
-    if not valid_row(question, options, answer):
-        return None
-    return {"question": question, "options": options, "answer": answer,
-            "category": category, "source": "mmlu_italian"}
 
 
 # ---------------------------------------------------------------------------

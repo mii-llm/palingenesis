@@ -186,22 +186,6 @@ def test_pool_roundtrip(tmp_path):
     assert loaded[0]["options"] == [("A", "sì"), ("B", "no")]
 
 
-def test_normalize_mmlu_italian():
-    from palingenesis.opd.pool import normalize_mmlu_italian
-
-    row = normalize_mmlu_italian({
-        "input_translation": "Quale pianeta è il più vicino al Sole?",
-        "choices_translation": ["Mercurio", "Venere", "Terra", "Marte"],
-        "label": 0,
-        "metadata": {"subject": "Astronomia"},
-    })
-    assert row["answer"] == "A"
-    assert row["options"][0] == ("A", "Mercurio")
-    assert row["category"] == "astronomia"
-    # invalid label -> rejected
-    assert normalize_mmlu_italian({"input_translation": "q", "choices_translation": ["a"], "label": 5}) is None
-
-
 def test_valid_row_rejects_malformed():
     from palingenesis.opd.pool import valid_row
 
@@ -267,10 +251,9 @@ def test_italic_config_templates_render_verbatim():
 
 
 def test_template_placeholder_validation():
-    from palingenesis.opd.config import OPDConfig, OPDConfigError
+    from palingenesis.opd.config import OPDConfigError
 
-    config = OPDConfig()
-    config.data.shots_path = "shots.jsonl"
+    config = _valid_base_config()
     config.data.fast_template = "{question}\n{options}\n{merged_letters}"
     assert config.validate() == []
 
@@ -481,27 +464,37 @@ def test_opd_config_from_yaml_and_cli(tmp_path):
     assert config.model.gradient_checkpointing is True
 
 
-def test_opd_config_validate():
-    import pytest
-
-    from palingenesis.opd.config import OPDConfig, OPDConfigError
+def _valid_base_config():
+    from palingenesis.opd.config import OPDConfig
 
     config = OPDConfig()
+    config.model.student = "org/student"
+    config.model.teacher = "org/teacher"
     config.data.shots_path = "shots.jsonl"
+    return config
+
+
+def test_opd_config_validate():
+    from palingenesis.opd.config import OPDConfig, OPDConfigError
+
+    config = _valid_base_config()
     assert config.validate() == []
+
+    # student/teacher have no defaults — the pair is the experiment's decision
+    with pytest.raises(OPDConfigError, match="model.student"):
+        OPDConfig().validate()
 
     config.train.loss_fn = "nonsense"
     with pytest.raises(OPDConfigError, match="loss_fn"):
         config.validate()
 
-    config = OPDConfig()
+    config = _valid_base_config()
     config.data.p_reference_shots = 0.8
     config.data.p_pool_shots = 0.5
     with pytest.raises(OPDConfigError, match="p_reference_shots"):
         config.validate()
 
-    config = OPDConfig()
-    config.data.shots_path = "shots.jsonl"
+    config = _valid_base_config()
     config.sampling.group_size = 4  # legal but useless with cot_fraction=0
     warnings = config.validate()
     assert len(warnings) == 1 and "group_size" in warnings[0]

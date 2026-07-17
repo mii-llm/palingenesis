@@ -16,8 +16,10 @@ import yaml
 
 @dataclass(slots=True)
 class OPDModelConfig:
-    student: str = "mii-llm/nesso-0.4B-agentic"
-    teacher: str = "Coloss/nesso-3B"
+    # No defaults on purpose: the student/teacher pair is the experiment's
+    # central decision. See configs/distill_opd.yaml for a worked example.
+    student: str = ""
+    teacher: str = ""
     # Teacher placement; empty = same device as the student. On a multi-GPU
     # node "cuda:1" removes the largest memory consumer from the student's GPU.
     teacher_device: str = ""
@@ -184,6 +186,11 @@ class OPDConfig:
         errors: list[str] = []
         warnings: list[str] = []
 
+        if not self.model.student or not self.model.teacher:
+            errors.append(
+                "model.student and model.teacher are required (there are no defaults — "
+                "see configs/distill_opd.yaml for a worked example)."
+            )
         if self.data.format not in ("mcqa", "messages"):
             errors.append(f"data.format must be 'mcqa' or 'messages', got {self.data.format!r}")
         for name in ("fast_template", "cot_template"):
