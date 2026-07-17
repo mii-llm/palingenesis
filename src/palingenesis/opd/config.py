@@ -192,7 +192,8 @@ class OPDConfig:
                 "the remainder is the zero-shot probability."
             )
 
-        if self.sampling.group_size > 1 and self.sampling.cot_fraction == 0.0:
+        if self.data.format == "mcqa" and self.sampling.group_size > 1 and self.sampling.cot_fraction == 0.0:
+            # mcqa-only: for messages-format long completions, groups add useful diversity
             warnings.append(
                 "sampling.group_size > 1 with cot_fraction=0: fast-mode completions are "
                 "~1 token, so extra rollouts per prompt add cost without signal."
