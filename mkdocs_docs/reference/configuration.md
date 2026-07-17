@@ -238,3 +238,77 @@ pgs train --config base.yaml \
 ```
 
 Overrides are applied after the YAML is loaded.
+
+---
+
+## Distillation config (`pgs distill`)
+
+`pgs distill` and `pgs distill-score` use their own config (`OPDConfig`) with the same YAML + `--section.field` override mechanics. Example files: `configs/distill_opd.yaml` (multiple choice), `configs/distill_chat.yaml` (generic chat).
+
+### model
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `student` | str | — | Student model (trained; fp32 weights + bf16 autocast). |
+| `teacher` | str | — | Teacher model (frozen, bf16). Vocab must be a prefix of the student's. |
+| `teacher_device` | str | `""` | Teacher placement; empty = student's device, `"cuda:1"` on multi-GPU nodes. |
+| `gradient_checkpointing` | bool | `true` | Recompute student activations; needed for a 0.4B+3B pair at batch 32 on 80 GB. |
+
+### bridge
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `eos_map` | dict | `{}` | Student→teacher end-of-turn token map, e.g. `{"<\|im_end\|>": "<\|eot_id\|>"}`. Empty = auto from configured eos tokens (set explicitly for base-model teachers). |
+| `extra_stop_tokens` | list | `[]` | Additional student tokens that terminate a completion. |
+| `probe_texts` | list | `[]` | Extra texts checked for identical tokenization before weights load. |
+
+### data
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `format` | str | `mcqa` | Prompt source: `mcqa` (pool-row JSONL, letter-accuracy dev metric) or `messages` (chat JSONL, held-out reverse-KL dev metric). |
+| `prompts_path` | str | — | Prompt file for the selected format. |
+| `dev_size` | int | `500` | Held-out dev rows (deterministic hash-ranked split, unique questions). |
+| `system_message` | str | `""` | System message for rendered prompts (mcqa; empty = template default). |
+| `shots_path` | str | `""` | mcqa: the benchmark's official few-shot file. |
+| `p_reference_shots` | float | `0.5` | mcqa: probability of rendering with the official shots. |
+| `p_pool_shots` | float | `0.25` | mcqa: probability of 1–k random pool shots; remainder is zero-shot. |
+| `pool_shots_max_k` | int | `5` | mcqa: max k for the pool-shot regime. |
+
+### sampling
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `batch_prompts` | int | `32` | Prompts per optimizer step. |
+| `group_size` | int | `1` | Rollouts per prompt (useful diversity for long completions). |
+| `temperature` | float | `1.0` | On-policy sampling temperature. |
+| `max_new_tokens` | int | `16` | Completion budget (mcqa fast mode / messages). |
+| `cot_fraction` | float | `0.0` | mcqa: fraction of prompts using the CoT template. |
+| `cot_max_new_tokens` | int | `300` | mcqa: completion budget for CoT prompts. |
+| `gen_micro_seqs` | int | `64` | Sequences per generate() call. |
+
+### train
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `output_dir` | str | `./runs/opd` | Checkpoints + `opd_config.json` provenance. |
+| `steps` | int | `2000` | Optimizer steps (one per sampled batch). |
+| `learning_rate` | float | `1e-5` | AdamW, no weight decay. |
+| `warmup_steps` | int | `50` | Linear warmup. |
+| `lr_scheduler` | str | `cosine` | `cosine` or `constant`. |
+| `max_grad_norm` | float | `1.0` | Gradient clipping. |
+| `loss_fn` | str | `full_kl` | `full_kl` (full-distribution reverse KL) or `sampled_rkl` (tinker-style REINFORCE). |
+| `score_micro_seqs` | int | `8` | Sequences per scoring forward; grad accumulation keeps the math identical. |
+| `eval_every` | int | `200` | Source dev metric every N steps (0 = off). |
+| `eval_dev_samples` | int | `200` | Dev rows per evaluation. |
+| `save_steps` | int | `500` | Checkpoint every N steps (0 = final only). |
+| `keep_checkpoints` | int | `3` | Newest `step_*` dirs kept (0 = keep all; `final` exempt). |
+
+### logging
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `log_every` | int | `10` | Train-metric cadence (kl/tok, sampled_kl, length, source stats). |
+| `use_wandb` | bool | `false` | Mirror metrics to wandb; failures degrade to console, never kill the run. |
+| `project` | str | `palingenesis-opd` | wandb project. |
+| `run_name` | str | `""` | wandb run name (empty = auto). |

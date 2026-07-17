@@ -519,3 +519,66 @@ data.max_seq_length: 8192
 train.learning_rate: 1e-5
 train.optimizer: lion8bit       # Memory constrained
 ```
+
+## Example 6: On-Policy Distillation into a Small Student
+
+**Goal**: Lift a 0.4B student toward a 3B teacher on an MCQA benchmark (real case: nesso-0.4B-agentic on ITALIC, official score 33.1% → 37.2%).
+
+### Step 1: Annotate the pool with the teacher's answers
+
+Pure reverse KL distills the teacher's *errors* too — the teacher's accuracy becomes a hard ceiling. Score first, filter before training:
+
+```bash
+pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
+# -> each row gains teacher_answer / teacher_correct (one forward per row, ~2h for 110k on an A100)
+```
+
+Then apply your policy (drop wrong rows, reweight weak domains) with a small script — the annotation is mechanism, the filtering is your call.
+
+### Step 2: Train
+
+```yaml
+# configs/distill_opd.yaml (the winning knobs)
+model:
+  student: mii-llm/nesso-0.4B-agentic
+  teacher: Coloss/nesso-3B
+  gradient_checkpointing: true     # 0.4B student + 3B teacher on one 80GB GPU
+
+bridge:
+  eos_map: {"<|im_end|>": "<|eot_id|>"}   # ChatML student <- Llama-3 teacher
+  extra_stop_tokens: ["<|end_of_text|>"]
+
+data:
+  prompts_path: data/prompts_filtered.jsonl
+  p_reference_shots: 0.8           # train mostly on the benchmark's exact shot prefix
+  shots_path: data/5_shots.jsonl
+
+sampling:
+  max_new_tokens: 8                # terse supervision: no verbosity drift, no misparse tax
+
+train:
+  steps: 600
+  score_micro_seqs: 8              # memory knob; grad accumulation keeps the math identical
+  eval_every: 50
+  save_steps: 50
+```
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True pgs distill --config configs/distill_opd.yaml
+```
+
+### Step 3: Pick the checkpoint by dev accuracy, not KL
+
+KL keeps falling long after accuracy stops improving. With a teacher-correct-filtered pool the dev accuracy climbs monotonically instead of plateauing early — checkpoint densely and evaluate the top candidates on the real benchmark.
+
+### Results (ITALIC, official harness, full 10k)
+
+| Configuration | Score |
+|---|---:|
+| Baseline student | 33.1% |
+| + on-policy KL, unfiltered pool | ~34.4% |
+| + fast-only supervision | ~35.4%* |
+| + teacher-correct filter, shot matching, terse budget | **37.2%** |
+| Teacher (ceiling for pure KL) | 50.7% |
+
+*informal harness. The same pipeline runs on generic chat data with `data.format: messages` (`configs/distill_chat.yaml`) — dev metric becomes held-out reverse KL.
