@@ -56,6 +56,11 @@ class PromptSource(Protocol):
         """Per-batch stats from (meta, decoded_completion) pairs. May be {}."""
 
 
+def mcqa_templates(config: OPDConfig) -> tuple[str | None, str | None]:
+    """(fast, cot) templates from the config; None = the library defaults."""
+    return config.data.fast_template or None, config.data.cot_template or None
+
+
 def build_source(config: OPDConfig, rng: random.Random) -> "McqaPoolSource | ChatMessagesSource":
     if config.data.format == "mcqa":
         return McqaPoolSource(config, rng)
@@ -74,6 +79,7 @@ class McqaPoolSource:
         self.train_rows, self.dev_rows = split_pool(pool, config.data.dev_size, config.train.seed)
         logger.info("Pool: %d train / %d dev", len(self.train_rows), len(self.dev_rows))
         self.reference_shots = load_reference_shots(config.data.shots_path) if config.data.shots_path else []
+        self.fast_template, self.cot_template = mcqa_templates(config)
         self.renderer = PromptRenderer(
             self.train_rows,
             self.reference_shots,
@@ -82,6 +88,8 @@ class McqaPoolSource:
             pool_shots_max_k=config.data.pool_shots_max_k,
             cot_fraction=config.sampling.cot_fraction,
             system_message=config.data.system_message or None,
+            fast_template=self.fast_template,
+            cot_template=self.cot_template,
             rng=rng,
         )
 
@@ -95,7 +103,8 @@ class McqaPoolSource:
         rows = self.dev_rows[: self.config.train.eval_dev_samples]
         prompts = [
             build_messages(r, few_shots=self.reference_shots, fast=True,
-                           system_message=self.config.data.system_message or None)
+                           system_message=self.config.data.system_message or None,
+                           template=self.fast_template)
             for r in rows
         ]
         texts = engine.greedy_generate(prompts, max_new_tokens=8)

@@ -222,18 +222,65 @@ ROW = {"question": "Chi scrisse la Divina Commedia?",
        "answer": "A", "category": "letteratura"}
 
 
-def test_fast_template_matches_benchmark_format():
+def test_default_templates_are_neutral_english():
     from palingenesis.opd.formatting import build_user_query
 
     q = build_user_query(ROW, fast=True)
-    assert q.startswith("Rispondi alla seguente domanda a scelta multipla sull'argomento 'letteratura'.")
+    assert q.startswith("Answer the following multiple-choice question about 'letteratura'.")
     assert "A) Dante\nB) Petrarca" in q
-    assert "una tra AB" in q
-    assert q.endswith("Risposta:")
+    assert "one of AB" in q
+    assert q.endswith("Answer:")
 
     cot = build_user_query(ROW, fast=False)
-    assert "'Risposta: LETTERA'" in cot
-    assert not cot.endswith("Risposta:")
+    assert "'Answer: LETTER'" in cot
+    assert not cot.endswith("Answer:")
+
+
+def test_italic_config_templates_render_verbatim():
+    """The example config carries ITALIC's exact prompt bytes — the benchmark
+    policy lives in the config, and this locks the reproduction path."""
+    from pathlib import Path
+
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.opd.formatting import build_user_query
+    from palingenesis.opd.sources import mcqa_templates
+
+    config = OPDConfig.from_yaml(Path(__file__).parent.parent / "configs" / "distill_opd.yaml")
+    assert config.validate() == []
+    fast, cot = mcqa_templates(config)
+    assert config.data.system_message == "Sei un assistente utile."
+
+    assert build_user_query(ROW, fast=True, template=fast) == (
+        "Rispondi alla seguente domanda a scelta multipla sull'argomento 'letteratura'. "
+        "La tua risposta deve essere nel seguente formato: 'LETTERA' (senza virgolette) "
+        "dove LETTERA è una tra AB. Scrivi solo la lettera corrispondente alla tua "
+        "risposta senza spiegazioni.\n\nChi scrisse la Divina Commedia?\n\n"
+        "A) Dante\nB) Petrarca\n\nRisposta:"
+    )
+    assert build_user_query(ROW, fast=False, template=cot) == (
+        "Rispondi alla seguente domanda a scelta multipla sull'argomento 'letteratura'. "
+        "L'ultima riga della tua risposta deve essere nel seguente formato: "
+        "'Risposta: LETTERA' (senza virgolette) dove LETTERA è una tra AB. "
+        "Ragiona brevemente prima di rispondere.\n\nChi scrisse la Divina Commedia?\n\n"
+        "A) Dante\nB) Petrarca"
+    )
+
+
+def test_template_placeholder_validation():
+    from palingenesis.opd.config import OPDConfig, OPDConfigError
+
+    config = OPDConfig()
+    config.data.shots_path = "shots.jsonl"
+    config.data.fast_template = "{question}\n{options}\n{merged_letters}"
+    assert config.validate() == []
+
+    config.data.fast_template = "{question}\n{options}\n{answer_key}"  # unknown field
+    with pytest.raises(OPDConfigError, match="unknown placeholders"):
+        config.validate()
+
+    config.data.fast_template = "{question} only"  # missing {options}
+    with pytest.raises(OPDConfigError, match="missing required"):
+        config.validate()
 
 
 def test_build_messages_structure():

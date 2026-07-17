@@ -269,7 +269,9 @@ Overrides are applied after the YAML is loaded.
 | `format` | str | `mcqa` | Prompt source: `mcqa` (pool-row JSONL, letter-accuracy dev metric) or `messages` (chat JSONL, held-out reverse-KL dev metric). |
 | `prompts_path` | str | — | Prompt file for the selected format. |
 | `dev_size` | int | `500` | Held-out dev rows (deterministic hash-ranked split, unique questions). |
-| `system_message` | str | `""` | System message for rendered prompts (mcqa; empty = template default). |
+| `system_message` | str | `""` | System message for rendered prompts (mcqa; empty = library default). |
+| `fast_template` | str | `""` | mcqa: fast-mode prompt template — put the benchmark's *verbatim* template here (empty = neutral English default). Placeholders `{question}`/`{options}` required, `{topic}`/`{merged_letters}` optional; validated at startup. |
+| `cot_template` | str | `""` | mcqa: CoT-mode prompt template, same rules. |
 | `shots_path` | str | `""` | mcqa: the benchmark's official few-shot file. |
 | `p_reference_shots` | float | `0.5` | mcqa: probability of rendering with the official shots. |
 | `p_pool_shots` | float | `0.25` | mcqa: probability of 1–k random pool shots; remainder is zero-shot. |

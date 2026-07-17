@@ -52,6 +52,13 @@ class OPDDataConfig:
     # System message for rendered prompts (mcqa; empty = the template default).
     system_message: str = ""
     # ---- mcqa-only fields ----
+    # Prompt templates (empty = the library's neutral English defaults). To
+    # train against a specific benchmark, put its VERBATIM templates here —
+    # exact prompt bytes are policy, and they belong in the config (see
+    # configs/distill_opd.yaml for ITALIC's). Placeholders: {question} and
+    # {options} required; {topic} and {merged_letters} optional.
+    fast_template: str = ""
+    cot_template: str = ""
     # The benchmark's official few-shot file (empty = pool/zero-shot regimes only).
     shots_path: str = ""
     # Shot-regime mixture per sampled prompt: reference shots / k pool shots /
@@ -179,6 +186,10 @@ class OPDConfig:
 
         if self.data.format not in ("mcqa", "messages"):
             errors.append(f"data.format must be 'mcqa' or 'messages', got {self.data.format!r}")
+        for name in ("fast_template", "cot_template"):
+            template = getattr(self.data, name)
+            if template:
+                errors.extend(_check_template(f"data.{name}", template))
         if self.train.loss_fn not in ("full_kl", "sampled_rkl"):
             errors.append(f"train.loss_fn must be 'full_kl' or 'sampled_rkl', got {self.train.loss_fn!r}")
         if self.train.lr_scheduler not in ("cosine", "constant"):
@@ -218,3 +229,24 @@ class OPDConfig:
 
 class OPDConfigError(Exception):
     """Raised when the OPD config has hard incompatibilities that prevent safe training."""
+
+
+_TEMPLATE_FIELDS_REQUIRED = {"question", "options"}
+_TEMPLATE_FIELDS_ALLOWED = _TEMPLATE_FIELDS_REQUIRED | {"topic", "merged_letters"}
+
+
+def _check_template(name: str, template: str) -> list[str]:
+    """Validate a prompt template's placeholders (str.format would KeyError at train time)."""
+    import string as _string
+
+    try:
+        fields = {f for _, f, _, _ in _string.Formatter().parse(template) if f}
+    except ValueError as e:
+        return [f"{name} is not a valid format string: {e}"]
+    errors = []
+    if unknown := fields - _TEMPLATE_FIELDS_ALLOWED:
+        errors.append(f"{name} has unknown placeholders {sorted(unknown)}; "
+                      f"allowed: {sorted(_TEMPLATE_FIELDS_ALLOWED)}. Escape literal braces as '{{{{'.")
+    if missing := _TEMPLATE_FIELDS_REQUIRED - fields:
+        errors.append(f"{name} is missing required placeholders {sorted(missing)}.")
+    return errors

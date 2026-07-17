@@ -552,6 +552,9 @@ data:
   prompts_path: data/prompts_filtered.jsonl
   p_reference_shots: 0.8           # train mostly on the benchmark's exact shot prefix
   shots_path: data/5_shots.jsonl
+  # plus the benchmark's VERBATIM templates + system message via
+  # data.fast_template / data.cot_template — exact prompt bytes are policy,
+  # so they live in the config (see configs/distill_opd.yaml for ITALIC's)
 
 sampling:
   max_new_tokens: 8                # terse supervision: no verbosity drift, no misparse tax

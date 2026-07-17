@@ -42,6 +42,7 @@ from transformers import AutoTokenizer
 from palingenesis.opd.config import OPDConfig
 from palingenesis.opd.formatting import build_messages, letter_token_ids, load_reference_shots
 from palingenesis.opd.pool import load_pool
+from palingenesis.opd.sources import mcqa_templates
 from palingenesis.opd.trainer import OPDTrainer, load_causal_lm, pick_device
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,8 @@ logger = logging.getLogger(__name__)
 
 @torch.no_grad()
 def score_rows(model, tok, rows, shots, letter_ids, batch_size: int, device: str,
-               system_message: str | None = None, log_every: int = 50):
+               system_message: str | None = None, template: str | None = None,
+               log_every: int = 50):
     """Yield rows annotated with teacher_answer / teacher_correct."""
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     t0 = time.time()
@@ -57,7 +59,8 @@ def score_rows(model, tok, rows, shots, letter_ids, batch_size: int, device: str
         chunk = rows[start : start + batch_size]
         prompts = [
             OPDTrainer._encode_prompt(
-                tok, build_messages(r, few_shots=shots, fast=True, system_message=system_message)
+                tok, build_messages(r, few_shots=shots, fast=True,
+                                    system_message=system_message, template=template)
             )
             for r in chunk
         ]
@@ -116,6 +119,7 @@ def main():
         for i, scored in enumerate(score_rows(
             model, tok, rows, shots, letter_ids, args.batch_size, device,
             system_message=config.data.system_message or None,
+            template=mcqa_templates(config)[0],
         )):
             n_correct += scored["teacher_correct"]
             f.write(json.dumps(scored, ensure_ascii=False) + "\n")

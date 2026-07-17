@@ -97,7 +97,7 @@ Each training prompt is rendered with a randomized shot regime (`formatting.Prom
 | 1–k pool shots | `data.p_pool_shots` | format generalization |
 | zero-shot | remainder | robustness |
 
-The default templates are byte-identical to the ITALIC benchmark's `run_eval.py` (fast mode: answer with a bare letter; CoT mode: reason, then `Risposta: LETTERA`). Both are overridable per call for other benchmarks.
+Prompt templates are **config, not code**: training against a benchmark means training on its *exact* prompt bytes, and that's policy. Set `data.fast_template` / `data.cot_template` / `data.system_message` to the benchmark's verbatim templates (placeholders: `{question}`, `{options}` required; `{topic}`, `{merged_letters}` optional — validated at startup). The library defaults are neutral English MCQA templates; `configs/distill_opd.yaml` carries ITALIC's verbatim Italian ones, byte-locked by a test.
 
 ## Memory
 

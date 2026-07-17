@@ -34,6 +34,24 @@ data:
   p_reference_shots: 0.5
   p_pool_shots: 0.25
   pool_shots_max_k: 5
+  # ITALIC's VERBATIM prompts (Crisp-Unimib/ITALIC run_eval.py). Training on
+  # the benchmark's exact bytes is policy, so it lives here — the library
+  # defaults are neutral English templates.
+  system_message: "Sei un assistente utile."
+  fast_template: |-
+    Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. La tua risposta deve essere nel seguente formato: 'LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Scrivi solo la lettera corrispondente alla tua risposta senza spiegazioni.
+
+    {question}
+
+    {options}
+
+    Risposta:
+  cot_template: |-
+    Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. L'ultima riga della tua risposta deve essere nel seguente formato: 'Risposta: LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Ragiona brevemente prima di rispondere.
+
+    {question}
+
+    {options}
 
 sampling:
   batch_prompts: 32

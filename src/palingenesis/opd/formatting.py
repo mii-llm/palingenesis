@@ -1,10 +1,12 @@
 """Multiple-choice prompt construction and shot-regime sampling for OPD.
 
-The default templates are byte-identical to the ITALIC benchmark's
-run_eval.py (Crisp-Unimib/ITALIC) so the training distribution matches that
-harness's exact prompt format. Both templates (and the system message) can be
-overridden per call for other benchmarks — the required placeholders are
-``{topic}``, ``{question}``, ``{options}`` and ``{merged_letters}``.
+The templates below are neutral library defaults. Distillation against a
+specific benchmark should train on that benchmark's *exact* prompt bytes —
+which is policy, so verbatim benchmark templates belong in the config
+(``data.fast_template`` / ``data.cot_template`` / ``data.system_message``),
+not here. See ``configs/distill_opd.yaml`` for a worked example carrying
+ITALIC's verbatim templates. Placeholders: ``{question}`` and ``{options}``
+(required), ``{topic}`` and ``{merged_letters}`` (optional).
 """
 
 from __future__ import annotations
@@ -14,10 +16,10 @@ import random
 import re
 from typing import Any
 
-DEFAULT_SYSTEM_MESSAGE = "Sei un assistente utile."
+DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 
 QUERY_TEMPLATE_MULTICHOICE = """
-Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. L'ultima riga della tua risposta deve essere nel seguente formato: 'Risposta: LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Ragiona brevemente prima di rispondere.
+Answer the following multiple-choice question about '{topic}'. The last line of your answer must have the following format: 'Answer: LETTER' (without quotes) where LETTER is one of {merged_letters}. Think briefly before answering.
 
 {question}
 
@@ -25,13 +27,13 @@ Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. L'ult
 """.strip()
 
 QUERY_TEMPLATE_MULTICHOICE_FAST = """
-Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. La tua risposta deve essere nel seguente formato: 'LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Scrivi solo la lettera corrispondente alla tua risposta senza spiegazioni.
+Answer the following multiple-choice question about '{topic}'. Your answer must have the following format: 'LETTER' (without quotes) where LETTER is one of {merged_letters}. Write only the letter of your answer, with no explanation.
 
 {question}
 
 {options}
 
-Risposta:
+Answer:
 """.strip()
 
 LETTER_RE = re.compile(r"\b([A-J])\b")
@@ -84,15 +86,20 @@ def build_messages(
     few_shots: list[dict[str, Any]] | None = None,
     fast: bool = True,
     system_message: str | None = None,
+    template: str | None = None,
 ) -> list[dict[str, str]]:
-    """Full chat message list in the benchmark's structure: system, k few-shot turns, question."""
+    """Full chat message list in the benchmark's structure: system, k few-shot turns, question.
+
+    `template` (if given) renders both the few-shot turns and the final
+    question — one mode, one template, so shots match the question format.
+    """
     messages = [{"role": "system", "content": system_message or DEFAULT_SYSTEM_MESSAGE}]
     for shot in few_shots or []:
-        messages.append({"role": "user", "content": build_user_query(shot, fast=fast)})
+        messages.append({"role": "user", "content": build_user_query(shot, fast=fast, template=template)})
         # Fast-mode shots answer with the bare letter; CoT shots too (reference
         # shot files typically only store the letter).
         messages.append({"role": "assistant", "content": shot["answer"]})
-    messages.append({"role": "user", "content": build_user_query(row, fast=fast)})
+    messages.append({"role": "user", "content": build_user_query(row, fast=fast, template=template)})
     return messages
 
 
@@ -142,6 +149,8 @@ class PromptRenderer:
         pool_shots_max_k: int = 5,
         cot_fraction: float = 0.0,
         system_message: str | None = None,
+        fast_template: str | None = None,
+        cot_template: str | None = None,
         rng: random.Random | None = None,
     ):
         self.pool_rows = pool_rows
@@ -151,6 +160,8 @@ class PromptRenderer:
         self.pool_shots_max_k = pool_shots_max_k
         self.cot_fraction = cot_fraction
         self.system_message = system_message
+        self.fast_template = fast_template
+        self.cot_template = cot_template
         self.rng = rng or random.Random(0)
 
     def sample(self) -> tuple[list[dict[str, str]], dict[str, Any], bool]:
@@ -165,5 +176,8 @@ class PromptRenderer:
             shots = [s for s in self.rng.sample(self.pool_rows, k + 1) if s is not row][:k]
         else:
             shots = []
-        messages = build_messages(row, few_shots=shots, fast=fast, system_message=self.system_message)
+        messages = build_messages(
+            row, few_shots=shots, fast=fast, system_message=self.system_message,
+            template=self.fast_template if fast else self.cot_template,
+        )
         return messages, row, fast
