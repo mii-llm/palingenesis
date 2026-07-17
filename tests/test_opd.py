@@ -158,6 +158,23 @@ def test_split_pool_deterministic_and_disjoint():
     assert all(question_hash(r["question"]) not in dev_hashes for r in train1)
 
 
+def test_split_pool_with_duplicated_rows():
+    """Upweighted (duplicated) pools: dev stays unique, no dev question leaks into train."""
+    from palingenesis.opd.pool import question_hash, split_pool
+
+    rows = [{"question": f"q{i}", "options": [("A", "x"), ("B", "y")], "answer": "A"}
+            for i in range(30)]
+    duplicated = rows + rows[:15] * 3  # upweight the first 15 questions x4
+    train, dev = split_pool(duplicated, dev_size=10)
+
+    dev_questions = [r["question"] for r in dev]
+    assert len(dev_questions) == len(set(dev_questions)) == 10
+    dev_hashes = {question_hash(q) for q in dev_questions}
+    assert all(question_hash(r["question"]) not in dev_hashes for r in train)
+    # train keeps the duplicates of non-dev questions (that's the upweighting)
+    assert len(train) > 30 - 10
+
+
 def test_pool_roundtrip(tmp_path):
     from palingenesis.opd.pool import load_pool, write_pool
 

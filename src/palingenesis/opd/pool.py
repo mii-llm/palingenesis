@@ -133,9 +133,17 @@ def load_pool(path: str) -> list[dict[str, Any]]:
 
 
 def split_pool(rows: list[dict[str, Any]], dev_size: int = 500, seed: int = 0):
-    """Deterministic train/dev split by question hash (stable across runs)."""
-    ranked = sorted(rows, key=lambda r: question_hash(r["question"]))
-    dev = ranked[:dev_size]
-    dev_hashes = {question_hash(r["question"]) for r in dev}
-    train = [r for r in rows if question_hash(r["question"]) not in dev_hashes]
+    """Deterministic train/dev split by question hash (stable across runs and input order).
+
+    Dev rows are unique by question hash, so a pool with duplicated rows
+    (upweighting by repetition is a legitimate reweighting strategy) can
+    neither fill dev with copies of one question nor leak a dev question
+    into train through its duplicates.
+    """
+    by_hash: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        by_hash.setdefault(question_hash(r["question"]), r)
+    dev_hashes = sorted(by_hash)[:dev_size]
+    dev = [by_hash[h] for h in dev_hashes]
+    train = [r for r in rows if question_hash(r["question"]) not in set(dev_hashes)]
     return train, dev
