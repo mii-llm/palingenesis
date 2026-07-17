@@ -43,6 +43,23 @@ def extract_letter(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def letter_token_ids(tok, letters: str = "ABCDEFGHIJ") -> dict[str, int]:
+    """Token id of each bare option letter (the first completion token in fast mode).
+
+    Raises if a letter does not encode to a single token — single-forward
+    scoring (see score_pool) reads exactly one logit per option, so a
+    multi-token letter would silently score garbage.
+    """
+    ids: dict[str, int] = {}
+    for letter in letters:
+        enc = tok.encode(letter, add_special_tokens=False)
+        if len(enc) != 1:
+            raise ValueError(f"option letter {letter!r} encodes to {len(enc)} tokens; "
+                             "single-forward scoring requires single-token letters")
+        ids[letter] = enc[0]
+    return ids
+
+
 def format_options(options: list[tuple[str, str]]) -> tuple[str, str]:
     """options: [("A", "text"), ...] -> ("A) text\\nB) ...", "ABCD")"""
     formatted = "\n".join(f"{letter}) {text}" for letter, text in options)

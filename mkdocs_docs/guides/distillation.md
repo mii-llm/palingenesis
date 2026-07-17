@@ -54,6 +54,22 @@ A compatibility check runs before any weights load and raises if the two tokeniz
     accent-stripped, alphanumeric-only) so you can reject anything that appears
     in the benchmark before it enters the pool.
 
+## Don't distill the teacher's mistakes
+
+The teacher's accuracy is a hard ceiling for pure KL — and half of a mediocre teacher's supervision actively pulls the student toward wrong answers. When your pool has verifiable answers, score it with the teacher first and filter:
+
+```bash
+pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
+```
+
+Every row comes back annotated with `teacher_answer` and `teacher_correct` — one batched forward per row (the answer is read from the option-letter logits, no generation, no parsing). What you do with the annotations — drop wrong rows, downweight them, rebalance — is your call, in the same score-then-select spirit as `pgs prepare`.
+
+!!! note "Current scope"
+    The OPD engine (token bridge, on-policy sampling, reverse-KL loss) is
+    task-agnostic; the shipped data layer targets multiple-choice QA pools.
+    Generic prompt sources (`messages` JSONL, pluggable dev metric) are the
+    planned next step.
+
 ## What to watch
 
 | Metric | Healthy |

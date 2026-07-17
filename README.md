@@ -81,10 +81,11 @@ pgs autopilot --model Qwen/Qwen3.5-4B --dataset your_data.jsonl
 Shrink a teacher into a student by scoring the student's **own samples** — full-distribution reverse KL, no train/inference mismatch. Works across mismatched chat templates (e.g. ChatML student ← Llama-3-template teacher) as long as the pair shares a base vocabulary; the token bridge maps end-of-turn tokens so the teacher also supervises *when to stop*.
 
 ```bash
-pgs distill --config configs/distill_opd.yaml
+pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl  # annotate pool with teacher answers
+pgs distill       --config configs/distill_opd.yaml
 ```
 
-See [docs/on_policy_distillation.md](docs/on_policy_distillation.md).
+`distill-score` marks every pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. See [docs/on_policy_distillation.md](docs/on_policy_distillation.md).
 
 ## Multi-GPU / Multi-Node
 

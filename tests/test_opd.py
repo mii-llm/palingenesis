@@ -265,6 +265,24 @@ def test_extract_letter():
     assert extract_letter("nessuna lettera") is None
 
 
+def test_letter_token_ids():
+    from palingenesis.opd.formatting import letter_token_ids
+
+    class SingleTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(text)]
+
+    ids = letter_token_ids(SingleTokenizer(), letters="ABC")
+    assert ids == {"A": 65, "B": 66, "C": 67}
+
+    class MultiTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+    with pytest.raises(ValueError, match="single-token"):
+        letter_token_ids(MultiTokenizer(), letters="A")
+
+
 def test_load_reference_shots_both_layouts(tmp_path):
     from palingenesis.opd.formatting import load_reference_shots
 

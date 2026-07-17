@@ -4,12 +4,17 @@
 #
 #   pgs distill --config configs/distill_opd.yaml
 #   pgs distill --config configs/distill_opd.yaml --train.learning_rate 5e-6
+#
+# Optional but recommended first step — annotate the pool with the teacher's
+# own answers, then filter/reweight before training (don't distill errors):
+#   pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
 
 model:
   student: mii-llm/nesso-0.4B-agentic
   teacher: Coloss/nesso-3B
   # teacher_device: "cuda:1"      # uncomment on a multi-GPU node
-  gradient_checkpointing: false   # enable if student + teacher OOM one GPU
+  gradient_checkpointing: true    # with batch_prompts 32 the student scoring
+                                  # forward OOMs an 80GB A100 without this
 
 bridge:
   # Student <|im_end|> and teacher <|eot_id|> both mean "end of turn": the
@@ -48,8 +53,10 @@ train:
   max_grad_norm: 1.0
   loss_fn: full_kl       # or sampled_rkl (tinker-style REINFORCE on sampled tokens)
   seed: 0
-  score_micro_seqs: 32   # memory knob: sequences per scoring forward. On an 80GB
-                         # A100 with cot_fraction > 0, drop to 8 and also set
+  score_micro_seqs: 8    # memory knob: sequences per scoring forward (grad accum
+                         # keeps the math identical). 8 + gradient_checkpointing
+                         # holds a 0.4B student + 3B teacher at ~24GB of an A100;
+                         # 32 OOMs. Also set
                          # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   eval_every: 200
   eval_dev_samples: 200

@@ -3,11 +3,14 @@
 Distill a large teacher into a small student by scoring the student's **own samples** — not a fixed dataset of teacher outputs.
 
 ```bash
-pgs distill --config configs/distill_opd.yaml
-pgs distill --config configs/distill_opd.yaml --train.learning_rate 5e-6 --train.steps 3000
+pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl  # optional: annotate pool with teacher answers
+pgs distill       --config configs/distill_opd.yaml
+pgs distill       --config configs/distill_opd.yaml --train.learning_rate 5e-6 --train.steps 3000
 ```
 
-Package: `palingenesis.opd` (`config.py`, `trainer.py`, `token_bridge.py`, `formatting.py`, `pool.py`).
+Package: `palingenesis.opd` (`config.py`, `trainer.py`, `token_bridge.py`, `formatting.py`, `pool.py`, `score_pool.py`).
+
+**Current scope**: the *engine* (token bridge, on-policy sampling, reverse-KL scoring loss, checkpointing) is task-agnostic; the *data layer* (pool schema, prompt templates, shot regimes, dev metric) currently assumes multiple-choice QA pools. Generic prompt sources (a JSONL of `messages` with a pluggable dev metric) are the planned next step — the MCQA layer will become one implementation of that interface.
 
 ## Why on-policy
 
@@ -59,6 +62,18 @@ The pool is a JSONL of multiple-choice rows (`palingenesis.opd.pool`):
 
 The train/dev split is deterministic by question hash — stable across runs and input order.
 
+## Teacher-correct filtering (`pgs distill-score`)
+
+Reverse KL transfers the teacher's *errors* along with its knowledge: on a pool where the teacher is right half the time, half the supervision pulls the student toward wrong answers, and the teacher's accuracy is a hard ceiling. When the pool has verifiable answers, annotate it with the teacher's own answer first:
+
+```bash
+pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
+```
+
+Each row is written back with `teacher_answer` (the option letter the teacher assigns the highest logit) and `teacher_correct`. The module only annotates — dropping incorrect rows, downweighting them, or rebalancing categories is downstream policy, same as the score-then-select flow of `pgs prepare` on the SFT side.
+
+Scoring is one batched forward per row, no generation: the fast-mode prompt ends right before the answer, so the teacher's choice is read from the option-letter logits at the final prompt position. No decoding loop, no format parsing, no unparseable outputs. ~110k rows with 5-shot prompts score in about an hour on an A100.
+
 Each training prompt is rendered with a randomized shot regime (`formatting.PromptRenderer`):
 
 | Regime | Probability | Purpose |
@@ -71,7 +86,7 @@ The default templates are byte-identical to the ITALIC benchmark's `run_eval.py`
 
 ## Memory
 
-Student (fp32 + bf16 autocast, gradients) and teacher (bf16, frozen) share one GPU by default. Logits are never materialized for the full sequence — hidden states are gathered at completion positions first, keeping the big tensor at `N_completion_tokens × vocab`. If you still OOM (typically with `cot_fraction > 0`, where completions are hundreds of tokens):
+Student (fp32 + bf16 autocast, gradients) and teacher (bf16, frozen) share one GPU by default. Logits are never materialized for the full sequence — hidden states are gathered at completion positions first, keeping the big tensor at `N_completion_tokens × vocab`. Validated reference point: a 0.4B student + 3B teacher at `batch_prompts 32` with 5-shot prompts needs `score_micro_seqs 8` + `gradient_checkpointing true` (~24 GB on an A100); `score_micro_seqs 32` OOMs the same 80 GB card in the student scoring forward. The knobs:
 
 | Knob | Effect |
 |------|--------|

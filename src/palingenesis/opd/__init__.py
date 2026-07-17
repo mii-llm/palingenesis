@@ -11,9 +11,14 @@ Works across a student/teacher pair with *different chat templates* as long as
 they share a base vocabulary: prompts are rendered per-model with each model's
 own template, and only completion tokens are aligned (see `token_bridge`).
 
+Current scope: the engine (token_bridge, on-policy sampling, reverse-KL loss)
+is task-agnostic; the data layer (pool, formatting, dev metric) targets
+multiple-choice QA pools. Generic prompt sources are the planned next step.
+
 Entry points:
-    pgs distill --config configs/distill_opd.yaml
-    python -m palingenesis.opd.trainer --config configs/distill_opd.yaml
+    pgs distill       --config configs/distill_opd.yaml   # train
+    pgs distill-score --config configs/distill_opd.yaml --out scored.jsonl  # annotate pool with teacher answers
+    python -m palingenesis.opd.trainer ... / python -m palingenesis.opd.score_pool ...
 """
 
 from palingenesis.opd.config import OPDConfig
