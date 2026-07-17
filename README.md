@@ -85,7 +85,7 @@ pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.js
 pgs distill       --config configs/distill_opd.yaml
 ```
 
-`distill-score` marks every pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. See [docs/on_policy_distillation.md](docs/on_policy_distillation.md).
+`distill-score` marks every pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. Works on multiple-choice pools (`data.format: mcqa`) and generic chat prompts (`data.format: messages`, see `configs/distill_chat.yaml`); custom tasks implement the three-method `PromptSource` protocol. See [docs/on_policy_distillation.md](docs/on_policy_distillation.md).
 
 ## Multi-GPU / Multi-Node
 

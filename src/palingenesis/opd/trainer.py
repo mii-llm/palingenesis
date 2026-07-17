@@ -38,8 +38,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from palingenesis.opd.config import OPDConfig
-from palingenesis.opd.formatting import PromptRenderer, build_messages, extract_letter, load_reference_shots
-from palingenesis.opd.pool import load_pool, split_pool
+from palingenesis.opd.sources import PromptSource, build_source
 from palingenesis.opd.token_bridge import TokenBridge, check_compatible
 
 logger = logging.getLogger(__name__)
@@ -62,7 +61,14 @@ def pick_device() -> str:
 
 
 class OPDTrainer:
-    def __init__(self, config: OPDConfig):
+    """The task-agnostic OPD engine; task-specific data lives in the source.
+
+    The source decides what to roll out and how to evaluate (see
+    opd.sources.PromptSource); the engine samples on-policy, teacher-scores,
+    and steps. Pass a custom source for tasks the built-ins don't cover.
+    """
+
+    def __init__(self, config: OPDConfig, source: PromptSource | None = None):
         self.config = config
         self.device = pick_device()
         self.teacher_device = config.model.teacher_device or self.device
@@ -91,21 +97,7 @@ class OPDTrainer:
         self.teacher = load_causal_lm(config.model.teacher, torch.bfloat16).to(self.teacher_device)
         self.teacher.eval().requires_grad_(False)
 
-        logger.info("Loading prompt pool from %s", config.data.prompts_path)
-        pool = load_pool(config.data.prompts_path)
-        self.train_rows, self.dev_rows = split_pool(pool, config.data.dev_size, config.train.seed)
-        logger.info("Pool: %d train / %d dev", len(self.train_rows), len(self.dev_rows))
-        self.reference_shots = load_reference_shots(config.data.shots_path) if config.data.shots_path else []
-        self.renderer = PromptRenderer(
-            self.train_rows,
-            self.reference_shots,
-            p_reference_shots=config.data.p_reference_shots,
-            p_pool_shots=config.data.p_pool_shots,
-            pool_shots_max_k=config.data.pool_shots_max_k,
-            cot_fraction=config.sampling.cot_fraction,
-            system_message=config.data.system_message or None,
-            rng=self.rng,
-        )
+        self.source = source or build_source(config, rng=self.rng)
 
         self.opt = torch.optim.AdamW(
             self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0
@@ -169,28 +161,63 @@ class OPDTrainer:
     # -------------------------------------------------------------- generation
 
     @torch.no_grad()
-    def _generate(self, prompt_ids: list[list[int]], max_new_tokens: int) -> list[list[int]]:
-        """Sample one completion per prompt (already replicated for group_size)."""
+    def _generate(self, prompt_ids: list[list[int]], max_new_tokens: int,
+                  greedy: bool = False) -> list[list[int]]:
+        """One completion per prompt (already replicated for group_size), cleaned."""
         sampling = self.config.sampling
         self.student.eval()
         completions: list[list[int]] = []
         for i in range(0, len(prompt_ids), sampling.gen_micro_seqs):
             chunk = prompt_ids[i : i + sampling.gen_micro_seqs]
             ids, mask, T = self._left_pad(chunk)
+            decode_kwargs = (
+                dict(do_sample=False) if greedy
+                else dict(do_sample=True, temperature=sampling.temperature, top_p=1.0, top_k=0)
+            )
             with torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16,
                                 enabled=self.device != "cpu"):
                 out = self.student.generate(
                     ids.to(self.device), attention_mask=mask.to(self.device),
-                    do_sample=True, temperature=sampling.temperature, top_p=1.0, top_k=0,
                     max_new_tokens=max_new_tokens,
                     eos_token_id=list(self.bridge.stop_ids),
                     pad_token_id=self.s_pad,
+                    **decode_kwargs,
                 )
             for j in range(len(chunk)):
                 raw = out[j, T:].tolist()
                 completions.append(self.bridge.clean_completion(raw))
         self.student.train()
         return completions
+
+    # ------------------------------------------------- engine services (sources)
+
+    def greedy_generate(self, messages_list, max_new_tokens: int) -> list[str]:
+        """Greedy-decode one completion per conversation, decoded (stop token trimmed)."""
+        prompts = [self._encode_prompt(self.s_tok, m) for m in messages_list]
+        comps = self._generate(prompts, max_new_tokens, greedy=True)
+        return [self.s_tok.decode(c[:-1] if c and c[-1] in self.bridge.stop_ids else c)
+                for c in comps]
+
+    @torch.no_grad()
+    def dev_kl(self, messages_list, max_new_tokens: int) -> dict[str, float]:
+        """On-policy sample + teacher-score held-out prompts; mean reverse KL/token."""
+        rollouts = []
+        s_prompts = [self._encode_prompt(self.s_tok, m) for m in messages_list]
+        t_prompts = [self._encode_prompt(self.t_tok, m) for m in messages_list]
+        comps = self._generate(s_prompts, max_new_tokens)
+        for s_p, t_p, comp in zip(s_prompts, t_prompts, comps):
+            if comp:
+                rollouts.append(({"s_prompt": s_p, "t_prompt": t_p}, comp))
+        if not rollouts:
+            return {"dev_kl": float("nan"), "dev_len": 0.0}
+        total_kl = total_tok = 0.0
+        for i in range(0, len(rollouts), self.config.train.score_micro_seqs):
+            chunk = rollouts[i : i + self.config.train.score_micro_seqs]
+            _, n_tok, stats = self._loss_on_chunk(*self._chunk_args(chunk))
+            total_kl += stats["kl"] * n_tok
+            total_tok += n_tok
+        return {"dev_kl": total_kl / total_tok,
+                "dev_len": total_tok / len(rollouts)}
 
     # ----------------------------------------------------------------- scoring
 
@@ -219,6 +246,19 @@ class OPDTrainer:
             h_sel = h.reshape(B * T, H)[torch.tensor(flat, device=device)]
             logits = model.lm_head(h_sel)  # (N, vocab)
         return logits
+
+    def _chunk_args(self, chunk):
+        """(rollout, completion) pairs -> _loss_on_chunk arguments."""
+        s_seqs, t_seqs, plens_s, plens_t, lens, targets = [], [], [], [], [], []
+        for b, comp in chunk:
+            comp_t = self.bridge.to_teacher(comp)
+            s_seqs.append(b["s_prompt"] + comp[:-1])
+            t_seqs.append(b["t_prompt"] + comp_t[:-1])
+            plens_s.append(len(b["s_prompt"]))
+            plens_t.append(len(b["t_prompt"]))
+            lens.append(len(comp))
+            targets.extend(comp_t)
+        return s_seqs, t_seqs, plens_s, plens_t, lens, targets
 
     def _loss_on_chunk(self, s_seqs, t_seqs, plens_s, plens_t, lens, targets_t):
         """Loss for a micro-batch of rollouts. Returns (loss, n_tokens, stats)."""
@@ -275,25 +315,22 @@ class OPDTrainer:
             for g in self.opt.param_groups:
                 g["lr"] = self._lr_at(step)
 
-            # 1. draw prompts, render for both models
+            # 1. draw prompts from the source, render for both models
             batch = []
             for _ in range(config.sampling.batch_prompts):
-                messages, row, fast = self.renderer.sample()
+                messages, mnt, meta = self.source.sample()
                 s_prompt = self._encode_prompt(self.s_tok, messages)
                 t_prompt = self._encode_prompt(self.t_tok, messages)
                 for _ in range(config.sampling.group_size):
                     batch.append({"s_prompt": s_prompt, "t_prompt": t_prompt,
-                                  "row": row, "fast": fast})
+                                  "mnt": mnt, "meta": meta})
 
-            # 2. student samples completions (on-policy)
-            fast_idx = [i for i, b in enumerate(batch) if b["fast"]]
-            cot_idx = [i for i, b in enumerate(batch) if not b["fast"]]
+            # 2. student samples completions (on-policy), grouped by length budget
             completions: dict[int, list[int]] = {}
-            for idx, mnt in ((fast_idx, config.sampling.max_new_tokens),
-                             (cot_idx, config.sampling.cot_max_new_tokens)):
-                if idx:
-                    comps = self._generate([batch[i]["s_prompt"] for i in idx], mnt)
-                    completions.update(dict(zip(idx, comps)))
+            for mnt in sorted({b["mnt"] for b in batch}):
+                idx = [i for i, b in enumerate(batch) if b["mnt"] == mnt]
+                comps = self._generate([batch[i]["s_prompt"] for i in idx], mnt)
+                completions.update(dict(zip(idx, comps)))
 
             rollouts = [(batch[i], completions[i]) for i in range(len(batch))
                         if len(completions[i]) > 0]
@@ -307,18 +344,7 @@ class OPDTrainer:
             agg = {"kl": 0.0, "sampled_kl": 0.0, "residual_mass": 0.0}
             for i in range(0, len(rollouts), config.train.score_micro_seqs):
                 chunk = rollouts[i : i + config.train.score_micro_seqs]
-                s_seqs, t_seqs, plens_s, plens_t, lens, targets = [], [], [], [], [], []
-                for b, comp in chunk:
-                    comp_t = self.bridge.to_teacher(comp)
-                    s_seqs.append(b["s_prompt"] + comp[:-1])
-                    t_seqs.append(b["t_prompt"] + comp_t[:-1])
-                    plens_s.append(len(b["s_prompt"]))
-                    plens_t.append(len(b["t_prompt"]))
-                    lens.append(len(comp))
-                    targets.extend(comp_t)
-                loss, n_tok, stats = self._loss_on_chunk(
-                    s_seqs, t_seqs, plens_s, plens_t, lens, targets
-                )
+                loss, n_tok, stats = self._loss_on_chunk(*self._chunk_args(chunk))
                 (loss / n_total).backward()
                 for k in agg:
                     agg[k] += stats[k] * n_tok / n_total
@@ -329,69 +355,42 @@ class OPDTrainer:
             # ------------------------------------------------------- logging
             if step % config.logging.log_every == 0:
                 mean_len = n_total / len(rollouts)
-                fmt_ok = sum(
-                    1 for b, comp in rollouts
-                    if (letter := extract_letter(self.s_tok.decode(comp)))
-                    and letter in {le for le, _ in b["row"]["options"]}
-                ) / len(rollouts)
+                source_stats = self.source.batch_stats(
+                    [(b["meta"], self.s_tok.decode(comp)) for b, comp in rollouts]
+                )
+                extra = "".join(f" {k}={v:.2f}" for k, v in source_stats.items())
                 logger.info(
-                    "step %d | kl/tok=%.4f sampled_kl=%.4f len=%.1f fmt_ok=%.2f lr=%.2e (%.0fs)",
-                    step, agg["kl"], agg["sampled_kl"], mean_len, fmt_ok,
+                    "step %d | kl/tok=%.4f sampled_kl=%.4f len=%.1f%s lr=%.2e (%.0fs)",
+                    step, agg["kl"], agg["sampled_kl"], mean_len, extra,
                     self.opt.param_groups[0]["lr"], time.time() - t0,
                 )
                 self._track({"kl": agg["kl"], "sampled_kl": agg["sampled_kl"],
                              "residual_mass": agg["residual_mass"],
-                             "completion_len": mean_len, "format_ok": fmt_ok,
+                             "completion_len": mean_len, **source_stats,
                              "lr": self.opt.param_groups[0]["lr"]}, step)
 
             if config.train.eval_every and step and step % config.train.eval_every == 0:
-                acc = self.eval_dev()
-                logger.info("step %d | dev_acc=%.4f", step, acc)
-                self._track({"dev_acc": acc}, step)
+                metrics = self._evaluate()
+                logger.info("step %d | %s", step,
+                            " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+                self._track(metrics, step)
 
             if config.train.save_steps and step and step % config.train.save_steps == 0:
                 self._save(f"step_{step}")
 
-        acc = self.eval_dev()
-        logger.info("final | dev_acc=%.4f", acc)
+        metrics = self._evaluate()
+        logger.info("final | %s", " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
         self._save("final")
 
     # -------------------------------------------------------------------- eval
 
-    @torch.no_grad()
-    def eval_dev(self) -> float:
-        """Greedy few-shot fast-mode accuracy on the held-out dev slice."""
-        config = self.config
-        rows = self.dev_rows[: config.train.eval_dev_samples]
+    def _evaluate(self) -> dict[str, float]:
+        """Held-out evaluation, delegated to the source (metric is task-specific)."""
         self.student.eval()
-        correct = 0
-        for i in range(0, len(rows), config.sampling.gen_micro_seqs):
-            chunk = rows[i : i + config.sampling.gen_micro_seqs]
-            prompts = [
-                self._encode_prompt(
-                    self.s_tok,
-                    build_messages(r, few_shots=self.reference_shots, fast=True,
-                                   system_message=config.data.system_message or None),
-                )
-                for r in chunk
-            ]
-            ids, mask, T = self._left_pad(prompts)
-            with torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16,
-                                enabled=self.device != "cpu"):
-                out = self.student.generate(
-                    ids.to(self.device), attention_mask=mask.to(self.device),
-                    do_sample=False, max_new_tokens=8,
-                    eos_token_id=list(self.bridge.stop_ids), pad_token_id=self.s_pad,
-                )
-            for j, r in enumerate(chunk):
-                text = self.s_tok.decode(
-                    self.bridge.clean_completion(out[j, T:].tolist())[:-1]
-                    or out[j, T:].tolist()
-                )
-                if extract_letter(text) == r["answer"]:
-                    correct += 1
-        self.student.train()
-        return correct / max(1, len(rows))
+        try:
+            return self.source.evaluate(self)
+        finally:
+            self.student.train()
 
     # ------------------------------------------------------------- bookkeeping
 

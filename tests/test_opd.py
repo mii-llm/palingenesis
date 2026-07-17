@@ -316,6 +316,101 @@ def test_load_reference_shots_both_layouts(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Prompt sources
+# ---------------------------------------------------------------------------
+
+class FakeEngine:
+    """Engine stub: greedy answers 'A' to everything; dev_kl returns a constant."""
+
+    def __init__(self):
+        self.calls = []
+
+    def greedy_generate(self, messages_list, max_new_tokens):
+        self.calls.append(("greedy", len(messages_list), max_new_tokens))
+        return ["A"] * len(messages_list)
+
+    def dev_kl(self, messages_list, max_new_tokens):
+        self.calls.append(("dev_kl", len(messages_list), max_new_tokens))
+        return {"dev_kl": 0.5, "dev_len": 3.0}
+
+
+def write_mcqa_pool(tmp_path, n=20):
+    rows = [{"question": f"Domanda {i}?", "options": [["A", "sì"], ["B", "no"]],
+             "answer": "A" if i % 2 == 0 else "B", "category": "storia", "source": "t"}
+            for i in range(n)]
+    path = tmp_path / "pool.jsonl"
+    path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    return path
+
+
+def test_mcqa_source(tmp_path):
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.opd.sources import McqaPoolSource, build_source
+
+    config = OPDConfig()
+    config.data.prompts_path = str(write_mcqa_pool(tmp_path))
+    config.data.dev_size = 4
+    config.train.eval_dev_samples = 4
+
+    source = build_source(config, rng=random.Random(0))
+    assert isinstance(source, McqaPoolSource)
+
+    messages, mnt, meta = source.sample()
+    assert messages[-1]["role"] == "user"
+    assert mnt == config.sampling.max_new_tokens  # cot_fraction=0 -> always fast
+    assert "row" in meta and meta["fast"] is True
+
+    engine = FakeEngine()
+    metrics = source.evaluate(engine)
+    # FakeEngine answers 'A'; half the dev rows have answer 'A'
+    assert engine.calls == [("greedy", 4, 8)]
+    assert 0.0 <= metrics["dev_acc"] <= 1.0
+
+    stats = source.batch_stats([(meta, "A"), (meta, "boh niente lettera")])
+    assert stats["format_ok"] == 0.5
+
+
+def test_messages_source(tmp_path):
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.opd.sources import ChatMessagesSource, build_source
+
+    rows = [{"messages": [{"role": "user", "content": f"Ciao {i}"}]} for i in range(12)]
+    rows.append({"messages": [{"role": "user", "content": "x"},
+                              {"role": "assistant", "content": "ends wrong"}]})  # skipped
+    path = tmp_path / "chat.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    config = OPDConfig()
+    config.data.format = "messages"
+    config.data.prompts_path = str(path)
+    config.data.dev_size = 3
+    config.train.eval_dev_samples = 3
+    config.sampling.max_new_tokens = 64
+
+    source = build_source(config, rng=random.Random(0))
+    assert isinstance(source, ChatMessagesSource)
+    assert len(source.dev_rows) == 3 and len(source.train_rows) == 9  # 12 usable - 3 dev
+
+    messages, mnt, meta = source.sample()
+    assert messages[-1]["role"] == "user" and mnt == 64 and meta == {}
+
+    engine = FakeEngine()
+    assert source.evaluate(engine) == {"dev_kl": 0.5, "dev_len": 3.0}
+    assert engine.calls == [("dev_kl", 3, 64)]
+    assert source.batch_stats([({}, "whatever")]) == {}
+
+
+def test_build_source_rejects_unknown_format():
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.opd.sources import build_source
+
+    config = OPDConfig()
+    config.data.format = "video"
+    with pytest.raises(ValueError, match="video"):
+        build_source(config, rng=random.Random(0))
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 

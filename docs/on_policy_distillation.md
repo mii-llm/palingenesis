@@ -8,9 +8,24 @@ pgs distill       --config configs/distill_opd.yaml
 pgs distill       --config configs/distill_opd.yaml --train.learning_rate 5e-6 --train.steps 3000
 ```
 
-Package: `palingenesis.opd` (`config.py`, `trainer.py`, `token_bridge.py`, `formatting.py`, `pool.py`, `score_pool.py`).
+Package: `palingenesis.opd` (`config.py`, `trainer.py`, `sources.py`, `token_bridge.py`, `formatting.py`, `pool.py`, `score_pool.py`).
 
-**Current scope**: the *engine* (token bridge, on-policy sampling, reverse-KL scoring loss, checkpointing) is task-agnostic; the *data layer* (pool schema, prompt templates, shot regimes, dev metric) currently assumes multiple-choice QA pools. Generic prompt sources (a JSONL of `messages` with a pluggable dev metric) are the planned next step — the MCQA layer will become one implementation of that interface.
+**Architecture**: the *engine* (token bridge, on-policy sampling, reverse-KL scoring loss, checkpointing) is task-agnostic; everything task-shaped lives behind the `PromptSource` protocol (`sources.py`) — what conversation to roll out next, how to evaluate held-out prompts, which per-batch stats to log. Two sources ship, selected by `data.format`:
+
+| `data.format` | prompts | dev metric |
+|---|---|---|
+| `mcqa` (default) | pool-row JSONL, shot regimes, fast/CoT templates | letter accuracy (`dev_acc`) |
+| `messages` | JSONL of `{"messages": [...]}`, last turn = user | held-out reverse KL (`dev_kl`) + length |
+
+A custom source is any object with `sample()` / `evaluate(engine)` / `batch_stats()`; pass it as `OPDTrainer(config, source=...)`.
+
+## Generic chat distillation
+
+```bash
+pgs distill --config configs/distill_chat.yaml
+```
+
+This is OPD at its most valuable: on long-form generation (chat, reasoning, code, agentic traces), exposure bias compounds hardest, and on-policy correction is exactly the fix. Free-form answers can't be auto-graded, so the dev metric is the mean reverse KL to the teacher on held-out prompts — the trained quantity, measured out of sample. Rows whose last message is not a user turn are skipped with a warning. Practical knobs for long completions: small `train.score_micro_seqs` (4), `sampling.group_size 2` for rollout diversity, and a real `max_new_tokens` budget.
 
 ## Why on-policy
 

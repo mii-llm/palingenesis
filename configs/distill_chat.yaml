@@ -1,0 +1,52 @@
+# On-policy distillation on generic chat prompts (no benchmark, no options —
+# just conversations for the student to complete and the teacher to score).
+#
+#   pgs distill --config configs/distill_chat.yaml
+#
+# prompts_path is a JSONL of {"messages": [...]} where the last turn is the
+# user's. The dev metric is the mean reverse KL to the teacher on held-out
+# prompts (lower = closer to the teacher where the student actually goes) —
+# free-form answers can't be auto-graded, but distance-to-teacher out of
+# sample is exactly the trained quantity.
+
+model:
+  student: mii-llm/nesso-0.4B-agentic
+  teacher: Coloss/nesso-3B
+  gradient_checkpointing: true
+
+bridge:
+  eos_map:
+    "<|im_end|>": "<|eot_id|>"
+  extra_stop_tokens: ["<|end_of_text|>"]
+
+data:
+  format: messages
+  prompts_path: data/chat_prompts.jsonl
+  dev_size: 500
+
+sampling:
+  batch_prompts: 16        # chat completions are long; keep the token budget sane
+  group_size: 2            # a couple of rollouts per prompt adds on-policy diversity
+  temperature: 1.0
+  max_new_tokens: 512
+  gen_micro_seqs: 32
+
+train:
+  output_dir: runs/opd_chat
+  steps: 1000
+  learning_rate: 1.0e-5
+  warmup_steps: 50
+  lr_scheduler: cosine
+  max_grad_norm: 1.0
+  loss_fn: full_kl
+  seed: 0
+  score_micro_seqs: 4      # long completions: keep scoring micro-batches small
+  eval_every: 100
+  eval_dev_samples: 100
+  save_steps: 200
+  keep_checkpoints: 3
+
+logging:
+  log_every: 10
+  use_wandb: false
+  project: palingenesis-opd

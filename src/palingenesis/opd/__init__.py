@@ -11,9 +11,11 @@ Works across a student/teacher pair with *different chat templates* as long as
 they share a base vocabulary: prompts are rendered per-model with each model's
 own template, and only completion tokens are aligned (see `token_bridge`).
 
-Current scope: the engine (token_bridge, on-policy sampling, reverse-KL loss)
-is task-agnostic; the data layer (pool, formatting, dev metric) targets
-multiple-choice QA pools. Generic prompt sources are the planned next step.
+The engine (token_bridge, on-policy sampling, reverse-KL loss) is
+task-agnostic; task-specific data lives behind the PromptSource protocol
+(opd.sources). Built-ins: "mcqa" (multiple-choice pools, letter-accuracy dev
+metric) and "messages" (generic chat JSONL, held-out reverse-KL dev metric) —
+select with data.format, or pass a custom source to OPDTrainer.
 
 Entry points:
     pgs distill       --config configs/distill_opd.yaml   # train
@@ -22,11 +24,15 @@ Entry points:
 """
 
 from palingenesis.opd.config import OPDConfig
+from palingenesis.opd.sources import ChatMessagesSource, McqaPoolSource, PromptSource
 from palingenesis.opd.token_bridge import TokenBridge, TokenBridgeError, check_compatible
 
 __all__ = [
+    "ChatMessagesSource",
+    "McqaPoolSource",
     "OPDConfig",
     "OPDTrainer",
+    "PromptSource",
     "TokenBridge",
     "TokenBridgeError",
     "check_compatible",

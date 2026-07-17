@@ -64,11 +64,17 @@ pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.js
 
 Every row comes back annotated with `teacher_answer` and `teacher_correct` — one batched forward per row (the answer is read from the option-letter logits, no generation, no parsing). What you do with the annotations — drop wrong rows, downweight them, rebalance — is your call, in the same score-then-select spirit as `pgs prepare`.
 
-!!! note "Current scope"
-    The OPD engine (token bridge, on-policy sampling, reverse-KL loss) is
-    task-agnostic; the shipped data layer targets multiple-choice QA pools.
-    Generic prompt sources (`messages` JSONL, pluggable dev metric) are the
-    planned next step.
+## Beyond multiple choice
+
+The engine is task-agnostic; the data layer is pluggable. `data.format: messages` distills on generic chat prompts — a JSONL of `{"messages": [...]}` ending with a user turn:
+
+```bash
+pgs distill --config configs/distill_chat.yaml
+```
+
+This is where on-policy distillation earns its keep: on long-form generation (chat, reasoning traces, code, agentic trajectories) every early deviation compounds, and correcting the student on its own samples is exactly the fix. The dev metric becomes the held-out reverse KL to the teacher — free-form answers can't be auto-graded, but distance-to-teacher on unseen prompts is precisely the quantity being trained, measured out of sample.
+
+For anything else, implement the three-method `PromptSource` protocol (`sample`, `evaluate`, `batch_stats`) and pass it to `OPDTrainer(config, source=...)` — the MCQA and chat sources are ~80 lines each and serve as templates.
 
 ## What to watch
 

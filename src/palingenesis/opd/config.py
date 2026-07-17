@@ -40,19 +40,25 @@ class OPDBridgeConfig:
 
 @dataclass(slots=True)
 class OPDDataConfig:
-    # Prompt pool (JSONL, pool-row schema — see palingenesis.opd.pool).
+    # Prompt source kind (see palingenesis.opd.sources):
+    #   "mcqa"     — multiple-choice pool (pool-row JSONL), letter-accuracy dev metric
+    #   "messages" — generic chat prompts ({"messages": [...]} JSONL, last turn = user),
+    #                held-out reverse-KL dev metric
+    format: str = "mcqa"
+    # Prompt file (pool-row JSONL for "mcqa", messages JSONL for "messages").
     prompts_path: str = "data/prompts.jsonl"
+    # Held-out dev rows split off the pool (deterministic, hash-ranked, unique).
+    dev_size: int = 500
+    # System message for rendered prompts (mcqa; empty = the template default).
+    system_message: str = ""
+    # ---- mcqa-only fields ----
     # The benchmark's official few-shot file (empty = pool/zero-shot regimes only).
     shots_path: str = ""
-    # Held-out dev rows split off the pool (deterministic, hash-ranked).
-    dev_size: int = 500
     # Shot-regime mixture per sampled prompt: reference shots / k pool shots /
     # zero-shot with the remaining probability mass.
     p_reference_shots: float = 0.5
     p_pool_shots: float = 0.25
     pool_shots_max_k: int = 5
-    # System message for all rendered prompts (empty = the template default).
-    system_message: str = ""
 
 
 @dataclass(slots=True)
@@ -171,6 +177,8 @@ class OPDConfig:
         errors: list[str] = []
         warnings: list[str] = []
 
+        if self.data.format not in ("mcqa", "messages"):
+            errors.append(f"data.format must be 'mcqa' or 'messages', got {self.data.format!r}")
         if self.train.loss_fn not in ("full_kl", "sampled_rkl"):
             errors.append(f"train.loss_fn must be 'full_kl' or 'sampled_rkl', got {self.train.loss_fn!r}")
         if self.train.lr_scheduler not in ("cosine", "constant"):
@@ -189,10 +197,15 @@ class OPDConfig:
                 "sampling.group_size > 1 with cot_fraction=0: fast-mode completions are "
                 "~1 token, so extra rollouts per prompt add cost without signal."
             )
-        if self.data.p_reference_shots > 0 and not self.data.shots_path:
+        if self.data.format == "mcqa" and self.data.p_reference_shots > 0 and not self.data.shots_path:
             warnings.append(
                 "data.p_reference_shots > 0 but data.shots_path is empty — the reference-shot "
                 "regime will silently fall back to zero-shot."
+            )
+        if self.data.format == "messages" and self.sampling.cot_fraction > 0:
+            warnings.append(
+                "sampling.cot_fraction is an mcqa-only knob (fast/CoT template mix) and is "
+                "ignored by the messages source."
             )
 
         if errors:
