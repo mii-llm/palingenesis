@@ -22,10 +22,11 @@ at the final prompt position — in fast mode the first completion token IS the
 letter. One batched forward per row: no generation loop, no format parsing,
 no unparseable outputs.
 
-Usage:
+Usage (any --section.field override works, same as pgs distill):
     python -m palingenesis.opd.score_pool --config configs/distill_opd.yaml \
         --out data/prompts_scored.jsonl
-    pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
+    pgs distill-score --config configs/distill_opd.yaml --out scored.jsonl \
+        --model.teacher other/teacher --data.prompts_path pool.jsonl
 """
 
 from __future__ import annotations
@@ -85,14 +86,17 @@ def main():
     from palingenesis.logging import setup_logging
 
     setup_logging(rank=0)
-    ap = argparse.ArgumentParser(description="Annotate a prompt pool with the teacher's answers")
+    ap = argparse.ArgumentParser(
+        description="Annotate a prompt pool with the teacher's answers",
+        epilog="Any OPDConfig override is accepted too, e.g. --model.teacher X --data.prompts_path Y",
+    )
     ap.add_argument("--config", required=True, help="OPD config (teacher/pool/shots are read from it)")
     ap.add_argument("--out", required=True, help="Output JSONL (pool rows + teacher_answer/teacher_correct)")
     ap.add_argument("--batch-size", type=int, default=48)
     ap.add_argument("--limit", type=int, default=0, help="Score only the first N rows (0 = all)")
-    args = ap.parse_args()
+    args, override_args = ap.parse_known_args()
 
-    config = OPDConfig.from_yaml(args.config)
+    config = OPDConfig.from_cli(["--config", args.config, *override_args])
     device = pick_device()
 
     logger.info("Loading teacher %s (bf16) on %s", config.model.teacher, device)
