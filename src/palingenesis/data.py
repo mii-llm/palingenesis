@@ -92,6 +92,18 @@ def _shard_streaming_dataset(dataset, rank: int, world_size: int):
     return dataset.take_every(shard_count)
 
 
+def _shard_then_shuffle(dataset, rank: int, world_size: int, shuffle_buffer: int, shuffle_seed: int):
+    """Per-worker shard, THEN buffer-shuffle. The order is load-bearing:
+    `shuffle().shard()` on a streaming dataset leaves every worker except the
+    first with an empty shard list (datasets 5.x), killing the DataLoader.
+    Shard-first is also the semantically right order — each worker streams its
+    own files and shuffles locally within its buffer."""
+    dataset = _shard_streaming_dataset(dataset, rank, world_size)
+    if shuffle_buffer > 0:
+        dataset = dataset.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer)
+    return dataset
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE DATASETS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -117,6 +129,8 @@ class ChatDataset(IterableDataset):
         turn_scaling: str = "uniform",
         train_on_reasoning: bool = True,
         last_turn_only: bool = False,
+        shuffle_buffer: int = 0,
+        shuffle_seed: int = 0,
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -127,6 +141,9 @@ class ChatDataset(IterableDataset):
         self.include_observations = include_observations
         self.turn_scaling = turn_scaling
         self.train_on_reasoning = train_on_reasoning
+        # Streaming shuffle, applied per worker AFTER sharding (see _shard_then_shuffle).
+        self.shuffle_buffer = shuffle_buffer
+        self.shuffle_seed = shuffle_seed
         # last_turn_only: mask every assistant turn except the final one. Selects which
         # turns get loss (training) / are scored (eval). Use for eval-format SFT where
         # earlier assistant turns are a FIXED few-shot prefix (e.g. n-shot MCQA
@@ -134,7 +151,8 @@ class ChatDataset(IterableDataset):
         self.last_turn_only = last_turn_only
 
     def __iter__(self):
-        dataset = _shard_streaming_dataset(self.dataset, self.rank, self.world_size)
+        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size,
+                                      self.shuffle_buffer, self.shuffle_seed)
         for example in dataset:
             result = self._process(example)
             if result is not None:
@@ -737,6 +755,8 @@ class PretrainDataset(IterableDataset):
         text_field: str = "text",
         rank: int = 0,
         world_size: int = 1,
+        shuffle_buffer: int = 0,
+        shuffle_seed: int = 0,
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -744,9 +764,12 @@ class PretrainDataset(IterableDataset):
         self.text_field = text_field
         self.rank = rank
         self.world_size = world_size
+        self.shuffle_buffer = shuffle_buffer
+        self.shuffle_seed = shuffle_seed
 
     def __iter__(self):
-        dataset = _shard_streaming_dataset(self.dataset, self.rank, self.world_size)
+        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size,
+                                      self.shuffle_buffer, self.shuffle_seed)
         for example in dataset:
             result = self._process(example)
             if result is not None:
@@ -1115,6 +1138,7 @@ def build_dataloader(
     rank: int,
     world_size: int,
     batch_size: int,
+    streaming_shuffle_buffer: int = 0,
 ) -> DataLoader:
     """Build the complete data pipeline.
 
@@ -1134,8 +1158,8 @@ def build_dataloader(
         weights = []
         for src in config.sources:
             raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=True)
-            raw = raw.shuffle(seed=config.seed, buffer_size=10_000)
-
+            # Shuffle happens inside the dataset AFTER per-worker sharding —
+            # shuffle-then-shard crashes streaming workers (see _shard_then_shuffle).
             mode = src.get("mode", "sft")
             if mode == "sft":
                 ds = ChatDataset(
@@ -1149,6 +1173,8 @@ def build_dataloader(
                     turn_scaling=config.turn_scaling,
                     train_on_reasoning=getattr(config, "train_on_reasoning", True),
                     last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
+                    shuffle_buffer=10_000,
+                    shuffle_seed=config.seed,
                 )
             elif mode == "pretrain":
                 ds = PretrainDataset(
@@ -1158,6 +1184,8 @@ def build_dataloader(
                     text_field=src.get("text_field", "text"),
                     rank=rank,
                     world_size=world_size,
+                    shuffle_buffer=10_000,
+                    shuffle_seed=config.seed,
                 )
             else:
                 raise ValueError(f"Unknown data mode: {mode}. Use 'sft' or 'pretrain'.")
@@ -1167,7 +1195,9 @@ def build_dataloader(
 
         final_ds: IterableDataset = MixedDataset(source_datasets, weights, seed=config.seed)
     elif hasattr(dataset_or_config, "__iter__") and not isinstance(dataset_or_config, DataConfig):
-        # Pre-loaded HF dataset object passed directly
+        # Pre-loaded HF dataset object passed directly. The caller decides
+        # whether to shuffle (streaming_shuffle_buffer > 0) — e.g. curriculum-
+        # ordered prepared data must NOT be shuffled.
         raw = dataset_or_config
         final_ds = ChatDataset(
             raw,
@@ -1180,12 +1210,12 @@ def build_dataloader(
             turn_scaling=config.turn_scaling,
             train_on_reasoning=getattr(config, "train_on_reasoning", True),
             last_turn_only=getattr(config, "last_turn_only", False),
+            shuffle_buffer=streaming_shuffle_buffer,
+            shuffle_seed=config.seed,
         )
     else:
         # Single dataset from config
         raw = _load_dataset_source(config.dataset, config.dataset_split, config.streaming)
-        if config.streaming:
-            raw = raw.shuffle(seed=config.seed, buffer_size=10_000)
         final_ds = ChatDataset(
             raw,
             tokenizer,
@@ -1197,6 +1227,8 @@ def build_dataloader(
             turn_scaling=config.turn_scaling,
             train_on_reasoning=getattr(config, "train_on_reasoning", True),
             last_turn_only=getattr(config, "last_turn_only", False),
+            shuffle_buffer=10_000 if config.streaming else 0,
+            shuffle_seed=config.seed,
         )
 
     # ── Pretraining Replay (arxiv:2603.04964) ─────────────────────────────────
@@ -1205,7 +1237,6 @@ def build_dataloader(
     # implicit regularization that keeps the model in a good optimization basin.
     if config.pretrain_replay_dataset:
         replay_raw = _load_dataset_source(config.pretrain_replay_dataset, "train", streaming=True)
-        replay_raw = replay_raw.shuffle(seed=config.seed, buffer_size=10_000)
         replay_ds = PretrainDataset(
             replay_raw,
             tokenizer,
@@ -1213,6 +1244,8 @@ def build_dataloader(
             text_field="text",
             rank=rank,
             world_size=world_size,
+            shuffle_buffer=10_000,
+            shuffle_seed=config.seed,
         )
         # Mix: (1-w) * target_data + w * replay_data
         w = config.pretrain_replay_weight
