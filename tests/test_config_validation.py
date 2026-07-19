@@ -201,3 +201,18 @@ def test_validate_works_after_from_yaml():
     warnings = cfg.validate()
     # Should pass without error
     assert isinstance(warnings, list)
+
+
+def test_packing_epoch_horizon_warns():
+    """packing + epochs-based schedule: total_steps counts rows, packing compresses
+    the epoch, so the LR never fully decays — must warn and point at max_steps/wsd."""
+    cfg = Config()
+    cfg.data.packing = True
+    cfg.train.max_steps = -1
+    warnings = cfg.validate()
+    assert any("packing" in w and "max_steps" in w for w in warnings)
+
+    # Setting max_steps resolves it
+    cfg.train.max_steps = 5000
+    warnings = cfg.validate()
+    assert not any("epochs-based LR horizon" in w for w in warnings)
