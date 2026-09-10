@@ -74,10 +74,48 @@ def _load_dataset_source(dataset_id: str, split: str, streaming: bool):
 
 
 def _shard_streaming_dataset(dataset, rank: int, world_size: int):
+    """Shard a dataset across processes (rank) and dataloader workers.
+
+    Two dataset shapes need different handling:
+
+    * **Streaming** (``datasets.IterableDataset``): calling ``.shard(num_shards=N)``
+      with ``N`` greater than the dataset's own ``num_shards`` (e.g. a single-file
+      JSONL has 1 shard) creates empty sub-shards that crash on ``.features``
+      (``IndexError: list index out of range``). So we shard across processes with
+      ``split_dataset_by_node`` (which degrades to a strided skip when there are
+      fewer shards than nodes) and let HF's own DataLoader integration handle the
+      per-worker split — it assigns shards to workers when possible and otherwise
+      stops the surplus workers, which is exactly what we want.
+    * **Map-style** (``datasets.Dataset``): contiguous ``.shard()`` is safe and
+      cheap for both rank and worker, so we keep the original behaviour.
+    """
     worker_info = torch.utils.data.get_worker_info()
+
+    try:
+        from datasets import IterableDataset as _HFIterableDataset
+
+        is_streaming = isinstance(dataset, _HFIterableDataset)
+    except Exception:
+        is_streaming = False
+
+    if is_streaming:
+        # Per-worker sharding is handled automatically by HF when this streaming
+        # dataset is iterated inside a worker, so we only shard across processes.
+        if world_size > 1:
+            try:
+                from datasets.distributed import split_dataset_by_node
+
+                dataset = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
+            except Exception:
+                # Best-effort fallback; never over-shard (that is what crashes).
+                num_shards = getattr(dataset, "num_shards", None) or getattr(dataset, "n_shards", None)
+                if hasattr(dataset, "shard") and (num_shards is None or num_shards >= world_size):
+                    dataset = dataset.shard(num_shards=world_size, index=rank)
+        return dataset
+
+    # Map-style dataset: contiguous shard across both rank and worker.
     shard_index = rank
     shard_count = world_size
-
     if worker_info is not None and worker_info.num_workers > 1:
         shard_index = shard_index * worker_info.num_workers + worker_info.id
         shard_count *= worker_info.num_workers
@@ -808,25 +846,51 @@ class MixedDataset(IterableDataset):
     Each source can be either SFT (chat masking) or pretrain (all-token loss).
     """
 
-    def __init__(self, sources: list[IterableDataset], weights: list[float], seed: int = 42):
+    def __init__(
+        self,
+        sources: list[IterableDataset],
+        weights: list[float],
+        seed: int = 42,
+        names: list[str] | None = None,
+    ):
         assert len(sources) == len(weights)
         assert all(w >= 0 for w in weights)
         total = sum(weights)
         self.sources = sources
         self.probs = [w / total for w in weights]
         self.seed = seed
+        self.names = names or [f"source[{i}]" for i in range(len(sources))]
 
     def __iter__(self):
         rng = random.Random(self.seed)
         iterators = [iter(s) for s in self.sources]
         indices = list(range(len(self.sources)))
+        active = list(indices)
+        yielded = [0] * len(self.sources)
 
-        while True:
-            idx = rng.choices(indices, weights=self.probs, k=1)[0]
+        while active:
+            # When every source is still active this is identical to sampling over
+            # `indices` with `self.probs` (determinism preserved for the healthy case).
+            probs = [self.probs[i] for i in active]
+            idx = rng.choices(active, weights=probs, k=1)[0]
             try:
-                yield next(iterators[idx])
+                item = next(iterators[idx])
+                yielded[idx] += 1
+                yield item
             except StopIteration:
-                break  # Epoch boundary: first source exhausted
+                if yielded[idx] == 0:
+                    # A source that produced NOTHING is a misconfiguration (wrong
+                    # field/format/split, empty file), not an epoch boundary. Drop
+                    # it loudly and keep training on the rest instead of silently
+                    # ending the epoch (which, with packing, yields 0 steps).
+                    logger.warning(
+                        "Data source '%s' yielded 0 usable examples — dropping it from the "
+                        "mix. Check its messages/text field, format and split.",
+                        self.names[idx],
+                    )
+                    active.remove(idx)
+                    continue
+                break  # A non-empty source exhausted → epoch boundary.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -943,6 +1007,19 @@ class PackedDataset(IterableDataset):
         else:
             yield from self._sequential_packing()
 
+    @staticmethod
+    def _pack_block(ids: list[int], labels: list[int], positions: list[int]) -> dict[str, torch.Tensor]:
+        """Build one packed block. May be shorter than max_len (trailing remainder);
+        the collator pads it — dropping it would silently lose data (and can zero out
+        a short run entirely)."""
+        n = len(ids)
+        return {
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "attention_mask": torch.ones(n, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "position_ids": torch.tensor(positions, dtype=torch.long),
+        }
+
     def _sequential_packing(self):
         """Original sequential packing: concatenate in arrival order."""
         buf_ids: list[int] = []
@@ -959,15 +1036,14 @@ class PackedDataset(IterableDataset):
             buf_positions.extend(range(doc_len))
 
             while len(buf_ids) >= self.max_len:
-                yield {
-                    "input_ids": torch.tensor(buf_ids[: self.max_len], dtype=torch.long),
-                    "attention_mask": torch.ones(self.max_len, dtype=torch.long),
-                    "labels": torch.tensor(buf_labels[: self.max_len], dtype=torch.long),
-                    "position_ids": torch.tensor(buf_positions[: self.max_len], dtype=torch.long),
-                }
+                yield self._pack_block(buf_ids[: self.max_len], buf_labels[: self.max_len], buf_positions[: self.max_len])
                 buf_ids = buf_ids[self.max_len :]
                 buf_labels = buf_labels[self.max_len :]
                 buf_positions = buf_positions[self.max_len :]
+
+        # Emit the trailing remainder (< max_len) instead of discarding it.
+        if buf_ids:
+            yield self._pack_block(buf_ids, buf_labels, buf_positions)
 
     def _sorted_packing(self):
         """Sorted bin packing: accumulate buffer, sort by length, pack greedily.
@@ -978,28 +1054,35 @@ class PackedDataset(IterableDataset):
           - Less wasted space (short+short fills better than short+long that overflows)
           - More consistent compute per batch (no one sequence dominating)
           - ~2× packing efficiency improvement over random concatenation
+
+        The sub-max_len remainder is carried across buffer flushes (and emitted as a
+        final partial block at the end) so no tokens are silently dropped.
         """
         buffer: list[dict] = []
+        carry: tuple[list[int], list[int], list[int]] = ([], [], [])
 
         for ex in self.base:
             buffer.append(ex)
-
             if len(buffer) >= self.sort_buffer:
-                yield from self._flush_buffer(buffer)
+                carry = yield from self._flush_buffer(buffer, carry)
                 buffer = []
 
-        # Flush remaining
         if buffer:
-            yield from self._flush_buffer(buffer)
+            carry = yield from self._flush_buffer(buffer, carry)
 
-    def _flush_buffer(self, buffer: list[dict]):
-        """Sort buffer by length and pack greedily into max_len blocks."""
+        ids, labels, positions = carry
+        if ids:
+            yield self._pack_block(ids, labels, positions)
+
+    def _flush_buffer(self, buffer: list[dict], carry: tuple[list[int], list[int], list[int]]):
+        """Sort buffer by length and pack greedily into max_len blocks.
+
+        Returns the leftover (ids, labels, positions) below max_len so the caller can
+        carry it into the next flush instead of discarding it."""
         # Sort by sequence length (shortest first → best packing)
         buffer.sort(key=lambda ex: ex["input_ids"].size(0))
 
-        buf_ids: list[int] = []
-        buf_labels: list[int] = []
-        buf_positions: list[int] = []
+        buf_ids, buf_labels, buf_positions = list(carry[0]), list(carry[1]), list(carry[2])
 
         for ex in buffer:
             doc_ids = ex["input_ids"].tolist()
@@ -1013,36 +1096,17 @@ class PackedDataset(IterableDataset):
                 doc_labels = doc_labels[: self.max_len]
                 doc_len = self.max_len
 
-            # If adding this doc would overflow, try to yield what we have
-            # and start fresh (greedy bin packing)
-            if len(buf_ids) + doc_len > self.max_len and len(buf_ids) > 0:
-                # Yield current buffer (may be shorter than max_len — pad or yield partial)
-                if len(buf_ids) >= self.max_len:
-                    yield {
-                        "input_ids": torch.tensor(buf_ids[: self.max_len], dtype=torch.long),
-                        "attention_mask": torch.ones(self.max_len, dtype=torch.long),
-                        "labels": torch.tensor(buf_labels[: self.max_len], dtype=torch.long),
-                        "position_ids": torch.tensor(buf_positions[: self.max_len], dtype=torch.long),
-                    }
-                    buf_ids = buf_ids[self.max_len :]
-                    buf_labels = buf_labels[self.max_len :]
-                    buf_positions = buf_positions[self.max_len :]
-
             buf_ids.extend(doc_ids)
             buf_labels.extend(doc_labels)
             buf_positions.extend(range(doc_len))
 
-            # Yield complete blocks
             while len(buf_ids) >= self.max_len:
-                yield {
-                    "input_ids": torch.tensor(buf_ids[: self.max_len], dtype=torch.long),
-                    "attention_mask": torch.ones(self.max_len, dtype=torch.long),
-                    "labels": torch.tensor(buf_labels[: self.max_len], dtype=torch.long),
-                    "position_ids": torch.tensor(buf_positions[: self.max_len], dtype=torch.long),
-                }
+                yield self._pack_block(buf_ids[: self.max_len], buf_labels[: self.max_len], buf_positions[: self.max_len])
                 buf_ids = buf_ids[self.max_len :]
                 buf_labels = buf_labels[self.max_len :]
                 buf_positions = buf_positions[self.max_len :]
+
+        return (buf_ids, buf_labels, buf_positions)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1131,7 +1195,7 @@ def _collate_fn(
 collate_fn = _collate_fn
 
 
-def build_dataloader(
+def build_dataset(
     dataset_or_config,
     tokenizer: PreTrainedTokenizerBase,
     config: DataConfig,
@@ -1139,8 +1203,8 @@ def build_dataloader(
     world_size: int,
     batch_size: int,
     streaming_shuffle_buffer: int = 0,
-) -> DataLoader:
-    """Build the complete data pipeline.
+) -> IterableDataset:
+    """Assemble the final training IterableDataset (everything the DataLoader wraps).
 
     Handles three cases:
     1. Pre-built dataset object (backward compat)
@@ -1150,16 +1214,26 @@ def build_dataloader(
     Also handles:
     4. Pretraining replay: auto-mixes generic data to prevent forgetting AND improve target task
        (arxiv:2603.04964, Stanford/Liang 2026)
+
+    The returned stream yields per-sequence dicts (input_ids/attention_mask/labels,
+    plus position_ids when packed) — i.e. tokenization, masking, mixing and packing
+    are already applied.
     """
     # Determine the final IterableDataset
     if config.sources:
         # Multi-dataset mode: build each source and mix
         source_datasets = []
         weights = []
+        names = []
         for src in config.sources:
-            raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=True)
+            raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=config.streaming)
             # Shuffle happens inside the dataset AFTER per-worker sharding —
             # shuffle-then-shard crashes streaming workers (see _shard_then_shuffle).
+            # Map-style datasets can be shuffled eagerly and use a different
+            # shuffle() signature (no buffer_size).
+            if not config.streaming:
+                raw = raw.shuffle(seed=config.seed)
+            shuffle_buffer = 10_000 if config.streaming else 0
             mode = src.get("mode", "sft")
             if mode == "sft":
                 ds = ChatDataset(
@@ -1173,7 +1247,7 @@ def build_dataloader(
                     turn_scaling=config.turn_scaling,
                     train_on_reasoning=getattr(config, "train_on_reasoning", True),
                     last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
-                    shuffle_buffer=10_000,
+                    shuffle_buffer=shuffle_buffer,
                     shuffle_seed=config.seed,
                 )
             elif mode == "pretrain":
@@ -1184,7 +1258,7 @@ def build_dataloader(
                     text_field=src.get("text_field", "text"),
                     rank=rank,
                     world_size=world_size,
-                    shuffle_buffer=10_000,
+                    shuffle_buffer=shuffle_buffer,
                     shuffle_seed=config.seed,
                 )
             else:
@@ -1192,8 +1266,9 @@ def build_dataloader(
 
             source_datasets.append(ds)
             weights.append(src.get("weight", 1.0))
+            names.append(str(src.get("name", src.get("dataset", f"source[{len(names)}]"))))
 
-        final_ds: IterableDataset = MixedDataset(source_datasets, weights, seed=config.seed)
+        final_ds: IterableDataset = MixedDataset(source_datasets, weights, seed=config.seed, names=names)
     elif hasattr(dataset_or_config, "__iter__") and not isinstance(dataset_or_config, DataConfig):
         # Pre-loaded HF dataset object passed directly. The caller decides
         # whether to shuffle (streaming_shuffle_buffer > 0) — e.g. curriculum-
@@ -1253,6 +1328,7 @@ def build_dataloader(
             [final_ds, replay_ds],
             [1.0 - w, w],
             seed=config.seed,
+            names=["target_mix", f"replay:{config.pretrain_replay_dataset} (text_field='text')"],
         )
 
     # Optional packing
@@ -1269,13 +1345,250 @@ def build_dataloader(
             f"(cuts pad-token compute; set data.length_group_buffer: 0 to disable)"
         )
 
+    return final_ds
+
+
+def _dataloader_from_dataset(
+    final_ds: IterableDataset, tokenizer: PreTrainedTokenizerBase, num_workers: int, batch_size: int
+) -> DataLoader:
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     return DataLoader(
         final_ds,
         batch_size=batch_size,
         collate_fn=lambda b: collate_fn(b, pad_id, pad_to_multiple=64),
-        num_workers=config.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=2 if config.num_workers > 0 else None,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
+
+
+def build_dataloader(
+    dataset_or_config,
+    tokenizer: PreTrainedTokenizerBase,
+    config: DataConfig,
+    rank: int,
+    world_size: int,
+    batch_size: int,
+    streaming_shuffle_buffer: int = 0,
+) -> DataLoader:
+    """Build the complete data pipeline (assemble the dataset, then wrap in a DataLoader)."""
+    final_ds = build_dataset(
+        dataset_or_config,
+        tokenizer,
+        config,
+        rank,
+        world_size,
+        batch_size,
+        streaming_shuffle_buffer=streaming_shuffle_buffer,
+    )
+    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRE-TOKENIZED CACHE
+# ══════════════════════════════════════════════════════════════════════════════
+# Materialize the fully-assembled (tokenized → masked → mixed → packed) training
+# stream to disk once, then on later runs load the tensors directly — skipping all
+# per-step tokenization AND making the exact step count a cheap read. A fingerprint
+# over every input that affects the tokens invalidates a stale cache automatically.
+# Incompatible with dynamic-weight training (MSFT) and seq-len curriculum, which
+# can't be baked into a static stream — those are rejected in Config.validate().
+
+PRETOK_DATA = "train.parquet"
+PRETOK_META = "pretokenized_meta.json"
+
+
+def pretokenize_fingerprint(config, tokenizer) -> str:
+    """Stable SHA-256 over everything that changes the materialized token stream."""
+    import hashlib
+    import json as _json
+
+    d = config.data
+
+    def _src_sig(src: dict) -> dict:
+        p = Path(src.get("dataset", ""))
+        stat = None
+        try:
+            if p.exists():
+                st = p.stat()
+                stat = [st.st_size, int(st.st_mtime)]
+        except OSError:
+            stat = None
+        return {
+            "dataset": src.get("dataset", ""),
+            "split": src.get("split", "train"),
+            "weight": src.get("weight", 1.0),
+            "mode": src.get("mode", "sft"),
+            "messages_field": src.get("messages_field", "messages"),
+            "text_field": src.get("text_field", "text"),
+            "last_turn_only": src.get("last_turn_only", getattr(d, "last_turn_only", False)),
+            "stat": stat,
+        }
+
+    if d.sources:
+        sources_sig = [_src_sig(s) for s in d.sources]
+    else:
+        sources_sig = [
+            _src_sig({"dataset": d.dataset, "split": d.dataset_split, "messages_field": d.messages_field})
+        ]
+
+    payload = {
+        "version": 1,
+        "tokenizer": getattr(tokenizer, "name_or_path", ""),
+        "chat_template": getattr(tokenizer, "chat_template", None),
+        "vocab_size": getattr(tokenizer, "vocab_size", None),
+        "eos_token_id": tokenizer.eos_token_id,
+        "max_seq_length": d.max_seq_length,
+        "packing": d.packing,
+        "length_group_buffer": getattr(d, "length_group_buffer", 0),
+        "train_on_reasoning": getattr(d, "train_on_reasoning", True),
+        "turn_scaling": getattr(d, "turn_scaling", "uniform"),
+        "include_observations": getattr(d, "include_observations", False),
+        "seq_len_curriculum": getattr(d, "seq_len_curriculum", False),
+        "seed": d.seed,
+        "replay": [d.pretrain_replay_dataset, d.pretrain_replay_weight],
+        "sources": sources_sig,
+    }
+    blob = _json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def pretokenized_cache_valid(cache_dir, fingerprint: str) -> tuple[bool, str]:
+    """(is_valid, reason). Valid iff the cache files exist and the fingerprint matches."""
+    import json as _json
+
+    meta = Path(cache_dir) / PRETOK_META
+    data = Path(cache_dir) / PRETOK_DATA
+    if not meta.exists() or not data.exists():
+        return False, "no cache found"
+    try:
+        m = _json.loads(meta.read_text())
+    except Exception:
+        return False, "unreadable cache metadata"
+    if m.get("fingerprint") != fingerprint:
+        return False, "config/data/tokenizer changed since cache was built"
+    return True, "valid"
+
+
+def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, config, tokenizer) -> int:
+    """Iterate the assembled (masked/mixed/packed) stream once and write tensors to parquet.
+
+    Writes ``{cache_dir}/train.parquet`` (columns: input_ids, attention_mask, labels,
+    and position_ids when packed) plus ``pretokenized_meta.json`` with the fingerprint
+    and exact sequence count. Returns the number of sequences written.
+    """
+    import json as _json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out = Path(cache_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    tmp = out / (PRETOK_DATA + ".tmp")
+    meta_path = out / PRETOK_META
+
+    final_ds = final_ds_factory()
+    writer: "pq.ParquetWriter | None" = None
+    count = 0
+    has_pos: bool | None = None
+    buf: dict[str, list] = {"input_ids": [], "attention_mask": [], "labels": [], "position_ids": []}
+
+    def _flush():
+        nonlocal writer
+        if not buf["input_ids"]:
+            return
+        cols = {
+            "input_ids": buf["input_ids"],
+            "attention_mask": buf["attention_mask"],
+            "labels": buf["labels"],
+        }
+        if has_pos:
+            cols["position_ids"] = buf["position_ids"]
+        table = pa.table(cols)
+        if writer is None:
+            writer = pq.ParquetWriter(str(tmp), table.schema)
+        writer.write_table(table)
+        for v in buf.values():
+            v.clear()
+
+    try:
+        for ex in final_ds:
+            if has_pos is None:
+                has_pos = "position_ids" in ex
+            buf["input_ids"].append(ex["input_ids"].tolist())
+            buf["attention_mask"].append(ex["attention_mask"].tolist())
+            buf["labels"].append(ex["labels"].tolist())
+            if has_pos:
+                buf["position_ids"].append(ex["position_ids"].tolist())
+            count += 1
+            if len(buf["input_ids"]) >= 1000:
+                _flush()
+        _flush()
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if count == 0:
+        raise ValueError(
+            "Pre-tokenization produced 0 sequences — the data pipeline yielded nothing. "
+            "Check the source paths/fields and masking settings."
+        )
+
+    tmp.replace(out / PRETOK_DATA)
+    meta = {
+        "fingerprint": fingerprint,
+        "num_sequences": count,
+        "max_seq_length": config.data.max_seq_length,
+        "packing": config.data.packing,
+        "has_position_ids": bool(has_pos),
+    }
+    meta_path.write_text(_json.dumps(meta, indent=2))
+    return count
+
+
+class PretokenizedDataset(IterableDataset):
+    """Yields already-tokenized/packed tensors from a cached parquet, sharded by rank/worker.
+
+    No tokenization, masking, mixing or packing — the cached rows are the final
+    training sequences produced by an earlier ``materialize_pretokenized`` pass.
+    """
+
+    def __init__(self, dataset, rank: int = 0, world_size: int = 1):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        dataset = _shard_streaming_dataset(self.dataset, self.rank, self.world_size)
+        for ex in dataset:
+            out = {
+                "input_ids": torch.as_tensor(ex["input_ids"], dtype=torch.long),
+                "attention_mask": torch.as_tensor(ex["attention_mask"], dtype=torch.long),
+                "labels": torch.as_tensor(ex["labels"], dtype=torch.long),
+            }
+            pos = ex.get("position_ids")
+            if pos is not None:
+                out["position_ids"] = torch.as_tensor(pos, dtype=torch.long)
+            yield out
+
+
+def build_pretokenized_dataloader(cache_dir, tokenizer, config: DataConfig, rank, world_size, batch_size) -> DataLoader:
+    """Load the cached pre-tokenized parquet and wrap it in a DataLoader (no re-tokenization).
+
+    Packed caches are all-max-length (no padding), so length grouping is a no-op there.
+    For non-packed caches we re-apply length-grouped batching (honoring
+    ``length_group_buffer``) so the cache doesn't lose the pad-token throughput win.
+    """
+    from datasets import load_dataset
+
+    data_file = Path(cache_dir) / PRETOK_DATA
+    ds = load_dataset("parquet", data_files=str(data_file), split="train", streaming=False)
+    final_ds: IterableDataset = PretokenizedDataset(ds, rank=rank, world_size=world_size)
+
+    if not config.packing and batch_size > 1 and getattr(config, "length_group_buffer", 512) > 0:
+        final_ds = LengthGroupedDataset(
+            final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed
+        )
+
+    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)

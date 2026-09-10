@@ -52,6 +52,8 @@
 | `seq_len_curriculum` | bool | `false` | Ramp max sequence length from short to full over training. |
 | `seq_len_curriculum_min` | int | `1024` | Starting max sequence length during curriculum. |
 | `seq_len_curriculum_ramp_steps` | int | `1000` | Steps to ramp from min to full `max_seq_length`. |
+| `pretokenize` | bool | `false` | Materialize the fully-assembled stream (tokenize → mask → mix → pack) to disk once, then load the tensors directly on later runs — skips all per-step tokenization **and** turns the exact step-count scan into a cheap read. A fingerprint over tokenizer/template/`max_seq_length`/sources/masking auto-rebuilds a stale cache. Incompatible with `msft_tracking` and `seq_len_curriculum` (both change the stream during training → hard error). |
+| `pretokenize_path` | str | `./pretokenized` | Directory for the pre-tokenized cache (`train.parquet` + `pretokenized_meta.json`). |
 
 !!! note "Reasoning / thinking modes"
     `train_on_reasoning` is the **only** training-time control for `<think>` content:
@@ -101,7 +103,7 @@
 | `output_dir` | str | `./checkpoints` | Where to save checkpoints and final model. Must be shared filesystem for multi-node. |
 | `resume_from` | str\|null | `null` | Checkpoint path to resume from. `"auto"` finds the latest valid checkpoint in `output_dir`. |
 | `epochs` | int | `1` | Number of training epochs. |
-| `max_steps` | int | `-1` | Maximum optimizer steps. Overrides epochs if positive. When unset, the LR schedule horizon (warmup + decay) is derived automatically from epochs × dataset size for map-style datasets; for streaming datasets with no length it falls back to 100k steps with a loud warning — set `max_steps` explicitly there, or short runs never leave warmup. |
+| `max_steps` | int | `-1` | Maximum optimizer steps. Overrides epochs if positive. When unset, the LR-schedule horizon (warmup + decay) is computed **exactly** by scanning the assembled pipeline once (steps/epoch × epochs). If the count can't be known ahead of time — `streaming: true` or a `ga_ramp` — the run is **refused** with a clear error asking you to set `max_steps` (never a silent 100k guess, which would trap short runs inside warmup). Enable `pretokenize` to make the exact-count scan cheap. |
 | `per_device_batch_size` | int | `1` | Sequences per GPU per forward pass. Increase if memory allows. |
 | `gradient_accumulation_steps` | int | `16` | Micro-batches before optimizer step. Effective batch = batch_size × GA × num_gpus. |
 | `ga_ramp_start` | int | `0` | Batch size scheduling: start GA at this value, linearly ramp to full `gradient_accumulation_steps`. 0 = constant. |

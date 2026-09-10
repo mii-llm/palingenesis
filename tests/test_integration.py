@@ -528,16 +528,22 @@ def test_packing_produces_correct_output():
     outputs = list(packed)
     assert len(outputs) > 0, "Should produce at least one packed sequence"
 
-    for out in outputs:
-        assert out["input_ids"].shape[0] == 32, f"Should be max_len=32, got {out['input_ids'].shape[0]}"
-        assert out["labels"].shape[0] == 32
-        assert out["position_ids"].shape[0] == 32
-        # Position IDs should reset to 0 at document boundaries
-        assert out["position_ids"][0].item() == 0, "First position should be 0"
-        # Position IDs should never exceed max_len
+    total_tokens = 10 + 15 + 8 + 20 + 5 + 12 + 18 + 7  # = 95
+    for i, out in enumerate(outputs):
+        # Full blocks are max_len; the LAST block may be a shorter trailing remainder
+        # (emitted, not dropped — dropping it silently loses data).
+        is_last = i == len(outputs) - 1
+        n = out["input_ids"].shape[0]
+        assert (n == 32) or (is_last and 0 < n <= 32), f"block {i} has bad length {n}"
+        assert out["labels"].shape[0] == n
+        assert out["position_ids"].shape[0] == n
+        # A doc's remainder is carried across block boundaries, so only the very first
+        # block is guaranteed to start at position 0; every block stays within a doc.
         assert out["position_ids"].max().item() < 32
 
-    print(f"  Produced {len(outputs)} packed sequences of length 32")
+    assert outputs[0]["position_ids"][0].item() == 0, "first block must start at position 0"
+    assert sum(o["input_ids"].shape[0] for o in outputs) == total_tokens, "no tokens may be dropped"
+    print(f"  Produced {len(outputs)} packed sequences ({total_tokens} tokens, none dropped)")
     print("✓ test_packing_produces_correct_output PASSED\n")
 
 
@@ -562,10 +568,13 @@ def test_packing_defensive_oversized_doc():
     packed = PackedDataset(FakeDataset(), max_len=32, eos_id=0, sort_buffer=0)
     outputs = list(packed)
 
-    # Should still produce valid fixed-length outputs (not crash or produce garbage)
-    for out in outputs:
-        assert out["input_ids"].shape[0] == 32
-        assert out["labels"].shape[0] == 32
+    # Should still produce valid outputs (not crash or produce garbage). Full blocks
+    # are max_len; a shorter trailing remainder may be emitted last (never dropped).
+    for i, out in enumerate(outputs):
+        n = out["input_ids"].shape[0]
+        is_last = i == len(outputs) - 1
+        assert (n == 32) or (is_last and 0 < n <= 32), f"block {i} has bad length {n}"
+        assert out["labels"].shape[0] == n
 
     print(f"  Handled oversized doc: produced {len(outputs)} valid packed sequences")
     print("✓ test_packing_defensive_oversized_doc PASSED\n")
