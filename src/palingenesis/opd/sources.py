@@ -180,3 +180,62 @@ class ChatMessagesSource:
 
     def batch_stats(self, rollouts):
         return {}
+
+
+class MixedSource:
+    """Compose several PromptSources with sampling weights into ONE OPD run.
+
+    Each step samples a sub-source by weight and delegates ``sample()``; the
+    trainer already groups rollouts by their per-sample ``max_new_tokens``, so
+    heterogeneous objectives coexist (e.g. terse MCQA at 8 tokens + long-form
+    chat at 1024). ``evaluate()`` and ``batch_stats()`` merge each sub-source's
+    metrics under a ``metric/<name>`` key, so one on-policy run can lift several
+    objectives jointly — avoiding the forgetting that sequential OPD stages
+    cause (a terse-MCQA stage would overwrite chat verbosity, and vice versa).
+
+    Construct programmatically and pass via ``OPDTrainer(config, source=...)``:
+
+        mixed = MixedSource([("mmlu_en", 0.25, en_src),
+                             ("mmlu_it", 0.25, it_src),
+                             ("chat",    0.50, chat_src)], rng)
+    """
+
+    def __init__(self, sources: list[tuple[str, float, Any]], rng: random.Random):
+        if not sources:
+            raise ValueError("MixedSource needs at least one sub-source")
+        names = [n for n, _, _ in sources]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate sub-source names: {names}")
+        weights = [w for _, w, _ in sources]
+        if any(w < 0 for w in weights) or sum(weights) <= 0:
+            raise ValueError(f"weights must be non-negative and sum > 0: {weights}")
+        self.rng = rng
+        self.names = names
+        self.weights = weights
+        self.subs = {n: s for n, _, s in sources}
+        logger.info("MixedSource: %s",
+                    ", ".join(f"{n}={w / sum(weights):.0%}" for n, w in zip(names, weights)))
+
+    def sample(self) -> tuple[list[dict[str, str]], int, dict[str, Any]]:
+        name = self.rng.choices(self.names, weights=self.weights, k=1)[0]
+        messages, mnt, meta = self.subs[name].sample()
+        return messages, mnt, {**meta, "_src": name}
+
+    def evaluate(self, engine: Engine) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for name, sub in self.subs.items():
+            for k, v in sub.evaluate(engine).items():
+                out[f"{k}/{name}"] = v
+        return out
+
+    def batch_stats(self, rollouts: list[tuple[dict[str, Any], str]]) -> dict[str, float]:
+        by_src: dict[str, list] = {}
+        for meta, text in rollouts:
+            by_src.setdefault(meta.get("_src"), []).append((meta, text))
+        out: dict[str, float] = {}
+        for name, sub in self.subs.items():
+            rs = by_src.get(name)
+            if rs:
+                for k, v in sub.batch_stats(rs).items():
+                    out[f"{k}/{name}"] = v
+        return out

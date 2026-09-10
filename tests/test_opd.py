@@ -1,5 +1,6 @@
 """Test on-policy distillation: token bridge, prompt pool, formatting, config."""
 
+import collections
 import json
 import random
 import sys
@@ -522,3 +523,65 @@ def test_opd_config_validate():
     config.sampling.group_size = 4  # legal but useless with cot_fraction=0
     warnings = config.validate()
     assert len(warnings) == 1 and "group_size" in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# MixedSource (compose sub-sources into one OPD run)
+# ---------------------------------------------------------------------------
+
+class _FakeSub:
+    """Minimal PromptSource: samples a fixed mnt, reports a per-source metric."""
+
+    def __init__(self, name, mnt, dev):
+        self.name, self.mnt, self.dev = name, mnt, dev
+
+    def sample(self):
+        return [{"role": "user", "content": self.name}], self.mnt, {"tag": self.name}
+
+    def evaluate(self, engine):
+        return {"dev": self.dev}
+
+    def batch_stats(self, rollouts):
+        return {"n": float(len(rollouts))}
+
+
+def test_mixed_source_routes_samples_and_merges_metrics():
+    from palingenesis.opd.sources import MixedSource
+
+    a, b = _FakeSub("mcqa", 8, 0.4), _FakeSub("chat", 1024, 0.8)
+    m = MixedSource([("mcqa", 1.0, a), ("chat", 1.0, b)], random.Random(0))
+
+    # sample() tags meta with _src and preserves each sub's max_new_tokens
+    seen = {}
+    for _ in range(300):
+        _, mnt, meta = m.sample()
+        seen[meta["_src"]] = mnt
+    assert seen == {"mcqa": 8, "chat": 1024}
+
+    # evaluate() merges under metric/<name>
+    assert m.evaluate(engine=None) == {"dev/mcqa": 0.4, "dev/chat": 0.8}
+
+    # batch_stats() routes rollouts back to the right sub by _src
+    rolls = [({"_src": "mcqa"}, "x"), ({"_src": "mcqa"}, "y"), ({"_src": "chat"}, "z")]
+    assert m.batch_stats(rolls) == {"n/mcqa": 2.0, "n/chat": 1.0}
+
+
+def test_mixed_source_respects_weights():
+    from palingenesis.opd.sources import MixedSource
+
+    a, b = _FakeSub("rare", 8, 0.0), _FakeSub("common", 8, 0.0)
+    m = MixedSource([("rare", 1.0, a), ("common", 9.0, b)], random.Random(0))
+    counts = collections.Counter(m.sample()[2]["_src"] for _ in range(2000))
+    assert counts["common"] > counts["rare"] * 4  # ~9:1, generous margin
+
+
+def test_mixed_source_rejects_bad_construction():
+    from palingenesis.opd.sources import MixedSource
+
+    a = _FakeSub("a", 8, 0.0)
+    with pytest.raises(ValueError, match="at least one"):
+        MixedSource([], random.Random(0))
+    with pytest.raises(ValueError, match="duplicate"):
+        MixedSource([("a", 1.0, a), ("a", 1.0, a)], random.Random(0))
+    with pytest.raises(ValueError, match="weights"):
+        MixedSource([("a", 0.0, a)], random.Random(0))

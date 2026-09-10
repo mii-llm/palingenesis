@@ -5,14 +5,16 @@ import os
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import (
-    CPUOffloadPolicy,
-    fully_shard,
-    MixedPrecisionPolicy,
-)
-from torch.distributed._composable.fsdp import FSDPModule
 
 from palingenesis.config import ParallelConfig
+
+# NOTE: FSDP2 symbols (fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy,
+# FSDPModule) are imported lazily inside the functions that use them. Those
+# names only exist under torch.distributed.fsdp in torch>=2.6, and are only
+# needed for multi-GPU (world_size>1) runs -- build_mesh() returns None for a
+# single GPU, so apply_fsdp() is never called there. Keeping them out of module
+# scope lets this module import on older torch (e.g. 2.5.x) for single-GPU
+# training, where FSDP2 is unnecessary.
 
 
 def setup_distributed() -> tuple[int, int, int]:
@@ -109,6 +111,9 @@ def apply_fsdp(
         (avoids duplicate all-gathers for shared weights)
       - NVLink systems: enable symmetric memory for faster collectives
     """
+    from torch.distributed._composable.fsdp import FSDPModule
+    from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
+
     # Get the DP submesh (or full mesh if no CP)
     dp_mesh = mesh["dp"] if "cp" in (mesh.mesh_dim_names or ()) else mesh
 
@@ -166,6 +171,8 @@ def _try_enable_symm_mem(model: torch.nn.Module) -> None:
     On NVLink-connected systems, symmetric memory uses NVLink multicast
     for faster all-gathers and reduce-scatters. Harmless no-op if unsupported.
     """
+    from torch.distributed._composable.fsdp import FSDPModule
+
     try:
         for module in model.modules():
             if isinstance(module, FSDPModule):
