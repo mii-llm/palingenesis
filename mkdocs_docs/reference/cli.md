@@ -19,6 +19,26 @@ Equivalent to:
 torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/quickstart.yaml
 ```
 
+### distill
+
+On-policy distillation: the student samples with its current weights, the teacher scores those exact tokens, reverse-KL update. Works across mismatched chat templates when the pair shares a base vocabulary. Single-GPU by design (the student both generates and takes gradients every step).
+
+```bash
+pgs distill --config configs/distill_opd.yaml                  # multiple-choice pool
+pgs distill --config configs/distill_chat.yaml                 # generic chat prompts
+pgs distill --config configs/distill_opd.yaml --train.learning_rate 5e-6
+```
+
+See the [On-Policy Distillation guide](../guides/distillation.md).
+
+### distill-score
+
+Annotate a distillation pool with the teacher's own answers (`teacher_answer`, `teacher_correct`) so you can filter or reweight before training — pure KL distills the teacher's errors too. One batched forward per row, no generation. Accepts the same `--section.field` overrides as `distill`.
+
+```bash
+pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
+```
+
 ### autopilot
 
 Zero-config autonomous training. Profiles hardware, sweeps LR, trains to completion.

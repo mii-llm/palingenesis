@@ -363,9 +363,13 @@ def train(config: Config):
 
         logger.info(f"  Single dataset: {dataset_id}")
         dataset = _load_dataset_source(dataset_id, config.data.dataset_split, config.data.streaming)
+        streaming_shuffle_buffer = 0
         if not preserve_order:
             if config.data.streaming:
-                dataset = dataset.shuffle(seed=config.train.seed, buffer_size=10_000)
+                # Streaming must shuffle INSIDE the dataset, after per-worker
+                # sharding — shuffle-then-shard leaves workers 1..N-1 with empty
+                # shard lists and kills the DataLoader (see data._shard_then_shuffle).
+                streaming_shuffle_buffer = 10_000
             else:
                 # Map-style datasets were previously NEVER shuffled — samples
                 # arrived in file order every epoch (bad for optimization).
@@ -373,7 +377,13 @@ def train(config: Config):
 
         def _make_dataloader():
             return build_dataloader(
-                dataset, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
+                dataset,
+                tokenizer,
+                config.data,
+                rank,
+                world_size,
+                config.train.per_device_batch_size,
+                streaming_shuffle_buffer=streaming_shuffle_buffer,
             )
 
         dataloader = _make_dataloader()

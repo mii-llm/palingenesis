@@ -26,6 +26,8 @@ HELP = f"""{BANNER}
 
 Commands:
   train       Start training (use with torchrun for multi-GPU)
+  distill     On-policy distillation: student samples, teacher scores, reverse-KL update
+  distill-score  Annotate a distillation pool with the teacher's answers (filter before training)
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
   prepare     Score and filter data by difficulty (offline, uses model inference)
   prepare-multi  Prepare multiple sources with per-source scoring + MSFT allocation
@@ -40,6 +42,7 @@ Commands:
 
 Usage:
   pgs train --config configs/quickstart.yaml
+  pgs distill --config configs/distill_opd.yaml
   pgs autopilot --model Qwen/Qwen3.5-4B --dataset my_data.jsonl
   pgs prepare --model Qwen/Qwen3.5-4B --data traces.jsonl --strategy optimal
 
@@ -69,6 +72,16 @@ def main():
             from palingenesis.train import main as train_main
 
             train_main()
+
+        case "distill":
+            from palingenesis.opd.trainer import main as distill_main
+
+            distill_main()
+
+        case "distill-score":
+            from palingenesis.opd.score_pool import main as distill_score_main
+
+            distill_score_main()
 
         case "autopilot":
             from palingenesis.autopilot.run import main as autopilot_main

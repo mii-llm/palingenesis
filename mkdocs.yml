@@ -96,6 +96,7 @@ nav:
     - Multi-GPU: guides/multi-gpu.md
     - Multi-Node & SLURM: guides/multi-node.md
     - Autopilot: guides/autopilot.md
+    - On-Policy Distillation: guides/distillation.md
     - SFT → RL Transition: guides/sft-to-rl.md
   - Reference:
     - Configuration: reference/configuration.md
