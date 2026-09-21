@@ -34,7 +34,7 @@
 | `seed` | int | `42` | Random seed for data shuffling. |
 | `sources` | list | `[]` | Multi-dataset mode. List of `{dataset, split, weight, mode, messages_field}` dicts. |
 | `include_observations` | bool | `false` | **ECHO mode**: include tool/observation role tokens in loss. Teaches the model to predict tool outputs (world model). |
-| `train_on_reasoning` | bool | `true` | Include reasoning traces (`<think>` blocks / `reasoning_content`) in the loss. Required for distilling reasoning behavior. Set `false` to train only on the post-`</think>` response. Honored identically whether the chat template uses a `{% generation %}` span (fast path) or not (fallback path). |
+| `train_on_reasoning` | bool | `true` | Include reasoning traces (`<think>` blocks / `reasoning`) in the loss. Required for distilling reasoning behavior. Set `false` to train only on the post-`</think>` response. Honored identically whether the chat template uses a `{% generation %}` span (fast path) or not (fallback path). |
 | `turn_scaling` | str | `uniform` | Per-turn loss weight. `uniform` (equal), `progressive` (later turns heavier, √(idx/total)), `last_heavy` (final turn 2×). |
 | `last_turn_only` | bool | `false` | Mask every assistant turn except the final one — in training, loss only on the last answer; in `eval_sources`, score only the last answer. Phase-neutral name (no `train_`/`eval_` prefix) since the same mask serves both. Use when earlier assistant turns are a fixed context you must not fit/score (e.g. few-shot exemplar answers in eval-format SFT). No-op for single-turn data. Overridable per source in `sources`/`eval_sources`. |
 | `eval_dataset` | str | `""` | Single validation dataset. Enables best-model tracking. Empty = no validation. Superseded by `eval_sources` when set. |
@@ -202,6 +202,29 @@ Offline data preparation, driven by the **same config** as training (see the [Da
 | `max_batch_tokens` | int | `16384` | Padded-token cap per scoring forward. Logits are batch×seq×vocab, so this is what bounds memory: 16K ≈ 5GB bf16 logits at 150K vocab. On an 80GB GPU with a ≤8B model, `32768` is safe and noticeably faster. |
 | `hes` | bool | `false` | Also compute High-Entropy Sum reasoning-quality scores. Slower (second forward pass). |
 | `hes_top_k_pct` | float | `0.5` | Top-k% highest-entropy tokens summed for HES. |
+
+---
+
+## dpo
+
+Preference optimization (DPO and variants), a mode of `pgs train`. When `enabled`, `data.dataset` and `data.eval_dataset` hold preference pairs; optimizer, schedule, FSDP, checkpoints and chat-template masking are shared with SFT. See the [DPO guide](../guides/dpo.md).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | bool | `false` | Train on preference pairs instead of SFT conversations. |
+| `loss_type` | str | `sigmoid` | `sigmoid` (DPO), `hinge` (SLiC-HF), `ipo`, `robust` (rDPO), `sigmoid_norm` (length-normalised). |
+| `beta` | float | `0.1` | Inverse temperature of the implicit reward `β·(log π − log π_ref)`. |
+| `label_smoothing` | float | `0.0` | Assumed label-flip rate, `robust` only. Must be < 0.5. |
+| `ld_alpha` | float | `1.0` | LD-DPO: weight of the longer answer's tail beyond the shared length. `1.0` = off. |
+| `sft_weight` | float | `0.0` | Adds `sft_weight` × mean NLL of the chosen answer, anchoring it (RPO). |
+| `reference_model` | str | `""` | Frozen reference policy. Empty = `model.name_or_path`. |
+| `prompt_field` | str | `prompt` | Prompt field. Missing/empty = implicit prompt (chosen and rejected are full conversations). |
+| `chosen_field` | str | `chosen` | Preferred completion: messages, a multi-turn continuation, or a string. |
+| `rejected_field` | str | `rejected` | Dispreferred completion, same forms. |
+| `truncate_rejected` | bool | `true` | Truncate rejected answers longer than `data.max_seq_length` (else drop the pair). Chosen answers are never truncated. |
+| `disable_dropout` | bool | `true` | Zero dropout in the policy, so its log-probs are deterministic like the reference's. |
+
+`train.per_device_batch_size` counts **pairs**. Use `model.torch_dtype: float32`: without an fp32 master copy, DPO-sized updates round to zero in bf16. Incompatible (rejected by validation): packing, `data.sources`, `data.eval_sources`, pretokenize, MSFT, sequence-length curriculum, pretrain replay, `preprocess.enabled`, context parallel, gradient release, and the token-weighting plugins.
 
 ---
 

@@ -53,6 +53,15 @@ from palingenesis.data import (
     pretokenized_cache_valid,
 )
 from palingenesis.distributed import apply_fsdp, build_mesh, cleanup_distributed, is_main, setup_distributed
+from palingenesis.dpo import (
+    PreferenceDataset,
+    PreferenceEvaluator,
+    build_preference_dataloader,
+    collate_preferences,
+    disable_dropout,
+    preference_step,
+    reference_logps,
+)
 from palingenesis.health import HealthMonitor
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel
 from palingenesis.logging import Tracker, setup_logging
@@ -230,6 +239,28 @@ def train(config: Config):
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
+    # ── DPO reference policy (frozen; no activation checkpointing, no compile) ──
+    dpo = config.dpo if config.dpo.enabled else None
+    ref_model = None
+    if dpo is not None:
+        ref_path = dpo.reference_model or config.model.name_or_path
+        logger.info(f"DPO: loading frozen reference model: {ref_path}")
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            ref_path,
+            torch_dtype=model_dtype,
+            attn_implementation=config.model.attn_implementation,
+            trust_remote_code=config.model.trust_remote_code,
+            low_cpu_mem_usage=True,
+        )
+        if hasattr(ref_model, "config") and hasattr(ref_model.config, "use_cache"):
+            ref_model.config.use_cache = False
+        ref_model.requires_grad_(False)
+        ref_model.eval()
+        if dpo.disable_dropout:
+            n = disable_dropout(model)
+            if n:
+                logger.info(f"DPO: disabled {n} dropout module(s) in the policy")
+
     # ── Float8 Training (H100+ speedup, before AC and FSDP) ─────────────
     if config.memory.float8_training:
         from palingenesis.float8 import apply_float8_training
@@ -256,8 +287,12 @@ def train(config: Config):
     if is_fsdp:
         logger.info("Applying FSDP2 (fully_shard)")
         model = apply_fsdp(model, mesh, config.parallel, bf16=config.train.bf16)
+        if ref_model is not None:
+            ref_model = apply_fsdp(ref_model, mesh, config.parallel, bf16=config.train.bf16)
     else:
         model = model.to(device)
+        if ref_model is not None:
+            ref_model = ref_model.to(device)
 
     # ── Context Parallel ──────────────────────────────────────────────────
     cp_enabled = config.parallel.context_parallel and mesh is not None and "cp" in (mesh.mesh_dim_names or ())
@@ -375,16 +410,31 @@ def train(config: Config):
                 # arrived in file order every epoch (bad for optimization).
                 dataset = dataset.shuffle(seed=config.train.seed)
 
-        def _make_dataloader():
-            return build_dataloader(
-                dataset,
-                tokenizer,
-                config.data,
-                rank,
-                world_size,
-                config.train.per_device_batch_size,
-                streaming_shuffle_buffer=streaming_shuffle_buffer,
-            )
+        if dpo is not None:
+            # Preference pairs: per_device_batch_size PAIRS per micro-batch.
+            def _make_dataloader():
+                return build_preference_dataloader(
+                    dataset,
+                    tokenizer,
+                    config.data,
+                    dpo,
+                    rank,
+                    world_size,
+                    config.train.per_device_batch_size,
+                    streaming_shuffle_buffer=streaming_shuffle_buffer,
+                    shuffle_seed=config.train.seed,
+                )
+        else:
+            def _make_dataloader():
+                return build_dataloader(
+                    dataset,
+                    tokenizer,
+                    config.data,
+                    rank,
+                    world_size,
+                    config.train.per_device_batch_size,
+                    streaming_shuffle_buffer=streaming_shuffle_buffer,
+                )
 
         dataloader = _make_dataloader()
 
@@ -486,7 +536,17 @@ def train(config: Config):
     except AttributeError:
         _loss_vocab_size = 128256
 
-    if use_chunked_loss:
+    if dpo is not None:
+        lm_head = _get_lm_head(model)
+        if lm_head is None:
+            raise RuntimeError("DPO needs the model's lm_head (model.lm_head) for chunked log-probs.")
+        use_chunked_loss = False  # the DPO branch runs its own chunked passes
+        logger.info(
+            f"DPO: loss_type={dpo.loss_type} beta={dpo.beta} sft_weight={dpo.sft_weight} "
+            f"ld_alpha={dpo.ld_alpha} label_smoothing={dpo.label_smoothing} "
+            f"(per_device_batch_size={config.train.per_device_batch_size} pairs)"
+        )
+    elif use_chunked_loss:
         lm_head = _get_lm_head(model)
         _use_chunked_deft = config.plugins.deft and lm_head is not None
         if lm_head is None:
@@ -549,7 +609,42 @@ def train(config: Config):
     # ── Validation Set (optional) ─────────────────────────────────────────
     # Skipped when eval_sources is configured (the multi-evaluator takes over).
     eval_batches: list | None = None
-    if config.data.eval_dataset and not config.data.eval_sources:
+    _pref_evaluator = None
+    if dpo is not None and config.data.eval_dataset:
+        logger.info(f"Loading preference eval set: {config.data.eval_dataset} (split={config.data.eval_split})")
+        eval_pairs_ds = PreferenceDataset(
+            _load_dataset_source(config.data.eval_dataset, config.data.eval_split, streaming=True),
+            tokenizer,
+            config.data.max_seq_length,
+            prompt_field=dpo.prompt_field,
+            chosen_field=dpo.chosen_field,
+            rejected_field=dpo.rejected_field,
+            last_turn_only=config.data.last_turn_only,
+            train_on_reasoning=config.data.train_on_reasoning,
+            truncate_rejected=dpo.truncate_rejected,
+        )
+        eval_pairs = []
+        for pair in eval_pairs_ds:
+            eval_pairs.append(pair)
+            if len(eval_pairs) >= config.data.eval_samples:
+                break
+        if eval_pairs:
+            # Length-sorted batches of 4 pairs; eval metrics are per-pair means (order-free).
+            eval_pairs.sort(key=lambda x: max(x["chosen"]["input_ids"].numel(), x["rejected"]["input_ids"].numel()))
+            pad_id = tokenizer.pad_token_id or 0
+            _pref_evaluator = PreferenceEvaluator(
+                [collate_preferences(eval_pairs[i : i + 4], pad_id, pad_to_multiple=64)
+                 for i in range(0, len(eval_pairs), 4)],
+                loss_type=dpo.loss_type,
+                beta=dpo.beta,
+                label_smoothing=dpo.label_smoothing,
+                ld_alpha=dpo.ld_alpha if dpo.ld_alpha < 1.0 else None,
+                num_chunks_for=lambda n: _dynamic_num_chunks(n, _loss_vocab_size),
+            )
+            logger.info(f"  Preference eval set: {len(eval_pairs)} pairs ({eval_pairs_ds.stats})")
+        else:
+            logger.warning("  Preference eval set empty, disabling validation")
+    elif config.data.eval_dataset and not config.data.eval_sources:
         logger.info(f"Loading eval dataset: {config.data.eval_dataset} (split={config.data.eval_split})")
         eval_ds = _load_dataset_source(config.data.eval_dataset, config.data.eval_split, streaming=True)
         from palingenesis.data import ChatDataset, _collate_fn
@@ -693,8 +788,10 @@ def train(config: Config):
     # against a CE; DEFT/DFT/CADFT/InfoSFT values are differently scaled)
     _objective_is_ce = not (
         config.plugins.deft or config.plugins.dft or config.plugins.cadft
-        or config.plugins.info_sft or config.plugins.pre_rl
+        or config.plugins.info_sft or config.plugins.pre_rl or dpo is not None
     )
+    accum_dpo: dict[str, float] = {}  # DPO metrics summed over the accumulation window
+    accum_dpo_micro = 0
     grad_accum = config.train.gradient_accumulation_steps
     # GA ramp: start small, increase to target over training (arxiv:2602.14208)
     ga_ramp_start = config.train.ga_ramp_start
@@ -779,8 +876,49 @@ def train(config: Config):
             if position_ids is not None:
                 fwd_kwargs["position_ids"] = position_ids
 
+            loss_val = None
             with torch.amp.autocast("cuda", dtype=model_dtype, enabled=config.train.bf16):
-                if use_cce:
+                if dpo is not None:
+                    # Rows [0, P) are chosen answers, [P, 2P) the paired rejected ones.
+                    num_pairs = input_ids.shape[0] // 2
+                    raw_labels = batch["labels"]
+                    num_chunks = _dynamic_num_chunks(input_ids.numel(), _loss_vocab_size)
+                    # Averages match SFT's global-token denominator: pairs (and chosen
+                    # tokens, for the SFT term) summed over ranks and GA micro-steps.
+                    local_chosen = (shift_labels(raw_labels[:num_pairs]) != IGNORE_INDEX).sum()
+                    if is_fsdp:
+                        global_chosen = local_chosen.clone()
+                        dist.all_reduce(global_chosen, op=dist.ReduceOp.SUM)
+                    else:
+                        global_chosen = local_chosen
+                    ref_logps = reference_logps(
+                        ref_model, _get_hidden_states, _get_lm_head,
+                        input_ids, attention_mask, raw_labels, num_chunks,
+                    )
+                    hidden = _get_hidden_states(model, input_ids, attention_mask, None)
+                    step_out = preference_step(
+                        hidden,
+                        raw_labels,
+                        lm_head,
+                        ref_logps,
+                        num_pairs,
+                        loss_type=dpo.loss_type,
+                        beta=dpo.beta,
+                        label_smoothing=dpo.label_smoothing,
+                        ld_alpha=dpo.ld_alpha if dpo.ld_alpha < 1.0 else None,
+                        sft_weight=dpo.sft_weight,
+                        pair_denom=num_pairs * world_size * current_ga,
+                        chosen_token_denom=max(global_chosen.item(), 1) * current_ga,
+                        num_chunks=num_chunks,
+                    )
+                    loss = step_out.loss
+                    del ref_logps
+                    # Logged loss = this micro-batch's own mean objective.
+                    loss_val = step_out.metrics["dpo/loss"] + dpo.sft_weight * step_out.metrics.get("dpo/sft_nll", 0.0)
+                    for k, v in step_out.metrics.items():
+                        accum_dpo[k] = accum_dpo.get(k, 0.0) + v
+                    accum_dpo_micro += 1
+                elif use_cce:
                     hidden = _get_hidden_states(model, input_ids, attention_mask, position_ids)
                     loss = cut_cross_entropy_loss(
                         hidden,
@@ -871,7 +1009,8 @@ def train(config: Config):
             # ── Backward ──────────────────────────────────────────────
             # Undo the GA factor for logging: loss_val is the true per-token
             # micro-loss, while `loss` carries the 1/GA gradient scaling.
-            loss_val = loss.detach().float().item() * current_ga
+            if loss_val is None:
+                loss_val = loss.detach().float().item() * current_ga
             loss.backward()
 
             # MONA: augment gradients with curvature-aware acceleration (before optimizer step)
@@ -983,6 +1122,14 @@ def train(config: Config):
                     elif _objective_is_ce:
                         metrics["train/ppl"] = math.exp(min(step_loss, 20.0))
 
+                    if accum_dpo_micro:
+                        keys = sorted(accum_dpo)
+                        vals = torch.tensor([accum_dpo[k] / accum_dpo_micro for k in keys], device=device)
+                        if is_fsdp:
+                            dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+                            vals /= world_size
+                        metrics.update({f"train/{k}": float(v) for k, v in zip(keys, vals.tolist())})
+
                     if _spike_detector is not None:
                         metrics["train/spikes_skipped"] = _spike_detector.spikes_detected
                     if _adagc is not None:
@@ -994,7 +1141,16 @@ def train(config: Config):
                         metrics.update(health_metrics)
 
                     # ── Validation Loss ────────────────────────────────
-                    if eval_batches and global_step % config.data.eval_every == 0:
+                    if _pref_evaluator is not None and global_step % config.data.eval_every == 0:
+                        # Every rank scores the same fixed pairs (FSDP needs all ranks
+                        # in each forward), so the metrics are identical across ranks.
+                        metrics.update(_pref_evaluator.evaluate(
+                            model, ref_model, _get_hidden_states, _get_lm_head,
+                            device, model_dtype, config.train.bf16,
+                        ))
+                        if _best_tracker is not None:
+                            _best_tracker.update(metrics["eval/loss"], global_step, model, tokenizer, is_fsdp)
+                    elif eval_batches and global_step % config.data.eval_every == 0:
                         eval_loss = _compute_eval_loss(model, eval_batches, device, model_dtype, config.train.bf16)
                         metrics["eval/loss"] = eval_loss
                         metrics["eval/ppl"] = math.exp(min(eval_loss, 20.0))
@@ -1042,6 +1198,11 @@ def train(config: Config):
                             else ""
                         )
                         ce_str = f" ce={ce_loss:.4f}" if ce_loss is not None else ""
+                        if "train/rewards/accuracies" in metrics:
+                            ce_str += (
+                                f" acc={metrics['train/rewards/accuracies']:.3f}"
+                                f" margin={metrics['train/rewards/margins']:.3f}"
+                            )
                         logger.info(
                             f"step={global_step} loss={step_loss:.4f}{ce_str} lr={lr:.2e} "
                             f"tok/s={tok_s:.0f} grad_norm={gn:.3f} dt={dt:.2f}s{entropy_str}{eval_str}"
@@ -1056,6 +1217,7 @@ def train(config: Config):
 
                 accum_loss, accum_tokens, accum_micro = 0.0, 0, 0
                 accum_ce, accum_gate, accum_ce_micro = 0.0, 0.0, 0
+                accum_dpo, accum_dpo_micro = {}, 0
                 t_step = time.perf_counter()
 
                 # ── Checkpoint ────────────────────────────────────────

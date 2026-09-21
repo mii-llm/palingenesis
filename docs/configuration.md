@@ -92,7 +92,7 @@ grep "STATUS: experimental" src/palingenesis/config.py
 | `streaming` | bool | `true` | Stream data (no full download needed) |
 | `max_seq_length` | int | `8192` | Maximum sequence length (truncation boundary) |
 | `messages_field` | str | `messages` | Field name containing chat messages |
-| `train_on_reasoning` | bool | `true` | Include `<think>`/`reasoning_content` traces in the loss (needed for reasoning distillation) |
+| `train_on_reasoning` | bool | `true` | Include `<think>`/`reasoning` traces in the loss (needed for reasoning distillation) |
 | `num_workers` | int | `4` | DataLoader worker processes |
 | `packing` | bool | `false` | Pack multiple sequences into fixed-length blocks |
 
@@ -184,6 +184,25 @@ pgs prepare --config my_config.yaml          # score + filter + dump parquet
 pgs train   --config my_config.yaml \
     --preprocess.enabled true                # trains on the prepared parquet
 ```
+
+## Section: `dpo`
+
+Preference optimisation (DPO and variants). When `enabled`, `data.dataset` and `data.eval_dataset` hold preference pairs; everything else (optimizer, schedule, FSDP, checkpoints, chat-template masking) is shared with SFT. Full guide: [dpo.md](dpo.md).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Train on preference pairs instead of SFT conversations |
+| `loss_type` | str | `sigmoid` | `sigmoid` (DPO), `hinge` (SLiC), `ipo`, `robust`, `sigmoid_norm` (length-normalised) — see [dpo.md](dpo.md) |
+| `beta` | float | `0.1` | Inverse temperature of the implicit reward |
+| `label_smoothing` | float | `0.0` | Assumed label-flip rate; `robust` only, must be < 0.5 |
+| `ld_alpha` | float | `1.0` | LD-DPO weight of the longer answer's tail (1.0 = off) |
+| `sft_weight` | float | `0.0` | Adds `sft_weight` × mean NLL of the chosen answer (RPO) |
+| `reference_model` | str | `""` | Frozen reference; empty = `model.name_or_path` |
+| `prompt_field` / `chosen_field` / `rejected_field` | str | `prompt` / `chosen` / `rejected` | Row fields. No prompt = implicit prompt (full conversations) |
+| `truncate_rejected` | bool | `true` | Cut over-long rejected answers (else drop the pair). Chosen is never cut |
+| `disable_dropout` | bool | `true` | Zero dropout in the policy |
+
+`per_device_batch_size` counts **pairs**. Incompatible (rejected by `validate()`): packing, `data.sources`, `data.eval_sources`, pretokenize, MSFT, seq-len curriculum, pretrain replay, `preprocess.enabled`, context parallel, gradient release, and the token-weighting plugins.
 
 ## Section: `logging`
 

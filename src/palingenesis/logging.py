@@ -38,7 +38,8 @@ class Tracker:
         if not is_main:
             return
 
-        name = config.logging.run_name or f"sft-{config.model.name_or_path.split('/')[-1]}"
+        stage = "dpo" if config.dpo.enabled else "sft"
+        name = config.logging.run_name or f"{stage}-{config.model.name_or_path.split('/')[-1]}"
         flat_config = _flatten(config)
         resuming = _will_resume(config)
 

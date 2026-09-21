@@ -33,6 +33,7 @@ Config examples:
         text_field: text
 """
 
+import json
 import logging
 import math
 import random
@@ -187,6 +188,15 @@ class ChatDataset(IterableDataset):
         # earlier assistant turns are a FIXED few-shot prefix (e.g. n-shot MCQA
         # exemplars) that must not receive loss.
         self.last_turn_only = last_turn_only
+        # Per-row chat-template kwargs (e.g. {"enable_thinking": false}), read from the
+        # example's `chat_template_kwargs` field and applied to EVERY render of that row,
+        # including the fallback paths. Rows without the field render with none.
+        self._template_kwargs: dict[str, Any] = {}
+
+    def _render_chat(self, messages: list[dict], **kwargs):
+        """apply_chat_template with the current row's template kwargs. Explicit keyword
+        arguments win, so a call site can still force e.g. add_generation_prompt."""
+        return self.tokenizer.apply_chat_template(messages, **{**self._template_kwargs, **kwargs})
 
     def __iter__(self):
         dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size,
@@ -216,6 +226,10 @@ class ChatDataset(IterableDataset):
         return new_mask
 
     def _process(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
+        kwargs = example.get("chat_template_kwargs") or {}
+        if isinstance(kwargs, str):  # JSON-encoded in some dataset exports
+            kwargs = json.loads(kwargs) if kwargs.strip() else {}
+        self._template_kwargs = dict(kwargs)
         messages = example.get(self.messages_field)
         if not messages:
             # Try alternative field names (conversations, chat, dialogue, etc.)
@@ -243,7 +257,7 @@ class ChatDataset(IterableDataset):
             return None
 
         try:
-            templated = self.tokenizer.apply_chat_template(
+            templated = self._render_chat(
                 messages,
                 tokenize=True,
                 add_generation_prompt=False,
@@ -281,7 +295,7 @@ class ChatDataset(IterableDataset):
         # the fallback path applies. Only affects already-trained tokens, so it respects
         # last_turn_only and never touches user/system regions.
         if not self.train_on_reasoning:
-            full_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            full_text = self._render_chat(messages, tokenize=False, add_generation_prompt=False)
             labels = self._strip_reasoning_labels(input_ids, labels, full_text)
 
         # ECHO: if include_observations, also unmask tool_response regions within user messages
@@ -297,13 +311,15 @@ class ChatDataset(IterableDataset):
     def _split_reasoning(msg: dict) -> tuple[str | None, str]:
         """Return (reasoning_raw, answer_raw): strings expected to appear verbatim in the
         rendered text. reasoning_raw is None when the turn carries no reasoning. Handles
-        both the `reasoning_content` field and `<think>...</think>` embedded in content."""
+        the `reasoning` field (current convention), `reasoning_content` (older), and
+        `<think>...</think>` embedded in content."""
         content = msg.get("content") or ""
         if not isinstance(content, str):
             content = str(content)
-        rc = msg.get("reasoning_content")
-        if isinstance(rc, str) and rc.strip():
-            return rc.strip(), content.strip()
+        for key in ("reasoning", "reasoning_content"):
+            rc = msg.get(key)
+            if isinstance(rc, str) and rc.strip():
+                return rc.strip(), content.strip()
         if "</think>" in content:
             head, _, tail = content.partition("</think>")
             reasoning = head.split("<think>")[-1].strip()
@@ -375,7 +391,7 @@ class ChatDataset(IterableDataset):
         Requires a fast tokenizer (offset mapping). Returns None on any anomaly so the
         caller can fall back to the progressive masker.
         """
-        full = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        full = self._render_chat(messages, tokenize=False, add_generation_prompt=False)
         enc = self.tokenizer(
             full,
             add_special_tokens=False,
@@ -531,7 +547,7 @@ class ChatDataset(IterableDataset):
         This eliminates the ~1-3 token boundary imprecision of the naive approach.
         """
         # Tokenize the full conversation
-        full_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        full_text = self._render_chat(messages, tokenize=False, add_generation_prompt=False)
         tokens = self.tokenizer(full_text, truncation=True, max_length=self.max_seq_length, return_tensors="pt")
         input_ids = tokens["input_ids"].squeeze(0)
         attn_mask = tokens["attention_mask"].squeeze(0)
@@ -554,7 +570,7 @@ class ChatDataset(IterableDataset):
         for i, msg in enumerate(messages):
             try:
                 # Tokenize prefix including this turn
-                prefix_text = self.tokenizer.apply_chat_template(
+                prefix_text = self._render_chat(
                     messages[: i + 1], tokenize=False, add_generation_prompt=False
                 )
                 prefix_ids = self.tokenizer(prefix_text, truncation=True, max_length=self.max_seq_length)["input_ids"]
@@ -590,7 +606,7 @@ class ChatDataset(IterableDataset):
                         stub_msg.pop("reasoning_content", None)
                     stub_messages = messages[:i] + [stub_msg]
                     try:
-                        stub_text = self.tokenizer.apply_chat_template(
+                        stub_text = self._render_chat(
                             stub_messages, tokenize=False, add_generation_prompt=False
                         )
                         stub_ids = self.tokenizer(stub_text, truncation=True, max_length=self.max_seq_length)["input_ids"]
@@ -748,7 +764,7 @@ class ChatDataset(IterableDataset):
         for i in range(len(messages)):
             prefix_messages = messages[: i + 1]
             try:
-                prefix_text = self.tokenizer.apply_chat_template(
+                prefix_text = self._render_chat(
                     prefix_messages,
                     tokenize=False,
                     add_generation_prompt=False,

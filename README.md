@@ -60,13 +60,26 @@ wandb + trackio, wired for real investigation: loss/ppl, grad norm, spike/clip c
 
 ## Agentic data support
 
-Native support for reasoning traces with `reasoning_content`, `tool_calls`, and tool responses. ShareGPT, Alpaca, and OpenAI formats auto-normalized. Tool-call validation against declared schemas.
+Native support for reasoning traces with `reasoning` (or legacy `reasoning_content`), `tool_calls`, and tool responses. ShareGPT, Alpaca, and OpenAI formats auto-normalized. Tool-call validation against declared schemas.
 
 ```yaml
 data:
   include_observations: true  # ECHO: train on tool outputs (world model)
   turn_scaling: progressive   # Later turns weighted more
 ```
+
+## Preference optimization (DPO)
+
+DPO and its variants (IPO, SLiC-HF, robust DPO, length-normalised, plus LD-DPO and an SFT anchor) run on the same trainer, chat templates and masking as SFT, with thinking and non-thinking pairs mixed in one dataset. The full `[B, S, V]` logits are never materialised.
+
+```yaml
+dpo:
+  enabled: true
+  beta: 0.1
+  sft_weight: 0.2
+```
+
+See [docs/dpo.md](docs/dpo.md).
 
 ## Autopilot
 

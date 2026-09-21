@@ -239,6 +239,44 @@ class PreprocessConfig:
 
 
 @dataclass(slots=True)
+class DPOConfig:
+    """Preference optimisation (DPO and variants) — see docs/dpo.md.
+
+    When enabled, `data.dataset` (and `data.eval_dataset`) hold preference pairs
+    instead of SFT conversations; everything else (optimizer, schedule, FSDP,
+    checkpointing, chat-template masking) is shared with SFT.
+    """
+
+    enabled: bool = False
+    # sigmoid (DPO) | hinge (SLiC) | ipo | robust | sigmoid_norm (length-normalised)
+    loss_type: str = "sigmoid"
+    beta: float = 0.1
+    # Assumed preference-label noise; only used by loss_type=robust (must be < 0.5).
+    label_smoothing: float = 0.0
+    # LD-DPO (arxiv:2409.06411): weight of the longer answer's tail beyond the
+    # length both answers share. 1.0 = off (plain DPO); the paper uses ~0.5.
+    ld_alpha: float = 1.0
+    # Adds sft_weight × mean NLL over chosen tokens (RPO, arxiv:2404.19733). Anchors the
+    # chosen answer so the margin cannot grow by only pushing rejected down.
+    sft_weight: float = 0.0
+    # Frozen reference policy. Empty = the model being trained, as loaded
+    # (model.name_or_path) — the standard choice.
+    reference_model: str = ""
+    # Row fields (conversational preference format). An empty/missing prompt means chosen and
+    # rejected are full conversations (implicit prompt).
+    prompt_field: str = "prompt"
+    chosen_field: str = "chosen"
+    rejected_field: str = "rejected"
+    # Chosen answers are never truncated (the pair is dropped). Rejected answers
+    # longer than data.max_seq_length are truncated when true (suits degenerate,
+    # looping rejections), dropped when false.
+    truncate_rejected: bool = True
+    # Zero every dropout in the policy. Otherwise the policy's
+    # log-probs are noisy against a deterministic reference.
+    disable_dropout: bool = True
+
+
+@dataclass(slots=True)
 class LoggingConfig:
     project: str = "palingenesis"
     run_name: str | None = None
@@ -266,6 +304,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
+    dpo: DPOConfig = field(default_factory=DPOConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     @classmethod
@@ -460,7 +499,19 @@ class Config:
                     "single fixed pre-tokenized stream can't represent it. Disable one of them."
                 )
 
+        if self.dpo.enabled:
+            errors.extend(self._dpo_errors())
+
         # ── Soft warnings (untested combinations) ─────────────────────────
+        if self.dpo.enabled and self.model.torch_dtype != "float32":
+            warnings.append(
+                f"dpo.enabled with model.torch_dtype={self.model.torch_dtype}: the optimizer "
+                "updates the weights in that dtype, with no fp32 master copy. A bf16 weight "
+                "resolves ~0.4% of its magnitude, so at DPO learning rates (~1e-6) nearly every "
+                "update rounds to zero and the policy never leaves the reference. Use "
+                "model.torch_dtype: float32 (compute still runs in bf16 under train.bf16)."
+            )
+
         if self.memory.gradient_release and self.train.hyperball:
             warnings.append(
                 "gradient_release + hyperball: both modify the parameter update path. "
@@ -540,6 +591,50 @@ class Config:
             raise ConfigError(msg)
 
         return warnings
+
+
+    def _dpo_errors(self) -> list[str]:
+        from palingenesis.dpo import LOSS_TYPES
+
+        d = self.dpo
+        errors: list[str] = []
+        if d.loss_type not in LOSS_TYPES:
+            errors.append(f"dpo.loss_type={d.loss_type!r} is not one of {', '.join(LOSS_TYPES)}.")
+        if d.beta <= 0:
+            errors.append(f"dpo.beta must be > 0 (got {d.beta}).")
+        if not 0.0 <= d.label_smoothing < 0.5:
+            errors.append(f"dpo.label_smoothing must be in [0, 0.5) (got {d.label_smoothing}).")
+        if d.label_smoothing and d.loss_type != "robust":
+            errors.append(
+                f"dpo.label_smoothing is only used by loss_type=robust; with {d.loss_type!r} it "
+                "would be silently ignored. Set it to 0 or use loss_type: robust."
+            )
+        if not 0.0 <= d.ld_alpha <= 1.0:
+            errors.append(f"dpo.ld_alpha must be in [0, 1] (got {d.ld_alpha}; 1.0 = off).")
+        if d.sft_weight < 0:
+            errors.append(f"dpo.sft_weight must be >= 0 (got {d.sft_weight}).")
+        # Features that assume one SFT sequence per row, or change the token stream.
+        unsupported = {
+            "data.packing": self.data.packing,
+            "data.sources (use one preference dataset)": bool(self.data.sources),
+            "data.eval_sources (use data.eval_dataset)": bool(self.data.eval_sources),
+            "data.pretokenize": self.data.pretokenize,
+            "data.msft_tracking": self.data.msft_tracking,
+            "data.seq_len_curriculum": self.data.seq_len_curriculum,
+            "data.pretrain_replay_dataset": bool(self.data.pretrain_replay_dataset),
+            "preprocess.enabled": self.preprocess.enabled,
+            "parallel.context_parallel": self.parallel.context_parallel,
+            "memory.gradient_release": self.memory.gradient_release,
+            "plugins.dft": self.plugins.dft,
+            "plugins.cadft": self.plugins.cadft,
+            "plugins.deft": self.plugins.deft,
+            "plugins.info_sft": self.plugins.info_sft,
+            "plugins.pre_rl": self.plugins.pre_rl,
+        }
+        for name, on in unsupported.items():
+            if on:
+                errors.append(f"dpo.enabled=true does not support {name}; disable it for preference training.")
+        return errors
 
 
 class ConfigError(Exception):

@@ -111,14 +111,16 @@ def normalize_messages(
         # Build normalized message
         msg: dict[str, Any] = {"role": role, "content": content or ""}
 
-        # Preserve special fields (reasoning_content, tool_calls, etc.)
-        if "reasoning_content" in turn:
-            msg["reasoning_content"] = turn["reasoning_content"]
-        elif "reasoning" in turn and turn["reasoning"]:
-            msg["reasoning_content"] = turn["reasoning"]
-        elif "think" in turn and turn["think"]:
-            # Fallback: 'think' field normalized to 'reasoning_content' (only if canonical field absent)
-            msg["reasoning_content"] = turn["think"]
+        # `reasoning` is the canonical field (OpenAI/vLLM); `reasoning_content` and
+        # `think` are accepted as legacy input. As vLLM does before rendering, the
+        # trace is exposed under both keys: templates such as Qwen3.5's still read
+        # `message.reasoning_content` in their Jinja.
+        reasoning = next((turn[k] for k in ("reasoning", "reasoning_content", "think")
+                          if isinstance(turn.get(k), str) and turn[k].strip()), None)
+        if reasoning is not None:
+            msg["reasoning"] = reasoning
+            msg["reasoning_content"] = reasoning
+        # Preserve other special fields (tool_calls, etc.)
         if "tool_calls" in turn:
             msg["tool_calls"] = turn["tool_calls"]
         if "function_call" in turn:

@@ -1,0 +1,69 @@
+# Qwen3.5-0.8B — DPO on top of an SFT checkpoint (full fine-tune).
+#
+# Preference rows (JSONL/parquet/HF dataset), e.g.
+#   {"prompt":   [{"role": "user", "content": "..."}],
+#    "chosen":   [{"role": "assistant", "content": "...", "reasoning": "..."}],
+#    "rejected": [{"role": "assistant", "content": "..."}],
+#    "chat_template_kwargs": {"enable_thinking": true}}
+# Mixed thinking / non-thinking rows are fine: kwargs are applied per row.
+# See docs/dpo.md.
+#
+# Launch:
+#   torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/dpo_qwen35_08b.yaml
+
+model:
+  name_or_path: ./checkpoints/qwen35-08b-sft/final   # the SFT policy; also the reference
+  trust_remote_code: true
+  torch_dtype: float32      # fp32 weights: DPO-sized updates vanish in bf16 (compute is bf16 via train.bf16)
+  attn_implementation: flash_attention_2
+  use_liger_kernel: true
+  compile: true
+
+data:
+  dataset: ./data/dpo/train.jsonl
+  dataset_split: train
+  streaming: false          # exact step count for the LR schedule
+  max_seq_length: 6144      # chosen answers longer than this are dropped, never cut
+  num_workers: 4
+  packing: false            # required: DPO scores whole sequences
+  last_turn_only: true      # score only the final assistant turn
+  train_on_reasoning: true  # reasoning tokens are part of the scored answer
+  eval_dataset: ./data/dpo/eval.jsonl
+  eval_split: train
+  eval_samples: 500
+  eval_every: 50
+
+dpo:
+  enabled: true
+  loss_type: sigmoid
+  beta: 0.1
+  sft_weight: 0.2           # keep the chosen answer likely, not only rejected unlikely
+  ld_alpha: 1.0             # off; <1 down-weights the longer answer's tail (see docs)
+  reference_model: ""       # empty = model.name_or_path
+  truncate_rejected: true   # long degenerate rejections are cut, not dropped
+  disable_dropout: true
+
+train:
+  output_dir: ./checkpoints/qwen35-08b-dpo
+  epochs: 1
+  per_device_batch_size: 2  # PAIRS per micro-batch (4 sequences)
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-7     # full fine-tune; DPO needs a far smaller LR than SFT
+  min_learning_rate: 5.0e-8
+  weight_decay: 0.0
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  save_steps: 100
+  logging_steps: 1
+  gradient_checkpointing: selective
+
+parallel:
+  fsdp: false
+
+memory:
+  float32_matmul_precision: high
+
+logging:
+  project: palingenesis
+  run_name: qwen35-08b-dpo
