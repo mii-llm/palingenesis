@@ -920,6 +920,7 @@ def train(config: Config):
                         chunk_size=config.memory.seco_chunk_size,
                         budget=config.memory.spaco_budget or None,
                         loss_denom=loss_denom,
+                        kv_offload=config.memory.seco_kv_offload,
                         num_loss_chunks=lambda n: _dynamic_num_chunks(n, _loss_vocab_size),
                     )
                     loss_val = result.loss * current_ga

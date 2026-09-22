@@ -124,8 +124,11 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     logits_gb = 2 * ce_tokens / chunks * vocab * 4 / GB       # fp32 logits + their gradient, one chunk
 
     kv_gb = 0.0
-    if config.memory.seco:                                    # K/V leaf + its gradient + one prefix copy
-        kv_gb = 3 * rows * seq * full_layers * 2 * kv_heads * head_dim * act_bytes / GB
+    if config.memory.seco:
+        # K/V store + its gradient on the GPU (sdpa); only the gradient with offload;
+        # the previous path (non-sdpa attention) also keeps a prefix copy.
+        copies = 1 if config.memory.seco_kv_offload else (2 if config.model.attn_implementation == "sdpa" else 3)
+        kv_gb = copies * rows * seq * full_layers * 2 * kv_heads * head_dim * act_bytes / GB
 
     exact_gb = params_gb + optimizer_gb + grads_gb + reference_gb
     total_gb = (exact_gb + activations_gb + logits_gb + kv_gb) * 1.10

@@ -395,3 +395,62 @@ def test_scored_ce_sum_equals_cross_entropy_of_the_model_logits(arch):
     got, count = scored_ce_sum(model, ids, mask, shifted, torch.float64, chunk_bytes=VOCAB * 4 * 7)
     assert count == int((shifted != IGNORE_INDEX).sum())
     assert abs(got - float(expected)) < 1e-9 * abs(float(expected))
+
+
+# ── K/V stores: no prefix copy, optional offload ─────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["llama", "qwen3_5", "gemma3"])
+@pytest.mark.parametrize("offload", [False, True])
+def test_kv_store_path_is_used_and_exact(arch, offload, monkeypatch):
+    import palingenesis.seco as seco_module
+
+    calls = []
+    original = seco_module.chunk_attention
+
+    def counting(*args, **kwargs):
+        calls.append(args[4])                 # prefix length seen by the store path
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(seco_module, "chunk_attention", counting)
+    monkeypatch.setattr(seco_module, "KV_BLOCK", 10)       # several prefix blocks per chunk
+    model = build(arch, attn="sdpa").eval()
+    ids, labels, mask = _batch()
+    _, full_grads = _full(model, ids, labels, mask)
+    _, grads = _chunked(model, ids, labels, chunk_size=16, kv_offload=offload)
+    assert calls and max(calls) == 64                      # the last chunk attended a 64-token prefix
+    assert _max_rel_err(grads, full_grads) < _ARCH_TOL.get(arch, 5e-6)
+
+
+def test_kv_offload_needs_sdpa():
+    model = build("llama", attn="eager")
+    ids, labels, _ = _batch()
+    with pytest.raises(NotImplementedError, match="seco_kv_offload"):
+        chunkwise_forward_backward(model, ids, labels, chunk_size=16, kv_offload=True)
+
+
+def test_offload_budget_is_checked_before_allocating():
+    """The estimate counts every full-attention layer's K and V for the whole
+    sequence, and an impossible request is refused up front."""
+    from palingenesis.seco import _offloaded_bytes
+    from palingenesis.seco_attention import check_host_budget
+
+    model = build("llama", attn="sdpa")
+    cfg = model.config
+    need = _offloaded_bytes(model.model, batch=2, seq_len=1000, cast=torch.bfloat16)
+    expected = 2 * cfg.num_hidden_layers * 2 * cfg.num_key_value_heads * cfg.head_dim * 1000 * 2
+    assert need == expected
+    check_host_budget(1 << 20)                       # a megabyte is fine anywhere
+    with pytest.raises(RuntimeError, match="seco_kv_offload would hold"):
+        check_host_budget(1 << 50)                   # a petabyte is not
+
+
+def test_offload_budget_counts_only_attention_layers_of_a_hybrid():
+    from palingenesis.seco import _offloaded_bytes
+
+    model = build("qwen3_5", attn="sdpa")
+    cfg = model.config
+    full_layers = sum(1 for t in cfg.layer_types if t == "full_attention")
+    need = _offloaded_bytes(model.model, batch=1, seq_len=512, cast=torch.bfloat16)
+    assert need == 2 * full_layers * cfg.num_key_value_heads * cfg.head_dim * 512 * 2
+    assert full_layers < cfg.num_hidden_layers       # the point of a hybrid

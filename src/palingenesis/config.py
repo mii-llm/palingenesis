@@ -198,6 +198,10 @@ class MemoryConfig:
     # full backprop, incl. Qwen3.5 hybrids) for one extra no-grad forward (~+33%).
     seco: bool = False
     seco_chunk_size: int = 4096
+    # Keep the full-attention K/V (and recurrent start states) in pinned CPU memory,
+    # streamed to the GPU block by block: GPU memory then grows only with the K/V
+    # gradient. Exact; costs PCIe transfers. Needs attn_implementation: sdpa.
+    seco_kv_offload: bool = False
     # SpaCO: backprop only this many random chunks per sequence (0 = SeCO, exact).
     # A stochastic gradient estimate; cuts backward compute on very long inputs.
     spaco_budget: int = 0

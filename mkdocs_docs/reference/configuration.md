@@ -166,6 +166,7 @@
 | `selective_diff` | bool | `true` | Skip activation saving for frozen layers. Auto-enabled with `freeze_non_attention`. |
 | `seco` | bool | `false` | SeCO chunk-wise training for long sequences: activation memory set by `seco_chunk_size`, not sequence length. Exact gradients. Single GPU. See [Long Sequences](../guides/long-sequences.md). |
 | `seco_chunk_size` | int | `4096` | Tokens per SeCO chunk. |
+| `seco_kv_offload` | bool | `false` | Keep full-attention K/V (and recurrent start states) in pinned CPU memory, streamed to the GPU block by block; GPU memory then grows only with the K/V gradient. Exact. Needs `attn_implementation: sdpa`. |
 | `spaco_budget` | int | `0` | SpaCO: backpropagate only this many random chunks per sequence (a stochastic gradient estimate). `0` = exact SeCO. |
 
 ---

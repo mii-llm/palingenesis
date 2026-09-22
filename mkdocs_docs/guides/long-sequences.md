@@ -71,29 +71,56 @@ Dropout and router jitter are replayed: each chunk's RNG state is saved in stage
 
 ## Efficiency
 
-- **Attention.** A chunk's queries attend to a longer prefix. For models configured with SDPA, SeCO attends through a lower-right causal bias with native grouped-query attention, which runs on the flash kernel with no mask. HF's generic path would build a `[chunk, prefix]` mask and expand K/V to every query head.
+- **The prefix is never copied.** Each full-attention layer keeps the whole sequence's K/V in one buffer. A chunk attends to it block by block, and to its own tokens causally; the parts are merged by their log-sum-exp, the exact combination flash and ring attention use internally. Backward runs per block from the merged output, so the gradients are exact and land straight in the prefix's gradient buffer. Memory that grows with length is then the K/V plus its gradient, 2x the K/V, instead of 4x.
+- **`memory.seco_kv_offload`.** The same block-by-block reads let the K/V (and the recurrent start states) live in pinned CPU memory, streamed to the GPU one block at a time. Only the gradient buffer stays resident: 1x the K/V. It costs PCIe transfers (measured 1.2x to 2.5x slower) and needs about the K/V size in host RAM.
+
+    !!! warning "Offloading is bounded by host RAM, not GPU memory"
+        The stores are pinned, so the host cannot swap them. palingenesis refuses up front to hold more than 40% of the machine's RAM in K/V and says how much it would need. On a 117 GiB host, 28 GiB of pinned K/V trained fine, while 56 GiB left the machine unusable and the GPU waiting on page faults.
+- **Grouped-query attention.** K/V heads go to the kernel as they are, never expanded to all query heads.
 - **Cache precision.** K/V are cached in the autocast dtype, exactly as attention consumes them.
 - **Logits.** The loss per chunk is the chunked cross-entropy, so logits never exist for more than one slice at a time.
 
 ### Measured on one A100 80GB
 
-All runs use Qwen3.5-0.8B (hybrid: Gated DeltaNet + attention; torch kernels, no `fla`) with fp32 weights, bf16 autocast, real text and one sequence per step. Each is one forward+backward.
+fp32 weights, bf16 autocast, full activation checkpointing, 4k chunks, real text, one forward+backward per row. Times in seconds, peak memory in GiB.
 
-| Tokens | Full backprop + full checkpointing | SeCO, 2k chunks + full ckpt | SeCO, 4k chunks + full ckpt | SeCO, 1k chunks, no ckpt |
+**Qwen3.5-0.8B** (hybrid: only 6 of 24 layers keep a K/V cache):
+
+| Tokens | Full backprop | SeCO, before this | **SeCO** | **SeCO + `seco_kv_offload`** |
 |---|---|---|---|---|
-| 32k | 42 s · 19.3 GB | 42 s · 18.5 GB | 34 s · 27.5 GB | 44 s · 20.2 GB |
-| 131k | 440 s · 64.6 GB | 175 s · 24.4 GB | 152 s · 33.0 GB | 185 s · 26.0 GB |
-| 262k | not run (≈125 GB projected) | 363 s · 32.7 GB | 327 s · 40.3 GB | 336 s · 35.1 GB |
-| 524k | not run | 871 s · 51.3 GB | 857 s · 56.5 GB | 713 s · 55.8 GB |
-| 1M | not run | out of memory | out of memory | out of memory |
+| 131k | 440 s · 60 GiB | 152 s · 31 GiB | not run | not run |
+| 262k | not run (~116 GiB) | 327 s · 38 GiB | 333 s · 31 GiB | 397 s · 27 GiB |
+| 524k | not run | 857 s · 53 GiB | 809 s · 38 GiB | 1079 s · 30 GiB |
+| **1M** | not run | out of memory | **2154 s · 53 GiB** | **3124 s · 36 GiB** |
 
-At 131k tokens SeCO is 2.4–2.9× faster than full backprop and uses 2.0–2.6× less memory, depending on the configuration. It trains 524k-token sequences. Full backprop's measured growth (≈0.46 MB per token) would need ≈125 GB already at 262k, beyond this 80 GB GPU; that length was not run. Memory still grows with length, because the attention K/V (and its gradient) and the per-chunk recurrent states are proportional to the sequence. For this model that is roughly 60 KB per token.
+**Qwen3-0.6B** (dense: every one of its 28 layers keeps K/V, like 4B–8B dense models):
 
-**Exactness** (same model, 4,096 real tokens):
+| Tokens | SeCO, before this | **SeCO** | **SeCO + `seco_kv_offload`** |
+|---|---|---|---|
+| 65k | 22 s · 35 GiB | 24 s · 25 GiB | 54 s · 18 GiB |
+| 131k | 78 s · 64 GiB | 84 s · 39 GiB | 198 s · 25 GiB |
+| 262k | out of memory | 311 s · 67 GiB | 733 s · 39 GiB |
+| 524k | out of memory | out of memory | refused: needs 56 GiB of host RAM |
 
-- **fp64:** gradients match full backpropagation to 2–6·10⁻⁷ at every chunk size, which is the floor of the fp32 loss kernel.
-- **fp32:** SeCO equals full backprop whenever both use the same loss chunk size.
-- **bf16 autocast:** measured against the fp32 gradient, full backprop is off by 1.72% and SeCO by 1.73–1.93%. That is the same mixed-precision error.
+Memory grows exactly as the K/V accounting predicts. Qwen3-0.6B stores 112 KB of K/V per token:
+
+| Path | Measured growth | = |
+|---|---|---|
+| Before | ~460 KB/token | ~4x the K/V |
+| K/V store | 224 KB/token | 2x (store + gradient) |
+| Offload | 112 KB/token | 1x (gradient only) |
+
+**Exactness** (4,096 real tokens for Qwen3.5-0.8B, 2,048 for Qwen3-0.6B), gradients against the fp64 ground truth:
+
+| | Qwen3.5-0.8B | Qwen3-0.6B |
+|---|---|---|
+| full backprop, fp32 | 2.99e-4 | 3.17e-5 |
+| SeCO, fp32 | 2.98e-4 | 3.11e-5 |
+| SeCO + offload, fp32 | identical to SeCO | identical to SeCO |
+| full backprop, bf16 | 1.89% | 6.9% |
+| SeCO, bf16 | 1.91% | 5.7% |
+
+Offload is numerically identical to the GPU store in fp32; in bf16 the two differ only by the flash backward's own non-determinism.
 
 ## Choosing `seco_chunk_size`
 
