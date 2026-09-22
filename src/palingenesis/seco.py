@@ -63,7 +63,7 @@ from transformers import cache_utils as cu
 
 from palingenesis.logits import output_head, verify_output_head
 from palingenesis.loss import chunked_cross_entropy_loss, shift_labels
-from palingenesis.seco_attention import KVStore, chunk_attention, check_host_budget, reset_host_budget
+from palingenesis.seco_attention import KVStore, check_host_budget, chunk_attention, reset_host_budget
 
 logger = logging.getLogger(__name__)
 
