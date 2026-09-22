@@ -134,7 +134,8 @@
 | `adamc` | bool | `false` | Corrected weight decay for normalized layers. Prevents gradient explosion at end of training. |
 | `llrd_decay` | float | `1.0` | Layer-wise LR decay. 1.0 = off. 0.9 = early layers get 0.9× LR per depth. |
 | `freeze_non_attention` | bool | `false` | Freeze all non-attention layers. For hybrid models (Qwen3.5) where only attention should be adapted. |
-| `hyperball` | bool | `false` | Norm-constrained optimization. 20-30% speedup, zero memory. Applied to 2D weight matrices (not embeddings/norms). |
+| `hyperball` | bool | `false` | Hyperball (arXiv:2606.16899): attention/MLP matrices keep their initial norm and move by a fixed angular step each update; embeddings, norms, biases and the head stay on the base optimizer. Any base optimizer. See [Optimizers](optimizers.md#hyperball). |
+| `hyperball_lr` | float | `0.0` | Hyperball's angular step η (fraction of each matrix norm moved per update, scaled by the LR schedule). `0` = per matrix, the base optimizer's first relative step (Adam/Lion: `learning_rate / rms(W)`). |
 | `mona` | bool | `false` | MONA curvature-aware acceleration. Augments gradients with EMA of gradient differences. |
 | `mona_beta_a` | float | `0.975` | MONA acceleration EMA decay. Higher for larger models (0.99 for 68B). |
 | `mona_lite` | bool | `true` | Store MONA buffers in bf16 + streaming computation. 75% overhead reduction. |
@@ -163,6 +164,9 @@
 | `float8_training` | bool | `false` | FP8 training (H100+ SM89). 1.2-1.5× throughput. |
 | `gradient_release` | bool | `false` | Fuse optimizer into backward. Eliminates gradient memory. Requires GA=1, incompatible with Muon. |
 | `selective_diff` | bool | `true` | Skip activation saving for frozen layers. Auto-enabled with `freeze_non_attention`. |
+| `seco` | bool | `false` | SeCO chunk-wise training for long sequences: activation memory set by `seco_chunk_size`, not sequence length. Exact gradients. Single GPU. See [Long Sequences](../guides/long-sequences.md). |
+| `seco_chunk_size` | int | `4096` | Tokens per SeCO chunk. |
+| `spaco_budget` | int | `0` | SpaCO: backpropagate only this many random chunks per sequence (a stochastic gradient estimate). `0` = exact SeCO. |
 
 ---
 

@@ -43,7 +43,7 @@ A 4-billion parameter model trains in 15 GB. Full fine-tune, not LoRA. Gradient 
 
 ### Quality
 
-DEFT loss is a parameter-free token weighting aimed at reasoning tasks (the original paper reports gains, not independently reproduced; results vary by model and data). Hyperball adds 20-30% convergence speed (single paper, experimental). Power-decay schedule is provably optimal for the easy-task regime. All on by default in flagship configs.
+DEFT loss is a parameter-free token weighting aimed at reasoning tasks (the original paper reports gains, not independently reproduced; results vary by model and data). Hyperball reports a 20–30% token-equivalent speedup in pretraining (single paper, experimental). Power-decay schedule is provably optimal for the easy-task regime. All on by default in flagship configs.
 
 [The research →](architecture/research.md)
 
@@ -125,7 +125,7 @@ Any HuggingFace causal LM. Optimized for: Qwen 2.5/3/3.5, Llama 3, Gemma 4, Mist
 ## Install
 
 ```bash
-git clone https://github.com/your-org/palingenesis.git && cd palingenesis
+git clone https://github.com/mii-llm/palingenesis.git && cd palingenesis
 uv pip install -e ".[train]"
 ```
 

@@ -65,6 +65,7 @@ from palingenesis.dpo import (
 from palingenesis.health import HealthMonitor
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel
 from palingenesis.logging import Tracker, setup_logging
+from palingenesis.logits import PostProcessedHead, output_head, verify_output_head
 from palingenesis.loss import (
     cce_available,
     chunked_cross_entropy_loss,
@@ -91,6 +92,7 @@ from palingenesis.plugins import (
     infosft_weighted_loss,
     pre_rl_loss,
 )
+from palingenesis.seco import chunkwise_forward_backward
 
 logger = logging.getLogger(__name__)
 
@@ -468,22 +470,19 @@ def train(config: Config):
         AdamCCorrection(optimizer, config.train.learning_rate) if config.train.adamc and scheduler is not None else None
     )
 
-    # ── Hyperball: norm-constrained optimization for scale-invariant layers (arxiv:2606.16899) ──
+    # ── Hyperball: norm-constrained attention/MLP matrices (arxiv:2606.16899) ──
     _hyperball = None
     if config.train.hyperball:
-        from palingenesis.optim import HyperballWrapper
+        from palingenesis.optim import Hyperball, is_hyperball_param
 
-        constrained_params = []
-        for name, p in model.named_parameters():
-            if (
-                p.requires_grad
-                and p.ndim == 2
-                and not any(k in name.lower() for k in ("embed", "norm", "bias", "lm_head"))
-            ):
-                constrained_params.append(p)
-        if constrained_params:
-            _hyperball = HyperballWrapper(optimizer, constrained_params)
-            logger.info(f"Hyperball enabled: {len(constrained_params)} weight matrices norm-constrained")
+        constrained = [p for n, p in model.named_parameters() if p.requires_grad and is_hyperball_param(n, p)]
+        if constrained:
+            _hyperball = Hyperball(optimizer, constrained, angular_lr=config.train.hyperball_lr)
+            logger.info(
+                f"Hyperball: {len(constrained)} matrices constrained, angular step "
+                + (f"{config.train.hyperball_lr:.2e}" if config.train.hyperball_lr
+                   else "calibrated per matrix to the base optimizer's first update")
+            )
 
     # ── MONA: curvature-aware acceleration for Muon/Lion (arxiv:2605.26842) ──
     _mona = None
@@ -536,7 +535,26 @@ def train(config: Config):
     except AttributeError:
         _loss_vocab_size = 128256
 
-    if dpo is not None:
+    seco = config.memory.seco
+    if seco:
+        if world_size > 1:
+            raise ConfigError(
+                "memory.seco is verified on a single process only; multi-GPU (FSDP) SeCO is not "
+                "supported yet. Use parallel.context_parallel for multi-GPU long sequences."
+            )
+        lm_head = _get_lm_head(model)
+        if lm_head is None:
+            raise RuntimeError("SeCO needs the model's lm_head (model.lm_head) for the chunked loss.")
+        use_chunked_loss = False  # SeCO runs chunked CE per sequence chunk itself
+        from palingenesis.seco import verify_chunked_forward
+
+        diff = verify_chunked_forward(model)
+        logger.info(f"SeCO: chunked forward matches the full forward (relative difference {diff:.1e})")
+        logger.info(
+            f"SeCO: chunk_size={config.memory.seco_chunk_size} "
+            + (f"SpaCO budget={config.memory.spaco_budget} chunks" if config.memory.spaco_budget else "(exact)")
+        )
+    elif dpo is not None:
         lm_head = _get_lm_head(model)
         if lm_head is None:
             raise RuntimeError("DPO needs the model's lm_head (model.lm_head) for chunked log-probs.")
@@ -553,7 +571,7 @@ def train(config: Config):
             logger.warning("Could not find lm_head, falling back to standard loss")
             use_chunked_loss = False
             _use_chunked_deft = False
-        elif cce_available() and not _needs_logits:
+        elif cce_available() and not _needs_logits and not isinstance(lm_head, PostProcessedHead):
             # CCE: zero-memory CE, replaces chunked when no plugin needs full logits
             use_cce = True
             use_chunked_loss = False
@@ -571,6 +589,13 @@ def train(config: Config):
                 f"Chunked {kind} loss: dynamic chunking (per-batch, ≤{LOSS_CHUNK_TARGET_GB:.0f}GB fp32 "
                 f"logits per chunk; worst case {worst_case} chunks at seq {config.data.max_seq_length})"
             )
+
+    # Chunked losses project hidden states themselves: check that the head they
+    # use (lm_head + the model's logit transform, if any) reproduces the logits of
+    # the model's own forward before training on it.
+    if lm_head is not None:
+        diff = verify_output_head(model, lm_head, _backbone(model))
+        logger.info(f"Output head verified against the model's forward (relative difference {diff:.1e})")
 
     # ── Tracker ───────────────────────────────────────────────────────────
     tracker = Tracker(config, is_main=is_main())
@@ -877,8 +902,22 @@ def train(config: Config):
                 fwd_kwargs["position_ids"] = position_ids
 
             loss_val = None
+            backward_done = False
             with torch.amp.autocast("cuda", dtype=model_dtype, enabled=config.train.bf16):
-                if dpo is not None:
+                if seco:
+                    # Forward AND backward, chunk by chunk (gradients accumulate in .grad).
+                    result = chunkwise_forward_backward(
+                        model,
+                        input_ids,
+                        batch["labels"],
+                        chunk_size=config.memory.seco_chunk_size,
+                        budget=config.memory.spaco_budget or None,
+                        loss_denom=loss_denom,
+                        num_loss_chunks=lambda n: _dynamic_num_chunks(n, _loss_vocab_size),
+                    )
+                    loss_val = result.loss * current_ga
+                    backward_done = True
+                elif dpo is not None:
                     # Rows [0, P) are chosen answers, [P, 2P) the paired rejected ones.
                     num_pairs = input_ids.shape[0] // 2
                     raw_labels = batch["labels"]
@@ -1011,7 +1050,8 @@ def train(config: Config):
             # micro-loss, while `loss` carries the 1/GA gradient scaling.
             if loss_val is None:
                 loss_val = loss.detach().float().item() * current_ga
-            loss.backward()
+            if not backward_done:
+                loss.backward()
 
             # MONA: augment gradients with curvature-aware acceleration (before optimizer step)
             if _mona is not None:
@@ -1063,7 +1103,7 @@ def train(config: Config):
                         )
                     else:
                         if _hyperball is not None:
-                            _hyperball.step()  # optimizer.step() + norm projection
+                            _hyperball.step()   # base step + Hyperball update on constrained matrices
                         else:
                             optimizer.step()
                         if scheduler is not None:
@@ -1356,10 +1396,19 @@ def _compile_layers(model: torch.nn.Module, backend: str = "inductor", mode: str
 
 
 def _get_lm_head(model: torch.nn.Module):
-    """Find the lm_head linear layer."""
-    if hasattr(model, "lm_head"):
-        return model.lm_head
-    return None
+    """The output head: lm_head plus the model's logit transform, if any
+    (Cohere's logit_scale, Gemma's final soft-capping, ...; see palingenesis.logits)."""
+    return output_head(model)
+
+
+def _backbone(model: torch.nn.Module) -> torch.nn.Module:
+    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
+    if backbone is None:
+        base = getattr(model, "base_model", None)
+        backbone = base if base is not model else None
+    if backbone is None:
+        raise RuntimeError("Cannot find model backbone for chunked loss. Disable memory.chunked_loss.")
+    return backbone
 
 
 def _get_hidden_states(
@@ -1372,9 +1421,7 @@ def _get_hidden_states(
 
     Works for HF models that have model.model as the transformer backbone.
     """
-    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
-    if backbone is None:
-        raise RuntimeError("Cannot find model backbone for chunked loss. Disable memory.chunked_loss.")
+    backbone = _backbone(model)
 
     kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
     if position_ids is not None:

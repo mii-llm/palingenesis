@@ -54,7 +54,7 @@ train:
   save_steps: 500
   logging_steps: 1
   bf16: true
-  hyperball: true                # zero overhead, helps at all scales
+  hyperball: false               # never ran with gradient_release (optimizer steps inside backward)
 
 parallel:
   fsdp: false

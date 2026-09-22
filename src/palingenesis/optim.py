@@ -456,77 +456,145 @@ def build_scheduler(
 
 
 # ==============================================================================
-# HYPERBALL: NORM-CONSTRAINED OPTIMIZER WRAPPER
-# Paper: "Fantastic Pretraining Optimizers II: Hyperball" (Stanford, 2026)
-# arxiv:2606.16899
+# HYPERBALL: NORM-CONSTRAINED OPTIMIZATION
+# Paper: "Fantastic Pretraining Optimizers and Where to Find Them II: Hyperball
+# Optimization" (arXiv:2606.16899), Algorithm 1, over ANY base optimizer.
 #
-# Key insight: For scale-invariant layers (after LayerNorm/RMSNorm), only the
-# DIRECTION of the weight matrix matters. Weight decay indirectly controls the
-# angular learning rate via equilibrium norm. Hyperball makes this explicit:
-# fix the Frobenius norm, only update direction.
-#
-# Result: 20-30% token-equivalent speedup on Muon at 1.2B+ scale.
-# LR transfer: optimal LR drift reduced from 2-4× to 1.4× across depth/width.
-#
-# Implementation: 5-line wrapper. Apply AFTER any base optimizer step.
-# Only apply to attention + MLP weight matrices. NOT embeddings/norms/biases.
+# For each constrained matrix (attention / MLP weights), with R = ||W_0||_F and
+# u_t the base optimizer's update direction (Adam: m_hat/(sqrt(v_hat)+eps), Lion:
+# sign(...), Muon: orthogonalised momentum):
+#     W_{t+1} = R * Normalize(W_t - eta_t * R * Normalize(u_t))
+# eta_t is an ANGULAR step (fraction of the norm moved per update); the norm never
+# changes, which replaces weight decay. Embeddings, norms, biases and the head
+# stay on the base optimizer, as in the paper.
 # ==============================================================================
 
 
-class HyperballWrapper:
-    """Hyperball optimizer wrapper — constrains weights to their initial Frobenius norm.
+def is_hyperball_param(name: str, p: torch.Tensor) -> bool:
+    """Attention / MLP weight matrices (the paper's constrained set)."""
+    return p.ndim == 2 and not any(k in name.lower() for k in ("embed", "norm", "bias", "lm_head"))
 
-    For any base optimizer (Adam, Muon, Lion), Hyperball adds a projection step:
-        W_{t+1} = R · Normalize(W_t - η_t · R · Normalize(u_t))
 
-    Where R = ||W_0||_F is the initial norm (set once, never changes).
+def _math_dtype(p: torch.Tensor) -> torch.dtype:
+    """At least float32 for the update math; never lower than the weight's own dtype."""
+    return torch.promote_types(p.dtype, torch.float32)
 
-    This replaces weight decay for scale-invariant layers and produces:
-    - 20-30% token-equivalent speedup over weight-decay baselines
-    - Much better LR transfer across model scales (1.4× drift vs 3-4×)
 
-    Usage:
-        optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
-        hyperball = HyperballWrapper(optimizer, constrained_params)
-        for step in training:
-            optimizer.zero_grad()
-            loss.backward()
-            hyperball.step()  # replaces optimizer.step() + adds projection
+class Hyperball:
+    """Hyperball over an arbitrary base optimizer (call `.step()` instead of the
+    base optimizer's).
 
-    Args:
-        optimizer: Base optimizer (provides the update direction u_t)
-        constrained_params: List of parameter tensors to constrain.
-            Apply to 2D weight matrices in attention + MLP layers.
-            Do NOT include: embeddings, norm gains, biases, 1D params.
+    The base optimizer's direction for a matrix is recovered from its own step:
+    with weight decay off, it moves W by -lr * u, so Normalize(u) = -dW / ||dW||
+    exactly, whatever lr is. Constrained matrices are therefore stepped in buckets
+    of at most `snapshot_bytes`: snapshot, let the base optimizer step only that
+    bucket (parameters without .grad are skipped by every torch/bitsandbytes
+    optimizer), then apply the Hyperball update from the snapshot. Memory: one
+    bucket, not a copy of the model.
+
+    angular_lr > 0: the paper's global angular step eta, scaled by the LR schedule
+      (the ratio of each group's current lr to its initial lr).
+    angular_lr = 0: per-matrix eta calibrated at the first step to the relative
+      update the base optimizer made there (for Adam and Lion exactly
+      lr / rms(W)), then kept, scaled by the schedule.
+    R is each matrix's norm at the first step.
     """
 
-    def __init__(self, optimizer: torch.optim.Optimizer, constrained_params: list[torch.Tensor]):
+    def __init__(self, optimizer: torch.optim.Optimizer, constrained_params: list[torch.Tensor],
+                 angular_lr: float = 0.0, snapshot_bytes: int = 1 << 30):
         self.optimizer = optimizer
-        # Store initial norms (radii) for each constrained parameter
-        self._radii: dict[int, float] = {}
-        self._param_set: set[int] = set()
-        for p in constrained_params:
-            pid = id(p)
-            self._param_set.add(pid)
-            self._radii[pid] = p.data.float().norm().item()
+        self.angular_lr = angular_lr
+        ids = {id(p) for p in constrained_params}
+        self._constrained = [p for g in optimizer.param_groups for p in g["params"] if id(p) in ids]
+        self._group_of = {id(p): g for g in optimizer.param_groups for p in g["params"]}
+        self._buckets, bucket, size = [], [], 0
+        for p in self._constrained:
+            nbytes = p.numel() * p.element_size()
+            if bucket and size + nbytes > snapshot_bytes:
+                self._buckets.append(bucket)
+                bucket, size = [], 0
+            bucket.append(p)
+            size += nbytes
+        if bucket:
+            self._buckets.append(bucket)
+        self._radius: dict[int, torch.Tensor] = {}
+        self._eta: dict[int, float] = {}
 
-    def step(self, closure=None):
-        """Perform optimizer step then project constrained params to their hypersphere."""
-        # Standard optimizer step (computes the update)
-        self.optimizer.step(closure)
+    @property
+    def param_groups(self):
+        return self.optimizer.param_groups
 
-        # Project each constrained parameter back to its hypersphere
-        for group in self.optimizer.param_groups:
-            for p in group["params"]:
-                if id(p) in self._param_set and p.data.numel() > 0:
-                    radius = self._radii[id(p)]
-                    # Normalize and rescale: W = R * W / ||W||_F
-                    norm = p.data.float().norm().item()
-                    if norm > 1e-12:
-                        p.data.mul_(radius / norm)
-
-    def zero_grad(self, set_to_none=True):
+    def zero_grad(self, set_to_none: bool = True):
         self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {"base": self.optimizer.state_dict(),
+                "radius": [self._radius.get(id(p)) for p in self._constrained],
+                "eta": [self._eta.get(id(p)) for p in self._constrained]}
+
+    def load_state_dict(self, state):
+        self.optimizer.load_state_dict(state["base"])
+        for p, r, e in zip(self._constrained, state.get("radius", []), state.get("eta", [])):
+            if r is not None:
+                self._radius[id(p)] = r.to(p.device) if torch.is_tensor(r) else r
+            if e is not None:
+                self._eta[id(p)] = e
+
+    def _schedule(self, p) -> float:
+        group = self._group_of[id(p)]
+        return group["lr"] / group.get("initial_lr", group["lr"]) if group.get("initial_lr") else 1.0
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        grads = {id(p): p.grad for g in self.optimizer.param_groups for p in g["params"]}
+        constrained = {id(p) for p in self._constrained}
+        # 1) everything else: a plain base step
+        for g in self.optimizer.param_groups:
+            for p in g["params"]:
+                if id(p) in constrained:
+                    p.grad = None
+        self.optimizer.step()
+        # 2) constrained matrices, bucket by bucket
+        decay = [g.get("weight_decay", 0.0) for g in self.optimizer.param_groups]
+        for g in self.optimizer.param_groups:
+            if "weight_decay" in g:
+                g["weight_decay"] = 0.0
+        try:
+            for bucket in self._buckets:
+                live = [p for p in bucket if grads[id(p)] is not None]
+                if not live:
+                    continue
+                for g in self.optimizer.param_groups:
+                    for p in g["params"]:
+                        p.grad = None
+                for p in live:
+                    p.grad = grads[id(p)]
+                before = [p.detach().to(_math_dtype(p)).clone() for p in live]
+                self.optimizer.step()
+                for p, w0 in zip(live, before):
+                    self._project(p, w0)
+        finally:
+            for g, d in zip(self.optimizer.param_groups, decay):
+                if "weight_decay" in g:
+                    g["weight_decay"] = d
+            for g in self.optimizer.param_groups:
+                for p in g["params"]:
+                    p.grad = grads[id(p)]
+        return loss
+
+    def _project(self, p: torch.Tensor, before: torch.Tensor) -> None:
+        key = id(p)
+        if key not in self._radius:
+            self._radius[key] = before.norm()
+        radius = self._radius[key]
+        delta = p.detach().to(before.dtype) - before  # = -lr * u
+        step_norm = delta.norm()
+        if key not in self._eta:
+            self._eta[key] = self.angular_lr or float(step_norm / radius.clamp_min(1e-30)) / max(self._schedule(p), 1e-30)
+        eta = self._eta[key] * self._schedule(p)
+        trial = before.add_(delta, alpha=float(eta * radius / step_norm.clamp_min(1e-30)))
+        p.copy_(trial.mul_(radius / trial.norm().clamp_min(1e-30)))
 
 
 # ==============================================================================

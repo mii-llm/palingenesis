@@ -4,56 +4,64 @@
 
 ## Prerequisites
 
-Before palingenesis:
-
-1. **NVIDIA GPU** with 24+ GB VRAM (RTX 3090, RTX 4090, A100, H100, or newer)
-2. **CUDA toolkit** and a CUDA-enabled PyTorch installation
-3. **Python 3.11+**
-
-If you don't have PyTorch with CUDA yet:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-```
-
-Verify CUDA works:
-
-```bash
-python -c "import torch; print(torch.cuda.get_device_name(0))"
-# Should print your GPU name, e.g. "NVIDIA A100-SXM4-80GB"
-```
-
----
-
-## Get the code
-
-```bash
-git clone https://github.com/your-org/palingenesis.git
-cd palingenesis
-```
+1. **Linux with an NVIDIA GPU.** The default install targets CUDA 12.8, which needs an NVIDIA driver ≥ 570 (`nvidia-smi` shows the driver version).
+2. **[uv](https://docs.astral.sh/uv/)** (recommended): `curl -LsSf https://astral.sh/uv/install.sh | sh`
+3. **Python 3.11 or 3.12.** uv downloads one if needed.
 
 ---
 
 ## Install
 
-=== "uv (recommended — fast, reproducible)"
+=== "uv sync (recommended)"
 
     ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh  # skip if you have uv
-    uv pip install -e ".[train]"
+    git clone https://github.com/mii-llm/palingenesis.git
+    cd palingenesis
+    uv sync --extra train --extra logging   # creates .venv, installs the locked versions
+    source .venv/bin/activate
     ```
+
+    This installs exactly the versions in `uv.lock`, the tested set. On Linux, torch comes from PyTorch's CUDA 12.8 index automatically (configured in `pyproject.toml`).
+
+=== "uv pip (into your own venv)"
+
+    ```bash
+    git clone https://github.com/mii-llm/palingenesis.git
+    cd palingenesis
+    uv venv --python 3.12 && source .venv/bin/activate
+    uv pip install -e ".[train,logging]"
+    ```
+
+    `uv pip` needs an active virtual environment. It also reads the CUDA 12.8 torch source from `pyproject.toml`.
 
 === "pip"
 
     ```bash
+    git clone https://github.com/mii-llm/palingenesis.git
+    cd palingenesis
+    python -m venv .venv && source .venv/bin/activate
+    pip install torch --index-url https://download.pytorch.org/whl/cu128   # FIRST: CUDA build of torch
     pip install -e ".[train,logging]"
     ```
 
-=== "Full (everything)"
+    Install torch first. Plain pip ignores uv's index configuration, so it would otherwise install PyPI's default torch.
+
+!!! warning "Torch installs, but sees no GPU?"
+    PyPI's default Linux torch wheels target the newest CUDA (torch 2.14 needs CUDA 13.0, i.e. driver ≥ 580). On an older driver, `torch.cuda.is_available()` is `False`, or you get "The NVIDIA driver on your system is too old". Install torch from a CUDA index your driver supports:
 
     ```bash
-    uv pip install -e ".[all]"
+    uv pip install torch --index-url https://download.pytorch.org/whl/cu128   # driver >= 570
     ```
+
+!!! warning "`cannot import name 'ScalingType' from 'torch.nn.functional'`"
+    torchao (from the `train` extra) is newer than your torch. transformers imports torchao whenever it's installed, so model creation fails. palingenesis requires torch ≥ 2.11 for this reason. Upgrade torch as above rather than pinning an old one.
+
+Verify:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# e.g. 2.11.0+cu128 True NVIDIA A100-SXM4-80GB
+```
 
 ---
 
@@ -61,7 +69,7 @@ cd palingenesis
 
 | Extra | What it adds | Install when... |
 |-------|-------------|-----------------|
-| `train` | Liger Kernel, bitsandbytes, torchao | Always (core training dependencies) |
+| `train` | Liger Kernel (Linux), bitsandbytes, torchao | Always (core training dependencies) |
 | `logging` | wandb, trackio | You want experiment tracking dashboards |
 | `loss` | Cut Cross-Entropy (Triton kernel) | Training models with 256K+ vocabulary (Gemma) |
 | `optim` | ScheduleFree | Using schedule-free mode |

@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, "src")
 
 import math
+import pytest
 import torch
 import torch.nn as nn
 
@@ -249,100 +250,121 @@ def test_entropy_monitoring_disabled():
 
 
 # ==============================================================================
-# HYPERBALL OPTIMIZER WRAPPER TESTS
+# HYPERBALL TESTS — arXiv:2606.16899, Algorithm 1 over a base optimizer
 # ==============================================================================
 
 
-def test_hyperball_preserves_norm():
-    """Test that Hyperball keeps weight matrix norms constant."""
-    from palingenesis.optim import HyperballWrapper
+def _adam_direction(grads, beta1=0.9, beta2=0.95, eps=1e-8):
+    """Adam's update direction after len(grads) steps (reference implementation)."""
+    m = torch.zeros_like(grads[0])
+    v = torch.zeros_like(grads[0])
+    for g in grads:
+        m = beta1 * m + (1 - beta1) * g
+        v = beta2 * v + (1 - beta2) * g * g
+    t = len(grads)
+    return (m / (1 - beta1 ** t)) / ((v / (1 - beta2 ** t)).sqrt() + eps)
+
+
+def test_hyperball_matches_the_paper_update():
+    """W_{t+1} = R * N(W_t - eta * R * N(u_t)), u_t Adam's direction, R = ||W_0||,
+    whatever the base lr and weight decay (both must cancel / be switched off)."""
+    from palingenesis.optim import Hyperball
+
+    torch.manual_seed(0)
+    W = nn.Parameter(torch.randn(16, 8, dtype=torch.float64))
+    b = nn.Parameter(torch.randn(8, dtype=torch.float64))            # unconstrained
+    R = W.detach().norm()
+    base = torch.optim.AdamW([{"params": [W], "weight_decay": 0.3}, {"params": [b], "weight_decay": 0.0}],
+                             lr=0.123, betas=(0.9, 0.95), eps=1e-8)
+    hb = Hyperball(base, [W], angular_lr=0.05)
+    reference, grads = W.detach().clone(), []
+    for _ in range(5):
+        g = torch.randn_like(W)
+        grads.append(g)
+        W.grad, b.grad = g.clone(), torch.randn_like(b)
+        b_before = b.detach().clone()
+        hb.step()
+        u = _adam_direction(grads)
+        trial = reference - 0.05 * R * u / u.norm()
+        reference = R * trial / trial.norm()
+        assert torch.allclose(W.detach(), reference, rtol=0, atol=1e-9)
+        assert not torch.equal(b.detach(), b_before)                 # the rest still trains
+    assert base.param_groups[0]["weight_decay"] == 0.3             # restored after the step
+
+
+def test_hyperball_keeps_norm_sets_angular_step_and_follows_schedule():
+    from palingenesis.optim import Hyperball, build_scheduler
+
+    torch.manual_seed(1)
+    W = nn.Parameter(torch.randn(32, 64))
+    R = W.detach().norm().item()
+    base = torch.optim.AdamW([W], lr=1.0)
+    sched = build_scheduler(base, "linear", 10, 0.0, 0.1)              # lr factor 1 -> 0.1
+    hb = Hyperball(base, [W], angular_lr=1e-2)
+    for _ in range(10):
+        before = W.detach().clone()
+        factor = base.param_groups[0]["lr"] / base.param_groups[0]["initial_lr"]
+        W.grad = torch.randn_like(W) * 1e3                           # gradient scale must not matter
+        hb.step()
+        sched.step()
+        assert abs(W.detach().norm().item() - R) / R < 1e-5
+        moved = (W.detach() - before).norm().item() / R               # chord <= eta, ~eta for small eta
+        assert 0.99 * 1e-2 * factor / (1 + (1e-2 * factor) ** 2) ** 0.5 < moved <= 1e-2 * factor * 1.0001
+
+
+def test_hyperball_calibrated_step_equals_adam_first_relative_step():
+    """angular_lr = 0: each matrix keeps the relative step Adam's first update made,
+    which for Adam is exactly lr / rms(W)."""
+    from palingenesis.optim import Hyperball
+
+    torch.manual_seed(2)
+    W = nn.Parameter(torch.randn(16, 16) * 0.02)
+    rms = (W.detach().pow(2).mean().sqrt()).item()
+    hb = Hyperball(torch.optim.AdamW([W], lr=1e-4, weight_decay=0.0), [W])
+    W.grad = torch.randn_like(W)
+    hb.step()
+    assert abs(hb._eta[id(W)] - 1e-4 / rms) / (1e-4 / rms) < 1e-3
+
+
+def test_hyperball_buckets_bound_memory_and_match_one_bucket():
+    from palingenesis.optim import Hyperball
+
+    def run(snapshot_bytes):
+        torch.manual_seed(3)
+        mats = [nn.Parameter(torch.randn(8, 8, dtype=torch.float64)) for _ in range(5)]
+        hb = Hyperball(torch.optim.AdamW(mats, lr=1e-2), mats, angular_lr=3e-2, snapshot_bytes=snapshot_bytes)
+        for _ in range(3):
+            for m in mats:
+                m.grad = torch.randn_like(m)
+            hb.step()
+        return len(hb._buckets), [m.detach().clone() for m in mats]
+
+    n_small, small = run(8 * 8 * 8)          # one matrix per bucket
+    n_big, big = run(1 << 30)                # everything at once
+    assert (n_small, n_big) == (5, 1)
+    assert all(torch.equal(a, b) for a, b in zip(small, big))
+
+
+@pytest.mark.parametrize("base_name", ["adamw", "sgd_momentum"])
+def test_hyperball_convergence(base_name):
+    """Any base optimizer: Hyperball solves a small regression task."""
+    from palingenesis.optim import Hyperball, is_hyperball_param
 
     torch.manual_seed(42)
-    # Create a simple weight matrix
-    W = nn.Linear(64, 32, bias=False)
-    initial_norm = W.weight.data.norm().item()
-
-    optimizer = torch.optim.AdamW(W.parameters(), lr=1e-2, weight_decay=0.0)
-    hyperball = HyperballWrapper(optimizer, [W.weight])
-
-    # Run several optimization steps
-    for _ in range(50):
-        optimizer.zero_grad()
-        x = torch.randn(4, 64)
-        loss = W(x).pow(2).mean()
-        loss.backward()
-        hyperball.step()
-
-    final_norm = W.weight.data.norm().item()
-    diff = abs(final_norm - initial_norm) / initial_norm
-
-    print(f"  Initial norm: {initial_norm:.6f}")
-    print(f"  Final norm:   {final_norm:.6f}")
-    print(f"  Relative diff: {diff:.2e}")
-    assert diff < 1e-5, f"Hyperball should preserve norm, got {diff:.2e} relative change"
-    print("✓ test_hyperball_preserves_norm PASSED\n")
-
-
-def test_hyperball_updates_direction():
-    """Test that Hyperball actually changes the weight direction (not stuck)."""
-    from palingenesis.optim import HyperballWrapper
-
-    torch.manual_seed(42)
-    W = nn.Linear(64, 32, bias=False)
-    initial_direction = W.weight.data.clone() / W.weight.data.norm()
-
-    optimizer = torch.optim.AdamW(W.parameters(), lr=1e-2, weight_decay=0.0)
-    hyperball = HyperballWrapper(optimizer, [W.weight])
-
-    for _ in range(20):
-        optimizer.zero_grad()
-        x = torch.randn(4, 64)
-        target = torch.randn(4, 32)
-        loss = (W(x) - target).pow(2).mean()
-        loss.backward()
-        hyperball.step()
-
-    final_direction = W.weight.data / W.weight.data.norm()
-    cosine_sim = (initial_direction * final_direction).sum().item()
-
-    print(f"  Cosine similarity with init: {cosine_sim:.4f}")
-    assert cosine_sim < 0.99, f"Hyperball should change direction, got cosine={cosine_sim}"
-    assert cosine_sim > -1.0, "Direction should not completely flip"
-    print("✓ test_hyperball_updates_direction PASSED\n")
-
-
-def test_hyperball_convergence():
-    """Test that Hyperball + AdamW converges on a simple task."""
-    from palingenesis.optim import HyperballWrapper
-
-    torch.manual_seed(42)
-    model = nn.Linear(32, 16, bias=False)
-    target_W = torch.randn(16, 32) * 0.5
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
-    hyperball = HyperballWrapper(optimizer, [model.weight])
-
+    model = nn.Sequential(nn.Linear(32, 64, bias=False), nn.Tanh(), nn.Linear(64, 16, bias=False))
+    teacher = nn.Sequential(nn.Linear(32, 64, bias=False), nn.Tanh(), nn.Linear(64, 16, bias=False))
+    base = (torch.optim.AdamW(model.parameters(), lr=1e-2) if base_name == "adamw"
+            else torch.optim.SGD(model.parameters(), lr=1e-2, momentum=0.9))
+    hb = Hyperball(base, [p for n, p in model.named_parameters() if is_hyperball_param(n, p)], angular_lr=2e-2)
     losses = []
-    for step in range(400):
-        optimizer.zero_grad()
-        x = torch.randn(8, 32)
-        target = x @ target_W.T
-        pred = model(x)
-        loss = (pred - target).pow(2).mean()
+    for _ in range(300):
+        hb.zero_grad()
+        x = torch.randn(32, 32)
+        loss = (model(x) - teacher(x).detach()).pow(2).mean()
         loss.backward()
-        hyperball.step()
+        hb.step()
         losses.append(loss.item())
-
-    # Loss should decrease substantially
-    initial_loss = sum(losses[:5]) / 5
-    final_loss = sum(losses[-5:]) / 5
-    ratio = final_loss / initial_loss
-
-    print(f"  Initial loss: {initial_loss:.4f}")
-    print(f"  Final loss:   {final_loss:.4f}")
-    print(f"  Reduction:    {(1-ratio)*100:.1f}%")
-    assert ratio < 0.7, f"Should converge by >30%, got only {(1-ratio)*100:.1f}% reduction"
-    print("✓ test_hyperball_convergence PASSED\n")
+    assert sum(losses[-10:]) / 10 < 0.5 * sum(losses[:10]) / 10
 
 
 # ==============================================================================

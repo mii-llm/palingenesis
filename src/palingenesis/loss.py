@@ -200,7 +200,9 @@ def chunked_cross_entropy_loss(
     """
     from torch.distributed._composable.fsdp import FSDPModule
 
-    fsdp_enabled = isinstance(lm_head, FSDPModule)
+    # A PostProcessedHead (palingenesis.logits) wraps the projection that FSDP manages.
+    fsdp_head = getattr(lm_head, "head", lm_head)
+    fsdp_enabled = isinstance(fsdp_head, FSDPModule)
     requires_grad = hidden_states.requires_grad
 
     # Split into contiguous chunks along sequence dim
@@ -222,9 +224,9 @@ def chunked_cross_entropy_loss(
     # (avoids N all-gathers; just 1 all-gather at the start)
     # Disable grad sync for chunks 0..N-2, coalesce into last chunk
     if fsdp_enabled:
-        lm_head.set_reshard_after_forward(False)
-        lm_head.set_reshard_after_backward(False)
-        lm_head.set_requires_gradient_sync(False, recurse=False)
+        fsdp_head.set_reshard_after_forward(False)
+        fsdp_head.set_reshard_after_backward(False)
+        fsdp_head.set_requires_gradient_sync(False, recurse=False)
 
     last_idx = len(h_chunks) - 1
     seq_offset = 0
@@ -234,7 +236,7 @@ def chunked_cross_entropy_loss(
 
         # Enable grad sync only on the last chunk (single reduce-scatter)
         if fsdp_enabled and i == last_idx:
-            lm_head.set_requires_gradient_sync(True, recurse=False)
+            fsdp_head.set_requires_gradient_sync(True, recurse=False)
 
         # lm_head projection: [B, chunk_S, D] -> [B, chunk_S, V]
         logits = lm_head(h_chunk)
@@ -259,10 +261,10 @@ def chunked_cross_entropy_loss(
 
     # === Restore FSDP state ===
     if fsdp_enabled:
-        lm_head.set_reshard_after_forward(True)
-        lm_head.set_reshard_after_backward(True)
-        lm_head.set_requires_gradient_sync(True, recurse=False)
-        lm_head.reshard()
+        fsdp_head.set_reshard_after_forward(True)
+        fsdp_head.set_reshard_after_backward(True)
+        fsdp_head.set_requires_gradient_sync(True, recurse=False)
+        fsdp_head.reshard()
 
     if not requires_grad:
         return total_loss

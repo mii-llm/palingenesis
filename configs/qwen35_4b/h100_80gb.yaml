@@ -55,7 +55,7 @@ train:
   save_steps: 200
   logging_steps: 1
   bf16: true
-  hyperball: true
+  hyperball: false               # never ran with gradient_release (optimizer steps inside backward)
   # MONA: curvature-aware acceleration (arxiv:2605.26842)
   # H100 has memory headroom for the bf16 acceleration buffer
   mona: true

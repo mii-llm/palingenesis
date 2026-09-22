@@ -31,9 +31,10 @@ import torch.nn.functional as F
 from palingenesis.config import Config, ConfigError
 from palingenesis.loss import cross_entropy_loss, chunked_cross_entropy_loss, IGNORE_INDEX
 from palingenesis.optim import (
+    Hyperball,
+    is_hyperball_param,
     build_optimizer,
     build_scheduler,
-    HyperballWrapper,
     MONAAcceleration,
     AdamCCorrection,
 )
@@ -135,9 +136,9 @@ def test_flagship_all_features():
     optimizer = build_optimizer(model, lr=5e-3, weight_decay=0.1)
     scheduler = build_scheduler(optimizer, "power_decay", num_steps=30, warmup_ratio=0.1, min_lr_ratio=0.1)
 
-    # Hyperball on weight matrices
-    constrained = [p for n, p in model.named_parameters() if p.ndim == 2 and "embed" not in n]
-    hyperball = HyperballWrapper(optimizer, constrained)
+    # Hyperball on attention/MLP matrices (calibrated angular step)
+    constrained = [p for n, p in model.named_parameters() if is_hyperball_param(n, p)]
+    hyperball = Hyperball(optimizer, constrained)
 
     # AdaGC
     adagc = AdaGC(model, lambda_rel=1.5, beta=0.95, warmup_steps=5, global_max_norm=1.0)
@@ -166,7 +167,6 @@ def test_flagship_all_features():
         # AdaGC clips
         adagc.clip(step)
 
-        # Hyperball steps (includes optimizer.step + projection)
         hyperball.step()
 
         # Scheduler + AdamC
@@ -186,7 +186,8 @@ def test_flagship_all_features():
     sym_noise.remove()
 
     assert all(math.isfinite(l) for l in losses), "NaN/Inf in flagship path"
-    # Verify Hyperball preserved norms
+    # Hyperball keeps each constrained matrix on its sphere (EMA/base-merge are
+    # applied outside the optimizer and may move it; they run on a fixed cadence)
     for p in constrained:
         assert p.data.norm().item() > 0.01, "Hyperball collapsed a weight to zero"
     # Verify training made progress

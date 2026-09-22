@@ -56,14 +56,34 @@ Does NOT compose with: gradient_release ✗ (needs full gradient matrix for pola
 
 ## Hyperball
 
-Not an optimizer — a wrapper. Applies to any base optimizer. Projects weight matrices back to their initial Frobenius norm after each step. Zero memory, zero compute.
+Not an optimizer, but a wrapper around any base optimizer (AdamW, Lion, Muon, 8-bit variants). It implements Algorithm 1 of [arXiv:2606.16899](https://arxiv.org/abs/2606.16899).
 
-The theory: in prenorm Transformers, weight matrices between normalization layers are scale-invariant. The loss is `L(cW) = L(W)` for any scalar c. Weight decay's real purpose is controlling the *angular* learning rate. Hyperball makes this explicit.
+The theory: in prenorm Transformers, weight matrices between normalization layers are scale-invariant, so `L(cW) = L(W)` for any scalar c. Weight decay's real role is to control the *angular* learning rate. Hyperball makes that explicit. Each attention/MLP matrix keeps its initial Frobenius norm R, and every update moves it by a fixed angle:
+
+```
+u   = the base optimizer's update direction   (Adam: m̂/(√v̂+ε), Lion: sign, Muon: orthogonalised momentum)
+W  ← R · normalize(W − η · R · normalize(u))
+```
+
+- **Angular step η.** The gradient scale and the base optimizer's own LR cancel out: the step is always η·R before renormalisation. η follows the LR schedule.
+- **What is constrained.** Only attention and MLP matrices. Embeddings, norms, biases and the output head train on the base optimizer as usual, including weight decay. The constraint replaces weight decay on the constrained matrices.
+- **How the direction is obtained.** Exactly, for any base optimizer: with weight decay switched off, the base step moves W by −lr·u, so normalize(u) = −ΔW/‖ΔW‖.
+- **Memory.** Matrices are stepped in buckets of at most 1 GiB, so the extra memory is one bucket snapshot, not a copy of the model.
 
 ```yaml
 train:
-  hyperball: true   # Works with any optimizer
+  hyperball: true
+  hyperball_lr: 0.0   # angular step η; 0 = per matrix, the base optimizer's first relative step
 ```
+
+**Choosing `hyperball_lr`:**
+
+- `0` (default) calibrates each matrix to the relative step its base optimizer's first update made. For Adam and Lion that is exactly `learning_rate / rms(W)`.
+- A positive value is the paper's single angular step for all matrices.
+- For scale: AdamW at 2e-5 on matrices with RMS 0.02 moves them by about 1e-3 per step.
+
+!!! warning "Use fp32 weights"
+    Angular steps of 1e-3 or less partly round away in bf16 weights (`model.torch_dtype: float32`).
 
 ---
 

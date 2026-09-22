@@ -72,13 +72,20 @@ train:
 
 Here's a subtle insight: in a Transformer, every weight matrix that sits between two normalization layers is *scale-invariant* — the loss doesn't care about its magnitude, only its direction. Weight decay's real job isn't regularization; it's indirectly controlling the *angular* learning rate.
 
-Hyperball makes this explicit: after each optimizer step, it normalizes the weight matrix back to its initial Frobenius norm. The optimizer only changes the direction, never the scale.
+Hyperball makes this explicit. Each attention/MLP matrix is kept at its initial Frobenius norm R. The base optimizer only supplies a *direction* u, and every step moves the matrix by a fixed fraction of its norm:
 
-Result: 20-30% token-equivalent speedup at 1B+ scale per the original paper (arxiv:2606.16899; experimental, not independently reproduced). Zero memory cost (it's a 5-line projection after each step). Better LR transfer (optimal LR varies only 1.4× across model scales, vs 3-4× with weight decay).
+```
+W ← R · normalize(W − η · R · normalize(u))
+```
+
+η is an **angular** step. The optimizer's scale and the gradient scale drop out, and weight decay is replaced by the constraint. See the [optimizer reference](../reference/optimizers.md#hyperball) for details.
+
+The paper reports a 20–30% token-equivalent speedup at 1B+ scale, measured in pretraining with Muon (arxiv:2606.16899). It is experimental and not independently reproduced. It also reports better LR transfer across scales. Memory cost: one snapshot bucket (≤1 GiB).
 
 ```yaml
 train:
   hyperball: true
+  hyperball_lr: 0.0    # 0 = calibrate each matrix to the base optimizer's first step
 ```
 
 ### Power-decay scheduler

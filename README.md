@@ -9,10 +9,13 @@
 Papers distilled into one command. Every optimization applied automatically.
 
 ```bash
-git clone https://github.com/your-org/palingenesis.git && cd palingenesis
-uv pip install -e ".[train]"
+git clone https://github.com/mii-llm/palingenesis.git && cd palingenesis
+uv sync --extra train --extra logging     # creates .venv with CUDA-enabled torch
+source .venv/bin/activate
 ./run.sh configs/quickstart.yaml
 ```
+
+See [Installation](mkdocs_docs/getting-started/install.md) for pip, other CUDA versions and troubleshooting.
 
 Short CLI alias: `pgs`
 
@@ -67,6 +70,18 @@ data:
   include_observations: true  # ECHO: train on tool outputs (world model)
   turn_scaling: progressive   # Later turns weighted more
 ```
+
+## Hyper-long sequences on one GPU (SeCO)
+
+Train on sequences far beyond what fits in memory. The model runs chunk by chunk with a cache, keeping one chunk's activations at a time, and gradients are relayed back through the cache. The result is the exact gradient, verified against full backpropagation on 27 architectures, including the Qwen3.5 and LFM2 hybrids.
+
+```yaml
+memory:
+  seco: true
+  seco_chunk_size: 4096
+```
+
+See the [long-sequences guide](mkdocs_docs/guides/long-sequences.md).
 
 ## Preference optimization (DPO)
 

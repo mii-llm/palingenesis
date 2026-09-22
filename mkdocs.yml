@@ -93,6 +93,7 @@ nav:
     - Data Preparation: guides/data.md
     - Agentic & Reasoning Models: guides/agentic-training.md
     - Single GPU: guides/single-gpu.md
+    - Long Sequences (SeCO): guides/long-sequences.md
     - Multi-GPU: guides/multi-gpu.md
     - Multi-Node & SLURM: guides/multi-node.md
     - Autopilot: guides/autopilot.md

@@ -152,6 +152,12 @@ class TrainConfig:
     freeze_non_attention: bool = False  # STATUS: validated — Hybrid models: freeze DeltaNet/SSM (arxiv:2604.22127)
     # Advanced optimizer wrappers
     hyperball: bool = False  # STATUS: experimental — Norm-constrained optimization (arxiv:2606.16899)
+    # Hyperball's angular step: each update moves an attention/MLP matrix by this
+    # fraction of its (fixed) Frobenius norm, scaled by the LR schedule. 0 = calibrate
+    # each matrix to the relative step its base optimizer's first update made (for
+    # Adam/Lion exactly learning_rate / rms(W)). learning_rate itself stays the base
+    # optimizer's rate for embeddings, norms, biases and the head.
+    hyperball_lr: float = 0.0
     mona: bool = False  # STATUS: experimental — MONA curvature-aware acceleration (arxiv:2605.26842)
     mona_beta_a: float = 0.975  # MONA acceleration EMA decay
     mona_lite: bool = True  # MONA-Lite: bf16 buffers + streaming (75% overhead reduction)
@@ -183,6 +189,17 @@ class MemoryConfig:
     # STATUS: validated — Selective Differentiation (arxiv:2404.12406)
     # Skip activation saving for frozen layers. Zero accuracy impact.
     selective_diff: bool = True
+    # STATUS: validated — SeCO chunk-wise optimisation (arxiv:2505.16710)
+    # Long sequences: forward in chunks of `seco_chunk_size` tokens with a cache,
+    # then backprop chunk by chunk in reverse, relaying gradients through the
+    # cache. Only one chunk's activations are alive, so activation memory is set
+    # by the chunk size, not the sequence length. Exact gradients (tested equal to
+    # full backprop, incl. Qwen3.5 hybrids) for one extra no-grad forward (~+33%).
+    seco: bool = False
+    seco_chunk_size: int = 4096
+    # SpaCO: backprop only this many random chunks per sequence (0 = SeCO, exact).
+    # A stochastic gradient estimate; cuts backward compute on very long inputs.
+    spaco_budget: int = 0
 
 
 @dataclass(slots=True)
@@ -454,6 +471,15 @@ class Config:
                 "Choose one acceleration strategy."
             )
 
+        if self.train.hyperball:
+            if self.train.hyperball_lr < 0:
+                errors.append(f"train.hyperball_lr must be >= 0 (got {self.train.hyperball_lr}; 0 = calibrated).")
+            if self.model.torch_dtype != "float32":
+                warnings.append(
+                    f"train.hyperball with model.torch_dtype={self.model.torch_dtype}: the weights are "
+                    "updated in that dtype, so small angular steps partly round away in bf16. "
+                    "float32 weights apply them exactly."
+                )
         if self.train.hyperball and self.plugins.schedule_free:
             errors.append(
                 "hyperball=true is incompatible with schedule_free=true. "
@@ -501,6 +527,8 @@ class Config:
 
         if self.dpo.enabled:
             errors.extend(self._dpo_errors())
+        if self.memory.seco:
+            errors.extend(self._seco_errors())
 
         # ── Soft warnings (untested combinations) ─────────────────────────
         if self.dpo.enabled and self.model.torch_dtype != "float32":
@@ -512,11 +540,22 @@ class Config:
                 "model.torch_dtype: float32 (compute still runs in bf16 under train.bf16)."
             )
 
-        if self.memory.gradient_release and self.train.hyperball:
+        if self.memory.seco and self.model.compile:
             warnings.append(
-                "gradient_release + hyperball: both modify the parameter update path. "
-                "Individually tested, but their interaction is UNVERIFIED. "
-                "Monitor weight norms via health metrics to confirm Hyperball is projecting correctly."
+                "memory.seco with model.compile: SeCO runs every layer against a cache whose length "
+                "changes each chunk; this combination is not validated (expect recompilations). "
+                "SeCO was validated with model.compile=false."
+            )
+        if self.memory.seco and self.model.torch_dtype != "float32":
+            warnings.append(
+                f"memory.seco with model.torch_dtype={self.model.torch_dtype}: SeCO's chunked forward is "
+                "verified at startup with a tolerance of 2e-2 in low precision (1e-4 in float32)."
+            )
+
+        if self.memory.gradient_release and self.train.hyperball:
+            errors.append(
+                "gradient_release=true steps the optimizer inside backward, so Hyperball's update "
+                "(which wraps the optimizer step) would never run. Disable one of them."
             )
 
         if self.memory.gradient_release and self.train.mona:
@@ -634,6 +673,33 @@ class Config:
         for name, on in unsupported.items():
             if on:
                 errors.append(f"dpo.enabled=true does not support {name}; disable it for preference training.")
+        return errors
+
+
+    def _seco_errors(self) -> list[str]:
+        m = self.memory
+        errors: list[str] = []
+        if m.seco_chunk_size < 1:
+            errors.append(f"memory.seco_chunk_size must be >= 1 (got {m.seco_chunk_size}).")
+        if m.spaco_budget < 0:
+            errors.append(f"memory.spaco_budget must be >= 0 (got {m.spaco_budget}; 0 = exact SeCO).")
+        unsupported = {
+            "data.packing (packed documents need per-document attention)": self.data.packing,
+            "parallel.context_parallel (both split the sequence)": self.parallel.context_parallel,
+            "dpo.enabled": self.dpo.enabled,
+            "memory.gradient_release (it steps inside every backward; SeCO runs one per chunk)":
+                self.memory.gradient_release,
+            "plugins.sym_noise (noise would differ between the two passes)": self.plugins.sym_noise,
+            "plugins.dft": self.plugins.dft,
+            "plugins.cadft": self.plugins.cadft,
+            "plugins.deft": self.plugins.deft,
+            "plugins.info_sft": self.plugins.info_sft,
+            "plugins.pre_rl": self.plugins.pre_rl,
+            "logging.rl_readiness (needs full-sequence hidden states)": self.logging.rl_readiness,
+        }
+        for name, on in unsupported.items():
+            if on:
+                errors.append(f"memory.seco=true does not support {name}.")
         return errors
 
 

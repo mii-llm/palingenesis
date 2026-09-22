@@ -18,11 +18,16 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
+# Lower bounds, not exact pins: exact pins clash with whatever torch/CUDA build a
+# machine already has. torch >= 2.11 because torchao (train extra, and imported by
+# transformers whenever installed) needs it: with an older torch, model creation
+# fails with "cannot import name 'ScalingType'". transformers 5.x for the cache
+# classes SeCO/DPO use and for Qwen3.5.
 dependencies = [
-    "torch==2.8.0",
-    "transformers>=4.48.0",
-    "datasets==5.0.0",
-    "accelerate==1.14.0",
+    "torch>=2.11",
+    "transformers>=5.12,<6",
+    "datasets>=4.0",
+    "accelerate>=1.10",
     "pyyaml>=6.0",
     "safetensors>=0.4.0",
 ]
@@ -30,9 +35,9 @@ dependencies = [
 [project.optional-dependencies]
 # Core training (what you need to actually train)
 train = [
-    "liger-kernel>=0.5.0",
+    "liger-kernel>=0.5.0; sys_platform == 'linux'",   # Triton kernels: Linux only
     "torchao>=0.8.0",
-    "bitsandbytes==0.49.2",
+    "bitsandbytes>=0.49",
 ]
 # Logging backends
 logging = [
@@ -67,8 +72,8 @@ palingenesis = "palingenesis.cli:main"
 pgs = "palingenesis.cli:main"
 
 [project.urls]
-Repository = "https://github.com/your-org/palingenesis"
-Documentation = "https://github.com/your-org/palingenesis/tree/main/docs"
+Repository = "https://github.com/mii-llm/palingenesis"
+Documentation = "https://mii-llm.github.io/palingenesis/"
 
 [build-system]
 requires = ["hatchling"]
@@ -80,6 +85,18 @@ build-backend = "hatchling.build"
 packages = ["src/palingenesis", "agent_tooling"]
 
 [tool.uv]
+
+# On Linux, torch comes from PyTorch's CUDA 12.8 index. PyPI's default Linux wheels
+# target the newest CUDA (torch 2.14: CUDA 13.0, NVIDIA driver >= 580); on an older
+# driver they install fine and then see no GPU. cu128 runs on drivers >= 570.
+# macOS/Windows keep PyPI's build. Other CUDA versions: see the installation guide.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [dependency-groups]
 dev = [

@@ -98,14 +98,15 @@ def test_multiple_loss_functions_exclusive():
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def test_gradient_release_plus_hyperball_warns():
-    """gradient_release + hyperball is untested, warns but doesn't raise."""
+def test_gradient_release_plus_hyperball_is_an_error():
+    """gradient_release steps the optimizer inside backward, so Hyperball (which
+    wraps the optimizer step) would silently never run."""
     cfg = Config()
     cfg.memory.gradient_release = True
     cfg.train.gradient_accumulation_steps = 1
     cfg.train.hyperball = True
-    warnings = cfg.validate()  # should NOT raise
-    assert any("hyperball" in w for w in warnings)
+    with pytest.raises(ConfigError, match="Hyperball"):
+        cfg.validate()
 
 
 def test_ema_plus_base_merge_warns():
@@ -175,11 +176,11 @@ def test_quickstart_style_config_valid():
 
 
 def test_flagship_config_validates():
-    """The flagship A100 config (many features) should validate with warnings."""
+    """The flagship A100 config (many features) should validate with warnings.
+    (Hyperball is left out: it cannot run under gradient_release, see above.)"""
     cfg = Config()
     cfg.memory.gradient_release = True
     cfg.train.gradient_accumulation_steps = 1
-    cfg.train.hyperball = True
     cfg.train.adagc = True
     cfg.train.ema = True
     cfg.train.base_merge = True

@@ -7,7 +7,7 @@
 ## 1. Install
 
 ```bash
-git clone https://github.com/your-org/palingenesis.git
+git clone https://github.com/mii-llm/palingenesis.git
 cd palingenesis
 uv pip install -e ".[train]"
 ```

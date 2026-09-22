@@ -40,7 +40,8 @@ except ConfigError as e:
 | `gradient_release + ga_ramp` | Dynamic accumulation is impossible without GA |
 | `packing + context_parallel` | Ring Attention requires single-document sequences |
 | `mona + schedule_free` | Both replace optimizer internals |
-| `hyperball + schedule_free` | Hyperball projects after step(); SF has no step() |
+| `hyperball + schedule_free` | Hyperball wraps step(); SF has no standard step() |
+| `hyperball + gradient_release` | The optimizer steps inside backward, so Hyperball would never run |
 | Multiple token-weighting losses | Only one of dft/cadft/deft/info_sft at a time |
 | `preprocess.enabled + data.sources` | Prepared output replaces the single `data.dataset`; use `prepare-multi` for multi-source |
 
@@ -48,7 +49,6 @@ except ConfigError as e:
 
 | Combination | Concern |
 |-------------|---------|
-| `gradient_release + hyperball` | Both modify update path; unverified interaction |
 | `ema + base_merge` | Both modify weights outside optimizer; mathematically sound but untested at scale |
 | `adagc + spike_detection` | Redundant: AdaGC subsumes spike detection |
 | `deft + pre_rl (kl=0)` | DEFT has drift risk; pre_rl without KL provides no anchor |
@@ -155,6 +155,9 @@ grep "STATUS: experimental" src/palingenesis/config.py
 | `chunked_loss` | bool | `true` | Chunk CE loss along sequence dim |
 | `loss_num_chunks` | int | `8` | Number of chunks (higher = less memory, tiny overhead) |
 | `float32_matmul_precision` | str | `high` | Matmul precision: `highest`, `high`, `medium` |
+| `seco` | bool | `false` | SeCO chunk-wise training for long sequences (exact gradients, single GPU) |
+| `seco_chunk_size` | int | `4096` | Tokens per SeCO chunk |
+| `spaco_budget` | int | `0` | SpaCO: backprop only N random chunks (stochastic estimate); 0 = exact SeCO |
 
 **Notes**:
 - Chunked loss avoids materializing `[B, S, V]` logits (saves 0.5-4 GB)

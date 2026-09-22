@@ -66,7 +66,7 @@ train:
   bf16: true
   # Hyperball: enable for scale-invariant weight matrices (attention+MLP)
   # Constrains norms → replaces weight decay role → 20-30% convergence speedup
-  hyperball: true
+  hyperball: false               # never ran with gradient_release (optimizer steps inside backward)
 
 parallel:
   fsdp: false
