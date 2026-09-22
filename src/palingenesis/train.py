@@ -65,7 +65,7 @@ from palingenesis.dpo import (
 from palingenesis.health import HealthMonitor
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel
 from palingenesis.logging import Tracker, setup_logging
-from palingenesis.logits import PostProcessedHead, output_head, verify_output_head
+from palingenesis.logits import PostProcessedHead, backbone_of, output_head, scored_ce_sum, verify_output_head
 from palingenesis.loss import (
     cce_available,
     chunked_cross_entropy_loss,
@@ -198,6 +198,13 @@ def train(config: Config):
     # ── Distributed ───────────────────────────────────────────────────────
     rank, local_rank, world_size = setup_distributed()
     setup_logging(rank)
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"No usable CUDA GPU (torch {torch.__version__}, built for CUDA {torch.version.cuda}). If `nvidia-smi` "
+            "works, this torch build needs a newer NVIDIA driver than the machine has: reinstall torch from a CUDA "
+            "index your driver supports, e.g. `uv pip install torch --index-url "
+            "https://download.pytorch.org/whl/cu128` (driver >= 570). See docs: Installation."
+        )
     device = torch.device(f"cuda:{local_rank}")
 
     logger.info(f"rank={rank} local_rank={local_rank} world_size={world_size}")
@@ -1310,7 +1317,8 @@ def train(config: Config):
         logger.info("Applying EMA weights for final save (better generalization)")
         _ema.apply_to_model()
 
-    save_final(model, tokenizer, config.train.output_dir, is_fsdp)
+    if config.train.save_final:
+        save_final(model, tokenizer, config.train.output_dir, is_fsdp)
     tracker.log(
         {"train/total_steps": global_step, "train/total_time_s": total_time, "train/tokens_total": tokens_total},
         step=global_step,
@@ -1402,13 +1410,7 @@ def _get_lm_head(model: torch.nn.Module):
 
 
 def _backbone(model: torch.nn.Module) -> torch.nn.Module:
-    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
-    if backbone is None:
-        base = getattr(model, "base_model", None)
-        backbone = base if base is not model else None
-    if backbone is None:
-        raise RuntimeError("Cannot find model backbone for chunked loss. Disable memory.chunked_loss.")
-    return backbone
+    return backbone_of(model)
 
 
 def _get_hidden_states(
@@ -1493,20 +1495,11 @@ def _compute_eval_loss(
         attention_mask = batch["attention_mask"].to(device)
         labels = shift_labels(batch["labels"].to(device))
 
-        valid = (labels != IGNORE_INDEX).sum().item()
-        if valid == 0:
-            continue
-
-        with torch.amp.autocast("cuda", dtype=dtype, enabled=bf16):
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-
-        # Chunked CE (fp32 outside autocast) — bounds the transient fp32
-        # logits/log-softmax that would otherwise OOM at large seq×vocab.
-        loss = _chunked_ce_sum(logits, labels)
-        total_loss += loss.item()
+        # Logits only at scored positions, in slices (palingenesis.logits): the
+        # model's own forward would materialise the full [B, S, V] logits.
+        loss, valid = scored_ce_sum(model, input_ids, attention_mask, labels, dtype, autocast=bf16)
+        total_loss += loss
         total_tokens += valid
-        del outputs, logits
 
     model.train()
     return total_loss / max(total_tokens, 1)

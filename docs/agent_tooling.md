@@ -133,11 +133,11 @@ The static estimate has two parts:
 - **Exact:** parameters (the architecture built on the meta device, so GQA, linear attention, MoE, tying and freezing all count), optimizer states per the optimizer's real state layout, gradients, and the DPO reference model.
 - **Estimated:** logits (the trainer's per-batch chunk), the SeCO K/V cache, and activations. Activations are a rough approximation, because they depend on the architecture and its kernels.
 
-`--measure` runs two optimizer steps with the trainer's own components at the configured batch size and `max_seq_length`, on random tokens with every token scored (the worst case). It reports the true peak. Single GPU only; FSDP sharding is not modelled.
+`--measure` runs the **real trainer** (`palingenesis.train.train`) for two optimizer steps on worst-case rows (every row rendered to `max_seq_length`). It uses the configured batch size, gradient accumulation and evaluation (run once), and reports the true peak. A standalone trainer run with the same settings gave the same number (43.32 GiB), so the measurement is exact by construction. Single process only; FSDP sharding is not modelled.
 
 If the model config cannot be loaded, the tool fails rather than guessing.
 
-Example (Qwen3.5-0.8B, 8 × 4096 tokens, bf16, selective checkpointing, one A100):
+Example (Qwen3.5-0.8B, 2 × 8 × 4096 tokens, bf16, selective checkpointing, three eval sets, one A100):
 
 ```
   Model: Qwen/Qwen3.5-0.8B (0.75B params, bfloat16 weights, 100% trainable)
@@ -149,7 +149,8 @@ Example (Qwen3.5-0.8B, 8 × 4096 tokens, bf16, selective checkpointing, one A100
     Logits (one chunk):      3.8 GB
     Activations (rough):     6.4 GB  [checkpointing: selective]
     Total (+10% overhead):  17.9 GB of 80 GB (+62.1 GB)
-  Measured peak: 18.2 GiB of 79 GiB (8 x 4096 tokens, 2 optimizer steps)
+  Measured peak: 18.0 GiB of 79 GiB (real trainer: 2 optimizer steps x 2 micro-batches of 8 x 4096 tokens,
+  plus one evaluation)
 ```
 
 ### `monitor_run` — Live Training Monitor

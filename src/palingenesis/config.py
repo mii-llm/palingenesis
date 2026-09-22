@@ -132,6 +132,7 @@ class TrainConfig:
     optimizer: str = "adamw"  # "adamw", "muon", "adamw8bit", "lion8bit", "paged_adamw8bit"
     seed: int = 42
     save_steps: int = 500
+    save_final: bool = True  # write the final model at the end (off for dry runs such as `pgs profile --measure`)
     logging_steps: int = 1
     bf16: bool = True
     gradient_checkpointing: Literal["full", "selective", "none"] = "selective"  # STATUS: proven

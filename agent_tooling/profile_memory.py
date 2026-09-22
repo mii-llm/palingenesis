@@ -13,10 +13,11 @@ Static estimate (no GPU needed):
     - logits: the trainer's per-batch chunk size
     - activations: a ROUGH analytic estimate (architecture-dependent; use --measure)
 
---measure runs two optimizer steps with the trainer's own components (model,
-activation checkpointing, freezing, optimizer, Hyperball, chunked loss / SeCO /
-DPO) on random tokens at the configured batch size and max_seq_length, and
-reports torch's peak allocated memory. Single GPU; FSDP sharding is not modelled.
+--measure runs the real trainer (palingenesis.train.train) for two optimizer
+steps on worst-case rows (every row rendered to max_seq_length), with the
+configured batch size, gradient accumulation and evaluation (run once), and
+reports torch's peak allocated memory: exactly what training allocates for the
+largest possible batch. Single process, so FSDP sharding is not modelled.
 """
 
 import sys
@@ -154,82 +155,74 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     }
 
 
+def _worst_case_rows(config: Config, tokenizer, count: int) -> list[dict]:
+    """Rows that render to (just under) max_seq_length tokens: the largest batch
+    the trainer can see. Random vocabulary text; preference rows under DPO."""
+    import random
+
+    rng = random.Random(0)
+    target = config.data.max_seq_length
+
+    def fill(prefix_messages, budget):
+        n = budget
+        while True:
+            text = tokenizer.decode([rng.randrange(tokenizer.vocab_size) for _ in range(n)])
+            messages = prefix_messages + [{"role": "assistant", "content": text}]
+            length = len(tokenizer(tokenizer.apply_chat_template(messages, tokenize=False))["input_ids"])
+            if length <= target:
+                return messages[-1]
+            n -= length - target + 8
+
+    prompt = [{"role": "user", "content": "go"}]
+    rows = []
+    for _ in range(count):
+        if config.dpo.enabled:
+            rows.append({"prompt": prompt, "chosen": [fill(prompt, target - 32)], "rejected": [fill(prompt, target - 32)]})
+        else:
+            rows.append({"messages": prompt + [fill(prompt, target - 32)]})
+    return rows
+
+
 def measure_memory(config: Config, steps: int = 2) -> dict:
-    """Peak GPU memory of real optimizer steps built from the trainer's components."""
+    """Peak GPU memory of the real trainer (palingenesis.train.train) running
+    `steps` optimizer steps on worst-case rows: same code path as training, so
+    everything the trainer allocates is counted. Single process (no FSDP)."""
     if not torch.cuda.is_available():
         raise SystemExit("--measure needs a GPU")
-    from transformers import AutoModelForCausalLM
+    import copy
+    import json
+    import tempfile
 
-    from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel
-    from palingenesis.loss import chunked_cross_entropy_loss, shift_labels
-    from palingenesis.optim import Hyperball, build_optimizer, is_hyperball_param
-    from palingenesis.train import (
-        _dynamic_num_chunks,
-        _freeze_non_attention_layers,
-        _get_hidden_states,
-        _get_lm_head,
-        _infer_model_type,
-    )
+    from agent_tooling._pipeline import load_tokenizer
+    from palingenesis.train import train
 
-    device = torch.device("cuda")
-    dtype = _DTYPES[config.model.torch_dtype]
-    torch.cuda.reset_peak_memory_stats()
-    if config.model.use_liger_kernel:
-        apply_liger_kernel(_infer_model_type(config.model.name_or_path))
-
-    def load(path):
-        m = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, attn_implementation=config.model.attn_implementation,
-                                                 trust_remote_code=config.model.trust_remote_code)
-        m.config.use_cache = False
-        return m
-
-    model = load(config.model.name_or_path)
-    apply_activation_checkpointing(model, mode=config.train.gradient_checkpointing)
-    if config.train.freeze_non_attention:
-        _freeze_non_attention_layers(model)
-    model = model.to(device).train()
-    ref = None
-    if config.dpo.enabled:
-        ref = load(config.dpo.reference_model or config.model.name_or_path).to(device).eval().requires_grad_(False)
-    optimizer = build_optimizer(model, config.train.learning_rate, config.train.weight_decay, config.train.llrd_decay,
-                                use_muon=config.train.optimizer == "muon", optimizer_name=config.train.optimizer)
-    stepper = optimizer
-    if config.train.hyperball:
-        constrained = [p for n, p in model.named_parameters() if p.requires_grad and is_hyperball_param(n, p)]
-        stepper = Hyperball(optimizer, constrained, config.train.hyperball_lr)
-    head = _get_lm_head(model)
-    vocab = head.weight.shape[0]
-    rows = config.train.per_device_batch_size * (2 if config.dpo.enabled else 1)
-    ids = torch.randint(0, vocab, (rows, config.data.max_seq_length), device=device)
-    labels = ids.clone()                                     # every token scored: the worst case
-    mask = torch.ones_like(ids)
-    for _ in range(steps):
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.train.bf16):
-            if config.memory.seco:
-                from palingenesis.seco import chunkwise_forward_backward
-
-                chunkwise_forward_backward(model, ids, labels, chunk_size=config.memory.seco_chunk_size,
-                                           budget=config.memory.spaco_budget or None,
-                                           num_loss_chunks=lambda n: _dynamic_num_chunks(n, vocab))
-            elif config.dpo.enabled:
-                from palingenesis.dpo import preference_step, reference_logps
-
-                chunks = _dynamic_num_chunks(ids.numel(), vocab)
-                ref_lp = reference_logps(ref, _get_hidden_states, _get_lm_head, ids, mask, labels, chunks)
-                hidden = _get_hidden_states(model, ids, mask, None)
-                preference_step(hidden, labels, head, ref_lp, rows // 2, beta=config.dpo.beta,
-                                sft_weight=config.dpo.sft_weight, num_chunks=chunks).loss.backward()
-            else:
-                hidden = _get_hidden_states(model, ids, mask, None)
-                shifted = shift_labels(labels)
-                chunked_cross_entropy_loss(hidden, shifted, head, num_chunks=_dynamic_num_chunks(ids.numel(), vocab),
-                                           global_valid_tokens=float((shifted != -100).sum())).backward()
-        stepper.step()
-        optimizer.zero_grad(set_to_none=True)
-    # GiB here: GPUs are sold by GiB ("80 GB" A100 = 80 GiB), so the numbers match the card
+    tokenizer = load_tokenizer(config)
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = copy.deepcopy(config)
+        data_file = f"{tmp}/worst_case.jsonl"
+        micro = cfg.train.gradient_accumulation_steps
+        rows = _worst_case_rows(cfg, tokenizer, steps * micro * cfg.train.per_device_batch_size)
+        with open(data_file, "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+        cfg.data.dataset, cfg.data.dataset_split, cfg.data.streaming = data_file, "train", False
+        cfg.data.sources, cfg.data.pretrain_replay_dataset, cfg.data.pretokenize = [], "", False
+        cfg.data.eval_every = steps       # the configured evaluation runs once, at the last step
+        cfg.data.messages_field = "messages"
+        cfg.data.num_workers = 0          # workers would split the few rows below one batch each
+        cfg.preprocess.enabled = False
+        cfg.train.max_steps = steps
+        cfg.train.save_steps, cfg.train.save_final, cfg.train.resume_from = 0, False, None
+        cfg.train.output_dir = f"{tmp}/out"
+        cfg.logging.use_wandb = cfg.logging.use_trackio = False
+        torch.cuda.reset_peak_memory_stats()
+        train(cfg)
+    # GiB: GPUs are sold by GiB ("80 GB" A100 = 80 GiB), so the numbers match the card
     return {"measured_peak_gb": torch.cuda.max_memory_allocated() / 2**30,
-            "gpu_total_gb": torch.cuda.get_device_properties(device).total_memory / 2**30,
-            "rows": rows, "seq_len": config.data.max_seq_length}
+            "gpu_total_gb": torch.cuda.get_device_properties(0).total_memory / 2**30,
+            "rows": config.train.per_device_batch_size * (2 if config.dpo.enabled else 1),
+            "micro_batches": config.train.gradient_accumulation_steps,
+            "evaluated": bool(config.data.eval_sources or config.data.eval_dataset),
+            "seq_len": config.data.max_seq_length}
 
 
 def print_report(est: dict):
@@ -278,7 +271,8 @@ def main():
     if args.measure:
         m = measure_memory(config)
         print(f"  Measured peak: {m['measured_peak_gb']:.1f} GiB of {m['gpu_total_gb']:.0f} GiB "
-              f"({m['rows']} x {m['seq_len']} tokens, 2 optimizer steps)\n")
+              f"(real trainer: 2 optimizer steps x {m['micro_batches']} micro-batches of {m['rows']} x "
+              f"{m['seq_len']} tokens{', plus one evaluation' if m['evaluated'] else ''})\n")
         sys.exit(0 if m["measured_peak_gb"] < m["gpu_total_gb"] else 1)
     sys.exit(0 if est["fits"] else 1)
 

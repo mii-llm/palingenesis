@@ -44,7 +44,7 @@
     pip install -e ".[train,logging]"
     ```
 
-    Install torch first. Plain pip ignores uv's index configuration, so it would otherwise install PyPI's default torch.
+    Install torch first. Plain pip ignores uv's index configuration, so it would otherwise install PyPI's default torch. The same applies to installing a built wheel: wheel metadata cannot name a package index.
 
 !!! warning "Torch installs, but sees no GPU?"
     PyPI's default Linux torch wheels target the newest CUDA (torch 2.14 needs CUDA 13.0, i.e. driver ≥ 580). On an older driver, `torch.cuda.is_available()` is `False`, or you get "The NVIDIA driver on your system is too old". Install torch from a CUDA index your driver supports:

@@ -377,3 +377,21 @@ def test_attention_path_is_correct_outside_seco():
         chunked = torch.cat([model(input_ids=ids[:, lo:lo + 16], past_key_values=cache, use_cache=True).logits
                              for lo in range(0, 70, 16)], dim=1)
     assert float((chunked - full).abs().max()) < 1e-10
+
+
+@pytest.mark.parametrize("arch", ["llama", "gemma2_softcap", "cohere2"])
+def test_scored_ce_sum_equals_cross_entropy_of_the_model_logits(arch):
+    """Evaluation scores only labelled positions from hidden states; it must
+    equal cross-entropy over the model's own logits (incl. logit transforms)."""
+    from palingenesis.logits import scored_ce_sum
+
+    model = build(arch).eval()
+    ids, labels, mask = _batch(batch=2, seq=50, pad_to=64)
+    shifted = shift_labels(labels)
+    with torch.no_grad():
+        logits = model(input_ids=ids, attention_mask=mask).logits
+        expected = torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB).double(), shifted.reshape(-1),
+                                                     ignore_index=IGNORE_INDEX, reduction="sum")
+    got, count = scored_ce_sum(model, ids, mask, shifted, torch.float64, chunk_bytes=VOCAB * 4 * 7)
+    assert count == int((shifted != IGNORE_INDEX).sum())
+    assert abs(got - float(expected)) < 1e-9 * abs(float(expected))

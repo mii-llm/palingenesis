@@ -107,3 +107,55 @@ def verify_output_head(model: nn.Module, head: nn.Module, backbone: nn.Module, t
             "memory.chunked_loss (and DPO/SeCO, which need it) for this model."
         )
     return diff
+
+
+def backbone_of(model: nn.Module) -> nn.Module:
+    """The model minus its output head (what produces the final hidden states)."""
+    backbone = getattr(model, "model", None) or getattr(model, "transformer", None)
+    if backbone is None:
+        base = getattr(model, "base_model", None)
+        backbone = base if base is not model else None
+    if backbone is None:
+        raise RuntimeError("Cannot find the model backbone (model.model / model.transformer / model.base_model).")
+    return backbone
+
+
+@torch.no_grad()
+def scored_ce_sum(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                  shifted_labels: torch.Tensor, dtype: torch.dtype, autocast: bool = True,
+                  ignore_index: int = -100, chunk_bytes: float = 1e9) -> tuple[float, int]:
+    """Summed cross-entropy over the scored positions, and their count, for evaluation.
+
+    Equivalent to cross_entropy(model(...).logits, labels, reduction="sum") but the
+    logits are only ever built for the SCORED positions, a slice of ~chunk_bytes
+    of fp32 at a time. The model's forward would materialise [B, S, V] logits
+    (8 GB in bf16 for 4 x 4096 tokens at a 248k vocabulary, twice that once
+    upcast), which dominated the trainer's peak memory at evaluation time.
+    """
+    valid = shifted_labels != ignore_index
+    count = int(valid.sum())
+    if count == 0:
+        return 0.0, 0
+    head = output_head(model)
+    try:
+        backbone = backbone_of(model) if head is not None else None
+    except RuntimeError:
+        backbone = None
+    targets = shifted_labels[valid]
+    with torch.amp.autocast("cuda", dtype=dtype, enabled=autocast and input_ids.is_cuda):
+        if backbone is None:                     # no separable head: score the model's own logits
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            rows = (out.logits if hasattr(out, "logits") else out[0])[valid]
+            project = None
+        else:
+            out = backbone(input_ids=input_ids, attention_mask=attention_mask)
+            rows = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[valid]
+            project = head
+        vocab = head.weight.shape[0] if project is not None else rows.shape[-1]
+        step = max(1, int(chunk_bytes // (vocab * 4)))
+        total = torch.zeros((), dtype=torch.float64, device=rows.device)
+        for start in range(0, rows.shape[0], step):
+            logits = rows[start:start + step] if project is None else project(rows[start:start + step])
+            logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
+            total += torch.nn.functional.cross_entropy(logits, targets[start:start + step], reduction="sum").double()
+    return float(total), count

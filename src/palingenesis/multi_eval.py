@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from palingenesis.logits import scored_ce_sum
 from palingenesis.loss import shift_labels
 
 logger = logging.getLogger(__name__)
@@ -213,21 +213,10 @@ class MultiEvaluator:
                 # Shift for next-token prediction: logits[t] predicts input_ids[t+1]
                 labels = shift_labels(batch_device["labels"])
 
-                valid = (labels != IGNORE_INDEX).sum().item()
-                if valid == 0:
-                    continue
-
-                with torch.amp.autocast("cuda", dtype=dtype):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)).float(),
-                    labels.view(-1),
-                    reduction="sum",
-                    ignore_index=IGNORE_INDEX,
-                )
-                source_loss += loss.item()
+                # Logits only at scored positions, in slices: the full [B, S, V]
+                # logits of model(...) dominated peak memory (palingenesis.logits).
+                loss, valid = scored_ce_sum(model, input_ids, attention_mask, labels, dtype)
+                source_loss += loss
                 source_tokens += valid
 
             if source_tokens > 0:
