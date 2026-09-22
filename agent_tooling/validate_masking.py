@@ -18,43 +18,15 @@ What it checks:
 import sys
 
 import agent_tooling._path_setup  # noqa: F401
-
-import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer
-
+from agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
-from palingenesis.data import ChatDataset, IGNORE_INDEX
+from palingenesis.data import IGNORE_INDEX
 
 
 def validate(config: Config, num_samples: int = 100) -> dict:
     """Run masking validation. Returns a report dict."""
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.name_or_path,
-        trust_remote_code=config.model.trust_remote_code,
-        padding_side="right",
-    )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    dataset = load_dataset(
-        config.data.dataset,
-        split=config.data.dataset_split,
-        streaming=config.data.streaming,
-    )
-
-    chat_ds = ChatDataset(
-        dataset,
-        tokenizer,
-        config.data.max_seq_length,
-        config.data.messages_field,
-        rank=0,
-        world_size=1,
-        include_observations=config.data.include_observations,
-        turn_scaling=config.data.turn_scaling,
-        train_on_reasoning=getattr(config.data, "train_on_reasoning", True),
-    )
+    tokenizer = load_tokenizer(config)
+    chat_ds = training_samples(config, tokenizer)   # exactly what the trainer consumes
 
     results = {
         "total_samples": 0,
@@ -63,15 +35,13 @@ def validate(config: Config, num_samples: int = 100) -> dict:
         "total_trained": 0,
         "samples_all_masked": 0,  # 0 trained tokens
         "samples_all_trained": 0,  # all tokens trained
-        "pad_tokens_trained": 0,  # BUG: pad tokens with loss
+        "pad_tokens_trained": 0,  # BUG: padding positions (attention_mask == 0) with loss
         "seq_lengths": [],
         "train_ratios": [],
         "issues": [],
     }
 
-    raw_iter = iter(dataset)
     processed = 0
-    skipped = 0
 
     for sample in chat_ds:
         if processed >= num_samples:
@@ -96,11 +66,9 @@ def validate(config: Config, num_samples: int = 100) -> dict:
         if num_trained == seq_len:
             results["samples_all_trained"] += 1
 
-        # Check: are pad tokens being trained on?
-        if tokenizer.pad_token_id is not None:
-            pad_positions = input_ids == tokenizer.pad_token_id
-            pad_trained = (pad_positions & trained_mask).sum().item()
-            results["pad_tokens_trained"] += pad_trained
+        # Padding positions (not tokens that merely share the pad id: pad is often
+        # the EOS token, which is legitimately trained) must never carry loss.
+        results["pad_tokens_trained"] += ((attn == 0) & trained_mask).sum().item()
 
         processed += 1
 
@@ -112,12 +80,11 @@ def validate(config: Config, num_samples: int = 100) -> dict:
         return results
 
     avg_ratio = results["total_trained"] / max(results["total_tokens"], 1)
-    avg_len = sum(results["seq_lengths"]) / len(results["seq_lengths"])
 
     if results["samples_all_masked"] > processed * 0.1:
         results["issues"].append(
             f"WARNING: {results['samples_all_masked']}/{processed} samples have NO trained tokens. "
-            "Chat template may lack {% generation %} markers."
+            "Check the data has assistant turns (and data.last_turn_only)."
         )
 
     if results["samples_all_trained"] > processed * 0.1:

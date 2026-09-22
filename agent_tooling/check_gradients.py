@@ -16,26 +16,20 @@ Requires 1 GPU. Loads model, runs 1 forward-backward, reports norms.
 
 import sys
 
-import agent_tooling._path_setup  # noqa: F401
-
 import torch
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
+import agent_tooling._path_setup  # noqa: F401
+from agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
-from palingenesis.data import ChatDataset, collate_fn, IGNORE_INDEX
+from palingenesis.data import collate_fn
 
 
 def check_gradients(config: Config) -> dict:
     """Run one step and collect per-layer gradient norms."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.name_or_path,
-        trust_remote_code=config.model.trust_remote_code,
-    )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = load_tokenizer(config)
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     model_dtype = dtype_map[config.model.torch_dtype]
@@ -43,41 +37,28 @@ def check_gradients(config: Config) -> dict:
     print(f"Loading model: {config.model.name_or_path} ({model_dtype})")
     model = AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
         trust_remote_code=config.model.trust_remote_code,
-        use_cache=False,
     ).to(device)
+    model.config.use_cache = False
     model.train()
 
-    # Get one batch
-    dataset = load_dataset(
-        config.data.dataset,
-        split=config.data.dataset_split,
-        streaming=config.data.streaming,
-    )
-    chat_ds = ChatDataset(
-        dataset,
-        tokenizer,
-        config.data.max_seq_length,
-        config.data.messages_field,
-        rank=0,
-        world_size=1,
-        include_observations=config.data.include_observations,
-        turn_scaling=config.data.turn_scaling,
-        train_on_reasoning=getattr(config.data, "train_on_reasoning", True),
-    )
+    # One batch of exactly what the trainer consumes
+    chat_ds = training_samples(config, tokenizer)
 
     samples = []
     for s in chat_ds:
-        samples.append(s)
+        samples.append({k: v for k, v in s.items() if k != "side"})
         if len(samples) >= 2:
             break
 
     if not samples:
-        return {"issues": ["CRITICAL: No samples processed from dataset."]}
+        return {"issues": ["CRITICAL: No samples processed from dataset."], "loss": float("nan"),
+                "total_grad_norm": 0.0, "dead_layers": []}
 
     pad_id = tokenizer.pad_token_id or 0
     batch = collate_fn(samples, pad_id)
+    batch.pop("position_ids", None)   # packed rows: document masking is the trainer's job, not needed here
     batch = {k: v.to(device) for k, v in batch.items()}
 
     # Forward-backward

@@ -18,11 +18,8 @@ Usage:
     python -m agent_tooling.monitor_run --log_file outputs/train.log --brief
 """
 
-import re
 import sys
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 
 @dataclass
@@ -36,39 +33,20 @@ class StepInfo:
 
 
 def parse_training_log(text: str) -> list[StepInfo]:
-    """Parse structured training log lines into StepInfo objects.
+    """The trainer's step lines (SFT, DEFT, DPO formats alike), one StepInfo per step."""
+    from agent_tooling._logparse import parse_steps
 
-    Expected format:
-        step=123 loss=2.3456 lr=1.00e-05 tok/s=5432 grad_norm=0.456 dt=1.23s
-    """
-    steps = []
-
-    # Pattern for our training loop output
-    pattern = re.compile(
-        r"step=(\d+)\s+loss=([0-9.eE+\-naif]+)\s+lr=([0-9.eE+\-]+)\s+"
-        r"tok/s=([0-9.]+)\s+grad_norm=([0-9.eE+\-naif]+)(?:\s+dt=([0-9.]+)s)?"
-    )
-
-    for line in text.split("\n"):
-        m = pattern.search(line)
-        if m:
-            info = StepInfo(
-                step=int(m.group(1)),
-                loss=float(m.group(2)),
-                lr=float(m.group(3)),
-                tokens_per_sec=float(m.group(4)),
-                grad_norm=float(m.group(5)),
-                step_time=float(m.group(6)) if m.group(6) else 0.0,
-            )
-            steps.append(info)
-
-    return steps
+    return [
+        StepInfo(step=f["step"], loss=f["loss"], lr=f.get("lr", 0.0), tokens_per_sec=f.get("tok/s", 0.0),
+                 grad_norm=f.get("grad_norm", 0.0), step_time=f.get("dt", 0.0))
+        for f in parse_steps(text)
+    ]
 
 
 def analyze_run(steps: list[StepInfo], max_steps: int | None = None) -> dict:
     """Analyze training run health from step data."""
     if not steps:
-        return {"status": "NO_DATA", "message": "No training steps found in log."}
+        return {"status": "NO_DATA", "issues": ["No training step lines (step=N loss=X ...) found in the log."]}
 
     latest = steps[-1]
     first = steps[0]
@@ -100,16 +78,27 @@ def analyze_run(steps: list[StepInfo], max_steps: int | None = None) -> dict:
     elif abs(loss_trend) < 0.001 and n > 50:
         issues.append("INFO: Loss has plateaued — may need LR adjustment or more data diversity.")
 
-    if latest.grad_norm > 10:
-        issues.append(f"WARNING: Gradient norm is high ({latest.grad_norm:.1f}). Clipping may be too loose.")
-    if latest.grad_norm < 1e-6:
+    # Gradient norms are logged before clipping and their scale depends on the model,
+    # vocabulary and objective, so judge the latest one against the run's own history.
+    norms = sorted(s.grad_norm for s in steps[-50:-1] if s.grad_norm > 0)
+    if len(norms) >= 10 and latest.grad_norm > 5 * norms[len(norms) // 2]:
+        issues.append(
+            f"WARNING: Gradient norm spiked to {latest.grad_norm:.1f} "
+            f"(5x the recent median {norms[len(norms) // 2]:.1f})."
+        )
+    if 0 < latest.grad_norm < 1e-6:
         issues.append("WARNING: Gradient norm near zero — possible vanishing gradient or dead training.")
 
-    # Throughput stability
-    if n > 5:
-        tok_rates = [s.tokens_per_sec for s in recent]
-        if min(tok_rates) < max(tok_rates) * 0.5:
-            issues.append("WARNING: Throughput is unstable (>2x variation). Possible data loading bottleneck.")
+    # Throughput: per-step tok/s varies by design with variable-length batches, so
+    # look for a sustained slowdown (recent median well below the earlier median).
+    if n >= 20:
+        def median(xs):
+            xs = sorted(xs)
+            return xs[len(xs) // 2]
+
+        now, before = median([s.tokens_per_sec for s in recent]), median([s.tokens_per_sec for s in earlier])
+        if before > 0 and now < 0.5 * before:
+            issues.append(f"WARNING: Throughput dropped from ~{before:.0f} to ~{now:.0f} tok/s (median of 10 steps).")
 
     status = "HEALTHY"
     if any("CRITICAL" in i for i in issues):
@@ -152,6 +141,9 @@ def _format_time(seconds: float | None) -> str:
 
 def print_brief(result: dict):
     """One-line status for agent consumption."""
+    if result["status"] == "NO_DATA":
+        print(f"[NO_DATA] {result['issues'][0]}")
+        return
     print(
         f"[{result['status']}] step={result['current_step']} "
         f"loss={result['current_loss']} "
@@ -166,7 +158,11 @@ def print_full(result: dict):
     print("TRAINING RUN MONITOR")
     print("=" * 70)
     print(f"  Status: {result['status']}")
-    print(f"  Step: {result['current_step']} (of {result.get('eta_steps', '?')} remaining)")
+    if result["status"] == "NO_DATA":
+        print(f"  {result['issues'][0]}\n")
+        return
+    remaining = f", {result['eta_steps']} remaining" if result.get("eta_steps") is not None else ""
+    print(f"  Step: {result['current_step']}{remaining}")
     print(
         f"  Loss: {result['current_loss']} (initial: {result['initial_loss']}, improvement: {result['improvement_pct']:.1f}%)"
     )
@@ -190,7 +186,14 @@ def main():
     parser.add_argument("--last", type=int, help="Only analyze last N steps")
     parser.add_argument("--brief", action="store_true", help="One-line output")
     parser.add_argument("--max_steps", type=int, help="Total expected training steps")
+    parser.add_argument("--config", help="Training config: takes max_steps from train.max_steps")
     args = parser.parse_args()
+    if args.max_steps is None and args.config:
+        import agent_tooling._path_setup  # noqa: F401
+        from palingenesis.config import Config
+
+        max_steps = Config.from_yaml(args.config).train.max_steps
+        args.max_steps = max_steps if max_steps > 0 else None
 
     with open(args.log_file) as f:
         text = f.read()

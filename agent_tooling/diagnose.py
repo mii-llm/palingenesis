@@ -23,7 +23,6 @@ import sys
 import time
 
 import agent_tooling._path_setup  # noqa: F401
-
 from palingenesis.config import Config
 
 
@@ -56,16 +55,23 @@ def diagnose_pre(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         "issues": masking["issues"],
     }
 
-    # 3. Config sanity
-    issues = _check_config_sanity(config)
+    # 3. The trainer's own validation (hard errors fail, warnings warn)
+    from palingenesis.config import ConfigError
+
+    try:
+        validation = [f"WARNING: {w}" for w in config.validate()]
+        errored = False
+    except ConfigError as exc:
+        validation, errored = [str(exc)], True
+    issues = validation + _check_config_sanity(config)
     report["checks"]["config"] = {
-        "status": "pass" if not issues else "warn",
+        "status": "fail" if errored else ("pass" if not issues else "warn"),
         "issues": issues,
     }
 
     # Overall
-    all_pass = all(c["status"] == "pass" for c in report["checks"].values())
-    report["overall"] = "HEALTHY" if all_pass else "ISSUES_FOUND"
+    report["overall"] = "ISSUES_FOUND" if any(c["status"] == "fail" for c in report["checks"].values()) \
+        else "HEALTHY"
     return report
 
 
@@ -81,7 +87,7 @@ def diagnose_post(config: Config, log_file: str) -> dict:
         text = f.read()
     pairs = parse_losses_from_text(text)
     if pairs:
-        losses = [l for _, l in sorted(pairs)]
+        losses = [value for _, value in sorted(pairs)]
         analysis = analyze_losses(losses)
         report["checks"]["loss"] = {
             "status": "pass" if analysis.healthy else "fail",
@@ -124,9 +130,8 @@ def diagnose_full(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     else:
         report["checks"]["gradients"] = {"status": "skip", "reason": "No GPU available"}
 
-    report["overall"] = (
-        "HEALTHY" if all(c["status"] in ("pass", "skip") for c in report["checks"].values()) else "ISSUES_FOUND"
-    )
+    report["overall"] = "ISSUES_FOUND" if any(c["status"] == "fail" for c in report["checks"].values()) \
+        else "HEALTHY"
     return report
 
 
@@ -147,15 +152,15 @@ def _check_config_sanity(config: Config) -> list[str]:
     if effective_batch > 512:
         issues.append(f"Effective batch size is {effective_batch} — very large. May need higher LR.")
 
-    # Seq length + context parallel
-    if config.data.max_seq_length > 32768 and not config.parallel.context_parallel:
+    # Very long sequences: SeCO (one GPU) or Context Parallel (several)
+    if config.data.max_seq_length > 32768 and not (config.parallel.context_parallel or config.memory.seco):
         issues.append(
-            f"Sequence length is {config.data.max_seq_length} but Context Parallel is off. "
-            "Consider enabling for memory efficiency on multi-GPU."
+            f"Sequence length is {config.data.max_seq_length}: consider memory.seco (single GPU, exact "
+            "chunk-wise training) or parallel.context_parallel (multi-GPU)."
         )
 
     # Chunked loss for long sequences
-    if config.data.max_seq_length > 4096 and not config.memory.chunked_loss:
+    if config.data.max_seq_length > 4096 and not config.memory.chunked_loss and not config.memory.seco:
         issues.append(
             "Long sequences without chunked loss — CE will materialize huge logit tensor. "
             "Enable memory.chunked_loss=true."

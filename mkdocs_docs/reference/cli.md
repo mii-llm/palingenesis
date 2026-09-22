@@ -109,10 +109,11 @@ pgs validate --config config.yaml --num_samples 200
 
 ### profile
 
-Estimate memory usage before training.
+Memory for a config: parameters, optimizer states and gradients exactly, activations roughly. `--measure` runs two real optimizer steps on the GPU and reports the true peak.
 
 ```bash
-pgs profile --config config.yaml --gpu_memory_gb 80
+pgs profile --config config.yaml --gpu 80
+pgs profile --config config.yaml --measure
 ```
 
 ### monitor

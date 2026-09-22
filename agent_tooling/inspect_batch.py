@@ -14,17 +14,11 @@ Output: Colored text showing which tokens are trained on (green = loss computed,
         gray = masked/ignored), plus statistics.
 """
 
-import sys
 
 import agent_tooling._path_setup  # noqa: F401 — adds src/ to sys.path
-
-import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer
-
+from agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
-from palingenesis.data import ChatDataset, IGNORE_INDEX
-
+from palingenesis.data import IGNORE_INDEX
 
 # ANSI colors
 GREEN = "\033[92m"
@@ -36,32 +30,8 @@ RESET = "\033[0m"
 
 
 def inspect(config: Config, num_samples: int = 3):
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.name_or_path,
-        trust_remote_code=config.model.trust_remote_code,
-        padding_side="right",
-    )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    dataset = load_dataset(
-        config.data.dataset,
-        split=config.data.dataset_split,
-        streaming=config.data.streaming,
-    )
-
-    chat_ds = ChatDataset(
-        dataset,
-        tokenizer,
-        config.data.max_seq_length,
-        config.data.messages_field,
-        rank=0,
-        world_size=1,
-        include_observations=config.data.include_observations,
-        turn_scaling=config.data.turn_scaling,
-        train_on_reasoning=getattr(config.data, "train_on_reasoning", True),
-    )
+    tokenizer = load_tokenizer(config)
+    chat_ds = training_samples(config, tokenizer)   # exactly what the trainer consumes
 
     print(f"{BOLD}{'=' * 80}{RESET}")
     print(f"{BOLD}Batch Inspector — {config.model.name_or_path}{RESET}")
@@ -85,8 +55,10 @@ def inspect(config: Config, num_samples: int = 3):
         total_tokens += seq_len
         total_trained += num_trained
 
+        side = f" [{sample['side']}]" if "side" in sample else ""
         print(
-            f"{BOLD}Sample {count + 1}{RESET} — {seq_len} tokens, {num_trained} trained ({100*num_trained/seq_len:.1f}%)"
+            f"{BOLD}Sample {count + 1}{side}{RESET} — {seq_len} tokens, {num_trained} trained "
+            f"({100*num_trained/seq_len:.1f}%)"
         )
         print(f"{'-' * 60}")
 

@@ -121,29 +121,35 @@ python -m agent_tooling check_gradients --config configs/single_gpu.yaml
 - NaN/Inf detection
 - Layer norm ratio (max/min across depth)
 
-### `profile_memory` — Pre-Training Memory Estimation
-
-Estimates peak GPU memory without running training.
+### `profile_memory` — Memory: exact where possible, measured on demand
 
 ```bash
-python -m agent_tooling profile_memory --config configs/long_context.yaml --gpu_memory_gb 80
+pgs profile --config configs/qwen35_4b/a100_80gb.yaml --gpu 80      # static estimate, no GPU
+pgs profile --config configs/qwen35_4b/a100_80gb.yaml --measure     # + two real optimizer steps
 ```
 
-**Reports**:
-```
-Memory Breakdown (single GPU, pre-FSDP):
-  Model parameters:     17.7 GB
-  Optimizer states:    106.0 GB
-  Gradients:            17.7 GB
-  Activations:          72.2 GB  [SELECTIVE (~60% reduction)]
-  CE loss peak:          2.1 GB  [CHUNKED (16 chunks)]
-  ──────────────────────────────────────
-  Total (+10% overhead): 237.2 GB
-  GPU available:          80.0 GB
-  Headroom:              -157.2 GB
+The static estimate has two parts:
 
-  ✗ Will NOT fit on 80GB GPU (over by 157.2 GB)
-  → Use FSDP with more GPUs (8x → ~30 GB/GPU)
+- **Exact:** parameters (the architecture built on the meta device, so GQA, linear attention, MoE, tying and freezing all count), optimizer states per the optimizer's real state layout, gradients, and the DPO reference model.
+- **Estimated:** logits (the trainer's per-batch chunk), the SeCO K/V cache, and activations. Activations are a rough approximation, because they depend on the architecture and its kernels.
+
+`--measure` runs two optimizer steps with the trainer's own components at the configured batch size and `max_seq_length`, on random tokens with every token scored (the worst case). It reports the true peak. Single GPU only; FSDP sharding is not modelled.
+
+If the model config cannot be loaded, the tool fails rather than guessing.
+
+Example (Qwen3.5-0.8B, 8 × 4096 tokens, bf16, selective checkpointing, one A100):
+
+```
+  Model: Qwen/Qwen3.5-0.8B (0.75B params, bfloat16 weights, 100% trainable)
+  Exact (single GPU, before any FSDP sharding):
+    Model parameters:        1.5 GB
+    Optimizer states:        3.0 GB  [adamw]
+    Gradients:               1.5 GB
+  Estimated:
+    Logits (one chunk):      3.8 GB
+    Activations (rough):     6.4 GB  [checkpointing: selective]
+    Total (+10% overhead):  17.9 GB of 80 GB (+62.1 GB)
+  Measured peak: 18.2 GiB of 79 GiB (8 x 4096 tokens, 2 optimizer steps)
 ```
 
 ### `monitor_run` — Live Training Monitor

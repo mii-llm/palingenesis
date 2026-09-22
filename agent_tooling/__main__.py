@@ -5,7 +5,6 @@ Dispatches to the appropriate diagnostic tool.
 
 import sys
 
-
 TOOLS = {
     "diagnose": "agent_tooling.diagnose",
     "inspect_batch": "agent_tooling.inspect_batch",

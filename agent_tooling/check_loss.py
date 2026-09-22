@@ -54,15 +54,10 @@ def parse_losses_from_text(text: str) -> list[tuple[int, float]]:
         {"train/loss": 2.3456, "train/global_step": 123}
         2.3456  (one value per line, step = line number)
     """
-    pairs = []
+    # The trainer's own step lines (training loss only, never eval_loss)
+    from agent_tooling._logparse import parse_steps
 
-    # Try structured format: step=X ... loss=Y
-    pattern = re.compile(r"step[=:]?\s*(\d+).*?loss[=:]?\s*([0-9.eE+\-naif]+)")
-    for match in pattern.finditer(text):
-        step = int(match.group(1))
-        loss = float(match.group(2))
-        pairs.append((step, loss))
-
+    pairs = [(s["step"], s["loss"]) for s in parse_steps(text)]
     if pairs:
         return pairs
 
@@ -101,14 +96,14 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
 
     result.initial_loss = losses[0]
     result.final_loss = losses[-1]
-    result.min_loss = min(l for l in losses if math.isfinite(l)) if any(math.isfinite(l) for l in losses) else 0
-    result.max_loss = max(l for l in losses if math.isfinite(l)) if any(math.isfinite(l) for l in losses) else 0
+    result.min_loss = min(value for value in losses if math.isfinite(value)) if any(math.isfinite(value) for value in losses) else 0
+    result.max_loss = max(value for value in losses if math.isfinite(value)) if any(math.isfinite(value) for value in losses) else 0
 
     # Check NaN/Inf
-    for i, l in enumerate(losses):
-        if math.isnan(l):
+    for i, value in enumerate(losses):
+        if math.isnan(value):
             result.nan_steps.append(i)
-        elif math.isinf(l):
+        elif math.isinf(value):
             result.inf_steps.append(i)
 
     if result.nan_steps:
@@ -122,7 +117,7 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
         result.healthy = False
 
     # Filter finite losses for remaining analysis
-    finite = [(i, l) for i, l in enumerate(losses) if math.isfinite(l)]
+    finite = [(i, value) for i, value in enumerate(losses) if math.isfinite(value)]
     if len(finite) < 5:
         return result
 
@@ -263,7 +258,7 @@ def main():
         print("ERROR: Could not parse any loss values from input.", file=sys.stderr)
         sys.exit(1)
 
-    losses = [l for _, l in sorted(pairs)]
+    losses = [value for _, value in sorted(pairs)]
     analysis = analyze_losses(losses)
     print_report(analysis)
     sys.exit(0 if analysis.healthy else 1)
