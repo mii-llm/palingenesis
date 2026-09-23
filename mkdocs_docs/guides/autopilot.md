@@ -31,7 +31,7 @@ Four phases, fully automatic:
 Reads your GPU's memory, compute capability, and available bandwidth. From this plus the model size, it determines:
 
 - Maximum batch size that fits
-- Whether to use gradient release or FSDP
+- Whether to use FSDP
 - Optimal number of loss chunks
 - Whether FP8 is available (H100+)
 
@@ -55,13 +55,16 @@ Bad trials terminate early (NaN, increasing loss, no progress), saving time for 
 
 ### Phase 3: Full training (the main event)
 
-Trains with the corrected LR and all optimizations:
+Trains with the corrected LR and these settings:
 
-- DEFT loss
+- DEFT loss, SymNoise
 - Power-decay scheduler
-- Hyperball + EMA + base merge
-- AdaGC spike protection
+- Hyperball, EMA of the weights, AdamC
+- AdaGC per-tensor gradient clipping
+- Length-grouped batching (no packing), uniform turn weights, no observation loss (`include_observations` is opt-in: it trains on your tool outputs)
 - Best-model tracking
+
+Several of these are single-paper techniques (see [research](../architecture/research.md)); if you want the plain baseline, write the config by hand with the swept LR from the report.
 
 Checkpoints are saved for auto-resume. If this phase is interrupted and you re-run the same command, it picks up from the last checkpoint.
 

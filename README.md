@@ -11,6 +11,7 @@ Papers distilled into one command. Every optimization applied automatically.
 ```bash
 git clone https://github.com/mii-llm/palingenesis.git && cd palingenesis
 uv sync --extra train --extra logging     # creates .venv with CUDA-enabled torch
+                                          # (+ --extra hybrid for Qwen3.5: faster, and needed to pack)
 source .venv/bin/activate
 ./run.sh configs/quickstart.yaml
 ```
@@ -28,19 +29,19 @@ pgs autopilot --model Qwen/Qwen3.5-4B --dataset your_data.jsonl
 
 ## What you get
 
-- **4B full fine-tune in 15 GB**: no LoRA compromise needed (RTX 4090 compatible)
-- **DEFT loss**: parameter-free token weighting; the original paper (arxiv:2602.11424) reports math-reasoning gains, not independently reproduced
-- **Hyperball optimizer**: 20-30% convergence speedup via norm constraints (arxiv:2606.16899, single paper)
-- **Power-decay scheduler**: theoretically optimal (better than cosine at all scales)
-- **Best-model tracking**: automatically saves the checkpoint with lowest eval loss
-- **Auto-resume**: crash and re-run, picks up from last valid checkpoint
-- **Multi-node SLURM**: sharded DCP checkpoints, zero extra memory
+- **Correct by construction**: the loss path is checked against a plain reference loop step by step; packed conversations never see each other; saved models load with plain `from_pretrained`; multi-GPU gradients equal single-GPU ones (tests included)
+- **Agentic masking from the chat template itself**: whole assistant turns, tool calls and end-of-turn tokens included; `tools` rendered into the prompt; per-message `loss: false`
+- **Memory**: chunked losses (never the full logits), selective activation checkpointing, gradient release, 8-bit optimizers; a Qwen3.5-4B fine-tune (attention pathway trained, 36% of the weights) in ~16 GiB
+- **Research options, one line each**: DEFT/DFT/InfoSFT token weighting, Hyperball, power-decay; implemented to their papers' definitions, benefits as reported by the papers (not reproduced here)
+- **Best-model tracking**: eval before training, every `eval_every` steps and at the end; saves the lowest-eval-loss checkpoint
+- **Auto-resume**: crash and re-run, picks up exactly where the last complete checkpoint left off
+- **Multi-node SLURM**: sharded DCP checkpoints
 
 ## Hardware
 
 | GPU | Model | Config |
 |-----|-------|--------|
-| RTX 4090 (24 GB) | Qwen3.5-4B full ft | `configs/qwen35_4b/a100_40gb.yaml` |
+| RTX 4090 (24 GB) | Qwen3.5-4B, attention pathway (36% of weights) | `configs/qwen35_4b/a100_40gb.yaml` |
 | A100-80GB | Qwen3.5-4B, batch=4 | `configs/qwen35_4b/a100_80gb.yaml` |
 | 8× A100 | Qwen3.5-35B MoE | `configs/qwen35_35b_moe/a100_80gb_multigpu.yaml` |
 | H100 | Qwen3.5-4B, FP8 | `configs/qwen35_4b/h100_80gb.yaml` |
@@ -63,7 +64,7 @@ wandb + trackio, wired for real investigation: loss/ppl, grad norm, spike/clip c
 
 ## Agentic data support
 
-Native support for reasoning traces with `reasoning` (or legacy `reasoning_content`), `tool_calls`, and tool responses. ShareGPT, Alpaca, and OpenAI formats auto-normalized. Tool-call validation against declared schemas.
+Native support for reasoning traces with `reasoning` (or legacy `reasoning_content`), `tool_calls`, and tool responses. Each assistant turn is trained exactly as the chat template renders it, tool calls and end-of-turn token included. Tool definitions in a `tools` field are rendered into the prompt; `"loss": false` on a message keeps it as context only. ShareGPT, Alpaca and OpenAI formats (JSON-string tool arguments included) are normalized. Tool-call validation against declared schemas.
 
 ```yaml
 data:

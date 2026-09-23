@@ -21,8 +21,8 @@ One command. State-of-the-art quality. RTX 4090 to multi-node clusters.
 
 <div class="numbers">
   <div class="num"><span class="value">352</span><span class="label">papers read</span></div>
-  <div class="num"><span class="value">15 GB</span><span class="label">for 4B full ft</span></div>
-  <div class="num"><span class="value">62</span><span class="label">tests passing</span></div>
+  <div class="num"><span class="value">~16 GiB</span><span class="label">Qwen3.5-4B fine-tune</span></div>
+  <div class="num"><span class="value">530+</span><span class="label">tests</span></div>
 </div>
 
 ---
@@ -33,7 +33,7 @@ One command. State-of-the-art quality. RTX 4090 to multi-node clusters.
 
 ### Memory
 
-A 4-billion parameter model trains in 15 GB. Full fine-tune, not LoRA. Gradient release + Lion 8-bit + selective checkpointing eliminate every byte of waste.
+A Qwen3.5-4B fine-tune (its attention pathway, 36% of the weights) trains in about 16 GiB, without LoRA. Chunked losses, gradient release, Lion 8-bit and selective checkpointing each remove a different kind of memory.
 
 [How it works →](guides/single-gpu.md)
 
@@ -43,7 +43,7 @@ A 4-billion parameter model trains in 15 GB. Full fine-tune, not LoRA. Gradient 
 
 ### Quality
 
-DEFT loss is a parameter-free token weighting aimed at reasoning tasks (the original paper reports gains, not independently reproduced; results vary by model and data). Hyperball reports a 20–30% token-equivalent speedup in pretraining (single paper, experimental). Power-decay schedule is provably optimal for the easy-task regime. All on by default in flagship configs.
+Correctness first: the loss path matches a plain reference loop step by step, assistant turns are masked from the chat template itself (tool calls included), packed conversations never see each other. On top, research options (DEFT, Hyperball, power-decay) implemented to their papers' definitions, with their papers' claims clearly labelled as such.
 
 [The research →](architecture/research.md)
 
@@ -71,10 +71,10 @@ Palingenesis takes the opposite stance. We read the papers, ran the ablations, f
 
 This means:
 
-- You don't pick a loss function. **DEFT** is parameter-free and subsumes everything else.
-- You don't pick a scheduler. **Power-decay** is theoretically optimal for SFT.
-- You don't worry about memory. **Gradient release** handles it.
-- You don't tune the learning rate (unless you want to). **Autopilot** finds it.
+- The masking is right without you writing a template-specific rule: turns are located from the chat template itself.
+- Memory is handled: chunked losses, checkpointing and `pgs profile` (static estimate, or a measured real step).
+- The learning rate can be found for you: **Autopilot** sweeps it.
+- Research options (DEFT, Hyperball, power-decay) are one line each, documented with what their papers claim.
 
 When you *do* want control — it's all there. Every parameter, every plugin, every optimization is configurable. But the base case is: it just works.
 
@@ -126,7 +126,7 @@ Any HuggingFace causal LM. Optimized for: Qwen 2.5/3/3.5, Llama 3, Gemma 4, Mist
 
 ```bash
 git clone https://github.com/mii-llm/palingenesis.git && cd palingenesis
-uv pip install -e ".[train]"
+uv sync --extra train --extra logging && source .venv/bin/activate
 ```
 
 [Full installation guide →](getting-started/install.md)

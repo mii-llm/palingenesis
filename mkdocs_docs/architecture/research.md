@@ -16,9 +16,9 @@ We scanned 352 papers from arXiv published between 2024 and mid-2026, focusing o
 - Distributed systems
 - SFT-to-RL transitions
 
-Each paper was evaluated on: (1) does it compose with our existing stack? (2) is the improvement reproducible at our target scale (0.8B-35B)? (3) does it add complexity proportional to its benefit?
+Each paper was evaluated on: (1) does it compose with our existing stack? (2) is the claimed improvement plausible at our target scale (0.8B-35B)? (3) does it add complexity proportional to its benefit?
 
-The papers that passed all three filters were implemented. The rest are catalogued in `NEXT_STEPS.md` for future work.
+Implemented does not mean reproduced: unless a page says otherwise, the gains below are the papers' own claims, mostly from pretraining or other settings. Each technique is opt-in or documented as such, and checked against its paper's definition in the test suite.
 
 ---
 
@@ -28,7 +28,7 @@ The papers that passed all three filters were implemented. The rest are catalogu
 
 | Technique | Paper | Key insight | Our implementation |
 |-----------|-------|-------------|-------------------|
-| Hyperball | Wen et al., Stanford, Jun 2026 | Scale-invariant layers only care about weight *direction*. Fix the norm, optimize the angle. | `optim.HyperballWrapper` — 5-line projection after each step |
+| Hyperball | Wen et al., Stanford, Jun 2026 | Scale-invariant layers only care about weight *direction*. Fix the norm, optimize the angle. | `optim.Hyperball` — wraps any base optimizer; projection after each step (Algorithm 1) |
 | MONA | Li et al., Meituan, May 2026 | EMA of gradient differences ≈ Hessian·Δθ. Augments gradients with curvature before orthogonalization. | `optim.MONAAcceleration` — bf16 buffers, streaming computation |
 | Muon | Jordan et al., 2024 | Newton-Schulz polar decomposition on momentum = steepest descent under spectral norm. | PyTorch native `torch.optim.Muon` |
 | Lion 8-bit | Chen et al., 2023 + bitsandbytes | Sign-based update, one momentum buffer. 4 bytes/param. | `bitsandbytes.optim.Lion8bit` |
@@ -39,14 +39,16 @@ The papers that passed all three filters were implemented. The rest are catalogu
 
 | Technique | Paper | Key insight |
 |-----------|-------|-------------|
-| Power-decay | Li et al., Peking, Feb 2026 | η(z) = η_peak·(1-z/N)^γ with γ≈4 is optimal when model capacity β > 3. Cosine saturates. |
+| Power-decay | Li et al., Peking, Feb 2026 | η(z) = η_peak·(1-z/N)^γ with γ≈4, derived as better than cosine in a functional-scaling-law model of pretraining (capacity β > 3). |
 | WSD | Hu et al., 2024 | Maintain peak LR for 80% of training, decay only at end. Optimal for hard tasks. |
 
 ### Loss
 
 | Technique | Paper | Key insight |
 |-----------|-------|-------------|
-| DEFT | Wu et al., Feb 2026 | Token weight = f(model confidence). Parameter-free. Subsumes NLL and DFT. Reports math-reasoning gains (original paper, not reproduced externally). |
+| DEFT | Wang et al., Feb 2026 (arXiv:2602.11424) | CE gated by `p^α`, α = Σp² (Rényi-2 collision probability), stop-gradient. Parameter-free; NLL and DFT are its α→0 and α=1 ends. Reports math-reasoning gains from base models; not reproduced here. |
+| DFT | Wu et al., 2025 | CE weighted by the (stop-gradient) target probability `p`. |
+| InfoSFT | Sabbaghi et al., May 2025 (arXiv:2605.14967) | Weight `q·[logit(p̄) − logit(q)]₊`, stop-gradient, p̄ = 0.93 (palingenesis also normalises it to mean 1 per batch). |
 | Chunked CE | Aligned with torchtitan | Split [B,S,V] logit computation into N chunks. FSDP-aware reshard management. |
 | Cut Cross-Entropy | Apple, ICLR 2025 | Computes CE without materializing logits. O(1) memory. Triton kernel. |
 
@@ -71,9 +73,9 @@ The papers that passed all three filters were implemented. The rest are catalogu
 
 | Technique | Paper | Key insight |
 |-----------|-------|-------------|
-| TFP packing | Dong et al., Aug 2024 | Greedy TSP ordering with threshold filtering. Related-but-diverse samples in same pack → +7% GSM8K. |
+| TFP packing | Dong et al., Aug 2024 | Greedy TSP ordering with threshold filtering, so related samples share a packed sequence. Needs packed documents to see each other, which palingenesis prevents: available as a standalone utility only. |
 | ECHO | ICML 2026 | Train on tool/observation tokens too. Model becomes world model. |
-| J-shaped difficulty | Synthesis of 2605.12906, 2502.02797 | 20% easy + 50% medium + 25% hard + 5% very hard is optimal. |
+| J-shaped difficulty | Synthesis of 2605.12906, 2502.02797 | 20% easy + 50% medium + 25% hard + 5% very hard: our synthesis of those papers, not a measured optimum. |
 | HES scoring | May 2026 | High-Entropy Sum: top-k% highest-entropy tokens predict reasoning quality. |
 | MSFT | Mar 2026 | Per-source adaptive weight decay. Sources that overfit get down-weighted. |
 
@@ -93,7 +95,7 @@ The papers that passed all three filters were implemented. The rest are catalogu
 | Paper | Why not |
 |-------|---------|
 | AdEMAMix (dual EMA) | Needs thousands of steps for slow EMA to fill. SFT runs are too short. |
-| AdamS (momentum as normalizer) | Same performance as AdamW. We already beat AdamW with Lion. |
+| AdamS (momentum as normalizer) | Reported on par with AdamW; no reason to add it. |
 | GaLore (low-rank gradient) | Lion8bit + gradient release already solves memory. GaLore adds complexity for marginal gain. |
 | RASFT (rollout-adaptive SFT) | Requires on-policy rollout generation. Fundamentally changes the training paradigm. |
 | PACT (privileged traces) | RL infrastructure needed. Out of scope for an SFT library. |

@@ -147,38 +147,7 @@ The `optimal` strategy interpolates these findings into one distribution.
 
 ## Semantic packing (TFP)
 
-Standard packing concatenates samples randomly into fixed-length sequences. But random concatenation wastes the cross-document context window — adjacent samples have no relationship, so the model can't do implicit few-shot learning within a packed sequence.
-
-TFP (Threshold Filtering Packing) fixes this. It reorders samples so that semantically related — but not identical — conversations end up adjacent. During packing, they land in the same sequence. The model sees a related example before processing the current one, creating an implicit demonstration.
-
-The algorithm:
-
-1. Embed each sample with a lightweight sentence transformer (~22M params, fast)
-2. Build a nearest-neighbor ordering via greedy TSP traversal
-3. Apply a threshold filter: skip edges that are *too* similar (prevents redundant packs) or too dissimilar (loses the context benefit)
-
-The threshold is the key insight. Pure nearest-neighbor would cluster identical samples together — that's bad (overfitting within packs). The filter ensures diversity: related enough for context, different enough for learning.
-
-Result: +4-7% on benchmarks with zero runtime cost (ordering is done once during preparation).
-
-```python
-from palingenesis.tfp import compute_tfp_ordering
-import json
-
-# (if you prepared with format: parquet, load via datasets instead:
-#  samples = list(load_dataset("parquet", data_files="prepared/scored_data.parquet", split="train")))
-with open('prepared/scored_data.jsonl') as f:
-    samples = [json.loads(l) for l in f]
-
-texts = [s['messages'][-1]['content'] for s in samples]  # use assistant response for embedding
-ordering = compute_tfp_ordering(texts, sim_threshold_low=0.2, sim_threshold_high=0.85)
-
-with open('prepared/tfp_ordered.jsonl', 'w') as f:
-    for idx in ordering:
-        f.write(json.dumps(samples[idx]) + '\n')
-```
-
-Requires: `pip install sentence-transformers`
+TFP (Threshold Filtering Packing, Dong et al. 2024) orders samples so that related but not identical conversations end up adjacent, then packed into the same sequence, where each one serves as an implicit demonstration for the next. That mechanism needs packed documents to attend to each other. palingenesis keeps every packed conversation isolated (a document never sees the one before it; see [packing](../getting-started/first-training.md#packing-when-to-use-it)), so a TFP ordering changes nothing the model sees and is not part of the pipeline. `palingenesis.tfp.compute_tfp_ordering` remains available as a standalone utility for data exploration.
 
 ---
 
@@ -233,7 +202,9 @@ A sample is one of two shapes, and each is scored differently:
 Palingenesis masks purely from the model's own chat template, two ways:
 
 1. **Fast path** — templates with a `{% generation %}` span expose Hugging Face's native assistant mask; that mask defines the trained tokens exactly.
-2. **Fallback path** — templates without a generation span are masked by locating each assistant turn's text in the rendered string via offset mapping. This makes **no prefix-consistency assumption**, so it stays correct for templates that rewrite history — e.g. Qwen3.x dropping `<think>` from past turns, or MiniMax-M2 interleaved thinking — which naive boundary-diffing gets wrong. The turn's end-of-turn token is included so the model learns to stop.
+2. **Turn-marker path** — templates without a generation span (Qwen3/3.5, Llama 3, ...). The assistant header and end-of-turn marker are derived from the template itself by rendering probe conversations; each assistant turn is then everything between its header and its end-of-turn token in the rendered string, found via offset mapping. That includes text the template renders from other fields, such as tool calls, and the end-of-turn token (the model learns to stop). Only the final render is used, with **no prefix-consistency assumption**, so it stays correct for templates that rewrite history — e.g. Qwen3.x dropping `<think>` from past turns. Templates without special-token markers fall back to locating each turn's text.
+
+Per-message flags (`"loss": false`) and the `tools` field are honoured on both paths (see the [agentic guide](agentic-training.md)).
 
 Both paths honor the same two knobs, identically:
 
@@ -331,4 +302,4 @@ Per-source keys: `name`, `dataset`, `split`, `weight` (composite importance), `s
 
 > Train on the samples the model finds *informative*. Not the ones that are easy. Not the ones that are impressive. The ones where the gradient points somewhere useful.
 
-Running `pgs prepare` for 10 minutes is worth more than 10 hours of training on unfiltered data. This isn't a nice-to-have; it's the single highest-leverage thing you can do.
+Scoring costs one forward pass over the data with the model you will train, a small fraction of a training run. Whether the selection helps on your task is an empirical question: compare against a random subset of the same size on your eval set.

@@ -600,7 +600,16 @@ class Hyperball:
         delta = p.detach().to(before.dtype) - before  # = -lr * u
         step_norm = delta.norm()
         if key not in self._eta:
-            self._eta[key] = self.angular_lr or float(step_norm / radius.clamp_min(1e-30)) / max(self._schedule(p), 1e-30)
+            if self.angular_lr:
+                self._eta[key] = self.angular_lr
+            elif self._schedule(p) <= 0 or float(step_norm) == 0.0:
+                # Nothing to calibrate against yet: the first warmup step has lr 0
+                # (the base optimizer did not move W). Calibrating here would fix
+                # eta at 0 and freeze the matrix for the whole run.
+                p.copy_(before)
+                return
+            else:
+                self._eta[key] = float(step_norm / radius.clamp_min(1e-30)) / self._schedule(p)
         eta = self._eta[key] * self._schedule(p)
         trial = before.add_(delta, alpha=float(eta * radius / step_norm.clamp_min(1e-30)))
         p.copy_(trial.mul_(radius / trial.norm().clamp_min(1e-30)))

@@ -1,6 +1,6 @@
 # Single GPU
 
-*How a 4-billion parameter model fits in 15 GB — and why that matters.*
+*How a 4-billion parameter model fine-tunes in about 16 GiB — and what each technique contributes.*
 
 ---
 
@@ -19,12 +19,12 @@ Palingenesis takes a different path: eliminate the waste.
 | Component | Naive | Palingenesis | How |
 |-----------|:-----:|:------------:|-----|
 | Weights | 8 GB | 8 GB | No change (bf16 is already minimal) |
-| Optimizer | 32 GB | **1 GB** | Lion 8-bit: sign-based updates, 4 bytes/param |
+| Optimizer | 32 GB | **1.4 GiB** | Lion 8-bit (1 byte/param), on the 36% of weights that train (`freeze_non_attention`) |
 | Gradients | 8 GB | **0 GB** | Gradient release: each grad freed after use |
-| Activations | 12 GB | **4 GB** | Selective AC: save only attention outputs |
-| **Total** | **60 GB** | **~15 GB** | — |
+| Activations | 12 GB | **~2.5 GiB** | Selective AC: keep attention outputs and every other matmul, recompute the rest |
+| **Total** | **60 GB** | **~16 GiB** | `pgs profile --config configs/qwen35_4b/a100_40gb.yaml` |
 
-This isn't theoretical. Run it and watch `nvidia-smi`.
+`pgs profile --measure` runs two real optimizer steps and reports the measured peak for your config.
 
 ---
 
@@ -60,12 +60,12 @@ train:
 
 AdamW needs two fp32 buffers (momentum + variance): 16 bytes per parameter. Lion uses one buffer (momentum only, sign-based update): 4 bytes. With bitsandbytes 8-bit quantization: even less.
 
-The catch: Lion's learning rate needs to be ~3× higher than AdamW for the same convergence speed. Palingenesis configs handle this automatically.
+The catch: every Lion update element has magnitude 1, so at the same learning rate Lion moves the weights more than AdamW. The [Lion paper](https://arxiv.org/abs/2302.06675) recommends a learning rate 3–10× *smaller* than AdamW's. `learning_rate` is passed to the optimizer as is.
 
 ```yaml
 train:
   optimizer: lion8bit
-  learning_rate: 4.5e-5   # Already 3× scaled
+  learning_rate: 3.0e-6   # vs ~1e-5 to 2e-5 for AdamW fine-tuning
 ```
 
 ### Hyperball (Stanford, June 2026)
@@ -90,11 +90,7 @@ train:
 
 ### Power-decay scheduler
 
-Cosine annealing is the default everywhere. It's wrong.
-
-The theory (Li et al., February 2026) derives optimal LR schedules from functional scaling laws. Result: for capacity exponent β > 3 (always true for modern LLMs), cosine *saturates* — it can't exploit the full model capacity. Power-decay with γ ≈ 2β-1 ≈ 4 is provably optimal.
-
-In practice: same code complexity as cosine, consistently better final loss.
+The theory (Li et al., February 2026) derives LR schedules from functional scaling laws. In its model of pretraining, for capacity exponent β > 3, cosine saturates and power decay with γ ≈ 2β-1 ≈ 4 does better. It has not been benchmarked here for fine-tuning; cosine is the library default and the baseline to compare against.
 
 ```yaml
 train:
@@ -105,13 +101,15 @@ train:
 
 ## Which config for which GPU
 
-| GPU | VRAM | Config | What you get |
+| GPU | VRAM | Config | Batch × sequence |
 |-----|------|--------|-------------|
-| RTX 3090/4090 | 24 GB | `qwen35_4b/a100_40gb.yaml` | batch=2, seq=2048, ~4K tok/s |
-| A100-40GB | 40 GB | `qwen35_4b/a100_40gb.yaml` | batch=2-3, seq=2048, ~5K tok/s |
-| A100-80GB | 80 GB | `qwen35_4b/a100_80gb.yaml` | batch=4, seq=4096, ~6K tok/s |
-| H100-80GB | 80 GB | `qwen35_4b/h100_80gb.yaml` | batch=8, seq=8192, FP8, ~12K tok/s |
-| B200 | 192 GB | `qwen35_4b/b200.yaml` | batch=32, seq=8192, ridiculous headroom |
+| RTX 3090/4090 | 24 GB | `qwen35_4b/a100_40gb.yaml` | 2 × 2048 |
+| A100-40GB | 40 GB | `qwen35_4b/a100_40gb.yaml` | 2 × 2048 |
+| A100-80GB | 80 GB | `qwen35_4b/a100_80gb.yaml` | 4 × 4096 |
+| H100-80GB | 80 GB | `qwen35_4b/h100_80gb.yaml` | 8 × 8192, FP8 |
+| B200 | 192 GB | `qwen35_4b/b200.yaml` | 32 × 8192 |
+
+Check any of them on your GPU with `pgs profile --config <config> --measure` before a long run.
 
 ---
 
@@ -128,7 +126,7 @@ torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/
 ```
 
 !!! note "First step is slow (30-60 seconds)"
-    `torch.compile` traces the computation graph on the first forward pass. This is a one-time cost per session. Steps 2+ run at full speed (~6,000 tok/s on A100-80GB). Don't cancel because step 1 looks frozen — it's compiling.
+    `torch.compile` traces the computation graph on the first forward pass (and once more for each new batch shape early on). Don't cancel because step 1 looks frozen — it's compiling.
 
 ---
 
@@ -143,7 +141,7 @@ step=150 loss=1.67 lr=4.4e-05 tok/s=6180 grad_norm=0.29 dt=1.2s
 ```
 
 - `tok/s` — training throughput (tokens processed per second)
-- `grad_norm` — should be stable (0.1-1.0). If spiking: data quality issue.
+- `grad_norm` — gradient norm before clipping. Its scale depends on the model and the loss (5–30 at the start of a fine-tune is common); judge it against the run's own recent values. `pgs monitor` does that.
 - `eval` — validation loss (appears every `eval_every` steps)
 - `dt` — wall-clock per step. Should be stable; spikes indicate GC stalls.
 
@@ -157,7 +155,7 @@ Healthy training: loss decreases smoothly, grad_norm is stable, tok/s is constan
 |------|------|------|
 | Loss=NaN on step 1 | LR way too high | Divide `learning_rate` by 10 |
 | Loss decreases then spikes | Bad batch hit | Normal (<1% of steps). If >5%, filter data. |
-| Loss flat for 100+ steps | LR too low or all data is easy | Increase LR 2× or run `pgs prepare` |
+| Loss flat for 100+ steps early on | LR too low or all data is easy | Increase LR 2× or run `pgs prepare` (a slow decrease after the initial drop is normal) |
 | OOM crash | Batch too big or seq too long | Reduce `per_device_batch_size` by 1 |
 | Very slow (~1K tok/s) | Compile disabled | Set `model.compile: true` |
 | "SPIKE SKIPPED" in logs | Anomalous gradient detected | Palingenesis handled it. Investigate if frequent. |

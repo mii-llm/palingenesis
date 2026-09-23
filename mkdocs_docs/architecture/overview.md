@@ -17,14 +17,14 @@ Each stage is a module. They compose orthogonally — you can swap any part with
 | Stage | Module | What it decides |
 |-------|--------|----------------|
 | Data | `data.py` | Chat template masking, packing, multi-source mixing |
-| Tokenize | HuggingFace tokenizer | Which tokens are system/user/assistant |
-| Pack | `data.PackedDataset` | Multiple conversations per sequence, position_id resets |
+| Tokenize | HuggingFace chat template + `data.ChatDataset` | Which tokens are trained: whole assistant turns (tool calls and end-of-turn included), per the template's own turn markers |
+| Pack | `data.PackedDataset` + `packing.PackedBatch` | Whole conversations per sequence, each attending only to itself |
 | Prefetch | `perf.CUDAPrefetcher` | Overlaps PCIe transfer with previous step's compute |
 | Forward | HuggingFace model + `torch.compile` | The neural network computation |
-| Loss | `loss.py` | Standard CE, chunked CE, Cut CE, or DEFT |
+| Loss | `loss.py`, `plugins.py` | CE (plain, chunked, Cut CE) or a token-gated objective (DEFT, DFT, InfoSFT, CADFT), chunked |
 | Backward | PyTorch autograd + `memory.GradientRelease` | Gradient computation, optional fused optimizer step |
 | Clip | `perf.AdaGC` or `torch.nn.utils.clip_grad_norm_` | Per-tensor adaptive or global clipping |
-| Step | Optimizer + `optim.HyperballWrapper` + `optim.MONAAcceleration` | Weight update with optional norm projection |
+| Step | Optimizer + `optim.Hyperball` + `optim.MONAAcceleration` | Weight update with optional norm projection |
 | Log | `health.HealthMonitor` + `logging.Tracker` | Tiered diagnostics, wandb/trackio |
 | Checkpoint | `checkpoint.py` | Sharded DCP (FSDP) or safetensors (single GPU) |
 
@@ -32,19 +32,19 @@ Each stage is a module. They compose orthogonally — you can swap any part with
 
 ## Memory model
 
-The genius of the memory stack is that each optimization removes a different category of waste:
+Each optimization removes a different category of memory:
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │  TOTAL GPU MEMORY                                    │
 ├─────────────────────────────────────────────────────┤
-│  Model weights (bf16)          │ FIXED: 2B per param │
+│  Model weights (bf16)          │ FIXED: 2 B/param    │
 ├────────────────────────────────┼─────────────────────┤
-│  Optimizer states              │ Lion8bit: 0.5B/param │
-│  (AdamW would be 8B/param)    │ saved: 94%          │
+│  Optimizer states              │ Lion8bit: 1 B/param  │
+│  (AdamW: 2 states, 4-8 B/param)│ saved: 75-88%       │
 ├────────────────────────────────┼─────────────────────┤
 │  Gradients                     │ Gradient release: 0  │
-│  (normally 2B/param)           │ saved: 100%         │
+│  (normally 2 B/param)          │ saved: 100%         │
 ├────────────────────────────────┼─────────────────────┤
 │  Activations                   │ Selective AC: ~30%   │
 │  (for backward recomputation) │ of naive             │
@@ -55,7 +55,7 @@ The genius of the memory stack is that each optimization removes a different cat
 └────────────────────────────────┴─────────────────────┘
 ```
 
-These compose multiplicatively. The result: a 4B model in 15 GB.
+They add up: a Qwen3.5-4B fine-tune with its linear-attention layers frozen fits in about 16 GiB (`pgs profile` shows the breakdown for any config).
 
 ---
 
@@ -71,7 +71,7 @@ Palingenesis adds two optimizations over vanilla FSDP2:
 
 1. **Last-layer skip**: the final transformer layer doesn't reshard after forward, because FSDP would immediately re-gather it for backward. Saves one reshard + one all-gather per step.
 
-2. **Weight-tying grouping**: when `tok_embeddings` and `lm_head` share a parameter (common in Llama, Qwen, Gemma), they're placed in a single FSDP unit to avoid duplicate communication.
+2. **Root kept gathered through the step**: the root unit (embeddings, final norm, output head, tied or not) does not reshard after forward. The chunked losses apply the head outside the model's forward, after a root forward (`logits.final_hidden_states`) has gathered it; the gradients equal single-process training (`tests/test_fsdp_trainer_path.py`).
 
 ### Context Parallel (sequence sharding)
 
@@ -122,14 +122,18 @@ The `BestModelTracker` maintains a shadow copy at `output/best/` — updated whe
 ```
 train.py
 ├── config.py          (flat YAML → typed dataclass)
-├── data.py            (ChatDataset, PackedDataset, collation)
+├── data.py            (ChatDataset, turn markers, PackedDataset, collation)
+├── packing.py         (forward arguments that isolate packed documents)
+├── logits.py          (output head incl. logit transforms, FSDP-safe hidden states)
 ├── loss.py            (CE, chunked CE, CCE, DEFT bridge)
 ├── optim.py           (build_optimizer, schedulers, Hyperball, MONA, SAGE)
 ├── distributed.py     (FSDP2, mesh, Context Parallel)
 ├── memory.py          (GradientRelease, SelectiveDiff)
 ├── health.py          (HealthMonitor, entropy tracking)
 ├── perf.py            (Prefetch, GC, AdaGC, SpikeDetector, EMA, SLERP)
-├── plugins.py         (DEFT, DFT, InfoSFT, PreRL, SymNoise)
+├── plugins.py         (DEFT, DFT, InfoSFT, CADFT, PreRL, SymNoise; chunked gated loss)
+├── seco.py            (SeCO / SpaCO chunk-wise training)
+├── dpo.py             (preference optimization)
 ├── checkpoint.py      (save/load, DCP, auto-purge, BestModelTracker)
 ├── kernels.py         (Liger kernel patching, activation checkpointing)
 └── logging.py         (Tracker: wandb + trackio)

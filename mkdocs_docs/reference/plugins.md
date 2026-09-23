@@ -6,7 +6,7 @@
 
 ## DEFT
 
-Dynamic Entropy Fine-Tuning. The default loss plugin. See [Loss Functions](loss.md) for details.
+Dynamic Entropy Fine-Tuning (off by default; enabled in the quickstart and several shipped configs). See [Loss Functions](loss.md) for details.
 
 ```yaml
 plugins:
@@ -25,7 +25,7 @@ plugins:
   sym_noise_alpha: 5.0   # Higher = stronger regularization (try 7.0 for small models)
 ```
 
-"Symmetric" means the noise is zero-mean and applied identically to train+eval embeddings during training, preventing a train/eval distribution mismatch.
+"Symmetric" refers to the noise distribution: each embedding coordinate gets ±α/√(L·d) with equal probability (Bernoulli, where NEFTune uses uniform noise). Noise is added only in training mode; evaluation and inference see clean embeddings.
 
 ---
 
@@ -52,7 +52,7 @@ See [SFT → RL Transition](../guides/sft-to-rl.md) for the full guide.
 
 ## DFT / CADFT / InfoSFT
 
-Earlier token-weighting schemes. DEFT subsumes all of these — you probably don't need them individually. They exist for ablation studies.
+Other token-weighting schemes. DEFT contains DFT as its confident-token limit; InfoSFT and CADFT weight differently. All run chunked under `memory.chunked_loss`, and exactly one objective can be enabled.
 
 | Plugin | Mechanism | When to use |
 |--------|-----------|-------------|

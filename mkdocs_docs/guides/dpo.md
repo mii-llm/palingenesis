@@ -72,6 +72,8 @@ or implicit, with both sides written out as full conversations:
 ```
 
 - **Completions** can be a single assistant message, a multi-turn continuation (tool calls and tool results included) or a plain string. A string prompt becomes one user turn.
+- **Both at once**, as in `HuggingFaceH4/ultrafeedback_binarized` (a `prompt` string, and `chosen`/`rejected` conversations that already start with that user turn): the completions are used as they are, so the prompt is not repeated.
+- **Tool definitions** come from the row's `tools` field (`data.tools_field`) and are rendered into both sides, as in SFT.
 - **Reasoning** goes in `reasoning`, the field OpenAI-compatible servers such as vLLM use. The legacy `reasoning_content`, a `think` field and inline `<think>…</think>` are also read. Like vLLM, palingenesis passes the trace to the chat template under both `reasoning` and `reasoning_content`, so templates that still read `reasoning_content` in their Jinja (Qwen3.5's among them) render it.
 - **`chat_template_kwargs`** applies per row, to every render of that row. One dataset can therefore mix thinking and non-thinking pairs.
 - **Field names** are configurable: `dpo.prompt_field`, `dpo.chosen_field`, `dpo.rejected_field`.

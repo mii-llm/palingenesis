@@ -114,6 +114,7 @@
 | `optimizer` | str | `adamw` | Optimizer. `adamw`, `muon`, `lion8bit`, `adamw8bit`, `paged_adamw8bit`. |
 | `seed` | int | `42` | Training random seed. |
 | `save_steps` | int | `500` | Save checkpoint every N steps. Auto-purges old ones (keeps last 5). |
+| `save_final` | bool | `true` | Save the final model to `output_dir/final` (Hugging Face format) at the end. |
 | `logging_steps` | int | `1` | Log metrics every N steps. |
 | `bf16` | bool | `true` | Enable bf16 mixed precision with fp32 gradient reduction. |
 | `gradient_checkpointing` | str | `selective` | Activation checkpointing. `selective` keeps attention outputs and every other matmul (Qwen3-0.6B, 8×2048 tokens, compiled: 8.6 GiB of activations, +10% step time); `full` recomputes each layer (1.9 GiB, +25%); `none` keeps everything (19.8 GiB, fastest). |
@@ -201,6 +202,9 @@ Offline data preparation, driven by the **same config** as training (see the [Da
 | `budget` | int | `0` | Samples to keep after scoring and filtering. 0 = keep all. |
 | `strategy` | str | `optimal` | Selection strategy: `optimal` (J-shaped, budget-adaptive: easier mix below 2K samples, full 20/50/25/5 above 10K, backfills short buckets), `curriculum` (easy→hard, order preserved at train time), `balanced`, `medium_focus`, `hard_focus`, `flow`, `random`. |
 | `eval_holdout` | int | `0` | Reserve N random samples as a held-out eval set (`eval_data.parquet`), excluded from the training selection. Training auto-uses it when `data.eval_dataset` is empty — a true same-distribution holdout, so `eval/loss` and `eval/gap` are trustworthy. |
+| `min_ppl` | float | `1.5` | Drop samples whose response perplexity is below this (already known). |
+| `max_ppl` | float | `500.0` | Drop samples above this (noise, wrong language); `<= 0` disables. |
+| `filter_score` | str | `response` | Perplexity the filters use: `response` (trained tokens only) or `full` (whole conversation). |
 | `batch_size` | int | `4` | Max samples per scoring forward pass. Scoring is length-sorted and padded-batch, so large values (64–256) are safe — `max_batch_tokens` bounds memory, not this. |
 | `max_batch_tokens` | int | `16384` | Padded-token cap per scoring forward. Logits are batch×seq×vocab, so this is what bounds memory: 16K ≈ 5GB bf16 logits at 150K vocab. On an 80GB GPU with a ≤8B model, `32768` is safe and noticeably faster. |
 | `hes` | bool | `false` | Also compute High-Entropy Sum reasoning-quality scores. Slower (second forward pass). |

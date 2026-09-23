@@ -21,7 +21,7 @@ Other ways to install (pip, other CUDA versions): see [Installation](install.md)
 ./run.sh configs/quickstart.yaml
 ```
 
-The first run downloads the model (~6 GB) and starts streaming data. After 2-3 minutes of setup, you'll see:
+The first run downloads the model (Qwen3-0.6B, ~1.5 GB) and starts streaming UltraChat. After a minute of setup, you'll see:
 
 ```
 step=1   loss=4.12 lr=0.00e+00 tok/s=0     grad_norm=1.23 dt=45.2s   ← first step: compile warmup
@@ -66,11 +66,12 @@ Your data should be JSONL with chat messages:
 
 Behind the scenes, palingenesis applied:
 
-- **DEFT loss** — adaptive token weighting (harder tokens get more influence)
-- **Power-decay LR** — theoretically optimal schedule
-- **Chunked CE** — never OOMs on large vocabularies
-- **Packing** — multiple conversations per sequence (2-3× throughput)
-- **Best-model tracking** — saves the checkpoint with lowest eval loss
+- **Chat-template masking** — only assistant turns get loss (tool calls and end-of-turn tokens included)
+- **DEFT loss** — token weighting by the model's own confidence (arXiv:2602.11424)
+- **Power-decay LR** schedule
+- **Chunked loss** — the full logits are never materialized, whatever the vocabulary
+- **Length-grouped batches** — rows of similar length batched together, so little compute goes to padding
+- **Best-model tracking** — with an `eval_dataset`, the lowest-eval-loss checkpoint is saved to `best/`
 
 All without configuring anything.
 

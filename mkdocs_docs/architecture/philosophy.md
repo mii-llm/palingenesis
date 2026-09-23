@@ -12,7 +12,7 @@ We disagree — not because LoRA is bad, but because its premise is outdated.
 
 LoRA was essential when fine-tuning a 7B model required 80+ GB of GPU memory. The alternative was "don't fine-tune at all." In that world, LoRA was a breakthrough.
 
-But the memory problem is solvable without compromising representation capacity. Gradient release eliminates the gradient buffer. Lion 8-bit reduces optimizer state 8×. Selective checkpointing halves activation memory. The result: a 4B full fine-tune in 15 GB. A 7B in 24 GB. On hardware that costs $0.50/hour on cloud.
+But the memory problem is largely solvable without a low-rank adapter. Gradient release eliminates the gradient buffer. Lion 8-bit reduces optimizer state 8×. Selective checkpointing trades a little compute for activation memory. Freezing the linear-attention layers of a hybrid model (`freeze_non_attention`) keeps the trainable set to its attention pathway. Together they fit a Qwen3.5-4B fine-tune (36% of the weights trainable) in about 16 GiB (`pgs profile` on `configs/qwen35_4b/a100_40gb.yaml`).
 
 What you lose with LoRA:
 - Rank-limited representations (the delta can only express rank-16 or rank-64 perturbations)
@@ -34,25 +34,25 @@ Most training frameworks are "batteries not included." They give you AdamW, cosi
 
 We've spent months reading the literature to answer the question: *what should the defaults actually be?* Not for a generic ML task — specifically for fine-tuning language models in 2025-2026.
 
-The answers, backed by papers:
+The library defaults stay conservative (cross-entropy, cosine schedule, AdamW, global-norm clipping) because they are the baseline everything else must beat. The research-backed options are one line each to turn on, and several shipped configs do:
 
-| Decision | Standard default | Our default | Why |
-|----------|-----------------|-------------|-----|
-| Loss | Cross-entropy | **DEFT** | math-reasoning gains per original paper (not reproduced); parameter-free; subsumes CE |
-| Scheduler | Cosine | **Power-decay** | Provably optimal when β > 3 (always true for LLMs) |
-| Gradient handling | Store all | **Release immediately** | Saves 2× param memory, zero accuracy cost |
-| Optimizer | AdamW (16 B/param) | **Lion8bit** (4 B/param) or **Muon** (fastest) | 4× less memory or 2× faster convergence |
-| Weight update | Standard step | **Hyperball projection** | 20-30% speedup by making scale-invariance explicit |
-| Checkpointing | Save last | **Save best + purge old** | The last checkpoint is often overtrained |
-| Gradient clipping | Global norm | **Per-tensor AdaGC** | Handles heterogeneous gradient scales correctly |
+| Decision | Library default | Option | Status |
+|----------|-----------------|--------|--------|
+| Loss | Cross-entropy | **DEFT**, DFT, InfoSFT, CADFT | Paper claims (math reasoning, from base models); not reproduced here |
+| Scheduler | Cosine | **Power-decay**, WSD | Derived for pretraining; not benchmarked here for fine-tuning |
+| Gradient handling | Store all | **Gradient release** | Exact; saves the gradient buffer; needs gradient_accumulation_steps 1 |
+| Optimizer | AdamW (16 B/param) | **Lion8bit** (4 B/param), **Muon** | Lion needs a 3-10× lower LR than AdamW |
+| Weight update | Standard step | **Hyperball projection** | 20-30% speedup reported in pretraining; experimental for fine-tuning |
+| Checkpointing | Save periodically | **Best + final + purge old** | On by default when an eval set is configured |
+| Gradient clipping | Global norm | **Per-tensor AdaGC** | Experimental |
 
-You can override any of these. But the defaults are the result of reading 352 papers and running ablations. They're not arbitrary.
+You can override any of these. The implementations are checked against their papers' definitions; their benefit on your task is something to measure.
 
 ---
 
 ## Why not RL (yet)?
 
-Palingenesis is an SFT tool. It doesn't do GRPO, DPO, PPO, or any reinforcement learning. This is a deliberate scope decision.
+Palingenesis is an SFT tool with offline preference optimization ([DPO and variants](../guides/dpo.md)) and [on-policy distillation](../guides/distillation.md). It doesn't do GRPO, PPO or other reward-driven RL. This is a deliberate scope decision.
 
 The research finding that motivates this (CacheRL, June 2026): *"RL provides stability but yields limited gains beyond strong SFT. Data quality and reward design are more important than complex optimization."*
 
@@ -73,7 +73,7 @@ The research is clear:
 - Samples the model can't follow at all (PPL > 500) produce random gradients
 - The sweet spot is medium difficulty: informative enough to learn from, tractable enough to generalize
 
-Palingenesis's `prepare` command finds this sweet spot automatically. 10 minutes of scoring saves hours of wasted training.
+Palingenesis's `prepare` command scores every sample with the model you will train (on exactly the tokens training will use) and selects by difficulty. Compare against a random subset of the same size to see what it buys on your task.
 
 ---
 

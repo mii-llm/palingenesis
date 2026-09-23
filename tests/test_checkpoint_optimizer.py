@@ -110,3 +110,25 @@ if __name__ == "__main__":
     test_optimizer_shard_roundtrip_bnb_like_nested_state()
     test_optimizer_shard_loads_legacy_json_meta()
     print("\nALL CHECKPOINT OPTIMIZER TESTS PASSED ✓")
+
+
+def test_hyperball_moves_weights_after_a_zero_lr_warmup_step():
+    """With LR warmup the first step has lr 0: calibrating the angular step there
+    fixed it at 0 and froze every constrained matrix for the whole run."""
+    import torch
+
+    from palingenesis.optim import Hyperball, build_scheduler
+
+    torch.manual_seed(0)
+    lin = torch.nn.Linear(16, 16, bias=False)
+    opt = torch.optim.AdamW(lin.parameters(), lr=1e-2, weight_decay=0.0)
+    sched = build_scheduler(opt, "cosine", 100, 0.05, 0.1)
+    hb = Hyperball(opt, [lin.weight])
+    w0 = lin.weight.detach().clone()
+    for _ in range(10):
+        lin(torch.randn(4, 16)).pow(2).sum().backward()
+        hb.step()
+        sched.step()
+        opt.zero_grad()
+    assert (lin.weight - w0).norm() > 0.1
+    torch.testing.assert_close(lin.weight.norm(), w0.norm())

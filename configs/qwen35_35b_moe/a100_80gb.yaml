@@ -40,8 +40,8 @@ train:
   per_device_batch_size: 1
   gradient_accumulation_steps: 16
   ga_ramp_start: 4           # batch ramp: 4→16 over training
-  learning_rate: 1e-5
-  min_learning_rate: 1e-6
+  learning_rate: 2.0e-6         # Lion: 3-10x below an AdamW LR
+  min_learning_rate: 2.0e-7
   weight_decay: 0.1
   warmup_ratio: 0.05
   lr_scheduler: wsd          # WSD: anytime stopping (important for slow runs)

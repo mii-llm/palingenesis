@@ -33,8 +33,8 @@ train:
   epochs: 3
   per_device_batch_size: 2
   gradient_accumulation_steps: 1
-  learning_rate: 4.5e-5
-  min_learning_rate: 4.5e-6
+  learning_rate: 3.0e-6          # Lion: 3-10x below an AdamW LR (a100_80gb_test.yaml found 1e-5 already degrading)
+  min_learning_rate: 3.0e-7
   weight_decay: 0.1
   warmup_ratio: 0.05
   lr_scheduler: power_decay      # better than cosine, zero cost

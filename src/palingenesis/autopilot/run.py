@@ -439,9 +439,10 @@ def _build_config(
     cfg.data.dataset_split = dataset_split
     cfg.data.max_seq_length = seq_length
     cfg.data.streaming = True
-    cfg.data.packing = True
-    cfg.data.include_observations = True  # ECHO: world model from tool outputs
-    cfg.data.turn_scaling = "progressive"
+    # Length-grouped batching (default) wastes little on padding; packing needs extra
+    # kernels on linear-attention models. ECHO (training on tool outputs) and per-turn
+    # scaling change what is learned: opt-in choices, not defaults.
+    cfg.data.packing = False
     # Eval set: prefer an explicit held-out dataset. Without one, fall back to
     # a fixed subset of the TRAIN split (works for any dataset, but numbers are
     # optimistic since eval samples may also appear in training).
@@ -482,9 +483,9 @@ def _build_config(
     cfg.memory.float8_training = recommended.get("memory.float8_training", False)
     cfg.memory.selective_diff = True  # Always beneficial
 
-    # Enable gradient release when GA=1 and compatible optimizer
-    if cfg.train.gradient_accumulation_steps == 1 and cfg.train.optimizer != "muon":
-        cfg.memory.gradient_release = True
+    # Gradient release (optimizer step inside backward) would disable Hyperball's
+    # update and global clipping: not used by autopilot.
+    cfg.memory.gradient_release = False
 
     # Plugins: DEFT + SymNoise (research-backed optimal combo)
     cfg.plugins.deft = True

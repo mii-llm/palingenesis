@@ -38,7 +38,7 @@ On a single GPU with gradient release, memory is the constraint. You use Lion8bi
 
 With FSDP, memory is *abundant* — the model is split across N GPUs. So the constraint shifts from memory to *convergence speed*. Now you want the fastest optimizer per step:
 
-**Muon** — steepest descent under the spectral norm. Instead of treating each parameter as an independent scalar (like AdamW), Muon treats entire weight matrices as geometric objects. It applies a Newton-Schulz iteration (5 steps of a cubic recurrence) to find the polar decomposition of the momentum, then updates in the direction of the matrix sign. This respects the matrix geometry and converges 1.5-2× faster per step.
+**Muon** — steepest descent under the spectral norm. Instead of treating each parameter as an independent scalar (like AdamW), Muon treats entire weight matrices as geometric objects. It applies a Newton-Schulz iteration (5 steps of a cubic recurrence) to find the polar decomposition of the momentum, then updates in the direction of the matrix sign. Reported faster than AdamW per step in pretraining; not benchmarked here for fine-tuning.
 
 **+ MONA** — before Muon orthogonalizes the momentum, MONA enriches it with curvature information. The gradient difference `G_k - G_{k-1}` is approximately `H·Δθ` — the Hessian times the parameter change. This points *away from sharp minima*. MONA accumulates these differences as an EMA and adds them to the gradient before orthogonalization.
 
@@ -50,7 +50,7 @@ The composition:
 gradient → MONA (add curvature) → Muon (orthogonalize) → step → Hyperball (project to sphere)
 ```
 
-Each stage operates on a different aspect. They compose without interference.
+Each stage operates on a different aspect of the update. The combination runs, but has not been benchmarked against AdamW for fine-tuning: treat it as experimental.
 
 ```yaml
 train:
@@ -86,11 +86,11 @@ torchrun --standalone --nproc_per_node=8 \
 
 ## Why scaling is sublinear
 
-On 8 GPUs you get 5.8× speedup, not 8×. Here's where the 2.2× overhead goes:
+Scaling is sublinear. Where the overhead goes:
 
-1. **All-gather latency** (~15%): even with NVLink, gathering 4B params per layer takes time that can't fully overlap
-2. **Reduce-scatter** (~10%): sending gradient shards back after backward
-3. **Synchronization** (~5%): all ranks must finish each micro-batch before the next starts. The slowest rank (stochastic — depends on data) gates everyone.
+1. **All-gather latency**: even with NVLink, gathering each layer's parameters takes time that can't fully overlap
+2. **Reduce-scatter**: sending gradient shards back after backward
+3. **Synchronization**: all ranks must finish each micro-batch before the next starts. The slowest rank (stochastic — depends on data) gates everyone.
 
 You can reduce #3 by increasing batch size per GPU (more compute per communication event = better ratio). The configs already do this — multi-GPU configs use batch=8 vs single-GPU batch=4.
 
@@ -131,11 +131,4 @@ The trade-off: more communication (KV rotation), but you can now train on 128K+ 
 
 ## Practical expectations
 
-| GPUs | Tokens/sec (4B) | Effective speedup | Memory per GPU |
-|------|----------------|:-:|:---:|
-| 1 | 6,000 | 1× | 15 GB |
-| 2 | 11,000 | 1.8× | ~10 GB |
-| 4 | 20,000 | 3.3× | ~7 GB |
-| 8 | 35,000 | 5.8× | ~5 GB |
-
-Memory per GPU drops because model parameters are sharded. The freed memory goes to larger batch sizes (more throughput) or longer sequences.
+Multi-GPU throughput has not been benchmarked for this release. Parameters, gradients and optimizer states are sharded across GPUs, so memory per GPU drops roughly with their count; the freed memory goes to larger batches or longer sequences. Measure your setup's tokens/s from the log (`tok/s`, and `train/tokens_per_sec_global` in wandb) over the first steps.

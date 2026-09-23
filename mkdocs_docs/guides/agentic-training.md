@@ -159,37 +159,31 @@ The default is `uniform`. The case for `progressive`: in a 10-turn trace, the ea
 
 ## Example config for agentic traces
 
-```yaml title="configs/agentic_traces.yaml"
+```yaml title="agentic config (Qwen3.5, long traces)"
 model:
   name_or_path: Qwen/Qwen3.5-4B
-  trust_remote_code: true
-  torch_dtype: bfloat16
-  attn_implementation: flash_attention_2
+  torch_dtype: float32           # SeCO's recommendation; compute runs in bf16
+  compile: false                 # SeCO is validated without torch.compile
 
 data:
-  dataset: ./prepared/agentic_traces.jsonl
-  max_seq_length: 8192           # Agentic traces are long
-  packing: true
-  include_observations: true     # ECHO: learn the world model
-  turn_scaling: progressive      # Later turns matter more
+  dataset: ./agentic_traces.parquet   # messages (+ tools) per row
+  streaming: false
+  max_seq_length: 65536          # whole traces; SeCO keeps memory set by the chunk
+  include_observations: false    # set true for ECHO (trains on tool outputs)
 
 train:
-  epochs: 3
-  per_device_batch_size: 2       # Long sequences → smaller batch
-  learning_rate: 4.5e-5
-  lr_scheduler: power_decay
-  optimizer: lion8bit
-  gradient_checkpointing: selective
-  hyperball: true
-  freeze_non_attention: true     # Qwen3.5-specific: only train attention
+  epochs: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-5
+  gradient_checkpointing: full
 
 memory:
-  chunked_loss: true
-  gradient_release: true
-
-plugins:
-  deft: true
+  seco: true
+  seco_chunk_size: 4096
 ```
+
+For traces that fit in memory without SeCO (a few thousand tokens), drop the `memory:` section and use `gradient_checkpointing: selective`; the chat-template masking, `tools` and per-message flags work the same way.
 
 ---
 

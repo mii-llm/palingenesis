@@ -12,8 +12,9 @@ Memory tight (single GPU, ≤40 GB)?
         (4 bytes/param, 0 grad memory)
 
 Memory abundant (multi-GPU FSDP)?
-  └── Yes → muon + mona + hyperball
-        (fastest convergence, ~2-3× AdamW speed)
+  └── Yes → adamw, or muon (+ hyperball) to experiment
+        (Muon/Hyperball speedups are reported for pretraining,
+         not measured here for fine-tuning)
 
 Maximum simplicity?
   └── adamw (reliable baseline, 16 bytes/param)
@@ -28,7 +29,7 @@ The memory king. Sign-based updates (like Muon but simpler), one momentum buffer
 ```yaml
 train:
   optimizer: lion8bit
-  learning_rate: 1.5e-5   # applied as-is (no hidden scaling)
+  learning_rate: 3.0e-6   # applied as-is; ~3-10x below an AdamW fine-tuning LR
 ```
 
 Lion's update is `sign(β₁·m + (1-β₁)·g)` — uniform magnitude across all dimensions. Works because the loss landscape of Transformers is approximately sign-symmetric.
@@ -42,7 +43,7 @@ Composes with: gradient_release ✓, Hyperball ✓, AdaGC ✓, EMA ✓
 
 ## Muon
 
-Matrix orthogonalization via Newton-Schulz iteration. Treats entire weight matrices as geometric units instead of independent scalars. 1.5-2× faster convergence than AdamW.
+Matrix orthogonalization via Newton-Schulz iteration. Treats entire weight matrices as geometric units instead of independent scalars. Reported faster than AdamW in pretraining; not benchmarked here for fine-tuning. Hidden 2-D matrices use Muon; embeddings, the output head, norms, biases and stacked 3-D expert weights use AdamW.
 
 ```yaml
 train:
@@ -78,7 +79,7 @@ train:
 
 **Choosing `hyperball_lr`:**
 
-- `0` (default) calibrates each matrix to the relative step its base optimizer's first update made. For Adam and Lion that is exactly `learning_rate / rms(W)`.
+- `0` (default) calibrates each matrix to the relative step its base optimizer's first update with a non-zero learning rate made (the first warmup step has lr 0 and is skipped). For Adam and Lion that is `learning_rate / rms(W)`. The calibration is not stored in checkpoints: a resumed run recalibrates from its first step.
 - A positive value is the paper's single angular step for all matrices.
 - For scale: AdamW at 2e-5 on matrices with RMS 0.02 moves them by about 1e-3 per step.
 
@@ -114,17 +115,17 @@ Specialized for embedding layers. Regular sign-based optimizers (Lion, Muon) fai
 
 SAGE adds an O(d) adaptive damper that scales each embedding dimension by its relative "loudness" — loud dimensions get damped, quiet ones pass through at full magnitude. Provably bounded ≤ 1.0.
 
-Available as a standalone optimizer for embedding-specific use, but palingenesis handles this automatically in hybrid mode.
+Available as a standalone optimizer class (`palingenesis.optim.SAGE`); no training config selects it.
 
 ---
 
 ## Schedulers
 
-### power_decay (recommended)
+### power_decay
 
 `η(t) = η_peak · (1 - progress)^γ` where γ = 4.
 
-Provably optimal when model capacity exceeds β > 3 (always true for LLMs). Cosine saturates — power-decay doesn't.
+Motivated by a functional-scaling-law analysis (arXiv:2602.06797) that finds power decay better than cosine in its model of pretraining; not benchmarked here for fine-tuning.
 
 ### wsd (warmup-stable-decay)
 
@@ -132,7 +133,7 @@ Maintains peak LR for 80% of post-warmup training, then power-decays. Best for l
 
 ### cosine
 
-The legacy default. Still works. Slightly suboptimal. Use power_decay instead.
+The `train.lr_scheduler` default: warmup, then cosine decay to `min_learning_rate`. The baseline every other choice should be compared against.
 
 
 ---
