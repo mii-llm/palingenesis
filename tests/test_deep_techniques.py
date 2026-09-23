@@ -4,11 +4,9 @@ import sys
 
 sys.path.insert(0, "src")
 
-import math
 import tempfile
-import torch
-import torch.nn as nn
 
+import torch
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG TYPE COERCION EDGE CASES
@@ -80,19 +78,18 @@ def test_config_int_from_string():
     print("✓ test_config_int_from_string PASSED\n")
 
 
-def test_config_unknown_fields_ignored():
-    """Unknown fields in YAML should be silently ignored (forward compat)."""
-    from palingenesis.config import Config
+def test_config_unknown_fields_rejected():
+    """Unknown fields in YAML are errors: a misspelt option silently keeping its
+    default would be a wrong training run."""
+    import pytest
+
+    from palingenesis.config import Config, ConfigError
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write("train:\n  learning_rate: 1e-4\n  future_param: yes\nfuture_section:\n  foo: bar\n")
+        f.write("train:\n  learning_rate: 1e-4\n  future_param: yes\n")
         f.flush()
-        c = Config.from_yaml(f.name)
-
-    assert c.train.learning_rate == 1e-4
-    # Should not crash on unknown fields
-    print("  Unknown fields silently ignored ✓")
-    print("✓ test_config_unknown_fields_ignored PASSED\n")
+        with pytest.raises(ConfigError, match="train.future_param"):
+            Config.from_yaml(f.name)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -102,7 +99,7 @@ def test_config_unknown_fields_ignored():
 
 def test_packing_position_ids_reset_at_boundaries():
     """Position IDs must reset to 0 at each document boundary within a packed sequence."""
-    from palingenesis.data import PackedDataset, IGNORE_INDEX
+    from palingenesis.data import PackedDataset
 
     class FakeDataset:
         def __iter__(self):
@@ -142,7 +139,7 @@ def test_packing_position_ids_reset_at_boundaries():
 
 def test_packing_no_cross_document_label_leakage():
     """Labels from one document should not bleed into another document's positions."""
-    from palingenesis.data import PackedDataset, IGNORE_INDEX
+    from palingenesis.data import IGNORE_INDEX, PackedDataset
 
     class FakeDataset:
         def __iter__(self):
@@ -168,12 +165,12 @@ def test_packing_no_cross_document_label_leakage():
     # Where input_ids are 1 (doc A), labels should be 1 or IGNORE
     doc_a_mask = input_ids == 1
     doc_a_labels = labels[doc_a_mask]
-    assert all(l.item() in (1, IGNORE_INDEX) for l in doc_a_labels), "Doc A labels should only be 1 or IGNORE"
+    assert all(x.item() in (1, IGNORE_INDEX) for x in doc_a_labels), "Doc A labels should only be 1 or IGNORE"
 
     # Where input_ids are 2 (doc B), labels should be 2 or IGNORE
     doc_b_mask = input_ids == 2
     doc_b_labels = labels[doc_b_mask]
-    assert all(l.item() in (2, IGNORE_INDEX) for l in doc_b_labels), "Doc B labels should only be 2 or IGNORE"
+    assert all(x.item() in (2, IGNORE_INDEX) for x in doc_b_labels), "Doc B labels should only be 2 or IGNORE"
 
     print("  No label leakage between packed documents ✓")
     print("✓ test_packing_no_cross_document_label_leakage PASSED\n")
@@ -221,7 +218,6 @@ def test_spike_detector_variance_transition():
 def test_deft_loss_weights_hard_tokens_more():
     """DEFT gradient scaling should differ from uniform CE when token difficulties vary."""
     from palingenesis.plugins import deft_loss
-    from palingenesis.loss import cross_entropy_loss, IGNORE_INDEX
 
     torch.manual_seed(42)
     vocab = 50
@@ -260,8 +256,8 @@ def test_deft_loss_weights_hard_tokens_more():
 
 def test_deft_loss_ignores_masked_tokens():
     """DEFT should produce zero gradient for IGNORE_INDEX positions."""
-    from palingenesis.plugins import deft_loss
     from palingenesis.loss import IGNORE_INDEX
+    from palingenesis.plugins import deft_loss
 
     torch.manual_seed(42)
     logits = torch.randn(2, 16, 50, requires_grad=True)
@@ -286,7 +282,6 @@ def test_deft_loss_ignores_masked_tokens():
 def test_deft_loss_finite_output():
     """DEFT loss should never produce NaN/Inf even with extreme logits."""
     from palingenesis.plugins import deft_loss
-    from palingenesis.loss import IGNORE_INDEX
 
     # Extreme cases
     for desc, logits_val in [("very large", 100.0), ("very small", -100.0), ("near zero", 0.001)]:
@@ -318,7 +313,7 @@ if __name__ == "__main__":
     test_config_null_and_empty()
     test_config_bool_from_yaml()
     test_config_int_from_string()
-    test_config_unknown_fields_ignored()
+    test_config_unknown_fields_rejected()
 
     print("── Packing Correctness ──\n")
     test_packing_position_ids_reset_at_boundaries()

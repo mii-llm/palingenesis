@@ -121,7 +121,22 @@ def _to_conversations(
     if not chosen or not rejected:
         return None
     prompt = _as_messages(example.get(prompt_field), role="user")
+    if prompt and _starts_with(chosen, prompt) and _starts_with(rejected, prompt):
+        # Both completions already are full conversations that begin with the
+        # prompt (e.g. HuggingFaceH4/ultrafeedback_binarized): prepending it again
+        # would repeat the user turn.
+        return chosen, rejected
     return prompt + chosen, prompt + rejected
+
+
+def _starts_with(conversation: list[dict], prefix: list[dict]) -> bool:
+    def key(message: dict) -> tuple:
+        content = message.get("content")
+        return message.get("role"), content.strip() if isinstance(content, str) else content
+
+    return len(conversation) > len(prefix) and all(
+        isinstance(m, dict) and isinstance(p, dict) and key(m) == key(p) for m, p in zip(conversation, prefix)
+    )
 
 
 class PreferenceDataset(IterableDataset):
@@ -142,12 +157,14 @@ class PreferenceDataset(IterableDataset):
         last_turn_only: bool = False,
         train_on_reasoning: bool = True,
         truncate_rejected: bool = True,
+        tools_field: str = "tools",
         rank: int = 0,
         world_size: int = 1,
         shuffle_buffer: int = 0,
         shuffle_seed: int = 0,
     ):
         self.dataset = dataset
+        self.tools_field = tools_field
         self.max_seq_length = max_seq_length
         self.prompt_field = prompt_field
         self.chosen_field = chosen_field
@@ -183,8 +200,9 @@ class PreferenceDataset(IterableDataset):
         kwargs = example.get("chat_template_kwargs") or {}
         if isinstance(kwargs, str):
             kwargs = json.loads(kwargs) if kwargs.strip() else {}
-        chosen = self._chosen._process({"messages": convs[0], "chat_template_kwargs": kwargs})
-        rejected = self._rejected._process({"messages": convs[1], "chat_template_kwargs": kwargs})
+        tools = example.get(self.tools_field)
+        chosen = self._chosen._process({"messages": convs[0], "chat_template_kwargs": kwargs, "tools": tools})
+        rejected = self._rejected._process({"messages": convs[1], "chat_template_kwargs": kwargs, "tools": tools})
         if chosen is None or rejected is None:
             self.stats["dropped_unusable"] += 1
             return None
@@ -242,6 +260,7 @@ def build_preference_dataloader(
         last_turn_only=data_config.last_turn_only,
         train_on_reasoning=data_config.train_on_reasoning,
         truncate_rejected=dpo_config.truncate_rejected,
+        tools_field=getattr(data_config, "tools_field", "tools"),
         rank=rank,
         world_size=world_size,
         shuffle_buffer=streaming_shuffle_buffer,

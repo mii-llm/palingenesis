@@ -167,11 +167,11 @@ def test_profile_counts_parameters_exactly(tmp_path, model_dir):
     real = AutoModelForCausalLM.from_pretrained(model_dir)
     n = sum(p.numel() for p in real.parameters())
     assert est["total_params_B"] * 1e9 == pytest.approx(n)
-    assert est["params_memory_gb"] == pytest.approx(n * 4 / 1e9)
-    assert est["optimizer_memory_gb"] == pytest.approx(2 * n * 4 / 1e9)      # AdamW: 2 states, fp32 weights
+    assert est["params_memory_gb"] == pytest.approx(n * 4 / 2**30)
+    assert est["optimizer_memory_gb"] == pytest.approx(2 * n * 4 / 2**30)      # AdamW: 2 states, fp32 weights
     config.model.torch_dtype = "bfloat16"
     config.train.optimizer = "lion8bit"
-    assert estimate_memory(config)["optimizer_memory_gb"] == pytest.approx(n / 1e9)
+    assert estimate_memory(config)["optimizer_memory_gb"] == pytest.approx(n / 2**30)
 
 
 def test_profile_refuses_to_guess_an_unknown_model(tmp_path, model_dir):
@@ -195,7 +195,7 @@ def test_profile_accepts_gpu_flag(tmp_path, model_dir, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exit_info:
         profile_memory.main()
     assert exit_info.value.code == 0
-    assert "of 40 GB" in capsys.readouterr().out
+    assert "of 40 GiB" in capsys.readouterr().out
 
 
 def test_monitor_throughput_flags_sustained_drops_not_batch_variation():

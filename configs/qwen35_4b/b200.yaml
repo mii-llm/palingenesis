@@ -29,11 +29,6 @@ data:
   packing: true
   include_observations: true
   turn_scaling: progressive
-  # Seq-len curriculum (arxiv:2405.13226): start short for speed, ramp to full length
-  # B200 has so much memory we can afford any seq length, but short seqs = faster attention
-  seq_len_curriculum: true
-  seq_len_curriculum_min: 2048
-  seq_len_curriculum_ramp_steps: 500  # ramp from 2048→8192 over first 500 steps
 
 train:
   output_dir: ./checkpoints/qwen35_4b_b200

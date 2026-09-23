@@ -103,8 +103,10 @@ def _infosft_fused(logits: torch.Tensor, labels: torch.Tensor, logit_pbar: float
     IGNORE_INDEX = -100
     B, S, V = logits.shape
 
-    # 1. Get q = P(correct token) for each position
-    probs = torch.softmax(logits.float(), dim=-1)  # [B, S, V]
+    # 1. Get q = P(correct token) for each position. The weight is a stop-gradient
+    #    quantity (the paper's objective is sg(q * Omega(q)) * log pi): no gradient
+    #    flows through it.
+    probs = torch.softmax(logits.float().detach(), dim=-1)  # [B, S, V]
     valid_mask = labels != IGNORE_INDEX
     safe_labels = labels.clamp(min=0)
     q = probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)  # [B, S]
@@ -116,7 +118,9 @@ def _infosft_fused(logits: torch.Tensor, labels: torch.Tensor, logit_pbar: float
     correction = (logit_pbar - logit_q).clamp(min=0.0)
     weights = q * correction  # [B, S]
 
-    # 3. Normalize over valid tokens (mean=1 preserves loss magnitude)
+    # 3. Normalize over valid tokens (mean=1 preserves loss magnitude). Not in the
+    #    paper, which leaves the scale to the learning rate: this keeps SFT learning
+    #    rates usable with InfoSFT.
     weights = torch.where(valid_mask, weights, torch.zeros_like(weights))
     valid_count = valid_mask.sum().clamp(min=1)
     mean_w = weights.sum() / valid_count
@@ -223,136 +227,164 @@ def _deft_loss_fused(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor
     return weighted.sum()
 
 
-def chunked_deft_loss(
+GATED_OBJECTIVES = ("deft", "dft", "info_sft", "cadft")
+
+
+def chunked_gated_loss(
     hidden_states: torch.Tensor,
     labels: torch.Tensor,
     lm_head: torch.nn.Module,
+    objective: str,
     num_chunks: int = 8,
     global_valid_tokens: float = 1.0,
     stats: dict | None = None,
+    weights: torch.Tensor | None = None,
+    info_sft_pbar: float = INFOSFT_PBAR_DEFAULT,
+    cadft_beta: float = 1.0,
 ) -> torch.Tensor:
-    """Chunked DEFT: memory-efficient DEFT loss via sequence-chunked lm_head projection.
+    """Gated cross-entropy, sum_t gate_t * CE_t / global_valid_tokens, with the logits
+    built one sequence chunk at a time (never [B, S, V]).
 
-    Problem: DEFT needs full logits (for softmax → p_t → alpha → gate), but materializing
-    [B, S, V] for large vocab (152K) is 4.7-9.4 GB. Can't use CCE (needs custom kernel).
-
-    Solution: Process chunks along the sequence dimension. Each chunk independently:
-      1. Projects hidden_states → logits (only [B, S/N, V] materialized)
-      2. Computes softmax, alpha, p_t, gate for that chunk
-      3. Computes weighted CE for that chunk
-      4. Frees the chunk's logits before processing next
-
-    This is exact — DEFT is per-token, no cross-position dependency.
-    Memory: O(B × S/N × V) instead of O(B × S × V).
+    The gates (all detached, as in their papers) are those of the full-logit losses
+    above, which this matches exactly:
+      deft      p_t ** alpha_t, alpha_t = sum_v p_v**2 (Renyi-2 collision probability)
+      dft       p_t
+      info_sft  q * [logit(p_bar) - logit(q)]_+ with q = p_t, divided by its mean over
+                the batch's scored tokens
+      cadft     p_t * exp(-beta * max(z_b, 0)), z_b the batch z-score of row b's mean NLL
+    info_sft and cadft need batch statistics before any gate is known: one extra
+    no-grad pass over the chunks computes them.
 
     Args:
-        hidden_states: [B, S, D] from model backbone (before lm_head)
-        labels: [B, S] target labels
-        lm_head: The lm_head module
-        num_chunks: Number of sequence chunks (8 → each chunk is S/8 positions)
-        global_valid_tokens: Denominator for loss normalization
-        stats: Optional dict; if given, filled with side metrics computed for
-            free during the loss pass: "ce_sum" (unweighted CE over valid
-            tokens — the DEFT value is NOT a CE and can't be used for ppl),
-            "gate_sum" (sum of trust gates), "valid" (valid token count).
-
-    Returns:
-        Scalar loss (sum / global_valid_tokens)
+        hidden_states: [B, S, D] from the backbone; labels: [B, S], already shifted
+        lm_head: the output head (a PostProcessedHead included)
+        weights: optional [B, S] per-token weights (data.turn_scaling), multiplied in
+        stats: optional dict filled with "ce_sum" (unweighted CE over scored tokens),
+            "gate_sum" and "valid" (scored-token count), for logging
     """
     from torch.distributed._composable.fsdp import FSDPModule
 
+    if objective not in GATED_OBJECTIVES:
+        raise ValueError(f"unknown gated objective {objective!r}; one of {GATED_OBJECTIVES}")
     IGNORE_INDEX = -100
-    B, S, D = hidden_states.shape
-    fsdp_enabled = isinstance(lm_head, FSDPModule)
+    # A PostProcessedHead (palingenesis.logits) wraps the projection that FSDP manages.
+    fsdp_head = getattr(lm_head, "head", lm_head)
+    fsdp_enabled = isinstance(fsdp_head, FSDPModule)
     requires_grad = hidden_states.requires_grad
+    device = hidden_states.device
+    # Side metrics accumulate on the device: one sync at the end, not three per chunk.
+    ce_sum = torch.zeros((), device=device, dtype=torch.float32)
+    gate_sum = torch.zeros((), device=device, dtype=torch.float32)
+    valid_count = torch.zeros((), device=device, dtype=torch.long)
 
-    # Split into chunks along sequence dimension
     h_chunks = [c.contiguous() for c in torch.chunk(hidden_states.detach(), num_chunks, dim=1)]
     label_chunks = list(torch.chunk(labels, num_chunks, dim=1))
+    weight_chunks = list(torch.chunk(weights, num_chunks, dim=1)) if weights is not None else [None] * len(h_chunks)
+    logit_pbar = math.log(info_sft_pbar / (1.0 - info_sft_pbar))
+
+    def token_stats(logits, l_chunk):
+        probs = torch.softmax(logits.float(), dim=-1)
+        valid = l_chunk != IGNORE_INDEX
+        p_t = probs.gather(-1, l_chunk.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        return probs, valid, p_t
+
+    def info_raw(p_t):
+        q = p_t.clamp(min=1e-8, max=1.0 - 1e-8)
+        return q * (logit_pbar - (torch.log(q) - torch.log1p(-q))).clamp(min=0.0)
+
+    if fsdp_enabled:
+        fsdp_head.set_reshard_after_forward(False)
+        fsdp_head.set_reshard_after_backward(False)
+
+    # ── Batch statistics (info_sft: mean raw weight; cadft: per-row mean NLL) ──
+    info_mean = None
+    row_weight = None
+    if objective in ("info_sft", "cadft"):
+        info_total = torch.zeros((), device=device, dtype=torch.float32)
+        nll_rows = torch.zeros(labels.shape[0], device=device, dtype=torch.float32)
+        count_rows = torch.zeros(labels.shape[0], device=device, dtype=torch.float32)
+        with torch.no_grad():
+            for h_chunk, l_chunk in zip(h_chunks, label_chunks):
+                logits = lm_head(h_chunk)
+                _, valid, p_t = token_stats(logits, l_chunk)
+                if objective == "info_sft":
+                    info_total += torch.where(valid, info_raw(p_t), torch.zeros_like(p_t)).sum()
+                else:
+                    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), l_chunk.reshape(-1),
+                                         reduction="none", ignore_index=IGNORE_INDEX).view(l_chunk.shape)
+                    nll_rows += torch.where(valid, ce, torch.zeros_like(ce)).sum(dim=1)
+                    count_rows += valid.sum(dim=1)
+                del logits
+        if objective == "info_sft":
+            info_mean = (info_total / (labels != IGNORE_INDEX).sum().clamp(min=1)).clamp(min=1e-8)
+        else:
+            c_raw = nll_rows / count_rows.clamp(min=1)
+            z = (c_raw - c_raw.mean()) / c_raw.std().clamp(min=1e-6) if c_raw.numel() > 1 else torch.zeros_like(c_raw)
+            row_weight = torch.exp(-cadft_beta * z.clamp(min=0.0))
 
     if requires_grad:
         for c in h_chunks:
             c.requires_grad_(True)
-
-    # Pre-allocate gradient buffer
     grad_buffer = torch.zeros_like(hidden_states, dtype=torch.float32) if requires_grad else None
-
-    total_loss = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
-
-    # FSDP management (keep lm_head unsharded across chunks)
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
     if fsdp_enabled:
-        lm_head.set_reshard_after_forward(False)
-        lm_head.set_reshard_after_backward(False)
-        lm_head.set_requires_gradient_sync(False, recurse=False)
+        fsdp_head.set_requires_gradient_sync(False, recurse=False)
 
     last_idx = len(h_chunks) - 1
     seq_offset = 0
-
-    for i, (h_chunk, l_chunk) in enumerate(zip(h_chunks, label_chunks)):
+    for i, (h_chunk, l_chunk, w_chunk) in enumerate(zip(h_chunks, label_chunks, weight_chunks)):
         chunk_len = h_chunk.shape[1]
-
         if fsdp_enabled and i == last_idx:
-            lm_head.set_requires_gradient_sync(True, recurse=False)
+            fsdp_head.set_requires_gradient_sync(True, recurse=False)
 
-        # Project to logits: [B, chunk_S, V]
         logits = lm_head(h_chunk)
-
-        # ── DEFT computation on this chunk ────────────────────────────
         V = logits.shape[-1]
+        probs, valid_mask, p_t = token_stats(logits, l_chunk)
+        with torch.no_grad():
+            if objective == "deft":
+                gate = torch.pow(p_t.clamp(min=1e-8), (probs * probs).sum(dim=-1))
+            elif objective == "dft":
+                gate = p_t
+            elif objective == "info_sft":
+                gate = info_raw(p_t) / info_mean
+            else:  # cadft
+                gate = p_t * row_weight[:, None]
+        gate = gate.detach()
+        del probs
 
-        # Softmax + collision probability (alpha)
-        probs = torch.softmax(logits.float(), dim=-1)
-        alpha = (probs * probs).sum(dim=-1)  # [B, chunk_S]
-
-        # p_t = P(correct token)
-        valid_mask = l_chunk != IGNORE_INDEX
-        safe_labels = l_chunk.clamp(min=0)
-        p_t = probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
-        p_t = p_t.clamp(min=1e-8)
-
-        # Trust gate (detached)
-        gate = torch.pow(p_t, alpha).detach()
-
-        # Per-token CE
-        ce_flat = F.cross_entropy(
-            logits.reshape(-1, V),
-            l_chunk.reshape(-1),
-            reduction="none",
-            ignore_index=IGNORE_INDEX,
-        ).view(h_chunk.shape[0], chunk_len)
-
-        # Weighted loss for this chunk
+        ce_flat = F.cross_entropy(logits.reshape(-1, V), l_chunk.reshape(-1), reduction="none",
+                                  ignore_index=IGNORE_INDEX).view(h_chunk.shape[0], chunk_len)
         weighted = ce_flat * gate
+        if w_chunk is not None:
+            weighted = weighted * w_chunk.to(weighted.dtype)
         weighted = torch.where(valid_mask, weighted, torch.zeros_like(weighted))
         chunk_loss = weighted.sum() / global_valid_tokens
-
         total_loss = total_loss + chunk_loss.detach()
 
-        # Side metrics (free: everything is already computed)
         if stats is not None:
             with torch.no_grad():
-                stats["ce_sum"] = stats.get("ce_sum", 0.0) + torch.where(
-                    valid_mask, ce_flat, torch.zeros_like(ce_flat)
-                ).sum().item()
-                stats["gate_sum"] = stats.get("gate_sum", 0.0) + torch.where(
-                    valid_mask, gate, torch.zeros_like(gate)
-                ).sum().item()
-                stats["valid"] = stats.get("valid", 0) + valid_mask.sum().item()
+                ce_sum += torch.where(valid_mask, ce_flat, torch.zeros_like(ce_flat)).sum()
+                gate_sum += torch.where(valid_mask, gate, torch.zeros_like(gate)).sum()
+                valid_count += valid_mask.sum()
 
         # Backward for this chunk (frees logits immediately)
         if requires_grad:
             chunk_loss.backward()
             grad_buffer[:, seq_offset : seq_offset + chunk_len] = h_chunk.grad.float()
             h_chunk.grad = None
-
         seq_offset += chunk_len
 
-    # Restore FSDP
     if fsdp_enabled:
-        lm_head.set_reshard_after_forward(True)
-        lm_head.set_reshard_after_backward(True)
-        lm_head.set_requires_gradient_sync(True, recurse=False)
-        lm_head.reshard()
+        fsdp_head.set_reshard_after_forward(True)
+        fsdp_head.set_reshard_after_backward(True)
+        fsdp_head.set_requires_gradient_sync(True, recurse=False)
+        fsdp_head.reshard()
+
+    if stats is not None:
+        ce, gates, valid = torch.stack([ce_sum, gate_sum, valid_count.float()]).tolist()
+        stats["ce_sum"] = stats.get("ce_sum", 0.0) + ce
+        stats["gate_sum"] = stats.get("gate_sum", 0.0) + gates
+        stats["valid"] = stats.get("valid", 0) + int(valid)
 
     if not requires_grad:
         return total_loss
@@ -360,8 +392,14 @@ def chunked_deft_loss(
     # Bridge gradients back to decoder
     from palingenesis.loss import _BackwardBridge
 
-    accumulated_grad = grad_buffer.to(hidden_states.dtype)
-    return _BackwardBridge.apply(hidden_states, accumulated_grad, total_loss)
+    return _BackwardBridge.apply(hidden_states, grad_buffer.to(hidden_states.dtype), total_loss)
+
+
+def chunked_deft_loss(hidden_states, labels, lm_head, num_chunks: int = 8, global_valid_tokens: float = 1.0,
+                      stats: dict | None = None, weights: torch.Tensor | None = None) -> torch.Tensor:
+    """Chunked DEFT (see chunked_gated_loss)."""
+    return chunked_gated_loss(hidden_states, labels, lm_head, "deft", num_chunks=num_chunks,
+                              global_valid_tokens=global_valid_tokens, stats=stats, weights=weights)
 
 
 _deft_compiled = torch.compile(_deft_loss_fused, dynamic=True)

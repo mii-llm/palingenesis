@@ -80,14 +80,9 @@ train:
   base_merge_every: 200
 
 plugins:
-  deft: false            # REQUIRED off — DEFT takes precedence and silently
-  pre_rl: true           #   disables pre_rl (one objective per run)
+  pre_rl: true           # one objective per run: no deft/dft/cadft/info_sft
   pre_rl_entropy_coeff: 0.1
   pre_rl_kl_coeff: 0.5
-
-memory:
-  chunked_loss: false    # REQUIRED off — pre_rl needs the full logits; the
-                         #   chunked-CE path also takes precedence over it
 ```
 
 The `pre_rl` plugin splits tokens by entropy and KL from a stale reference snapshot. "Safe" tokens (low entropy, low KL) get normal cross-entropy. "Unsafe" tokens — where the distribution is still wide or already drifting — are excluded from imitation and instead get:
@@ -98,7 +93,7 @@ The `pre_rl` plugin splits tokens by entropy and KL from a stale reference snaps
 Together, these slow the entropy collapse while still allowing the model to learn the task format.
 
 !!! warning "pre_rl is one objective among alternatives, not an add-on"
-    The training loop selects **exactly one** loss objective per run, in priority order: chunked DEFT → chunked CE → CADFT → DEFT → DFT → InfoSFT → pre_rl → plain CE. Setting `pre_rl: true` while `deft: true` or `memory.chunked_loss: true` does **nothing** — the earlier branch wins silently. Choosing pre_rl means trading away DEFT's token weighting and the chunked-loss memory savings: full logits are materialized (batch × seq × vocab, plus float32 copies inside the loss and a cached reference snapshot — roughly 15–20 GB extra at batch 4 × seq 4096 × 150k vocab).
+    The training loop runs **exactly one** loss objective; enabling `pre_rl` together with `deft`, `dft`, `cadft` or `info_sft` is a configuration error. Choosing pre_rl means trading away the token weighting and the chunked-loss memory savings: full logits are materialized (batch × seq × vocab, plus float32 copies inside the loss and a cached reference snapshot — roughly 15–20 GB extra at batch 4 × seq 4096 × 150k vocab).
 
 ### 4. Use the EMA checkpoint for RL
 

@@ -14,9 +14,11 @@ import sys
 from pathlib import Path
 
 import pytest
-import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+# Reuse the real template + tokenizer helper from the integration suite.
+from test_last_turn_integration import CHAT_TEMPLATE  # noqa: E402
 
 from palingenesis.config import DataConfig  # noqa: E402
 from palingenesis.data import (  # noqa: E402
@@ -29,9 +31,6 @@ from palingenesis.data import (  # noqa: E402
     pretokenize_fingerprint,
     pretokenized_cache_valid,
 )
-
-# Reuse the real template + tokenizer helper from the integration suite.
-from test_last_turn_integration import CHAT_TEMPLATE  # noqa: E402
 
 
 def _make_tokenizer():
@@ -284,16 +283,6 @@ def test_validate_rejects_pretokenize_plus_msft():
     cfg.data.sources = [{"dataset": "a"}, {"dataset": "b"}]
     cfg.data.msft_tracking = True
     with pytest.raises(ConfigError, match="msft_tracking"):
-        cfg.validate()
-
-
-def test_validate_rejects_pretokenize_plus_seqlen_curriculum():
-    from palingenesis.config import Config, ConfigError
-
-    cfg = Config()
-    cfg.data.pretokenize = True
-    cfg.data.seq_len_curriculum = True
-    with pytest.raises(ConfigError, match="seq_len_curriculum"):
         cfg.validate()
 
 

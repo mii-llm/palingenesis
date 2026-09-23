@@ -15,11 +15,11 @@ plugins:
 
 No hyperparameters. Subsumes standard CE (α→0) and DFT (α=1). The original paper (arxiv:2602.11424) reports gains on math and code reasoning, but these have not been independently reproduced.
 
-The mechanism: `weight_t = -log(p_t)^α` where α is learned implicitly from the gradient dynamics. Hard tokens (low p_t) get exponentially more influence. Easy tokens (high p_t) contribute less noise.
+The mechanism: each token's cross-entropy is multiplied by a trust gate `p_t^α_t`, where `p_t` is the model's probability of the target token and `α_t = Σ_v p_v²` (the collision probability, i.e. exponentiated Rényi-2 entropy) measures how concentrated the prediction is; the gate is a stop-gradient weight, so the gradient on the target logit is `-p^α (1 - p)`. A diffuse prediction (α near 0) keeps the full cross-entropy gradient; a confident one (α near 1) behaves like DFT's `p_t` gate, suppressing tokens the model confidently disagrees with.
 
-### Chunked DEFT
+### Chunked token-gated objectives
 
-When `memory.chunked_loss: true` and `plugins.deft: true`, palingenesis uses chunked DEFT — computes DEFT loss per sequence chunk without materializing the full [B,S,V] logit tensor. Identical numerical result, 1/N peak memory.
+With `memory.chunked_loss: true` (the default), DEFT, DFT, InfoSFT and CADFT are computed chunk by chunk along the sequence, never materializing the full [B, S, V] logits; the result equals the full-logit definitions (tests/test_chunked_gated_losses.py). InfoSFT and CADFT need batch statistics (InfoSFT's mean weight, CADFT's per-sequence NLL z-scores), which one extra no-grad pass over the chunks provides.
 
 ---
 

@@ -266,12 +266,7 @@ What you get:
 - **Cheap exact step count** — the count scan reads pre-tokenized arrow instead of re-tokenizing, so you keep an exact LR horizon without the up-front cost.
 - **Automatic invalidation** — a fingerprint over the tokenizer, chat template, `max_seq_length`, `packing`, every source (path + size + mtime + weight + mode + fields + `last_turn_only`), `train_on_reasoning`, `turn_scaling`, `include_observations`, `seed` and replay is stored in `pretokenized_meta.json`. Change any of them and the cache is rebuilt — you can never silently train on a stale tokenization.
 
-The cache is a **static** stream, so two dynamic features are rejected at validation time with a clear error:
-
-- `msft_tracking` — adjusts per-source weights *during* training, so the mix isn't fixed.
-- `seq_len_curriculum` — changes the sequence length *during* training.
-
-Disable one of the pair to proceed. Under multi-GPU, rank 0 builds the cache once and the other ranks wait on a barrier, then each rank reads a disjoint shard.
+The cache is a **static** stream, so `msft_tracking` (which adjusts per-source weights *during* training) is rejected at validation time with a clear error. Disable one of the two to proceed. Under multi-GPU, rank 0 builds the cache once and the other ranks wait on a barrier, then each rank reads a disjoint shard.
 
 ---
 

@@ -12,9 +12,9 @@ import sys
 sys.path.insert(0, "src")
 
 import math
+
 import torch
 import torch.nn as nn
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ADAGC: Per-Tensor Adaptive Gradient Clipping
@@ -171,8 +171,9 @@ def test_spike_detector_doesnt_drift_from_spikes():
 
 def test_spike_detector_long_running_stability():
     """Over 10000 steps with occasional spikes, detector remains stable."""
-    from palingenesis.perf import SpikeDetector
     import random
+
+    from palingenesis.perf import SpikeDetector
 
     random.seed(42)
     detector = SpikeDetector(z_threshold=5.0, warmup=100, ema_decay=0.99)
@@ -360,7 +361,7 @@ def test_base_merge_repeated_converges_to_base():
 
 def test_full_perf_stack_composition():
     """All perf techniques compose without interference over a training simulation."""
-    from palingenesis.perf import AdaGC, SpikeDetector, ModelEMA, BaseModelMerge
+    from palingenesis.perf import AdaGC, BaseModelMerge, ModelEMA, SpikeDetector
 
     torch.manual_seed(42)
     model = nn.Linear(64, 32)
@@ -406,7 +407,7 @@ def test_full_perf_stack_composition():
     assert final < initial, f"Loss should decrease: {initial:.3f} → {final:.3f}"
 
     # Verify no NaN/Inf
-    assert all(math.isfinite(l) for l in losses), "No NaN/Inf losses"
+    assert all(math.isfinite(x) for x in losses), "No NaN/Inf losses"
 
     # Verify EMA is valid
     for t in ema._shadow.values():

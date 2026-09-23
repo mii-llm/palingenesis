@@ -61,6 +61,13 @@ def normalize_messages(
     - ShareGPT format ({"from": "human", "value": "..."})
     - Single-field conversations (list of dicts with any key combo)
 
+    - A conversation stored as a JSON string (common in exports whose tool-call
+      arguments differ in shape from row to row, which Arrow cannot store natively)
+    - Tool-call arguments stored as JSON strings (the OpenAI wire format): parsed to
+      dicts, which is what chat templates iterate over (Qwen3.x, Llama 3.x, ...)
+    - Other per-message keys (`tool_call_id`, `name`, `loss`, ...) are kept; keys whose
+      value is None (Arrow fills them in for messages that lack them) are dropped
+
     Returns normalized messages list, or None if the sample is unparseable.
     """
     if role_map is None:
@@ -74,6 +81,11 @@ def normalize_messages(
             if raw is not None:
                 break
 
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
     if not raw or not isinstance(raw, list):
         return None
 
@@ -82,34 +94,39 @@ def normalize_messages(
         if not isinstance(turn, dict):
             continue
 
-        # Find the role field
-        role_raw = None
-        for alias in ROLE_FIELD_ALIASES:
-            if alias in turn:
-                role_raw = turn[alias]
-                break
+        turn = {k: v for k, v in turn.items() if v is not None}
 
-        if role_raw is None:
+        # Find the role field
+        role_key = next((alias for alias in ROLE_FIELD_ALIASES if alias in turn), None)
+        if role_key is None:
             continue
+        role_raw = turn[role_key]
 
         # Normalize role name
         role = role_map.get(str(role_raw).lower().strip(), str(role_raw).lower().strip())
 
         # Find the content field
-        content = None
-        for alias in CONTENT_FIELD_ALIASES:
-            if alias in turn:
-                content = turn[alias]
-                break
+        content_key = next((alias for alias in CONTENT_FIELD_ALIASES if alias in turn), None)
+        content = turn[content_key] if content_key is not None else None
 
-        if content is None and "content" not in turn:
+        if content is None:
             # Maybe the content is the only other key besides role
             non_role_keys = [k for k in turn if k not in ROLE_FIELD_ALIASES]
             if len(non_role_keys) == 1:
-                content = turn[non_role_keys[0]]
+                content_key = non_role_keys[0]
+                content = turn[content_key]
 
-        # Build normalized message
-        msg: dict[str, Any] = {"role": role, "content": content or ""}
+        if role == "tool" and isinstance(content, (dict, list)) and not _is_content_parts(content):
+            content = json.dumps(content, ensure_ascii=False)
+
+        # Build normalized message. Keys the template may read (tool_call_id, name, ...)
+        # and per-message training flags (loss) pass through unchanged.
+        msg: dict[str, Any] = {
+            k: v for k, v in turn.items()
+            if k not in (role_key, content_key, "reasoning", "reasoning_content", "think", "function_call")
+        }
+        msg["role"] = role
+        msg["content"] = content or ""
 
         # `reasoning` is the canonical field (OpenAI/vLLM); `reasoning_content` and
         # `think` are accepted as legacy input. As vLLM does before rendering, the
@@ -120,18 +137,73 @@ def normalize_messages(
         if reasoning is not None:
             msg["reasoning"] = reasoning
             msg["reasoning_content"] = reasoning
-        # Preserve other special fields (tool_calls, etc.)
-        if "tool_calls" in turn:
-            msg["tool_calls"] = turn["tool_calls"]
         if "function_call" in turn:
             # OpenAI legacy format → normalize to tool_calls
-            msg["tool_calls"] = [{"function": turn["function_call"]}]
-        if "name" in turn and role == "tool":
-            msg["name"] = turn["name"]
+            msg["tool_calls"] = [{"type": "function", "function": turn["function_call"]}]
+        if msg.get("tool_calls"):
+            msg["tool_calls"] = [_parse_tool_call(call) for call in msg["tool_calls"]]
+        else:
+            msg.pop("tool_calls", None)
 
         normalized.append(msg)
 
     return normalized if normalized else None
+
+
+def normalize_tools(tools: Any) -> list[dict] | None:
+    """Tool definitions for the chat template's `tools=` argument: a list (possibly
+    stored as a JSON string), or None when there are none."""
+    if isinstance(tools, str):
+        if not tools.strip():
+            return None
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(tools, dict):
+        tools = [tools]
+    if not isinstance(tools, list):
+        return None
+    tools = [t for t in tools if isinstance(t, dict)]
+    return tools or None
+
+
+def is_trained_message(msg: dict[str, Any]) -> bool:
+    """Per-message training flag: `"loss": false` (or `"weight": 0`) marks a turn that
+    stays in the context but receives no loss, e.g. a greeting or a failed attempt."""
+    if msg.get("loss") is False:
+        return False
+    weight = msg.get("weight")
+    return not (isinstance(weight, (int, float)) and not isinstance(weight, bool) and weight == 0)
+
+
+def _is_content_parts(content: Any) -> bool:
+    """Multimodal-style content: a list of {"type": ...} parts, which templates render."""
+    return isinstance(content, list) and all(isinstance(p, dict) and "type" in p for p in content)
+
+
+def _parse_tool_call(call: Any) -> Any:
+    """Tool call with its `arguments` as a dict. The OpenAI wire format stores them as a
+    JSON string; chat templates iterate over them as a mapping (`arguments|items`) and
+    fail on a string. Arguments that are not valid JSON are left untouched."""
+    if not isinstance(call, dict):
+        return call
+    call = {k: v for k, v in call.items() if v is not None}
+    func = call.get("function")
+    target = func if isinstance(func, dict) else call
+    args = target.get("arguments")
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            target = {**target, "arguments": parsed}
+            if isinstance(func, dict):
+                call = {**call, "function": target}
+            else:
+                call = target
+    return call
 
 
 # ══════════════════════════════════════════════════════════════════════════════

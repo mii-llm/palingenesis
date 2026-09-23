@@ -63,6 +63,19 @@ def shift_labels(labels: torch.Tensor, position_ids: torch.Tensor | None = None)
     return shifted
 
 
+def shift_weights(weights: torch.Tensor) -> torch.Tensor:
+    """Per-token loss weights aligned like `shift_labels`: the weight of predicting
+    token t+1 sits at position t. Positions whose label is masked keep any weight;
+    the loss never reads them."""
+    shifted = torch.zeros_like(weights)
+    shifted[:, :-1] = weights[:, 1:]
+    return shifted
+
+
+def _weighted_sum(per_token: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
+    return per_token.sum() if weights is None else (per_token * weights.reshape(-1).to(per_token.dtype)).sum()
+
+
 # ==============================================================================
 # STANDARD CROSS-ENTROPY (sum reduction, correct for distributed)
 # ==============================================================================
@@ -72,19 +85,21 @@ def cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     global_valid_tokens: float = 1.0,
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy with sum reduction / global_valid_tokens normalization.
 
     This gives correct gradients across distributed ranks when each rank
-    has different numbers of valid (non-masked) tokens.
+    has different numbers of valid (non-masked) tokens. `weights` ([B, S], shifted
+    like the labels) scale each token's term (per-turn scaling).
     """
     loss = F.cross_entropy(
         logits.view(-1, logits.size(-1)).float(),
         labels.view(-1),
-        reduction="sum",
+        reduction="none" if weights is not None else "sum",
         ignore_index=IGNORE_INDEX,
     )
-    return loss / global_valid_tokens
+    return _weighted_sum(loss, weights) / global_valid_tokens
 
 
 # ==============================================================================
@@ -97,6 +112,7 @@ def cut_cross_entropy_loss(
     labels: torch.Tensor,
     lm_head: nn.Module,
     global_valid_tokens: float = 1.0,
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cut Cross-Entropy: memory-free CE via custom Triton kernel.
 
@@ -137,10 +153,10 @@ def cut_cross_entropy_loss(
         weight,
         targets_flat,
         ignore_index=IGNORE_INDEX,
-        reduction="sum",
+        reduction="none" if weights is not None else "sum",
     )
 
-    return loss / global_valid_tokens
+    return _weighted_sum(loss, weights) / global_valid_tokens
 
 
 # ==============================================================================
@@ -177,6 +193,7 @@ def chunked_cross_entropy_loss(
     lm_head: nn.Module,
     num_chunks: int = 8,
     global_valid_tokens: float = 1.0,
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FSDP2-compatible chunked cross-entropy loss.
 
@@ -208,6 +225,7 @@ def chunked_cross_entropy_loss(
     # Split into contiguous chunks along sequence dim
     h_chunks = [c.contiguous() for c in torch.chunk(hidden_states.detach(), num_chunks, dim=1)]
     label_chunks = list(torch.chunk(labels, num_chunks, dim=1))
+    weight_chunks = list(torch.chunk(weights, num_chunks, dim=1)) if weights is not None else [None] * len(h_chunks)
 
     # Make each chunk a leaf for gradient accumulation
     if requires_grad:
@@ -231,7 +249,7 @@ def chunked_cross_entropy_loss(
     last_idx = len(h_chunks) - 1
     seq_offset = 0
 
-    for i, (h_chunk, l_chunk) in enumerate(zip(h_chunks, label_chunks)):
+    for i, (h_chunk, l_chunk, w_chunk) in enumerate(zip(h_chunks, label_chunks, weight_chunks)):
         chunk_len = h_chunk.shape[1]
 
         # Enable grad sync only on the last chunk (single reduce-scatter)
@@ -241,13 +259,13 @@ def chunked_cross_entropy_loss(
         # lm_head projection: [B, chunk_S, D] -> [B, chunk_S, V]
         logits = lm_head(h_chunk)
 
-        # CE with sum reduction
-        chunk_loss = F.cross_entropy(
+        # CE with sum reduction (weighted per token under turn scaling)
+        chunk_loss = _weighted_sum(F.cross_entropy(
             logits.view(-1, logits.size(-1)).float(),
             l_chunk.reshape(-1),
-            reduction="sum",
+            reduction="none" if w_chunk is not None else "sum",
             ignore_index=IGNORE_INDEX,
-        )
+        ), w_chunk)
         scaled_loss = chunk_loss / global_valid_tokens
         total_loss = total_loss + scaled_loss.detach()
 

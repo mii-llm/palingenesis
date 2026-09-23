@@ -16,10 +16,8 @@ the full code path including:
 Each test simulates a real config scenario (quickstart, flagship, pre_rl, etc.)
 """
 
-import json
 import math
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -29,20 +27,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from palingenesis.config import Config, ConfigError
-from palingenesis.loss import cross_entropy_loss, chunked_cross_entropy_loss, IGNORE_INDEX
+from palingenesis.health import HealthMonitor
+from palingenesis.loss import IGNORE_INDEX, cross_entropy_loss
+from palingenesis.memory import GradientRelease
 from palingenesis.optim import (
+    AdamCCorrection,
     Hyperball,
-    is_hyperball_param,
     build_optimizer,
     build_scheduler,
-    MONAAcceleration,
-    AdamCCorrection,
+    is_hyperball_param,
 )
-from palingenesis.perf import AdaGC, SpikeDetector, ModelEMA, BaseModelMerge
-from palingenesis.health import HealthMonitor
-from palingenesis.plugins import deft_loss, dft_loss, pre_rl_loss, SymNoiseHook
-from palingenesis.memory import GradientRelease
-
+from palingenesis.perf import AdaGC, BaseModelMerge, ModelEMA, SpikeDetector
+from palingenesis.plugins import SymNoiseHook, deft_loss, pre_rl_loss
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIXTURES
@@ -116,7 +112,7 @@ def test_quickstart_path():
         lambda logits, labels, valid, **kw: cross_entropy_loss(logits, labels, valid),
     )
 
-    assert all(math.isfinite(l) for l in losses), "NaN/Inf in quickstart path"
+    assert all(math.isfinite(x) for x in losses), "NaN/Inf in quickstart path"
     assert losses[-1] < losses[0], f"Loss didn't decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
     print(f"  Quickstart: {losses[0]:.4f} -> {losses[-1]:.4f} (power_decay, 20 steps)")
     print("✓ test_quickstart_path PASSED\n")
@@ -185,7 +181,7 @@ def test_flagship_all_features():
 
     sym_noise.remove()
 
-    assert all(math.isfinite(l) for l in losses), "NaN/Inf in flagship path"
+    assert all(math.isfinite(x) for x in losses), "NaN/Inf in flagship path"
     # Hyperball keeps each constrained matrix on its sphere (EMA/base-merge are
     # applied outside the optimizer and may move it; they run on a fixed cadence)
     for p in constrained:
@@ -296,7 +292,7 @@ def test_ga_ramp_counter():
                 break
 
     assert global_step == total_steps, f"Expected {total_steps} steps, got {global_step}"
-    assert all(math.isfinite(l) for l in losses_per_step), "NaN/Inf in GA ramp"
+    assert all(math.isfinite(x) for x in losses_per_step), "NaN/Inf in GA ramp"
     # Verify convergence
     first = sum(losses_per_step[:5]) / 5
     last = sum(losses_per_step[-5:]) / 5
@@ -326,7 +322,6 @@ def test_pre_rl_stale_reference():
         optimizer.zero_grad()
         output = model(batch["input_ids"])
         logits = output.logits
-        valid = (batch["labels"] != IGNORE_INDEX).sum().item()
 
         # Mimic train.py logic
         if _pre_rl_ref_logits is None or _pre_rl_ref_logits.shape != logits.shape:
@@ -481,17 +476,18 @@ def test_health_monitor_during_training():
 def test_flagship_configs_validate():
     """All shipped YAML configs pass validation (no hard errors)."""
     configs_dir = Path(__file__).parent.parent / "configs"
-    yaml_files = list(configs_dir.rglob("*.yaml"))
+    # on-policy distillation configs have their own schema (palingenesis.opd.config)
+    yaml_files = [p for p in configs_dir.rglob("*.yaml") if not p.name.startswith("distill_")]
     assert len(yaml_files) >= 5, f"Expected >=5 configs, found {len(yaml_files)}"
 
     errors = []
     for yaml_path in yaml_files:
         try:
             cfg = Config.from_yaml(str(yaml_path))
-            warnings = cfg.validate()
+            cfg.validate()
         except ConfigError as e:
             errors.append((yaml_path.name, str(e)))
-        except Exception as e:
+        except Exception:
             # YAML parse errors are not our concern here
             pass
 

@@ -107,9 +107,9 @@ def apply_fsdp(
     Optimizations (aligned with torchtitan latest):
       - Last transformer layer: reshard_after_forward=False (FSDP would prefetch
         immediately for backward anyway, avoiding a wasted reshard+allgather)
-      - Weight-tied models: group tok_embeddings + lm_head in single FSDP unit
-        (avoids duplicate all-gathers for shared weights)
-      - NVLink systems: enable symmetric memory for faster collectives
+      - Root (embeddings, final norm, head; tied or not): gathered once per step and
+        kept until backward, so the chunked losses can apply the head outside the
+        model's forward (tests/test_fsdp_trainer_path.py checks the gradients)
     """
     from torch.distributed._composable.fsdp import FSDPModule
     from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
@@ -117,8 +117,10 @@ def apply_fsdp(
     # Get the DP submesh (or full mesh if no CP)
     dp_mesh = mesh["dp"] if "cp" in (mesh.mesh_dim_names or ()) else mesh
 
+    # bf16=False: parameters stay in the model's dtype (no float16: without a
+    # gradient scaler, fp16 training over/underflows)
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16 if bf16 else torch.float16,
+        param_dtype=torch.bfloat16 if bf16 else None,
         reduce_dtype=torch.float32,
     )
 
@@ -140,49 +142,21 @@ def apply_fsdp(
         layer_reshard = False if is_last else config.reshard_after_forward
         fully_shard(layer, **{**fsdp_kwargs, "reshard_after_forward": layer_reshard})
 
-    # Handle weight-tied models: group tok_embeddings + lm_head into one FSDP unit
-    # to avoid duplicate all-gathers for the shared weight tensor
-    tie_weights = getattr(getattr(model, "config", None), "tie_word_embeddings", False)
-    if tie_weights:
-        # Find embedding and lm_head to group them
-        embed = getattr(getattr(model, "model", model), "embed_tokens", None)
-        lm_head = getattr(model, "lm_head", None)
-        if embed is not None and lm_head is not None:
-            modules_to_group = [m for m in (embed, lm_head) if m is not None]
-            fully_shard(modules_to_group, **{**fsdp_kwargs, "reshard_after_forward": False})
+    # The root owns the rest: embeddings, final norm and output head (tied or not).
+    # The losses reach the head outside the model's forward (chunked CE, DPO), after a
+    # root forward (logits.final_hidden_states) has gathered these parameters; the root
+    # keeps them gathered until its backward.
+    fully_shard(model, **{**fsdp_kwargs, "reshard_after_forward": False})
 
-    # Shard root
-    fully_shard(model, **fsdp_kwargs)
-
-    # Disable automatic gradient division — we normalize by global_valid_tokens
+    # The loss is already normalised by the global valid-token count: gradients are
+    # summed across ranks, not averaged (divide factor 1, plain SUM reduction).
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
-
-    # Enable symmetric memory on NVLink systems (faster collectives)
-    _try_enable_symm_mem(model)
+            if hasattr(module, "set_force_sum_reduction_for_comms"):
+                module.set_force_sum_reduction_for_comms(True)
 
     return model
-
-
-def _try_enable_symm_mem(model: torch.nn.Module) -> None:
-    """Enable symmetric memory FSDP communication if supported.
-
-    On NVLink-connected systems, symmetric memory uses NVLink multicast
-    for faster all-gathers and reduce-scatters. Harmless no-op if unsupported.
-    """
-    from torch.distributed._composable.fsdp import FSDPModule
-
-    try:
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                if hasattr(module, "set_force_sum_reduction_for_comms"):
-                    module.set_force_sum_reduction_for_comms(True)
-                if hasattr(module, "set_symm_mem_for_comm"):
-                    module.set_symm_mem_for_comm()
-    except (AttributeError, RuntimeError):
-        # Not supported on this PyTorch version or hardware
-        pass
 
 
 def _find_transformer_layers(model: torch.nn.Module) -> list[torch.nn.Module]:

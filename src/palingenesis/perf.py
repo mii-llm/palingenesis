@@ -8,7 +8,7 @@ import gc
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from torch.utils.data import DataLoader
@@ -60,8 +60,14 @@ class CUDAPrefetcher:
             # Yield current batch (compute happens here on default stream)
             yield batch
 
-            # Wait for next batch transfer to complete before using it
-            torch.cuda.current_stream(self._device).wait_stream(self._stream)
+            # Wait for next batch transfer to complete before using it, and tell
+            # the allocator the compute stream uses its memory: without that, once
+            # the batch is freed the block can be reused by the next copy on the
+            # copy stream while queued compute kernels still read it.
+            compute = torch.cuda.current_stream(self._device)
+            compute.wait_stream(self._stream)
+            for v in next_batch.values():
+                v.record_stream(compute)
             batch = next_batch
 
         # Yield the last batch

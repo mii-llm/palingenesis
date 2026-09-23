@@ -36,7 +36,6 @@ Integration:
 """
 
 import logging
-import math
 from collections import deque
 from dataclasses import dataclass, field
 

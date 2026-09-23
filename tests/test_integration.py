@@ -28,7 +28,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # FIXTURES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -149,7 +148,7 @@ def test_config_defaults_are_sane():
 
 def test_cross_entropy_loss_correct():
     """Standard CE loss matches PyTorch reference."""
-    from palingenesis.loss import cross_entropy_loss, IGNORE_INDEX
+    from palingenesis.loss import IGNORE_INDEX, cross_entropy_loss
 
     torch.manual_seed(42)
     logits = torch.randn(2, 16, 256)
@@ -173,7 +172,7 @@ def test_cross_entropy_loss_correct():
 
 def test_chunked_loss_matches_standard():
     """Chunked CE loss produces same result as standard (within numerical tolerance)."""
-    from palingenesis.loss import cross_entropy_loss, chunked_cross_entropy_loss, IGNORE_INDEX
+    from palingenesis.loss import IGNORE_INDEX, chunked_cross_entropy_loss, cross_entropy_loss
 
     torch.manual_seed(42)
     model = TinyLM(vocab_size=128, hidden=32, layers=1)
@@ -211,8 +210,8 @@ def test_eval_chunked_ce_matches_oneshot():
     to bound fp32 memory, not to change the number). Regression for the eval OOM."""
     import torch.nn.functional as F
 
-    from palingenesis.train import _chunked_ce_sum
     from palingenesis.loss import IGNORE_INDEX
+    from palingenesis.train import _chunked_ce_sum
 
     torch.manual_seed(0)
     B, S, V = 3, 40, 128
@@ -298,7 +297,7 @@ def test_mona_converges_on_adamw():
 
 def test_checkpoint_save_load_roundtrip():
     """Checkpoint save then load restores model + optimizer + scheduler state."""
-    from palingenesis.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
+    from palingenesis.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
     from palingenesis.optim import build_scheduler
 
     torch.manual_seed(42)
@@ -431,7 +430,7 @@ def test_best_model_tracker():
 
 def test_health_monitor_full_lifecycle():
     """Health monitor records data, computes metrics, detects issues."""
-    from palingenesis.health import HealthMonitor, IGNORE_INDEX
+    from palingenesis.health import IGNORE_INDEX, HealthMonitor
 
     model = TinyLM()
     monitor = HealthMonitor(model, tier2_every=5, tier3_every=10, rl_readiness=True, rl_entropy_floor=2.0)
@@ -519,7 +518,7 @@ def test_all_schedulers_produce_valid_lr():
 
 def test_packing_produces_correct_output():
     """PackedDataset produces fixed-length sequences with correct position_ids."""
-    from palingenesis.data import PackedDataset, IGNORE_INDEX
+    from palingenesis.data import IGNORE_INDEX, PackedDataset
 
     # Simulate a base dataset yielding variable-length samples
     class FakeDataset:
@@ -535,28 +534,31 @@ def test_packing_produces_correct_output():
     outputs = list(packed)
     assert len(outputs) > 0, "Should produce at least one packed sequence"
 
-    total_tokens = 10 + 15 + 8 + 20 + 5 + 12 + 18 + 7  # = 95
-    for i, out in enumerate(outputs):
-        # Full blocks are max_len; the LAST block may be a shorter trailing remainder
-        # (emitted, not dropped — dropping it silently loses data).
-        is_last = i == len(outputs) - 1
+    lengths = [10, 15, 8, 20, 5, 12, 18, 7]
+    total_tokens = sum(lengths)  # = 95
+    packed_lengths = []
+    for out in outputs:
         n = out["input_ids"].shape[0]
-        assert (n == 32) or (is_last and 0 < n <= 32), f"block {i} has bad length {n}"
-        assert out["labels"].shape[0] == n
-        assert out["position_ids"].shape[0] == n
-        # A doc's remainder is carried across block boundaries, so only the very first
-        # block is guaranteed to start at position 0; every block stays within a doc.
-        assert out["position_ids"].max().item() < 32
+        assert 0 < n <= 32, f"block has bad length {n}"
+        assert out["labels"].shape[0] == n and out["position_ids"].shape[0] == n
+        # Documents are never split: every block starts a document, and each document
+        # in it is the whole sample (positions 0..len-1).
+        pos = out["position_ids"].tolist()
+        assert pos[0] == 0
+        starts = [i for i, p in enumerate(pos) if p == 0] + [n]
+        packed_lengths += [b - a for a, b in zip(starts, starts[1:])]
+        assert all(pos[a:b] == list(range(b - a)) for a, b in zip(starts, starts[1:]))
 
-    assert outputs[0]["position_ids"][0].item() == 0, "first block must start at position 0"
+    assert sorted(packed_lengths) == sorted(lengths), "every document packed whole, none dropped"
     assert sum(o["input_ids"].shape[0] for o in outputs) == total_tokens, "no tokens may be dropped"
+    assert len(outputs) <= 4, "online first-fit decreasing over a 4-document buffer"
     print(f"  Produced {len(outputs)} packed sequences ({total_tokens} tokens, none dropped)")
     print("✓ test_packing_produces_correct_output PASSED\n")
 
 
 def test_packing_defensive_oversized_doc():
     """Packing handles documents longer than max_len gracefully."""
-    from palingenesis.data import PackedDataset, IGNORE_INDEX
+    from palingenesis.data import PackedDataset
 
     class FakeDataset:
         def __iter__(self):
@@ -594,7 +596,7 @@ def test_packing_defensive_oversized_doc():
 
 def test_mini_training_loop():
     """Run 10 training steps on a tiny model and verify loss decreases."""
-    from palingenesis.loss import cross_entropy_loss, IGNORE_INDEX
+    from palingenesis.loss import IGNORE_INDEX, cross_entropy_loss
     from palingenesis.optim import Hyperball, build_scheduler, is_hyperball_param
 
     torch.manual_seed(42)
@@ -625,7 +627,7 @@ def test_mini_training_loop():
     reduction = 1 - last_5 / first_5
 
     assert reduction > 0.1, f"Loss should decrease by >10%, got {reduction*100:.1f}%"
-    assert all(math.isfinite(l) for l in losses), "No NaN/Inf losses"
+    assert all(math.isfinite(x) for x in losses), "No NaN/Inf losses"
 
     print(f"  Initial: {first_5:.4f}, Final: {last_5:.4f}, Reduction: {reduction*100:.1f}%")
     print("✓ test_mini_training_loop PASSED\n")

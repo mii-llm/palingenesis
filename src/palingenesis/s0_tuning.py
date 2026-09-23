@@ -235,8 +235,6 @@ class S0InjectionHooks:
         self.remove()  # clear any existing hooks
 
         for i, info in enumerate(self.layer_infos):
-            state_param = self.s0_states.states[i]
-
             def make_hook(idx: int, layer_info: RecurrentLayerInfo):
                 def hook(module, args, kwargs=None):
                     # Inject the scaled state

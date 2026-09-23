@@ -83,13 +83,13 @@ def test_multiple_loss_functions_exclusive():
     cfg = Config()
     cfg.plugins.deft = True
     cfg.plugins.dft = True
-    with pytest.raises(ConfigError, match="one token-weighting loss"):
+    with pytest.raises(ConfigError, match="one training objective plugin"):
         cfg.validate()
 
     cfg2 = Config()
     cfg2.plugins.cadft = True
     cfg2.plugins.info_sft = True
-    with pytest.raises(ConfigError, match="one token-weighting loss"):
+    with pytest.raises(ConfigError, match="one training objective plugin"):
         cfg2.validate()
 
 
@@ -127,29 +127,19 @@ def test_adagc_plus_spike_detection_warns():
     assert any("adagc" in w and "spike_detection" in w for w in warnings)
 
 
-def test_pre_rl_shadowed_warns():
-    """pre_rl is silently shadowed by earlier loss branches — validate() must warn.
-
-    The trainer picks ONE loss objective per run (chunked DEFT > chunked CE >
-    CADFT > DEFT > DFT > InfoSFT > pre_rl > CE). Enabling pre_rl alongside deft
-    or chunked_loss means it never runs.
-    """
+def test_pre_rl_is_exclusive_and_not_shadowed_by_chunked_loss():
+    """pre_rl with another objective is an error; with chunked_loss it runs (the
+    trainer computes full logits for it instead of chunking)."""
     cfg = Config()
     cfg.plugins.deft = True
     cfg.plugins.pre_rl = True
-    cfg.memory.chunked_loss = True
-    warnings = cfg.validate()
-    shadow_warnings = [w for w in warnings if "IGNORED" in w and "pre_rl" in w]
-    assert shadow_warnings, f"Expected a pre_rl-shadowed warning, got: {warnings}"
-    assert "plugins.deft" in shadow_warnings[0]
-    assert "memory.chunked_loss" in shadow_warnings[0]
+    with pytest.raises(ConfigError, match="one training objective plugin"):
+        cfg.validate()
 
-    # A correctly-configured pre_rl run does not warn
     cfg2 = Config()
     cfg2.plugins.pre_rl = True
-    cfg2.memory.chunked_loss = False
-    warnings2 = cfg2.validate()
-    assert not any("IGNORED" in w for w in warnings2), warnings2
+    cfg2.memory.chunked_loss = True
+    cfg2.validate()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -217,3 +207,65 @@ def test_packing_epoch_horizon_warns():
     cfg.train.max_steps = 5000
     warnings = cfg.validate()
     assert not any("epochs-based LR horizon" in w for w in warnings)
+
+
+# ── Loading: unknown options are errors, values are coerced to the option's type ──
+def _yaml(tmp_path, text):
+    p = tmp_path / "c.yaml"
+    p.write_text(text)
+    return p
+
+
+def test_yaml_unknown_option_is_an_error_with_a_hint(tmp_path):
+    import pytest
+
+    from palingenesis.config import Config, ConfigError
+
+    with pytest.raises(ConfigError, match=r"train\.learnig_rate.*did you mean train\.learning_rate"):
+        Config.from_yaml(_yaml(tmp_path, "train:\n  learnig_rate: 1.0e-5\n"))
+    with pytest.raises(ConfigError, match="unknown config section `trian`.*`train`"):
+        Config.from_yaml(_yaml(tmp_path, "trian:\n  epochs: 2\n"))
+
+
+def test_yaml_removed_option_explains_why(tmp_path):
+    import pytest
+
+    from palingenesis.config import Config, ConfigError
+
+    with pytest.raises(ConfigError, match="seq_len_curriculum was removed: it never took effect"):
+        Config.from_yaml(_yaml(tmp_path, "data:\n  seq_len_curriculum: true\n"))
+
+
+def test_yaml_values_are_coerced(tmp_path):
+    from palingenesis.config import Config
+
+    c = Config.from_yaml(_yaml(tmp_path, "train:\n  learning_rate: 2e-5\n  max_grad_norm: 1\n"
+                                         "data:\n  packing: 'true'\n  max_seq_length: '4096'\n"))
+    assert c.train.learning_rate == 2e-5 and isinstance(c.train.max_grad_norm, float)
+    assert c.data.packing is True and c.data.max_seq_length == 4096
+
+
+def test_cli_overrides_are_checked():
+    import pytest
+
+    from palingenesis.config import Config, ConfigError
+
+    c = Config.from_cli(["--train.learning_rate", "3e-5", "--data.packing", "false", "--train.resume_from", "auto"])
+    assert c.train.learning_rate == 3e-5 and c.data.packing is False and c.train.resume_from == "auto"
+    with pytest.raises(ConfigError, match="did you mean train.epochs"):
+        Config.from_cli(["--train.epoch", "2"])
+    with pytest.raises(ConfigError, match="not a valid bool"):
+        Config.from_cli(["--data.packing", "maybe"])
+
+
+def test_every_shipped_config_loads():
+    from pathlib import Path
+
+    from palingenesis.config import Config
+    from palingenesis.opd.config import OPDConfig
+
+    configs = sorted((Path(__file__).parent.parent / "configs").rglob("*.yaml"))
+    assert configs
+    for path in configs:
+        # on-policy distillation configs have their own schema
+        (OPDConfig if path.name.startswith("distill_") else Config).from_yaml(path)

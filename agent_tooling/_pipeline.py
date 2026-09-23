@@ -63,6 +63,7 @@ def training_samples(config: Config, tokenizer) -> Iterator[dict]:
             last_turn_only=config.data.last_turn_only,
             train_on_reasoning=config.data.train_on_reasoning,
             truncate_rejected=d.truncate_rejected,
+            tools_field=config.data.tools_field,
         )
         for pair in pairs:
             yield {**pair["chosen"], "side": "chosen"}

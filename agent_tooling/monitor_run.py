@@ -75,8 +75,12 @@ def analyze_run(steps: list[StepInfo], max_steps: int | None = None) -> dict:
         issues.append("CRITICAL: Latest loss is NaN/Inf — training has crashed.")
     elif loss_trend > 0.1 and n > 20:
         issues.append(f"WARNING: Loss trending UP ({loss_trend:+.1%} over last 20 steps). May be diverging.")
-    elif abs(loss_trend) < 0.001 and n > 50:
-        issues.append("INFO: Loss has plateaued — may need LR adjustment or more data diversity.")
+    elif n >= 100:
+        # Plateau: judged on 50-step means (single steps are too noisy)
+        last50 = sum(s.loss for s in steps[-50:]) / 50
+        prev50 = sum(s.loss for s in steps[-100:-50]) / 50
+        if abs(last50 - prev50) / max(prev50, 1e-8) < 0.005:
+            issues.append("INFO: Loss has plateaued (mean of the last 50 steps within 0.5% of the 50 before).")
 
     # Gradient norms are logged before clipping and their scale depends on the model,
     # vocabulary and objective, so judge the latest one against the run's own history.

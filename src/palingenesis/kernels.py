@@ -9,10 +9,10 @@ import logging
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
+from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 logger = logging.getLogger(__name__)
 
@@ -20,49 +20,68 @@ logger = logging.getLogger(__name__)
 # ─── Liger Kernel ─────────────────────────────────────────────────────────────
 
 
-def apply_liger_kernel(model_type: str | None = None) -> bool:
-    """Patch HF model implementations with Liger fused kernels. Call BEFORE model load."""
+def apply_liger_kernel(model_type: str | None) -> bool:
+    """Patch the HF implementation of `model_type` (the model config's `model_type`,
+    e.g. "qwen3", "qwen3_5", "llama") with Liger's fused kernels: RMSNorm, SwiGLU, RoPE
+    and the model-specific extras Liger provides. Call BEFORE the model is created.
+
+    Liger's loss patches stay off: the trainer computes the loss itself from hidden
+    states (chunked CE, DEFT, DPO, SeCO), never through the model's forward.
+    Returns whether a patch was applied.
+    """
     try:
-        import liger_kernel.transformers as lk
+        from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN, _apply_liger_kernel
     except ImportError:
-        logger.warning("liger-kernel not installed, skipping kernel patches.")
+        logger.warning("liger-kernel not installed: training without its fused kernels.")
         return False
 
-    patch_map: dict[str, list] = {
-        "llama": [lk.apply_liger_kernel_to_llama],
-        "mistral": [lk.apply_liger_kernel_to_mistral],
-        "gemma": [lk.apply_liger_kernel_to_gemma],
-        "gemma2": [lk.apply_liger_kernel_to_gemma2],
-        "qwen2": [lk.apply_liger_kernel_to_qwen2],
-        "qwen": [lk.apply_liger_kernel_to_qwen2],
-    }
-
-    if model_type and model_type in patch_map:
-        for fn in patch_map[model_type]:
-            fn()
-        logger.info(f"Liger Kernel applied for {model_type}")
-    else:
-        # Apply all available patches
-        for fns in patch_map.values():
-            for fn in fns:
-                try:
-                    fn()
-                except Exception:
-                    pass
-        logger.info("Liger Kernel patches applied (all architectures)")
+    if model_type not in MODEL_TYPE_TO_APPLY_LIGER_FN:
+        logger.info(f"Liger Kernel has no patch for model_type={model_type!r}: training without it.")
+        return False
+    _apply_liger_kernel(model_type, cross_entropy=False, fused_linear_cross_entropy=False)
+    logger.info(f"Liger Kernel applied for model_type={model_type}")
     return True
+
+
+def model_type_of(name_or_path: str, trust_remote_code: bool = False) -> str | None:
+    """`model_type` of a model's config (its text config for multimodal checkpoints
+    loaded as causal LMs, when Liger knows only that one)."""
+    from transformers import AutoConfig
+
+    try:
+        config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+    except Exception as exc:
+        logger.warning(f"Could not read the config of {name_or_path!r} ({exc}); Liger Kernel not applied.")
+        return None
+    return getattr(config, "model_type", None)
 
 
 # ─── Activation Checkpointing ────────────────────────────────────────────────
 
 
-# Ops whose outputs are expensive to recompute — save them
-_SAVE_OPS = {
-    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
-    torch.ops.aten._scaled_dot_product_attention_math.default,
-    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
-    torch.ops.aten.linear.default,
-}
+# Ops whose outputs are expensive to recompute: saved by the selective policy. These
+# are the ops the checkpoint's dispatch mode sees: nn.Linear reaches it as aten.mm
+# (never aten.linear), and SDPA as its backend-specific op (flash on A100/H100).
+def _save_ops() -> set:
+    names = (
+        ("aten", "mm"),
+        ("aten", "_scaled_dot_product_flash_attention"),
+        ("aten", "_scaled_dot_product_efficient_attention"),
+        ("aten", "_scaled_dot_product_cudnn_attention"),
+        ("aten", "_scaled_dot_product_fused_attention_overrideable"),
+        ("aten", "_flash_attention_forward"),
+        ("aten", "_efficient_attention_forward"),
+        ("_c10d_functional", "reduce_scatter_tensor"),
+    )
+    ops = set()
+    for namespace, op in names:
+        packet = getattr(getattr(torch.ops, namespace), op, None)
+        if packet is not None and hasattr(packet, "default"):
+            ops.add(packet.default)
+    return ops
+
+
+_SAVE_OPS = _save_ops()
 
 
 def apply_activation_checkpointing(model: nn.Module, mode: str = "selective"):
@@ -104,21 +123,23 @@ def apply_activation_checkpointing(model: nn.Module, mode: str = "selective"):
 
 
 def _selective_policy():
-    """Selective AC policy: save SDPA + every other matmul, recompute the rest.
+    """Selective AC policy (torchtitan's op-level SAC): save attention outputs and every
+    other matmul, recompute the rest (norms, activations, the other matmuls).
 
-    This balances memory and compute — norms, activations, and half the matmuls
-    are recomputed (cheap), while attention and the other half of matmuls are
-    saved (expensive to recompute).
+    The matmul parity is counted separately for the forward and for the recompute:
+    both must pick the same matmuls, and one shared counter would shift the parity
+    whenever a layer has an odd number of matmuls.
     """
-    meta = {"mm_count": 0}
+    counts = {"forward": 0, "recompute": 0}
+    mm = torch.ops.aten.mm.default
 
     def policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
+        if func == mm:
+            key = "recompute" if ctx.is_recompute else "forward"
+            counts[key] += 1
+            if counts[key] % 2 == 0:
+                return CheckpointPolicy.PREFER_RECOMPUTE
         if func in _SAVE_OPS:
-            if func == torch.ops.aten.linear.default:
-                meta["mm_count"] += 1
-                # Save every other matmul
-                if meta["mm_count"] % 2 == 0:
-                    return CheckpointPolicy.PREFER_RECOMPUTE
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 

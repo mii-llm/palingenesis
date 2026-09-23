@@ -79,7 +79,7 @@ def output_head(model: nn.Module) -> nn.Module | None:
 
 
 @torch.no_grad()
-def verify_output_head(model: nn.Module, head: nn.Module, backbone: nn.Module, tokens: int = 32) -> float:
+def verify_output_head(model: nn.Module, head: nn.Module, backbone: nn.Module | None = None, tokens: int = 32) -> float:
     """Raise if head(backbone(x)) differs from model(x).logits. Random tokens,
     eval mode (restored afterwards). Returns the relative max difference."""
     device = next(model.parameters()).device
@@ -91,8 +91,7 @@ def verify_output_head(model: nn.Module, head: nn.Module, backbone: nn.Module, t
     torch.set_float32_matmul_precision("highest")       # compare implementations, not TF32 noise
     try:
         reference = model(input_ids=ids).logits.float()
-        out = backbone(input_ids=ids)
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        hidden = final_hidden_states(model, ids) if backbone is None else _last_hidden(backbone(input_ids=ids))
         ours = head(hidden).float()
     finally:
         model.train(was_training)
@@ -107,6 +106,43 @@ def verify_output_head(model: nn.Module, head: nn.Module, backbone: nn.Module, t
             "memory.chunked_loss (and DPO/SeCO, which need it) for this model."
         )
     return diff
+
+
+def _last_hidden(outputs):
+    if hasattr(outputs, "last_hidden_state"):
+        return outputs.last_hidden_state
+    return outputs[0] if isinstance(outputs, tuple) else outputs
+
+
+def final_hidden_states(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None,
+                        **kwargs) -> torch.Tensor:
+    """The backbone's output: the hidden states the output head projects.
+
+    Normally the backbone is called directly. Under FSDP2 the call goes through the
+    root module's forward instead, which is what gathers the parameters the root owns
+    (embeddings, final norm, head) and runs FSDP's root setup; calling the backbone on
+    its own would fail. The backbone's output is captured by a hook and the head is
+    only applied to the last position (logits_to_keep=1), so its cost is negligible.
+    """
+    from torch.distributed.fsdp import FSDPModule
+
+    backbone = backbone_of(model)
+    if not isinstance(model, FSDPModule):
+        return _last_hidden(backbone(input_ids=input_ids, attention_mask=attention_mask, **kwargs))
+    captured = {}
+
+    def hook(module, args, output):
+        captured["hidden"] = _last_hidden(output)
+
+    handle = backbone.register_forward_hook(hook)
+    try:
+        try:
+            model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=1, **kwargs)
+        except TypeError:  # a model without logits_to_keep
+            model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    finally:
+        handle.remove()
+    return captured["hidden"]
 
 
 def backbone_of(model: nn.Module) -> nn.Module:
@@ -138,18 +174,17 @@ def scored_ce_sum(model: nn.Module, input_ids: torch.Tensor, attention_mask: tor
         return 0.0, 0
     head = output_head(model)
     try:
-        backbone = backbone_of(model) if head is not None else None
+        separable = head is not None and backbone_of(model) is not None
     except RuntimeError:
-        backbone = None
+        separable = False
     targets = shifted_labels[valid]
     with torch.amp.autocast("cuda", dtype=dtype, enabled=autocast and input_ids.is_cuda):
-        if backbone is None:                     # no separable head: score the model's own logits
+        if not separable:                        # no separable head: score the model's own logits
             out = model(input_ids=input_ids, attention_mask=attention_mask)
             rows = (out.logits if hasattr(out, "logits") else out[0])[valid]
             project = None
         else:
-            out = backbone(input_ids=input_ids, attention_mask=attention_mask)
-            rows = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])[valid]
+            rows = final_hidden_states(model, input_ids, attention_mask)[valid]
             project = head
         vocab = head.weight.shape[0] if project is not None else rows.shape[-1]
         step = max(1, int(chunk_bytes // (vocab * 4)))

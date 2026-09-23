@@ -28,11 +28,11 @@ def profile_hardware() -> dict:
     props = torch.cuda.get_device_properties(0)
     return {
         "gpu_name": props.name,
-        "memory_gb": props.total_memory / 1e9,
+        "memory_gb": props.total_memory / 2**30,
         "compute_capability": (props.major, props.minor),
         "num_gpus": torch.cuda.device_count(),
         "supports_bf16": props.major >= 8,
-        "supports_float8": props.major >= 8 and props.minor >= 9,
+        "supports_float8": (props.major, props.minor) >= (8, 9),   # Ada, Hopper, Blackwell
     }
 
 
@@ -41,6 +41,8 @@ def auto_config(
     seq_len: int,
     vocab_size: int,
     hardware: dict,
+    hidden_size: int = 4096,
+    num_layers: int = 32,
 ) -> dict:
     """Generate optimal training config based on hardware + model size.
 
@@ -74,10 +76,10 @@ def auto_config(
     # Remaining memory for activations
     activation_budget_gb = usable_mem - sharded
 
-    # Estimate activation memory per token (rough: 10 bytes/token for selective AC)
-    # This is a simplification; real value depends on hidden_size, num_layers
-    bytes_per_token = 10  # bf16 activations with selective AC
-    tokens_that_fit = int(activation_budget_gb * 1e9 / bytes_per_token)
+    # Activations per token with selective AC: ~20 x hidden_size bytes per layer
+    # (measured: Qwen3-0.6B, 28 layers x 1024, 8.6 GiB for 16k tokens).
+    bytes_per_token = 20 * hidden_size * num_layers
+    tokens_that_fit = int(max(activation_budget_gb, 0) * 2**30 / bytes_per_token)
 
     # Batch size: how many sequences fit
     max_batch = max(1, tokens_that_fit // seq_len)
@@ -109,7 +111,7 @@ def auto_config(
         "memory.loss_num_chunks": num_chunks,
         "memory.chunked_loss": num_chunks > 1,
         "memory.float8_training": use_float8,
-        "memory.gradient_release": grad_accum == 1,  # Enable when no accumulation needed
+        "memory.gradient_release": False,  # experimental; it also disables global clipping
         "memory.selective_diff": True,  # Always beneficial (zero cost)
         "parallel.context_parallel": use_cp,
         "parallel.fsdp": num_gpus > 1,
@@ -122,7 +124,7 @@ def auto_config(
     logger.info(
         f"Auto-config: batch={recommended_batch}, grad_accum={grad_accum}, "
         f"chunks={num_chunks}, CP={use_cp}, float8={use_float8}, "
-        f"grad_release={grad_accum == 1}"
+        f"grad_release=False"
     )
     return config
 

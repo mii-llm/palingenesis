@@ -21,8 +21,6 @@ import json
 import math
 import os
 import tempfile
-import functools
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -30,7 +28,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIXTURES — Tiny model compatible with FSDP
@@ -153,7 +150,7 @@ def _get_reference_gradients(model, batch, valid_tokens):
 def _fsdp_gradient_worker(rank, world_size, ref_state_dict, batch, expected_loss, results_path):
     """Worker: apply FSDP2 to model, run forward/backward, compare gradients."""
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     torch.manual_seed(42)
     model = TinyDistributedLM(vocab_size=256, hidden=64, num_layers=4)
@@ -177,6 +174,8 @@ def _fsdp_gradient_worker(rank, world_size, ref_state_dict, batch, expected_loss
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+            # plain SUM, as apply_fsdp sets it (gloo has no PREMUL_SUM)
+            module.set_force_sum_reduction_for_comms(True)
 
     # Each rank sees the FULL batch (simulating DP with world_size=2 and same data)
     # In real training, each rank sees different data. Here we use same data
@@ -404,6 +403,7 @@ def test_context_parallel_sharding_roundtrip():
 def test_context_parallel_rejects_indivisible_seqlen():
     """CP raises clear error when seq_len % cp_world_size != 0."""
     from unittest.mock import MagicMock
+
     from palingenesis.context_parallel import shard_for_context_parallel
 
     mock_mesh = MagicMock()
@@ -431,9 +431,9 @@ def test_context_parallel_rejects_indivisible_seqlen():
 
 def _grad_accum_worker(rank, world_size, results_path):
     """Worker: simulate gradient accumulation with FSDP sync control."""
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
     from torch.distributed._composable.fsdp import FSDPModule
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     torch.manual_seed(42 + rank)
 
@@ -448,6 +448,8 @@ def _grad_accum_worker(rank, world_size, results_path):
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+            # plain SUM, as apply_fsdp sets it (gloo has no PREMUL_SUM)
+            module.set_force_sum_reduction_for_comms(True)
 
     # Simulate gradient_accumulation_steps=4
     grad_accum_steps = 4
@@ -516,104 +518,8 @@ def test_fsdp_gradient_accumulation_sync():
         os.unlink(results_path)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TEST 5: Chunked CE loss + FSDP reshard state management
-# The chunked loss disables reshard on lm_head across chunks and re-enables
-# after. Verify this doesn't corrupt the model state.
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _chunked_fsdp_worker(rank, world_size, results_path):
-    """Worker: chunked CE with FSDP, verify loss matches standard CE."""
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-    from torch.distributed._composable.fsdp import FSDPModule
-    from palingenesis.loss import chunked_cross_entropy_loss, cross_entropy_loss
-
-    torch.manual_seed(42)
-    model = TinyDistributedLM(vocab_size=64, hidden=32, num_layers=2)
-    mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp",))
-    mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
-
-    for layer in model.model["layers"]:
-        fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
-    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
-
-    for module in model.modules():
-        if isinstance(module, FSDPModule):
-            module.set_gradient_divide_factor(1.0)
-
-    batch = make_batch(batch_size=2, seq_len=32, vocab_size=64)
-    valid = (batch["labels"] != IGNORE_INDEX).sum().item()
-
-    # --- Standard CE loss ---
-    model.zero_grad()
-    output = model(batch["input_ids"])
-    logits = output.logits
-    std_loss = cross_entropy_loss(logits, batch["labels"], valid)
-    std_loss.backward()
-    std_grad_norm = sum(
-        p.grad.float().norm().item() ** 2
-        for p in model.parameters() if p.grad is not None
-    ) ** 0.5
-
-    # --- Chunked CE loss ---
-    model.zero_grad()
-    # Get hidden states from backbone (skip lm_head)
-    h = model.model["embed_tokens"](batch["input_ids"])
-    for layer in model.model["layers"]:
-        h = layer(h)
-    h = model.model["norm"](h)
-
-    chunked_loss = chunked_cross_entropy_loss(
-        h, batch["labels"], model.lm_head,
-        num_chunks=4, global_valid_tokens=valid,
-    )
-    chunked_loss.backward()
-    chunked_grad_norm = sum(
-        p.grad.float().norm().item() ** 2
-        for p in model.parameters() if p.grad is not None
-    ) ** 0.5
-
-    if rank == 0:
-        loss_diff = abs(std_loss.item() - chunked_loss.item())
-        results = {
-            "std_loss": std_loss.item(),
-            "chunked_loss": chunked_loss.item(),
-            "loss_diff": loss_diff,
-            "loss_matches": loss_diff < 1e-3,
-            "std_grad_norm": std_grad_norm,
-            "chunked_grad_norm": chunked_grad_norm,
-        }
-        with open(results_path, "w") as f:
-            json.dump(results, f)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="FSDP2 requires NCCL backend (GPU-only)",
-)
-def test_chunked_loss_fsdp_consistency():
-    """Chunked CE with FSDP produces same loss as standard CE with FSDP."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        results_path = f.name
-
-    try:
-        run_distributed(_chunked_fsdp_worker, 2, results_path)
-
-        with open(results_path) as f:
-            results = json.load(f)
-
-        assert results["loss_matches"], (
-            f"Chunked loss {results['chunked_loss']:.6f} != "
-            f"standard {results['std_loss']:.6f} (diff={results['loss_diff']:.6f})"
-        )
-        print(f"  Standard CE: {results['std_loss']:.6f}")
-        print(f"  Chunked CE:  {results['chunked_loss']:.6f}")
-        print(f"  Diff: {results['loss_diff']:.2e}")
-        print("✓ test_chunked_loss_fsdp_consistency PASSED\n")
-    finally:
-        os.unlink(results_path)
+# TEST 5 (chunked CE under FSDP through the trainer's own path) lives in
+# tests/test_fsdp_trainer_path.py.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -624,8 +530,8 @@ def test_chunked_loss_fsdp_consistency():
 
 def test_build_mesh_topology_single_gpu():
     """Single GPU: no mesh created."""
-    from palingenesis.distributed import build_mesh
     from palingenesis.config import ParallelConfig
+    from palingenesis.distributed import build_mesh
 
     cfg = ParallelConfig(fsdp=True, context_parallel=False)
     mesh = build_mesh(world_size=1, config=cfg)
@@ -636,8 +542,8 @@ def test_build_mesh_topology_single_gpu():
 
 def _mesh_topology_worker(rank, world_size, results_path):
     """Worker: build mesh and report its shape."""
-    from palingenesis.distributed import build_mesh
     from palingenesis.config import ParallelConfig
+    from palingenesis.distributed import build_mesh
 
     # Test: FSDP only (no CP)
     cfg_fsdp = ParallelConfig(fsdp=True, context_parallel=False)
@@ -663,8 +569,8 @@ def _mesh_topology_worker(rank, world_size, results_path):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="build_mesh uses 'cuda' device mesh which requires GPU",
+    torch.cuda.device_count() < 4,
+    reason="build_mesh uses a 'cuda' device mesh, one device per rank: needs 4 GPUs",
 )
 def test_build_mesh_topology_multi_gpu():
     """Multi-GPU: correct mesh shapes for FSDP and FSDP+CP."""
@@ -704,10 +610,11 @@ def test_build_mesh_topology_multi_gpu():
 
 def _apply_fsdp_worker(rank, world_size, results_path):
     """Worker: apply_fsdp and verify layer structure."""
-    from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed._composable.fsdp import FSDPModule
-    from palingenesis.distributed import apply_fsdp
+    from torch.distributed.device_mesh import init_device_mesh
+
     from palingenesis.config import ParallelConfig
+    from palingenesis.distributed import apply_fsdp
 
     torch.manual_seed(42)
     model = TinyDistributedLM(vocab_size=64, hidden=32, num_layers=4)
@@ -776,9 +683,9 @@ def test_apply_fsdp_layer_structure():
 
 def _multi_step_worker(rank, world_size, results_path):
     """Worker: run 20 training steps with FSDP, verify convergence."""
-    from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
     from torch.distributed._composable.fsdp import FSDPModule
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     torch.manual_seed(42)
     model = TinyDistributedLM(vocab_size=64, hidden=32, num_layers=2)
@@ -792,6 +699,8 @@ def _multi_step_worker(rank, world_size, results_path):
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+            # plain SUM, as apply_fsdp sets it (gloo has no PREMUL_SUM)
+            module.set_force_sum_reduction_for_comms(True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
@@ -832,7 +741,7 @@ def _multi_step_worker(rank, world_size, results_path):
             "first_5_avg": first_5,
             "last_5_avg": last_5,
             "reduction": reduction,
-            "all_finite": all(math.isfinite(l) for l in losses),
+            "all_finite": all(math.isfinite(x) for x in losses),
             "converged": reduction > 0.05,
         }
         with open(results_path, "w") as f:
@@ -876,8 +785,7 @@ def test_fsdp_multi_step_convergence():
 def _checkpoint_fsdp_worker(rank, world_size, results_path, tmpdir):
     """Worker: save FSDP checkpoint, load into fresh model, compare."""
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-    from torch.distributed._composable.fsdp import FSDPModule
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     torch.manual_seed(42)
     model = TinyDistributedLM(vocab_size=64, hidden=32, num_layers=2)
@@ -895,11 +803,12 @@ def _checkpoint_fsdp_worker(rank, world_size, results_path, tmpdir):
             p.add_(torch.randn_like(p) * 0.1)
 
     # Save via DCP
-    from torch.distributed.checkpoint import save as dcp_save, load as dcp_load
+    from torch.distributed.checkpoint import load as dcp_load
+    from torch.distributed.checkpoint import save as dcp_save
     from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
         get_model_state_dict,
         set_model_state_dict,
-        StateDictOptions,
     )
 
     ckpt_path = os.path.join(tmpdir, "fsdp_ckpt")
@@ -993,7 +902,6 @@ if __name__ == "__main__":
         test_build_mesh_topology_multi_gpu()
         test_fsdp2_gradient_equivalence()
         test_fsdp_gradient_accumulation_sync()
-        test_chunked_loss_fsdp_consistency()
         test_apply_fsdp_layer_structure()
         test_fsdp_multi_step_convergence()
         test_fsdp_dcp_checkpoint_roundtrip()

@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 
+OPTIMIZERS = ("adamw", "muon", "adamw8bit", "lion8bit", "paged_adamw8bit")
+
+
 def build_optimizer(
     model: torch.nn.Module,
     lr: float,
@@ -38,11 +41,14 @@ def build_optimizer(
       - "muon": hybrid Muon + AdamW (8 bytes/param, 1.5× convergence)
       - "adamw8bit": bitsandbytes 8-bit AdamW (6 bytes/param)
       - "lion8bit": bitsandbytes 8-bit Lion (4 bytes/param, sign-based)
+      - "paged_adamw8bit": 8-bit AdamW whose states page to CPU memory under pressure
     """
+    if optimizer_name not in OPTIMIZERS:
+        raise ValueError(f"train.optimizer={optimizer_name!r} is not one of {', '.join(OPTIMIZERS)}.")
     if use_muon or optimizer_name == "muon":
         return _build_muon_optimizer(model, lr, weight_decay)
 
-    if optimizer_name in ("adamw8bit", "lion8bit"):
+    if optimizer_name in ("adamw8bit", "lion8bit", "paged_adamw8bit"):
         return _build_bnb_optimizer(model, lr, weight_decay, optimizer_name)
 
     if llrd_decay >= 1.0:
@@ -149,7 +155,10 @@ def _build_muon_optimizer(model: torch.nn.Module, lr: float, weight_decay: float
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim >= 2 and "embed" not in name.lower():
+        # Muon orthogonalises hidden 2-D matrices; embeddings and the output head stay
+        # on AdamW (as in the Muon paper), and so do stacked 3-D expert weights, which
+        # torch's Muon does not accept.
+        if p.ndim == 2 and not any(k in name.lower() for k in ("embed", "lm_head")):
             muon_params.append(p)
             muon_count += p.numel()
         elif any(k in name.lower() for k in ("bias", "norm")):

@@ -38,17 +38,13 @@ If your SFT model will undergo GRPO/DPO/PPO afterward, this plugin preserves the
 
 ```yaml
 plugins:
-  deft: false                 # required: DEFT takes precedence over pre_rl
   pre_rl: true
   pre_rl_entropy_coeff: 0.1   # Strength of entropy preservation
   pre_rl_kl_coeff: 0.5        # Strength of KL anchor to base
-
-memory:
-  chunked_loss: false         # required: pre_rl needs full logits
 ```
 
 !!! warning "Loss objectives don't stack"
-    The trainer picks a single loss objective per run (priority: chunked DEFT → chunked CE → CADFT → DEFT → DFT → InfoSFT → pre_rl → CE). With `deft: true` or `memory.chunked_loss: true` set, `pre_rl: true` is silently ignored.
+    One objective per run: enabling more than one of `deft`, `dft`, `cadft`, `info_sft`, `pre_rl` is a configuration error. DEFT, DFT, CADFT and InfoSFT run chunked under `memory.chunked_loss` (never the full logits); `pre_rl` compares full logits with a reference snapshot, so it materializes them whatever `chunked_loss` says.
 
 See [SFT → RL Transition](../guides/sft-to-rl.md) for the full guide.
 

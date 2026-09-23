@@ -28,7 +28,8 @@ import agent_tooling._path_setup  # noqa: F401
 from palingenesis.config import Config
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-GB = 1e9
+# GiB throughout, like the measured peak: GPUs are sold by GiB ("80 GB" A100 = 80 GiB).
+GB = 2**30
 
 
 def _model_config(config: Config):
@@ -238,19 +239,19 @@ def print_report(est: dict):
     print(f"  Hidden: {est['hidden_size']} | Layers: {est['num_layers']} | Vocab: {est['vocab_size']:,}")
     print()
     print("  Exact (single GPU, before any FSDP sharding):")
-    print(f"    Model parameters:     {est['params_memory_gb']:6.1f} GB")
-    print(f"    Optimizer states:     {est['optimizer_memory_gb']:6.1f} GB  [{est['optimizer_label']}]")
-    print(f"    Gradients:            {est['grad_memory_gb']:6.1f} GB")
+    print(f"    Model parameters:     {est['params_memory_gb']:6.1f} GiB")
+    print(f"    Optimizer states:     {est['optimizer_memory_gb']:6.1f} GiB  [{est['optimizer_label']}]")
+    print(f"    Gradients:            {est['grad_memory_gb']:6.1f} GiB")
     if est["reference_memory_gb"]:
-        print(f"    DPO reference model:  {est['reference_memory_gb']:6.1f} GB")
+        print(f"    DPO reference model:  {est['reference_memory_gb']:6.1f} GiB")
     print("  Estimated:")
-    print(f"    Logits (one chunk):   {est['ce_peak_gb']:6.1f} GB")
+    print(f"    Logits (one chunk):   {est['ce_peak_gb']:6.1f} GiB")
     if est["kv_memory_gb"]:
-        print(f"    SeCO K/V cache:       {est['kv_memory_gb']:6.1f} GB")
-    print(f"    Activations (rough):  {est['activation_memory_gb']:6.1f} GB  [checkpointing: {est['ac_mode']}]")
+        print(f"    SeCO K/V cache:       {est['kv_memory_gb']:6.1f} GiB")
+    print(f"    Activations (rough):  {est['activation_memory_gb']:6.1f} GiB  [checkpointing: {est['ac_mode']}]")
     print(f"    {'─' * 50}")
-    print(f"    Total (+10% overhead): {est['total_estimated_gb']:5.1f} GB of {est['gpu_memory_gb']:.0f} GB "
-          f"({est['headroom_gb']:+.1f} GB)")
+    print(f"    Total (+10% overhead): {est['total_estimated_gb']:5.1f} GiB of {est['gpu_memory_gb']:.0f} GiB "
+          f"({est['headroom_gb']:+.1f} GiB)")
     print()
     verdict = "should fit" if est["fits"] else "likely does NOT fit"
     print(f"  {'✓' if est['fits'] else '✗'} Estimate: {verdict}. Activations are approximate; "
@@ -264,7 +265,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--gpu_memory_gb", "--gpu", type=float, default=80.0, dest="gpu_memory_gb",
-                        help="GPU memory in GB (default: 80)")
+                        help="GPU memory in GiB, as GPUs are rated (default: 80)")
     parser.add_argument("--measure", action="store_true", help="run two real optimizer steps and report the peak")
     args = parser.parse_args()
 

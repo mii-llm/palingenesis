@@ -101,8 +101,7 @@ def test_weight_recovery():
     for _ in range(5):
         state.weight = min(state.weight * 1.15, state.original_weight)
 
-    expected = 0.5 * (1.15**5)
-    # But capped at original (1.0)
+    # 0.5 * 1.15**5 ≈ 1.006, capped at the original weight (1.0)
     assert state.weight <= state.original_weight
     assert state.weight > 0.5, f"Expected recovery above 0.5, got {state.weight:.4f}"
 
@@ -171,7 +170,7 @@ def test_evaluate_with_model():
     metrics2 = tracker.evaluate_and_adjust(model, step=10, device=torch.device("cpu"), dtype=torch.float32, bf16=False)
 
     # Losses should be higher → trend should be negative
-    print(f"  After corruption:")
+    print("  After corruption:")
     print(
         f"  src_a: loss={metrics2['msft/src_a/val_loss']:.4f}, weight={metrics2['msft/src_a/weight']:.4f}, "
         f"trend={metrics2['msft/src_a/trend']}"
@@ -238,7 +237,7 @@ def test_mixed_dataset_update():
     # 'a' should have lower probability than before
     assert ds.probs[0] < 0.6, f"'a' prob should have decreased, got {ds.probs[0]:.4f}"
     # 'b' and 'c' should have increased relative share
-    assert ds.probs[1] > 0.3, f"'b' prob should have increased"
+    assert ds.probs[1] > 0.3, "'b' prob should have increased"
 
     print(f"  Updated probs: {[f'{p:.3f}' for p in ds.probs]}")
     print("✓ test_mixed_dataset_update PASSED\n")

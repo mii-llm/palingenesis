@@ -245,7 +245,7 @@ def test_combined_memory_savings():
     # Check trainable weights changed
     print(f"  {n_modified} frozen layers (selective diff)")
     print(f"  {len(trainable)} trainable params (gradient release)")
-    print(f"  Combined: all gradients freed after backward ✓")
+    print("  Combined: all gradients freed after backward ✓")
 
     gr.disable()
     print("✓ test_combined_memory_savings PASSED\n")

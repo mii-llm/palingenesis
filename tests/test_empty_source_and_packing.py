@@ -10,9 +10,11 @@ Two independent failure modes combined to zero out a run:
 These tests operate directly on the dataset classes (no tokenizer/model needed).
 """
 
+import itertools
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -72,8 +74,8 @@ def test_packing_short_stream_still_yields_one_block():
     blocks = list(PackedDataset(base, max_len=64, eos_id=0, sort_buffer=256))
     assert len(blocks) == 1
     assert sorted(blocks[0]["input_ids"].tolist()) == [1, 2, 3, 4, 5]
-    # position_ids reset per document (sorted: [4,5] then [1,2,3]).
-    assert blocks[0]["position_ids"].tolist() == [0, 1, 0, 1, 2]
+    # position_ids reset per document (first-fit decreasing: [1,2,3] then [4,5]).
+    assert blocks[0]["position_ids"].tolist() == [0, 1, 2, 0, 1]
 
 
 def test_packing_sequential_short_stream_yields_partial():
@@ -96,3 +98,40 @@ def test_packing_carries_remainder_across_buffer_flushes():
     assert len(all_ids) == 20, "every token is preserved across flushes"
     # 20 tokens / 4 = exactly 5 full blocks, no partial.
     assert [b["input_ids"].numel() for b in blocks] == [4, 4, 4, 4, 4]
+
+
+# ── PackedDataset: documents are never split across blocks ──────────────────────
+def _doc_lengths(block):
+    pos = block["position_ids"].tolist()
+    starts = [i for i, p in enumerate(pos) if p == 0] + [len(pos)]
+    return [b - a for a, b in zip(starts, starts[1:])]
+
+
+@pytest.mark.parametrize("sort_buffer", [0, 3, 256])
+def test_packing_never_splits_a_document(sort_buffer):
+    lengths = [7, 3, 9, 2, 6, 10, 4, 5, 8, 1]
+    base = [_seq(list(range(100 * i, 100 * i + n))) for i, n in enumerate(lengths)]
+    blocks = list(PackedDataset(base, max_len=10, eos_id=0, sort_buffer=sort_buffer))
+    assert all(b["input_ids"].numel() <= 10 for b in blocks)
+    assert sorted(n for b in blocks for n in _doc_lengths(b)) == sorted(lengths)
+    for b in blocks:  # each document's tokens stay together and in order
+        ids = b["input_ids"].tolist()
+        for a, n in zip([0] + list(itertools.accumulate(_doc_lengths(b))), _doc_lengths(b)):
+            assert ids[a:a + n] == list(range(ids[a], ids[a] + n))
+
+
+def test_bin_packing_fills_blocks():
+    """First-fit decreasing with open blocks carried across buffers: 55 tokens in
+    blocks of 10 need 6 blocks, even with a tiny buffer."""
+    base = [_seq([1] * n) for n in [7, 3, 9, 2, 6, 10, 4, 5, 8, 1]]
+    assert len(list(PackedDataset(base, max_len=10, eos_id=0, sort_buffer=3))) == 6
+
+
+def test_collate_pads_packed_rows_as_one_extra_document():
+    from palingenesis.data import collate_fn
+
+    block = {"input_ids": torch.tensor([5, 6, 7]), "labels": torch.tensor([5, 6, 7]),
+             "attention_mask": torch.ones(3, dtype=torch.long), "position_ids": torch.tensor([0, 1, 0])}
+    out = collate_fn([block], pad_id=0, pad_to_multiple=8)
+    assert out["position_ids"].tolist() == [[0, 1, 0, 0, 1, 2, 3, 4]]
+    assert out["labels"].tolist()[0][3:] == [-100] * 5

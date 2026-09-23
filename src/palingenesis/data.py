@@ -33,11 +33,14 @@ Config examples:
         text_field: text
 """
 
+import bisect
 import json
 import logging
-import math
+import os
 import random
 import re
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +147,173 @@ def _shard_then_shuffle(dataset, rank: int, world_size: int, shuffle_buffer: int
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CHAT-TEMPLATE TURN MARKERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class TurnMarkers:
+    """Where a chat template opens and closes an assistant turn.
+
+    header:    text written before every assistant turn whatever it contains, e.g.
+               "<|im_start|>assistant\\n". What follows it is what the model generates.
+    end:       the marker that closes an assistant turn, e.g. "<|im_end|>".
+    turn_open: the special token that opens every turn, e.g. "<|im_start|>" ("" if the
+               header has none); an assistant turn never extends past the next one.
+    """
+
+    header: str
+    end: str
+    turn_open: str
+
+
+# Probe strings: plain ASCII words that no template rewrites and no tokenizer splits oddly.
+_PROBE_USER, _PROBE_ANSWER, _PROBE_USER2, _PROBE_ANSWER2, _PROBE_REASONING = (
+    "PgsProbeUserOne", "PgsProbeAnswerOne", "PgsProbeUserTwo", "PgsProbeAnswerTwo", "PgsProbeReasoningOne"
+)
+
+
+def derive_turn_markers(render, tokenizer) -> TurnMarkers | None:
+    """Derive the assistant-turn markers of a chat template by rendering probe turns.
+
+    The header is the longest common prefix of the text the template puts before an
+    assistant turn in every situation: the generation prompt, a final turn, a turn in
+    the history, and a turn with reasoning. Templates differ exactly there (Qwen3.x open
+    the generation prompt with "<think>\\n" and drop it from history), so the common
+    prefix is the part that never belongs to the model's output. The end marker is the
+    first special token after a final turn's text. Returns None when the template
+    cannot be probed this way; callers then locate turns by their text.
+    """
+    user = {"role": "user", "content": _PROBE_USER}
+    answer = {"role": "assistant", "content": _PROBE_ANSWER}
+    try:
+        base = render([user])
+        gen = render([user], add_generation_prompt=True)
+        final = render([user, answer])
+        history = render([user, answer, {"role": "user", "content": _PROBE_USER2},
+                          {"role": "assistant", "content": _PROBE_ANSWER2}])
+    except Exception:
+        return None
+    try:
+        with_reasoning = render([user, {**answer, "reasoning_content": _PROBE_REASONING,
+                                        "reasoning": _PROBE_REASONING}])
+    except Exception:
+        with_reasoning = None
+
+    heads = [gen]
+    for text, probe in ((final, _PROBE_ANSWER), (history, _PROBE_ANSWER), (with_reasoning, _PROBE_REASONING)):
+        if text is None:
+            continue
+        i = text.find(probe, len(base))
+        if not text.startswith(base) or i == -1:
+            if probe == _PROBE_REASONING:
+                continue  # templates that do not render reasoning
+            return None
+        heads.append(text[:i])
+    if not gen.startswith(base):
+        return None
+    header = os.path.commonprefix([h[len(base):] for h in heads])
+    if not header.strip():
+        return None
+
+    special_ids = special_token_ids(tokenizer)
+
+    def first_special(text: str) -> tuple[int, int] | None:
+        enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        for tid, (o0, o1) in zip(enc["input_ids"], enc["offset_mapping"]):
+            if tid in special_ids and o1 > o0:
+                return o0, o1
+        return None
+
+    after = final[final.index(_PROBE_ANSWER) + len(_PROBE_ANSWER):]
+    found = first_special(after)
+    if found is None or after[: found[0]].strip():
+        return None
+    end = after[found[0]: found[1]]
+    after_history = history[history.index(_PROBE_ANSWER) + len(_PROBE_ANSWER):]
+    if not after_history.lstrip().startswith(end):
+        return None
+    opener = first_special(header)
+    turn_open = header[opener[0]: opener[1]] if opener is not None and not header[: opener[0]].strip() else ""
+    return TurnMarkers(header=header, end=end, turn_open=turn_open)
+
+
+def special_token_ids(tokenizer) -> set[int]:
+    """Ids of every special token. `all_special_ids` lists only the named ones in
+    transformers 5 (Qwen3.5 leaves out <|im_start|>); added tokens flagged special
+    complete it."""
+    ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+    added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    ids.update(i for i, tok in added.items() if getattr(tok, "special", False))
+    return ids
+
+
+class _TokenSpans:
+    """Character → token lookups over a fast tokenizer's offset mapping."""
+
+    def __init__(self, offsets: list[tuple[int, int]]):
+        self.offsets = offsets
+        self._starts = [o0 for o0, _ in offsets]
+        self._ends = [o1 for _, o1 in offsets]
+
+    def overlapping(self, c0: int, c1: int) -> list[int]:
+        """Tokens overlapping the characters [c0, c1). Overlap, not containment: a
+        byte-level BPE token that merges a leading space into the first character of the
+        span (o0 == c0 - 1) belongs to it."""
+        if c1 <= c0:
+            return []
+        lo = bisect.bisect_right(self._ends, c0)
+        hi = bisect.bisect_left(self._starts, c1)
+        return [ti for ti in range(lo, hi) if self._ends[ti] > self._starts[ti]]
+
+    def first_at(self, c: int) -> int:
+        """First non-empty token starting at or after character c."""
+        ti = bisect.bisect_left(self._starts, c)
+        while ti < len(self.offsets) and self._ends[ti] <= self._starts[ti]:
+            ti += 1
+        return ti
+
+
+# A <think> block and the whitespace after it; an unclosed block runs to the end.
+_THINK_BLOCK = re.compile(r"<think>.*?(?:</think>\s*|$)", re.DOTALL)
+
+
+def _subtract_intervals(span: tuple[int, int], excluded: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    pieces, pos = [], span[0]
+    for e0, e1 in sorted(excluded):
+        if e0 > pos:
+            pieces.append((pos, min(e0, span[1])))
+        pos = max(pos, e1)
+    if pos < span[1]:
+        pieces.append((pos, span[1]))
+    return [(a, b) for a, b in pieces if b > a]
+
+
+# Tool-output regions that templates embed inside other turns (Qwen wraps a tool
+# message in <tool_response> inside a user turn); trained under include_observations.
+_ECHO_MARKERS = (
+    ("<tool_response>", "</tool_response>"),
+    ("<|tool▁output|>", "<|tool▁output▁end|>"),
+    ("<observation>", "</observation>"),
+    ("[Tool Output]", "[/Tool Output]"),
+    ("```output\n", "```"),
+)
+
+
+def _echo_text_spans(text: str) -> list[tuple[int, int]]:
+    spans = []
+    for start_marker, end_marker in _ECHO_MARKERS:
+        pos = 0
+        while (start := text.find(start_marker, pos)) != -1:
+            c0 = start + len(start_marker)
+            c1 = text.find(end_marker, c0)
+            c1 = len(text) if c1 == -1 else c1
+            spans.append((c0, c1))
+            pos = c1 + len(end_marker)
+    return spans
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CORE DATASETS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -170,11 +340,15 @@ class ChatDataset(IterableDataset):
         last_turn_only: bool = False,
         shuffle_buffer: int = 0,
         shuffle_seed: int = 0,
+        tools_field: str = "tools",
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.messages_field = messages_field
+        # Per-row tool definitions, passed to the chat template as `tools=` so the
+        # rendered system prompt declares them exactly as at inference time.
+        self.tools_field = tools_field
         self.rank = rank
         self.world_size = world_size
         self.include_observations = include_observations
@@ -192,6 +366,13 @@ class ChatDataset(IterableDataset):
         # example's `chat_template_kwargs` field and applied to EVERY render of that row,
         # including the fallback paths. Rows without the field render with none.
         self._template_kwargs: dict[str, Any] = {}
+        # Turn markers of the chat template, derived once per set of template kwargs
+        # (see _turn_markers).
+        self._markers_cache: dict[str, TurnMarkers | None] = {}
+        self._has_generation_span: bool | None = None
+        # Per-iteration counts (kept, truncated, dropped_too_long, dropped_no_target),
+        # logged when the stream ends so silently skipped rows are visible.
+        self.stats: Counter = Counter()
 
     def _render_chat(self, messages: list[dict], **kwargs):
         """apply_chat_template with the current row's template kwargs. Explicit keyword
@@ -201,10 +382,28 @@ class ChatDataset(IterableDataset):
     def __iter__(self):
         dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size,
                                       self.shuffle_buffer, self.shuffle_seed)
+        self.stats.clear()
         for example in dataset:
+            too_long = self.stats["dropped_too_long"]
             result = self._process(example)
             if result is not None:
+                self.stats["kept"] += 1
                 yield result
+            elif self.stats["dropped_too_long"] == too_long:
+                self.stats["dropped_no_target"] += 1
+        self._log_stats()
+
+    def _log_stats(self) -> None:
+        dropped = self.stats["dropped_too_long"] + self.stats["dropped_no_target"]
+        if not dropped and not self.stats["truncated"]:
+            return
+        worker = torch.utils.data.get_worker_info()
+        where = f" (rank {self.rank}, worker {worker.id})" if worker is not None else f" (rank {self.rank})"
+        logger.info(
+            f"Chat data{where}: {self.stats['kept']} conversations kept, {self.stats['truncated']} cut to "
+            f"fit max_seq_length={self.max_seq_length}, {self.stats['dropped_too_long']} dropped (no trained "
+            f"assistant turn fits), {self.stats['dropped_no_target']} dropped (nothing to train on)"
+        )
 
     @staticmethod
     def _keep_last_segment(mask: torch.Tensor) -> torch.Tensor:
@@ -225,11 +424,28 @@ class ChatDataset(IterableDataset):
         new_mask[last_run_start:] = mask[last_run_start:]
         return new_mask
 
+    def _template_has_generation_span(self) -> bool:
+        """Whether the chat template marks assistant output with {% generation %}, the
+        only case in which transformers can return an assistant mask."""
+        if self._has_generation_span is None:
+            template = getattr(self.tokenizer, "chat_template", None)
+            if isinstance(template, dict):
+                template = template.get("default") or next(iter(template.values()), "")
+            self._has_generation_span = bool(
+                isinstance(template, str) and re.search(r"\{%-?\s*generation\s*-?%\}", template)
+            )
+        return self._has_generation_span
+
     def _process(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
+        from palingenesis.validate_data import is_trained_message, normalize_messages, normalize_tools
+
         kwargs = example.get("chat_template_kwargs") or {}
         if isinstance(kwargs, str):  # JSON-encoded in some dataset exports
             kwargs = json.loads(kwargs) if kwargs.strip() else {}
         self._template_kwargs = dict(kwargs)
+        tools = normalize_tools(example.get(self.tools_field))
+        if tools is not None and "tools" not in self._template_kwargs:
+            self._template_kwargs["tools"] = tools
         messages = example.get(self.messages_field)
         if not messages:
             # Try alternative field names (conversations, chat, dialogue, etc.)
@@ -240,13 +456,13 @@ class ChatDataset(IterableDataset):
         if not messages:
             return None
 
-        # Role normalization: handle non-standard formats (ShareGPT, Alpaca, etc.)
-        # Maps: human→user, gpt→assistant, from/value→role/content
-        from palingenesis.validate_data import normalize_messages
-
+        # Role normalization: handle non-standard formats (ShareGPT, Alpaca, OpenAI
+        # tool calls with JSON-string arguments, conversations stored as JSON strings)
         normalized = normalize_messages(example, self.messages_field)
         if normalized:
             messages = normalized
+        elif not isinstance(messages, list):
+            return None
         # If normalization returns None, use raw messages (may still work with some templates)
 
         # Smart truncation: if conversation exceeds max_seq_length, truncate at
@@ -255,6 +471,14 @@ class ChatDataset(IterableDataset):
         messages = self._smart_truncate(messages)
         if not messages:
             return None
+
+        # The template's {% generation %} mask cannot tell turns apart, so per-message
+        # training flags (`"loss": false`) need the turn-aware masker.
+        per_turn_flags = any(
+            m.get("role") == "assistant" and not is_trained_message(m) for m in messages
+        )
+        if per_turn_flags or self.turn_scaling != "uniform" or not self._template_has_generation_span():
+            return self._fallback(messages)
 
         try:
             templated = self._render_chat(
@@ -372,69 +596,175 @@ class ChatDataset(IterableDataset):
         """
         if getattr(self.tokenizer, "is_fast", False):
             try:
-                res = self._fallback_offsets(messages)
-            except Exception:
-                res = None
-            if res is not None:
-                return res
+                # None here means "nothing to train on" (e.g. every turn flagged
+                # loss: false), a verdict the progressive masker must not overturn.
+                return self._fallback_offsets(messages)
+            except Exception as e:
+                logger.debug(f"offset masker failed ({e!r}); using the progressive masker")
         return self._fallback_progressive(messages)
 
+    def _turn_markers(self) -> "TurnMarkers | None":
+        """The template's assistant-turn markers for the current row's template kwargs
+        (cached: they depend on the template and e.g. enable_thinking, not on the row)."""
+        kwargs = {k: v for k, v in self._template_kwargs.items() if k != "tools"}
+        key = json.dumps(kwargs, sort_keys=True, default=str)
+        if key not in self._markers_cache:
+            def render(messages, **kw):
+                return self.tokenizer.apply_chat_template(messages, tokenize=False, **{**kwargs, **kw})
+
+            self._markers_cache[key] = derive_turn_markers(render, self.tokenizer)
+        return self._markers_cache[key]
+
     def _fallback_offsets(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
-        """Robust, template-agnostic masking via offset mapping + forward text search.
+        """Template-agnostic masking on the final render, via offset mapping.
 
-        Renders the conversation once, tokenizes with offsets, then locates each trained
-        turn's reasoning/answer text by advancing a cursor through the rendered string.
-        Because it relies only on text that ACTUALLY appears in the final render (never on
-        render(messages[:i]) being a token-prefix of render(messages)), it is correct for
-        history-rewriting templates that break the progressive masker.
+        Renders the conversation once and tokenizes it with offsets. Each assistant turn
+        is located by the template's own assistant header (see `derive_turn_markers`):
+        everything the template writes after the header, up to and including the
+        end-of-turn marker, is what the model generates at inference, so all of it is
+        trained -- text, tool calls, the closing `</think>` and the end-of-turn token. A
+        `<think>` block is trained only when the turn carries reasoning and
+        train_on_reasoning is set: an empty block that the template inserts for a turn
+        without reasoning is scaffolding, not model output.
 
-        Requires a fast tokenizer (offset mapping). Returns None on any anomaly so the
-        caller can fall back to the progressive masker.
+        Only the final render is used (never render(messages[:i]) as a prefix of
+        render(messages)), so templates that rewrite history (Qwen3.x drop reasoning
+        from earlier turns) are handled. Requires a fast tokenizer (raises otherwise).
+        Returns None when nothing in the conversation is trained.
         """
+        from palingenesis.validate_data import is_trained_message
+
         full = self._render_chat(messages, tokenize=False, add_generation_prompt=False)
-        enc = self.tokenizer(
-            full,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-        )
-        offsets = enc.get("offset_mapping")
+        enc = self._encode(full)
+        ids = enc["input_ids"][: self.max_seq_length]
+        offsets = (enc.get("offset_mapping") or [])[: self.max_seq_length]
+        if not ids:
+            return None
         if not offsets:
-            return None
-        input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
-        attn_mask = torch.tensor(enc.get("attention_mask", [1] * len(enc["input_ids"])), dtype=torch.long)
-        n_tok = len(input_ids)
-        if n_tok == 0:
-            return None
+            raise ValueError("tokenizer returned no offset mapping")
+        input_ids = torch.tensor(ids, dtype=torch.long)
+        attn_mask = torch.ones_like(input_ids)
         labels = torch.full_like(input_ids, IGNORE_INDEX)
-        special_ids = set(self.tokenizer.all_special_ids or [])
+        spans = _TokenSpans(offsets)
 
-        train_roles = {"assistant"}
+        markers = self._turn_markers()
+        if markers is None:
+            located = self._locate_turns_by_content(full, messages, spans, input_ids)
+        else:
+            located = self._locate_turns_by_markers(full, messages, spans, markers)
+        turns, echo = located  # turns: [(token indices, message)] per assistant message, in order
+
+        def train(idx: list[int]) -> None:
+            if idx:
+                t = torch.tensor(idx, dtype=torch.long)
+                labels[t] = input_ids[t]
+
+        for tset in echo:  # tool/observation ECHO turns: always trained, never gated by last_turn_only
+            train(tset)
+
+        trained_turns = [(tset, i) for i, (tset, msg) in enumerate(turns) if is_trained_message(msg)]
+        if self.last_turn_only and trained_turns:
+            trained_turns = trained_turns[-1:]
+        for tset, _ in trained_turns:
+            train(tset)
+
+        labels[attn_mask == 0] = IGNORE_INDEX
+
         if self.include_observations:
-            train_roles.update({"tool", "observation", "ipython", "function"})
+            for c0, c1 in _echo_text_spans(full):
+                train(spans.overlapping(c0, c1))
 
-        def toks_in(c0: int, c1: int) -> list[int]:
-            # Overlap (not strict containment): captures a SentencePiece token that merges
-            # a leading space into the first content char (o0 == c0 - 1).
-            if c1 <= c0:
-                return []
-            return [ti for ti, (o0, o1) in enumerate(offsets) if o1 > o0 and o0 < c1 and o1 > c0]
+        if (labels != IGNORE_INDEX).sum() == 0:
+            return None
 
-        def first_tok_at(c: int) -> int:
-            for ti, (o0, o1) in enumerate(offsets):
-                if o1 > o0 and o0 >= c:
-                    return ti
-            return n_tok
+        result = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
+
+        n_trained = len(trained_turns)
+        if self.turn_scaling != "uniform" and n_trained > 1:
+            loss_weights = torch.zeros_like(input_ids, dtype=torch.float32)
+            loss_weights[labels != IGNORE_INDEX] = 1.0
+            for rank, (tset, _) in enumerate(trained_turns):
+                if self.turn_scaling == "progressive":
+                    w = ((rank + 1) / n_trained) ** 0.5
+                else:  # last_heavy
+                    w = 2.0 if rank == n_trained - 1 else 1.0
+                if tset:
+                    loss_weights[torch.tensor(tset, dtype=torch.long)] = w
+            loss_weights[labels == IGNORE_INDEX] = 0.0
+            valid = loss_weights > 0
+            if valid.any():
+                loss_weights[valid] /= loss_weights[valid].mean()
+            result["loss_weights"] = loss_weights
+
+        return result
+
+    def _locate_turns_by_markers(self, full: str, messages: list[dict], spans: "_TokenSpans",
+                                 markers: "TurnMarkers"):
+        """Token indices of every assistant turn (header excluded, end-of-turn included),
+        and of the ECHO-trained tool/observation contents."""
+        echo_roles = {"tool", "observation", "ipython", "function"} if self.include_observations else set()
+        turns: list[tuple[list[int], dict]] = []
+        echo: list[list[int]] = []
+        cursor = 0
+        n = len(full)
+
+        def next_turn(start: int) -> int:
+            """Where the next turn opens (bounds an assistant turn and a content search)."""
+            nxt = [p for p in (full.find(markers.turn_open, start) if markers.turn_open else -1,
+                               full.find(markers.header, start)) if p != -1]
+            return min(nxt) if nxt else n
+
+        for msg in messages:
+            role = msg.get("role")
+            if role in echo_roles:
+                _, answer = self._split_reasoning(msg)
+                stop = full.find(markers.header, cursor)
+                p = full.find(answer, cursor, n if stop == -1 else stop) if answer else -1
+                if p != -1:
+                    echo.append(spans.overlapping(p, p + len(answer)))
+                continue
+            if role != "assistant":
+                continue
+
+            h = full.find(markers.header, cursor)
+            if h == -1:
+                break
+            start = h + len(markers.header)
+            limit = next_turn(start)
+            reasoning, _ = self._split_reasoning(msg)
+            e = full.find(markers.end, start, limit) if markers.end else -1
+            end = e + len(markers.end) if e != -1 else limit
+            cursor = end
+
+            train_think = self.train_on_reasoning and reasoning is not None
+            pieces = [(start, end)]
+            if not train_think:
+                excluded = [m.span() for m in _THINK_BLOCK.finditer(full, start, end)]
+                if reasoning and not self.train_on_reasoning:
+                    # Reasoning rendered outside <think> tags (other templates' channels).
+                    p = full.find(reasoning, start, end)
+                    if p != -1:
+                        excluded.append((p, p + len(reasoning)))
+                pieces = _subtract_intervals((start, end), excluded)
+            tset = sorted({ti for c0, c1 in pieces for ti in spans.overlapping(c0, c1)})
+            turns.append((tset, msg))
+        return turns, echo
+
+    def _locate_turns_by_content(self, full: str, messages: list[dict], spans: "_TokenSpans",
+                                 input_ids: torch.Tensor):
+        """Legacy locator for templates whose turn markers cannot be derived: finds each
+        turn's reasoning/answer TEXT in the render, plus one end-of-turn special token.
+        Text the template renders from other fields (tool calls) is not found."""
+        special_ids = special_token_ids(self.tokenizer)
+        n_tok = len(input_ids)
+        echo_roles = {"tool", "observation", "ipython", "function"} if self.include_observations else set()
+        turns: list[tuple[list[int], dict]] = []
+        echo: list[list[int]] = []
+        cursor = 0
 
         def is_ws(ti: int) -> bool:
-            o0, o1 = offsets[ti]
+            o0, o1 = spans.offsets[ti]
             return o1 > o0 and full[o0:o1].strip() == ""
-
-        n_assist = sum(1 for m in messages if m.get("role") == "assistant")
-        assist_seen = 0
-        cursor = 0
-        turn_boundaries: list[tuple[set[int], int]] = []  # (token indices, assistant_turn_idx)
 
         for msg in messages:
             role = msg.get("role")
@@ -455,79 +785,33 @@ class ChatDataset(IterableDataset):
                     a0, a1 = p, p + len(answer_raw)
                     cursor = a1
 
-            if role not in train_roles:
+            if role != "assistant" and role not in echo_roles:
                 continue
 
             tset: set[int] = set()
             if role == "assistant" and self.train_on_reasoning and reasoning_raw and r0 != -1:
-                # Include the '<think>' opener + reasoning + the '</think>' wrapper up to
-                # the answer, so the whole generated block is one contiguous trained span.
                 think_open = full.rfind("<think>", 0, r0)
-                rstart = think_open if think_open != -1 else r0
-                tset.update(toks_in(rstart, r1))
+                tset.update(spans.overlapping(think_open if think_open != -1 else r0, r1))
                 if a0 != -1:
-                    tset.update(toks_in(r1, a0))
+                    tset.update(spans.overlapping(r1, a0))
             if a0 != -1:
-                tset.update(toks_in(a0, a1))
+                tset.update(spans.overlapping(a0, a1))
 
-            # Terminator: skip whitespace, include ONE end-of-turn special token (+ a
-            # trailing newline). Stops before the next turn's header special token.
+            # Terminator: skip whitespace, include ONE end-of-turn special token.
             anchor = a1 if a1 != -1 else r1
-            if anchor != -1:
-                ti = first_tok_at(anchor)
+            if anchor != -1 and role == "assistant":
+                ti = spans.first_at(anchor)
                 while ti < n_tok and is_ws(ti):
                     tset.add(ti)
                     ti += 1
                 if ti < n_tok and int(input_ids[ti]) in special_ids:
                     tset.add(ti)
-                    ti += 1
-                    if ti < n_tok and is_ws(ti):
-                        tset.add(ti)
 
             if role == "assistant":
-                turn_boundaries.append((tset, assist_seen))
-                assist_seen += 1
+                turns.append((sorted(tset), msg))
             else:
-                # tool/observation ECHO turn: always trained, never gated by last_turn_only
-                for ti in tset:
-                    labels[ti] = input_ids[ti]
-
-        keep = turn_boundaries
-        if self.last_turn_only and n_assist > 1:
-            keep = [(ts, idx) for (ts, idx) in turn_boundaries if idx == n_assist - 1]
-        for tset, _idx in keep:
-            for ti in tset:
-                labels[ti] = input_ids[ti]
-
-        labels[attn_mask == 0] = IGNORE_INDEX
-
-        if self.include_observations:
-            labels = self._apply_echo_from_text(input_ids, labels, messages)
-
-        if (labels != IGNORE_INDEX).sum() == 0:
-            return None
-
-        result = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
-
-        if self.turn_scaling != "uniform" and n_assist > 1 and turn_boundaries:
-            loss_weights = torch.ones_like(input_ids, dtype=torch.float32)
-            loss_weights[labels == IGNORE_INDEX] = 0.0
-            if self.turn_scaling == "progressive":
-                for tset, idx in turn_boundaries:
-                    w = ((idx + 1) / n_assist) ** 0.5
-                    for ti in tset:
-                        loss_weights[ti] = w
-            elif self.turn_scaling == "last_heavy":
-                for tset, idx in turn_boundaries:
-                    w = 2.0 if idx == n_assist - 1 else 1.0
-                    for ti in tset:
-                        loss_weights[ti] = w
-            valid = loss_weights > 0
-            if valid.any():
-                loss_weights[valid] /= loss_weights[valid].mean()
-            result["loss_weights"] = loss_weights
-
-        return result
+                echo.append(sorted(tset))
+        return turns, echo
 
     def _fallback_progressive(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
         """Legacy fallback masking: progressive tokenization to find exact turn boundaries.
@@ -546,6 +830,8 @@ class ChatDataset(IterableDataset):
 
         This eliminates the ~1-3 token boundary imprecision of the naive approach.
         """
+        from palingenesis.validate_data import is_trained_message
+
         # Tokenize the full conversation
         full_text = self._render_chat(messages, tokenize=False, add_generation_prompt=False)
         tokens = self.tokenizer(full_text, truncation=True, max_length=self.max_seq_length, return_tensors="pt")
@@ -581,7 +867,7 @@ class ChatDataset(IterableDataset):
                 prev_len = max(prev_len, 0)
                 continue
 
-            if msg.get("role") in train_roles:
+            if msg.get("role") in train_roles and is_trained_message(msg):
                 # This turn gets loss. But we want to exclude the header/role tokens
                 # (e.g., "<|start_header_id|>assistant<|end_header_id|>\n\n")
                 # Strategy: tokenize messages[:i] + a stub that produces the header
@@ -741,61 +1027,87 @@ class ChatDataset(IterableDataset):
 
         return labels
 
+    def _encode(self, text: str):
+        """Tokenize a render with offsets, remembering the last one: truncation and
+        masking both need the full conversation's encoding."""
+        cached = self._last_encoding
+        if cached is not None and cached[0] == text:
+            return cached[1]
+        enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        self._last_encoding = (text, enc)
+        return enc
+
+    _last_encoding: tuple[str, Any] | None = None
+
     def _smart_truncate(self, messages: list[dict]) -> list[dict] | None:
-        """Truncate at turn boundaries to fit max_seq_length while preserving training signal.
+        """Cut an over-long conversation after the last trained assistant turn that fits.
 
-        Strategy:
-        1. Quick char-based heuristic: if total chars < max_seq_length * 3, likely fits (skip)
-        2. Otherwise, tokenize progressively at each turn boundary (exact count)
-        3. Keep the maximum number of turns that fit within max_seq_length
-        4. Require at least one complete assistant turn in the kept portion
+        Keeps whole turns (a conversation cut mid-turn trains on a fragment and loses the
+        end-of-turn token) and ends on an assistant turn (trailing user/tool turns would
+        cost compute without loss). Returns None when not even the first trained
+        assistant turn fits.
 
-        Uses actual tokenizer for precise token counting (no char/token ratio guessing).
+        Cheap for the common case: a token is at least one UTF-8 byte, so a conversation
+        whose serialized messages and tools, plus a margin for template text, fit in
+        max_seq_length bytes fits in max_seq_length tokens. Otherwise the full render is
+        tokenized once; if it is too long, the cut is searched on renders alone (token
+        counts estimated from the full render's characters per token) and only the
+        candidates next to the limit are tokenized.
         """
-        # Fast path: short conversations definitely fit (4 chars/token is generous)
-        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-        if total_chars < self.max_seq_length * 3:
+        from palingenesis.validate_data import is_trained_message
+
+        payload = len(json.dumps(messages, ensure_ascii=False, default=str).encode())
+        tools = self._template_kwargs.get("tools")
+        if tools:
+            payload += len(json.dumps(tools, ensure_ascii=False, default=str).encode())
+        if payload + 64 * len(messages) + 2048 <= self.max_seq_length:
             return messages
 
-        # Tokenize at each turn boundary to find exact fit
-        last_valid_boundary = 0
-        has_assistant = False
+        def render(k: int) -> str:
+            return self._render_chat(messages[:k], tokenize=False, add_generation_prompt=False)
 
-        for i in range(len(messages)):
-            prefix_messages = messages[: i + 1]
+        try:
+            full = render(len(messages))
+            n_full = len(self._encode(full)["input_ids"])
+        except Exception:
+            return messages  # the masker reports templates that cannot render this row
+        if n_full <= self.max_seq_length:
+            return messages
+
+        chars_per_token = len(full) / max(n_full, 1)
+
+        def fits(k: int) -> bool:
             try:
-                prefix_text = self._render_chat(
-                    prefix_messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
+                return len(self.tokenizer(render(k), add_special_tokens=False)["input_ids"]) <= self.max_seq_length
             except Exception:
-                # Template error: stop here
-                break
+                return False
 
-            # Exact token count
-            token_count = len(self.tokenizer.encode(prefix_text, add_special_tokens=False))
-
-            if token_count > self.max_seq_length:
-                # This turn pushes us over: stop at previous boundary
-                break
-
-            # This turn fits
-            last_valid_boundary = i + 1
-            if messages[i].get("role") == "assistant":
-                has_assistant = True
-
-        # Require at least one assistant turn
-        if not has_assistant:
-            for j in range(last_valid_boundary):
-                if messages[j].get("role") == "assistant":
-                    has_assistant = True
-                    break
-
-        if not has_assistant or last_valid_boundary < 2:
+        ends = [k for k in range(1, len(messages) + 1)
+                if messages[k - 1].get("role") == "assistant" and is_trained_message(messages[k - 1])]
+        # Largest end whose ESTIMATED length fits (renders only; they grow with the turns).
+        lo, hi, guess = 0, len(ends) - 1, -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            try:
+                estimate = len(render(ends[mid])) / chars_per_token
+            except Exception:
+                estimate = float("inf")
+            if estimate <= self.max_seq_length:
+                guess, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        # Settle the estimate with exact counts: step down while too long, up while the
+        # next one still fits.
+        i = max(guess, 0)
+        while i >= 0 and not fits(ends[i]):
+            i -= 1
+        while 0 <= i < len(ends) - 1 and fits(ends[i + 1]):
+            i += 1
+        if i < 0:
+            self.stats["dropped_too_long"] += 1
             return None
-
-        return messages[:last_valid_boundary]
+        self.stats["truncated"] += 1
+        return messages[: ends[i]]
 
 
 class PretrainDataset(IterableDataset):
@@ -914,215 +1226,101 @@ class MixedDataset(IterableDataset):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class SeqLenCurriculum:
-    """Sequence length curriculum: ramp max_seq_len from short to full over training.
-
-    Inspired by Dataset Decomposition (Apple, arxiv:2405.13226):
-    Training with shorter sequences early saves compute (quadratic attention)
-    while the model learns basic patterns. Longer sequences are introduced
-    progressively for complex reasoning and long-range dependencies.
-
-    Result: >4× data efficiency, up to 6× training speedup.
-
-    The curriculum ramps from min_len to max_len over ramp_steps, using
-    power-of-2 increments (matching the binary decomposition in the paper).
-
-    Usage:
-        curriculum = SeqLenCurriculum(min_len=1024, max_len=8192, ramp_steps=5000)
-        packed_ds = PackedDataset(base, max_len=8192, eos_id=0, seq_len_curriculum=curriculum)
-
-        for step in training:
-            batch = next(dataloader)  # uses curriculum.current_max_len
-            ...
-            curriculum.step()  # advance curriculum
-    """
-
-    def __init__(self, min_len: int = 1024, max_len: int = 8192, ramp_steps: int = 5000):
-        self.min_len = min_len
-        self.max_len = max_len
-        self.ramp_steps = ramp_steps
-        self._current_step = 0
-
-    @property
-    def current_max_len(self) -> int:
-        """Get current max sequence length based on training progress."""
-        if self._current_step >= self.ramp_steps:
-            return self.max_len
-
-        progress = self._current_step / max(1, self.ramp_steps)
-        # Linear ramp in log2 space (power-of-2 increments)
-        log_min = math.log2(self.min_len)
-        log_max = math.log2(self.max_len)
-        log_current = log_min + progress * (log_max - log_min)
-        # Round to nearest power of 2 (for efficient GPU batching)
-        current = 2 ** int(log_current)
-        return min(current, self.max_len)
-
-    def step(self):
-        """Advance curriculum by one step."""
-        self._current_step += 1
-
-    def reset(self):
-        """Reset curriculum to beginning."""
-        self._current_step = 0
-
-
 class PackedDataset(IterableDataset):
-    """Packs sequences into fixed-length blocks with document-aware position_ids.
+    """Packs whole conversations into blocks of at most max_len tokens.
 
-    Concatenates multiple sequences end-to-end into one long tensor of length
-    max_len. Produces `position_ids` that reset to 0 at each document boundary.
+    Documents are never split: a conversation cut across two blocks would train its
+    tail without the prompt it answers. Blocks carry `position_ids` that restart at 0
+    for every document, which is what keeps documents apart in the forward pass (see
+    palingenesis.packing).
 
-    Smart packing (sorted-length bin packing, inspired by arxiv:2107.02027):
-    When sort_buffer > 0, accumulates samples in a buffer, sorts by length,
-    then packs greedily. This reduces wasted space from 15-30% (random) to 3-8%
-    (sorted). The buffer size controls the trade-off between packing efficiency
-    and memory/randomness.
+    sort_buffer > 0: first-fit-decreasing bin packing over a buffer of that many
+    documents (longest first, each into the first open block with room). Blocks that
+    are not full stay open across buffers, so the fill rate stays high without a
+    large buffer; at most `max_open` blocks are kept, the fullest emitted first.
+    sort_buffer == 0: next-fit in arrival order (a block is emitted when the next
+    document does not fit).
 
-    Sequence length curriculum (inspired by arxiv:2405.13226, Dataset Decomposition):
-    When seq_len_curriculum is provided, the effective max_len ramps from a short
-    initial value to the full max_len over training. Early steps use shorter
-    sequences (faster due to quadratic attention) while later steps use full length.
-    This produces >4× data efficiency and up to 6× training speedup.
-
-    When used with `attn_implementation="flex_attention"` in HuggingFace models,
-    the position_ids resets trigger proper document-level causal masking:
-    tokens from different documents cannot attend to each other.
-
-    Output per sample:
-      - input_ids: [max_len] packed token IDs
-      - attention_mask: [max_len] all ones (no padding in packed sequences)
-      - labels: [max_len] with IGNORE_INDEX preserved from source datasets
-      - position_ids: [max_len] positions resetting to 0 at each document boundary
+    Output per block (trailing blocks may be shorter than max_len; the collator pads):
+      - input_ids, labels (and loss_weights, when present): the documents concatenated
+      - attention_mask: all ones
+      - position_ids: restart at 0 at each document
     """
 
-    def __init__(
-        self,
-        base: IterableDataset,
-        max_len: int,
-        eos_id: int,
-        sort_buffer: int = 256,
-        seq_len_curriculum: "SeqLenCurriculum | None" = None,
-    ):
+    def __init__(self, base: IterableDataset, max_len: int, eos_id: int = 0, sort_buffer: int = 256,
+                 max_open: int = 64):
         self.base = base
         self.max_len = max_len
-        self.eos_id = eos_id
-        self.sort_buffer = sort_buffer  # 0 = no sorting (sequential), >0 = sorted bin packing
-        self.seq_len_curriculum = seq_len_curriculum
-
-    @property
-    def effective_max_len(self) -> int:
-        """Current effective max sequence length (may be ramped by curriculum)."""
-        if self.seq_len_curriculum is not None:
-            return self.seq_len_curriculum.current_max_len
-        return self.max_len
+        self.eos_id = eos_id  # unused; kept for call-site compatibility
+        self.sort_buffer = sort_buffer
+        self.max_open = max(1, max_open)
 
     def __iter__(self):
         if self.sort_buffer > 0:
-            yield from self._sorted_packing()
+            yield from self._bin_packing()
         else:
-            yield from self._sequential_packing()
+            yield from self._next_fit()
+
+    def _doc(self, ex: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        # Oversized documents are cut to max_len (the chat pipeline already keeps whole
+        # turns within max_seq_length; this only guards other sources).
+        keys = ["input_ids", "labels"] + (["loss_weights"] if "loss_weights" in ex else [])
+        return {k: ex[k][: self.max_len] for k in keys}
 
     @staticmethod
-    def _pack_block(ids: list[int], labels: list[int], positions: list[int]) -> dict[str, torch.Tensor]:
-        """Build one packed block. May be shorter than max_len (trailing remainder);
-        the collator pads it — dropping it would silently lose data (and can zero out
-        a short run entirely)."""
-        n = len(ids)
-        return {
-            "input_ids": torch.tensor(ids, dtype=torch.long),
-            "attention_mask": torch.ones(n, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-            "position_ids": torch.tensor(positions, dtype=torch.long),
-        }
+    def _block(docs: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        block = {k: torch.cat([d[k] for d in docs]) for k in docs[0]}
+        n = block["input_ids"].numel()
+        block["attention_mask"] = torch.ones(n, dtype=torch.long)
+        block["position_ids"] = torch.cat([torch.arange(d["input_ids"].numel()) for d in docs])
+        return block
 
-    def _sequential_packing(self):
-        """Original sequential packing: concatenate in arrival order."""
-        buf_ids: list[int] = []
-        buf_labels: list[int] = []
-        buf_positions: list[int] = []
+    def _next_fit(self):
+        docs: list[dict[str, torch.Tensor]] = []
+        used = 0
+        for ex in self.base:
+            doc = self._doc(ex)
+            n = doc["input_ids"].numel()
+            if docs and used + n > self.max_len:
+                yield self._block(docs)
+                docs, used = [], 0
+            docs.append(doc)
+            used += n
+        if docs:
+            yield self._block(docs)
+
+    def _bin_packing(self):
+        open_bins: list[tuple[int, list[dict[str, torch.Tensor]]]] = []  # (tokens used, docs)
+        buffer: list[dict[str, torch.Tensor]] = []
+
+        def flush():
+            buffer.sort(key=lambda d: d["input_ids"].numel(), reverse=True)
+            for doc in buffer:
+                n = doc["input_ids"].numel()
+                for i, (used, docs) in enumerate(open_bins):
+                    if used + n <= self.max_len:
+                        docs.append(doc)
+                        open_bins[i] = (used + n, docs)
+                        break
+                else:
+                    open_bins.append((n, [doc]))
+            buffer.clear()
+            full = [docs for used, docs in open_bins if used == self.max_len]
+            open_bins[:] = [(used, docs) for used, docs in open_bins if used < self.max_len]
+            open_bins.sort(key=lambda b: b[0], reverse=True)
+            while len(open_bins) > self.max_open:
+                full.append(open_bins.pop(0)[1])
+            return full
 
         for ex in self.base:
-            doc_ids = ex["input_ids"].tolist()
-            doc_labels = ex["labels"].tolist()
-            doc_len = len(doc_ids)
-
-            buf_ids.extend(doc_ids)
-            buf_labels.extend(doc_labels)
-            buf_positions.extend(range(doc_len))
-
-            while len(buf_ids) >= self.max_len:
-                yield self._pack_block(buf_ids[: self.max_len], buf_labels[: self.max_len], buf_positions[: self.max_len])
-                buf_ids = buf_ids[self.max_len :]
-                buf_labels = buf_labels[self.max_len :]
-                buf_positions = buf_positions[self.max_len :]
-
-        # Emit the trailing remainder (< max_len) instead of discarding it.
-        if buf_ids:
-            yield self._pack_block(buf_ids, buf_labels, buf_positions)
-
-    def _sorted_packing(self):
-        """Sorted bin packing: accumulate buffer, sort by length, pack greedily.
-
-        From arxiv:2107.02027 and arxiv:2405.13226:
-        Sorting samples by length before packing ensures similar-length documents
-        end up in the same packed sequence. Benefits:
-          - Less wasted space (short+short fills better than short+long that overflows)
-          - More consistent compute per batch (no one sequence dominating)
-          - ~2× packing efficiency improvement over random concatenation
-
-        The sub-max_len remainder is carried across buffer flushes (and emitted as a
-        final partial block at the end) so no tokens are silently dropped.
-        """
-        buffer: list[dict] = []
-        carry: tuple[list[int], list[int], list[int]] = ([], [], [])
-
-        for ex in self.base:
-            buffer.append(ex)
+            buffer.append(self._doc(ex))
             if len(buffer) >= self.sort_buffer:
-                carry = yield from self._flush_buffer(buffer, carry)
-                buffer = []
-
-        if buffer:
-            carry = yield from self._flush_buffer(buffer, carry)
-
-        ids, labels, positions = carry
-        if ids:
-            yield self._pack_block(ids, labels, positions)
-
-    def _flush_buffer(self, buffer: list[dict], carry: tuple[list[int], list[int], list[int]]):
-        """Sort buffer by length and pack greedily into max_len blocks.
-
-        Returns the leftover (ids, labels, positions) below max_len so the caller can
-        carry it into the next flush instead of discarding it."""
-        # Sort by sequence length (shortest first → best packing)
-        buffer.sort(key=lambda ex: ex["input_ids"].size(0))
-
-        buf_ids, buf_labels, buf_positions = list(carry[0]), list(carry[1]), list(carry[2])
-
-        for ex in buffer:
-            doc_ids = ex["input_ids"].tolist()
-            doc_labels = ex["labels"].tolist()
-            doc_len = len(doc_ids)
-
-            # Defensive: cap oversized documents to max_len (should be caught by
-            # smart_truncate upstream, but guarantee packing never produces garbage)
-            if doc_len > self.max_len:
-                doc_ids = doc_ids[: self.max_len]
-                doc_labels = doc_labels[: self.max_len]
-                doc_len = self.max_len
-
-            buf_ids.extend(doc_ids)
-            buf_labels.extend(doc_labels)
-            buf_positions.extend(range(doc_len))
-
-            while len(buf_ids) >= self.max_len:
-                yield self._pack_block(buf_ids[: self.max_len], buf_labels[: self.max_len], buf_positions[: self.max_len])
-                buf_ids = buf_ids[self.max_len :]
-                buf_labels = buf_labels[self.max_len :]
-                buf_positions = buf_positions[self.max_len :]
-
-        return (buf_ids, buf_labels, buf_positions)
+                for docs in flush():
+                    yield self._block(docs)
+        for docs in flush():
+            yield self._block(docs)
+        for _, docs in open_bins:
+            yield self._block(docs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1181,30 +1379,41 @@ class LengthGroupedDataset(IterableDataset):
 def _collate_fn(
     batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multiple: int = 1
 ) -> dict[str, torch.Tensor]:
-    """Pad to longest in batch (rounded up to pad_to_multiple). Handles position_ids.
+    """Pad to longest in batch (rounded up to pad_to_multiple).
 
     pad_to_multiple > 1 keeps shapes tensor-core aligned and drastically cuts
     the number of distinct shapes torch.compile sees (fewer recompiles).
+
+    Packed rows (with position_ids): the padding gets positions 0, 1, 2, ..., i.e. it
+    is one more document, attending only to itself, instead of one document per pad
+    token. loss_weights (per-turn scaling) are padded with 0.
     """
     max_len = max(x["input_ids"].size(0) for x in batch)
     if pad_to_multiple > 1:
         max_len = ((max_len + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
-    ids, masks, labels = [], [], []
     has_positions = "position_ids" in batch[0]
-    positions = [] if has_positions else None
+    has_weights = any("loss_weights" in x for x in batch)
+    out: dict[str, list[torch.Tensor]] = {"input_ids": [], "attention_mask": [], "labels": []}
+    if has_positions:
+        out["position_ids"] = []
+    if has_weights:
+        out["loss_weights"] = []
 
     for item in batch:
-        pad_len = max_len - item["input_ids"].size(0)
-        ids.append(torch.cat([item["input_ids"], torch.full((pad_len,), pad_id, dtype=torch.long)]))
-        masks.append(torch.cat([item["attention_mask"], torch.zeros(pad_len, dtype=torch.long)]))
-        labels.append(torch.cat([item["labels"], torch.full((pad_len,), IGNORE_INDEX, dtype=torch.long)]))
+        n = item["input_ids"].size(0)
+        pad_len = max_len - n
+        out["input_ids"].append(torch.cat([item["input_ids"], torch.full((pad_len,), pad_id, dtype=torch.long)]))
+        out["attention_mask"].append(torch.cat([item["attention_mask"], torch.zeros(pad_len, dtype=torch.long)]))
+        out["labels"].append(torch.cat([item["labels"], torch.full((pad_len,), IGNORE_INDEX, dtype=torch.long)]))
         if has_positions:
-            positions.append(torch.cat([item["position_ids"], torch.zeros(pad_len, dtype=torch.long)]))
+            out["position_ids"].append(torch.cat([item["position_ids"], torch.arange(pad_len, dtype=torch.long)]))
+        if has_weights:
+            weights = item.get("loss_weights")
+            if weights is None:
+                weights = (item["labels"] != IGNORE_INDEX).float()
+            out["loss_weights"].append(torch.cat([weights.float(), torch.zeros(pad_len)]))
 
-    result = {"input_ids": torch.stack(ids), "attention_mask": torch.stack(masks), "labels": torch.stack(labels)}
-    if positions:
-        result["position_ids"] = torch.stack(positions)
-    return result
+    return {k: torch.stack(v) for k, v in out.items()}
 
 
 # Keep backward-compatible name
@@ -1265,6 +1474,7 @@ def build_dataset(
                     last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
                     shuffle_buffer=shuffle_buffer,
                     shuffle_seed=config.seed,
+                    tools_field=src.get("tools_field", config.tools_field),
                 )
             elif mode == "pretrain":
                 ds = PretrainDataset(
@@ -1303,6 +1513,7 @@ def build_dataset(
             last_turn_only=getattr(config, "last_turn_only", False),
             shuffle_buffer=streaming_shuffle_buffer,
             shuffle_seed=config.seed,
+            tools_field=config.tools_field,
         )
     else:
         # Single dataset from config
@@ -1320,6 +1531,7 @@ def build_dataset(
             last_turn_only=getattr(config, "last_turn_only", False),
             shuffle_buffer=10_000 if config.streaming else 0,
             shuffle_seed=config.seed,
+            tools_field=config.tools_field,
         )
 
     # ── Pretraining Replay (arxiv:2603.04964) ─────────────────────────────────
@@ -1461,7 +1673,6 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
         "train_on_reasoning": getattr(d, "train_on_reasoning", True),
         "turn_scaling": getattr(d, "turn_scaling", "uniform"),
         "include_observations": getattr(d, "include_observations", False),
-        "seq_len_curriculum": getattr(d, "seq_len_curriculum", False),
         "seed": d.seed,
         "replay": [d.pretrain_replay_dataset, d.pretrain_replay_weight],
         "sources": sources_sig,

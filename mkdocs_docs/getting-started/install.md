@@ -23,6 +23,8 @@
 
     This installs exactly the versions in `uv.lock`, the tested set. On Linux, torch comes from PyTorch's CUDA 12.8 index automatically (configured in `pyproject.toml`).
 
+    Training Qwen3.5 or another model with linear-attention layers? Add `--extra hybrid`: it compiles causal-conv1d against your torch (a few minutes, needs `nvcc`), which makes those layers faster and is required to pack their sequences.
+
 === "uv pip (into your own venv)"
 
     ```bash
@@ -54,7 +56,7 @@
     ```
 
 !!! warning "`cannot import name 'ScalingType' from 'torch.nn.functional'`"
-    torchao (from the `train` extra) is newer than your torch. transformers imports torchao whenever it's installed, so model creation fails. palingenesis requires torch ≥ 2.11 for this reason. Upgrade torch as above rather than pinning an old one.
+    torchao (from the `float8` extra) is newer than your torch. transformers imports torchao whenever it's installed, so model creation fails. Upgrade torch as above rather than pinning an old one, or uninstall torchao if you don't train in float8.
 
 Verify:
 
@@ -69,7 +71,9 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 
 | Extra | What it adds | Install when... |
 |-------|-------------|-----------------|
-| `train` | Liger Kernel (Linux), bitsandbytes, torchao | Always (core training dependencies) |
+| `train` | Liger Kernel, flash-linear-attention (Linux), bitsandbytes | Always (core training dependencies) |
+| `hybrid` | causal-conv1d (compiled against your torch: a few minutes, needs `nvcc`) | Qwen3.5 / Qwen3-Next: ~25% faster, and required for `data.packing` on these models |
+| `float8` | torchao | Float8 training (`memory.float8_training`) on H100/B200 |
 | `logging` | wandb, trackio | You want experiment tracking dashboards |
 | `loss` | Cut Cross-Entropy (Triton kernel) | Training models with 256K+ vocabulary (Gemma) |
 | `optim` | ScheduleFree | Using schedule-free mode |
@@ -83,14 +87,14 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 pgs version
 ```
 
-Expected:
+Expected (versions from `uv.lock`):
 
 ```
 palingenesis 0.3.0
-  PyTorch: 2.7.0+cu124
-  Transformers: 4.52.0
+  PyTorch: 2.11.0+cu128
+  Transformers: 5.12.1
   CUDA: NVIDIA A100-SXM4-80GB (80 GB)
-  Liger Kernel: 0.5.2
+  Liger Kernel: installed
 ```
 
 If you see `CUDA: not available`, your PyTorch installation doesn't have CUDA support. Reinstall PyTorch from the [official instructions](https://pytorch.org/get-started/locally/).

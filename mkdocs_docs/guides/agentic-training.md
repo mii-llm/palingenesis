@@ -52,6 +52,20 @@ Palingenesis supports the full agentic trace structure:
 ]}
 ```
 
+Tool definitions go in a `tools` field next to `messages` (a list, or a JSON string: Arrow often cannot store heterogeneous JSON schemas natively). They are passed to the chat template as `tools=`, which renders them into the system prompt the way the model sees them at inference. The field name is `data.tools_field` (default `tools`).
+
+Tool-call `arguments` may be a dict or a JSON string (the OpenAI wire format); strings are parsed, since chat templates iterate over the arguments as a mapping. A whole conversation stored as a JSON string also works.
+
+### Per-message training flags
+
+A message with `"loss": false` (or `"weight": 0`) stays in the context but receives no loss, e.g. a canned greeting, or a failed attempt kept so the model learns the recovery that follows:
+
+```json
+{"role": "assistant", "content": "Hi! How can I help you today?", "loss": false}
+```
+
+Messages without the flag (or with `"loss": null`, which Arrow fills in for messages that lack the key) are trained.
+
 ### Role semantics and masking
 
 | Role | Field | Gets loss? | Why |
@@ -65,6 +79,8 @@ Palingenesis supports the full agentic trace structure:
 | `tool` | `content` | **Yes** (ECHO mode) | See below |
 
 The chat template handles the serialization. `reasoning` is passed to the template under both `reasoning` and `reasoning_content` (as vLLM does), so Qwen3/3.5 templates — which read `reasoning_content` — render it as `<think>...</think>` tokens. For other models, it's part of the assistant turn.
+
+An assistant turn is trained as the template renders it: everything after the template's assistant header, up to and including the end-of-turn token. That covers the tool-call markup (`<tool_call>...</tool_call>` on Qwen), which templates render from `tool_calls` rather than from `content`, and the end-of-turn token after it, which teaches the model to stop and wait for the tool result. An empty `<think></think>` block that a template inserts into a turn without reasoning is not trained.
 
 ---
 
@@ -137,7 +153,7 @@ Options:
 | `progressive` | Weight = √(turn_idx / total_turns) | Agentic traces (iterative refinement) |
 | `last_heavy` | Final turn gets 2× weight, others 1× | Task completion (answer quality matters most) |
 
-`progressive` is the default for agentic training. The reasoning: in a 10-turn trace, the early turns are often exploration (trying things, getting errors). The later turns incorporate all the information and produce the real solution. Weighting later turns more teaches the model that the *conclusion* matters, not just the process.
+The default is `uniform`. The case for `progressive`: in a 10-turn trace, the early turns are often exploration (trying things, getting errors) and the later turns produce the real solution. This is a heuristic, not a result from a paper; measure it on your eval set. Weights are normalised to mean 1 per conversation, so the loss scale is unchanged. They are applied by the cross-entropy losses (plain, chunked, Cut Cross-Entropy) and by chunked DEFT; other objectives, SeCO and DPO reject a non-uniform `turn_scaling`.
 
 ---
 
@@ -187,12 +203,13 @@ pgs inspect --config configs/agentic_traces.yaml --num_samples 3
 
 This shows you exactly which tokens have loss (highlighted) and which are masked. For agentic traces, you should see:
 
-- System prompt: **masked**
+- System prompt (including the tool definitions): **masked**
 - User message: **masked**
 - Assistant thinking (`<think>...</think>`): **has loss**
-- Assistant tool calls: **has loss**
+- Assistant tool calls, and the end-of-turn token after them: **has loss**
 - Tool responses: **masked** (or **has loss** if ECHO enabled)
 - Assistant final answer: **has loss**
+- Turns flagged `"loss": false`: **masked**
 
 If anything looks wrong (e.g., user tokens getting loss, or thinking tokens masked), the chat template isn't matching your data format. Check your `messages_field` and ensure roles are spelled correctly.
 

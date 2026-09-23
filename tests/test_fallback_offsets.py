@@ -91,10 +91,11 @@ def test_offsets_path_is_taken():
 @needs_tok
 def test_history_stripping_default_trains_all_turns():
     """The case the progressive masker gets WRONG: all three answers + terminators, and
-    crucially NO user/system text or headers leak in."""
+    crucially NO user/system text or headers leak in. The final turn's empty <think>
+    block is template scaffolding, not model output, so it stays masked."""
     ds = ChatDataset(None, TOK, 4096, last_turn_only=False)
     trained = _trained(ds._process({"messages": MULTI}))
-    assert trained == "ZEBRA<|im_end|>\nQUOKKA<|im_end|>\nFINALX<|im_end|>\n", trained
+    assert trained == "ZEBRA<|im_end|>QUOKKA<|im_end|>FINALX<|im_end|>", trained
     assert "user" not in trained and "system" not in trained and "Q1" not in trained
 
 
@@ -102,7 +103,7 @@ def test_history_stripping_default_trains_all_turns():
 def test_history_stripping_last_turn_only():
     ds = ChatDataset(None, TOK, 4096, last_turn_only=True)
     trained = _trained(ds._process({"messages": MULTI}))
-    assert trained == "FINALX<|im_end|>\n", trained
+    assert trained == "FINALX<|im_end|>", trained
 
 
 @needs_tok
@@ -113,8 +114,8 @@ def test_reasoning_included_only_when_enabled():
     ]
     on = _trained(ChatDataset(None, TOK, 4096, train_on_reasoning=True)._process({"messages": msgs}))
     off = _trained(ChatDataset(None, TOK, 4096, train_on_reasoning=False)._process({"messages": msgs}))
-    assert on == "<think>\ndeep thought here\n</think>\n\nthe answer is 42<|im_end|>\n", on
-    assert off == "the answer is 42<|im_end|>\n", off
+    assert on == "<think>\ndeep thought here\n</think>\n\nthe answer is 42<|im_end|>", on
+    assert off == "the answer is 42<|im_end|>", off
 
 
 @needs_tok
@@ -149,7 +150,7 @@ def test_progressive_would_fail_here():
     prog = ds._fallback_progressive(MULTI)
     prog_txt = _trained(prog) if prog is not None else ""
     # progressive leaks headers / drops answers; offsets is clean
-    assert prog_txt != "ZEBRA<|im_end|>\nQUOKKA<|im_end|>\nFINALX<|im_end|>\n"
+    assert prog_txt != "ZEBRA<|im_end|>QUOKKA<|im_end|>FINALX<|im_end|>"
 
 
 if __name__ == "__main__":

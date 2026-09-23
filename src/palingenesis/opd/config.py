@@ -117,28 +117,31 @@ class OPDConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "OPDConfig":
+        """Load a YAML config. Unknown sections and options are errors (with a
+        did-you-mean hint), as for training configs."""
+        from palingenesis.config import ConfigError, _section, _set_option
+
         with Path(path).open() as f:
             raw = yaml.safe_load(f) or {}
+        if not isinstance(raw, dict):
+            raise ConfigError(f"{path}: expected a mapping of sections (model:, data:, train:, ...).")
         config = cls()
         for section_name, section_data in raw.items():
-            if hasattr(config, section_name) and isinstance(section_data, dict):
-                section = getattr(config, section_name)
-                for k, v in section_data.items():
-                    if hasattr(section, k):
-                        current = getattr(section, k)
-                        if isinstance(current, bool) and isinstance(v, str):
-                            v = v.lower() in ("true", "1", "yes")
-                        elif isinstance(current, float) and isinstance(v, str):
-                            v = float(v)
-                        elif isinstance(current, int) and isinstance(v, str):
-                            v = int(v)
-                        setattr(section, k, v)
+            section = _section(config, section_name, where=str(path))
+            if section_data is None:
+                continue
+            if not isinstance(section_data, dict):
+                raise ConfigError(f"{path}: `{section_name}:` must be a mapping of options.")
+            for key, value in section_data.items():
+                _set_option(section, section_name, key, value, where=str(path))
         return config
 
     @classmethod
     def from_cli(cls, args: list[str] | None = None) -> "OPDConfig":
         """Parse --config file.yaml and --section.field value overrides."""
         import sys
+
+        from palingenesis.config import ConfigError, _section, _set_option
 
         args = args or sys.argv[1:]
         config = cls()
@@ -161,20 +164,10 @@ class OPDConfig:
             if args[i].startswith("--") and i + 1 < len(args):
                 key, value = args[i][2:], args[i + 1]
                 parts = key.split(".")
-                if len(parts) == 2:
-                    section_name, field_name = parts
-                    if hasattr(config, section_name):
-                        section = getattr(config, section_name)
-                        if hasattr(section, field_name):
-                            current = getattr(section, field_name)
-                            if isinstance(current, bool):
-                                setattr(section, field_name, value.lower() in ("true", "1", "yes"))
-                            elif isinstance(current, int):
-                                setattr(section, field_name, int(value))
-                            elif isinstance(current, float):
-                                setattr(section, field_name, float(value))
-                            else:
-                                setattr(section, field_name, value)
+                if len(parts) != 2:
+                    raise ConfigError(f"--{key}: overrides are --section.option value.")
+                section = _section(config, parts[0], where="command line")
+                _set_option(section, parts[0], parts[1], value, where="command line")
                 i += 2
             else:
                 i += 1

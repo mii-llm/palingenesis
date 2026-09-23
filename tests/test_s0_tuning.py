@@ -7,7 +7,6 @@ sys.path.insert(0, "src")
 import torch
 import torch.nn as nn
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Minimal GatedDeltaNet-style recurrent layer for testing
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,7 +125,7 @@ def test_discover_layers():
 
 def test_s0_states_container():
     """Test S0States container creation and L2 penalty."""
-    from palingenesis.s0_tuning import discover_recurrent_layers, S0States
+    from palingenesis.s0_tuning import S0States, discover_recurrent_layers
 
     model = FakeHybridModel()
     layers = discover_recurrent_layers(model)
@@ -197,8 +196,8 @@ def test_s0_training_step():
         print(f"  State {i} moved by {diff:.6f}")
 
     # Loss should generally decrease (not guaranteed with random data, but should not explode)
-    print(f"  Losses: {[f'{l:.4f}' for l in losses]}")
-    assert all(l < 100 for l in losses), "Losses exploded"
+    print("  Losses:", [f"{x:.4f}" for x in losses])
+    assert all(x < 100 for x in losses), "Losses exploded"
 
     print("✓ test_s0_training_step PASSED\n")
 
@@ -206,6 +205,7 @@ def test_s0_training_step():
 def test_s0_save_load():
     """Test saving and loading S0 states."""
     import tempfile
+
     from palingenesis.s0_tuning import S0Trainer
 
     model = FakeHybridModel()

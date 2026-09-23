@@ -27,6 +27,34 @@ TRAINING_META_FILE = "training_meta.json"
 MAX_SHARD_SIZE = "2GB"
 DEFAULT_KEEP_LATEST_K = 5  # Auto-purge: keep only last 5 checkpoints
 
+# Prefixes that training wrappers add to parameter names: torch.compile's
+# OptimizedModule, activation checkpointing, FSDP1. A saved model must use the
+# architecture's own names, or from_pretrained initialises those weights randomly.
+_WRAPPER_PREFIXES = ("_orig_mod.", "_checkpoint_wrapped_module.", "_fsdp_wrapped_module.")
+
+
+def hf_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """A state dict with the wrapper prefixes removed from every name."""
+    clean = {}
+    for name, tensor in state.items():
+        for prefix in _WRAPPER_PREFIXES:
+            name = name.replace(prefix, "")
+        clean[name] = tensor
+    return clean
+
+
+def save_hf_model(model, tokenizer, path: Path, state: dict[str, torch.Tensor] | None = None) -> None:
+    """Save in Hugging Face format under the architecture's parameter names.
+
+    `state` is an already gathered full state dict (FSDP); by default the model's own.
+    The live model is never modified.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    state = hf_state_dict(state if state is not None else model.state_dict())
+    model.save_pretrained(path, state_dict=state, safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(path)
+
 
 def save_checkpoint(
     model,
@@ -67,12 +95,7 @@ def _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step
     path.mkdir(parents=True, exist_ok=True)
 
     # Model in sharded safetensors (HF format, loadable by from_pretrained)
-    model.save_pretrained(
-        path / "model",
-        safe_serialization=True,
-        max_shard_size=MAX_SHARD_SIZE,
-    )
-    tokenizer.save_pretrained(path / "model")
+    save_hf_model(model, tokenizer, path / "model")
 
     # Optimizer: save state_dict (complex nested structure)
     # We split into per-group files if state is large
@@ -242,34 +265,31 @@ def _load_single(model, optimizer, path, device):
     """Load single-GPU checkpoint with low memory usage.
 
     Model weights are loaded shard-by-shard using safetensors memory mapping.
-    Only one shard is in RAM at a time.
+    Only one shard is in RAM at a time. Every parameter of the model must be found
+    in the checkpoint (a weight tied to another counts as found through it).
     """
     model_path = path / "model"
     if model_path.exists():
-        # Load model shards one by one (low RAM)
-        index_file = model_path / "model.safetensors.index.json"
-        if index_file.exists():
-            # Sharded model: load each shard and apply to model
-            with open(index_file) as f:
-                index = json.load(f)
-            # Get unique shard files
-            shard_files = sorted(set(index["weight_map"].values()))
-            for shard_file in shard_files:
-                shard_path = model_path / shard_file
-                # Memory-mapped load: only the accessed tensors are actually read
-                shard_dict = safetensors_load(str(shard_path), device=str(device) if device else "cpu")
-                # Apply to model
-                missing, unexpected = model.load_state_dict(shard_dict, strict=False)
-                del shard_dict  # Free immediately
-            logger.info(f"Loaded model from {len(shard_files)} shards")
-        else:
-            # Single file model
-            sf_files = list(model_path.glob("*.safetensors"))
-            if sf_files:
-                state = safetensors_load(str(sf_files[0]), device=str(device) if device else "cpu")
-                model.load_state_dict(state, strict=False)
-                del state
-                logger.info("Loaded model from single safetensors file")
+        # Model names without wrapper prefixes -> the model's own names
+        own = {hf: name for name, hf in zip(model.state_dict(), hf_state_dict(dict.fromkeys(model.state_dict())))}
+        shard_files = sorted(model_path.glob("*.safetensors"))
+        if not shard_files:
+            raise FileNotFoundError(f"No model weights (*.safetensors) in {model_path}")
+        loaded: set[str] = set()
+        for shard_file in shard_files:
+            # Memory-mapped load: only the accessed tensors are actually read
+            shard = hf_state_dict(safetensors_load(str(shard_file), device=str(device) if device else "cpu"))
+            unknown = [k for k in shard if k not in own]
+            if unknown:
+                raise RuntimeError(f"Checkpoint {model_path} has weights this model does not: {unknown[:5]}")
+            model.load_state_dict({own[k]: v for k, v in shard.items()}, strict=False)
+            loaded.update(shard)
+            del shard  # Free immediately
+        tied = _tied_parameter_names(model)
+        missing = [k for k in own if k not in loaded and k not in tied]
+        if missing:
+            raise RuntimeError(f"Checkpoint {model_path} lacks weights of this model: {missing[:5]}")
+        logger.info(f"Loaded model from {len(shard_files)} file(s)")
 
     # Optimizer: load sharded
     optim_path = path / "optimizer"
@@ -281,6 +301,20 @@ def _load_single(model, optimizer, path, device):
         optimizer.load_state_dict(state)
         del state
         logger.info("Loaded optimizer (legacy single file)")
+
+
+def _tied_parameter_names(model) -> set[str]:
+    """HF names of parameters that share storage with an earlier one (tied embeddings),
+    which save_pretrained writes once."""
+    seen: dict[int, str] = {}
+    tied = set()
+    for name, tensor in hf_state_dict(model.state_dict()).items():
+        ptr = tensor.untyped_storage().data_ptr() if tensor.device.type != "meta" else id(tensor)
+        if ptr in seen:
+            tied.add(name)
+        else:
+            seen[ptr] = name
+    return tied
 
 
 def _load_optimizer_sharded(optimizer, path: Path, device):
@@ -402,42 +436,34 @@ def save_final(model, tokenizer, output_dir: str, is_fsdp: bool = False):
     Intermediate checkpoints use sharded DCP (fast, zero extra memory).
     """
     path = Path(output_dir) / "final"
+    _save_gathered_or_local(model, tokenizer, path, is_fsdp)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info(f"Final model saved (HF format) -> {path}")
 
+
+def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool) -> None:
+    """HF-format save; under FSDP the full state is gathered to rank 0 (CPU) and saved
+    from there, leaving every rank's sharded model untouched."""
     if is_fsdp and dist.is_initialized() and dist.get_world_size() > 1:
         from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-        dist.barrier()  # Ensure all ranks finished training before gathering
-
-        # Gather full state to rank 0 (cpu_offload=True to avoid GPU OOM)
+        dist.barrier()  # every rank has finished its step before the gather
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         state = get_model_state_dict(model, options=opts)
-
         if dist.get_rank() == 0:
-            path.mkdir(parents=True, exist_ok=True)
-            # Apply gathered state to a local model copy for save_pretrained
-            model.load_state_dict(state, assign=True)
-            model.save_pretrained(path, safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
-            tokenizer.save_pretrained(path)
-            logger.info(f"Final model saved (HF format) -> {path}")
-
+            save_hf_model(model, tokenizer, path, state=state)
+        del state
         dist.barrier()
     else:
-        path.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(path, safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
-        tokenizer.save_pretrained(path)
-        logger.info(f"Final model saved -> {path}")
+        save_hf_model(model, tokenizer, path)
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
-    """Find the latest VALID checkpoint directory by step number.
+    """Find the latest COMPLETE checkpoint directory by step number.
 
-    A checkpoint is valid only if it contains either:
-      - training_meta.json (our format)
-      - .metadata (DCP format marker)
-      - model.safetensors.index.json (HF sharded format)
-
-    This prevents picking up half-written checkpoints from interrupted saves.
-    (Aligned with torchtitan's validity check pattern.)
+    training_meta.json is written after the model and optimizer state (and, under
+    FSDP, after every rank's DCP shard), so it marks a checkpoint whose save
+    finished; a directory without it is a save interrupted halfway and is skipped.
     """
     base = Path(output_dir)
     if not base.exists():
@@ -452,13 +478,10 @@ def find_latest_checkpoint(output_dir: str) -> str | None:
         except (ValueError, IndexError):
             continue
 
-        # Check validity: at least one completion marker must exist
-        has_meta = (d / TRAINING_META_FILE).exists()
-        has_dcp = (d / "dcp" / ".metadata").exists()
-        has_hf = (d / "model" / "model.safetensors.index.json").exists()
-
-        if has_meta or has_dcp or has_hf:
+        if (d / TRAINING_META_FILE).exists():
             valid_checkpoints.append((step_num, str(d)))
+        else:
+            logger.warning(f"Skipping incomplete checkpoint {d} (no {TRAINING_META_FILE})")
 
     if not valid_checkpoints:
         return None
@@ -558,30 +581,11 @@ class BestModelTracker:
         self.best_step = step
 
         path = Path(self.output_dir) / "best"
-
-        if is_fsdp and dist.is_initialized() and dist.get_world_size() > 1:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
-            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-            state = get_model_state_dict(model, options=opts)
-
-            if dist.get_rank() == 0:
-                # Remove old best, save new one
-                if path.exists():
-                    shutil.rmtree(path)
-                path.mkdir(parents=True, exist_ok=True)
-                model.load_state_dict(state, assign=True)
-                model.save_pretrained(path / "model", safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
-                tokenizer.save_pretrained(path / "model")
-                _save_best_meta(path, step, eval_loss)
-
-            dist.barrier()
-        else:
-            if path.exists():
-                shutil.rmtree(path)
-            path.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(path / "model", safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
-            tokenizer.save_pretrained(path / "model")
+        is_main = not dist.is_initialized() or dist.get_rank() == 0
+        if is_main and path.exists():
+            shutil.rmtree(path)
+        _save_gathered_or_local(model, tokenizer, path / "model", is_fsdp)
+        if is_main:
             _save_best_meta(path, step, eval_loss)
 
         if not dist.is_initialized() or dist.get_rank() == 0:

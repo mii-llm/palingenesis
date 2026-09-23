@@ -9,8 +9,11 @@
 ```bash
 git clone https://github.com/mii-llm/palingenesis.git
 cd palingenesis
-uv pip install -e ".[train]"
+uv sync --extra train --extra logging
+source .venv/bin/activate
 ```
+
+Other ways to install (pip, other CUDA versions): see [Installation](install.md).
 
 ## 2. Run
 

@@ -173,6 +173,7 @@ def _run_agent_tool(module_name: str):
 def _run_prepare_multi():
     """CLI for multi-source data preparation with MSFT allocation."""
     import argparse
+
     import yaml
 
     parser = argparse.ArgumentParser(description="Prepare multiple data sources with per-source scoring")
@@ -339,7 +340,7 @@ def _cuda_info() -> str:
 
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
-            mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+            mem = torch.cuda.get_device_properties(0).total_memory / 2**30
             return f"{name} ({mem:.0f} GB)"
         return "not available"
     except Exception:

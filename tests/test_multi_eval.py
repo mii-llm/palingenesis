@@ -1,11 +1,13 @@
 """Tests for multi-source evaluation with weighted scoring."""
 
 import sys
+
 sys.path.insert(0, "src")
 
 import torch
 import torch.nn as nn
-from palingenesis.multi_eval import MultiEvaluator, MultiEvalResult, IGNORE_INDEX
+
+from palingenesis.multi_eval import MultiEvalResult, MultiEvaluator
 
 
 class TinyModel(nn.Module):
@@ -21,6 +23,7 @@ class TinyModel(nn.Module):
 
     def save_pretrained(self, path, **kwargs):
         from pathlib import Path
+
         from safetensors.torch import save_file
         Path(path).mkdir(parents=True, exist_ok=True)
         state = {k: v.contiguous() for k, v in self.state_dict().items()}
@@ -60,7 +63,7 @@ def test_multi_eval_with_real_model():
     """MultiEvaluator computes valid loss on a tiny model with synthetic data."""
     import json
     import tempfile
-    from pathlib import Path
+
     from transformers import AutoTokenizer
 
     # Create synthetic eval data
@@ -113,6 +116,7 @@ def test_multi_eval_pretrain_mode():
     template — so it works even with a tokenizer that has no chat template (GPT-2)."""
     import json
     import tempfile
+
     from transformers import AutoTokenizer
 
     docs = [
@@ -182,6 +186,7 @@ def test_multi_eval_unknown_mode_skips():
 def test_multi_eval_best_model_integration():
     """MultiEval score integrates with BestModelTracker correctly."""
     import tempfile
+
     from palingenesis.checkpoint import BestModelTracker
 
     with tempfile.TemporaryDirectory() as tmpdir:

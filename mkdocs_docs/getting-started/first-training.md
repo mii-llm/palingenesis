@@ -77,12 +77,11 @@ output/
 
 ## Packing: when to use it
 
-Packing concatenates multiple short conversations into one long sequence (up to `max_seq_length`). This avoids wasting compute on padding tokens.
+Packing (`packing: true`, off by default) places several whole conversations in one sequence of up to `max_seq_length` tokens. A conversation is never split across two sequences, and each one only attends to itself: `position_ids` restart at every conversation and the trainer passes the arguments that make every attention and linear-attention layer respect them.
 
-- **Use packing** (default, `packing: true`) when: most of your conversations are shorter than `max_seq_length`. This is almost always the case.
-- **Disable packing** when: every conversation is already close to `max_seq_length` (e.g., long document summarization with 8K inputs). Packing provides no benefit when there's nothing to pack.
+Without packing, batches are already cut to the length of their longest row, and length-grouped batching (`length_group_buffer`, on by default) puts rows of similar length together, so little compute goes to padding. On short chat data (Qwen3-0.6B, perfectblend) the two measured about the same (packing somewhat slower with `sdpa`, which needs an explicit block-diagonal mask), so packing is not a free speedup. It pays off when rows are few and of very different lengths, or with `attn_implementation: flash_attention_2`, whose variable-length kernel needs no mask.
 
-With packing, throughput typically improves 2-3× because the GPU processes useful tokens instead of padding.
+Qwen3.5 and other linear-attention hybrids need the `hybrid` extra to pack (see [Installation](install.md)); the trainer refuses otherwise.
 
 ---
 

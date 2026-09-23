@@ -88,7 +88,8 @@ def autopilot(
         num_layers = getattr(model_cfg, "num_hidden_layers", 32)
         model_params_b = (num_layers * (12 * hidden_size**2) + vocab_size * hidden_size * 2) / 1e9
 
-        recommended = auto_config(model_params_b, seq_length, vocab_size, hardware)
+        recommended = auto_config(model_params_b, seq_length, vocab_size, hardware,
+                                  hidden_size=hidden_size, num_layers=num_layers)
 
         # Estimate optimal LR from scaling laws (used as sweep center point)
         effective_batch_tokens = (

@@ -134,12 +134,19 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
             "Possible data corruption or learning rate too high."
         )
 
-    # Plateau detection (loss doesn't improve for >50 consecutive steps)
+    # Plateau detection (the SMOOTHED loss doesn't improve for >50 consecutive
+    # steps). Per-step SFT losses vary a lot from batch to batch; against the best
+    # raw value (an unusually easy batch) almost every healthy run would "plateau".
     plateau_threshold = max(50, len(finite) // 10)
-    best_so_far = finite[0][1]
+    window = 20
+    smoothed = [
+        (idx, sum(v for _, v in finite[max(0, i - window + 1): i + 1]) / (i + 1 - max(0, i - window + 1)))
+        for i, (idx, _) in enumerate(finite)
+    ]
+    best_so_far = smoothed[0][1]
     plateau_start = 0
-    for i, (idx, val) in enumerate(finite):
-        if val < best_so_far * 0.999:  # 0.1% improvement
+    for i, (idx, val) in enumerate(smoothed):
+        if val < best_so_far * 0.99:  # 1% improvement of the smoothed loss
             if i - plateau_start > plateau_threshold:
                 result.plateau_ranges.append((finite[plateau_start][0], finite[i - 1][0]))
             best_so_far = val
@@ -151,7 +158,8 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
     if result.plateau_ranges:
         longest = max(e - s for s, e in result.plateau_ranges)
         result.issues.append(
-            f"WARNING: Loss plateaued for {longest} steps. " "Learning rate may be too low or training is saturated."
+            f"INFO: the smoothed loss did not improve by 1% for {longest} steps. Normal once the initial drop is "
+            "over; early in training it can mean the learning rate is too low."
         )
 
     # Divergence detection (monotonically increasing over last 20% of training)

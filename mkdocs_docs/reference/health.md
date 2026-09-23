@@ -12,7 +12,7 @@ Core training dynamics, logged under `train/` and `eval/` on every `logging_step
 |--------|---------|-------------------|
 | `train/loss` | Per-token **objective** value, averaged over the accumulation window. With DEFT/DFT-family losses this is the gated loss — numerically much smaller than a cross-entropy (0.05–0.2 is normal) | Smooth decrease. Spikes → data or LR issues |
 | `train/ce_loss` | Unweighted cross-entropy on the same batches (logged under chunked DEFT, computed for free). This is the number comparable to `eval/loss` | Same scale as eval loss |
-| `train/deft_gate` | Mean DEFT trust gate `p^α` ∈ (0,1]. Rising gate = model growing confident on its targets | Slow rise over training |
+| `train/token_gate` | Mean token gate of the gated objective (DEFT `p^α`, DFT `p`, InfoSFT, CADFT). Rising gate = model growing confident on its targets | Slow rise over training |
 | `train/ppl` | `exp` of the true CE (`train/ce_loss` when available). Omitted when the objective is not a CE — `exp(DEFT)` would be meaningless | A ppl of 2-6 is typical mid-SFT |
 | `train/lr` | Current learning rate from the scheduler | Matches your configured schedule |
 | `train/grad_norm` | Global gradient norm (after clipping / AdaGC) | Stable band. Growth → instability brewing |
@@ -213,7 +213,7 @@ Reports: convergence rate, spike count, plateau detection, recommended next step
 | **Representation collapse** | Model outputs become repetitive | `health/stable_rank_min < 3` | Reduce LR, enable `sym_noise` |
 | **Entropy collapse (RL)** | Output diversity disappearing | `health/output_entropy < 1.5` | `pre_rl: true`, stop early |
 | **Data quality issues** | Loss noisy, frequent spikes | `SPIKE SKIPPED` > 5% of steps | `pgs prepare` to filter |
-| **Packing cross-contamination** | Loss suspiciously low | `pgs inspect` shows wrong masking | `attn_implementation: flash_attention_2` |
+| **Packing cross-contamination** | Loss differs from the unpacked run on the same data | Compare a few steps with `data.packing: false` | Report it: packed conversations are isolated by design (palingenesis.packing) |
 | **Memory pressure** | OOM or CUDA malloc fails | `health/cuda_utilization_pct > 95%` | Reduce `per_device_batch_size`, increase `loss_num_chunks` |
 | **Slow throughput** | tok/s below expected | `health/cuda_utilization_pct` low | `model.compile: true`, increase batch, `num_workers` |
 | **Source overfitting (multi-dataset)** | One source's eval degrades | Per-source eval in multi-eval | `msft_tracking: true` |

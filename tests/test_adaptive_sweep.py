@@ -14,19 +14,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import pytest
 
 from palingenesis.autopilot.adaptive_sweep import (
     TrialResult,
+    _surge_aware_batch_factor,
     adaptive_lr_sweep,
     correct_lr_adaptive,
     estimate_horizon_exponent,
     generate_coarse_candidates,
     generate_refinement_candidates,
     should_early_stop_trial,
-    _surge_aware_batch_factor,
 )
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CANDIDATE GENERATION
@@ -100,7 +98,6 @@ def test_coarse_candidates_scale_with_batch_size():
 
 def test_surge_aware_batch_factor():
     """The surge function peaks at B_crit and falls on both sides."""
-    from palingenesis.autopilot.adaptive_sweep import _surge_aware_batch_factor
 
     # At B_crit (100K): factor should be 1.0 (peak, by normalization)
     f_crit = _surge_aware_batch_factor(100_000)
@@ -112,15 +109,15 @@ def test_surge_aware_batch_factor():
 
     # Well below: very small factor
     f_tiny = _surge_aware_batch_factor(1_024)  # toy batch
-    assert f_tiny < f_small, f"Tinier batch should have lower factor"
+    assert f_tiny < f_small, "Tinier batch should have lower factor"
 
     # Above B_crit: factor < 1 (falling phase)
     f_large = _surge_aware_batch_factor(4_000_000)  # 8GPU × batch4 × seq8K × GA16
     assert f_large < 1.0, f"Large batch: factor={f_large}, expected < 1.0"
 
     # The peak is at B_crit
-    assert f_crit > f_small, f"Peak should be higher than small"
-    assert f_crit > f_large, f"Peak should be higher than large"
+    assert f_crit > f_small, "Peak should be higher than small"
+    assert f_crit > f_large, "Peak should be higher than large"
 
     print(f"  1K tokens: factor={f_tiny:.3f}")
     print(f"  4K tokens: factor={f_small:.3f}")

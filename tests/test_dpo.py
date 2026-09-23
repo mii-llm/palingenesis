@@ -340,3 +340,19 @@ def test_metrics_are_reported():
     assert step.metrics["rewards/margins"] == 0.0
     for key in ("rewards/chosen", "rewards/rejected", "rewards/accuracies", "logps/chosen", "logps/rejected"):
         assert key in step.metrics
+
+
+def test_prompt_not_repeated_when_completions_are_full_conversations():
+    """ultrafeedback_binarized-style rows: a prompt string AND chosen/rejected that
+    already start with that user turn. The prompt must appear once."""
+    from palingenesis.dpo import _to_conversations
+
+    row = {"prompt": "Hi?",
+           "chosen": [{"role": "user", "content": "Hi?"}, {"role": "assistant", "content": "Hello"}],
+           "rejected": [{"role": "user", "content": "Hi?"}, {"role": "assistant", "content": "Go away"}]}
+    chosen, rejected = _to_conversations(row)
+    assert [m["role"] for m in chosen] == ["user", "assistant"]
+    assert [m["role"] for m in rejected] == ["user", "assistant"]
+    # a prompt followed by bare completions is still prepended
+    chosen, _ = _to_conversations({"prompt": "Hi?", "chosen": "Hello", "rejected": "Go away"})
+    assert [m["role"] for m in chosen] == ["user", "assistant"]

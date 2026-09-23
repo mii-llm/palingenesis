@@ -152,6 +152,7 @@ class MultiEvaluator:
                 rank=0,
                 world_size=1,
                 last_turn_only=src_config.get("last_turn_only", False),
+                tools_field=src_config.get("tools_field", "tools"),
             )
         else:
             logger.warning(f"MultiEval: unknown mode '{mode}' for source '{src_config.get('name', '?')}', skipping")

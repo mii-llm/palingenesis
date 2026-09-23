@@ -18,7 +18,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from palingenesis.data import ChatDataset, IGNORE_INDEX  # noqa: E402
+from palingenesis.data import IGNORE_INDEX, ChatDataset  # noqa: E402
 
 
 class FakeReasoningTokenizer:

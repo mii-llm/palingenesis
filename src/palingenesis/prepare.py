@@ -90,6 +90,7 @@ def score_samples_with_model(
     batch_size: int = 4,
     device: str = "auto",
     max_batch_tokens: int = 16384,
+    chat_options: dict | None = None,
 ) -> list[dict]:
     """Score samples by computing model perplexity on responses.
 
@@ -124,28 +125,26 @@ def score_samples_with_model(
     )
     model.eval()
 
-    # ── Phase 1: tokenize everything on CPU (chat template + response masks) ──
+    # ── Phase 1: tokenize everything on CPU with the TRAINER's own pipeline ──
+    # (ChatDataset: chat template, tools, truncation at turn boundaries, and the
+    # exact tokens that get loss in training, per-message flags and reasoning
+    # settings included), so "response perplexity" scores what training trains.
+    from palingenesis.data import IGNORE_INDEX, ChatDataset
+
+    chat = ChatDataset(None, tokenizer, max_seq_length, messages_field, **(chat_options or {}))
     total = len(samples)
     entries: list[tuple[int, list[int], torch.Tensor]] = []  # (sample_idx, input_ids, response_mask)
     for idx, sample in enumerate(samples):
-        messages = _get_messages(sample, messages_field)
-        if not messages:
-            _mark_unscoreable(sample)
-            continue
-
         try:
-            full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        except Exception:
-            full_text = "\n".join(m.get("content", "") for m in messages)
-
-        ids = tokenizer(full_text, max_length=max_seq_length, truncation=True)["input_ids"]
-        if len(ids) < 2:
+            processed = chat._process(sample)
+        except Exception as exc:
+            logger.debug(f"sample {idx} cannot be rendered: {exc!r}")
+            processed = None
+        if processed is None or processed["input_ids"].numel() < 2:
             _mark_unscoreable(sample)
             continue
-
-        # True for assistant tokens, False for context — same tokens that get loss in training
-        response_mask = _build_response_mask(tokenizer, messages, len(ids))
-        entries.append((idx, ids, response_mask))
+        ids = processed["input_ids"].tolist()
+        entries.append((idx, ids, processed["labels"] != IGNORE_INDEX))
 
         if idx % 5000 == 0:
             logger.info(f"  Tokenized {idx}/{total}")
@@ -291,68 +290,6 @@ def _score_padded_batch(
         sample["_score_avg_nll"] = round(avg_nll, 4)
         sample["_score_response_nll"] = round(response_nll, 4)
         sample["_score_response_token_count"] = n_resp
-
-
-def _build_response_mask(
-    tokenizer,
-    messages: list[dict],
-    total_seq_len: int,
-) -> torch.Tensor:
-    """Build a boolean mask identifying assistant response tokens.
-
-    Uses the chat template to precisely locate where each assistant turn starts
-    and ends within the tokenized sequence. This matches what ChatDataset does
-    during training (only assistant tokens get loss).
-
-    Strategy:
-    1. For each assistant message, tokenize the conversation UP TO (but not including)
-       that message to find the prefix length.
-    2. Tokenize the conversation UP TO AND INCLUDING that message for the end position.
-    3. Mark tokens in [prefix_len, end_len) as response tokens.
-
-    Falls back to the "everything after first user message" heuristic if
-    chat template tokenization fails.
-    """
-    mask = torch.zeros(total_seq_len, dtype=torch.bool)
-
-    try:
-        # Find assistant message indices
-        assistant_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
-        if not assistant_indices:
-            # No assistant messages — everything is context
-            return mask
-
-        for asst_idx in assistant_indices:
-            # Tokenize up to (not including) this assistant message
-            prefix_messages = messages[:asst_idx]
-            if prefix_messages:
-                prefix_text = tokenizer.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=True)
-                prefix_tokens = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
-                start_pos = len(prefix_tokens)
-            else:
-                start_pos = 0
-
-            # Tokenize up to and including this assistant message
-            inclusive_messages = messages[: asst_idx + 1]
-            inclusive_text = tokenizer.apply_chat_template(
-                inclusive_messages, tokenize=False, add_generation_prompt=False
-            )
-            inclusive_tokens = tokenizer(inclusive_text, add_special_tokens=False)["input_ids"]
-            end_pos = len(inclusive_tokens)
-
-            # Clamp to sequence length
-            start_pos = min(start_pos, total_seq_len)
-            end_pos = min(end_pos, total_seq_len)
-
-            if end_pos > start_pos:
-                mask[start_pos:end_pos] = True
-
-    except Exception:
-        # Fallback: mark last 60% as response (crude but better than nothing)
-        response_start = max(1, int(total_seq_len * 0.4))
-        mask[response_start:] = True
-
-    return mask
 
 
 def classify_difficulty(
@@ -698,8 +635,12 @@ def prepare_data(
     max_ppl: float = 500.0,
     filter_score: str = "response",
     max_batch_tokens: int = 16384,
+    chat_options: dict | None = None,
 ) -> Path:
     """Full data preparation pipeline.
+
+    chat_options: ChatDataset options (train_on_reasoning, include_observations,
+    last_turn_only, tools_field) so scoring masks exactly what training trains.
 
     1. Load data
     2. Score with model perplexity
@@ -746,7 +687,8 @@ def prepare_data(
     # Score
     logger.info("Scoring samples with model perplexity...")
     samples = score_samples_with_model(
-        model_name, samples, messages_field, max_seq_length, batch_size, max_batch_tokens=max_batch_tokens
+        model_name, samples, messages_field, max_seq_length, batch_size, max_batch_tokens=max_batch_tokens,
+        chat_options=chat_options,
     )
 
     # Optional HES scoring (for reasoning data)
@@ -1154,6 +1096,12 @@ def prepare_from_config(config) -> Path:
         max_ppl=config.preprocess.max_ppl,
         filter_score=config.preprocess.filter_score,
         max_batch_tokens=config.preprocess.max_batch_tokens,
+        chat_options={
+            "train_on_reasoning": config.data.train_on_reasoning,
+            "include_observations": config.data.include_observations,
+            "last_turn_only": config.data.last_turn_only,
+            "tools_field": config.data.tools_field,
+        },
     )
 
 

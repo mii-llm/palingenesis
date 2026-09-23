@@ -11,8 +11,8 @@
 | `name_or_path` | str | `meta-llama/Llama-3.1-8B-Instruct` | HuggingFace model ID or local path. Any `AutoModelForCausalLM`-compatible model. |
 | `trust_remote_code` | bool | `true` | Allow executing model code from HuggingFace. Required for Qwen, Gemma. |
 | `torch_dtype` | str | `bfloat16` | Weight precision. Options: `bfloat16`, `float16`, `float32`. bf16 recommended for A100+. |
-| `attn_implementation` | str | `sdpa` | Attention backend. `flash_attention_2` for packing with document masking, `sdpa` for compatibility, `eager` for debugging. |
-| `use_liger_kernel` | bool | `true` | Fused Triton kernels for RMSNorm, SwiGLU, RoPE. ~15% speedup, zero accuracy change. Disable for unsupported architectures. |
+| `attn_implementation` | str | `sdpa` | Attention backend. `sdpa` works everywhere (packing included); `flash_attention_2` (if installed) packs without an explicit mask; `eager` for debugging. |
+| `use_liger_kernel` | bool | `true` | Liger's fused Triton kernels (RMSNorm, SwiGLU, RoPE, ...) for the model's `model_type`. Applied only when `compile` is false: torch.compile fuses the same ops (faster in our measurements) and cannot trace Liger's kernels. |
 | `compile` | bool | `true` | `torch.compile` each transformer layer. First step is slow (compilation), then 20-40% faster. |
 | `compile_backend` | str | `inductor` | Compiler backend. `inductor` (default, fastest), `aot_eager` (debugging). |
 | `compile_mode` | str | `default` | Compile optimization level. `default`, `reduce-overhead` (small batches), `max-autotune` (5-15% faster, longer compile). |
@@ -29,13 +29,14 @@
 | `max_seq_length` | int | `8192` | Maximum sequence length. Longer = more memory. Packing fills to this length. |
 | `messages_field` | str | `messages` | JSON field containing chat messages. Also tries: `conversations`, `chat`, `dialogue`, `turns`. |
 | `num_workers` | int | `4` | DataLoader worker processes. Increase if data loading is the bottleneck. |
-| `packing` | bool | `false` | Pack multiple conversations into one sequence. 2-3× throughput. Requires `flash_attention_2` for correct masking. |
+| `packing` | bool | `false` | Pack whole conversations into sequences of up to `max_seq_length` tokens, each attending only to itself (any `attn_implementation`; linear-attention hybrids need the `hybrid` extra). See [first training](../getting-started/first-training.md#packing-when-to-use-it) for when it pays off. |
 | `length_group_buffer` | int | `512` | Without packing, batches pad to their longest sample — with skewed length distributions most FLOPs go to pad tokens. Length-grouped batching buffers N samples, sorts by length, and emits batch-aligned groups so padding collapses to the within-group spread. Often a multi-× throughput win. `0` disables. Auto-disabled for `strategy: curriculum`. |
 | `seed` | int | `42` | Random seed for data shuffling. |
 | `sources` | list | `[]` | Multi-dataset mode. List of `{dataset, split, weight, mode, messages_field}` dicts. |
 | `include_observations` | bool | `false` | **ECHO mode**: include tool/observation role tokens in loss. Teaches the model to predict tool outputs (world model). |
 | `train_on_reasoning` | bool | `true` | Include reasoning traces (`<think>` blocks / `reasoning`) in the loss. Required for distilling reasoning behavior. Set `false` to train only on the post-`</think>` response. Honored identically whether the chat template uses a `{% generation %}` span (fast path) or not (fallback path). |
-| `turn_scaling` | str | `uniform` | Per-turn loss weight. `uniform` (equal), `progressive` (later turns heavier, √(idx/total)), `last_heavy` (final turn 2×). |
+| `turn_scaling` | str | `uniform` | Per-turn loss weight. `uniform` (equal), `progressive` (later turns heavier, √(idx/total)), `last_heavy` (final turn 2×). Weights have mean 1 per conversation. Applied by CE, chunked CE, Cut Cross-Entropy and chunked DEFT; rejected with other objectives, SeCO and DPO. |
+| `tools_field` | str | `tools` | Row field with the tool definitions (list or JSON string), passed to the chat template as `tools=`. |
 | `last_turn_only` | bool | `false` | Mask every assistant turn except the final one — in training, loss only on the last answer; in `eval_sources`, score only the last answer. Phase-neutral name (no `train_`/`eval_` prefix) since the same mask serves both. Use when earlier assistant turns are a fixed context you must not fit/score (e.g. few-shot exemplar answers in eval-format SFT). No-op for single-turn data. Overridable per source in `sources`/`eval_sources`. |
 | `eval_dataset` | str | `""` | Single validation dataset. Enables best-model tracking. Empty = no validation. Superseded by `eval_sources` when set. |
 | `eval_sources` | list | `[]` | Per-capability eval: each source is scored independently (no cross-contamination) and combined into a weighted composite for best-model tracking. Per-source keys below. |
@@ -49,10 +50,7 @@
 | `msft_decay_factor` | float | `0.7` | Weight multiplier when a source overfits. |
 | `msft_recovery_factor` | float | `1.15` | Weight multiplier when a source improves. |
 | `msft_floor_ratio` | float | `0.1` | Minimum weight (fraction of original). Never fully excludes a source. |
-| `seq_len_curriculum` | bool | `false` | Ramp max sequence length from short to full over training. |
-| `seq_len_curriculum_min` | int | `1024` | Starting max sequence length during curriculum. |
-| `seq_len_curriculum_ramp_steps` | int | `1000` | Steps to ramp from min to full `max_seq_length`. |
-| `pretokenize` | bool | `false` | Materialize the fully-assembled stream (tokenize → mask → mix → pack) to disk once, then load the tensors directly on later runs — skips all per-step tokenization **and** turns the exact step-count scan into a cheap read. A fingerprint over tokenizer/template/`max_seq_length`/sources/masking auto-rebuilds a stale cache. Incompatible with `msft_tracking` and `seq_len_curriculum` (both change the stream during training → hard error). |
+| `pretokenize` | bool | `false` | Materialize the fully-assembled stream (tokenize → mask → mix → pack) to disk once, then load the tensors directly on later runs — skips all per-step tokenization **and** turns the exact step-count scan into a cheap read. A fingerprint over tokenizer/template/`max_seq_length`/sources/masking auto-rebuilds a stale cache. Incompatible with `msft_tracking` (it changes the stream during training → hard error). |
 | `pretokenize_path` | str | `./pretokenized` | Directory for the pre-tokenized cache (`train.parquet` + `pretokenized_meta.json`). |
 
 !!! note "Reasoning / thinking modes"
@@ -118,7 +116,7 @@
 | `save_steps` | int | `500` | Save checkpoint every N steps. Auto-purges old ones (keeps last 5). |
 | `logging_steps` | int | `1` | Log metrics every N steps. |
 | `bf16` | bool | `true` | Enable bf16 mixed precision with fp32 gradient reduction. |
-| `gradient_checkpointing` | str | `selective` | Activation checkpointing. `selective` (best trade-off), `full` (max memory savings), `none` (fastest). |
+| `gradient_checkpointing` | str | `selective` | Activation checkpointing. `selective` keeps attention outputs and every other matmul (Qwen3-0.6B, 8×2048 tokens, compiled: 8.6 GiB of activations, +10% step time); `full` recomputes each layer (1.9 GiB, +25%); `none` keeps everything (19.8 GiB, fastest). |
 | `spike_detection` | bool | `true` | Skip optimizer step when gradient norm is anomalous (z-score based). |
 | `spike_z_threshold` | float | `5.0` | Z-score threshold for spike detection. Higher = fewer skips. |
 | `adagc` | bool | `false` | Per-tensor adaptive gradient clipping. Replaces global clipping. Better for stability. |
@@ -133,7 +131,7 @@
 | `base_merge_method` | str | `lerp` | Interpolation: `lerp` (linear) or `slerp` (spherical, preserves norms). |
 | `adamc` | bool | `false` | Corrected weight decay for normalized layers. Prevents gradient explosion at end of training. |
 | `llrd_decay` | float | `1.0` | Layer-wise LR decay. 1.0 = off. 0.9 = early layers get 0.9× LR per depth. |
-| `freeze_non_attention` | bool | `false` | Freeze all non-attention layers. For hybrid models (Qwen3.5) where only attention should be adapted. |
+| `freeze_non_attention` | bool | `false` | Hybrid models (Qwen3.5, Qwen3-Next, Mamba hybrids): freeze the linear-attention / recurrent layers (all their parameters except the layer norms); full-attention layers, embeddings, final norm and head train. No-op, with a warning, on models without such layers. |
 | `hyperball` | bool | `false` | Hyperball (arXiv:2606.16899): attention/MLP matrices keep their initial norm and move by a fixed angular step each update; embeddings, norms, biases and the head stay on the base optimizer. Any base optimizer. See [Optimizers](optimizers.md#hyperball). |
 | `hyperball_lr` | float | `0.0` | Hyperball's angular step η (fraction of each matrix norm moved per update, scaled by the LR schedule). `0` = per matrix, the base optimizer's first relative step (Adam/Lion: `learning_rate / rms(W)`). |
 | `mona` | bool | `false` | MONA curvature-aware acceleration. Augments gradients with EMA of gradient differences. |
@@ -184,7 +182,7 @@
 | `sym_noise` | bool | `false` | Symmetric noisy embeddings. Regularization that prevents overfitting to surface patterns. |
 | `sym_noise_alpha` | float | `5.0` | Noise magnitude. Higher = stronger regularization. Try 7.0 for small models. |
 | `schedule_free` | bool | `false` | Schedule-Free optimizer. Replaces LR scheduler with iterate averaging. |
-| `pre_rl` | bool | `false` | Pre-RL mode: entropy bonus + KL anchor to preserve diversity for subsequent GRPO/DPO. Requires `deft: false` and `memory.chunked_loss: false` — earlier loss branches take precedence and silently disable it. |
+| `pre_rl` | bool | `false` | Pre-RL mode: entropy bonus + KL anchor to preserve diversity for subsequent GRPO/DPO. Exclusive with the other objectives (a configuration error otherwise); materializes the full logits whatever `memory.chunked_loss` says. |
 | `pre_rl_entropy_coeff` | float | `0.1` | Entropy bonus weight. Higher = more output diversity preserved. |
 | `pre_rl_kl_coeff` | float | `0.5` | KL penalty weight. Higher = less drift from base model. |
 

@@ -283,7 +283,7 @@ class HealthMonitor:
         if len(self._loss_buffer) > 1:
             losses = list(self._loss_buffer)
             mean = sum(losses) / len(losses)
-            var = sum((l - mean) ** 2 for l in losses) / (len(losses) - 1)
+            var = sum((x - mean) ** 2 for x in losses) / (len(losses) - 1)
             metrics["health/loss_mean_window"] = mean
             metrics["health/loss_std_window"] = math.sqrt(var)
             # Coefficient of variation — normalized measure of noise
@@ -575,19 +575,17 @@ def _sample_stable_ranks(
 
 @torch.no_grad()
 def _sample_grads(model: nn.Module, max_elements: int = 500_000) -> torch.Tensor | None:
-    """Flatten a sample of gradients for cosine similarity computation."""
-    chunks = []
-    total = 0
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-        flat = p.grad.data.float().flatten()
-        take = min(flat.numel(), max_elements - total)
-        if take <= 0:
-            break
-        chunks.append(flat[:take])
-        total += take
-    return torch.cat(chunks) if chunks else None
+    """A fixed, strided sample of all gradients (about max_elements of them), for the
+    step-to-step cosine similarity. Strided over every parameter so the sample covers
+    the whole model: the first elements alone would be the first rows of the
+    embedding matrix, mostly tokens absent from the batch."""
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    grads = [g._local_tensor if hasattr(g, "_local_tensor") else g for g in grads]
+    total = sum(g.numel() for g in grads)
+    if total == 0:
+        return None
+    stride = max(1, total // max_elements)
+    return torch.cat([g.detach().flatten()[::stride].float() for g in grads])
 
 
 def _per_layer_grad_weight_ratio(

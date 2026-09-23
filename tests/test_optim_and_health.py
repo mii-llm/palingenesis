@@ -12,11 +12,9 @@ import sys
 
 sys.path.insert(0, "src")
 
-import math
 import pytest
 import torch
 import torch.nn as nn
-
 
 # ==============================================================================
 # SCHEDULER TESTS
@@ -169,7 +167,6 @@ def test_entropy_monitoring_basic():
 
 def test_entropy_collapse_detection():
     """Test that entropy collapse warning triggers correctly."""
-    import logging
     from palingenesis.health import HealthMonitor
 
     model = nn.Linear(10, 100)
@@ -212,7 +209,7 @@ def test_entropy_collapse_detection():
 
 def test_entropy_monitoring_ignores_mask():
     """Test that entropy is only computed on valid (non-IGNORE) positions."""
-    from palingenesis.health import HealthMonitor, IGNORE_INDEX
+    from palingenesis.health import IGNORE_INDEX, HealthMonitor
 
     model = nn.Linear(10, 50)
     monitor = HealthMonitor(model, rl_readiness=True, rl_entropy_floor=1.0)
@@ -552,8 +549,6 @@ if __name__ == "__main__":
 
     # Hyperball tests
     print("── Hyperball Optimizer Tests ──\n")
-    test_hyperball_preserves_norm()
-    test_hyperball_updates_direction()
     test_hyperball_convergence()
 
     # MONA tests

@@ -19,7 +19,7 @@ class ModelConfig:
     trust_remote_code: bool = True
     torch_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     attn_implementation: Literal["sdpa", "flash_attention_2", "eager"] = "sdpa"
-    use_liger_kernel: bool = True
+    use_liger_kernel: bool = True  # used when compile is false (compile fuses the same ops)
     compile: bool = True
     compile_backend: str = "inductor"
     compile_mode: str = "default"  # "default", "reduce-overhead", or "max-autotune"
@@ -33,6 +33,10 @@ class DataConfig:
     streaming: bool = True
     max_seq_length: int = 8192
     messages_field: str = "messages"
+    # Row field with the tool definitions (a list, or a JSON string), passed to the
+    # chat template as `tools=`: the template renders them into the system prompt the
+    # way the model sees them at inference. Rows without it render without tools.
+    tools_field: str = "tools"
     num_workers: int = 4
     packing: bool = False
     # Without packing, batches are padded to their longest sample. Length-grouped
@@ -95,18 +99,12 @@ class DataConfig:
     msft_decay_factor: float = 0.7  # Weight decay multiplier when overfitting
     msft_recovery_factor: float = 1.15  # Weight recovery multiplier when improving
     msft_floor_ratio: float = 0.1  # Minimum weight as fraction of original (never zero)
-    # Sequence length curriculum (arxiv:2405.13226, Dataset Decomposition)
-    # Ramps max_seq_length from short to full over training. Short seqs early = faster
-    # attention (quadratic), model learns basics fast. Long seqs later = full context.
-    seq_len_curriculum: bool = False
-    seq_len_curriculum_min: int = 1024  # Starting max sequence length
-    seq_len_curriculum_ramp_steps: int = 1000  # Steps to ramp from min to max_seq_length
     # Pre-tokenized cache: materialize the fully-assembled (tokenized → masked → mixed
     # → packed) training stream to disk once, then load tensors directly on later runs
     # (skips per-step tokenization AND makes the exact step count a cheap read). A
     # fingerprint over tokenizer/template/seqlen/sources/masking invalidates a stale
-    # cache and triggers an automatic rebuild. Incompatible with msft_tracking and
-    # seq_len_curriculum (both change the stream during training).
+    # cache and triggers an automatic rebuild. Incompatible with msft_tracking (it
+    # changes the stream during training).
     pretokenize: bool = False
     pretokenize_path: str = "./pretokenized"
 
@@ -333,21 +331,17 @@ class Config:
     def from_yaml(cls, path: str | Path) -> "Config":
         with Path(path).open() as f:
             raw = yaml.safe_load(f) or {}
+        if not isinstance(raw, dict):
+            raise ConfigError(f"{path}: expected a mapping of sections (model:, data:, train:, ...).")
         config = cls()
         for section_name, section_data in raw.items():
-            if hasattr(config, section_name) and isinstance(section_data, dict):
-                section = getattr(config, section_name)
-                for k, v in section_data.items():
-                    if hasattr(section, k):
-                        # Type coercion: ensure YAML values match dataclass field types
-                        current = getattr(section, k)
-                        if isinstance(current, float) and isinstance(v, str):
-                            v = float(v)
-                        elif isinstance(current, int) and isinstance(v, str):
-                            v = int(v)
-                        elif isinstance(current, bool) and isinstance(v, str):
-                            v = v.lower() in ("true", "1", "yes")
-                        setattr(section, k, v)
+            section = _section(config, section_name, where=str(path))
+            if section_data is None:
+                continue
+            if not isinstance(section_data, dict):
+                raise ConfigError(f"{path}: `{section_name}:` must be a mapping of options.")
+            for key, value in section_data.items():
+                _set_option(section, section_name, key, value, where=str(path))
         return config
 
     @classmethod
@@ -403,20 +397,11 @@ class Config:
             if args[i].startswith("--") and i + 1 < len(args):
                 key, value = args[i][2:], args[i + 1]
                 parts = key.split(".")
-                if len(parts) == 2:
-                    section_name, field_name = parts
-                    if hasattr(config, section_name):
-                        section = getattr(config, section_name)
-                        if hasattr(section, field_name):
-                            current = getattr(section, field_name)
-                            if isinstance(current, bool):
-                                setattr(section, field_name, value.lower() in ("true", "1", "yes"))
-                            elif isinstance(current, int):
-                                setattr(section, field_name, int(value))
-                            elif isinstance(current, float):
-                                setattr(section, field_name, float(value))
-                            else:
-                                setattr(section, field_name, value)
+                if len(parts) != 2:
+                    raise ConfigError(f"--{key}: overrides are --section.option value (e.g. --train.learning_rate 1e-5).")
+                section_name, field_name = parts
+                section = _section(config, section_name, where="command line")
+                _set_option(section, section_name, field_name, value, where="command line")
                 i += 2
             else:
                 i += 1
@@ -461,6 +446,14 @@ class Config:
                     "Consider enabling adagc=true for per-tensor clipping instead."
                 )
 
+        from palingenesis.optim import OPTIMIZERS
+
+        if self.train.optimizer not in OPTIMIZERS:
+            errors.append(f"train.optimizer={self.train.optimizer!r} is not one of {', '.join(OPTIMIZERS)}.")
+        if self.train.lr_scheduler not in ("cosine", "linear", "constant", "power_decay", "wsd"):
+            errors.append(f"train.lr_scheduler={self.train.lr_scheduler!r} is not one of cosine, linear, "
+                          "constant, power_decay, wsd.")
+
         if self.data.packing and self.parallel.context_parallel:
             errors.append(
                 "packing=true is incompatible with context_parallel=true. "
@@ -498,12 +491,12 @@ class Config:
             self.plugins.cadft,
             self.plugins.deft,
             self.plugins.info_sft,
+            self.plugins.pre_rl,
         ])
         if active_losses > 1:
             errors.append(
-                f"Only one token-weighting loss can be active at a time ({active_losses} enabled). "
-                "Enable exactly one of: dft, cadft, deft, info_sft. "
-                "Hierarchy: DEFT > CADFT > DFT > InfoSFT > standard CE."
+                f"Only one training objective plugin can be active at a time ({active_losses} enabled). "
+                "Enable at most one of: dft, cadft, deft, info_sft, pre_rl."
             )
 
         if self.preprocess.enabled and self.data.sources:
@@ -523,12 +516,20 @@ class Config:
                     "Disable one of them (drop pretokenize to keep adaptive weighting, or "
                     "drop msft_tracking to cache a fixed stream)."
                 )
-            if self.data.seq_len_curriculum:
-                errors.append(
-                    "data.pretokenize=true is incompatible with data.seq_len_curriculum=true. "
-                    "The curriculum changes the sequence length as training progresses, so a "
-                    "single fixed pre-tokenized stream can't represent it. Disable one of them."
-                )
+
+        if self.data.turn_scaling not in ("uniform", "progressive", "last_heavy"):
+            errors.append(f"data.turn_scaling={self.data.turn_scaling!r} is not one of uniform, progressive, last_heavy.")
+        elif self.data.turn_scaling != "uniform":
+            # Per-token weights reach CE, chunked CE, CCE and the chunked gated objectives.
+            gated = self.plugins.dft or self.plugins.cadft or self.plugins.info_sft or self.plugins.deft
+            unweighted = [name for name, on in (
+                ("plugins.pre_rl", self.plugins.pre_rl),
+                ("plugins.deft/dft/cadft/info_sft without memory.chunked_loss", gated and not self.memory.chunked_loss),
+                ("memory.seco", self.memory.seco), ("dpo.enabled", self.dpo.enabled),
+            ) if on]
+            if unweighted:
+                errors.append(f"data.turn_scaling={self.data.turn_scaling!r} is not applied by {', '.join(unweighted)}; "
+                              "use turn_scaling: uniform with it.")
 
         if self.dpo.enabled:
             errors.extend(self._dpo_errors())
@@ -589,13 +590,6 @@ class Config:
                 "which may confuse MONA's curvature estimates. UNTESTED combination."
             )
 
-        if self.data.seq_len_curriculum and self.data.packing:
-            warnings.append(
-                "seq_len_curriculum + packing: curriculum ramps max_seq_length, but packing "
-                "concatenates sequences into fixed-length blocks. The curriculum may be ineffective "
-                "because packing already handles variable lengths efficiently."
-            )
-
         if self.data.packing and self.train.max_steps <= 0:
             warnings.append(
                 "packing=true with an epochs-based LR horizon: total_steps is derived from ROW "
@@ -605,29 +599,6 @@ class Config:
                 "(per_device_batch_size × grad_accum × max_seq_length × world_size)), or use "
                 "lr_scheduler: wsd, which tolerates an overestimated horizon."
             )
-
-        # The trainer picks ONE loss objective per run (priority: chunked DEFT >
-        # chunked CE > CADFT > DEFT > DFT > InfoSFT > pre_rl > CE), so pre_rl is
-        # silently shadowed by earlier branches — warn instead of ignoring.
-        if self.plugins.pre_rl:
-            shadowed_by = []
-            if self.plugins.deft:
-                shadowed_by.append("plugins.deft")
-            if self.plugins.cadft:
-                shadowed_by.append("plugins.cadft")
-            if self.plugins.dft:
-                shadowed_by.append("plugins.dft")
-            if self.plugins.info_sft:
-                shadowed_by.append("plugins.info_sft")
-            if self.memory.chunked_loss:
-                shadowed_by.append("memory.chunked_loss")
-            if shadowed_by:
-                warnings.append(
-                    f"pre_rl is enabled but will be SILENTLY IGNORED: {', '.join(shadowed_by)} "
-                    "take(s) precedence in the loss selection. To actually use pre_rl "
-                    "(entropy preservation for RL), disable those options — note that "
-                    "chunked_loss off means full logits are materialized (more memory)."
-                )
 
         # ── Raise on errors ───────────────────────────────────────────────
         if errors:
@@ -664,7 +635,6 @@ class Config:
             "data.eval_sources (use data.eval_dataset)": bool(self.data.eval_sources),
             "data.pretokenize": self.data.pretokenize,
             "data.msft_tracking": self.data.msft_tracking,
-            "data.seq_len_curriculum": self.data.seq_len_curriculum,
             "data.pretrain_replay_dataset": bool(self.data.pretrain_replay_dataset),
             "preprocess.enabled": self.preprocess.enabled,
             "parallel.context_parallel": self.parallel.context_parallel,
@@ -711,3 +681,60 @@ class Config:
 class ConfigError(Exception):
     """Raised when config has hard incompatibilities that prevent safe training."""
     pass
+
+
+# Options that existed once: a config that still sets them gets told why they are gone.
+_REMOVED_OPTIONS = {
+    ("data", "seq_len_curriculum"): "it never took effect (the curriculum was not wired into the data "
+                                    "pipeline). Remove it; set data.max_seq_length directly.",
+    ("data", "seq_len_curriculum_min"): "see data.seq_len_curriculum.",
+    ("data", "seq_len_curriculum_ramp_steps"): "see data.seq_len_curriculum.",
+}
+
+
+def _section(config: Config, name: str, where: str):
+    import dataclasses
+    import difflib
+
+    names = [f.name for f in dataclasses.fields(config)]
+    if name not in names:
+        hint = difflib.get_close_matches(name, names, n=1)
+        raise ConfigError(f"{where}: unknown config section `{name}`"
+                          + (f" (did you mean `{hint[0]}`?)" if hint else f"; sections: {', '.join(names)}"))
+    return getattr(config, name)
+
+
+def _set_option(section, section_name: str, key: str, value, where: str) -> None:
+    """Set section.key = value, coerced to the option's type. Unknown or removed options
+    are errors: a misspelt option silently keeping its default is a wrong training run."""
+    import dataclasses
+    import difflib
+
+    names = [f.name for f in dataclasses.fields(section)]
+    if key not in names:
+        if (section_name, key) in _REMOVED_OPTIONS:
+            raise ConfigError(f"{where}: {section_name}.{key} was removed: {_REMOVED_OPTIONS[(section_name, key)]}")
+        hint = difflib.get_close_matches(key, names, n=1)
+        raise ConfigError(f"{where}: unknown option {section_name}.{key}"
+                          + (f" (did you mean {section_name}.{hint[0]}?)" if hint else ""))
+    current = getattr(section, key)
+    if isinstance(value, str):
+        # YAML reads `2e-5` (no dot) as a string, and command-line values are strings.
+        text = value.strip()
+        try:
+            if isinstance(current, bool):
+                if text.lower() not in ("true", "false", "1", "0", "yes", "no"):
+                    raise ValueError
+                value = text.lower() in ("true", "1", "yes")
+            elif isinstance(current, int):
+                value = int(text)
+            elif isinstance(current, float):
+                value = float(text)
+            elif current is None and text.lower() in ("none", "null", ""):
+                value = None
+        except ValueError:
+            raise ConfigError(f"{where}: {section_name}.{key}={value!r} is not a valid "
+                              f"{type(current).__name__}.") from None
+    elif isinstance(current, float) and isinstance(value, int) and not isinstance(value, bool):
+        value = float(value)
+    setattr(section, key, value)
