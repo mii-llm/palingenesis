@@ -67,7 +67,7 @@ Your data should be JSONL with chat messages:
 Behind the scenes, palingenesis applied:
 
 - **Chat-template masking** — only assistant turns get loss (tool calls and end-of-turn tokens included)
-- **DEFT loss** — token weighting by the model's own confidence (arXiv:2602.11424)
+- **Cross-entropy loss** on those tokens (token-weighting objectives such as DEFT are [opt-in](../reference/loss.md))
 - **Power-decay LR** schedule
 - **Chunked loss** — the full logits are never materialized, whatever the vocabulary
 - **Length-grouped batches** — rows of similar length batched together, so little compute goes to padding

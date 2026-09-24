@@ -1,19 +1,31 @@
 # Loss Functions
 
-*The loss function determines which tokens the model pays attention to. The default (DEFT) is parameter-free and outperforms everything else.*
+*The loss function determines how much each trained token counts. The default is cross-entropy; token-weighting objectives are opt-in.*
 
 ---
 
-## DEFT (recommended)
+## DEFT
 
-Dynamic Entropy Fine-Tuning. Token weight is a function of the model's own confidence: tokens the model finds surprising get amplified, tokens it already knows get attenuated.
+Dynamic Entropy Fine-Tuning (arXiv:2602.11424). Each token's cross-entropy is weighted by the model's own confidence: where the model's prediction is concentrated and disagrees with the target, the token's weight shrinks; where the prediction is diffuse, the token keeps (almost) its full cross-entropy weight.
 
 ```yaml
 plugins:
   deft: true
 ```
 
-No hyperparameters. Subsumes standard CE (α→0) and DFT (α=1). The original paper (arxiv:2602.11424) reports gains on math and code reasoning, but these have not been independently reproduced.
+No hyperparameters. Standard CE (α→0) and DFT (α=1) are its two ends. The paper reports large gains fine-tuning **base** math models on NuminaMath (Qwen2.5-Math-1.5B, MATH-500: 41.7 with CE, 61.4 with DEFT).
+
+!!! warning "Measured here: it hurt when refining a post-trained model"
+    Qwen3-0.6B (post-trained, non-thinking), 30k NuminaMath-CoT conversations, the paper's recipe (1 epoch, LR 5e-5, cosine, warmup 0.1, fp32 master weights), greedy evaluation:
+
+    | | MATH-500 | GSM8K |
+    |---|---|---|
+    | Base model | 52.8 | 64.0 |
+    | Cross-entropy | 35.0 | 55.3 |
+    | DEFT | 30.2 | 48.5 |
+    | DFT | 5.0 | 2.6 (collapsed into repetition) |
+
+    All three degraded a model that is already good at math at this learning rate, and the token-weighted ones more. Measure on your own model and data before enabling them.
 
 The mechanism: each token's cross-entropy is multiplied by a trust gate `p_t^α_t`, where `p_t` is the model's probability of the target token and `α_t = Σ_v p_v²` (the collision probability, i.e. exponentiated Rényi-2 entropy) measures how concentrated the prediction is; the gate is a stop-gradient weight, so the gradient on the target logit is `-p^α (1 - p)`. A diffuse prediction (α near 0) keeps the full cross-entropy gradient; a confident one (α near 1) behaves like DFT's `p_t` gate, suppressing tokens the model confidently disagrees with.
 

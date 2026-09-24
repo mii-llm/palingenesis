@@ -12,7 +12,7 @@
 # What it does:
 #   - Loads your model in bf16
 #   - Trains only on assistant responses (proper chat masking)
-#   - Uses DEFT loss (parameter-free, improves math reasoning per arxiv:2602.11424)
+#   - Uses plain cross-entropy (the token-weighting plugins are opt-in: see docs/reference/loss)
 #   - Saves checkpoints every 200 steps
 #   - Logs to console (wandb/trackio optional)
 #
@@ -48,9 +48,6 @@ train:
 memory:
   chunked_loss: true               # Never OOMs on large vocab
   loss_num_chunks: 4
-
-plugins:
-  deft: true                       # State-of-the-art token weighting, zero config
 
 logging:
   use_wandb: false                 # Set to true if you have wandb configured

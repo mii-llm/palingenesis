@@ -6,7 +6,7 @@
 
 ## DEFT
 
-Dynamic Entropy Fine-Tuning (off by default; enabled in the quickstart and several shipped configs). See [Loss Functions](loss.md) for details.
+Dynamic Entropy Fine-Tuning (off by default). See [Loss Functions](loss.md) for details, including a measurement where it hurt.
 
 ```yaml
 plugins:
