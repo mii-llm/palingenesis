@@ -53,6 +53,16 @@ hybrid = [
 float8 = [
     "torchao>=0.9.0",
 ]
+# vLLM rollouts and teachers for `pgs distill` (Linux + NVIDIA only). vLLM pins torch
+# 2.11.0; both come from the CUDA 12.9 indexes below. torchvision, torchaudio and
+# torchcodec are listed so that they come from that index too: PyPI's builds target
+# CUDA 13 (torchcodec then fails to load on a CUDA 12 driver).
+vllm = [
+    "vllm==0.26.0; sys_platform == 'linux'",
+    "torchvision==0.26.0; sys_platform == 'linux'",
+    "torchaudio==2.11.0; sys_platform == 'linux'",
+    "torchcodec>=0.14; sys_platform == 'linux'",
+]
 # Logging backends
 logging = [
     "trackio>=0.25.0",
@@ -103,16 +113,26 @@ packages = ["src/palingenesis", "agent_tooling"]
 [tool.uv.extra-build-dependencies]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }, "ninja", "packaging", "wheel", "setuptools"]
 
-# On Linux, torch comes from PyTorch's CUDA 12.8 index. PyPI's default Linux wheels
+# On Linux, torch comes from PyTorch's CUDA 12.9 index. PyPI's default Linux wheels
 # target the newest CUDA (torch 2.14: CUDA 13.0, NVIDIA driver >= 580); on an older
-# driver they install fine and then see no GPU. cu128 runs on drivers >= 570.
+# driver they install fine and then see no GPU. cu129 runs on drivers >= 575, and it is
+# the CUDA build vLLM 0.26 publishes for torch 2.11 (there is no cu128 one).
 # macOS/Windows keep PyPI's build. Other CUDA versions: see the installation guide.
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torch = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
+torchcodec = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
+vllm = [{ index = "vllm-cu129", marker = "sys_platform == 'linux'" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-cu129"
+url = "https://wheels.vllm.ai/0.26.0/cu129"
 explicit = true
 
 [dependency-groups]

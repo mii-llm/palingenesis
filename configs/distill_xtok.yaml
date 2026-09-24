@@ -1,0 +1,48 @@
+# On-policy distillation across tokenizers: Qwen3.5-0.8B (248k vocabulary) -> Qwen3-0.6B
+# (151k) on GSM8K. The teacher re-tokenizes each completion and the loss compares
+# log-probabilities of byte-aligned text chunks (loss xtok, chosen automatically
+# because the vocabularies differ). One A100 80GB.
+#
+#   pgs distill --config configs/distill_xtok.yaml
+#
+# Data: as in configs/distill_math.yaml.
+
+model:
+  student: Qwen/Qwen3-0.6B
+  chat_template_kwargs: {enable_thinking: false}
+
+teachers:
+  qwen3_5_0_8b:
+    model: Qwen/Qwen3.5-0.8B
+
+sources:
+  gsm8k:
+    format: messages
+    path: data/gsm8k_train.jsonl
+    dev_path: data/gsm8k_test200.jsonl
+    max_new_tokens: 512
+
+rollout:
+  backend: vllm
+  batch_prompts: 64
+  temperature: 1.0
+  gpu_memory_utilization: 0.3
+  max_model_len: 2048
+
+loss:
+  xtok_spread: chunk
+  xtok_dense_weight: 0.0          # > 0 adds a top-k KL where a chunk is one token on each side
+
+train:
+  output_dir: runs/distill_xtok
+  steps: 60
+  learning_rate: 3.0e-6
+  warmup_steps: 5
+  score_micro_seqs: 16
+  eval_every: 20
+  eval_samples: 200
+
+logging:
+  log_every: 1
+  use_wandb: false
+  project: palingenesis-opd

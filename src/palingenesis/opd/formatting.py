@@ -3,7 +3,7 @@
 The templates below are neutral library defaults. Distillation against a
 specific benchmark should train on that benchmark's *exact* prompt bytes —
 which is policy, so verbatim benchmark templates belong in the config
-(``data.fast_template`` / ``data.cot_template`` / ``data.system_message``),
+(``sources.<name>.fast_template`` / ``cot_template`` / ``system_message``),
 not here. See ``configs/distill_opd.yaml`` for a worked example carrying
 ITALIC's verbatim templates. Placeholders: ``{question}`` and ``{options}``
 (required), ``{topic}`` and ``{merged_letters}`` (optional).
@@ -37,6 +37,28 @@ Answer:
 """.strip()
 
 LETTER_RE = re.compile(r"\b([A-J])\b")
+ANSWER_NUMBER_RE = re.compile(r"Answer:\s*\$?(-?\d+(?:\.\d+)?)")
+NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def encode_prompt(tok, messages: list[dict[str, str]], chat_template_kwargs: dict | None = None) -> list[int]:
+    """Token ids of `messages` rendered with the tokenizer's chat template, ready for
+    the assistant's turn (BOS prepended when the template leaves it out)."""
+    text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False,
+                                   **(chat_template_kwargs or {}))
+    ids = tok.encode(text, add_special_tokens=False)
+    bos = tok.bos_token_id
+    if bos is not None and (not ids or ids[0] != bos):
+        ids = [bos] + ids
+    return ids
+
+
+def extract_number(text: str) -> str | None:
+    """The final answer of a worked solution: the number after the last "Answer:",
+    else the last number in the text (thousands separators removed)."""
+    text = text.replace(",", "")
+    matches = ANSWER_NUMBER_RE.findall(text) or NUMBER_RE.findall(text)
+    return matches[-1] if matches else None
 
 
 def extract_letter(text: str, last: bool = False) -> str | None:

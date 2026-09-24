@@ -1,52 +1,161 @@
 # On-Policy Distillation
 
-*Shrink a teacher into a student by correcting the student where it actually goes — reverse KL on the student's own samples, across mismatched chat templates.*
+*Shrink a teacher into a student by correcting the student where it actually goes: the student samples, the teacher scores those exact tokens, and the student's distribution is pulled toward the teacher's. Works across tokenizers and with several teachers at once.*
 
 ---
 
 ## Offline vs on-policy
 
-The usual way to distill is offline: the teacher generates a dataset, the student does SFT on it. That trains the student on the **teacher's** trajectory distribution — but at inference the student walks its own path, and every early deviation lands it in states the training data never covered.
+The usual way to distill is offline: the teacher generates a dataset, the student does SFT on it. That trains the student on the **teacher's** trajectories, but at inference the student walks its own path, and every early deviation lands it in states the training data never covered.
 
-On-policy distillation (OPD) flips the sampling:
+On-policy distillation (OPD) flips the sampling. Every step the student samples completions with its current weights, the teacher scores exactly those tokens, and the loss is the reverse KL from the student to the teacher on the student's own states:
 
 ```
-┌────────────┐   sample    ┌──────────────┐   score    ┌────────────┐
-│   PROMPT   │────────────▶│   STUDENT    │───────────▶│  TEACHER   │
-│   pool     │  (its own   │  completions │  (same     │  log-probs │
-└────────────┘   template) └──────────────┘   text)    └─────┬──────┘
-                                 ▲                           │
-                                 └────── reverse KL ─────────┘
+ sources ──prompts──▶ rollout engine ──completions──▶ aligner ──teacher view──▶ teacher
+ (per-source          (student's current weights:      (same vocabulary: ids;    (log-probs of the
+  teacher)             HF generate or vLLM)             else byte chunks)          student's text)
+                                      ▲                                                  │
+                                      └──────── new weights ◀── loss (reverse KL) ◀──────┘
 ```
-
-Every step the student samples with its *current* weights and the loss is the full-distribution reverse KL to the teacher over exactly those tokens. One gradient step per batch, no importance sampling, no train/inference mismatch.
 
 ## Quickstart
 
-```bash
-pgs distill --config configs/distill_opd.yaml
-```
-
-Any config field is overridable from the CLI, same as `pgs train`:
+Qwen3-1.7B into Qwen3-0.6B on GSM8K, non-thinking, on one A100 80GB:
 
 ```bash
-pgs distill --config configs/distill_opd.yaml \
-    --train.learning_rate 5e-6 \
-    --sampling.cot_fraction 0.3
+uv sync --extra train --extra logging --extra vllm    # vLLM rollouts (Linux, driver >= 575)
 ```
 
-## Mismatched chat templates
+```python
+# data/gsm8k_*.jsonl: one chat prompt per line, with the reference answer for dev accuracy
+import itertools, json
+from datasets import load_dataset
 
-OPD works across a student/teacher pair with **different chat templates** — e.g. a ChatML student distilled from a Llama-3-template teacher — as long as they share a base vocabulary. Prompts are rendered per-model with each model's own template; only completion tokens are aligned. The student's end-of-turn token is mapped onto the teacher's, so the teacher also supervises *when to stop*:
+PROMPT = "{q}\nSolve the problem step by step, then give the final answer as a number on the last line, after 'Answer:'."
+def rows(split, n):
+    for r in itertools.islice(load_dataset("openai/gsm8k", "main", split=split, streaming=True), n):
+        yield {"messages": [{"role": "user", "content": PROMPT.format(q=r["question"])}],
+               "answer": r["answer"].split("####")[-1].strip().replace(",", "")}
+for name, split, n in [("gsm8k_train", "train", 3000), ("gsm8k_test200", "test", 200)]:
+    with open(f"data/{name}.jsonl", "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows(split, n))
+```
+
+```bash
+pgs distill --config configs/distill_math.yaml
+pgs distill --config configs/distill_math.yaml --train.learning_rate 1e-6 --logging.use_wandb true
+```
+
+Every option can be overridden on the command line, including those of a named teacher or source: `--teachers.qwen3_1_7b.backend vllm`, `--sources.gsm8k.max_new_tokens 384`.
+
+## A step
+
+1. The orchestrator draws `rollout.batch_prompts` prompts from the sources (by `weight`) and renders each with the student's chat template and with its teacher's.
+2. The rollout engine samples `rollout.group_size` completions per prompt at `rollout.temperature`, and records each sampled token's log-probability under the policy that sampled it.
+3. Each completion is cut at the first stop token (kept: stopping is supervised too), aligned with its teacher's view of the same text, and scored by that teacher.
+4. The student scores its own completions (the only forward with gradient); each teacher's loss is summed over its samples and normalized by the batch's completion tokens. Logits are projected a slice of rows at a time, so `[tokens, vocabulary]` is never materialized.
+5. Clipped AdamW step on fp32 master weights (bf16 autocast); the new weights go to the rollout engine.
+
+## Rollout backends
+
+| `rollout.backend` | What samples | Notes |
+|---|---|---|
+| `hf` (default) | the trainer's own `model.generate` | No extra dependency. Slow: padded batches, no paged KV cache. |
+| `vllm` | an in-process vLLM engine on the student's GPU | Sleeps while the trainer trains (its weights and KV cache are released), wakes for the next batch; new weights are loaded into it in place after every step. Needs the `vllm` extra. |
+| `vllm_server` | a separate `vllm serve` process on the same GPU | **Experimental.** Weights go over CUDA IPC through vLLM's native weight-transfer endpoints; generation runs concurrently with training (`rollout.max_staleness: 1`). Also needs `ray` installed (vLLM 0.26's IPC module imports it). |
+
+`rollout.gpu_memory_utilization` is the vLLM engine's share of the GPU (weights and KV cache); with `vllm` it only holds that memory while it generates.
+
+### Staleness and asynchrony
+
+`rollout.max_staleness` is how many optimizer steps a batch may lag behind the weights it trains:
+
+- `0` (default): batch k is generated with the weights of step k, strictly on-policy. The orchestrator thread still samples and renders the next prompts while the trainer trains.
+- `1`: batch k+1 is generated (and scored by the teacher) while the trainer trains on batch k. The divergence losses need no correction for this: the student's distribution is computed with the current weights, only the visited states come from a one-step-old policy. The policy-gradient losses (`sampled_rkl`, `xtok`) weight each token by the importance ratio to the rollout policy's log-probabilities, and zero it outside `[loss.is_low, loss.is_high]`.
+
+With `vllm` and `max_staleness: 1` the engine stays awake (its memory is held during training) and its kernels share the trainer's CUDA stream, so what overlaps is mostly host work: vLLM's scheduling and the trainer's Python. On a second stream the in-process engine raced with the trainer's kernels (illegal memory accesses that disappear with `CUDA_LAUNCH_BLOCKING=1`), so it is kept on one. With `vllm_server` the rollouts run in another process, and the teacher scoring on a stream of its own.
+
+A batch older than `max_staleness` when it reaches the trainer is dropped and counted (`dropped_samples`); the orchestrator only starts a batch once the weights it may use are published, so this does not happen in normal operation. `staleness` is logged every step.
+
+## Teachers and losses
+
+A teacher is `hf` (in-process, frozen bf16, full distribution) or `vllm` (a vLLM server run prefill-only: `prompt_logprobs=k` returns the teacher's top-k log-probabilities and the actual token's at every completion position). A vLLM teacher is a separate server, launched on the student's GPU with `teachers.<name>.gpu_memory_utilization` or reached at `url`, because vLLM allows one sleep-mode engine per process and that one is the rollout engine. Each teacher has one loss, picked automatically unless `teachers.<name>.loss` is set:
+
+| Loss | Needs | What it minimizes | Default for |
+|---|---|---|---|
+| `full_rkl` | hf teacher, shared vocabulary | exact reverse KL over the shared vocabulary at every completion token | hf teacher, shared vocabulary |
+| `topk_kl` | shared vocabulary | KL between coarse distributions: the teacher's top-k plus the realized token, and one tail bucket holding the rest of each side's mass (`loss.beta`: 1 reverse, 0 forward) | vllm teacher, shared vocabulary |
+| `sampled_rkl` | shared vocabulary | REINFORCE on the per-token reward log p_T(y) − log p_S(y) (the sampled reverse KL), with an importance ratio to the rollout policy | — |
+| `xtok` | any tokenizers | REINFORCE on text chunks: reward log p_T(chunk) − log p_S(chunk); optional top-k KL where a chunk is one token on each side | teacher with another tokenizer |
+
+Asking for a shared-vocabulary loss with a teacher whose tokenizer differs is an error at startup, before any weights load.
+
+A **shared vocabulary** means the teacher's vocabulary is a prefix of the student's and both tokenize a set of probe texts identically (Qwen3-0.6B and Qwen3-1.7B; or a ChatML student extending Llama 3's vocabulary with `<|im_end|>`, distilled from a Llama-3-template teacher). Prompts are rendered with each model's own template, and the student's end-of-turn token is scored against the teacher's (`teachers.<name>.eos_map`, automatic in the common cases), so the teacher also supervises when to stop.
+
+### Across tokenizers
+
+When the tokenizers differ, the completion's text is re-tokenized by the teacher and both token sequences are cut into **chunks** at the byte offsets where both end a token:
+
+```
+student (Qwen3)     |Un|belie|vably|,| |1|2|5|0| ducks|.|
+teacher (SmolLM2)   |Un|belie|v|ably|,| |1|2|5|0| ducks|.|
+chunks              [Un][belie][vably][,][ ][1][2][5][0][ ducks][.]      "vably" = "v" + "ably": one chunk
+```
+
+A chunk is the same text on both sides, so its total log-probability is comparable: the reward of chunk c is A_c = log p_T(c) − log p_S(c) (the sum of each side's token log-probabilities in the chunk), and the rewards of a completion add up to its log-likelihood ratio between the two models. Details that matter:
+
+- The student's byte offsets come from the **sampled token ids** (each token's bytes), never from re-encoding the decoded text: a sampled sequence is often not the tokenizer's canonical encoding of its own text.
+- The student's end-of-turn token pairs with the teacher's as the last chunk.
+- Whitespace-only chunks carry no loss (`loss.mask_whitespace`): tokenizers disagree most on whitespace runs, and supervising them hurt code models badly in published work.
+- Bytes after the last complete UTF-8 character (a completion cut inside an emoji) and special tokens inside a completion are left out.
+- `loss.xtok_spread: chunk` gives every token of a chunk the chunk's advantage; `proportional` gives each token the share log p_S(t) / log p_S(c) of it.
+- `loss.xtok_dense_weight > 0` adds a top-k KL at chunks of exactly one token on each side, over the teacher's top-k tokens mapped to student tokens that spell the same bytes (a tail bucket holds the rest).
+
+### Several teachers
+
+Each source names its teacher; every step mixes the sources by weight and each sample is scored by its own teacher with its own loss (one teacher per sample, no ensemble averaging):
 
 ```yaml
-bridge:
-  eos_map:
-    "<|im_end|>": "<|eot_id|>"    # student terminator -> teacher terminator
-  extra_stop_tokens: ["<|end_of_text|>"]
+teachers:
+  math: {model: Qwen/Qwen3-1.7B}                       # full_rkl
+  chat: {model: HuggingFaceTB/SmolLM2-360M-Instruct}   # another tokenizer: xtok
+sources:
+  gsm8k: {path: data/gsm8k_train.jsonl, teacher: math, weight: 0.5}
+  chat:  {path: data/chat_train.jsonl,  teacher: chat, weight: 0.5}
 ```
 
-A compatibility check runs before any weights load and raises if the two tokenizers diverge on probe texts — a near-miss vocabulary silently turns the KL into noise, so this is a hard error, not a warning.
+Metrics are reported per teacher (`kl/<teacher>`, `k1/<teacher>`, `tokens/<teacher>`) and dev metrics per source (`eval/dev_kl/<source>`). An hf teacher that does not fit next to the others can wait on CPU between scoring calls (`offload: true`) or live on another GPU (`device: cuda:1`).
+
+## Measured
+
+Student Qwen3-0.6B, non-thinking, on GSM8K train prompts; one A100 80GB (vLLM 0.26, torch 2.11, cu129). Every run: 64 prompts per step, 512 new tokens, temperature 1, 60 steps, learning rate 3e-6 (5 warmup steps, cosine), `configs/distill_math.yaml` with the changes listed. Dev metrics on 200 GSM8K test questions: `dev_kl` is the on-policy sampled reverse-KL estimate per student token (on the teacher's own tokens for xtok, whitespace chunks excluded), accuracy is greedy with the last number after "Answer:". Greedy accuracy of the models alone on the same questions: Qwen3-0.6B 64.5%, Qwen3-1.7B 79.0%, Qwen3.5-0.8B 52.0%, SmolLM2-360M-Instruct 10.0%.
+
+| Run | Rollout | Teacher → loss | Rollout tok/s (median) | s / step (median) | dev_kl, step 0 → 60 | GSM8K %, step 0 / 20 / 40 / 60 |
+|---|---|---|---:|---:|---|---|
+| reference | `hf` | Qwen3-1.7B hf → `full_rkl` | 638 | 27.9 | 0.542 → 0.256 | 61.5 / 62.5 / 64.0 / 61.5 |
+| default | `vllm` | Qwen3-1.7B hf → `full_rkl` | 7,503 | 5.6 | 0.538 → 0.248 | 63.0 / 64.0 / 61.0 / 59.5 |
+| vLLM teacher | `vllm` | Qwen3-1.7B vllm (top-8) → `topk_kl` | 7,898 | 6.9 | 0.538 → 0.253 | 63.0 / 66.0 / 67.0 / 64.0 |
+| sampled | `vllm` | Qwen3-1.7B hf → `sampled_rkl` | 7,529 | 5.4 | 0.538 → 0.282 | 63.0 / 67.5 / 62.5 / 59.5 |
+| cross-tokenizer | `vllm` | Qwen3.5-0.8B hf → `xtok` | 8,557 | 5.7 | 0.446 → 0.204 | 63.0 / 58.0 / 48.5 / 53.5 |
+| xtok, same vocabulary | `vllm` | Qwen3-1.7B hf → `xtok` | 7,448 | 5.4 | 0.509 → 0.242 | 63.0 / 67.5 / 64.0 / 64.5 |
+| two teachers | `vllm` | GSM8K: Qwen3-1.7B `full_rkl`; chat: SmolLM2-360M `xtok` | 8,420 | 5.9 | GSM8K 0.538 → 0.277, chat 0.779 → 0.423 | 63.0 / 64.5 / 70.0 / 64.0 |
+| async, in-process | `vllm`, `max_staleness: 1` | Qwen3-1.7B hf → `full_rkl` | 4,550 (while training) | 4.4 | 0.538 → 0.253 | 62.5 / 62.0 / 63.0 / 62.5 |
+| async server | `vllm_server`, `max_staleness: 1` | Qwen3-1.7B hf → `full_rkl` | 4,345 (while training) | 4.7 | 0.524 → 0.260 | 61.0 / 65.5 / 66.0 / 61.5 |
+
+What the numbers say:
+
+- **Rollouts dominate with `hf`.** The same run takes 27.9 s per step with the trainer's `generate` and 5.6 s with the in-process vLLM engine (rollouts ~12× faster, steps ~5×); the KL curves match. In the vLLM step (medians), rollout is 2.15 s, the hf teacher 0.75 s, training 1.88 s, the weight update 0.14 s and sleep/wake 0.67 s; a vLLM teacher takes 1.9 s (prefill with top-k log-probs, returned as JSON).
+- **Every loss reduces the on-policy KL by about half in 60 steps.** `full_rkl` and `topk_kl` (8 teacher tokens plus a tail bucket) track each other; the sampled estimators (`sampled_rkl`, `xtok`) are noisier.
+- **Accuracy follows the teacher, within noise.** With 200 questions one standard error is ~3.4 points: runs toward Qwen3-1.7B peak 3–7 points above the start around steps 20–40, and end within noise of it. A longer run at learning rate 1e-6 (150 steps) has the same shape: 63.0 → 67.0 at step 50 → 60.5 at step 150, while its dev KL plateaus at 0.26 from step 50 on. Watch `eval/dev_acc` and keep the best checkpoint. Toward Qwen3.5-0.8B, which is worse than the student at GSM8K, the student drifts toward the teacher's 52%, as it should: distillation transfers the teacher's behaviour, not accuracy.
+- **Across tokenizers, xtok behaves like the same-vocabulary losses.** Forced on the same-vocabulary teacher it matches `sampled_rkl`; aligning a batch of 64 completions costs ~0.05 s.
+- **Asynchrony saves 15–20% on one GPU.** Generating the next batch while the trainer trains, 60 steps take 280 s (in-process engine) or 300 s (server) instead of 354 s; the two contend for the GPU (training 1.9 → 2.7–3.0 s, rollout 2.2 → 3.6–3.7 s), and the in-process engine also skips its per-step sleep/wake. Every batch was exactly one version old; none was dropped. The dev KL curves match the synchronous run's.
+- **Weight sync is exact.** After an update, the rollout engine's log-probabilities of fixed probe sequences match the trainer's within bf16 noise (mean |Δ| 0.049 in-process, 0.056 over CUDA IPC, against 0.041 before any change and 1.56 after perturbing the trainer's weights without an update); Qwen3.5 (checkpoint names differ from the loaded model's) matches too (0.022).
+
+Also run, 5 steps each: an hf teacher with `offload: true` (moving Qwen3-1.7B on and off the GPU adds 1.4 s per step) and a vLLM teacher (Qwen3.5-0.8B) for `xtok` with the dense term. Runs are in the `palingenesis-validation` wandb project, named `opd2-*`.
+
+## Multiple-choice pools
+
+`format: mcqa` sources train on multiple-choice pools in a benchmark's exact prompt format (`configs/distill_opd.yaml` carries ITALIC's verbatim templates), with the reference shots, random pool shots and zero-shot mixed per prompt, and greedy letter accuracy as the dev metric.
 
 !!! warning "Dedup your pool against the target benchmark"
     Training pools are often drawn from the same corpora a benchmark was curated
@@ -54,41 +163,35 @@ A compatibility check runs before any weights load and raises if the two tokeniz
     accent-stripped, alphanumeric-only) so you can reject anything that appears
     in the benchmark before it enters the pool.
 
-## Don't distill the teacher's mistakes
-
-The teacher's accuracy is a hard ceiling for pure KL — and half of a mediocre teacher's supervision actively pulls the student toward wrong answers. When your pool has verifiable answers, score it with the teacher first and filter:
+The teacher's accuracy is a hard ceiling for pure KL, and half of a mediocre teacher's supervision pulls the student toward wrong answers. Score the pool with the teacher first and filter:
 
 ```bash
 pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
 ```
 
-Every row comes back annotated with `teacher_answer` and `teacher_correct` — one batched forward per row (the answer is read from the option-letter logits, no generation, no parsing). What you do with the annotations — drop wrong rows, downweight them, rebalance — is your call, in the same score-then-select spirit as `pgs prepare`.
+Every row comes back annotated with `teacher_answer` and `teacher_correct` (one batched forward per row, the answer read from the option-letter logits).
 
-## Beyond multiple choice
+## Custom sources
 
-The engine is task-agnostic; the data layer is pluggable. `data.format: messages` distills on generic chat prompts — a JSONL of `{"messages": [...]}` ending with a user turn:
-
-```bash
-pgs distill --config configs/distill_chat.yaml
-```
-
-This is where on-policy distillation earns its keep: on long-form generation (chat, reasoning traces, code, agentic trajectories) every early deviation compounds, and correcting the student on its own samples is exactly the fix. The dev metric becomes the held-out reverse KL to the teacher — free-form answers can't be auto-graded, but distance-to-teacher on unseen prompts is precisely the quantity being trained, measured out of sample.
-
-For anything else, implement the three-method `PromptSource` protocol (`sample`, `evaluate`, `batch_stats`) and pass it to `OPDTrainer(config, source=...)` — the MCQA and chat sources are ~80 lines each and serve as templates.
+A source is any object with `sample()` (messages, max_new_tokens, meta), `evaluate(engine)` and `batch_stats(rollouts)`; pass it as `OPDTrainer(config, source=...)`. The engine a source evaluates with offers `greedy_generate(messages_list, max_new_tokens)` and `dev_kl(messages_list, max_new_tokens)`. The built-in sources in `palingenesis.opd.sources` are short templates.
 
 ## What to watch
 
-| Metric | Healthy |
+| Metric | Meaning |
 |--------|---------|
-| `kl/tok` | falls steadily |
-| `residual_mass` | stays ≈ 0 (student mass on tokens the teacher can't see) |
-| `fmt_ok` | rises toward 1 (completions contain a valid option letter) |
-| `dev_acc` | the number that matters — checkpoint selection uses this |
+| `k1/<teacher>` | sampled reverse-KL estimate per student token, sum(log p_S − log p_T) / tokens: the same scale for every loss |
+| `kl/<teacher>` | the loss's own KL (exact for `full_rkl`, coarse for `topk_kl`) |
+| `eval/dev_kl/<source>` | `k1` on held-out prompts, sampled on-policy: the quantity being trained, out of sample |
+| `eval/dev_kl_full/<source>` | exact per-token reverse KL (full_rkl teachers) |
+| `eval/dev_acc/<source>` | greedy accuracy (messages rows with an `answer`, mcqa letters) |
+| `residual_mass/<teacher>` | student mass on tokens the teacher cannot see; stays ≈ 0 |
+| `is_dropped/<teacher>`, `abs_log_ratio/<teacher>` | policy-gradient losses: tokens outside the importance-ratio range, and the mean trainer/rollout log-prob gap |
+| `dense_kl/<teacher>`, `dense_fraction/<teacher>` | xtok dense term: its KL per supervised position, and the share of tokens that have one |
+| `rollout_tok_s`, `time/rollout`, `time/teacher`, `time/train`, `time/sync` | where a step's time goes |
+| `staleness`, `dropped_samples` | how far behind the trained batch was |
 
-Accuracy gains typically saturate **before** the KL stops falling: the KL keeps improving while dev accuracy plateaus once the transferable knowledge is exhausted. Keep `train.save_steps` small and pick the best checkpoint by dev accuracy.
+Accuracy gains typically saturate before the KL stops falling. Keep `train.save_steps` small when checkpoint selection matters.
 
 ## Memory
 
-Student (fp32 + bf16 autocast) and frozen bf16 teacher share one GPU by default. If they don't fit: lower `train.score_micro_seqs` (gradient accumulation keeps the math identical), enable `model.gradient_checkpointing`, or move the teacher with `model.teacher_device: "cuda:1"`. With long CoT completions, also export `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
-
-Full reference: [`docs/on_policy_distillation.md`](https://github.com/mii-llm/palingenesis/blob/main/docs/on_policy_distillation.md) in the repository.
+Student (fp32 master weights + bf16 autocast, AdamW) and frozen bf16 hf teachers share the GPU; the `vllm` rollout engine takes `rollout.gpu_memory_utilization` of it only while it generates. If it does not fit: lower `train.score_micro_seqs` (gradient accumulation keeps the math identical), enable `model.gradient_checkpointing`, move a teacher to another GPU (`device`), or offload it between uses (`offload`). vLLM's sleep mode is not compatible with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.

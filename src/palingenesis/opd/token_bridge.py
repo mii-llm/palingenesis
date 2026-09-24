@@ -1,12 +1,13 @@
 """Bridging a student and a teacher that share a base vocabulary.
 
 The supported setup: both tokenizers share the same base vocabulary
-(ids 0..shared_vocab_size-1) and the student *extends* it with template/tool
+(ids 0..shared_vocab_size-1), and the student may *extend* it with template/tool
 tokens the teacher cannot embed — e.g. a ChatML student (adds ``<|im_end|>``
 at 128256+) distilled from a Llama-3-template teacher (vocab ends at 128256).
+Identical tokenizers (Qwen3-0.6B and Qwen3-1.7B) are the trivial case.
 
-Prompts are therefore rendered per-model with each model's own chat template;
-only completion tokens (base vocab) are aligned across the two models.
+Prompts are rendered per-model with each model's own chat template; only
+completion tokens are aligned across the two models.
 
 End-of-turn handling: the student's terminator (say ``<|im_end|>``) and the
 teacher's (say ``<|eot_id|>``) mean the same thing, so for scoring the
@@ -14,6 +15,8 @@ student's terminator probability mass is merged into the teacher's terminator
 slot — that way the teacher also supervises *when to stop*, not just what to
 say. The mapping is the ``swap`` dict; it is applied both when a completion
 token is fed to the teacher and when it is used as a scoring target.
+
+Tokenizers that do not share a vocabulary go through align.ByteChunkAligner.
 """
 
 from __future__ import annotations
@@ -26,8 +29,8 @@ logger = logging.getLogger(__name__)
 # Tokenization-identity probes for check_compatible. Deliberately mixed:
 # plain prose with digits/punctuation, accented characters across languages
 # (both precomposed forms and ones that byte-level BPEs split aggressively),
-# apostrophes/quotes, and code. Benchmark- or language-specific probes can be
-# added per run via bridge.probe_texts.
+# apostrophes/quotes, and code. Task- or language-specific probes can be
+# added per teacher via teachers.<name>.probe_texts.
 DEFAULT_PROBE_TEXTS = (
     "The quick brown fox jumps over the lazy dog. 12,345.67!",
     "Perché città, così — l'aquila d'oro? È già qui: 'sì', naïve café.",
@@ -42,24 +45,16 @@ class TokenBridgeError(Exception):
 
 @dataclass(frozen=True)
 class TokenBridge:
-    """Completion-token alignment between a student and a smaller-vocab teacher."""
+    """Completion-token alignment between a student and a teacher with a shared base vocabulary."""
 
     # Ids below this are identical in both tokenizers (checked by check_compatible).
     shared_vocab_size: int
     # student id -> teacher id, applied when a completion token is fed to the
     # teacher or used as a scoring target in the shared vocab.
     swap: dict[int, int] = field(default_factory=dict)
-    # Completion is truncated at the first of these (kept, as terminal target).
-    stop_ids: tuple[int, ...] = ()
 
     @classmethod
-    def from_tokenizers(
-        cls,
-        student_tok,
-        teacher_tok,
-        eos_map: dict[str, str] | None = None,
-        extra_stop_tokens: tuple[str, ...] | list[str] = (),
-    ) -> "TokenBridge":
+    def from_tokenizers(cls, student_tok, teacher_tok, eos_map: dict[str, str] | None = None) -> "TokenBridge":
         """Build a bridge from a tokenizer pair.
 
         eos_map maps student token *strings* to teacher token strings, e.g.
@@ -69,15 +64,12 @@ class TokenBridge:
         teacher's *configured* eos is not its end-of-turn token (base models
         often configure ``<|end_of_text|>`` while the conversational
         terminator is ``<|eot_id|>``).
-
-        extra_stop_tokens are additional student token strings that terminate
-        a sampled completion (typically the shared end-of-text token).
         """
         shared = len(teacher_tok)
         if len(student_tok) < shared:
             raise TokenBridgeError(
-                f"Student vocab ({len(student_tok)}) is smaller than teacher vocab ({shared}). "
-                "OPD requires the teacher vocab to be a prefix of the student's."
+                f"Student vocab ({len(student_tok)}) is smaller than teacher vocab ({shared}): "
+                "the teacher vocab is not a prefix of the student's."
             )
 
         swap: dict[int, int] = {}
@@ -101,20 +93,9 @@ class TokenBridge:
                 teacher_tok.eos_token,
                 teacher_tok.eos_token_id,
             )
+        return cls(shared_vocab_size=shared, swap=swap)
 
-        stop_ids: list[int] = list(swap.keys())
-        if student_tok.eos_token_id is not None and student_tok.eos_token_id not in stop_ids:
-            stop_ids.append(student_tok.eos_token_id)
-        for name in extra_stop_tokens:
-            tid = student_tok.convert_tokens_to_ids(name)
-            if tid is None:
-                raise TokenBridgeError(f"extra_stop_tokens token not found in student vocab: {name!r}")
-            if tid not in stop_ids:
-                stop_ids.append(tid)
-
-        return cls(shared_vocab_size=shared, swap=swap, stop_ids=tuple(stop_ids))
-
-    def clean_completion(self, ids: list[int]) -> list[int]:
+    def clean_completion(self, ids: list[int], stop_ids: tuple[int, ...]) -> list[int]:
         """Truncate a raw sampled completion for scoring.
 
         Cuts at the first stop token (inclusive: stopping is supervised too).
@@ -123,8 +104,9 @@ class TokenBridge:
         """
         out: list[int] = []
         for t in ids:
-            if t in self.stop_ids:
-                out.append(t)
+            if t in stop_ids:
+                if t < self.shared_vocab_size or t in self.swap:
+                    out.append(t)
                 break
             if t >= self.shared_vocab_size and t not in self.swap:
                 break
@@ -165,15 +147,8 @@ def check_compatible(
         if not (0 <= t_id < bridge.shared_vocab_size):
             raise TokenBridgeError(f"swap target id {t_id} is outside the teacher vocab.")
 
-    if not bridge.stop_ids:
-        raise TokenBridgeError(
-            "No stop tokens resolved — generation would never terminate cleanly. "
-            "Set bridge.eos_map or bridge.extra_stop_tokens in the config."
-        )
-
     logger.info(
-        "token_bridge: OK — shared base vocab (%d ids), swap %s, stop ids %s",
+        "token_bridge: OK — shared base vocab (%d ids), swap %s",
         bridge.shared_vocab_size,
         bridge.swap or "{}",
-        list(bridge.stop_ids),
     )

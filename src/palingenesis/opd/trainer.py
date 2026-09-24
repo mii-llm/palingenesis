@@ -1,29 +1,22 @@
 """On-policy distillation trainer.
 
-Per step (mirrors tinker-cookbook's on_policy_distillation, self-contained):
-  1. draw pool prompts, render with the STUDENT's chat template
-  2. student samples completions (temperature 1.0) with its current weights
-     -> exactly on-policy, single gradient step per batch, no importance sampling
-  3. teacher scores the same completions conditioned on the SAME conversation
-     rendered with the TEACHER's chat template (see token_bridge for why)
-  4. loss = full-distribution reverse KL over completion tokens
-     sum_v p_student(v) * (log p_student(v) - log p_teacher(v))
-     ("sampled_rkl" reproduces tinker's sampled-token REINFORCE variant)
-
-Single-process, single-GPU by design: the student must both generate and take
-gradients each step, so there is no idle phase to shard away. On an 80 GB GPU
-a 0.4B student + 3B teacher fit together; if they don't, lower
-train.score_micro_seqs, enable model.gradient_checkpointing, or move the
-teacher with model.teacher_device.
+Per step:
+  1. the orchestrator's batch arrives: prompts drawn from the sources, sampled by
+     the student with (at most max_staleness versions old) current weights, each
+     completion aligned with and scored by its source's teacher (orchestrator.py)
+  2. the student scores its own completions (the only forward with gradient) and
+     each teacher group's loss is accumulated (losses.py): full_rkl, topk_kl,
+     sampled_rkl or xtok, normalized by the batch's completion tokens
+  3. clipped AdamW step on fp32 master weights (bf16 autocast), then the new
+     weights are published to the rollout engine
 
 Launch:
-    pgs distill --config configs/distill_opd.yaml
-    python -m palingenesis.opd.trainer --config configs/distill_opd.yaml
+    pgs distill --config configs/distill_math.yaml
+    python -m palingenesis.opd.trainer --config configs/distill_math.yaml
 """
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 import logging
@@ -32,93 +25,196 @@ import os
 import random
 import shutil
 import time
+from collections import defaultdict
+from pathlib import Path
 
 import torch
-import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
-from palingenesis.opd.config import OPDConfig
+from palingenesis.logits import final_hidden_states, output_head, verify_output_head
+from palingenesis.opd import losses
+from palingenesis.opd.align import ByteChunkAligner, SharedVocabAligner
+from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig
+from palingenesis.opd.formatting import encode_prompt
+from palingenesis.opd.orchestrator import Batch, Orchestrator, Pipeline, PublishedWeights, Request, Sample, TeacherRoute
+from palingenesis.opd.rollout import HFRollout, VLLMColocateRollout, VLLMServer, VLLMServerRollout
 from palingenesis.opd.sources import PromptSource, build_source
-from palingenesis.opd.token_bridge import TokenBridge, check_compatible
+from palingenesis.opd.teachers import (
+    HFTeacher,
+    VLLMTeacher,
+    completion_positions,
+    end_of_turn_id,
+    load_causal_lm,
+    right_pad,
+)
+from palingenesis.opd.token_bridge import TokenBridge, TokenBridgeError, check_compatible
 
 logger = logging.getLogger(__name__)
 
+SHARED_VOCAB_LOSSES = ("full_rkl", "topk_kl", "sampled_rkl")
 
-def load_causal_lm(name: str, dtype: torch.dtype):
-    """from_pretrained across the transformers 4.x (torch_dtype) / 5.x (dtype) rename."""
+
+def student_stop_ids(tok, model: str, extra_tokens: list[str], chat_template_kwargs: dict) -> tuple[int, ...]:
+    """Tokens that end a student completion; the chat template's end-of-turn token first."""
+    from transformers import GenerationConfig
+
+    ids = [end_of_turn_id(tok, chat_template_kwargs), tok.eos_token_id]
     try:
-        return AutoModelForCausalLM.from_pretrained(name, dtype=dtype)
-    except TypeError:
-        return AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype)
+        eos = GenerationConfig.from_pretrained(model).eos_token_id
+        ids += eos if isinstance(eos, list) else [eos]
+    except OSError:
+        pass
+    for name in extra_tokens:
+        token = tok.convert_tokens_to_ids(name)
+        if token is None or token == tok.unk_token_id:
+            raise OPDConfigError(f"model.stop_tokens: {name!r} is not a token of {model}")
+        ids.append(token)
+    return tuple(dict.fromkeys(i for i in ids if i is not None))
 
 
-def pick_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+def shared_vocab_bridge(student_tok, teacher_tok, teacher: TeacherConfig, name: str) -> TokenBridge | None:
+    """The pair's TokenBridge, or None when the tokenizers do not share a vocabulary."""
+    try:
+        bridge = TokenBridge.from_tokenizers(student_tok, teacher_tok, eos_map=teacher.eos_map)
+        check_compatible(student_tok, teacher_tok, bridge, probe_texts=tuple(teacher.probe_texts))
+        return bridge
+    except TokenBridgeError as e:
+        if teacher.eos_map or teacher.loss in SHARED_VOCAB_LOSSES:
+            raise OPDConfigError(
+                f"teachers.{name}: {teacher.loss or 'eos_map'} needs a teacher that shares the student's "
+                f"vocabulary, and {teacher.model}'s tokenizer does not ({e}). Use loss xtok (cross-tokenizer)."
+            ) from None
+        return None
 
 
 class OPDTrainer:
-    """The task-agnostic OPD engine; task-specific data lives in the source.
+    """The task-agnostic OPD engine; task-specific data lives in the sources.
 
-    The source decides what to roll out and how to evaluate (see
-    opd.sources.PromptSource); the engine samples on-policy, teacher-scores,
-    and steps. Pass a custom source for tasks the built-ins don't cover.
+    Pass a custom source (opd.sources.PromptSource) for tasks the built-ins don't
+    cover; its prompts go to the first teacher unless its meta carries "_src" of
+    a configured source.
     """
 
     def __init__(self, config: OPDConfig, source: PromptSource | None = None):
+        for warning in config.validate():
+            logger.warning(warning)
         self.config = config
-        self.device = pick_device()
-        self.teacher_device = config.model.teacher_device or self.device
+        # Not MPS: rollouts run on the orchestrator's thread, and Metal command
+        # buffers are not safe to use from two threads.
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.rng = random.Random(config.train.seed)
         torch.manual_seed(config.train.seed)
         os.makedirs(config.train.output_dir, exist_ok=True)
+        chat_kwargs = config.model.chat_template_kwargs
 
-        logger.info("Loading tokenizers (%s / %s)", config.model.student, config.model.teacher)
-        self.s_tok = AutoTokenizer.from_pretrained(config.model.student)
-        self.t_tok = AutoTokenizer.from_pretrained(config.model.teacher)
-        self.bridge = TokenBridge.from_tokenizers(
-            self.s_tok,
-            self.t_tok,
-            eos_map=config.bridge.eos_map,
-            extra_stop_tokens=tuple(config.bridge.extra_stop_tokens),
-        )
-        check_compatible(self.s_tok, self.t_tok, self.bridge, probe_texts=tuple(config.bridge.probe_texts))
-        self.s_pad = self.s_tok.pad_token_id or self.bridge.stop_ids[-1]
-        self.t_pad = self.t_tok.pad_token_id or self.t_tok.eos_token_id
+        # Tokenizers and alignment first: pairing errors surface before any weights load.
+        self.tok = AutoTokenizer.from_pretrained(config.model.student)
+        self.stop_ids = student_stop_ids(self.tok, config.model.student, config.model.stop_tokens, chat_kwargs)
+        self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.stop_ids[0]
+        self.kinds: dict[str, str] = {}
+        aligners, teacher_toks = {}, {}
+        for name, teacher in config.teachers.items():
+            teacher_toks[name] = AutoTokenizer.from_pretrained(teacher.tokenizer or teacher.model)
+            bridge = shared_vocab_bridge(self.tok, teacher_toks[name], teacher, name)
+            kind = teacher.loss or ("xtok" if bridge is None else "full_rkl" if teacher.backend == "hf" else "topk_kl")
+            if kind == "xtok":
+                aligners[name] = ByteChunkAligner(self.tok, teacher_toks[name], self.stop_ids,
+                                                  end_of_turn_id(teacher_toks[name], chat_kwargs),
+                                                  config.loss.mask_whitespace)
+                if bridge is not None:
+                    logger.warning("teachers.%s shares the student's vocabulary; xtok works but full_rkl is exact", name)
+            else:
+                aligners[name] = SharedVocabAligner(bridge, self.stop_ids)
+            self.kinds[name] = kind
+            logger.info("teacher %s: %s (%s backend), loss %s", name, teacher.model, teacher.backend, kind)
 
-        logger.info("Loading student (fp32 + autocast) on %s", self.device)
+        # vLLM servers start before the trainer's models: they claim their share of free GPU memory.
+        self.servers: list[VLLMServer] = []
+        teachers = {name: self._vllm_teacher(name, t) for name, t in config.teachers.items() if t.backend == "vllm"}
+        rollout = config.rollout
+        server = None
+        if rollout.backend == "vllm_server":
+            server = self._server(config.model.student, rollout.url, "rollout", [
+                "--gpu-memory-utilization", str(rollout.gpu_memory_utilization),
+                "--max-model-len", str(rollout.max_model_len), "--logprobs-mode", "processed_logprobs",
+                "--weight-transfer-config", '{"backend": "ipc"}', *(["--enforce-eager"] if rollout.enforce_eager else [])])
+
+        logger.info("Loading student %s (fp32 master weights, bf16 autocast) on %s", config.model.student, self.device)
         self.student = load_causal_lm(config.model.student, torch.float32).to(self.device)
         if config.model.gradient_checkpointing:
             self.student.gradient_checkpointing_enable()
-        logger.info("Loading teacher (bf16, frozen) on %s", self.teacher_device)
-        self.teacher = load_causal_lm(config.model.teacher, torch.bfloat16).to(self.teacher_device)
-        self.teacher.eval().requires_grad_(False)
+        self.head = output_head(self.student)
+        verify_output_head(self.student, self.head)
+        for name, teacher in config.teachers.items():
+            if teacher.backend == "hf":
+                teachers[name] = HFTeacher(teacher.model, teacher.device or self.device, teacher.offload)
 
-        self.source = source or build_source(config, rng=self.rng)
+        if rollout.backend == "hf":
+            engine = HFRollout(self.student, self.stop_ids, self.pad_id, rollout.micro_seqs)
+        elif rollout.backend == "vllm":
+            engine = VLLMColocateRollout(config.model.student, self.stop_ids, rollout.gpu_memory_utilization,
+                                         rollout.max_model_len, rollout.enforce_eager, config.train.seed,
+                                         sleep_mode=rollout.max_staleness == 0)
+        else:
+            engine = VLLMServerRollout(server, self.stop_ids)
 
-        self.opt = torch.optim.AdamW(
-            self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0
-        )
-        # A metrics backend must never kill a training run: init/log are guarded.
+        self.routes = {
+            name: TeacherRoute(teacher_toks[name], aligners[name], teachers[name],
+                               top_k=config.loss.top_k if kind == "topk_kl" or (
+                                   kind == "xtok" and config.loss.xtok_dense_weight > 0) else 0,
+                               keep_hidden=kind == "full_rkl")
+            for name, kind in self.kinds.items()
+        }
+        self.teacher_to_student = {name: torch.tensor(a.teacher_to_student, device=self.device)
+                                   for name, a in aligners.items() if isinstance(a, ByteChunkAligner)}
+        self.weights = PublishedWeights(self.student)
+        # Rollouts overlapping training run on their own CUDA stream (see Pipeline), except
+        # with the in-process vLLM engine: next to the trainer's default-stream kernels it
+        # hit illegal memory accesses (vLLM 0.26) that CUDA_LAUNCH_BLOCKING=1 made vanish,
+        # a race between streams. On the default stream only its host work overlaps.
+        overlap = rollout.max_staleness > 0 and rollout.backend == "vllm_server" and self.device == "cuda"
+        self.pipeline = Pipeline(self.tok, engine, self.routes, self.weights, chat_kwargs,
+                                 config.train.score_micro_seqs, torch.cuda.Stream() if overlap else None)
+        self.source = source or build_source(config, self.rng)
+        self.orchestrator = Orchestrator(self.pipeline, self._draw, rollout.temperature, rollout.max_staleness)
+        self.opt = torch.optim.AdamW(self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0,
+                                     fused=self.device == "cuda")
         self.wandb = None
         if config.logging.use_wandb:
             try:
                 import wandb
 
-                wandb.init(
-                    project=config.logging.project,
-                    name=config.logging.run_name or None,
-                    config=dataclasses.asdict(config),
-                    dir=config.train.output_dir,
-                )
+                wandb.init(project=config.logging.project, name=config.logging.run_name or None,
+                           config=dataclasses.asdict(config), dir=config.train.output_dir)
                 self.wandb = wandb
-            except Exception as e:  # noqa: BLE001 — degrade to console logging
+            except Exception as e:  # noqa: BLE001 — a metrics backend must never kill a training run
                 logger.warning("wandb init failed (%s); continuing without it", e)
 
-    # ------------------------------------------------------------------ utils
+    def _server(self, model: str, url: str, role: str, args: list[str]) -> VLLMServer:
+        server = VLLMServer(model, url=url, args=tuple(args),
+                            log_path=os.path.join(self.config.train.output_dir, f"vllm_{role}.log"))
+        self.servers.append(server)
+        return server
+
+    def _vllm_teacher(self, name: str, teacher: TeacherConfig) -> VLLMTeacher:
+        top_k = max(self.config.loss.top_k, 1)
+        return VLLMTeacher(self._server(teacher.model, teacher.url, f"teacher_{name}", [
+            "--gpu-memory-utilization", str(teacher.gpu_memory_utilization),
+            "--max-model-len", str(self.config.rollout.max_model_len + 512),
+            "--max-logprobs", str(top_k + 1), "--enforce-eager"]))
+
+    # ----------------------------------------------------------------- batches
+
+    def _draw(self) -> list[Request]:
+        """The next step's requests: batch_prompts prompts x group_size rollouts each."""
+        requests = []
+        for _ in range(self.config.rollout.batch_prompts):
+            messages, max_new_tokens, meta = self.source.sample()
+            source = meta.get("_src")
+            teacher = self.config.teacher_of(source) if source in self.config.sources else next(iter(self.routes))
+            request = self.pipeline.request(messages, max_new_tokens, meta, source, teacher)
+            requests += [request] * self.config.rollout.group_size
+        return requests
 
     def _lr_at(self, step: int) -> float:
         train = self.config.train
@@ -129,311 +225,275 @@ class OPDTrainer:
         t = (step - train.warmup_steps) / max(1, train.steps - train.warmup_steps)
         return train.learning_rate * 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
 
-    @staticmethod
-    def _encode_prompt(tok, messages) -> list[int]:
-        text = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        ids = tok.encode(text, add_special_tokens=False)
-        bos = tok.bos_token_id
-        if bos is not None and (not ids or ids[0] != bos):
-            ids = [bos] + ids
-        return ids
+    # -------------------------------------------------------------------- loss
 
-    @staticmethod
-    def _right_pad(seqs: list[list[int]], pad: int, device) -> tuple[torch.Tensor, torch.Tensor]:
-        T = max(len(s) for s in seqs)
-        ids = torch.full((len(seqs), T), pad, dtype=torch.long)
-        mask = torch.zeros((len(seqs), T), dtype=torch.long)
-        for i, s in enumerate(seqs):
-            ids[i, : len(s)] = torch.tensor(s, dtype=torch.long)
-            mask[i, : len(s)] = 1
-        return ids.to(device), mask.to(device)
+    def _score(self, samples: list[Sample], weights: list[float], train: bool) -> dict[str, float]:
+        """Student forward over `samples` (one teacher) and that teacher's loss; backward when training.
 
-    def _left_pad(self, prompts: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Left padding so all prompts end at the same position (for generate)."""
-        T = max(len(p) for p in prompts)
-        ids = torch.full((len(prompts), T), self.s_pad, dtype=torch.long)
-        mask = torch.zeros((len(prompts), T), dtype=torch.long)
-        for j, p in enumerate(prompts):
-            ids[j, T - len(p):] = torch.tensor(p, dtype=torch.long)
-            mask[j, T - len(p):] = 1
-        return ids, mask, T
+        `weights` is each sample's per-token loss weight (the normalization)."""
+        name = samples[0].teacher
+        kind, route, loss = self.kinds[name], self.routes[name], self.config.loss
+        device = self.device
+        ids, mask = right_pad([s.request.prompt_ids + s.completion[:-1] for s in samples], self.pad_id, device)
+        positions = completion_positions([len(s.request.prompt_ids) for s in samples],
+                                         [len(s.completion) for s in samples], ids.shape[1]).to(device)
+        targets = torch.tensor([t for s in samples for t in s.completion], device=device)
+        token_weights = torch.tensor([w for s, w in zip(samples, weights) for _ in s.completion], device=device)
+        behaviour = None
+        if all(len(s.behaviour_lp) == len(s.completion) for s in samples):
+            behaviour = torch.tensor([x for s in samples for x in s.behaviour_lp], device=device)
+        if kind != "xtok":            # one teacher token per student token
+            teacher_ids = torch.tensor([t for s in samples for t in s.view.input_ids[s.view.prompt_len:]], device=device)
+            token_lp = torch.cat([s.scores.token_lp for s in samples]).to(device)
+            vocab = losses.SharedVocab(route.aligner.bridge.shared_vocab_size, route.aligner.bridge.swap)
 
-    # -------------------------------------------------------------- generation
+        with (torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
+              torch.set_grad_enabled(train)):
+            hidden = final_hidden_states(self.student, ids, mask)[positions]
+            if kind == "full_rkl":
+                for s in samples:       # made on the pipeline's CUDA stream: keep until this stream is done
+                    if s.scores.hidden.is_cuda:
+                        s.scores.hidden.record_stream(torch.cuda.current_stream())
+                teacher_hidden = torch.cat([s.scores.hidden for s in samples])
+                value, stats = losses.full_rkl(hidden, self.head, teacher_ids, token_weights, vocab,
+                                               lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], vocab.size))
+            elif kind == "topk_kl":
+                topk_ids = torch.cat([s.scores.topk_ids for s in samples]).to(device)
+                topk_lp = torch.cat([s.scores.topk_lp for s in samples]).to(device)
+                realized_in_topk = (topk_ids == teacher_ids[:, None]).any(1, keepdim=True)
+                support = torch.cat([topk_ids, teacher_ids[:, None]], 1)
+                valid = torch.cat([topk_lp.isfinite(), ~realized_in_topk], 1) & (support < vocab.size)
+                value, stats = losses.topk_kl(hidden, self.head, teacher_ids, token_weights, vocab,
+                                              support.clamp(max=vocab.size - 1),
+                                              torch.cat([topk_lp, token_lp[:, None]], 1), valid, token_lp,
+                                              beta=loss.beta)
+            elif kind == "sampled_rkl":
+                value, stats = losses.sampled_rkl(hidden, self.head, targets, token_weights, token_lp, behaviour,
+                                                  loss.is_low, loss.is_high)
+            else:
+                chunks, dense = self._xtok_targets(samples, name)
+                value, stats = losses.xtok(hidden, self.head, targets, token_weights, chunks, behaviour,
+                                           spread=loss.xtok_spread, is_low=loss.is_low, is_high=loss.is_high,
+                                           dense=dense, dense_weight=loss.xtok_dense_weight, beta=loss.beta)
+        if train:
+            value.backward()
+        stats["loss"] = float(value.detach())
+        stats["tokens"] = targets.numel()
+        return stats
 
-    @torch.no_grad()
-    def _generate(self, prompt_ids: list[list[int]], max_new_tokens: int,
-                  greedy: bool = False) -> list[list[int]]:
-        """One completion per prompt (already replicated for group_size), cleaned."""
-        sampling = self.config.sampling
-        self.student.eval()
-        completions: list[list[int]] = []
-        for i in range(0, len(prompt_ids), sampling.gen_micro_seqs):
-            chunk = prompt_ids[i : i + sampling.gen_micro_seqs]
-            ids, mask, T = self._left_pad(chunk)
-            decode_kwargs = (
-                dict(do_sample=False) if greedy
-                else dict(do_sample=True, temperature=sampling.temperature, top_p=1.0, top_k=0)
-            )
-            with torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16,
-                                enabled=self.device != "cpu"):
-                out = self.student.generate(
-                    ids.to(self.device), attention_mask=mask.to(self.device),
-                    max_new_tokens=max_new_tokens,
-                    eos_token_id=list(self.bridge.stop_ids),
-                    pad_token_id=self.s_pad,
-                    **decode_kwargs,
-                )
-            for j in range(len(chunk)):
-                raw = out[j, T:].tolist()
-                completions.append(self.bridge.clean_completion(raw))
-        self.student.train()
-        return completions
+    def _xtok_targets(self, samples: list[Sample], name: str):
+        """Chunk ids and log-probs, and the one-to-one dense targets, over a micro-batch."""
+        device = self.device
+        chunk_ids, keep, teacher_chunk_lp, ends = [], [], [], []
+        dense_rows, dense_support, dense_lp = [], [], []
+        row = offset = 0
+        for s in samples:
+            ch = s.view.chunks
+            chunk_ids += [c + offset if c >= 0 else -1 for c in ch.student]
+            keep += ch.keep
+            t_index = torch.tensor(ch.teacher, dtype=torch.long)
+            on = t_index >= 0
+            teacher_chunk_lp.append(torch.zeros(ch.n_chunks).index_add_(0, t_index[on], s.scores.token_lp[on]))
+            # a loss slice may end wherever no chunk continues across (chunk ids only increase)
+            last = -1
+            for i, c in enumerate(ch.student):
+                if c >= 0:
+                    if last >= 0 and c != last:
+                        ends.append(row + i)
+                    last = c
+            ends.append(row + len(ch.student))
+            if s.scores.topk_ids is not None:
+                for s_pos, t_pos in ch.one_to_one:     # teacher top-k plus the teacher's actual token
+                    actual = s.view.input_ids[s.view.prompt_len + t_pos]
+                    dense_rows.append(row + s_pos)
+                    dense_support.append(torch.cat([s.scores.topk_ids[t_pos], torch.tensor([actual])]))
+                    dense_lp.append(torch.cat([s.scores.topk_lp[t_pos], s.scores.token_lp[t_pos:t_pos + 1]]))
+            row += len(ch.student)
+            offset += ch.n_chunks
+        chunks = losses.ChunkTargets(torch.tensor(chunk_ids, device=device), torch.cat(teacher_chunk_lp).to(device),
+                                     torch.tensor(keep, dtype=torch.bool, device=device), sorted(set(ends)))
+        if not dense_rows:
+            return chunks, None
+        support = torch.stack(dense_support).to(device)
+        t2s = self.teacher_to_student[name]
+        mapped = torch.where(support < t2s.numel(), t2s[support.clamp(max=t2s.numel() - 1)], -1)
+        teacher_lp = torch.stack(dense_lp).to(device)
+        valid = (mapped >= 0) & teacher_lp.isfinite()
+        valid[:, -1] &= ~(support[:, -1:] == support[:, :-1]).any(1)      # actual token already in the top-k
+        return chunks, losses.DenseTargets(torch.tensor(dense_rows, device=device), mapped, teacher_lp, valid)
 
-    # ------------------------------------------------- engine services (sources)
-
-    def greedy_generate(self, messages_list, max_new_tokens: int) -> list[str]:
-        """Greedy-decode one completion per conversation, decoded (stop token trimmed)."""
-        prompts = [self._encode_prompt(self.s_tok, m) for m in messages_list]
-        comps = self._generate(prompts, max_new_tokens, greedy=True)
-        return [self.s_tok.decode(c[:-1] if c and c[-1] in self.bridge.stop_ids else c)
-                for c in comps]
-
-    @torch.no_grad()
-    def dev_kl(self, messages_list, max_new_tokens: int) -> dict[str, float]:
-        """On-policy sample + teacher-score held-out prompts; mean reverse KL/token."""
-        rollouts = []
-        s_prompts = [self._encode_prompt(self.s_tok, m) for m in messages_list]
-        t_prompts = [self._encode_prompt(self.t_tok, m) for m in messages_list]
-        comps = self._generate(s_prompts, max_new_tokens)
-        for s_p, t_p, comp in zip(s_prompts, t_prompts, comps):
-            if comp:
-                rollouts.append(({"s_prompt": s_p, "t_prompt": t_p}, comp))
-        if not rollouts:
-            return {"dev_kl": float("nan"), "dev_len": 0.0}
-        total_kl = total_tok = 0.0
-        for i in range(0, len(rollouts), self.config.train.score_micro_seqs):
-            chunk = rollouts[i : i + self.config.train.score_micro_seqs]
-            _, n_tok, stats = self._loss_on_chunk(*self._chunk_args(chunk))
-            total_kl += stats["kl"] * n_tok
-            total_tok += n_tok
-        return {"dev_kl": total_kl / total_tok,
-                "dev_len": total_tok / len(rollouts)}
-
-    # ----------------------------------------------------------------- scoring
-
-    @staticmethod
-    def _gather_logits(model, seqs, plens, lens, pad, device, autocast_dev=None):
-        """Forward `seqs`, return lm_head logits only at completion positions.
-
-        Position p predicts token p+1, so for a completion of length L starting
-        at index P (= prompt length) we need hidden states at P-1 .. P+L-2.
-        Full logits over a 128k vocab for every position would not fit; gathering
-        hidden states first keeps memory at N_completion_tokens x vocab.
-
-        Assumes the HF causal-LM layout (model.model backbone + model.lm_head),
-        which holds for Llama/Qwen/Gemma-family architectures.
-        """
-        ids, mask = OPDTrainer._right_pad(seqs, pad, device)
-        # grad-vs-no-grad is decided by the caller's context, not here
-        ctx = (torch.autocast(autocast_dev, dtype=torch.bfloat16)
-               if autocast_dev else contextlib.nullcontext())
-        with ctx:
-            h = model.model(input_ids=ids, attention_mask=mask).last_hidden_state
-            B, T, H = h.shape
-            flat = []
-            for i, (P, L) in enumerate(zip(plens, lens)):
-                flat.extend(range(i * T + P - 1, i * T + P - 1 + L))
-            h_sel = h.reshape(B * T, H)[torch.tensor(flat, device=device)]
-            logits = model.lm_head(h_sel)  # (N, vocab)
-        return logits
-
-    def _chunk_args(self, chunk):
-        """(rollout, completion) pairs -> _loss_on_chunk arguments."""
-        s_seqs, t_seqs, plens_s, plens_t, lens, targets = [], [], [], [], [], []
-        for b, comp in chunk:
-            comp_t = self.bridge.to_teacher(comp)
-            s_seqs.append(b["s_prompt"] + comp[:-1])
-            t_seqs.append(b["t_prompt"] + comp_t[:-1])
-            plens_s.append(len(b["s_prompt"]))
-            plens_t.append(len(b["t_prompt"]))
-            lens.append(len(comp))
-            targets.extend(comp_t)
-        return s_seqs, t_seqs, plens_s, plens_t, lens, targets
-
-    def _loss_on_chunk(self, s_seqs, t_seqs, plens_s, plens_t, lens, targets_t):
-        """Loss for a micro-batch of rollouts. Returns (loss, n_tokens, stats)."""
-        train = self.config.train
-        V = self.bridge.shared_vocab_size
-
-        with torch.no_grad():
-            t_logits = self._gather_logits(
-                self.teacher, t_seqs, plens_t, lens, self.t_pad, self.teacher_device
-            )
-            logp_t = F.log_softmax(t_logits.float(), dim=-1).to(self.device)  # (N, V)
-
-        s_logits = self._gather_logits(
-            self.student, s_seqs, plens_s, lens, self.s_pad, self.device,
-            autocast_dev=self.device.split(":")[0] if self.device != "cpu" else None,
-        )
-        logp_s_full = F.log_softmax(s_logits.float(), dim=-1)  # (N, student vocab)
-
-        tgt = torch.tensor(targets_t, dtype=torch.long, device=self.device)  # (N,)
-
-        # merge the student's end-of-turn mass into the teacher's terminator slot(s)
-        p_full = logp_s_full.exp()
-        p_shared = p_full[:, :V].clone()
-        for s_id, t_id in self.bridge.swap.items():
-            p_shared[:, t_id] += p_full[:, s_id]
-        residual = 1.0 - p_shared.sum(-1)  # mass on unmapped student-only tokens, should be ~0
-        logp_s = (p_shared + 1e-12).log()
-
-        kl = (p_shared * (logp_s - logp_t)).sum(-1)  # (N,) full reverse KL
-        sampled_kl = (logp_s.gather(-1, tgt[:, None]) - logp_t.gather(-1, tgt[:, None])).squeeze(-1)
-
-        if train.loss_fn == "full_kl":
-            loss = kl.sum()
-        elif train.loss_fn == "sampled_rkl":
-            # tinker-style: REINFORCE with per-token advantage = -sampled KL
-            logp_s_tgt = logp_s.gather(-1, tgt[:, None]).squeeze(-1)
-            loss = (logp_s_tgt * sampled_kl.detach()).sum()
-        else:
-            raise ValueError(train.loss_fn)
-
-        stats = {
-            "kl": kl.detach().mean().item(),
-            "sampled_kl": sampled_kl.detach().mean().item(),
-            "residual_mass": residual.detach().mean().item(),
-        }
-        return loss, len(targets_t), stats
+    def _scores(self, batch: Batch, train: bool) -> dict[str, float]:
+        """Loss over a whole batch in micro-batches per teacher; per-teacher sums of the stats."""
+        samples = batch.samples
+        total_tokens = sum(len(s.completion) for s in samples)
+        stats: dict[str, float] = defaultdict(float)
+        for name in self.routes:
+            group = sorted((s for s in samples if s.teacher == name), key=lambda s: len(s.completion))
+            for start in range(0, len(group), self.config.train.score_micro_seqs):
+                micro = group[start:start + self.config.train.score_micro_seqs]
+                weights = [1.0 / (len(s.completion) * len(samples)) if self.config.loss.length_norm
+                           else 1.0 / total_tokens for s in micro]
+                for k, v in self._score(micro, weights, train).items():
+                    stats[f"{k}/{name}"] += v
+                stats[f"samples/{name}"] += len(micro)
+        return stats
 
     # ------------------------------------------------------------------- train
 
-    def train(self):
+    def train(self) -> None:
         config = self.config
-        t0 = time.time()
-        for step in range(config.train.steps):
-            for g in self.opt.param_groups:
-                g["lr"] = self._lr_at(step)
+        self.orchestrator.start()
+        try:
+            if config.train.eval_every:
+                self._log("eval", self.evaluate(), 0)
+            start_time = time.time()
+            for step in range(config.train.steps):
+                t0 = time.perf_counter()
+                batch = self.orchestrator.next(self.weights.version)
+                waited = time.perf_counter() - t0
+                if not batch.samples:
+                    logger.warning("step %d: no non-empty completions, skipping", step)
+                    self.weights.publish()      # the producer waits for this step's version
+                    continue
+                lr = self._lr_at(step)
+                for group in self.opt.param_groups:
+                    group["lr"] = lr
+                t1 = time.perf_counter()
+                self.student.train()
+                stats = self._scores(batch, train=True)
+                with self.weights.lock:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), config.train.max_grad_norm)
+                    self.opt.step()
+                    self.opt.zero_grad(set_to_none=True)
+                    if self.device == "cuda":
+                        torch.cuda.synchronize()
+                train_time = time.perf_counter() - t1
+                staleness = self.weights.version - batch.version
+                self.weights.publish()
+                metrics = self._summarize(stats, batch)
+                metrics.update({"lr": lr, "grad_norm": float(grad_norm), "staleness": staleness,
+                                "dropped_samples": self.orchestrator.dropped, "time/train": train_time,
+                                "time/wait_batch": waited, "time/step": time.perf_counter() - t0,
+                                "elapsed": time.time() - start_time})
+                if step % config.logging.log_every == 0:
+                    self._log("step", metrics, step + 1)
+                if config.train.eval_every and (step + 1) % config.train.eval_every == 0 and step + 1 < config.train.steps:
+                    self._log("eval", self.evaluate(), step + 1)
+                if config.train.save_steps and (step + 1) % config.train.save_steps == 0:
+                    self.save(f"step_{step + 1}")
+            if config.train.eval_every:
+                self._log("eval", self.evaluate(), config.train.steps)
+            self.save("final")
+        finally:
+            self.orchestrator.stop()
+            for server in self.servers:
+                server.close()
 
-            # 1. draw prompts from the source, render for both models
-            batch = []
-            for _ in range(config.sampling.batch_prompts):
-                messages, mnt, meta = self.source.sample()
-                s_prompt = self._encode_prompt(self.s_tok, messages)
-                t_prompt = self._encode_prompt(self.t_tok, messages)
-                for _ in range(config.sampling.group_size):
-                    batch.append({"s_prompt": s_prompt, "t_prompt": t_prompt,
-                                  "mnt": mnt, "meta": meta})
-
-            # 2. student samples completions (on-policy), grouped by length budget
-            completions: dict[int, list[int]] = {}
-            for mnt in sorted({b["mnt"] for b in batch}):
-                idx = [i for i, b in enumerate(batch) if b["mnt"] == mnt]
-                comps = self._generate([batch[i]["s_prompt"] for i in idx], mnt)
-                completions.update(dict(zip(idx, comps)))
-
-            rollouts = [(batch[i], completions[i]) for i in range(len(batch))
-                        if len(completions[i]) > 0]
-            if not rollouts:
-                logger.warning("step %d: no non-empty completions, skipping", step)
-                continue
-
-            # 3+4. teacher scoring + reverse-KL update (micro-batched, grad accum)
-            self.opt.zero_grad(set_to_none=True)
-            n_total = sum(len(c) for _, c in rollouts)
-            agg = {"kl": 0.0, "sampled_kl": 0.0, "residual_mass": 0.0}
-            for i in range(0, len(rollouts), config.train.score_micro_seqs):
-                chunk = rollouts[i : i + config.train.score_micro_seqs]
-                loss, n_tok, stats = self._loss_on_chunk(*self._chunk_args(chunk))
-                (loss / n_total).backward()
-                for k in agg:
-                    agg[k] += stats[k] * n_tok / n_total
-
-            torch.nn.utils.clip_grad_norm_(self.student.parameters(), config.train.max_grad_norm)
-            self.opt.step()
-
-            # ------------------------------------------------------- logging
-            if step % config.logging.log_every == 0:
-                mean_len = n_total / len(rollouts)
-                source_stats = self.source.batch_stats(
-                    [(b["meta"], self.s_tok.decode(comp)) for b, comp in rollouts]
-                )
-                extra = "".join(f" {k}={v:.2f}" for k, v in source_stats.items())
-                logger.info(
-                    "step %d | kl/tok=%.4f sampled_kl=%.4f len=%.1f%s lr=%.2e (%.0fs)",
-                    step, agg["kl"], agg["sampled_kl"], mean_len, extra,
-                    self.opt.param_groups[0]["lr"], time.time() - t0,
-                )
-                self._track({"kl": agg["kl"], "sampled_kl": agg["sampled_kl"],
-                             "residual_mass": agg["residual_mass"],
-                             "completion_len": mean_len, **source_stats,
-                             "lr": self.opt.param_groups[0]["lr"]}, step)
-
-            if config.train.eval_every and step and step % config.train.eval_every == 0:
-                metrics = self._evaluate()
-                logger.info("step %d | %s", step,
-                            " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-                self._track(metrics, step)
-
-            if config.train.save_steps and step and step % config.train.save_steps == 0:
-                self._save(f"step_{step}")
-
-        metrics = self._evaluate()
-        logger.info("final | %s", " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-        self._save("final")
+    def _summarize(self, stats: dict[str, float], batch: Batch) -> dict[str, float]:
+        metrics = {k: v for k, v in batch.stats.items()}
+        total_tokens = sum(v for k, v in stats.items() if k.startswith("tokens/"))
+        metrics["loss"] = sum(v for k, v in stats.items() if k.startswith("loss/"))
+        metrics["k1"] = sum(v for k, v in stats.items() if k.startswith("k1/")) / max(total_tokens, 1)
+        metrics["completion_len"] = total_tokens / max(len(batch.samples), 1)
+        for name in self.routes:
+            tokens = stats.get(f"tokens/{name}", 0)
+            if tokens:
+                metrics[f"kl/{name}"] = stats[f"kl/{name}"] / tokens
+                metrics[f"k1/{name}"] = stats[f"k1/{name}"] / tokens
+                metrics[f"tokens/{name}"] = tokens
+                if f"is_dropped/{name}" in stats:
+                    metrics[f"is_dropped/{name}"] = stats[f"is_dropped/{name}"] / tokens
+                    metrics[f"abs_log_ratio/{name}"] = stats[f"abs_log_ratio/{name}"] / tokens
+                if f"residual/{name}" in stats:
+                    metrics[f"residual_mass/{name}"] = stats[f"residual/{name}"] / tokens
+                if stats.get(f"dense_tokens/{name}"):
+                    metrics[f"dense_kl/{name}"] = stats[f"dense_kl/{name}"] / stats[f"dense_tokens/{name}"]
+                    metrics[f"dense_fraction/{name}"] = stats[f"dense_tokens/{name}"] / tokens
+        metrics.update(self.source.batch_stats(
+            [(s.request.meta, self.tok.decode(s.completion, skip_special_tokens=True)) for s in batch.samples]))
+        return metrics
 
     # -------------------------------------------------------------------- eval
 
-    def _evaluate(self) -> dict[str, float]:
-        """Held-out evaluation, delegated to the source (metric is task-specific)."""
+    def evaluate(self) -> dict[str, float]:
+        """Held-out metrics of every source, each scored against its own teacher."""
         self.student.eval()
         try:
-            return self.source.evaluate(self)
+            return self.source.evaluate(lambda name: _SourceEngine(self, name))
         finally:
             self.student.train()
 
+    def greedy_generate(self, messages_list, max_new_tokens: int) -> list[str]:
+        prompts = [encode_prompt(self.tok, m, self.config.model.chat_template_kwargs) for m in messages_list]
+        rollouts, _ = self.pipeline.generate(prompts, [max_new_tokens] * len(prompts), 0.0)
+        return [self.tok.decode(r.completion_ids, skip_special_tokens=True) for r in rollouts]
+
+    @torch.no_grad()
+    def dev_kl(self, messages_list, max_new_tokens: int, source: str | None, teacher: str) -> dict[str, float]:
+        """Sample the held-out prompts on-policy, score them against `teacher`, no gradient.
+
+        dev_kl is the sampled estimate sum(log p_S - log p_T) per student token, on one
+        scale for every loss; dev_kl_full (full_rkl teachers) the exact per-token KL."""
+        requests = [self.pipeline.request(m, max_new_tokens, {}, source, teacher) for m in messages_list]
+        with self.pipeline.lock:      # no rollout engine activity (vLLM sleep) while this scores on the GPU
+            batch = self.pipeline.run(requests, self.config.rollout.temperature)
+            if not batch.samples:
+                return {"dev_kl": float("nan"), "dev_len": 0.0}
+            stats = self._scores(batch, train=False)
+        tokens = stats[f"tokens/{teacher}"]
+        metrics = {"dev_kl": stats[f"k1/{teacher}"] / tokens, "dev_len": tokens / len(batch.samples)}
+        if self.kinds[teacher] == "full_rkl":
+            metrics["dev_kl_full"] = stats[f"kl/{teacher}"] / tokens
+        return metrics
+
     # ------------------------------------------------------------- bookkeeping
 
-    def _track(self, metrics: dict, step: int):
+    def _log(self, kind: str, metrics: dict[str, float], step: int) -> None:
+        logger.info("%s %d | %s", kind, step, " ".join(f"{k}={v:.4g}" for k, v in sorted(metrics.items())))
         if self.wandb:
             try:
-                self.wandb.log(metrics, step=step)
+                self.wandb.log({(f"eval/{k}" if kind == "eval" else k): v for k, v in metrics.items()}, step=step)
             except Exception as e:  # noqa: BLE001 — a metrics backend must never kill training
                 logger.warning("wandb.log failed (%s); disabling wandb", e)
                 self.wandb = None
 
-    def _save(self, name: str):
-        path = os.path.join(self.config.train.output_dir, name)
-        logger.info("Saving checkpoint -> %s", path)
-        self.student.save_pretrained(path)
-        self.s_tok.save_pretrained(path)
-        with open(os.path.join(path, "opd_config.json"), "w") as f:
-            json.dump(dataclasses.asdict(self.config), f, indent=2)
-        self._prune_checkpoints()
+    def save(self, name: str) -> None:
+        from palingenesis.checkpoint import save_hf_model
 
-    def _prune_checkpoints(self):
-        """Keep only the newest keep_checkpoints step_* dirs ("final" is exempt)."""
+        path = Path(self.config.train.output_dir) / name
+        logger.info("Saving checkpoint -> %s", path)
+        save_hf_model(self.student, self.tok, path)
+        with open(path / "opd_config.json", "w") as f:
+            json.dump(dataclasses.asdict(self.config), f, indent=2)
         keep = self.config.train.keep_checkpoints
-        if keep <= 0:
-            return
-        steps = sorted(
-            (d for d in os.listdir(self.config.train.output_dir) if d.startswith("step_")),
-            key=lambda d: int(d.split("_")[1]),
-        )
-        for d in steps[:-keep]:
-            victim = os.path.join(self.config.train.output_dir, d)
-            logger.info("Pruning old checkpoint %s", victim)
-            shutil.rmtree(victim, ignore_errors=True)
+        if keep > 0:
+            steps = sorted((d for d in os.listdir(self.config.train.output_dir) if d.startswith("step_")),
+                           key=lambda d: int(d.split("_")[1]))
+            for old in steps[:-keep]:
+                shutil.rmtree(os.path.join(self.config.train.output_dir, old), ignore_errors=True)
+
+
+class _SourceEngine:
+    """The engine services a source's evaluate() uses, bound to that source's teacher."""
+
+    def __init__(self, trainer: OPDTrainer, source: str):
+        self.trainer = trainer
+        self.source = source
+        config = trainer.config
+        self.teacher = config.teacher_of(source) if source in config.sources else next(iter(trainer.routes))
+
+    def greedy_generate(self, messages_list, max_new_tokens: int) -> list[str]:
+        return self.trainer.greedy_generate(messages_list, max_new_tokens)
+
+    def dev_kl(self, messages_list, max_new_tokens: int) -> dict[str, float]:
+        return self.trainer.dev_kl(messages_list, max_new_tokens, self.source, self.teacher)
 
 
 def main():
     from palingenesis.logging import setup_logging
 
     setup_logging(rank=0)
-    config = OPDConfig.from_cli()
-    for warning in config.validate():
-        logger.warning(warning)
-    OPDTrainer(config).train()
+    OPDTrainer(OPDConfig.from_cli()).train()
 
 
 if __name__ == "__main__":

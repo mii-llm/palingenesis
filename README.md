@@ -107,14 +107,16 @@ pgs autopilot --model Qwen/Qwen3.5-4B --dataset your_data.jsonl
 
 ## On-policy distillation
 
-Shrink a teacher into a student by scoring the student's **own samples** — full-distribution reverse KL, no train/inference mismatch. Works across mismatched chat templates (e.g. ChatML student ← Llama-3-template teacher) as long as the pair shares a base vocabulary; the token bridge maps end-of-turn tokens so the teacher also supervises *when to stop*.
+Shrink a teacher into a student by scoring the student's **own samples**: the student samples with its current weights, the teacher scores those exact tokens, and the student is pulled toward the teacher's distribution (reverse KL). Rollouts from vLLM or the trainer's own `generate`; teachers in-process or on a vLLM server; teachers with another tokenizer (byte-aligned chunks); one teacher per prompt source.
 
 ```bash
-pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl  # annotate pool with teacher answers
-pgs distill       --config configs/distill_opd.yaml
+pgs distill --config configs/distill_math.yaml     # Qwen3-1.7B -> Qwen3-0.6B, vLLM rollouts
+pgs distill --config configs/distill_xtok.yaml     # teacher with another tokenizer
+pgs distill --config configs/distill_multi.yaml    # one teacher per prompt source
+pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl  # annotate an mcqa pool
 ```
 
-`distill-score` marks every pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. Works on multiple-choice pools (`data.format: mcqa`) and generic chat prompts (`data.format: messages`, see `configs/distill_chat.yaml`); custom tasks implement the three-method `PromptSource` protocol. See [docs/on_policy_distillation.md](docs/on_policy_distillation.md).
+`distill-score` marks every multiple-choice pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. See the [distillation guide](https://mii-llm.github.io/palingenesis/guides/distillation/).
 
 ## Multi-GPU / Multi-Node
 

@@ -1,0 +1,44 @@
+# On-policy distillation, shared vocabulary: Qwen3-1.7B -> Qwen3-0.6B on GSM8K
+# (non-thinking), vLLM rollouts, exact full-vocabulary reverse KL. One A100 80GB.
+#
+#   pgs distill --config configs/distill_math.yaml
+#
+# Data (see the distillation guide for the few lines that write them):
+#   data/gsm8k_train.jsonl    {"messages": [{"role": "user", "content": ...}], "answer": "72"}
+#   data/gsm8k_test200.jsonl  the same for 200 test questions: dev KL and greedy accuracy
+
+model:
+  student: Qwen/Qwen3-0.6B
+  chat_template_kwargs: {enable_thinking: false}
+
+teachers:
+  qwen3_1_7b:
+    model: Qwen/Qwen3-1.7B        # hf backend: full distribution, so the loss is full_rkl
+
+sources:
+  gsm8k:
+    format: messages
+    path: data/gsm8k_train.jsonl
+    dev_path: data/gsm8k_test200.jsonl
+    max_new_tokens: 512
+
+rollout:
+  backend: vllm                   # in-process vLLM, asleep while the trainer trains
+  batch_prompts: 64
+  temperature: 1.0
+  gpu_memory_utilization: 0.3
+  max_model_len: 2048
+
+train:
+  output_dir: runs/distill_math
+  steps: 60
+  learning_rate: 3.0e-6
+  warmup_steps: 5
+  score_micro_seqs: 16
+  eval_every: 20
+  eval_samples: 200
+
+logging:
+  log_every: 1
+  use_wandb: false
+  project: palingenesis-opd
