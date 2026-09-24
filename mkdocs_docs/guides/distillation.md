@@ -84,6 +84,7 @@ A teacher is `hf` (in-process, frozen bf16, full distribution) or `vllm` (a vLLM
 | Loss | Needs | What it minimizes | Default for |
 |---|---|---|---|
 | `full_rkl` | hf teacher, shared vocabulary | exact reverse KL over the shared vocabulary at every completion token | hf teacher, shared vocabulary |
+| `rs_kd` | hf teacher, shared vocabulary | forward KL to tokens drawn from the teacher's distribution, importance-weighted (Random Sampling KD, arXiv 2503.16870): unbiased, `loss.rs_rounds` ids per token | — |
 | `topk_kl` | shared vocabulary | KL between coarse distributions: the teacher's top-k plus the realized token, and one tail bucket holding the rest of each side's mass (`loss.beta`: 1 reverse, 0 forward) | vllm teacher, shared vocabulary |
 | `sampled_rkl` | shared vocabulary | REINFORCE on the per-token reward log p_T(y) − log p_S(y) (the sampled reverse KL), with an importance ratio to the rollout policy | — |
 | `xtok` | any tokenizers | REINFORCE on text chunks: reward log p_T(chunk) − log p_S(chunk); optional top-k KL where a chunk is one token on each side | teacher with another tokenizer |
@@ -165,7 +166,23 @@ What the numbers say:
 
 The fused `full_rkl` (`opd/fused_rkl.py`, used automatically for plain linear output heads and a shared vocabulary without end-of-turn remapping) computes both models' logits in fp32 straight from bf16 GEMMs, then makes two streaming passes over them in Triton: one for both log-sum-exps, the KL and its statistics, one for the analytic gradient q·(log q − log p + 1 − KL − S). Autograd through the definition, which the generic path uses, takes about a dozen elementwise passes over the [tokens, 248k] logits and recasts the output head's weight for every slice. The fused path is also more exact: against fp64 on the same inputs its loss is within 4e-6 and its gradients within 1.3% (norm), where the autocast path's are 9e-6 and 2.9%.
 
+The fused path covers every head `logits.output_head` produces: a logit scale (Cohere, Granite, Falcon-H1) and Gemma 2's final-logit softcap are applied inside the kernels, with the softcap's derivative computed as 4σ(2x)σ(−2x) (no cancellation where the logits saturate). On real hidden states against fp64: Gemma-2-2B-it ← Gemma-2-2B (softcap 30, 256k vocabulary) loss error 2.6e-4 vs 4.8e-3 for the generic path, gradients 5–12× closer, 79 vs 197 ms; Granite-3.3-2B ← 8B (logit scales 1/8 and 1/16) 3.6e-5 vs 7.5e-5, 46 vs 61 ms.
+
 Rollout time is set by decoding: 512 steps for the longest completion, about 5 ms each at 64 sequences (Qwen3.5's linear-attention layers read and write a recurrent state per sequence at every step). Larger batches decode more tokens per second: 128 prompts per step give 13.5k rollout tokens/s instead of 9.7k, and 4.9k trained tokens/s instead of 4.3k, at half the optimizer steps per token.
+
+### Sparse teacher targets and token selection
+
+Same setup (Qwen3.5-4B → 0.8B, 100 steps, one seed each; one standard error on 200 questions is ~3.4 points):
+
+| Run | GSM8K %, step 0 / 25 / 50 / 75 / 100 | dev_kl, step 100 | s / step |
+|---|---|---:|---:|
+| `full_rkl` (baseline) | 53.0 / 55.5 / 59.5 / 62.0 / 62.5 | 0.243 | 5.5 |
+| `token_weighting: sure`, α = 1 | 53.0 / 55.0 / 62.5 / 61.0 / 62.0 | 0.245 | 5.5 |
+| `token_weighting: entropy`, keep 20% | 53.0 / 62.5 / 63.0 / 59.0 / 64.0 | 0.249 | 5.7 |
+| `rs_kd`, 50 draws | 53.0 / 53.5 / 59.0 / 58.5 / 56.5 | 0.284 | 7.0 |
+
+- **Token selection matches the baseline, within noise.** SuRe (arXiv 2608.25643) up-weights tokens the student found unlikely; `entropy` trains on only the 20% of tokens where the student is most uncertain (the forking tokens of arXiv 2506.01939, an RL result applied here to distillation). Training on a fifth of the tokens loses nothing measurable here, and neither beats the baseline by more than the noise.
+- **Random Sampling KD is unbiased but noisier than top-k on-policy.** On a real batch, against the exact full forward-KL gradient: rs_kd with 50 draws is 13° off (25° with 12), top-12 with a tail bucket 2.6°, top-50 0.6°, and even renormalized top-12 (the paper's Top-K baseline) 4.4°. The paper (arXiv 2503.16870) reports the opposite ordering (top-12 58°, its method 4°) on pretraining text, where the teacher's distribution is broad; at the states an on-policy student visits the teacher is confident (4.3 distinct ids in 50 draws), so a top-k captures nearly all the mass and sampling only adds variance. rs_kd optimizes forward KL, which is mode-covering: completions grew to ~455 tokens (vs ~380) and accuracy trailed. It is also slower here (the teacher projects and samples the full vocabulary per token). Use it where sparse targets are the point — caching a teacher's targets offline, a teacher on another device — not in place of `full_rkl` on one GPU.
 
 Also run, 5 steps each: an hf teacher with `offload: true` (moving Qwen3-1.7B on and off the GPU adds 1.4 s per step) and a vLLM teacher (Qwen3.5-0.8B) for `xtok` with the dense term. Runs are in the `palingenesis-validation` wandb project, named `opd2-*`.
 

@@ -21,6 +21,9 @@ so micro-batches accumulate to exactly the full-batch gradient.
   xtok         cross-tokenizer: the same REINFORCE with one advantage per text
                chunk, sg[l_T(c) - l_S(c)] (chunk log-probabilities, align.py),
                plus an optional top-k KL at chunks of one token on each side.
+  rs_kd        forward KL to tokens sampled from the teacher's distribution,
+               importance-weighted: unbiased like the full distribution, a few
+               ids per token (Random Sampling KD). HF teacher.
 
 Each returns (loss, stats): `stats` holds sums over tokens (the caller divides),
 including ``k1``, the sampled estimate sum(log p_S - log p_T) that every loss can
@@ -256,6 +259,48 @@ def sampled_rkl(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tenso
         return (weights[a:b] * loss).sum(), stats
 
     return chunked_head(hidden, head, fn)
+
+
+def rs_kd(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, vocab: SharedVocab,
+          sample_ids: Tensor, sample_weights: Tensor, sample_lp: Tensor,
+          teacher_token_lp: Tensor) -> tuple[Tensor, dict[str, float]]:
+    """Random Sampling KD (arXiv 2503.16870): forward KL to the teacher's sampled tokens.
+
+    Per token, the teacher drew R ids from its distribution (teachers.sample_teacher);
+    with their importance weights w (summing to 1) they estimate the teacher's
+    distribution without bias, so sum_k w_k (log p(v_k) - log q(v_k)) estimates
+    KL(p || q) and its gradient q - sum_k w_k [v_k] is the full forward-KL gradient
+    in expectation. Draws outside the shared vocabulary are dropped (the teacher's
+    mass there, like full_rkl's residual). `targets`: completion ids in the teacher's
+    vocabulary (for k1).
+    """
+    valid = sample_ids < vocab.size
+    ids = sample_ids.clamp(max=vocab.size - 1)
+    w = sample_weights * valid
+
+    def fn(logits: Tensor, a: int, b: int):
+        lq = vocab.project(F.log_softmax(logits, -1))
+        kl = (w[a:b] * (sample_lp[a:b] - lq.gather(1, ids[a:b]))).sum(-1)
+        k1 = lq.gather(1, targets[a:b, None]).squeeze(1) - teacher_token_lp[a:b]
+        stats = {"kl": kl.detach().sum(), "k1": k1.detach().sum()}
+        return (weights[a:b] * kl).sum(), stats
+
+    sorted_ids = sample_ids.sort(1).values
+    unique = 1 + (sorted_ids[:, 1:] != sorted_ids[:, :-1]).sum(1)
+    value, stats = chunked_head(hidden, head, fn)
+    stats["rs_unique"] = float(unique.sum())
+    return value, stats
+
+
+@torch.no_grad()
+def token_entropy(hidden: Tensor, head: nn.Module) -> Tensor:
+    """The student's entropy at each row of `hidden` [N] (fp32), a slice of rows at a time."""
+    rows = max(1, SLICE_ELEMENTS // head.weight.shape[0])
+    out = []
+    for a in range(0, hidden.shape[0], rows):
+        lp = F.log_softmax(_upcast(head(hidden[a:a + rows])), -1)
+        out.append(-(lp.exp() * lp).sum(-1))
+    return torch.cat(out) if out else hidden.new_zeros(0, dtype=torch.float32)
 
 
 @dataclass

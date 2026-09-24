@@ -16,7 +16,8 @@ from pathlib import Path
 
 import yaml
 
-LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok")
+LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok", "rs_kd")
+TOKEN_WEIGHTINGS = ("none", "sure", "entropy")
 ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server")
 TEACHER_BACKENDS = ("hf", "vllm")
 
@@ -130,6 +131,18 @@ class OPDLossConfig:
     xtok_spread: str = "chunk"        # "chunk" or "proportional" (see losses.xtok)
     xtok_dense_weight: float = 0.0    # xtok: top-k KL at one-to-one chunks
     mask_whitespace: bool = True      # xtok: no loss on whitespace-only chunks
+    # rs_kd (Random Sampling KD, arXiv 2503.16870): forward KL to `rs_rounds` tokens drawn
+    # from the teacher's distribution raised to `rs_temperature`, importance-weighted.
+    rs_rounds: int = 50
+    rs_temperature: float = 1.0
+    # Which completion tokens the loss weighs, for every loss:
+    #   none     all equally
+    #   sure     w = 1 + sure_alpha (1 - p_student(token)), detached (SuRe, arXiv 2608.25643)
+    #   entropy  only the entropy_keep fraction of tokens with the highest student entropy
+    #            in each scoring micro-batch ("forking tokens", arXiv 2506.01939)
+    token_weighting: str = "none"
+    sure_alpha: float = 1.0
+    entropy_keep: float = 0.2
 
 
 @dataclass(slots=True)
@@ -283,9 +296,10 @@ class OPDConfig:
                 errors.append(f"{where}.backend must be one of {TEACHER_BACKENDS}, got {teacher.backend!r}.")
             if teacher.loss and teacher.loss not in LOSSES:
                 errors.append(f"{where}.loss must be one of {LOSSES} (or empty for auto), got {teacher.loss!r}.")
-            if teacher.loss == "full_rkl" and teacher.backend == "vllm":
-                errors.append(f"{where}: full_rkl needs the teacher's full distribution; a vllm teacher only "
-                              "returns its top-k. Use loss topk_kl or sampled_rkl, or backend hf.")
+            if teacher.loss in ("full_rkl", "rs_kd") and teacher.backend == "vllm":
+                errors.append(f"{where}: {teacher.loss} needs the teacher's full distribution; a vllm teacher only "
+                              "returns its top-k. Use loss topk_kl (top-k plus a tail bucket) or sampled_rkl, "
+                              "or backend hf.")
             if teacher.backend == "vllm" and (teacher.device or teacher.offload):
                 errors.append(f"{where}: device and offload apply to hf teachers only.")
             if teacher.backend == "hf" and teacher.url:
@@ -336,6 +350,16 @@ class OPDConfig:
             errors.append("loss.is_low must be in (0, 1] and loss.is_high >= 1.")
         if loss.top_k < 1:
             errors.append(f"loss.top_k must be >= 1, got {loss.top_k}.")
+        if loss.rs_rounds < 1:
+            errors.append(f"loss.rs_rounds must be >= 1, got {loss.rs_rounds}.")
+        if loss.rs_temperature <= 0:
+            errors.append(f"loss.rs_temperature must be > 0, got {loss.rs_temperature}.")
+        if loss.token_weighting not in TOKEN_WEIGHTINGS:
+            errors.append(f"loss.token_weighting must be one of {TOKEN_WEIGHTINGS}, got {loss.token_weighting!r}.")
+        if loss.sure_alpha < 0:
+            errors.append(f"loss.sure_alpha must be >= 0, got {loss.sure_alpha}.")
+        if not 0 < loss.entropy_keep <= 1:
+            errors.append(f"loss.entropy_keep must be in (0, 1], got {loss.entropy_keep}.")
         if self.train.lr_scheduler not in ("cosine", "constant"):
             errors.append(f"train.lr_scheduler must be 'cosine' or 'constant', got {self.train.lr_scheduler!r}.")
 

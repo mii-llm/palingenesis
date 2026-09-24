@@ -297,7 +297,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `model` | str | — | Teacher model. |
 | `tokenizer` | str | `""` | Tokenizer to render and score with (empty = the model's). |
 | `backend` | str | `hf` | `hf`: in-process, frozen bf16, full distribution. `vllm`: a vLLM server scoring prefill-only top-k log-probs (launched on the student's GPU, or reached at `url`). |
-| `loss` | str | `""` | `full_rkl`, `topk_kl`, `sampled_rkl` or `xtok`. Empty = `full_rkl` (hf) or `topk_kl` (vllm) for a teacher sharing the student's vocabulary, `xtok` otherwise. `full_rkl` needs the hf backend; the first three need a shared vocabulary (checked when the tokenizers load). |
+| `loss` | str | `""` | `full_rkl`, `topk_kl`, `sampled_rkl`, `xtok` or `rs_kd`. Empty = `full_rkl` (hf) or `topk_kl` (vllm) for a teacher sharing the student's vocabulary, `xtok` otherwise. `full_rkl` and `rs_kd` need the hf backend; all but `xtok` need a shared vocabulary (checked when the tokenizers load). |
 | `device` | str | `""` | hf: device (empty = the student's), e.g. `cuda:1`. |
 | `offload` | bool | `false` | hf: keep the model on CPU between scoring calls (the output head stays on the device). |
 | `url` | str | `""` | vllm: an already running server. |
@@ -351,6 +351,11 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `xtok_spread` | str | `chunk` | `chunk`: every token of a chunk gets the chunk's advantage. `proportional`: token t gets A_c · log p(t) / log p(chunk). |
 | `xtok_dense_weight` | float | `0.0` | Weight of a top-k KL at chunks of exactly one token on each side. |
 | `mask_whitespace` | bool | `true` | xtok: no loss on whitespace-only chunks. |
+| `rs_rounds` | int | `50` | rs_kd: tokens drawn from the teacher's distribution per position. |
+| `rs_temperature` | float | `1.0` | rs_kd: the draws' proposal is the teacher's distribution raised to this power; importance weights correct for it. |
+| `token_weighting` | str | `none` | Which completion tokens the loss weighs, for every loss: `none`; `sure`: w = 1 + `sure_alpha` (1 − p), p the student's probability of the sampled token; `entropy`: only the `entropy_keep` fraction of tokens with the highest student entropy in each scoring micro-batch. |
+| `sure_alpha` | float | `1.0` | `sure` weighting strength (0 = none). |
+| `entropy_keep` | float | `0.2` | `entropy` weighting: fraction of tokens kept. |
 
 ### train
 

@@ -55,6 +55,8 @@ def make_config(tmp_path, models, **teacher_losses):
     prompts = write_prompts(tmp_path / "prompts.jsonl")
     settings = {
         "model.student": models["student"], "model.chat_template_kwargs": {"enable_thinking": False},
+        # Liger patches the model classes process-wide; later tests here run Qwen3 on the CPU
+        "model.use_liger_kernel": False,
         "teachers.same.model": models["same"], "teachers.other.model": models["other"],
         "sources.math.path": prompts, "sources.math.teacher": "same", "sources.math.max_new_tokens": 8,
         "sources.math.dev_size": 4,
@@ -97,11 +99,11 @@ def test_multi_teacher_training_run(tmp_path, models, caplog):
     saved = tmp_path / "run" / "final"
     reloaded = transformers.AutoModelForCausalLM.from_pretrained(saved)
     for (name, p), (_, q) in zip(trainer.student.named_parameters(), reloaded.named_parameters()):
-        torch.testing.assert_close(p, q, msg=name)
+        torch.testing.assert_close(p.cpu(), q.cpu(), msg=name)
     assert json.loads((saved / "opd_config.json").read_text())["teachers"]["other"]["model"] == models["other"]
 
 
-@pytest.mark.parametrize("loss", ["sampled_rkl", "xtok"])
+@pytest.mark.parametrize("loss", ["sampled_rkl", "xtok", "rs_kd"])
 def test_shared_vocabulary_teacher_with_other_losses(tmp_path, models, loss):
     from palingenesis.opd.trainer import OPDTrainer
 
@@ -184,9 +186,9 @@ def test_resume_continues_from_the_checkpoint(tmp_path, models):
     assert resumed.resume_path == str(run / "step_2") and resumed.start_step == 2
     assert resumed.weights.version == 2
     for (name, p), (_, q) in zip(resumed.student.named_parameters(), saved.named_parameters()):
-        torch.testing.assert_close(p, q, msg=name)
+        torch.testing.assert_close(p.cpu(), q.cpu(), msg=name)
     for got, want in zip(resumed.opt.state_dict()["state"].values(), saved_state["optimizer"]["state"].values()):
-        torch.testing.assert_close(got["exp_avg_sq"], want["exp_avg_sq"])
+        torch.testing.assert_close(got["exp_avg_sq"].cpu(), want["exp_avg_sq"].cpu())
     logged = []
     resumed._log = lambda kind, metrics, step: logged.append((kind, step, metrics))
     resumed.train()
@@ -212,3 +214,43 @@ def test_resume_from_path_needs_a_complete_checkpoint(tmp_path):
     assert checkpoint_steps(str(tmp_path), complete=False)[-1] == str(tmp_path / "step_12")
     with pytest.raises(OPDConfigError, match="not a complete OPD checkpoint"):
         resolve_resume(str(tmp_path / "final"), str(tmp_path))
+
+
+@pytest.mark.parametrize("weighting", ["sure", "entropy"])
+def test_token_weighting_run(tmp_path, models, weighting):
+    from palingenesis.opd.trainer import OPDTrainer
+
+    config = make_config(tmp_path, models)
+    config.sources.pop("chat")
+    config.teachers.pop("other")
+    config.train.eval_every = 0
+    config.loss.token_weighting = weighting
+    trainer = OPDTrainer(config)
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append(metrics)
+    trainer.train()
+    assert all(m["grad_norm"] > 0 for m in logged)
+
+
+def test_token_weighting_rules():
+    from types import SimpleNamespace
+
+    from palingenesis.opd.config import OPDLossConfig
+    from palingenesis.opd.trainer import OPDTrainer
+
+    torch.manual_seed(0)
+    head = torch.nn.Linear(4, 7, bias=False)
+    hidden = torch.randn(10, 4)
+    weights = torch.full((10,), 0.1)
+    behaviour = torch.log(torch.linspace(0.05, 1.0, 10))
+
+    def run(**options):
+        fake = SimpleNamespace(config=SimpleNamespace(loss=OPDLossConfig(**options)), head=head)
+        return OPDTrainer._token_weights(fake, weights, hidden, behaviour)
+
+    torch.testing.assert_close(run(), weights)
+    torch.testing.assert_close(run(token_weighting="sure", sure_alpha=0.5), weights * (1 + 0.5 * (1 - behaviour.exp())))
+    kept = run(token_weighting="entropy", entropy_keep=0.3)
+    from palingenesis.opd import losses
+    entropy = losses.token_entropy(hidden, head)
+    assert (kept > 0).sum() == 3 and set((kept > 0).nonzero().flatten().tolist()) == set(entropy.topk(3).indices.tolist())

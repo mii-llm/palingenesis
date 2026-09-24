@@ -574,6 +574,12 @@ def test_opd_config_validate():
     invalid("rollout.backend", rollout__backend="sglang")
     invalid("device and offload apply to hf teachers", teachers__big__backend="vllm", teachers__big__offload=True)
     invalid("xtok_spread", loss__xtok_spread="evenly")
+    invalid("rs_kd needs the teacher's full distribution", teachers__big__backend="vllm", teachers__big__loss="rs_kd")
+    invalid("rs_rounds", loss__rs_rounds=0)
+    invalid("rs_temperature", loss__rs_temperature=0.0)
+    invalid("token_weighting must be one of", loss__token_weighting="forking")
+    invalid("entropy_keep", loss__entropy_keep=0.0)
+    invalid("sure_alpha", loss__sure_alpha=-1.0)
     invalid("p_reference_shots", sources__pool__p_reference_shots=0.8, sources__pool__p_pool_shots=0.5)
 
     config = _valid_base_config()

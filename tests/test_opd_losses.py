@@ -308,3 +308,71 @@ def test_xtok_slices_never_cut_a_chunk():
     # a chunk longer than a slice becomes one oversized slice
     assert losses.slice_bounds(10, 2, [1, 7, 10]) == [(0, 1), (1, 7), (7, 10)]
     assert losses.slice_bounds(7, 3) == [(0, 3), (3, 6), (6, 7)]
+
+
+# ------------------------------------------------------------------------ rs_kd
+
+
+def test_teacher_samples_estimate_the_distribution_without_bias():
+    """Temperature 1: weighted draws average to p. Another proposal temperature: the
+    self-normalized importance weights converge to p as draws grow."""
+    from palingenesis.opd.teachers import sample_teacher
+
+    g = torch.Generator().manual_seed(0)
+    logp = F.log_softmax(torch.randn(4, 30, generator=g, dtype=torch.float64) * 2, -1)
+
+    def estimate(rounds, temperature, repeats):
+        total = torch.zeros_like(logp)
+        for _ in range(repeats):
+            ids, w, lp = sample_teacher(logp, rounds, temperature, g)
+            torch.testing.assert_close(lp, logp.gather(1, ids))
+            torch.testing.assert_close(w.sum(1), torch.ones(4, dtype=torch.float64))
+            total += torch.zeros_like(logp).scatter_add_(1, ids, w)
+        return total / repeats
+
+    assert (estimate(12, 1.0, 4000) - logp.exp()).abs().max() < 0.01          # small samples, unbiased on average
+    assert (estimate(20000, 0.7, 1) - logp.exp()).abs().max() < 0.01         # flatter proposal, reweighted
+
+
+def test_rs_kd_gradient_is_the_forward_kl_gradient_in_expectation():
+    from palingenesis.opd.teachers import sample_teacher
+
+    hidden, head, weights, g = make()
+    teacher_full = F.log_softmax(torch.randn(N, SHARED + 3, generator=g, dtype=torch.float64), -1)
+    t_logp = teacher_full[:, :SHARED]                           # the teacher's ids beyond SHARED have no student match
+    vocab = losses.SharedVocab(SHARED, SWAP)
+    targets = torch.randint(0, SHARED, (N,), generator=g)
+    lq = project(F.log_softmax(head(hidden), -1))
+    full = (weights * (t_logp.exp() * (t_logp - lq)).sum(-1)).sum()          # forward KL over the shared vocabulary
+    want = grads(full, hidden, head)
+
+    repeats, got, values = 400, [torch.zeros_like(x) for x in want], []
+    for _ in range(repeats):
+        ids, w, lp = sample_teacher(teacher_full, 16, 1.0, g)
+        loss, stats = losses.rs_kd(hidden, head, targets, weights, vocab, ids, w, lp,
+                                   t_logp.gather(1, targets[:, None]).squeeze(1))
+        values.append(loss.item())
+        for acc, x in zip(got, grads(loss, hidden, head)):
+            acc += x / repeats
+        assert 1 <= stats["rs_unique"] / N <= 16
+    for a, b in zip(got, want):
+        assert ((a - b).norm() / b.norm()).item() < 0.05
+    assert sum(values) / repeats == pytest.approx(full.item(), rel=0.05)
+
+
+def test_rs_kd_drops_draws_outside_the_shared_vocabulary():
+    hidden, head, weights, g = make()
+    vocab = losses.SharedVocab(SHARED)
+    ids = torch.tensor([[1, SHARED + 1]] * N)                   # the second draw has no student counterpart
+    w = torch.full((N, 2), 0.5, dtype=torch.float64)
+    lp = torch.full((N, 2), -1.0, dtype=torch.float64)
+    targets = torch.ones(N, dtype=torch.long)
+    loss, _ = losses.rs_kd(hidden, head, targets, weights, vocab, ids, w, lp, torch.full((N,), -1.0))
+    lq = F.log_softmax(head(hidden), -1)[:, 1]
+    assert loss.item() == pytest.approx((weights * 0.5 * (-1.0 - lq)).sum().item())
+
+
+def test_token_entropy():
+    hidden, head, _, _ = make(softcap=True)
+    lp = F.log_softmax(head(hidden), -1)
+    torch.testing.assert_close(losses.token_entropy(hidden, head), -(lp.exp() * lp).sum(-1).detach())

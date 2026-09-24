@@ -15,8 +15,13 @@ F = torch.nn.functional
 
 from palingenesis.opd import fused_rkl, losses  # noqa: E402
 
+# (multiplier, softcap) of the student's and the teacher's logits: none, Granite-like scales, Gemma 2-like softcaps
+TRANSFORMS = [((1.0, None), (1.0, None)), ((0.125, None), (0.0625, None)), ((1.0, 3.0), (1.3, 2.5))]
 
-def setup(n, h, v_s, v_t, device="cpu", dtype=torch.float64, seed=0):
+
+def setup(n, h, v_s, v_t, device="cpu", dtype=torch.float64, seed=0, transforms=TRANSFORMS[0]):
+    from palingenesis.logits import PostProcessedHead
+
     g = torch.Generator(device="cpu").manual_seed(seed)
     hidden = (torch.randn(n, h, generator=g, dtype=dtype) * 2).to(device).requires_grad_()
     head = torch.nn.Linear(h, v_s, bias=False, dtype=dtype, device=device)
@@ -26,6 +31,11 @@ def setup(n, h, v_s, v_t, device="cpu", dtype=torch.float64, seed=0):
         teacher_head.weight.copy_(torch.randn(v_t, h + 3, generator=g, dtype=dtype) / h**0.5 * 3)
     teacher_hidden = torch.randn(n, h + 3, generator=g, dtype=dtype).to(device)
     weights = torch.rand(n, generator=g, dtype=dtype).to(device)
+    (m_s, c_s), (m_t, c_t) = transforms
+    if (m_s, c_s) != (1.0, None):
+        head = PostProcessedHead(head, m_s, c_s)
+    if (m_t, c_t) != (1.0, None):
+        teacher_head = PostProcessedHead(teacher_head, m_t, c_t)
     return hidden, head, teacher_hidden, teacher_head, weights
 
 
@@ -44,9 +54,11 @@ def grads(loss, hidden, head):
 
 @pytest.mark.parametrize("v_s, v_t, n_shared", [(40, 40, 40), (43, 40, 37), (40, 45, 40)])
 @pytest.mark.parametrize("rows", [None, 3])
-def test_fused_matches_the_definition(v_s, v_t, n_shared, rows):
-    """Same vocabularies, a student-only tail (residual mass), a teacher-only tail; one slice or many."""
-    hidden, head, t_hidden, t_head, weights = setup(11, 8, v_s, v_t)
+@pytest.mark.parametrize("transforms", TRANSFORMS)
+def test_fused_matches_the_definition(v_s, v_t, n_shared, rows, transforms):
+    """Same vocabularies, a student-only tail (residual mass), a teacher-only tail; one slice or many;
+    plain, scaled and softcapped logits."""
+    hidden, head, t_hidden, t_head, weights = setup(11, 8, v_s, v_t, transforms=transforms)
     targets = torch.randint(0, n_shared, (11,))
     want, want_stats = reference(hidden, head, t_hidden, t_head, targets, weights, n_shared)
     got, stats = fused_rkl.fused_full_rkl(hidden, head, t_hidden, t_head, targets, weights, n_shared, rows=rows)
@@ -56,8 +68,9 @@ def test_fused_matches_the_definition(v_s, v_t, n_shared, rows):
         torch.testing.assert_close(a, b)
 
 
-def test_fused_agrees_with_the_generic_loss():
-    hidden, head, t_hidden, t_head, weights = setup(9, 8, 30, 30)
+@pytest.mark.parametrize("transforms", TRANSFORMS)
+def test_fused_agrees_with_the_generic_loss(transforms):
+    hidden, head, t_hidden, t_head, weights = setup(9, 8, 30, 30, transforms=transforms)
     targets = torch.randint(0, 30, (9,))
     t_logp = F.log_softmax(t_head(t_hidden), -1)
     generic, g_stats = losses.full_rkl(hidden, head, targets, weights, losses.SharedVocab(30), lambda a, b: t_logp[a:b])
@@ -80,17 +93,31 @@ def test_no_grad_and_frozen_head():
     torch.testing.assert_close(torch.autograd.grad(got, hidden)[0], torch.autograd.grad(want, hidden)[0])
 
 
-def test_supported_only_for_plain_heads_without_swap():
+def test_supported_for_bias_free_heads_with_any_transform_without_swap():
+    from palingenesis.logits import PostProcessedHead
+
     plain = torch.nn.Linear(4, 10, bias=False)
+    capped = PostProcessedHead(plain, 0.5, 30.0)
     assert fused_rkl.supported(plain, plain, {})
+    assert fused_rkl.supported(capped, plain, {})
+    assert fused_rkl.unwrap(capped) == fused_rkl.Head(plain.weight, 0.5, 30.0)
     assert not fused_rkl.supported(plain, plain, {9: 8})
     assert not fused_rkl.supported(torch.nn.Linear(4, 10), plain, {})
+    assert not fused_rkl.supported(PostProcessedHead(torch.nn.Linear(4, 10), 0.5), plain, {})
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or fused_rkl.triton is None, reason="needs CUDA and Triton")
-@pytest.mark.parametrize("v_s, v_t, n_shared", [(248320, 248320, 248320), (151936, 151669, 151643)])
-def test_triton_kernels_match_fp64(v_s, v_t, n_shared):
+@pytest.mark.parametrize("v_s, v_t, n_shared, transforms", [
+    (248320, 248320, 248320, TRANSFORMS[0]),                 # Qwen3.5
+    (151936, 151669, 151643, TRANSFORMS[0]),                 # a student-only tail
+    (256000, 256000, 256000, ((1.0, 30.0), (1.0, 30.0))),    # Gemma 2: softcap 30
+    (49159, 49159, 49159, ((0.125, None), (0.0625, None))),  # Granite 3.3 2B / 8B: logits_scaling 8 / 16
+])
+def test_triton_kernels_match_fp64(v_s, v_t, n_shared, transforms):
     """The kernels on fp32 logits against the fused math in fp64, at real vocabulary sizes."""
+    (m_s, c_s), (m_t, c_t) = transforms
+    student = fused_rkl.Head(None, m_s, c_s or 0.0)
+    teacher = fused_rkl.Head(None, m_t, c_t or 0.0)
     g = torch.Generator(device="cuda").manual_seed(0)
     rows = 64
     zs = torch.randn(rows, v_s, device="cuda", generator=g) * 4
@@ -98,11 +125,17 @@ def test_triton_kernels_match_fp64(v_s, v_t, n_shared):
         torch.randn(rows, v_t, device="cuda", generator=g) * 4
     targets = torch.randint(0, n_shared, (rows,), device="cuda", generator=g)
     weights = torch.rand(rows, device="cuda", generator=g)
-    stats, grad = fused_rkl._slice_triton(zs, zt, targets, weights, n_shared, torch.float32)
+    zs, zt = zs / m_s, zt / m_t                              # logits of the usual scale after the transform
+    stats, grad = fused_rkl._slice_triton(zs, zt, targets, weights, n_shared, torch.float32, student, teacher)
     ref_stats, ref_grad = fused_rkl._slice_torch(zs.double(), zt.double(), targets, weights.double(), n_shared,
-                                                 torch.float64)
+                                                 torch.float64, student, teacher)
+    fp32_stats, fp32_grad = fused_rkl._slice_torch(zs, zt, targets, weights, n_shared, torch.float32, student, teacher)
     torch.testing.assert_close(stats.double(), ref_stats, rtol=1e-5, atol=2e-5)
-    torch.testing.assert_close(grad.double(), ref_grad, rtol=1e-4, atol=1e-9)
+
+    def norm_error(grad):
+        return ((grad.double() - ref_grad).norm() / ref_grad.norm()).item()
+    # as exact as fp32 allows: within a small factor of the same math in fp32 torch (~1e-6)
+    assert norm_error(grad) < 2 * norm_error(fp32_grad) + 1e-7
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or fused_rkl.triton is None, reason="needs CUDA and Triton")

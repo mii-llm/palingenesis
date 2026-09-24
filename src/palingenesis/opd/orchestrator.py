@@ -91,6 +91,8 @@ class TeacherRoute:
     teacher: Any                      # HFTeacher | VLLMTeacher
     top_k: int                        # 0: token log-probs only
     keep_hidden: bool                 # full_rkl: keep hidden states for the loss
+    sample_rounds: int = 0            # rs_kd: tokens drawn from the teacher per position
+    sample_temperature: float = 1.0   # rs_kd: the proposal's temperature
 
 
 class PublishedWeights:
@@ -202,7 +204,9 @@ class Pipeline:
                 group = [s for s in samples if s.teacher == name]
                 if group:
                     scores = route.teacher.score([s.view for s in group], top_k=route.top_k,
-                                                 keep_hidden=route.keep_hidden, micro_seqs=self.score_micro_seqs)
+                                                 keep_hidden=route.keep_hidden, micro_seqs=self.score_micro_seqs,
+                                                 sample_rounds=route.sample_rounds,
+                                                 sample_temperature=route.sample_temperature)
                     for s, sc in zip(group, scores):
                         s.scores = sc
             stats["time/teacher"] = time.perf_counter() - start

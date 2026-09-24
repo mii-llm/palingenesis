@@ -29,6 +29,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+from torch import Tensor
 from transformers import AutoTokenizer
 
 from palingenesis.kernels import apply_liger_kernel, model_type_of
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 TRAINER_STATE_FILE = "trainer_state.pt"     # written last: its presence marks a complete checkpoint
 
-SHARED_VOCAB_LOSSES = ("full_rkl", "topk_kl", "sampled_rkl")
+SHARED_VOCAB_LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "rs_kd")
 
 
 def student_stop_ids(tok, model: str, extra_tokens: list[str], chat_template_kwargs: dict) -> tuple[int, ...]:
@@ -157,7 +158,8 @@ class OPDTrainer:
         verify_output_head(self.student, self.head)
         for name, teacher in config.teachers.items():
             if teacher.backend == "hf":
-                teachers[name] = HFTeacher(teacher.model, teacher.device or self.device, teacher.offload)
+                teachers[name] = HFTeacher(teacher.model, teacher.device or self.device, teacher.offload,
+                                           seed=config.train.seed)
 
         if rollout.backend == "hf":
             engine = HFRollout(self.student, self.stop_ids, self.pad_id, rollout.micro_seqs)
@@ -172,7 +174,9 @@ class OPDTrainer:
             name: TeacherRoute(teacher_toks[name], aligners[name], teachers[name],
                                top_k=config.loss.top_k if kind == "topk_kl" or (
                                    kind == "xtok" and config.loss.xtok_dense_weight > 0) else 0,
-                               keep_hidden=kind == "full_rkl")
+                               keep_hidden=kind == "full_rkl",
+                               sample_rounds=config.loss.rs_rounds if kind == "rs_kd" else 0,
+                               sample_temperature=config.loss.rs_temperature)
             for name, kind in self.kinds.items()
         }
         # full_rkl through the fused kernels where they compute the same thing (fused_rkl.supported)
@@ -264,12 +268,13 @@ class OPDTrainer:
         if kind != "xtok":            # one teacher token per student token
             teacher_ids = torch.tensor([t for s in samples for t in s.view.input_ids[s.view.prompt_len:]], device=device)
             vocab = losses.SharedVocab(route.aligner.bridge.shared_vocab_size, route.aligner.bridge.swap)
-        if kind in ("topk_kl", "sampled_rkl"):
+        if kind in ("topk_kl", "sampled_rkl", "rs_kd"):
             token_lp = torch.cat([s.scores.token_lp for s in samples]).to(device)
 
         with (torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
               torch.set_grad_enabled(train)):
             hidden = final_hidden_states(self.student, ids, mask)[positions]
+            token_weights = self._token_weights(token_weights, hidden, behaviour)
             if kind == "full_rkl":
                 for s in samples:       # made on the pipeline's CUDA stream: keep until this stream is done
                     if s.scores.hidden.is_cuda:
@@ -291,6 +296,10 @@ class OPDTrainer:
                                               support.clamp(max=vocab.size - 1),
                                               torch.cat([topk_lp, token_lp[:, None]], 1), valid, token_lp,
                                               beta=loss.beta)
+            elif kind == "rs_kd":
+                sample = [torch.cat([getattr(s.scores, f) for s in samples]).to(device)
+                          for f in ("sample_ids", "sample_weights", "sample_lp")]
+                value, stats = losses.rs_kd(hidden, self.head, teacher_ids, token_weights, vocab, *sample, token_lp)
             elif kind == "sampled_rkl":
                 value, stats = losses.sampled_rkl(hidden, self.head, targets, token_weights, token_lp, behaviour,
                                                   loss.is_low, loss.is_high)
@@ -304,6 +313,25 @@ class OPDTrainer:
         stats["loss"] = float(value.detach())
         stats["tokens"] = targets.numel()
         return stats
+
+    def _token_weights(self, weights: Tensor, hidden: Tensor, behaviour: Tensor | None) -> Tensor:
+        """`weights` times loss.token_weighting's per-token factors (detached).
+
+        sure: 1 + alpha (1 - p), p the student's probability of the sampled token when it
+        was sampled (the rollout's log-probs; on-policy, the current student's).
+        entropy: 1 for the entropy_keep fraction of tokens with the highest student
+        entropy in this micro-batch, 0 for the rest."""
+        loss = self.config.loss
+        if loss.token_weighting == "sure":
+            if behaviour is None:
+                raise RuntimeError("token_weighting sure needs the rollout's log-probs of the sampled tokens")
+            return weights * (1 + loss.sure_alpha * (1 - behaviour.exp()))
+        if loss.token_weighting == "entropy":
+            entropy = losses.token_entropy(hidden.detach(), self.head)
+            keep = max(1, math.ceil(loss.entropy_keep * entropy.numel()))
+            threshold = entropy.topk(keep).values[-1]
+            return weights * (entropy >= threshold)
+        return weights
 
     def _xtok_targets(self, samples: list[Sample], name: str):
         """Chunk ids and log-probs, and the one-to-one dense targets, over a micro-batch."""
@@ -430,6 +458,8 @@ class OPDTrainer:
                 if f"is_dropped/{name}" in stats:
                     metrics[f"is_dropped/{name}"] = stats[f"is_dropped/{name}"] / tokens
                     metrics[f"abs_log_ratio/{name}"] = stats[f"abs_log_ratio/{name}"] / tokens
+                if f"rs_unique/{name}" in stats:
+                    metrics[f"rs_unique/{name}"] = stats[f"rs_unique/{name}"] / tokens
                 if f"residual/{name}" in stats:
                     metrics[f"residual_mass/{name}"] = stats[f"residual/{name}"] / tokens
                 if stats.get(f"dense_tokens/{name}"):

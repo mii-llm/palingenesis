@@ -36,6 +36,11 @@ class TeacherScores:
     topk_ids: Tensor | None = None  # [n, k] (CPU)
     topk_lp: Tensor | None = None   # [n, k] (CPU, fp32)
     hidden: Tensor | None = None    # [n, H] final hidden states (teacher's device), for full_rkl
+    # rs_kd: tokens drawn from the teacher's distribution per position [n, R] (teacher's device),
+    # their importance weights (each row sums to 1) and the teacher's log-probs of them
+    sample_ids: Tensor | None = None
+    sample_weights: Tensor | None = None
+    sample_lp: Tensor | None = None
 
 
 def pick_device() -> str:
@@ -85,6 +90,24 @@ def completion_positions(prompt_lens: list[int], completion_lens: list[int], wid
     return mask
 
 
+def sample_teacher(logp: Tensor, rounds: int, temperature: float,
+                   generator: torch.Generator | None = None) -> tuple[Tensor, Tensor, Tensor]:
+    """Random Sampling KD's sparse targets (arXiv 2503.16870) from teacher log-probs [R, V].
+
+    Draws `rounds` tokens per row, with replacement, from the proposal r = p^temperature
+    (renormalized); each draw's weight is the likelihood ratio p / r, normalized over the
+    row. The weighted draws estimate p without bias (temperature 1: plain counts / rounds).
+    Returns ids [R, rounds], weights [R, rounds] (rows sum to 1), and log p of the ids.
+    """
+    if temperature == 1.0:
+        proposal_lp = logp
+    else:
+        proposal_lp = torch.log_softmax(logp * temperature, -1)
+    ids = torch.multinomial(proposal_lp.exp(), rounds, replacement=True, generator=generator)
+    lp = logp.gather(1, ids)
+    return ids, torch.softmax(lp - proposal_lp.gather(1, ids), 1), lp       # ratios, normalized in log space
+
+
 class HFTeacher:
     """A frozen transformers model scoring in bf16 on `device`.
 
@@ -92,20 +115,23 @@ class HFTeacher:
     stays on the device for full_rkl's projections during the loss).
     """
 
-    def __init__(self, model: str, device: str, offload: bool = False):
+    def __init__(self, model: str, device: str, offload: bool = False, seed: int = 0):
         self.device = device
         self.offload = offload
         logger.info("Loading teacher %s (bf16, frozen) on %s", model, device)
         self.model = load_causal_lm(model, torch.bfloat16).to(device).eval().requires_grad_(False)
         self.head = output_head(self.model)
         verify_output_head(self.model, self.head)
+        self.generator = torch.Generator(device=device).manual_seed(seed)     # rs_kd's draws
         if offload:
             self.head = copy.deepcopy(self.head)
             self.model.to("cpu")
 
     @torch.no_grad()
     def score(self, views: list[TeacherView], top_k: int = 0, keep_hidden: bool = False,
-              micro_seqs: int = 16) -> list[TeacherScores]:
+              micro_seqs: int = 16, sample_rounds: int = 0, sample_temperature: float = 1.0) -> list[TeacherScores]:
+        """Scores of each view's completion tokens: log-probs, plus top-k, hidden states or
+        `sample_rounds` tokens drawn from the teacher's distribution (rs_kd), as asked."""
         if self.offload:
             self.model.to(self.device)
         results: list[TeacherScores | None] = [None] * len(views)
@@ -128,7 +154,7 @@ class HFTeacher:
             with torch.autocast(ids.device.type, dtype=torch.bfloat16, enabled=ids.is_cuda):
                 targets = torch.tensor([t for i in chunk for t in views[i].input_ids[views[i].prompt_len:]],
                                        device=ids.device)
-                token_lp, topk_ids, topk_lp = [], [], []
+                token_lp, topk_ids, topk_lp, samples = [], [], [], []
                 for a in range(0, hidden.shape[0], rows):
                     logp = torch.log_softmax(self.head(hidden[a:a + rows]).float(), -1)
                     token_lp.append(logp.gather(1, targets[a:a + rows, None]).squeeze(1))
@@ -136,16 +162,21 @@ class HFTeacher:
                         top = logp.topk(top_k, -1)
                         topk_lp.append(top.values)
                         topk_ids.append(top.indices)
+                    if sample_rounds:
+                        samples.append(sample_teacher(logp, sample_rounds, sample_temperature, self.generator))
             token_lp = torch.cat(token_lp).cpu()
             topk_ids = torch.cat(topk_ids).cpu() if top_k else None
             topk_lp = torch.cat(topk_lp).cpu() if top_k else None
+            if sample_rounds:
+                sample_ids, sample_w, sample_lp = (torch.cat(x) for x in zip(*samples))
             offset = 0
             for i in chunk:
                 n = views[i].completion_len
                 sl = slice(offset, offset + n)
                 results[i] = TeacherScores(token_lp[sl], topk_ids[sl] if top_k else None,
                                            topk_lp[sl] if top_k else None,
-                                           hidden[sl].clone() if keep_hidden else None)
+                                           hidden[sl].clone() if keep_hidden else None,
+                                           *((sample_ids[sl], sample_w[sl], sample_lp[sl]) if sample_rounds else ()))
                 offset += n
         if self.offload:
             self.model.to("cpu")
@@ -164,7 +195,9 @@ class VLLMTeacher:
         self.server = server
 
     def score(self, views: list[TeacherView], top_k: int = 0, keep_hidden: bool = False,
-              micro_seqs: int = 16) -> list[TeacherScores]:
+              micro_seqs: int = 16, sample_rounds: int = 0, sample_temperature: float = 1.0) -> list[TeacherScores]:
+        if sample_rounds:
+            raise ValueError("a vLLM teacher returns only its top-k: rs_kd needs an hf teacher")
         if keep_hidden:
             raise ValueError("a vLLM teacher has no hidden states for full_rkl; use topk_kl or sampled_rkl")
         choices = self.server.complete([v.input_ids for v in views], max_tokens=1, temperature=1.0,
