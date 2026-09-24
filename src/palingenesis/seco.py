@@ -416,7 +416,13 @@ def verify_chunked_forward(model: nn.Module, chunk_size: int = 64, num_chunks: i
     backbone, head = _backbone(model), _lm_head(model)
     verify_output_head(model, head, backbone)
     dtype = next(model.parameters()).dtype
-    tolerance = tolerance if tolerance is not None else (1e-4 if dtype in (torch.float32, torch.float64) else 2e-2)
+    if tolerance is None:
+        tolerance = 1e-4 if dtype in (torch.float32, torch.float64) else 2e-2
+        if tolerance < 1e-3 and _uses_fla_kernels(model):
+            # flash-linear-attention's Triton kernels do not reproduce fp32 exactly
+            # (their chunked and full forwards differ by ~6e-4 on Qwen3.5-0.8B); SeCO's
+            # gradients then match full backprop to cosine 0.99998 instead of bit-exactly.
+            tolerance = 2e-3
     device = next(model.parameters()).device
     vocab = head.weight.shape[0]
     g = torch.Generator(device="cpu").manual_seed(0)
@@ -462,6 +468,17 @@ def verify_chunked_forward(model: nn.Module, chunk_size: int = 64, num_chunks: i
             "(measured for e.g. Bamba, Jamba, Mamba, RecurrentGemma)."
         )
     return diff
+
+
+def _uses_fla_kernels(model: nn.Module) -> bool:
+    """Linear-attention layers running flash-linear-attention's Triton kernels."""
+    from palingenesis.packing import has_linear_attention
+
+    if not has_linear_attention(model):
+        return False
+    from transformers.utils.import_utils import is_flash_linear_attention_available
+
+    return is_flash_linear_attention_available()
 
 
 def _run(backbone: nn.Module, input_ids: torch.Tensor, cache) -> torch.Tensor:

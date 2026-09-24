@@ -122,6 +122,15 @@ Memory grows exactly as the K/V accounting predicts. Qwen3-0.6B stores 112 KB of
 
 Offload is numerically identical to the GPU store in fp32; in bf16 the two differ only by the flash backward's own non-determinism.
 
+The Qwen3.5 rows above use transformers' pure-torch linear attention. With flash-linear-attention installed (the `train` extra), its Triton kernels are used instead. They are much faster, but not bit-exact in fp32. On 14,428 real tokens (Qwen3.5-0.8B, fp32, 4k chunks), SeCO against full backprop, both with those kernels:
+
+| | Gradient cosine | Relative L2 error | Time | Peak memory |
+|---|---|---|---|---|
+| Full backprop | | | 8.9 s | 31.5 GiB |
+| SeCO | 0.99998 | 5.5e-3 | 9.4 s | 19.1 GiB |
+
+The startup check then allows 2e-3 instead of 1e-4 in fp32. The first step of a run is slower while Triton tunes its kernels for each new shape. On dense models (Qwen3-0.6B, 14,055 tokens, fp32) SeCO stays exact: cosine 1.00000, relative error 3.7e-5, 22.4 s vs 20.1 s, 26.3 vs 52.5 GiB.
+
 ## Choosing `seco_chunk_size`
 
 - **Larger chunks** mean fewer passes and better GPU utilisation, but more activation memory per chunk.

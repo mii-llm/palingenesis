@@ -656,14 +656,21 @@ class SpikeDetector:
             optimizer.step()
     """
 
-    def __init__(self, z_threshold: float = 5.0, warmup: int = 50, ema_decay: float = 0.99):
+    def __init__(self, z_threshold: float = 5.0, warmup: int = 50, ema_decay: float = 0.99,
+                 max_consecutive: int = 10):
         self.z_threshold = z_threshold
         self.warmup = warmup
         self.ema_decay = ema_decay
+        # A spike is transient; `max_consecutive` flagged steps in a row mean the gradient
+        # scale itself changed. The statistics (updated only with non-spike steps) would
+        # then flag every remaining step and silently stop training, so they restart.
+        self.max_consecutive = max_consecutive
+        self.consecutive = 0
         self.mean = 0.0
         self.var = 0.0
         self.count = 0
         self.spikes_detected = 0
+        self.regime_changes = 0
 
     def check(self, grad_norm: float) -> bool:
         """Check if grad_norm is a spike. Updates running statistics.
@@ -703,7 +710,19 @@ class SpikeDetector:
             self.var = self.ema_decay * self.var + (1 - self.ema_decay) * diff * diff
 
         if z_score > self.z_threshold:
+            self.consecutive += 1
+            if self.consecutive > self.max_consecutive:
+                logger.warning(
+                    f"Gradient norm has stayed at ~{grad_norm:.1f} (running mean {self.mean:.2f}) for "
+                    f"{self.consecutive} steps: treating it as the new scale and restarting spike statistics. "
+                    "A sudden permanent change of gradient scale often means training is diverging; check the loss."
+                )
+                self.regime_changes += 1
+                self.consecutive = 0
+                self.count, self.mean, self.var = 1, grad_norm, 0.0
+                return False
             self.spikes_detected += 1
             return True
 
+        self.consecutive = 0
         return False

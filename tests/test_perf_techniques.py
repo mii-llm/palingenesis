@@ -454,3 +454,17 @@ if __name__ == "__main__":
     print("=" * 60)
     print("ALL PERFORMANCE TESTS PASSED ✓")
     print("=" * 60)
+
+
+def test_spike_detector_accepts_a_permanent_change_of_gradient_scale():
+    """Statistics update only on non-spike steps: without a bound, a lasting jump in
+    gradient norm (a collapse, a data shift) would be skipped for the rest of the run."""
+    from palingenesis.perf import SpikeDetector
+
+    det = SpikeDetector(z_threshold=5.0, warmup=20, max_consecutive=10)
+    for i in range(100):
+        det.check(1.0 + 0.01 * (i % 3))
+    skipped = [det.check(40.0) for _ in range(60)]
+    assert sum(skipped) == 10          # ten spikes skipped, then the new scale is accepted
+    assert det.regime_changes == 1
+    assert not any(skipped[11:])
