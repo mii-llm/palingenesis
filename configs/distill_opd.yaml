@@ -1,6 +1,6 @@
-# On-policy distillation: the student samples, the teacher scores, reverse-KL update.
-# Worked example: nesso-0.4B-agentic (ChatML) <- nesso-3B (Llama-3 template),
-# multiple-choice QA in the ITALIC benchmark's exact prompt format.
+# On-policy distillation on a multiple-choice pool, in a benchmark's exact prompt format.
+# Worked example: nesso-0.4B-agentic (ChatML) <- nesso-3B (Llama-3 template): the two
+# share Llama 3's base vocabulary, so the loss is the exact full-vocabulary reverse KL.
 #
 #   pgs distill --config configs/distill_opd.yaml
 #   pgs distill --config configs/distill_opd.yaml --train.learning_rate 5e-6
@@ -11,56 +11,59 @@
 
 model:
   student: mii-llm/nesso-0.4B-agentic
-  teacher: Coloss/nesso-3B
-  # teacher_device: "cuda:1"      # uncomment on a multi-GPU node
   gradient_checkpointing: true    # with batch_prompts 32 the student scoring
                                   # forward OOMs an 80GB A100 without this
+  stop_tokens: ["<|end_of_text|>"]
 
-bridge:
-  # Student <|im_end|> and teacher <|eot_id|> both mean "end of turn": the
-  # student's probability mass on <|im_end|> is scored against the teacher's
-  # <|eot_id|> slot, so the teacher also supervises WHEN to stop.
-  # Set explicitly — auto-detection uses the teacher's configured eos, which
-  # for base models is <|end_of_text|>, not the conversational terminator.
-  eos_map:
-    "<|im_end|>": "<|eot_id|>"
-  extra_stop_tokens: ["<|end_of_text|>"]
+teachers:
+  nesso3b:
+    model: Coloss/nesso-3B
+    # device: "cuda:1"            # uncomment on a multi-GPU node
+    # Student <|im_end|> and teacher <|eot_id|> both mean "end of turn": the
+    # student's probability mass on <|im_end|> is scored against the teacher's
+    # <|eot_id|> slot, so the teacher also supervises WHEN to stop.
+    # Set explicitly — auto-detection uses the teacher's configured eos, which
+    # for base models is <|end_of_text|>, not the conversational terminator.
+    eos_map:
+      "<|im_end|>": "<|eot_id|>"
 
-data:
-  prompts_path: data/prompts.jsonl   # pool-row JSONL (see palingenesis.opd.pool)
-  shots_path: data/5_shots.jsonl     # the benchmark's official few-shot file
-  dev_size: 500
-  # Shot-regime mixture: official shots / 1-k random pool shots / zero-shot
-  p_reference_shots: 0.5
-  p_pool_shots: 0.25
-  pool_shots_max_k: 5
-  # ITALIC's VERBATIM prompts (Crisp-Unimib/ITALIC run_eval.py). Training on
-  # the benchmark's exact bytes is policy, so it lives here — the library
-  # defaults are neutral English templates.
-  system_message: "Sei un assistente utile."
-  fast_template: |-
-    Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. La tua risposta deve essere nel seguente formato: 'LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Scrivi solo la lettera corrispondente alla tua risposta senza spiegazioni.
+sources:
+  italic:
+    format: mcqa
+    path: data/prompts.jsonl          # pool-row JSONL (see palingenesis.opd.pool)
+    shots_path: data/5_shots.jsonl    # the benchmark's official few-shot file
+    dev_size: 500
+    max_new_tokens: 16                # fast mode: the answer is a letter
+    # Shot-regime mixture: official shots / 1-k random pool shots / zero-shot
+    p_reference_shots: 0.5
+    p_pool_shots: 0.25
+    pool_shots_max_k: 5
+    cot_fraction: 0.0                 # raise (e.g. 0.3) to also distill the CoT template; then
+    cot_max_new_tokens: 300           # consider rollout.group_size 2-4 and a smaller batch_prompts
+    # ITALIC's VERBATIM prompts (Crisp-Unimib/ITALIC run_eval.py). Training on
+    # the benchmark's exact bytes is policy, so it lives here — the library
+    # defaults are neutral English templates.
+    system_message: "Sei un assistente utile."
+    fast_template: |-
+      Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. La tua risposta deve essere nel seguente formato: 'LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Scrivi solo la lettera corrispondente alla tua risposta senza spiegazioni.
 
-    {question}
+      {question}
 
-    {options}
+      {options}
 
-    Risposta:
-  cot_template: |-
-    Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. L'ultima riga della tua risposta deve essere nel seguente formato: 'Risposta: LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Ragiona brevemente prima di rispondere.
+      Risposta:
+    cot_template: |-
+      Rispondi alla seguente domanda a scelta multipla sull'argomento '{topic}'. L'ultima riga della tua risposta deve essere nel seguente formato: 'Risposta: LETTERA' (senza virgolette) dove LETTERA è una tra {merged_letters}. Ragiona brevemente prima di rispondere.
 
-    {question}
+      {question}
 
-    {options}
+      {options}
 
-sampling:
+rollout:
+  backend: hf                         # vllm needs a vLLM-supported student; hf always works
   batch_prompts: 32
-  group_size: 1          # fast-mode completions are ~1 token; groups add nothing
+  group_size: 1                       # fast-mode completions are ~1 token; groups add nothing
   temperature: 1.0
-  max_new_tokens: 16
-  cot_fraction: 0.0      # raise (e.g. 0.3) to also distill the CoT template; then
-  cot_max_new_tokens: 300  # consider group_size 2-4 and a smaller batch_prompts
-  gen_micro_seqs: 64
 
 train:
   output_dir: runs/opd
@@ -69,15 +72,12 @@ train:
   warmup_steps: 50
   lr_scheduler: cosine
   max_grad_norm: 1.0
-  loss_fn: full_kl       # or sampled_rkl (tinker-style REINFORCE on sampled tokens)
   seed: 0
-  score_micro_seqs: 8    # memory knob: sequences per scoring forward (grad accum
-                         # keeps the math identical). 8 + gradient_checkpointing
-                         # holds a 0.4B student + 3B teacher at ~24GB of an A100;
-                         # 32 OOMs. Also set
-                         # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  score_micro_seqs: 8                 # memory knob: sequences per scoring forward (the gradient
+                                      # is the same). 8 + gradient_checkpointing holds a 0.4B
+                                      # student + 3B teacher at ~24GB of an A100.
   eval_every: 200
-  eval_dev_samples: 200
+  eval_samples: 200
   save_steps: 500
   keep_checkpoints: 3
 

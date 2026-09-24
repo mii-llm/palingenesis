@@ -21,19 +21,20 @@ torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/
 
 ### distill
 
-On-policy distillation: the student samples with its current weights, the teacher scores those exact tokens, reverse-KL update. Works across mismatched chat templates when the pair shares a base vocabulary. Single-GPU by design (the student both generates and takes gradients every step).
+On-policy distillation: the student samples with its current weights, each prompt's teacher scores those exact tokens, and the student is pulled toward the teacher's distribution (full-vocabulary reverse KL for a teacher sharing the student's vocabulary, byte-aligned chunks across different tokenizers). Rollouts come from the trainer's own `generate` or from vLLM (`rollout.backend`); teachers run in-process or on a vLLM server; several teachers can each take their own prompt sources. Overrides: `--section.option value`, and `--teachers.<name>.option` / `--sources.<name>.option` for the named mappings.
 
 ```bash
-pgs distill --config configs/distill_opd.yaml                  # multiple-choice pool
-pgs distill --config configs/distill_chat.yaml                 # generic chat prompts
-pgs distill --config configs/distill_opd.yaml --train.learning_rate 5e-6
+pgs distill --config configs/distill_math.yaml                 # Qwen3-1.7B -> Qwen3-0.6B, vLLM rollouts
+pgs distill --config configs/distill_xtok.yaml                 # teacher with another tokenizer
+pgs distill --config configs/distill_multi.yaml                # one teacher per prompt source
+pgs distill --config configs/distill_math.yaml --train.learning_rate 1e-6 --teachers.qwen3_1_7b.backend vllm
 ```
 
 See the [On-Policy Distillation guide](../guides/distillation.md).
 
 ### distill-score
 
-Annotate a distillation pool with the teacher's own answers (`teacher_answer`, `teacher_correct`) so you can filter or reweight before training — pure KL distills the teacher's errors too. One batched forward per row, no generation. Accepts the same `--section.field` overrides as `distill`.
+Annotate a multiple-choice pool with its teacher's own answers (`teacher_answer`, `teacher_correct`) so you can filter or reweight before training — pure KL distills the teacher's errors too. One batched forward per row, no generation. Scores the first `mcqa` source (or `--source NAME`) with that source's teacher; accepts the same overrides as `distill`.
 
 ```bash
 pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl

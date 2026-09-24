@@ -273,76 +273,105 @@ Overrides are applied after the YAML is loaded.
 
 ---
 
+
 ## Distillation config (`pgs distill`)
 
-`pgs distill` and `pgs distill-score` use their own config (`OPDConfig`) with the same YAML + `--section.field` override mechanics. Example files: `configs/distill_opd.yaml` (multiple choice), `configs/distill_chat.yaml` (generic chat).
+`pgs distill` and `pgs distill-score` use their own config (`OPDConfig`) with the same strict YAML loading and command-line overrides. Teachers and prompt sources are named mappings, overridden as `--teachers.<name>.<option>` and `--sources.<name>.<option>` (names cannot contain dots). Examples: `configs/distill_math.yaml` (shared vocabulary), `configs/distill_xtok.yaml` (cross-tokenizer), `configs/distill_multi.yaml` (two teachers), `configs/distill_opd.yaml` (multiple choice), `configs/distill_chat.yaml` (generic chat).
+
+A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling:`, `train.loss_fn`) is rejected with a message saying where each option moved.
 
 ### model
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `student` | str | — | Student model (trained; fp32 weights + bf16 autocast). |
-| `teacher` | str | — | Teacher model (frozen, bf16). Vocab must be a prefix of the student's. |
-| `teacher_device` | str | `""` | Teacher placement; empty = student's device, `"cuda:1"` on multi-GPU nodes. |
-| `gradient_checkpointing` | bool | `true` | Recompute student activations; needed for a 0.4B+3B pair at batch 32 on 80 GB. |
+| `student` | str | — | Student model (trained; fp32 master weights, bf16 autocast). |
+| `gradient_checkpointing` | bool | `false` | Recompute the student's activations in the scoring backward. |
+| `stop_tokens` | list | `[]` | Student tokens that end a completion, besides the chat template's end-of-turn token and the eos tokens of the tokenizer and generation config. |
+| `chat_template_kwargs` | dict | `{}` | Extra `apply_chat_template` arguments for every model, e.g. `{enable_thinking: false}`. |
 
-### bridge
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `eos_map` | dict | `{}` | Student→teacher end-of-turn token map, e.g. `{"<\|im_end\|>": "<\|eot_id\|>"}`. Empty = auto from configured eos tokens (set explicitly for base-model teachers). |
-| `extra_stop_tokens` | list | `[]` | Additional student tokens that terminate a completion. |
-| `probe_texts` | list | `[]` | Extra texts checked for identical tokenization before weights load. |
-
-### data
+### teachers.&lt;name&gt;
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `format` | str | `mcqa` | Prompt source: `mcqa` (pool-row JSONL, letter-accuracy dev metric) or `messages` (chat JSONL, held-out reverse-KL dev metric). |
-| `prompts_path` | str | — | Prompt file for the selected format. |
-| `dev_size` | int | `500` | Held-out dev rows (deterministic hash-ranked split, unique questions). |
-| `system_message` | str | `""` | System message for rendered prompts (mcqa; empty = library default). |
-| `fast_template` | str | `""` | mcqa: fast-mode prompt template — put the benchmark's *verbatim* template here (empty = neutral English default). Placeholders `{question}`/`{options}` required, `{topic}`/`{merged_letters}` optional; validated at startup. |
-| `cot_template` | str | `""` | mcqa: CoT-mode prompt template, same rules. |
+| `model` | str | — | Teacher model. |
+| `tokenizer` | str | `""` | Tokenizer to render and score with (empty = the model's). |
+| `backend` | str | `hf` | `hf`: in-process, frozen bf16, full distribution. `vllm`: a vLLM server scoring prefill-only top-k log-probs (launched on the student's GPU, or reached at `url`). |
+| `loss` | str | `""` | `full_rkl`, `topk_kl`, `sampled_rkl` or `xtok`. Empty = `full_rkl` (hf) or `topk_kl` (vllm) for a teacher sharing the student's vocabulary, `xtok` otherwise. `full_rkl` needs the hf backend; the first three need a shared vocabulary (checked when the tokenizers load). |
+| `device` | str | `""` | hf: device (empty = the student's), e.g. `cuda:1`. |
+| `offload` | bool | `false` | hf: keep the model on CPU between scoring calls (the output head stays on the device). |
+| `url` | str | `""` | vllm: an already running server. |
+| `gpu_memory_utilization` | float | `0.15` | vllm: GPU fraction of a launched server. |
+| `eos_map` | dict | `{}` | Shared vocabulary: student end-of-turn token → teacher's, e.g. `{"<\|im_end\|>": "<\|eot_id\|>"}`. Empty = auto (student eos → teacher eos when the student's lies outside the shared vocabulary). |
+| `probe_texts` | list | `[]` | Extra texts that must tokenize identically for a shared vocabulary. |
+
+### sources.&lt;name&gt;
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `format` | str | `messages` | `messages` (chat JSONL `{"messages": [...], "answer"?: ...}`: held-out reverse KL, plus greedy accuracy for rows with an answer) or `mcqa` (pool-row JSONL: letter accuracy). |
+| `path` | str | — | Prompt file. |
+| `weight` | float | `1.0` | Sampling weight among the sources. |
+| `teacher` | str | `""` | Teacher of this source's prompts (empty = the first teacher). |
+| `max_new_tokens` | int | `512` | Completion budget (mcqa: fast-template prompts). |
+| `dev_size` | int | `200` | Held-out rows split off `path` (deterministic, hash-ranked, unique). |
+| `dev_path` | str | `""` | A separate held-out file instead (e.g. a benchmark's test split). |
+| `system_message` | str | `""` | mcqa: system message (empty = library default). |
+| `fast_template` / `cot_template` | str | `""` | mcqa: prompt templates — put the benchmark's *verbatim* template here. Placeholders `{question}`/`{options}` required, `{topic}`/`{merged_letters}` optional; validated at startup. |
 | `shots_path` | str | `""` | mcqa: the benchmark's official few-shot file. |
-| `p_reference_shots` | float | `0.5` | mcqa: probability of rendering with the official shots. |
-| `p_pool_shots` | float | `0.25` | mcqa: probability of 1–k random pool shots; remainder is zero-shot. |
+| `p_reference_shots` / `p_pool_shots` | float | `0.5` / `0.25` | mcqa: probability of the official shots / of 1–k random pool shots; the remainder is zero-shot. |
 | `pool_shots_max_k` | int | `5` | mcqa: max k for the pool-shot regime. |
+| `cot_fraction` | float | `0.0` | mcqa: fraction of prompts rendered with the CoT template. |
+| `cot_max_new_tokens` | int | `300` | mcqa: completion budget of CoT prompts. |
 
-### sampling
+### rollout
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `backend` | str | `hf` | `hf` (the trainer's `generate`), `vllm` (in-process vLLM on the student's GPU, asleep while the trainer trains) or `vllm_server` (a vLLM server fed weights over CUDA IPC; experimental). |
 | `batch_prompts` | int | `32` | Prompts per optimizer step. |
-| `group_size` | int | `1` | Rollouts per prompt (useful diversity for long completions). |
-| `temperature` | float | `1.0` | On-policy sampling temperature. |
-| `max_new_tokens` | int | `16` | Completion budget (mcqa fast mode / messages). |
-| `cot_fraction` | float | `0.0` | mcqa: fraction of prompts using the CoT template. |
-| `cot_max_new_tokens` | int | `300` | mcqa: completion budget for CoT prompts. |
-| `gen_micro_seqs` | int | `64` | Sequences per generate() call. |
+| `group_size` | int | `1` | Rollouts per prompt. |
+| `temperature` | float | `1.0` | Sampling temperature (the losses compare the teacher with the temperature-scaled student). |
+| `max_staleness` | int | `0` | Policy versions a batch may lag behind the weights it trains. 0 = on-policy; ≥ 1 generates the next batch while the trainer trains (vllm backends). |
+| `micro_seqs` | int | `64` | hf: sequences per `generate()` call. |
+| `gpu_memory_utilization` | float | `0.3` | vllm: GPU fraction for the engine's weights and KV cache. |
+| `max_model_len` | int | `4096` | vllm: prompt + completion tokens. |
+| `enforce_eager` | bool | `false` | vllm: no CUDA graphs. |
+| `url` | str | `""` | vllm_server: a running server (started with `--weight-transfer-config '{"backend": "ipc"}'` on the trainer's GPU). |
+
+### loss
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `top_k` | int | `8` | Teacher top-k for `topk_kl` and the xtok dense term. |
+| `beta` | float | `1.0` | `topk_kl` and dense term: weight of the reverse KL (1 − beta: forward KL). |
+| `is_low` / `is_high` | float | `0.5` / `2.0` | `sampled_rkl`/`xtok`: tokens whose importance ratio to the rollout policy falls outside the range get no gradient (ICE-POP). |
+| `length_norm` | bool | `false` | Mean per sequence, then over sequences, instead of per token over the batch. |
+| `xtok_spread` | str | `chunk` | `chunk`: every token of a chunk gets the chunk's advantage. `proportional`: token t gets A_c · log p(t) / log p(chunk). |
+| `xtok_dense_weight` | float | `0.0` | Weight of a top-k KL at chunks of exactly one token on each side. |
+| `mask_whitespace` | bool | `true` | xtok: no loss on whitespace-only chunks. |
 
 ### train
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `output_dir` | str | `./runs/opd` | Checkpoints + `opd_config.json` provenance. |
-| `steps` | int | `2000` | Optimizer steps (one per sampled batch). |
-| `learning_rate` | float | `1e-5` | AdamW, no weight decay. |
-| `warmup_steps` | int | `50` | Linear warmup. |
+| `output_dir` | str | `./runs/opd` | Checkpoints, `opd_config.json` provenance, vLLM server logs. |
+| `steps` | int | `1000` | Optimizer steps (one per batch). |
+| `learning_rate` | float | `1e-6` | AdamW, no weight decay. |
+| `warmup_steps` | int | `20` | Linear warmup. |
 | `lr_scheduler` | str | `cosine` | `cosine` or `constant`. |
 | `max_grad_norm` | float | `1.0` | Gradient clipping. |
-| `loss_fn` | str | `full_kl` | `full_kl` (full-distribution reverse KL) or `sampled_rkl` (tinker-style REINFORCE). |
-| `score_micro_seqs` | int | `8` | Sequences per scoring forward; grad accumulation keeps the math identical. |
-| `eval_every` | int | `200` | Source dev metric every N steps (0 = off). |
-| `eval_dev_samples` | int | `200` | Dev rows per evaluation. |
-| `save_steps` | int | `500` | Checkpoint every N steps (0 = final only). |
+| `seed` | int | `0` | Prompt sampling and vLLM seed. |
+| `score_micro_seqs` | int | `16` | Sequences per scoring forward (student and teacher); gradient accumulation keeps the math identical. |
+| `eval_every` | int | `50` | Dev metrics before training, every N steps and at the end (0 = off). |
+| `eval_samples` | int | `200` | Dev prompts per source and evaluation. |
+| `save_steps` | int | `0` | Checkpoint every N steps (0 = final only). |
 | `keep_checkpoints` | int | `3` | Newest `step_*` dirs kept (0 = keep all; `final` exempt). |
 
 ### logging
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `log_every` | int | `10` | Train-metric cadence (kl/tok, sampled_kl, length, source stats). |
+| `log_every` | int | `1` | Train-metric cadence. |
 | `use_wandb` | bool | `false` | Mirror metrics to wandb; failures degrade to console, never kill the run. |
 | `project` | str | `palingenesis-opd` | wandb project. |
 | `run_name` | str | `""` | wandb run name (empty = auto). |

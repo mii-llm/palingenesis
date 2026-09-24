@@ -541,23 +541,24 @@ Then apply your policy (drop wrong rows, reweight weak domains) with a small scr
 # configs/distill_opd.yaml (the winning knobs)
 model:
   student: mii-llm/nesso-0.4B-agentic
-  teacher: Coloss/nesso-3B
   gradient_checkpointing: true     # 0.4B student + 3B teacher on one 80GB GPU
+  stop_tokens: ["<|end_of_text|>"]
 
-bridge:
-  eos_map: {"<|im_end|>": "<|eot_id|>"}   # ChatML student <- Llama-3 teacher
-  extra_stop_tokens: ["<|end_of_text|>"]
+teachers:
+  nesso3b:
+    model: Coloss/nesso-3B
+    eos_map: {"<|im_end|>": "<|eot_id|>"}   # ChatML student <- Llama-3 teacher
 
-data:
-  prompts_path: data/prompts_filtered.jsonl
-  p_reference_shots: 0.8           # train mostly on the benchmark's exact shot prefix
-  shots_path: data/5_shots.jsonl
-  # plus the benchmark's VERBATIM templates + system message via
-  # data.fast_template / data.cot_template — exact prompt bytes are policy,
-  # so they live in the config (see configs/distill_opd.yaml for ITALIC's)
-
-sampling:
-  max_new_tokens: 8                # terse supervision: no verbosity drift, no misparse tax
+sources:
+  italic:
+    format: mcqa
+    path: data/prompts_filtered.jsonl
+    p_reference_shots: 0.8         # train mostly on the benchmark's exact shot prefix
+    shots_path: data/5_shots.jsonl
+    max_new_tokens: 8              # terse supervision: no verbosity drift, no misparse tax
+    # plus the benchmark's VERBATIM templates + system message (fast_template,
+    # cot_template, system_message) — exact prompt bytes are policy, so they
+    # live in the config (see configs/distill_opd.yaml for ITALIC's)
 
 train:
   steps: 600
@@ -567,7 +568,7 @@ train:
 ```
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True pgs distill --config configs/distill_opd.yaml
+pgs distill --config configs/distill_opd.yaml
 ```
 
 ### Step 3: Pick the checkpoint by dev accuracy, not KL
@@ -584,4 +585,4 @@ KL keeps falling long after accuracy stops improving. With a teacher-correct-fil
 | + teacher-correct filter, shot matching, terse budget | **37.2%** |
 | Teacher (ceiling for pure KL) | 50.7% |
 
-*informal harness. The same pipeline runs on generic chat data with `data.format: messages` (`configs/distill_chat.yaml`) — dev metric becomes held-out reverse KL.
+*informal harness. Those results predate the current engine (HF rollouts, the same full-vocabulary reverse KL). The same pipeline runs on generic chat data with `format: messages` sources (`configs/distill_chat.yaml`) — dev metric becomes held-out reverse KL.
