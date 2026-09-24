@@ -156,3 +156,59 @@ def test_hf_rollout_records_the_sampling_log_probs(models):
         torch.testing.assert_close(torch.tensor(rollout.logprobs), want.squeeze(1), atol=1e-4, rtol=1e-4)
     assert all(r.finish_reason in ("stop", "length") for r in rollouts)
     assert [len(r.completion_ids) for r in engine.generate(prompts, [3, 5], temperature=0.0)] == [3, 5]
+
+
+def test_resume_continues_from_the_checkpoint(tmp_path, models):
+    from palingenesis.opd.trainer import TRAINER_STATE_FILE, OPDTrainer
+
+    def config(steps, **extra):
+        config = make_config(tmp_path, models)
+        config.sources.pop("chat")
+        config.teachers.pop("other")
+        config.train.eval_every = 0
+        config.train.steps = steps
+        config.train.save_steps = 2
+        for key, value in extra.items():
+            setattr(config.train, key, value)
+        return config
+
+    first = OPDTrainer(config(3))
+    first.train()
+    run = tmp_path / "run"
+    assert (run / "step_2" / TRAINER_STATE_FILE).exists() and not (run / "final" / TRAINER_STATE_FILE).exists()
+    saved = transformers.AutoModelForCausalLM.from_pretrained(run / "step_2")
+    saved_state = torch.load(run / "step_2" / TRAINER_STATE_FILE, weights_only=False)
+    (run / "step_9").mkdir()                                    # a save interrupted before its trainer state
+
+    resumed = OPDTrainer(config(4, resume_from="auto"))
+    assert resumed.resume_path == str(run / "step_2") and resumed.start_step == 2
+    assert resumed.weights.version == 2
+    for (name, p), (_, q) in zip(resumed.student.named_parameters(), saved.named_parameters()):
+        torch.testing.assert_close(p, q, msg=name)
+    for got, want in zip(resumed.opt.state_dict()["state"].values(), saved_state["optimizer"]["state"].values()):
+        torch.testing.assert_close(got["exp_avg_sq"], want["exp_avg_sq"])
+    logged = []
+    resumed._log = lambda kind, metrics, step: logged.append((kind, step, metrics))
+    resumed.train()
+    steps = [(step, m) for kind, step, m in logged if kind == "step"]
+    assert [step for step, _ in steps] == [3, 4]
+    assert all(m["staleness"] == 0 and m["dropped_samples"] == 0 for _, m in steps)   # no batch generated stale
+    assert steps[0][1]["lr"] == pytest.approx(resumed._lr_at(2)) != resumed._lr_at(0)   # the schedule continues
+    assert (run / "step_4" / TRAINER_STATE_FILE).exists()
+
+
+def test_resume_from_path_needs_a_complete_checkpoint(tmp_path):
+    from palingenesis.opd.config import OPDConfigError
+    from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, resolve_resume
+
+    assert resolve_resume("", str(tmp_path)) is None
+    assert resolve_resume("auto", str(tmp_path / "missing")) is None                   # fresh start
+    for step, complete in [(2, True), (10, True), (12, False)]:
+        (tmp_path / f"step_{step}").mkdir()
+        if complete:
+            (tmp_path / f"step_{step}" / TRAINER_STATE_FILE).write_bytes(b"")
+    (tmp_path / "final").mkdir()
+    assert resolve_resume("auto", str(tmp_path)) == str(tmp_path / "step_10")          # numeric, complete only
+    assert checkpoint_steps(str(tmp_path), complete=False)[-1] == str(tmp_path / "step_12")
+    with pytest.raises(OPDConfigError, match="not a complete OPD checkpoint"):
+        resolve_resume(str(tmp_path / "final"), str(tmp_path))

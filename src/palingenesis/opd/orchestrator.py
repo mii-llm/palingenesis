@@ -237,7 +237,7 @@ class Orchestrator:
         self.thread.join(timeout=600)
 
     def _produce(self) -> None:
-        k = 0
+        k = self.pipeline.weights.version       # > 0 when the trainer resumed from a checkpoint
         try:
             while not self.stop_event.is_set():
                 requests = self.draw()

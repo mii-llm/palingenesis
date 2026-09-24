@@ -151,6 +151,22 @@ What the numbers say:
 - **Asynchrony saves 15–20% on one GPU.** Generating the next batch while the trainer trains, 60 steps take 280 s (in-process engine) or 300 s (server) instead of 354 s; the two contend for the GPU (training 1.9 → 2.7–3.0 s, rollout 2.2 → 3.6–3.7 s), and the in-process engine also skips its per-step sleep/wake. Every batch was exactly one version old; none was dropped. The dev KL curves match the synchronous run's.
 - **Weight sync is exact.** After an update, the rollout engine's log-probabilities of fixed probe sequences match the trainer's within bf16 noise (mean |Δ| 0.049 in-process, 0.056 over CUDA IPC, against 0.041 before any change and 1.56 after perturbing the trainer's weights without an update); Qwen3.5 (checkpoint names differ from the loaded model's) matches too (0.022).
 
+### Qwen3.5-4B → Qwen3.5-0.8B, and where a step's time goes
+
+`configs/distill_qwen35.yaml`: `full_rkl` from an hf teacher, 64 prompts × 512 new tokens per step, on-policy (`max_staleness: 0`). In 100 steps (11 minutes, five evaluations included) GSM8K accuracy goes 53.0 → 55.5 → 59.5 → 62.0 → 62.5% (steps 0/25/50/75/100; the teacher scores 87.5%) and dev KL 0.344 → 0.245. A step takes 5.5 s, down from 8.4 s before these changes (the same batch; timings are means over steps 3–8):
+
+| Phase (s) | before | after | what changed |
+|---|---:|---:|---|
+| rollout (vLLM, 64 × ~375 tokens) | 2.58 | 2.46 | — (decode-bound: see below) |
+| vLLM sleep/wake | 1.07 | 0 | `rollout.sleep: false`, `gpu_memory_utilization: 0.1`: the engine stays resident |
+| weight sync | 0.23 | 0.03 | no weights to re-map after a sleep |
+| teacher scoring | 1.92 | 1.46 | no output-head pass the loss does not use; Liger kernels |
+| student forward/backward + optimizer | 2.57 | 1.67 | fused `full_rkl` (below); Liger kernels |
+
+The fused `full_rkl` (`opd/fused_rkl.py`, used automatically for plain linear output heads and a shared vocabulary without end-of-turn remapping) computes both models' logits in fp32 straight from bf16 GEMMs, then makes two streaming passes over them in Triton: one for both log-sum-exps, the KL and its statistics, one for the analytic gradient q·(log q − log p + 1 − KL − S). Autograd through the definition, which the generic path uses, takes about a dozen elementwise passes over the [tokens, 248k] logits and recasts the output head's weight for every slice. The fused path is also more exact: against fp64 on the same inputs its loss is within 4e-6 and its gradients within 1.3% (norm), where the autocast path's are 9e-6 and 2.9%.
+
+Rollout time is set by decoding: 512 steps for the longest completion, about 5 ms each at 64 sequences (Qwen3.5's linear-attention layers read and write a recurrent state per sequence at every step). Larger batches decode more tokens per second: 128 prompts per step give 13.5k rollout tokens/s instead of 9.7k, and 4.9k trained tokens/s instead of 4.3k, at half the optimizer steps per token.
+
 Also run, 5 steps each: an hf teacher with `offload: true` (moving Qwen3-1.7B on and off the GPU adds 1.4 s per step) and a vLLM teacher (Qwen3.5-0.8B) for `xtok` with the dense term. Runs are in the `palingenesis-validation` wandb project, named `opd2-*`.
 
 ## Multiple-choice pools
@@ -192,6 +208,12 @@ A source is any object with `sample()` (messages, max_new_tokens, meta), `evalua
 
 Accuracy gains typically saturate before the KL stops falling. Keep `train.save_steps` small when checkpoint selection matters.
 
+## Checkpoints and resume
+
+Every `train.save_steps` steps the trainer writes `output_dir/step_N`: the student in Hugging Face format (loadable and servable as is) plus `trainer_state.pt` with the optimizer, the policy version and the random states. `final` is the model only. To continue an interrupted run, rerun the same command with `--train.resume_from auto` (the newest complete checkpoint in `output_dir`; a fresh start if there is none) or a checkpoint path. The student reloads from the checkpoint, the rollout engine syncs to it before its first rollout, the learning-rate schedule and wandb run continue where they were. Prompts continue from the sampler's saved state; the few drawn ahead of training when the checkpoint was written are skipped, not repeated.
+
 ## Memory
+
+With `rollout.sleep: false` the vLLM engine keeps its `gpu_memory_utilization` share while the trainer trains, which saves the wake-up each step (about 1 s for Qwen3.5-0.8B) when it fits: models with little KV cache per token (hybrid linear-attention models, small models) need only a small share.
 
 Student (fp32 master weights + bf16 autocast, AdamW) and frozen bf16 hf teachers share the GPU; the `vllm` rollout engine takes `rollout.gpu_memory_utilization` of it only while it generates. If it does not fit: lower `train.score_micro_seqs` (gradient accumulation keeps the math identical), enable `model.gradient_checkpointing`, move a teacher to another GPU (`device`), or offload it between uses (`offload`). vLLM's sleep mode is not compatible with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.

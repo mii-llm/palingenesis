@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TeacherScores:
-    token_lp: Tensor                # [n] log-prob of each completion token (CPU, fp32)
+    token_lp: Tensor | None         # [n] log-prob of each completion token (CPU, fp32); None with hidden only
     topk_ids: Tensor | None = None  # [n, k] (CPU)
     topk_lp: Tensor | None = None   # [n, k] (CPU, fp32)
     hidden: Tensor | None = None    # [n, H] final hidden states (teacher's device), for full_rkl
@@ -118,6 +118,14 @@ class HFTeacher:
                                              [views[i].completion_len for i in chunk], ids.shape[1])
             with torch.autocast(ids.device.type, dtype=torch.bfloat16, enabled=ids.is_cuda):
                 hidden = final_hidden_states(self.model, ids, mask)[positions.to(ids.device)]
+            if keep_hidden and not top_k:     # full_rkl projects the hidden states in its loss: nothing else needed
+                offset = 0
+                for i in chunk:
+                    n = views[i].completion_len
+                    results[i] = TeacherScores(None, hidden=hidden[offset:offset + n])
+                    offset += n
+                continue
+            with torch.autocast(ids.device.type, dtype=torch.bfloat16, enabled=ids.is_cuda):
                 targets = torch.tensor([t for i in chunk for t in views[i].input_ids[views[i].prompt_len:]],
                                        device=ids.device)
                 token_lp, topk_ids, topk_lp = [], [], []

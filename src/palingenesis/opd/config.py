@@ -27,6 +27,8 @@ class OPDModelConfig:
     # central decision. See configs/distill_*.yaml for worked examples.
     student: str = ""
     gradient_checkpointing: bool = False
+    # Liger's fused kernels (RMSNorm, SwiGLU, RoPE, ...) in the student and hf teachers, on CUDA
+    use_liger_kernel: bool = True
     # Student tokens that end a completion besides its eos/generation-config eos,
     # e.g. ["<|end_of_text|>"].
     stop_tokens: list = field(default_factory=list)
@@ -112,6 +114,9 @@ class OPDRolloutConfig:
     gpu_memory_utilization: float = 0.3   # vllm: GPU fraction for weights + KV cache
     max_model_len: int = 4096         # vllm: prompt + completion tokens
     enforce_eager: bool = False       # vllm: no CUDA graphs (faster start, slower decode)
+    # vllm, max_staleness 0: release the engine's memory while the trainer trains. Off keeps
+    # it resident (no wake-up per step) when its gpu_memory_utilization fits beside training.
+    sleep: bool = True
     url: str = ""                     # vllm_server: a running server (empty = launch one)
 
 
@@ -141,6 +146,7 @@ class OPDTrainConfig:
     eval_samples: int = 200           # dev prompts per source
     save_steps: int = 0               # checkpoint every N steps (0 = final only)
     keep_checkpoints: int = 3         # newest step_* dirs kept on disk (0 = keep all)
+    resume_from: str = ""             # a step_* checkpoint dir, or "auto": the newest in output_dir
 
 
 @dataclass(slots=True)

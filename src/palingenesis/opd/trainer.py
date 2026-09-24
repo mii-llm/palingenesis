@@ -31,11 +31,13 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
+from palingenesis.kernels import apply_liger_kernel, model_type_of
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
-from palingenesis.opd import losses
+from palingenesis.opd import fused_rkl, losses
 from palingenesis.opd.align import ByteChunkAligner, SharedVocabAligner
 from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig
 from palingenesis.opd.formatting import encode_prompt
+from palingenesis.opd.fused_rkl import fused_full_rkl
 from palingenesis.opd.orchestrator import Batch, Orchestrator, Pipeline, PublishedWeights, Request, Sample, TeacherRoute
 from palingenesis.opd.rollout import HFRollout, VLLMColocateRollout, VLLMServer, VLLMServerRollout
 from palingenesis.opd.sources import PromptSource, build_source
@@ -50,6 +52,8 @@ from palingenesis.opd.teachers import (
 from palingenesis.opd.token_bridge import TokenBridge, TokenBridgeError, check_compatible
 
 logger = logging.getLogger(__name__)
+
+TRAINER_STATE_FILE = "trainer_state.pt"     # written last: its presence marks a complete checkpoint
 
 SHARED_VOCAB_LOSSES = ("full_rkl", "topk_kl", "sampled_rkl")
 
@@ -139,8 +143,14 @@ class OPDTrainer:
                 "--max-model-len", str(rollout.max_model_len), "--logprobs-mode", "processed_logprobs",
                 "--weight-transfer-config", '{"backend": "ipc"}', *(["--enforce-eager"] if rollout.enforce_eager else [])])
 
-        logger.info("Loading student %s (fp32 master weights, bf16 autocast) on %s", config.model.student, self.device)
-        self.student = load_causal_lm(config.model.student, torch.float32).to(self.device)
+        if config.model.use_liger_kernel and self.device == "cuda":     # patches classes: before any model loads
+            for model_type in sorted({model_type_of(m) for m in [config.model.student] + [
+                    t.model for t in config.teachers.values() if t.backend == "hf"]} - {None}):
+                apply_liger_kernel(model_type)
+        self.resume_path = resolve_resume(config.train.resume_from, config.train.output_dir)
+        student_path = self.resume_path or config.model.student
+        logger.info("Loading student %s (fp32 master weights, bf16 autocast) on %s", student_path, self.device)
+        self.student = load_causal_lm(student_path, torch.float32).to(self.device)
         if config.model.gradient_checkpointing:
             self.student.gradient_checkpointing_enable()
         self.head = output_head(self.student)
@@ -154,7 +164,7 @@ class OPDTrainer:
         elif rollout.backend == "vllm":
             engine = VLLMColocateRollout(config.model.student, self.stop_ids, rollout.gpu_memory_utilization,
                                          rollout.max_model_len, rollout.enforce_eager, config.train.seed,
-                                         sleep_mode=rollout.max_staleness == 0)
+                                         sleep_mode=rollout.sleep and rollout.max_staleness == 0)
         else:
             engine = VLLMServerRollout(server, self.stop_ids)
 
@@ -165,6 +175,10 @@ class OPDTrainer:
                                keep_hidden=kind == "full_rkl")
             for name, kind in self.kinds.items()
         }
+        # full_rkl through the fused kernels where they compute the same thing (fused_rkl.supported)
+        self.fused = {name for name, kind in self.kinds.items()
+                      if kind == "full_rkl" and fused_rkl.supported(self.head, teachers[name].head, aligners[name].bridge.swap)
+                      and teachers[name].head.weight.device == self.head.weight.device}
         self.teacher_to_student = {name: torch.tensor(a.teacher_to_student, device=self.device)
                                    for name, a in aligners.items() if isinstance(a, ByteChunkAligner)}
         self.weights = PublishedWeights(self.student)
@@ -179,13 +193,18 @@ class OPDTrainer:
         self.orchestrator = Orchestrator(self.pipeline, self._draw, rollout.temperature, rollout.max_staleness)
         self.opt = torch.optim.AdamW(self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0,
                                      fused=self.device == "cuda")
-        self.wandb = None
+        self.start_step, wandb_id = 0, None
+        if self.resume_path:
+            wandb_id = self._load_state(self.resume_path)
+        self.wandb, self.wandb_id = None, wandb_id
         if config.logging.use_wandb:
             try:
                 import wandb
 
-                wandb.init(project=config.logging.project, name=config.logging.run_name or None,
-                           config=dataclasses.asdict(config), dir=config.train.output_dir)
+                run = wandb.init(project=config.logging.project, name=config.logging.run_name or None,
+                                 config=dataclasses.asdict(config), dir=config.train.output_dir,
+                                 id=wandb_id, resume="allow" if wandb_id else None)
+                self.wandb_id = run.id
                 self.wandb = wandb
             except Exception as e:  # noqa: BLE001 — a metrics backend must never kill a training run
                 logger.warning("wandb init failed (%s); continuing without it", e)
@@ -244,8 +263,9 @@ class OPDTrainer:
             behaviour = torch.tensor([x for s in samples for x in s.behaviour_lp], device=device)
         if kind != "xtok":            # one teacher token per student token
             teacher_ids = torch.tensor([t for s in samples for t in s.view.input_ids[s.view.prompt_len:]], device=device)
-            token_lp = torch.cat([s.scores.token_lp for s in samples]).to(device)
             vocab = losses.SharedVocab(route.aligner.bridge.shared_vocab_size, route.aligner.bridge.swap)
+        if kind in ("topk_kl", "sampled_rkl"):
+            token_lp = torch.cat([s.scores.token_lp for s in samples]).to(device)
 
         with (torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
               torch.set_grad_enabled(train)):
@@ -255,8 +275,12 @@ class OPDTrainer:
                     if s.scores.hidden.is_cuda:
                         s.scores.hidden.record_stream(torch.cuda.current_stream())
                 teacher_hidden = torch.cat([s.scores.hidden for s in samples])
-                value, stats = losses.full_rkl(hidden, self.head, teacher_ids, token_weights, vocab,
-                                               lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], vocab.size))
+                if name in self.fused:
+                    value, stats = fused_full_rkl(hidden, self.head, teacher_hidden, route.teacher.head, teacher_ids,
+                                                  token_weights, vocab.size)
+                else:
+                    value, stats = losses.full_rkl(hidden, self.head, teacher_ids, token_weights, vocab,
+                                                   lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], vocab.size))
             elif kind == "topk_kl":
                 topk_ids = torch.cat([s.scores.topk_ids for s in samples]).to(device)
                 topk_lp = torch.cat([s.scores.topk_lp for s in samples]).to(device)
@@ -342,12 +366,14 @@ class OPDTrainer:
 
     def train(self) -> None:
         config = self.config
+        if self.start_step >= config.train.steps:
+            logger.warning("the checkpoint is at step %d of %d: nothing to train", self.start_step, config.train.steps)
         self.orchestrator.start()
         try:
-            if config.train.eval_every:
+            if config.train.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)
             start_time = time.time()
-            for step in range(config.train.steps):
+            for step in range(self.start_step, config.train.steps):
                 t0 = time.perf_counter()
                 batch = self.orchestrator.next(self.weights.version)
                 waited = time.perf_counter() - t0
@@ -380,7 +406,7 @@ class OPDTrainer:
                 if config.train.eval_every and (step + 1) % config.train.eval_every == 0 and step + 1 < config.train.steps:
                     self._log("eval", self.evaluate(), step + 1)
                 if config.train.save_steps and (step + 1) % config.train.save_steps == 0:
-                    self.save(f"step_{step + 1}")
+                    self.save(f"step_{step + 1}", step + 1)
             if config.train.eval_every:
                 self._log("eval", self.evaluate(), config.train.steps)
             self.save("final")
@@ -457,20 +483,84 @@ class OPDTrainer:
                 logger.warning("wandb.log failed (%s); disabling wandb", e)
                 self.wandb = None
 
-    def save(self, name: str) -> None:
+    def save(self, name: str, step: int | None = None) -> None:
+        """The student in Hugging Face format; with `step`, also the state to resume from.
+
+        A resumable checkpoint adds the optimizer, the policy version and the random
+        states. trainer_state.pt is written last and atomically, so a checkpoint with
+        it is complete; `final` is the model export only."""
         from palingenesis.checkpoint import save_hf_model
 
         path = Path(self.config.train.output_dir) / name
         logger.info("Saving checkpoint -> %s", path)
-        save_hf_model(self.student, self.tok, path)
+        with self.weights.lock:       # a rollout engine may be copying the weights (max_staleness > 0)
+            save_hf_model(self.student, self.tok, path)
         with open(path / "opd_config.json", "w") as f:
             json.dump(dataclasses.asdict(self.config), f, indent=2)
+        if step is not None:
+            state = {"step": step, "optimizer": self.opt.state_dict(), "rng": self.rng.getstate(),
+                     "torch_rng": torch.get_rng_state(),
+                     "cuda_rng": torch.cuda.get_rng_state_all() if self.device == "cuda" else None,
+                     "dropped_samples": self.orchestrator.dropped, "wandb_id": self.wandb_id}
+            torch.save(state, path / (TRAINER_STATE_FILE + ".tmp"))
+            os.replace(path / (TRAINER_STATE_FILE + ".tmp"), path / TRAINER_STATE_FILE)
         keep = self.config.train.keep_checkpoints
         if keep > 0:
-            steps = sorted((d for d in os.listdir(self.config.train.output_dir) if d.startswith("step_")),
-                           key=lambda d: int(d.split("_")[1]))
-            for old in steps[:-keep]:
-                shutil.rmtree(os.path.join(self.config.train.output_dir, old), ignore_errors=True)
+            for old in checkpoint_steps(self.config.train.output_dir, complete=False)[:-keep]:
+                shutil.rmtree(old, ignore_errors=True)
+
+    def _load_state(self, path: str) -> str | None:
+        """Restore the optimizer, the policy version and the random states; the wandb run id.
+
+        The student's weights were loaded from `path` already. Rollout engines hold the
+        weights they were built with, older than the policy version restored here, so
+        the first rollout syncs them. Prompts continue with the source's random stream
+        as it was at the save: the few prompts drawn ahead of training then are skipped,
+        none are repeated."""
+        # On the CPU: the random states must stay there; load_state_dict moves the optimizer state to the parameters.
+        state = torch.load(Path(path) / TRAINER_STATE_FILE, map_location="cpu", weights_only=False)
+        self.opt.load_state_dict(state["optimizer"])
+        self.rng.setstate(state["rng"])
+        torch.set_rng_state(state["torch_rng"])
+        if state["cuda_rng"] is not None and self.device == "cuda":
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
+        self.start_step = state["step"]
+        self.weights.version = state["step"]
+        self.orchestrator.dropped = state["dropped_samples"]
+        logger.info("Resumed from %s at step %d", path, self.start_step)
+        return state["wandb_id"]
+
+
+def checkpoint_steps(output_dir: str, complete: bool = True) -> list[str]:
+    """The step_* checkpoint dirs in `output_dir`, oldest first; with `complete`, only resumable ones."""
+    if not os.path.isdir(output_dir):
+        return []
+    found = []
+    for d in os.listdir(output_dir):
+        path = os.path.join(output_dir, d)
+        if d.startswith("step_") and d[5:].isdigit() and os.path.isdir(path):
+            if not complete or os.path.exists(os.path.join(path, TRAINER_STATE_FILE)):
+                found.append((int(d[5:]), path))
+    return [path for _, path in sorted(found)]
+
+
+def resolve_resume(resume_from: str, output_dir: str) -> str | None:
+    """The checkpoint to resume from: None to start fresh.
+
+    "auto" picks the newest complete step_* checkpoint in output_dir, and starts
+    fresh when there is none (so one command both starts and resumes a run)."""
+    if not resume_from:
+        return None
+    if resume_from == "auto":
+        found = checkpoint_steps(output_dir)
+        if not found:
+            logger.info("resume_from: auto: no checkpoint in %s, starting fresh", output_dir)
+            return None
+        return found[-1]
+    if not os.path.exists(os.path.join(resume_from, TRAINER_STATE_FILE)):
+        raise OPDConfigError(f"train.resume_from: {resume_from} is not a complete OPD checkpoint "
+                             f"(no {TRAINER_STATE_FILE}; `final` holds the model only)")
+    return resume_from
 
 
 class _SourceEngine:

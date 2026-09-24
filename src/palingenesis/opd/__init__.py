@@ -14,6 +14,7 @@ Modules:
   align         student <-> teacher token alignment: shared vocabulary, or byte chunks
                 across different tokenizers
   losses        full_rkl, topk_kl, sampled_rkl, xtok — sliced over the vocabulary
+  fused_rkl     full_rkl for plain linear heads: fused Triton passes, analytic gradient
   orchestrator  the rollout pipeline and its background thread (bounded staleness)
   trainer       the training loop
   token_bridge  the shared-vocabulary bridge (end-of-turn remapping, compatibility check)

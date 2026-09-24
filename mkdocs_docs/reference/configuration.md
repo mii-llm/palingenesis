@@ -286,6 +286,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 |-----------|------|---------|-------------|
 | `student` | str | — | Student model (trained; fp32 master weights, bf16 autocast). |
 | `gradient_checkpointing` | bool | `false` | Recompute the student's activations in the scoring backward. |
+| `use_liger_kernel` | bool | `true` | Liger's fused kernels (RMSNorm, SwiGLU, RoPE) in the student and `hf` teachers, on CUDA: about 10% faster scoring and training for Qwen3.5-4B → 0.8B, and less memory. |
 | `stop_tokens` | list | `[]` | Student tokens that end a completion, besides the chat template's end-of-turn token and the eos tokens of the tokenizer and generation config. |
 | `chat_template_kwargs` | dict | `{}` | Extra `apply_chat_template` arguments for every model, e.g. `{enable_thinking: false}`. |
 
@@ -336,6 +337,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `gpu_memory_utilization` | float | `0.3` | vllm: GPU fraction for the engine's weights and KV cache. |
 | `max_model_len` | int | `4096` | vllm: prompt + completion tokens. |
 | `enforce_eager` | bool | `false` | vllm: no CUDA graphs. |
+| `sleep` | bool | `true` | vllm, `max_staleness: 0`: release the engine's weights and KV cache while the trainer trains. `false` keeps it resident (no wake-up each step) when its `gpu_memory_utilization` fits beside training. |
 | `url` | str | `""` | vllm_server: a running server (started with `--weight-transfer-config '{"backend": "ipc"}'` on the trainer's GPU). |
 
 ### loss
@@ -364,8 +366,9 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `score_micro_seqs` | int | `16` | Sequences per scoring forward (student and teacher); gradient accumulation keeps the math identical. |
 | `eval_every` | int | `50` | Dev metrics before training, every N steps and at the end (0 = off). |
 | `eval_samples` | int | `200` | Dev prompts per source and evaluation. |
-| `save_steps` | int | `0` | Checkpoint every N steps (0 = final only). |
+| `save_steps` | int | `0` | Resumable checkpoint (`step_N`: the model in HF format plus optimizer, policy version and random states) every N steps; 0 = only the `final` model export. |
 | `keep_checkpoints` | int | `3` | Newest `step_*` dirs kept (0 = keep all; `final` exempt). |
+| `resume_from` | str | `""` | A `step_*` checkpoint dir, or `auto`: the newest complete one in `output_dir`, starting fresh if there is none. |
 
 ### logging
 
