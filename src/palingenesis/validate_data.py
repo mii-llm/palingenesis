@@ -12,6 +12,7 @@ Two responsibilities:
 
 import json
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -134,9 +135,24 @@ def normalize_messages(
         # `message.reasoning_content` in their Jinja.
         reasoning = next((turn[k] for k in ("reasoning", "reasoning_content", "think")
                           if isinstance(turn.get(k), str) and turn[k].strip()), None)
+        if role == "assistant" and isinstance(msg["content"], str):
+            baked, rest = split_leading_think(msg["content"])
+            if baked is not None:
+                # The formatting is baked into the content: its LEADING <think> block is the
+                # turn's reasoning (an explicit reasoning field wins), never a second block.
+                # The content as given is kept for templates that do not render reasoning
+                # (restore_baked_think), where it must stay verbatim.
+                msg["_baked_content"] = msg["content"]
+                msg["content"] = rest
+                if reasoning is None and baked.strip():
+                    reasoning = baked
         if reasoning is not None:
             msg["reasoning"] = reasoning
             msg["reasoning_content"] = reasoning
+        elif role == "assistant" and "</think>" in (msg["content"] if isinstance(msg["content"], str) else ""):
+            # Think tags inside the answer are text: an explicit (empty) reasoning field stops
+            # templates such as Qwen3.x's from splitting the content at "</think>".
+            msg["reasoning"] = msg["reasoning_content"] = ""
         if "function_call" in turn:
             # OpenAI legacy format → normalize to tool_calls
             msg["tool_calls"] = [{"type": "function", "function": turn["function_call"]}]
@@ -148,6 +164,32 @@ def normalize_messages(
         normalized.append(msg)
 
     return normalized if normalized else None
+
+
+_LEADING_THINK = re.compile(r"\A\s*<think>(.*?)</think>[ \t]*\n*", re.DOTALL)
+
+
+def restore_baked_think(messages: list[dict]) -> list[dict]:
+    """Messages for a template that does not render reasoning: a turn whose content came with
+    its <think> block baked in gets that content back verbatim (the block is its reasoning
+    text, which such a template would otherwise drop)."""
+    out = []
+    for m in messages:
+        if "_baked_content" in m:
+            raw = m["_baked_content"]
+            m = {k: v for k, v in m.items() if k not in ("_baked_content", "reasoning", "reasoning_content")}
+            m["content"] = raw
+        out.append(m)
+    return out
+
+
+def split_leading_think(content: str) -> tuple[str | None, str]:
+    """(reasoning, rest) when `content` starts with a closed <think>...</think> block, else
+    (None, content). Only a leading block counts: think tags later in the text are text."""
+    m = _LEADING_THINK.match(content)
+    if m is None:
+        return None, content
+    return m.group(1).strip("\n"), content[m.end():]
 
 
 def normalize_tools(tools: Any) -> list[dict] | None:

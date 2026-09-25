@@ -173,6 +173,17 @@ _PROBE_USER, _PROBE_ANSWER, _PROBE_USER2, _PROBE_ANSWER2, _PROBE_REASONING = (
 )
 
 
+def renders_reasoning(render) -> bool:
+    """Whether a chat template puts an assistant turn's reasoning field into the text."""
+    try:
+        text = render([{"role": "user", "content": _PROBE_USER},
+                       {"role": "assistant", "content": _PROBE_ANSWER, "reasoning_content": _PROBE_REASONING,
+                        "reasoning": _PROBE_REASONING}])
+    except Exception:
+        return False
+    return _PROBE_REASONING in text
+
+
 def derive_turn_markers(render, tokenizer) -> TurnMarkers | None:
     """Derive the assistant-turn markers of a chat template by rendering probe turns.
 
@@ -374,6 +385,16 @@ class ChatDataset(IterableDataset):
         # logged when the stream ends so silently skipped rows are visible.
         self.stats: Counter = Counter()
 
+    def _renders_reasoning(self) -> bool:
+        """Whether the chat template (with this row's kwargs) renders a turn's reasoning field;
+        cached per kwargs."""
+        cache = self.__dict__.setdefault("_reasoning_cache", {})
+        key = json.dumps({k: v for k, v in self._template_kwargs.items() if k != "tools"}, sort_keys=True,
+                         default=str)
+        if key not in cache:
+            cache[key] = renders_reasoning(lambda m, **kw: self._render_chat(m, tokenize=False, **kw))
+        return cache[key]
+
     def _render_chat(self, messages: list[dict], **kwargs):
         """apply_chat_template with the current row's template kwargs. Explicit keyword
         arguments win, so a call site can still force e.g. add_generation_prompt."""
@@ -437,7 +458,12 @@ class ChatDataset(IterableDataset):
         return self._has_generation_span
 
     def _process(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
-        from palingenesis.validate_data import is_trained_message, normalize_messages, normalize_tools
+        from palingenesis.validate_data import (
+            is_trained_message,
+            normalize_messages,
+            normalize_tools,
+            restore_baked_think,
+        )
 
         kwargs = example.get("chat_template_kwargs") or {}
         if isinstance(kwargs, str):  # JSON-encoded in some dataset exports
@@ -461,6 +487,8 @@ class ChatDataset(IterableDataset):
         normalized = normalize_messages(example, self.messages_field)
         if normalized:
             messages = normalized
+            if not self._renders_reasoning():        # baked <think> blocks stay in the content
+                messages = restore_baked_think(messages)
         elif not isinstance(messages, list):
             return None
         # If normalization returns None, use raw messages (may still work with some templates)
@@ -544,10 +572,11 @@ class ChatDataset(IterableDataset):
             rc = msg.get(key)
             if isinstance(rc, str) and rc.strip():
                 return rc.strip(), content.strip()
-        if "</think>" in content:
-            head, _, tail = content.partition("</think>")
-            reasoning = head.split("<think>")[-1].strip()
-            return (reasoning or None), tail.strip()
+        from palingenesis.validate_data import split_leading_think
+
+        baked, rest = split_leading_think(content)        # only a LEADING block is reasoning
+        if baked is not None:
+            return (baked.strip() or None), rest.strip()
         return None, content.strip()
 
     def _strip_reasoning_labels(self, input_ids: torch.Tensor, labels: torch.Tensor, full_text: str) -> torch.Tensor:
@@ -577,6 +606,11 @@ class ChatDataset(IterableDataset):
             return labels
         for m in re.finditer(r"<think>.*?</think>", full_text, flags=re.DOTALL):
             c0, c1 = m.start(), m.end()
+            # Reasoning opens a turn: the token before it is the untrained header. A block
+            # preceded by trained text is part of an answer (literal tags), and stays trained.
+            first = next((i for i, (a, b) in enumerate(offsets) if b > c0), None)
+            if first is not None and first > 0 and labels[first - 1] != IGNORE_INDEX:
+                continue
             while c1 < len(full_text) and full_text[c1] in " \t\r\n":
                 c1 += 1
             for ti, (o0, o1) in enumerate(offsets):
@@ -739,7 +773,10 @@ class ChatDataset(IterableDataset):
             train_think = self.train_on_reasoning and reasoning is not None
             pieces = [(start, end)]
             if not train_think:
-                excluded = [m.span() for m in _THINK_BLOCK.finditer(full, start, end)]
+                # Only a block that OPENS the turn is reasoning; <think> tags later in the answer
+                # are text the model writes, and trained as such.
+                lead = _THINK_BLOCK.match(full, start + (len(full[start:end]) - len(full[start:end].lstrip())), end)
+                excluded = [lead.span()] if lead else []
                 if reasoning and not self.train_on_reasoning:
                     # Reasoning rendered outside <think> tags (other templates' channels).
                     p = full.find(reasoning, start, end)

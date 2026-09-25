@@ -41,7 +41,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from palingenesis.validate_data import normalize_messages, normalize_tools
+from palingenesis.validate_data import normalize_messages, normalize_tools, restore_baked_think
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,11 @@ class TracePlanner:
         rewritten = history[len(without):] if history.startswith(without) else ""
         self.turn_header = os.path.commonprefix([self.turn_opening, rewritten]) or self.turn_opening
         self.bos = tok.bos_token_id
+        from palingenesis.data import renders_reasoning
+
+        # a template that ignores the reasoning field keeps baked <think> blocks in the content
+        self.renders_reasoning = renders_reasoning(
+            lambda m, **kw: tok.apply_chat_template(m, tokenize=False, **{**chat_template_kwargs, **kw}))
 
     def render(self, messages: list[dict], tools: list[dict] | None, turn: int) -> str:
         return self.tok.apply_chat_template(messages[:turn], tools=tools or None, add_generation_prompt=True,
@@ -110,6 +115,8 @@ class TracePlanner:
         return ids, ends
 
     def plan(self, messages: list[dict], tools: list[dict] | None, rng: random.Random) -> TracePlan | None:
+        if not self.renders_reasoning:
+            messages = restore_baked_think(messages)
         turns = [k for k, m in enumerate(messages) if is_trainable_turn(m)]
         if not turns:
             return None
