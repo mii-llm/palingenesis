@@ -10,6 +10,7 @@ Two responsibilities:
    from/value→role/content) so the training pipeline sees a consistent format.
 """
 
+import functools
 import json
 import logging
 import re
@@ -53,6 +54,7 @@ def normalize_messages(
     sample: dict[str, Any],
     messages_field: str = "messages",
     role_map: dict[str, str] | None = None,
+    think_tags: tuple[str, str] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Normalize a sample's messages to standard {role, content} format.
 
@@ -68,6 +70,8 @@ def normalize_messages(
       dicts, which is what chat templates iterate over (Qwen3.x, Llama 3.x, ...)
     - Other per-message keys (`tool_call_id`, `name`, `loss`, ...) are kept; keys whose
       value is None (Arrow fills them in for messages that lack them) are dropped
+    - Reasoning baked into an assistant turn's content, delimited by `think_tags`
+      (default <think></think>): see split_leading_think
 
     Returns normalized messages list, or None if the sample is unparseable.
     """
@@ -136,7 +140,7 @@ def normalize_messages(
         reasoning = next((turn[k] for k in ("reasoning", "reasoning_content", "think")
                           if isinstance(turn.get(k), str) and turn[k].strip()), None)
         if role == "assistant" and isinstance(msg["content"], str):
-            baked, rest = split_leading_think(msg["content"])
+            baked, rest = split_leading_think(msg["content"], think_tags)
             if baked is not None:
                 # The formatting is baked into the content: its LEADING <think> block is the
                 # turn's reasoning (an explicit reasoning field wins), never a second block.
@@ -149,7 +153,8 @@ def normalize_messages(
         if reasoning is not None:
             msg["reasoning"] = reasoning
             msg["reasoning_content"] = reasoning
-        elif role == "assistant" and "</think>" in (msg["content"] if isinstance(msg["content"], str) else ""):
+        elif role == "assistant" and (think_tags or THINK_TAGS)[1] in (
+                msg["content"] if isinstance(msg["content"], str) else ""):
             # Think tags inside the answer are text: an explicit (empty) reasoning field stops
             # templates such as Qwen3.x's from splitting the content at "</think>".
             msg["reasoning"] = msg["reasoning_content"] = ""
@@ -166,7 +171,20 @@ def normalize_messages(
     return normalized if normalized else None
 
 
-_LEADING_THINK = re.compile(r"\A\s*<think>(.*?)</think>[ \t]*\n*", re.DOTALL)
+# Reasoning delimiters: most open-weight reasoning models (Qwen3.x, GLM, MiniMax, DeepSeek-R1)
+# use <think></think>; others differ ([THINK][/THINK], ◁think▷◁/think▷, <seed:think>...).
+THINK_TAGS = ("<think>", "</think>")
+
+
+def valid_think_tags(tags) -> bool:
+    """Whether a configured `think_tags` is [open, close]: two different non-empty strings."""
+    return (isinstance(tags, (list, tuple)) and len(tags) == 2
+            and all(isinstance(t, str) and t.strip() for t in tags) and tags[0] != tags[1])
+
+
+@functools.lru_cache(maxsize=16)
+def _leading_think(tags: tuple[str, str]) -> re.Pattern:
+    return re.compile(rf"\A\s*{re.escape(tags[0])}(.*?){re.escape(tags[1])}[ \t]*\n*", re.DOTALL)
 
 
 def restore_baked_think(messages: list[dict]) -> list[dict]:
@@ -183,10 +201,11 @@ def restore_baked_think(messages: list[dict]) -> list[dict]:
     return out
 
 
-def split_leading_think(content: str) -> tuple[str | None, str]:
-    """(reasoning, rest) when `content` starts with a closed <think>...</think> block, else
-    (None, content). Only a leading block counts: think tags later in the text are text."""
-    m = _LEADING_THINK.match(content)
+def split_leading_think(content: str, tags: tuple[str, str] | None = None) -> tuple[str | None, str]:
+    """(reasoning, rest) when `content` starts with a closed block delimited by `tags`
+    (default <think></think>), else (None, content). Only a leading block counts: think tags
+    later in the text are text."""
+    m = _leading_think(tuple(tags or THINK_TAGS)).match(content)
     if m is None:
         return None, content
     return m.group(1).strip("\n"), content[m.end():]

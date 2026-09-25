@@ -217,6 +217,27 @@ An **empty** `<think>\n\n</think>` scaffold (as Qwen fast-format emits) carries 
 
 Both are set globally under `data:`. `last_turn_only` can additionally be overridden per source (in `sources` and `eval_sources` entries); `train_on_reasoning` is global-only.
 
+### Reasoning in the data: fields, baked blocks, tags
+
+An assistant turn's reasoning can come as a field (`reasoning`, `reasoning_content` or `think`) or baked into the content, as a block that **opens** the message. A baked block is moved into the reasoning field, so the template renders it exactly once. Templates that put an empty `<think>\n\n</think>\n\n` in front of turns without reasoning never add one before the baked block. If a row has both a field and a baked block, the field wins. Think tags later in the answer are text: they are rendered as written and trained. Templates that do not render reasoning at all (e.g. SmolLM2) get the content back verbatim.
+
+| Option | Effect |
+|--------|--------|
+| `think_tags` (default: the template's) | Delimiters of the baked blocks, e.g. `["[THINK]", "[/THINK]"]`. By default they are read off the chat template (`<think></think>` for Qwen3.x, GLM, MiniMax; `[THINK][/THINK]` for Magistral-style templates), else `<think></think>`. Masking always uses the template's own tags, so data written with another model's tags (e.g. `◁think▷◁/think▷`) is converted to this model's format. |
+| `chat_template_kwargs` (default `{}`) | Template kwargs for every row, e.g. `{enable_thinking: true}`. A row's own `chat_template_kwargs` column overrides them key by key, so thinking and non-thinking rows mix in one dataset. |
+
+Both can be overridden per source (`sources` entries). A source's `chat_template_kwargs` is merged over the global kwargs. Agent-trace distillation sources take `think_tags` too.
+
+```yaml
+data:
+  think_tags: ["<think>", "</think>"]        # optional: the student template's by default
+  chat_template_kwargs: {enable_thinking: true}
+  sources:
+    - {dataset: data/reasoning.parquet, weight: 0.7}
+    - {dataset: data/chat.parquet, weight: 0.3, chat_template_kwargs: {enable_thinking: false}}
+    - {dataset: data/kimi_traces.parquet, weight: 0.2, think_tags: ["◁think▷", "◁/think▷"]}
+```
+
 ---
 
 ## Pre-tokenized cache

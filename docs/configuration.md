@@ -93,6 +93,8 @@ grep "STATUS: experimental" src/palingenesis/config.py
 | `max_seq_length` | int | `8192` | Maximum sequence length (truncation boundary) |
 | `messages_field` | str | `messages` | Field name containing chat messages |
 | `train_on_reasoning` | bool | `true` | Include `<think>`/`reasoning` traces in the loss (needed for reasoning distillation) |
+| `think_tags` | list | `null` | Delimiters of reasoning baked into assistant content, e.g. `["[THINK]", "[/THINK]"]` (null: the chat template's, else `<think></think>`) |
+| `chat_template_kwargs` | dict | `{}` | Template kwargs for every row, e.g. `{enable_thinking: true}`; a row's own `chat_template_kwargs` overrides them |
 | `num_workers` | int | `4` | DataLoader worker processes |
 | `packing` | bool | `false` | Pack multiple sequences into fixed-length blocks |
 

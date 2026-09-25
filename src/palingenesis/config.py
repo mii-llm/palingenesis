@@ -60,6 +60,16 @@ class DataConfig:
     # false: only the post-reasoning response gets loss (use when traces are
     #   low quality and you only want the final-answer style).
     train_on_reasoning: bool = True
+    # Delimiters of reasoning baked into the assistant content, e.g. ["[THINK]", "[/THINK]"].
+    # A LEADING block is the turn's reasoning (rendered once, by the template); tags later in
+    # the text are text. null: the chat template's own delimiters (detected), else
+    # <think></think>. Masking always uses the template's, so data written with another
+    # model's tags is converted to this model's format. Overridable per source.
+    think_tags: list | None = None
+    # Chat-template kwargs for every row, e.g. {enable_thinking: true}. A row's own
+    # `chat_template_kwargs` column overrides them key by key: thinking and non-thinking
+    # rows mix in one dataset. Overridable (merged) per source.
+    chat_template_kwargs: dict = field(default_factory=dict)
     # Per-turn loss scaling for multi-turn conversations
     # "uniform": all turns get equal weight (default, standard SFT)
     # "progressive": later turns get more weight (w = (turn_idx/total)^0.5)
@@ -422,6 +432,13 @@ class Config:
         warnings: list[str] = []
 
         # ── Hard incompatibilities (raise) ────────────────────────────────
+        from palingenesis.validate_data import valid_think_tags
+
+        for where, tags in [("data.think_tags", self.data.think_tags)] + [
+                (f"data.sources[{i}].think_tags", s.get("think_tags")) for i, s in enumerate(self.data.sources)
+                if isinstance(s, dict)]:
+            if tags and not valid_think_tags(tags):
+                errors.append(f"{where} must be two different non-empty strings [open, close], got {tags!r}.")
         if self.memory.gradient_release:
             if self.train.gradient_accumulation_steps > 1:
                 errors.append(

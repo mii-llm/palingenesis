@@ -41,7 +41,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from palingenesis.validate_data import normalize_messages, normalize_tools, restore_baked_think
+from palingenesis.validate_data import THINK_TAGS, normalize_messages, normalize_tools, restore_baked_think
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +97,14 @@ class TracePlanner:
         rewritten = history[len(without):] if history.startswith(without) else ""
         self.turn_header = os.path.commonprefix([self.turn_opening, rewritten]) or self.turn_opening
         self.bos = tok.bos_token_id
-        from palingenesis.data import renders_reasoning
+        from palingenesis.data import detect_think_tags, renders_reasoning
+
+        def probe_render(m, **kw):
+            return tok.apply_chat_template(m, tokenize=False, **{**chat_template_kwargs, **kw})
 
         # a template that ignores the reasoning field keeps baked <think> blocks in the content
-        self.renders_reasoning = renders_reasoning(
-            lambda m, **kw: tok.apply_chat_template(m, tokenize=False, **{**chat_template_kwargs, **kw}))
+        self.renders_reasoning = renders_reasoning(probe_render)
+        self.think_tags = detect_think_tags(probe_render) or THINK_TAGS
 
     def render(self, messages: list[dict], tools: list[dict] | None, turn: int) -> str:
         return self.tok.apply_chat_template(messages[:turn], tools=tools or None, add_generation_prompt=True,
@@ -216,9 +219,11 @@ class TracePlanner:
 # -------------------------------------------------------------------- data
 
 
-def load_trace_rows(path: str, messages_field: str = "messages", tools_field: str = "tools") -> list[dict]:
+def load_trace_rows(path: str, messages_field: str = "messages", tools_field: str = "tools",
+                    think_tags: tuple[str, str] | None = None) -> list[dict]:
     """Agent traces from JSONL or parquet: rows with messages (list or JSON string) and
-    optional tools; the other columns (topic, id, ...) are kept."""
+    optional tools; the other columns (topic, id, ...) are kept. `think_tags` delimit
+    reasoning baked into assistant content (default <think></think>)."""
     if path.endswith(".parquet"):
         import pandas as pd
 
@@ -228,7 +233,7 @@ def load_trace_rows(path: str, messages_field: str = "messages", tools_field: st
             records = [json.loads(line) for line in f if line.strip()]
     rows, skipped = [], 0
     for record in records:
-        messages = normalize_messages(record, messages_field)
+        messages = normalize_messages(record, messages_field, think_tags=think_tags)
         tools = record.get(tools_field)
         if isinstance(tools, str):
             tools = json.loads(tools) if tools.strip() else None

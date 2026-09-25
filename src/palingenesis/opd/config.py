@@ -16,6 +16,8 @@ from pathlib import Path
 
 import yaml
 
+from palingenesis.validate_data import valid_think_tags
+
 LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok", "rs_kd")
 TOKEN_WEIGHTINGS = ("none", "sure", "entropy")
 SOURCE_FORMATS = ("messages", "mcqa", "agent_traces")
@@ -84,6 +86,9 @@ class SourceConfig:
     # ---- agent_traces ----
     messages_field: str = "messages"
     tools_field: str = "tools"
+    # Delimiters of reasoning baked into the assistant content, e.g. ["[THINK]", "[/THINK]"]
+    # (empty = the student template's own, else <think></think>); see data.think_tags.
+    think_tags: list = field(default_factory=list)
     branches_per_trace: int = 8       # turns regenerated per sampled trace (0 = all)
     max_context: int = 32768          # tokens of context a regenerated turn may have
     max_new_tokens: int = 512
@@ -133,6 +138,19 @@ class OPDRolloutConfig:
     # it resident (no wake-up per step) when its gpu_memory_utilization fits beside training.
     sleep: bool = True
     url: str = ""                     # vllm_server: a running server (empty = launch one)
+    # vllm: sequences decoded concurrently. 0 = every sequence a step generates at once
+    # (at least 256; vLLM's own default on an A100 is 256, which caps larger batches).
+    max_num_seqs: int = 0
+
+
+def rollout_max_num_seqs(config) -> int:
+    """vLLM's max_num_seqs for the student engine: rollout.max_num_seqs, or every sequence one
+    step generates (prompts x group x regenerated turns per trace, times the steps in flight)."""
+    rollout = config.rollout
+    if rollout.max_num_seqs > 0:
+        return rollout.max_num_seqs
+    branches = max([1] + [s.branches_per_trace for s in config.sources.values() if s.format == "agent_traces"])
+    return min(2048, max(256, rollout.batch_prompts * rollout.group_size * branches * (1 + rollout.max_staleness)))
 
 
 @dataclass(slots=True)
@@ -331,6 +349,9 @@ class OPDConfig:
             where = f"sources.{name}"
             if source.format not in SOURCE_FORMATS:
                 errors.append(f"{where}.format must be one of {SOURCE_FORMATS}, got {source.format!r}.")
+            if source.think_tags and not valid_think_tags(source.think_tags):
+                errors.append(f"{where}.think_tags must be two different non-empty strings [open, close], "
+                              f"got {source.think_tags!r}.")
             if source.topic_teachers and not source.topic_field:
                 errors.append(f"{where}.topic_teachers needs topic_field (the row field holding the topic).")
             seen: dict = {}

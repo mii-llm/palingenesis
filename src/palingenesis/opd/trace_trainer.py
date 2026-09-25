@@ -68,13 +68,14 @@ class TraceBatch:
 class TraceSources:
     """The agent-trace sources, mixed by weight, each with a held-out split."""
 
-    def __init__(self, config, rng: random.Random):
+    def __init__(self, config, rng: random.Random, think_tags: dict[str, tuple[str, str]] | None = None):
         self.config, self.rng = config, rng
         self.names, self.weights, self.train, self.dev = [], [], {}, {}
         for name, source in config.sources.items():
-            rows = load_trace_rows(source.path, source.messages_field, source.tools_field)
+            tags = tuple(source.think_tags) if source.think_tags else (think_tags or {}).get(name)
+            rows = load_trace_rows(source.path, source.messages_field, source.tools_field, tags)
             if source.dev_path:
-                train, dev = rows, load_trace_rows(source.dev_path, source.messages_field, source.tools_field)
+                train, dev = rows, load_trace_rows(source.dev_path, source.messages_field, source.tools_field, tags)
             else:
                 def key(row):
                     return hashlib.sha1(json.dumps(row["messages"], sort_keys=True, ensure_ascii=False,
@@ -216,7 +217,7 @@ class TraceTrainer(OPDTrainer):
             name: TracePlanner(self.tok, config.model.chat_template_kwargs, self.stop_ids, source.max_context,
                                source.branches_per_trace, recorded_kd=False)
             for name, source in config.sources.items()}
-        return TraceSources(config, self.rng)
+        return TraceSources(config, self.rng, {name: p.think_tags for name, p in self.planners.items()})
 
     def _request(self, name: str, row: dict, rng: random.Random, planners=None) -> TraceRequest | None:
         source = self.config.sources[name]

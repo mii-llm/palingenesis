@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import signal
 import socket
 import subprocess
@@ -196,15 +197,30 @@ class VLLMColocateRollout:
     """
 
     def __init__(self, model: str, stop_ids: tuple[int, ...], gpu_memory_utilization: float, max_model_len: int,
-                 enforce_eager: bool, seed: int, sleep_mode: bool, prefix_caching: bool = False):
+                 enforce_eager: bool, seed: int, sleep_mode: bool, prefix_caching: bool = False,
+                 max_num_seqs: int | None = None):
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         vllm = _import_vllm()
         self.stop_ids = stop_ids
         self.sleep_mode = sleep_mode
-        self.llm = vllm.LLM(model=model, dtype="bfloat16", gpu_memory_utilization=gpu_memory_utilization,
+        def engine(max_num_seqs):
+            return vllm.LLM(model=model, dtype="bfloat16", gpu_memory_utilization=gpu_memory_utilization,
                             max_model_len=max_model_len, enforce_eager=enforce_eager, seed=seed,
                             enable_sleep_mode=sleep_mode, logprobs_mode="processed_logprobs",
-                            enable_prefix_caching=prefix_caching)
+                            enable_prefix_caching=prefix_caching, max_num_seqs=max_num_seqs)
+
+        try:
+            self.llm = engine(max_num_seqs)
+        except ValueError as e:
+            # Hybrid models (Qwen3.5, ...) hold one Mamba state per decoding sequence: vLLM
+            # refuses more sequences than its cache has states, and names the limit.
+            limit = re.search(r"exceeds available Mamba cache blocks \((\d+)\)", str(e))
+            if limit is None:
+                raise
+            logger.warning("vLLM: %s concurrent sequences do not fit the Mamba cache of gpu_memory_utilization "
+                           "%s; using %s (raise gpu_memory_utilization for more)", max_num_seqs,
+                           gpu_memory_utilization, limit.group(1))
+            self.llm = engine(int(limit.group(1)))
         self.SamplingParams = vllm.SamplingParams
         self.version = 0               # -1 while asleep: the weights are gone until the next update
         self.asleep = False            # KV cache released

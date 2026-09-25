@@ -34,6 +34,7 @@ Config examples:
 """
 
 import bisect
+import functools
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from transformers import PreTrainedTokenizerBase
 
 from palingenesis.config import DataConfig
+from palingenesis.validate_data import THINK_TAGS
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +186,29 @@ def renders_reasoning(render) -> bool:
     return _PROBE_REASONING in text
 
 
+def detect_think_tags(render) -> tuple[str, str] | None:
+    """The delimiters a chat template puts around an assistant turn's reasoning, read off a
+    probe render: the text between the reasoning and the answer is the closing tag, and the
+    opening tag is the closing one without its slash ("</think>", "[/THINK]", "◁/think▷",
+    "</seed:think>"). None when the template does not render reasoning or its delimiters
+    do not follow that pattern (the caller then uses the configured tags)."""
+    try:
+        text = render([{"role": "user", "content": _PROBE_USER},
+                       {"role": "assistant", "content": _PROBE_ANSWER, "reasoning_content": _PROBE_REASONING,
+                        "reasoning": _PROBE_REASONING}])
+    except Exception:
+        return None
+    i = text.find(_PROBE_REASONING)
+    j = text.find(_PROBE_ANSWER, i + len(_PROBE_REASONING)) if i != -1 else -1
+    if j == -1:
+        return None
+    close = text[i + len(_PROBE_REASONING): j].strip()
+    if "/" not in close or any(c.isspace() for c in close):
+        return None
+    open_ = close.replace("/", "", 1)
+    return (open_, close) if text[:i].rstrip().endswith(open_) else None
+
+
 def derive_turn_markers(render, tokenizer) -> TurnMarkers | None:
     """Derive the assistant-turn markers of a chat template by rendering probe turns.
 
@@ -285,8 +310,10 @@ class _TokenSpans:
         return ti
 
 
-# A <think> block and the whitespace after it; an unclosed block runs to the end.
-_THINK_BLOCK = re.compile(r"<think>.*?(?:</think>\s*|$)", re.DOTALL)
+@functools.lru_cache(maxsize=16)
+def _think_block(tags: tuple[str, str]) -> re.Pattern:
+    """A reasoning block and the whitespace after it; an unclosed block runs to the end."""
+    return re.compile(rf"{re.escape(tags[0])}.*?(?:{re.escape(tags[1])}\s*|$)", re.DOTALL)
 
 
 def _subtract_intervals(span: tuple[int, int], excluded: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -352,6 +379,8 @@ class ChatDataset(IterableDataset):
         shuffle_buffer: int = 0,
         shuffle_seed: int = 0,
         tools_field: str = "tools",
+        think_tags: tuple[str, str] | list[str] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -365,6 +394,14 @@ class ChatDataset(IterableDataset):
         self.include_observations = include_observations
         self.turn_scaling = turn_scaling
         self.train_on_reasoning = train_on_reasoning
+        # Delimiters of reasoning baked into the data's assistant content. None: the chat
+        # template's own (detect_think_tags), else <think></think>. The masking always uses
+        # the template's, so data baked with one model's tags trains another model's format.
+        self.think_tags = tuple(think_tags) if think_tags else None
+        # Template kwargs for every row (e.g. {"enable_thinking": true}); a row's own
+        # `chat_template_kwargs` field overrides them key by key, so thinking and
+        # non-thinking rows can be mixed in one dataset.
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         # Streaming shuffle, applied per worker AFTER sharding (see _shard_then_shuffle).
         self.shuffle_buffer = shuffle_buffer
         self.shuffle_seed = shuffle_seed
@@ -394,6 +431,20 @@ class ChatDataset(IterableDataset):
         if key not in cache:
             cache[key] = renders_reasoning(lambda m, **kw: self._render_chat(m, tokenize=False, **kw))
         return cache[key]
+
+    def _render_tags(self) -> tuple[str, str]:
+        """Reasoning delimiters in the rendered text: the template's, else the configured ones."""
+        cache = self.__dict__.setdefault("_tags_cache", {})
+        key = json.dumps({k: v for k, v in self._template_kwargs.items() if k != "tools"}, sort_keys=True,
+                         default=str)
+        if key not in cache:
+            detected = detect_think_tags(lambda m, **kw: self._render_chat(m, tokenize=False, **kw))
+            cache[key] = detected or self.think_tags or THINK_TAGS
+        return cache[key]
+
+    def _data_tags(self) -> tuple[str, str]:
+        """Reasoning delimiters baked into the data's content."""
+        return self.think_tags or self._render_tags()
 
     def _render_chat(self, messages: list[dict], **kwargs):
         """apply_chat_template with the current row's template kwargs. Explicit keyword
@@ -468,7 +519,7 @@ class ChatDataset(IterableDataset):
         kwargs = example.get("chat_template_kwargs") or {}
         if isinstance(kwargs, str):  # JSON-encoded in some dataset exports
             kwargs = json.loads(kwargs) if kwargs.strip() else {}
-        self._template_kwargs = dict(kwargs)
+        self._template_kwargs = {**self.chat_template_kwargs, **kwargs}
         tools = normalize_tools(example.get(self.tools_field))
         if tools is not None and "tools" not in self._template_kwargs:
             self._template_kwargs["tools"] = tools
@@ -484,7 +535,7 @@ class ChatDataset(IterableDataset):
 
         # Role normalization: handle non-standard formats (ShareGPT, Alpaca, OpenAI
         # tool calls with JSON-string arguments, conversations stored as JSON strings)
-        normalized = normalize_messages(example, self.messages_field)
+        normalized = normalize_messages(example, self.messages_field, think_tags=self._data_tags())
         if normalized:
             messages = normalized
             if not self._renders_reasoning():        # baked <think> blocks stay in the content
@@ -559,8 +610,7 @@ class ChatDataset(IterableDataset):
             return None
         return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
-    @staticmethod
-    def _split_reasoning(msg: dict) -> tuple[str | None, str]:
+    def _split_reasoning(self, msg: dict) -> tuple[str | None, str]:
         """Return (reasoning_raw, answer_raw): strings expected to appear verbatim in the
         rendered text. reasoning_raw is None when the turn carries no reasoning. Handles
         the `reasoning` field (current convention), `reasoning_content` (older), and
@@ -574,7 +624,7 @@ class ChatDataset(IterableDataset):
                 return rc.strip(), content.strip()
         from palingenesis.validate_data import split_leading_think
 
-        baked, rest = split_leading_think(content)        # only a LEADING block is reasoning
+        baked, rest = split_leading_think(content, self._data_tags())   # only a LEADING block is reasoning
         if baked is not None:
             return (baked.strip() or None), rest.strip()
         return None, content.strip()
@@ -589,7 +639,8 @@ class ChatDataset(IterableDataset):
         Needs a fast tokenizer (offset mapping) and offsets that align with input_ids; on
         any mismatch it returns labels unchanged (reasoning stays trained — safe no-op).
         """
-        if not getattr(self.tokenizer, "is_fast", False) or "</think>" not in full_text:
+        tags = self._render_tags()
+        if not getattr(self.tokenizer, "is_fast", False) or tags[1] not in full_text:
             return labels
         try:
             enc = self.tokenizer(
@@ -604,7 +655,7 @@ class ChatDataset(IterableDataset):
         offsets = enc.get("offset_mapping")
         if not offsets or enc["input_ids"] != input_ids.tolist():
             return labels
-        for m in re.finditer(r"<think>.*?</think>", full_text, flags=re.DOTALL):
+        for m in re.finditer(rf"{re.escape(tags[0])}.*?{re.escape(tags[1])}", full_text, flags=re.DOTALL):
             c0, c1 = m.start(), m.end()
             # Reasoning opens a turn: the token before it is the untrained header. A block
             # preceded by trained text is part of an answer (literal tags), and stays trained.
@@ -775,7 +826,8 @@ class ChatDataset(IterableDataset):
             if not train_think:
                 # Only a block that OPENS the turn is reasoning; <think> tags later in the answer
                 # are text the model writes, and trained as such.
-                lead = _THINK_BLOCK.match(full, start + (len(full[start:end]) - len(full[start:end].lstrip())), end)
+                lead = _think_block(self._render_tags()).match(
+                    full, start + (len(full[start:end]) - len(full[start:end].lstrip())), end)
                 excluded = [lead.span()] if lead else []
                 if reasoning and not self.train_on_reasoning:
                     # Reasoning rendered outside <think> tags (other templates' channels).
@@ -827,7 +879,7 @@ class ChatDataset(IterableDataset):
 
             tset: set[int] = set()
             if role == "assistant" and self.train_on_reasoning and reasoning_raw and r0 != -1:
-                think_open = full.rfind("<think>", 0, r0)
+                think_open = full.rfind(self._render_tags()[0], 0, r0)
                 tset.update(spans.overlapping(think_open if think_open != -1 else r0, r1))
                 if a0 != -1:
                     tset.update(spans.overlapping(r1, a0))
@@ -1512,6 +1564,9 @@ def build_dataset(
                     shuffle_buffer=shuffle_buffer,
                     shuffle_seed=config.seed,
                     tools_field=src.get("tools_field", config.tools_field),
+                    think_tags=src.get("think_tags", getattr(config, "think_tags", None)),
+                    chat_template_kwargs={**(getattr(config, "chat_template_kwargs", None) or {}),
+                                          **(src.get("chat_template_kwargs") or {})},
                 )
             elif mode == "pretrain":
                 ds = PretrainDataset(
@@ -1551,6 +1606,8 @@ def build_dataset(
             shuffle_buffer=streaming_shuffle_buffer,
             shuffle_seed=config.seed,
             tools_field=config.tools_field,
+            think_tags=getattr(config, "think_tags", None),
+            chat_template_kwargs=getattr(config, "chat_template_kwargs", None),
         )
     else:
         # Single dataset from config
@@ -1569,6 +1626,8 @@ def build_dataset(
             shuffle_buffer=10_000 if config.streaming else 0,
             shuffle_seed=config.seed,
             tools_field=config.tools_field,
+            think_tags=getattr(config, "think_tags", None),
+            chat_template_kwargs=getattr(config, "chat_template_kwargs", None),
         )
 
     # ── Pretraining Replay (arxiv:2603.04964) ─────────────────────────────────
@@ -1688,6 +1747,8 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
             "messages_field": src.get("messages_field", "messages"),
             "text_field": src.get("text_field", "text"),
             "last_turn_only": src.get("last_turn_only", getattr(d, "last_turn_only", False)),
+            "think_tags": src.get("think_tags"),
+            "chat_template_kwargs": src.get("chat_template_kwargs"),
             "stat": stat,
         }
 
@@ -1708,6 +1769,8 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
         "packing": d.packing,
         "length_group_buffer": getattr(d, "length_group_buffer", 0),
         "train_on_reasoning": getattr(d, "train_on_reasoning", True),
+        "think_tags": getattr(d, "think_tags", None),
+        "chat_template_kwargs": getattr(d, "chat_template_kwargs", None),
         "turn_scaling": getattr(d, "turn_scaling", "uniform"),
         "include_observations": getattr(d, "include_observations", False),
         "seed": d.seed,

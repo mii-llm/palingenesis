@@ -36,7 +36,7 @@ from palingenesis.kernels import apply_liger_kernel, model_type_of
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.opd import fused_rkl, losses
 from palingenesis.opd.align import ByteChunkAligner, SharedVocabAligner
-from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig
+from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig, rollout_max_num_seqs
 from palingenesis.opd.formatting import encode_prompt
 from palingenesis.opd.fused_rkl import fused_full_rkl
 from palingenesis.opd.orchestrator import Batch, Orchestrator, Pipeline, PublishedWeights, Request, Sample, TeacherRoute
@@ -149,7 +149,9 @@ class OPDTrainer:
                 "--gpu-memory-utilization", str(rollout.gpu_memory_utilization),
                 "--max-model-len", str(rollout.max_model_len), "--logprobs-mode", "processed_logprobs",
                 "--weight-transfer-config", '{"backend": "ipc"}', *(["--enforce-eager"] if rollout.enforce_eager else []),
-                *(["--enable-prefix-caching"] if rollout.prefix_caching else [])])
+                *(["--enable-prefix-caching"] if rollout.prefix_caching else []),
+                # a launched server cannot retry a limit its memory refuses: explicit settings only
+                *(["--max-num-seqs", str(rollout.max_num_seqs)] if rollout.max_num_seqs > 0 else [])])
 
         if config.model.use_liger_kernel and self.device == "cuda":     # patches classes: before any model loads
             for model_type in sorted({model_type_of(m) for m in [config.model.student] + [
@@ -176,7 +178,8 @@ class OPDTrainer:
             engine = VLLMColocateRollout(config.model.student, self.stop_ids, rollout.gpu_memory_utilization,
                                          rollout.max_model_len, rollout.enforce_eager, config.train.seed,
                                          sleep_mode=rollout.sleep and rollout.max_staleness == 0,
-                                         prefix_caching=rollout.prefix_caching)
+                                         prefix_caching=rollout.prefix_caching,
+                                         max_num_seqs=rollout_max_num_seqs(config))
         else:
             engine = VLLMServerRollout(server, self.stop_ids)
 

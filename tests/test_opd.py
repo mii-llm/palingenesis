@@ -664,3 +664,24 @@ def test_mixed_source_rejects_bad_construction():
         MixedSource([("a", 1.0, a), ("a", 1.0, a)], random.Random(0))
     with pytest.raises(ValueError, match="weights"):
         MixedSource([("a", 0.0, a)], random.Random(0))
+
+
+def test_rollout_max_num_seqs():
+    """vLLM decodes every sequence of a step at once: prompts x group x regenerated turns
+    (x steps in flight), at least vLLM's 256, at most 2048; an explicit setting wins."""
+    from palingenesis.opd.config import OPDConfig, SourceConfig, rollout_max_num_seqs
+
+    config = OPDConfig()
+    config.rollout.batch_prompts, config.rollout.group_size = 64, 4
+    assert rollout_max_num_seqs(config) == 256
+    config.rollout.batch_prompts = 128
+    assert rollout_max_num_seqs(config) == 512
+    config.rollout.max_staleness = 1
+    assert rollout_max_num_seqs(config) == 1024
+    config.rollout.batch_prompts, config.rollout.group_size, config.rollout.max_staleness = 4, 1, 0
+    config.sources = {"agent": SourceConfig(format="agent_traces", branches_per_trace=8)}
+    assert rollout_max_num_seqs(config) == 256
+    config.rollout.batch_prompts = 1000
+    assert rollout_max_num_seqs(config) == 2048
+    config.rollout.max_num_seqs = 300
+    assert rollout_max_num_seqs(config) == 300
