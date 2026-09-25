@@ -32,7 +32,7 @@ def profile_hardware() -> dict:
         "compute_capability": (props.major, props.minor),
         "num_gpus": torch.cuda.device_count(),
         "supports_bf16": props.major >= 8,
-        "supports_float8": (props.major, props.minor) >= (8, 9),   # Ada, Hopper, Blackwell
+        "supports_float8": (props.major, props.minor) >= (8, 9),  # Ada, Hopper, Blackwell
     }
 
 

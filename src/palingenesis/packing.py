@@ -17,8 +17,6 @@ keeps a document from attending to the previous one depends on the layer:
 the rows already end at document boundaries, so flattening changes nothing else.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import torch
@@ -42,8 +40,14 @@ def missing_linear_attention_kernels() -> list[str]:
     """Packages transformers needs for its fast linear-attention path, not installed."""
     from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
 
-    return [name for name, ok in (("flash-linear-attention", is_flash_linear_attention_available()),
-                                  ("causal-conv1d", is_causal_conv1d_available())) if not ok]
+    return [
+        name
+        for name, ok in (
+            ("flash-linear-attention", is_flash_linear_attention_available()),
+            ("causal-conv1d", is_causal_conv1d_available()),
+        )
+        if not ok
+    ]
 
 
 def check_packing_support(model: torch.nn.Module, attn_implementation: str) -> None:
@@ -81,8 +85,15 @@ class PackedBatch:
     loss_weights: torch.Tensor | None = None
 
     @classmethod
-    def build(cls, input_ids: torch.Tensor, labels: torch.Tensor, position_ids: torch.Tensor,
-              flatten: bool, attn_implementation: str, loss_weights: torch.Tensor | None = None) -> PackedBatch:
+    def build(
+        cls,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        position_ids: torch.Tensor,
+        flatten: bool,
+        attn_implementation: str,
+        loss_weights: torch.Tensor | None = None,
+    ) -> "PackedBatch":
         """`labels` (and `loss_weights`) must already be shifted (per row); `flatten`
         joins the rows."""
         kwargs: dict = {"attention_mask": None}

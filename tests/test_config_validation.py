@@ -239,8 +239,12 @@ def test_yaml_removed_option_explains_why(tmp_path):
 def test_yaml_values_are_coerced(tmp_path):
     from palingenesis.config import Config
 
-    c = Config.from_yaml(_yaml(tmp_path, "train:\n  learning_rate: 2e-5\n  max_grad_norm: 1\n"
-                                         "data:\n  packing: 'true'\n  max_seq_length: '4096'\n"))
+    c = Config.from_yaml(
+        _yaml(
+            tmp_path,
+            "train:\n  learning_rate: 2e-5\n  max_grad_norm: 1\ndata:\n  packing: 'true'\n  max_seq_length: '4096'\n",
+        )
+    )
     assert c.train.learning_rate == 2e-5 and isinstance(c.train.max_grad_norm, float)
     assert c.data.packing is True and c.data.max_seq_length == 4096
 
@@ -263,9 +267,13 @@ def test_every_shipped_config_loads():
 
     from palingenesis.config import Config
     from palingenesis.opd.config import OPDConfig
+    from palingenesis.rl.config import RLConfig
 
     configs = sorted((Path(__file__).parent.parent / "configs").rglob("*.yaml"))
     assert configs
     for path in configs:
-        # on-policy distillation configs have their own schema
-        (OPDConfig if path.name.startswith("distill_") else Config).from_yaml(path)
+        # on-policy distillation and RL configs have their own schemas
+        if path.name.startswith("rl_"):
+            RLConfig.from_yaml(path).validate()
+        else:
+            (OPDConfig if path.name.startswith("distill_") else Config).from_yaml(path)

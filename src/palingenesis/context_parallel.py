@@ -74,7 +74,7 @@ def enable_context_parallel(cp_mesh: DeviceMesh, rotate_method: str = "allgather
         logger.info(f"Context Parallel enabled (rotate_method={rotate_method})")
     except ImportError:
         logger.warning(
-            "Context Parallel requires PyTorch 2.7+. " "torch.distributed.tensor.experimental._attention not available."
+            "Context Parallel requires PyTorch 2.7+. torch.distributed.tensor.experimental._attention not available."
         )
 
 

@@ -34,7 +34,9 @@ DEFAULT_SYSTEM_MESSAGE = "Sei un assistente utile."
 CHAT_TEMPLATE = (
     "{%- if not messages %}{{- raise_exception('No messages provided.') }}{%- endif %}"
     "{%- if messages[0]['role'] == 'system' %}{%- set loop_messages = messages %}"
-    "{%- else %}{%- set loop_messages = [{'role':'system','content':'" + DEFAULT_SYSTEM_MESSAGE + "'}] + messages %}{%- endif %}"
+    "{%- else %}{%- set loop_messages = [{'role':'system','content':'"
+    + DEFAULT_SYSTEM_MESSAGE
+    + "'}] + messages %}{%- endif %}"
     "{%- for message in loop_messages %}"
     "{%- if message['role'] == 'system' %}{{- '<|im_start|>system\\n' }}{{- message['content'] | trim }}{{- '<|im_end|>\\n' }}"
     "{%- elif message['role'] == 'user' %}{{- '<|im_start|>user\\n' }}{{- message['content'] | trim }}{{- '<|im_end|>\\n' }}"
@@ -59,7 +61,11 @@ def _make_tokenizer():
     except Exception:
         return None
     tok.add_special_tokens(
-        {"additional_special_tokens": [x for x in ("<|im_start|>", "<|im_end|>", "<think>", "</think>") if x not in tok.get_vocab()]}
+        {
+            "additional_special_tokens": [
+                x for x in ("<|im_start|>", "<|im_end|>", "<think>", "</think>") if x not in tok.get_vocab()
+            ]
+        }
     )
     tok.chat_template = CHAT_TEMPLATE
     tok.eos_token = "<|im_end|>"
@@ -72,9 +78,12 @@ needs_tok = pytest.mark.skipif(TOK is None, reason="gpt2 tokenizer not cached (o
 
 FIVE_SHOT = [
     {"role": "system", "content": "Sei un assistente utile."},
-    {"role": "user", "content": "Q1"}, {"role": "assistant", "content": "ZEBRA"},
-    {"role": "user", "content": "Q2"}, {"role": "assistant", "content": "QUOKKA"},
-    {"role": "user", "content": "Qreal"}, {"role": "assistant", "content": "FINALX"},
+    {"role": "user", "content": "Q1"},
+    {"role": "assistant", "content": "ZEBRA"},
+    {"role": "user", "content": "Q2"},
+    {"role": "assistant", "content": "QUOKKA"},
+    {"role": "user", "content": "Qreal"},
+    {"role": "assistant", "content": "FINALX"},
 ]
 
 
@@ -87,8 +96,11 @@ def _trained_text(tok, res):
 @needs_tok
 def test_fast_path_is_actually_used():
     enc = TOK.apply_chat_template(
-        FIVE_SHOT, tokenize=True, add_generation_prompt=False,
-        return_assistant_tokens_mask=True, return_dict=True,
+        FIVE_SHOT,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_assistant_tokens_mask=True,
+        return_dict=True,
     )
     mk = "assistant_masks" if "assistant_masks" in enc else "assistant_tokens_mask"
     assert sum(enc[mk]) > 0, "real template must produce a non-empty assistant mask (fast path)"
@@ -128,8 +140,10 @@ def test_fast_train_on_reasoning_false_strips_think():
     """FAST path (template's {% generation %} span encloses <think>): train_on_reasoning
     must be honored here too -- False strips the reasoning, True keeps it. Regression for
     the bug where the flag was silently ignored on the fast path."""
-    msgs = [{"role": "user", "content": "Q"},
-            {"role": "assistant", "content": "<think>because 6*7=42</think>The answer is 42"}]
+    msgs = [
+        {"role": "user", "content": "Q"},
+        {"role": "assistant", "content": "<think>because 6*7=42</think>The answer is 42"},
+    ]
     on = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=True)._process({"messages": msgs}))
     off = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=False)._process({"messages": msgs}))
     assert on == "<think>\nbecause 6*7=42\n</think>\n\nThe answer is 42<|im_end|>\n", on
@@ -140,10 +154,16 @@ def test_fast_train_on_reasoning_false_strips_think():
 def test_fast_train_on_reasoning_false_multiturn_and_last_turn():
     """The strip only touches trained tokens, so it composes with last_turn_only and
     leaves each answer intact across turns."""
-    msgs = [{"role": "user", "content": "Q1"}, {"role": "assistant", "content": "first", "reasoning_content": "r1"},
-            {"role": "user", "content": "Q2"}, {"role": "assistant", "content": "final", "reasoning_content": "r2"}]
+    msgs = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "first", "reasoning_content": "r1"},
+        {"role": "user", "content": "Q2"},
+        {"role": "assistant", "content": "final", "reasoning_content": "r2"},
+    ]
     default = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=False)._process({"messages": msgs}))
-    last = _trained_text(TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=False, last_turn_only=True)._process({"messages": msgs}))
+    last = _trained_text(
+        TOK, ChatDataset(None, TOK, 4096, train_on_reasoning=False, last_turn_only=True)._process({"messages": msgs})
+    )
     assert default == "first<|im_end|>\nfinal<|im_end|>\n", default
     assert last == "final<|im_end|>\n", last
     assert "r1" not in default and "r2" not in default
@@ -160,7 +180,8 @@ def test_fast_single_turn_is_noop():
 @needs_tok
 def test_fast_reasoning_content_kept_on_last_turn():
     msgs = [
-        {"role": "user", "content": "Q1"}, {"role": "assistant", "content": "SHOT"},
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "SHOT"},
         {"role": "user", "content": "Q2"},
         {"role": "assistant", "content": "ANSWER", "reasoning_content": "BECAUSE_REASON"},
     ]
@@ -193,8 +214,14 @@ def test_pipeline_sft_last_turn_only(tmp_path):
     p = tmp_path / "sft.jsonl"
     _write(p, [{"messages": FIVE_SHOT}] * 3)
     cfg = DataConfig(
-        sources=[{"dataset": str(p), "split": "train", "mode": "sft", "messages_field": "messages", "last_turn_only": True}],
-        max_seq_length=512, packing=False, num_workers=0, length_group_buffer=0, streaming=True,
+        sources=[
+            {"dataset": str(p), "split": "train", "mode": "sft", "messages_field": "messages", "last_turn_only": True}
+        ],
+        max_seq_length=512,
+        packing=False,
+        num_workers=0,
+        length_group_buffer=0,
+        streaming=True,
     )
     trained = _batch_trained_text(_one_batch(cfg))
     assert "FINALX" in trained and "ZEBRA" not in trained and "QUOKKA" not in trained
@@ -208,7 +235,11 @@ def test_pipeline_sft_default_all_turns(tmp_path):
     _write(p, [{"messages": FIVE_SHOT}] * 3)
     cfg = DataConfig(
         sources=[{"dataset": str(p), "split": "train", "mode": "sft", "messages_field": "messages"}],
-        max_seq_length=512, packing=False, num_workers=0, length_group_buffer=0, streaming=True,
+        max_seq_length=512,
+        packing=False,
+        num_workers=0,
+        length_group_buffer=0,
+        streaming=True,
     )
     trained = _batch_trained_text(_one_batch(cfg))
     assert "ZEBRA" in trained and "QUOKKA" in trained and "FINALX" in trained
@@ -222,7 +253,11 @@ def test_pipeline_pretrain_mode_all_tokens(tmp_path):
     _write(p, [{"text": "Roma è la capitale d'Italia."}] * 3)
     cfg = DataConfig(
         sources=[{"dataset": str(p), "split": "train", "mode": "pretrain", "text_field": "text"}],
-        max_seq_length=512, packing=False, num_workers=0, length_group_buffer=0, streaming=True,
+        max_seq_length=512,
+        packing=False,
+        num_workers=0,
+        length_group_buffer=0,
+        streaming=True,
     )
     batch = _one_batch(cfg)
     lab = batch["attention_mask"][0]
@@ -251,9 +286,21 @@ def test_eval_sft_last_turn_only_scores_final_only(tmp_path):
 
     def scored_tokens(last_turn_only):
         ev = MultiEvaluator(
-            [{"name": "mcqa", "dataset": str(p), "split": "train", "mode": "sft",
-              "messages_field": "messages", "last_turn_only": last_turn_only, "weight": 1.0, "samples": 2}],
-            TOK, max_seq_length=512, device=torch.device("cpu"),
+            [
+                {
+                    "name": "mcqa",
+                    "dataset": str(p),
+                    "split": "train",
+                    "mode": "sft",
+                    "messages_field": "messages",
+                    "last_turn_only": last_turn_only,
+                    "weight": 1.0,
+                    "samples": 2,
+                }
+            ],
+            TOK,
+            max_seq_length=512,
+            device=torch.device("cpu"),
         )
         assert ev.sources[0]["batches"], "no eval batches built"
         return sum(int((b["labels"] != IGNORE_INDEX).sum()) for b in ev.sources[0]["batches"])
@@ -271,8 +318,25 @@ def test_eval_combined_pretrain_and_sft(tmp_path):
     _write(mcq, [{"messages": FIVE_SHOT}] * 2)
 
     sources = [
-        {"name": "lm", "dataset": str(lm), "split": "train", "mode": "pretrain", "text_field": "text", "weight": 0.4, "samples": 3},
-        {"name": "mcqa", "dataset": str(mcq), "split": "train", "mode": "sft", "messages_field": "messages", "last_turn_only": True, "weight": 0.6, "samples": 2},
+        {
+            "name": "lm",
+            "dataset": str(lm),
+            "split": "train",
+            "mode": "pretrain",
+            "text_field": "text",
+            "weight": 0.4,
+            "samples": 3,
+        },
+        {
+            "name": "mcqa",
+            "dataset": str(mcq),
+            "split": "train",
+            "mode": "sft",
+            "messages_field": "messages",
+            "last_turn_only": True,
+            "weight": 0.6,
+            "samples": 2,
+        },
     ]
     ev = MultiEvaluator(sources, TOK, max_seq_length=512, device=torch.device("cpu"))
     assert len(ev.sources) == 2 and all(s["batches"] for s in ev.sources)

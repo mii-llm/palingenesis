@@ -21,8 +21,17 @@ def _tiny(tie=True):
     from transformers import LlamaConfig, LlamaForCausalLM
 
     torch.manual_seed(0)
-    return LlamaForCausalLM(LlamaConfig(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                                        num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=tie))
+    return LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            tie_word_embeddings=tie,
+        )
+    )
 
 
 def _assert_same_weights(a, b):
@@ -38,7 +47,7 @@ def test_trained_model_reloads_with_from_pretrained(tmp_path, tie):
 
     model = _tiny(tie)
     apply_activation_checkpointing(model, mode="selective")
-    _compile_layers(model)            # in place: no "_orig_mod." in names
+    _compile_layers(model)  # in place: no "_orig_mod." in names
     assert not any("_orig_mod" in k for k in model.state_dict())
     save_final(model, None, str(tmp_path))
     _assert_same_weights(_tiny(tie), LlamaForCausalLM.from_pretrained(tmp_path / "final"))
@@ -67,7 +76,9 @@ def test_resume_refuses_a_checkpoint_missing_weights(tmp_path):
     state.pop("lm_head.weight")
     save_file(state, str(weights), metadata={"format": "pt"})
     with pytest.raises(RuntimeError, match="lacks weights"):
-        load_checkpoint(_tiny(tie=False), torch.optim.AdamW(_tiny(tie=False).parameters()), None, str(tmp_path / "step-3"))
+        load_checkpoint(
+            _tiny(tie=False), torch.optim.AdamW(_tiny(tie=False).parameters()), None, str(tmp_path / "step-3")
+        )
 
 
 def test_resume_restores_weights(tmp_path):

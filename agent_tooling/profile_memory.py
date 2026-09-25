@@ -63,14 +63,14 @@ def _optimizer_bytes(model, name: str, param_bytes: int) -> float:
         if not p.requires_grad:
             continue
         n = p.numel()
-        if name == "muon":                                   # Muon momentum on matrices, AdamW on the rest
+        if name == "muon":  # Muon momentum on matrices, AdamW on the rest
             is_matrix = p.ndim >= 2 and "embed" not in pname.lower()
             total += (1 if is_matrix else 2) * n * param_bytes
         elif name in ("adamw8bit", "paged_adamw8bit"):
-            total += 2 * n                                    # two 8-bit states (block stats negligible)
+            total += 2 * n  # two 8-bit states (block stats negligible)
         elif name == "lion8bit":
-            total += n                                        # one 8-bit momentum
-        else:                                                 # torch AdamW: exp_avg + exp_avg_sq, weight dtype
+            total += n  # one 8-bit momentum
+        else:  # torch AdamW: exp_avg + exp_avg_sq, weight dtype
             total += 2 * n * param_bytes
     return total
 
@@ -100,7 +100,7 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     params_gb = params * param_bytes / GB
     optimizer_gb = _optimizer_bytes(model, config.train.optimizer, param_bytes) / GB
     if config.train.hyperball:
-        optimizer_gb += min(1.0, trainable * 4 / GB)          # one snapshot bucket (<= 1 GiB)
+        optimizer_gb += min(1.0, trainable * 4 / GB)  # one snapshot bucket (<= 1 GiB)
     grads_gb = trainable * param_bytes / GB
     if config.memory.gradient_release and config.train.gradient_accumulation_steps <= 1:
         grads_gb = 0.0
@@ -111,18 +111,18 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     seq = config.data.max_seq_length
     live_tokens = rows * (min(config.memory.seco_chunk_size, seq) if config.memory.seco else seq)
     act_bytes = 2 if config.train.bf16 else param_bytes
-    per_layer = live_tokens * hidden * act_bytes * 10         # rough: ~10 hidden-sized tensors kept per layer
+    per_layer = live_tokens * hidden * act_bytes * 10  # rough: ~10 hidden-sized tensors kept per layer
     ckpt = config.train.gradient_checkpointing
     if ckpt == "none":
         activations_gb = layers * per_layer / GB
     elif ckpt == "selective":
         activations_gb = layers * per_layer * 0.4 / GB
-    else:                                                     # full: layer inputs kept + one layer recomputed
+    else:  # full: layer inputs kept + one layer recomputed
         activations_gb = (layers * live_tokens * hidden * act_bytes + per_layer) / GB
 
     ce_tokens = live_tokens if config.memory.seco else rows * seq
     chunks = _dynamic_num_chunks(ce_tokens, vocab)
-    logits_gb = 2 * ce_tokens / chunks * vocab * 4 / GB       # fp32 logits + their gradient, one chunk
+    logits_gb = 2 * ce_tokens / chunks * vocab * 4 / GB  # fp32 logits + their gradient, one chunk
 
     kv_gb = 0.0
     if config.memory.seco:
@@ -181,7 +181,9 @@ def _worst_case_rows(config: Config, tokenizer, count: int) -> list[dict]:
     rows = []
     for _ in range(count):
         if config.dpo.enabled:
-            rows.append({"prompt": prompt, "chosen": [fill(prompt, target - 32)], "rejected": [fill(prompt, target - 32)]})
+            rows.append(
+                {"prompt": prompt, "chosen": [fill(prompt, target - 32)], "rejected": [fill(prompt, target - 32)]}
+            )
         else:
             rows.append({"messages": prompt + [fill(prompt, target - 32)]})
     return rows
@@ -210,9 +212,9 @@ def measure_memory(config: Config, steps: int = 2) -> dict:
             f.writelines(json.dumps(r) + "\n" for r in rows)
         cfg.data.dataset, cfg.data.dataset_split, cfg.data.streaming = data_file, "train", False
         cfg.data.sources, cfg.data.pretrain_replay_dataset, cfg.data.pretokenize = [], "", False
-        cfg.data.eval_every = steps       # the configured evaluation runs once, at the last step
+        cfg.data.eval_every = steps  # the configured evaluation runs once, at the last step
         cfg.data.messages_field = "messages"
-        cfg.data.num_workers = 0          # workers would split the few rows below one batch each
+        cfg.data.num_workers = 0  # workers would split the few rows below one batch each
         cfg.preprocess.enabled = False
         cfg.train.max_steps = steps
         cfg.train.save_steps, cfg.train.save_final, cfg.train.resume_from = 0, False, None
@@ -221,20 +223,24 @@ def measure_memory(config: Config, steps: int = 2) -> dict:
         torch.cuda.reset_peak_memory_stats()
         train(cfg)
     # GiB: GPUs are sold by GiB ("80 GB" A100 = 80 GiB), so the numbers match the card
-    return {"measured_peak_gb": torch.cuda.max_memory_allocated() / 2**30,
-            "gpu_total_gb": torch.cuda.get_device_properties(0).total_memory / 2**30,
-            "rows": config.train.per_device_batch_size * (2 if config.dpo.enabled else 1),
-            "micro_batches": config.train.gradient_accumulation_steps,
-            "evaluated": bool(config.data.eval_sources or config.data.eval_dataset),
-            "seq_len": config.data.max_seq_length}
+    return {
+        "measured_peak_gb": torch.cuda.max_memory_allocated() / 2**30,
+        "gpu_total_gb": torch.cuda.get_device_properties(0).total_memory / 2**30,
+        "rows": config.train.per_device_batch_size * (2 if config.dpo.enabled else 1),
+        "micro_batches": config.train.gradient_accumulation_steps,
+        "evaluated": bool(config.data.eval_sources or config.data.eval_dataset),
+        "seq_len": config.data.max_seq_length,
+    }
 
 
 def print_report(est: dict):
     print("=" * 70)
     print("MEMORY PROFILE ESTIMATE")
     print("=" * 70)
-    print(f"  Model: {est['model']} ({est['total_params_B']:.2f}B params, {est['weight_dtype']} weights, "
-          f"{est['trainable_ratio']:.0%} trainable)")
+    print(
+        f"  Model: {est['model']} ({est['total_params_B']:.2f}B params, {est['weight_dtype']} weights, "
+        f"{est['trainable_ratio']:.0%} trainable)"
+    )
     print(f"  Sequence length: {est['seq_len']:,} | Batch size: {est['batch_size']}")
     print(f"  Hidden: {est['hidden_size']} | Layers: {est['num_layers']} | Vocab: {est['vocab_size']:,}")
     print()
@@ -250,12 +256,16 @@ def print_report(est: dict):
         print(f"    SeCO K/V cache:       {est['kv_memory_gb']:6.1f} GiB")
     print(f"    Activations (rough):  {est['activation_memory_gb']:6.1f} GiB  [checkpointing: {est['ac_mode']}]")
     print(f"    {'─' * 50}")
-    print(f"    Total (+10% overhead): {est['total_estimated_gb']:5.1f} GiB of {est['gpu_memory_gb']:.0f} GiB "
-          f"({est['headroom_gb']:+.1f} GiB)")
+    print(
+        f"    Total (+10% overhead): {est['total_estimated_gb']:5.1f} GiB of {est['gpu_memory_gb']:.0f} GiB "
+        f"({est['headroom_gb']:+.1f} GiB)"
+    )
     print()
     verdict = "should fit" if est["fits"] else "likely does NOT fit"
-    print(f"  {'✓' if est['fits'] else '✗'} Estimate: {verdict}. Activations are approximate; "
-          "`--measure` runs a real step for the exact peak.")
+    print(
+        f"  {'✓' if est['fits'] else '✗'} Estimate: {verdict}. Activations are approximate; "
+        "`--measure` runs a real step for the exact peak."
+    )
     print()
 
 
@@ -264,8 +274,14 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--gpu_memory_gb", "--gpu", type=float, default=80.0, dest="gpu_memory_gb",
-                        help="GPU memory in GiB, as GPUs are rated (default: 80)")
+    parser.add_argument(
+        "--gpu_memory_gb",
+        "--gpu",
+        type=float,
+        default=80.0,
+        dest="gpu_memory_gb",
+        help="GPU memory in GiB, as GPUs are rated (default: 80)",
+    )
     parser.add_argument("--measure", action="store_true", help="run two real optimizer steps and report the peak")
     args = parser.parse_args()
 
@@ -274,9 +290,11 @@ def main():
     print_report(est)
     if args.measure:
         m = measure_memory(config)
-        print(f"  Measured peak: {m['measured_peak_gb']:.1f} GiB of {m['gpu_total_gb']:.0f} GiB "
-              f"(real trainer: 2 optimizer steps x {m['micro_batches']} micro-batches of {m['rows']} x "
-              f"{m['seq_len']} tokens{', plus one evaluation' if m['evaluated'] else ''})\n")
+        print(
+            f"  Measured peak: {m['measured_peak_gb']:.1f} GiB of {m['gpu_total_gb']:.0f} GiB "
+            f"(real trainer: 2 optimizer steps x {m['micro_batches']} micro-batches of {m['rows']} x "
+            f"{m['seq_len']} tokens{', plus one evaluation' if m['evaluated'] else ''})\n"
+        )
         sys.exit(0 if m["measured_peak_gb"] < m["gpu_total_gb"] else 1)
     sys.exit(0 if est["fits"] else 1)
 

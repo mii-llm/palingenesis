@@ -1,0 +1,46 @@
+# RL on code with hidden tests: rows {"prompt": ..., "tests": ...} where tests are APPS/TACO
+# ({"inputs", "outputs", "fn_name"?}), LiveCodeBench ([{"input", "output", "testtype"}]),
+# or asserts (MBPP lists, HumanEval source with an entry_point column). Reward 1 when the
+# last ```python block passes every test (at most 15, longest input first) in the sandbox.
+#
+#   pgs rl --config configs/rl_code.yaml
+#
+# The sandbox is a warm pool of locked-down docker containers (no network, read-only,
+# nobody user, memory/pid limits). On Kubernetes, use sandbox.backend agent_sandbox with a
+# SandboxWarmPool (agent-sandbox.sigs.k8s.io) running a Python image.
+
+model:
+  policy: Qwen/Qwen3.5-4B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/code_rl.parquet
+  eval_size: 256
+  retire_above: 0.9
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 8
+  max_new_tokens: 4096
+  max_model_len: 6144
+  gpu_memory_utilization: 0.4
+  max_staleness: 1                # grade programs while the trainer steps
+
+rewards:
+  passes: {fn: code, args: {field: tests, timeout: 6, max_tests: 15}}
+
+sandbox:
+  backend: docker
+  workers: 4
+  slots_per_worker: 4
+
+loss:
+  truncation: mask                # an answer cut off by the budget teaches nothing about the code
+
+train:
+  output_dir: runs/rl_code
+  steps: 300
+  learning_rate: 1.0e-6
+  eval_every: 50
+  save_steps: 50

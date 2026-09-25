@@ -20,8 +20,6 @@ Kernels: flash (bf16/fp16 on CUDA; grouped K/V heads natively) or an exact math
 path (any dtype/device) with the same interface, used for fp32/fp64 and on CPU.
 """
 
-from __future__ import annotations
-
 import logging
 import math
 import os
@@ -38,7 +36,7 @@ def _host_bytes(name: str) -> int | None:
         return None
 
 
-_HOST_USED = 0        # bytes of host memory this call's offloaded stores hold
+_HOST_USED = 0  # bytes of host memory this call's offloaded stores hold
 
 
 def reset_host_budget() -> None:
@@ -86,7 +84,7 @@ def _host_tensor(shape, dtype: torch.dtype) -> torch.Tensor:
     _HOST_USED += need
     try:
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-    except RuntimeError as exc:      # pinning can fail (locked-memory limits): plain host memory still works
+    except RuntimeError as exc:  # pinning can fail (locked-memory limits): plain host memory still works
         logger.warning("SeCO: could not pin host memory for the K/V store (%s); using pageable memory", exc)
         return torch.empty(shape, dtype=dtype, device="cpu")
 
@@ -111,12 +109,14 @@ class KVStore:
 
     def write(self, lo: int, k: torch.Tensor, v: torch.Tensor) -> None:
         n = k.shape[-2]
-        self.k[..., lo:lo + n, :].copy_(k.detach(), non_blocking=True)
-        self.v[..., lo:lo + n, :].copy_(v.detach(), non_blocking=True)
+        self.k[..., lo : lo + n, :].copy_(k.detach(), non_blocking=True)
+        self.v[..., lo : lo + n, :].copy_(v.detach(), non_blocking=True)
 
     def load(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return (self.k[..., start:end, :].to(self.device, non_blocking=True),
-                self.v[..., start:end, :].to(self.device, non_blocking=True))
+        return (
+            self.k[..., start:end, :].to(self.device, non_blocking=True),
+            self.v[..., start:end, :].to(self.device, non_blocking=True),
+        )
 
     def start_gradients(self) -> None:
         self.grad_k = torch.zeros(self.k.shape, dtype=self.dtype, device=self.device)
@@ -132,14 +132,20 @@ class KVStore:
 
 
 def _flash_ok(q: torch.Tensor, k: torch.Tensor) -> bool:
-    return (q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) and q.shape[-1] % 8 == 0
-            and q.shape[-1] <= 256 and k.shape[-1] == q.shape[-1])
+    return (
+        q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.shape[-1] % 8 == 0
+        and q.shape[-1] <= 256
+        and k.shape[-1] == q.shape[-1]
+    )
 
 
 def _block_forward(q, k, v, causal: bool, scale: float):
     if _flash_ok(q, k):
         out, lse, cq, ck, mq, mk, seed, offset, _ = torch.ops.aten._scaled_dot_product_flash_attention(
-            q, k, v, 0.0, causal, False, scale=scale)
+            q, k, v, 0.0, causal, False, scale=scale
+        )
         return out, lse, ("flash", cq, ck, mq, mk, seed, offset)
     groups = q.shape[1] // k.shape[1]
     kr, vr = k.repeat_interleave(groups, 1), v.repeat_interleave(groups, 1)
@@ -156,7 +162,8 @@ def _block_backward(dout, q, k, v, out, lse, causal: bool, scale: float, aux):
     if aux[0] == "flash":
         _, cq, ck, mq, mk, seed, offset = aux
         return torch.ops.aten._scaled_dot_product_flash_attention_backward(
-            dout, q, k, v, out, lse, cq, ck, mq, mk, 0.0, causal, seed, offset, scale=scale)
+            dout, q, k, v, out, lse, cq, ck, mq, mk, 0.0, causal, seed, offset, scale=scale
+        )
     groups = q.shape[1] // k.shape[1]
     dtype = torch.promote_types(q.dtype, torch.float32)
     qf, dof, of = q.to(dtype), dout.to(dtype), out.to(dtype)
@@ -164,7 +171,7 @@ def _block_backward(dout, q, k, v, out, lse, causal: bool, scale: float, aux):
     s = (qf @ kr.transpose(-1, -2)) * scale
     if causal:
         s = s.masked_fill(torch.ones_like(s, dtype=torch.bool).triu(1), float("-inf"))
-    p = torch.exp(s - lse.to(dtype).unsqueeze(-1))           # probabilities under the MERGED normaliser
+    p = torch.exp(s - lse.to(dtype).unsqueeze(-1))  # probabilities under the MERGED normaliser
     dv = p.transpose(-1, -2) @ dof
     dp = dof @ vr.transpose(-1, -2)
     ds = p * (dp - (dof * of).sum(-1, keepdim=True))
@@ -182,7 +189,9 @@ def _merge(out_acc, lse_acc, out, lse):
     if out_acc is None:
         return out, lse
     new = torch.logaddexp(lse_acc, lse)
-    return out_acc * torch.exp(lse_acc - new).unsqueeze(-1).to(out.dtype) + out * torch.exp(lse - new).unsqueeze(-1).to(out.dtype), new
+    return out_acc * torch.exp(lse_acc - new).unsqueeze(-1).to(out.dtype) + out * torch.exp(lse - new).unsqueeze(-1).to(
+        out.dtype
+    ), new
 
 
 class ChunkAttention(torch.autograd.Function):
@@ -199,7 +208,7 @@ class ChunkAttention(torch.autograd.Function):
     def forward(ctx, q, k, v, store: KVStore, prefix, scale: float, block: int):
         rows = q.shape[0]
         prefixes = [prefix] * rows if isinstance(prefix, int) else list(prefix)
-        shared = store is not None and store.k.shape[0] != rows    # one stored row serving every query row
+        shared = store is not None and store.k.shape[0] != rows  # one stored row serving every query row
         out_acc = lse_acc = None
         parts = []
         for start in range(0, max(prefixes, default=0), block):
@@ -218,8 +227,8 @@ class ChunkAttention(torch.autograd.Function):
                     if n == 0:
                         continue
                     src = slice(0, 1) if shared else slice(b, b + 1)
-                    o, l_, a = _block_forward(q[b:b + 1], kb[src][..., :n, :], vb[src][..., :n, :], False, scale)
-                    out[b:b + 1], lse[b:b + 1] = o.to(out.dtype), l_.to(lse.dtype)
+                    o, l_, a = _block_forward(q[b : b + 1], kb[src][..., :n, :], vb[src][..., :n, :], False, scale)
+                    out[b : b + 1], lse[b : b + 1] = o.to(out.dtype), l_.to(lse.dtype)
                     per_row.append((b, n, a))
                 parts.append((start, end, per_row, None))
             out_acc, lse_acc = _merge(out_acc, lse_acc, out, lse)
@@ -251,12 +260,13 @@ class ChunkAttention(torch.autograd.Function):
             for b, n, a in per_row:
                 src = slice(0, 1) if ctx.shared else slice(b, b + 1)
                 r = slice(b, b + 1)
-                dqb, dkb, dvb = _block_backward(dout[r], q[r], kb[src][..., :n, :], vb[src][..., :n, :], out[r],
-                                                lse[r], False, ctx.scale, a)
+                dqb, dkb, dvb = _block_backward(
+                    dout[r], q[r], kb[src][..., :n, :], vb[src][..., :n, :], out[r], lse[r], False, ctx.scale, a
+                )
                 dq[r] += dqb
                 if store.grad_k is not None:
-                    store.grad_k[src][..., start:start + n, :].add_(dkb)
-                    store.grad_v[src][..., start:start + n, :].add_(dvb)
+                    store.grad_k[src][..., start : start + n, :].add_(dkb)
+                    store.grad_v[src][..., start : start + n, :].add_(dvb)
         dql, dkl, dvl = _block_backward(dout, q, k, v, out, lse, True, ctx.scale, ctx.aux_local)
         dq += dql
         return dq.to(q.dtype), dkl, dvl, None, None, None, None

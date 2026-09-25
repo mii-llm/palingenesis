@@ -310,8 +310,12 @@ def chunked_gated_loss(
                 if objective == "info_sft":
                     info_total += torch.where(valid, info_raw(p_t), torch.zeros_like(p_t)).sum()
                 else:
-                    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), l_chunk.reshape(-1),
-                                         reduction="none", ignore_index=IGNORE_INDEX).view(l_chunk.shape)
+                    ce = F.cross_entropy(
+                        logits.reshape(-1, logits.shape[-1]).float(),
+                        l_chunk.reshape(-1),
+                        reduction="none",
+                        ignore_index=IGNORE_INDEX,
+                    ).view(l_chunk.shape)
                     nll_rows += torch.where(valid, ce, torch.zeros_like(ce)).sum(dim=1)
                     count_rows += valid.sum(dim=1)
                 del logits
@@ -352,8 +356,9 @@ def chunked_gated_loss(
         gate = gate.detach()
         del probs
 
-        ce_flat = F.cross_entropy(logits.reshape(-1, V), l_chunk.reshape(-1), reduction="none",
-                                  ignore_index=IGNORE_INDEX).view(h_chunk.shape[0], chunk_len)
+        ce_flat = F.cross_entropy(
+            logits.reshape(-1, V), l_chunk.reshape(-1), reduction="none", ignore_index=IGNORE_INDEX
+        ).view(h_chunk.shape[0], chunk_len)
         weighted = ce_flat * gate
         if w_chunk is not None:
             weighted = weighted * w_chunk.to(weighted.dtype)
@@ -395,11 +400,26 @@ def chunked_gated_loss(
     return _BackwardBridge.apply(hidden_states, grad_buffer.to(hidden_states.dtype), total_loss)
 
 
-def chunked_deft_loss(hidden_states, labels, lm_head, num_chunks: int = 8, global_valid_tokens: float = 1.0,
-                      stats: dict | None = None, weights: torch.Tensor | None = None) -> torch.Tensor:
+def chunked_deft_loss(
+    hidden_states,
+    labels,
+    lm_head,
+    num_chunks: int = 8,
+    global_valid_tokens: float = 1.0,
+    stats: dict | None = None,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Chunked DEFT (see chunked_gated_loss)."""
-    return chunked_gated_loss(hidden_states, labels, lm_head, "deft", num_chunks=num_chunks,
-                              global_valid_tokens=global_valid_tokens, stats=stats, weights=weights)
+    return chunked_gated_loss(
+        hidden_states,
+        labels,
+        lm_head,
+        "deft",
+        num_chunks=num_chunks,
+        global_valid_tokens=global_valid_tokens,
+        stats=stats,
+        weights=weights,
+    )
 
 
 _deft_compiled = torch.compile(_deft_loss_fused, dynamic=True)

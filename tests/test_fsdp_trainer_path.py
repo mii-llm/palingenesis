@@ -25,8 +25,17 @@ def _tiny(tie: bool):
     from transformers import LlamaConfig, LlamaForCausalLM
 
     torch.manual_seed(0)
-    model = LlamaForCausalLM(LlamaConfig(vocab_size=96, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                                         num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=tie))
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=96,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            tie_word_embeddings=tie,
+        )
+    )
     model.config.use_cache = False
     return model
 
@@ -46,8 +55,9 @@ def _loss(model, ids, labels, denom):
     from palingenesis.train import _get_hidden_states
 
     hidden = _get_hidden_states(model, ids, torch.ones_like(ids))
-    return chunked_cross_entropy_loss(hidden, shift_labels(labels), output_head(model), num_chunks=3,
-                                      global_valid_tokens=denom)
+    return chunked_cross_entropy_loss(
+        hidden, shift_labels(labels), output_head(model), num_chunks=3, global_valid_tokens=denom
+    )
 
 
 def _full_grads(model) -> dict[str, list]:
@@ -69,12 +79,13 @@ def _worker(rank, world_size, tie, out):
         from palingenesis.config import ParallelConfig
         from palingenesis.distributed import apply_fsdp
 
-        model = apply_fsdp(_tiny(tie), init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp",)),
-                           ParallelConfig(), bf16=False)
+        model = apply_fsdp(
+            _tiny(tie), init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp",)), ParallelConfig(), bf16=False
+        )
         ids, labels = _batch()
         from palingenesis.loss import shift_labels
 
-        denom = int((shift_labels(labels) != IGNORE_INDEX).sum())   # global valid tokens, as the trainer
+        denom = int((shift_labels(labels) != IGNORE_INDEX).sum())  # global valid tokens, as the trainer
         rows = slice(rank * 2, rank * 2 + 2)
         loss = _loss(model, ids[rows], labels[rows], denom)
         loss.backward()
@@ -105,5 +116,6 @@ def test_fsdp_gradients_match_single_process(tie):
     assert got["loss"] == pytest.approx(ref_loss.item(), rel=1e-5)
     assert got["grads"].keys() == ref.keys()
     for name in ref:
-        torch.testing.assert_close(torch.tensor(got["grads"][name]), torch.tensor(ref[name]),
-                                   rtol=1e-4, atol=1e-6, msg=name)
+        torch.testing.assert_close(
+            torch.tensor(got["grads"][name]), torch.tensor(ref[name]), rtol=1e-4, atol=1e-6, msg=name
+        )

@@ -41,7 +41,11 @@ def _make_tokenizer():
     except Exception:
         return None
     tok.add_special_tokens(
-        {"additional_special_tokens": [x for x in ("<|im_start|>", "<|im_end|>", "<think>", "</think>") if x not in tok.get_vocab()]}
+        {
+            "additional_special_tokens": [
+                x for x in ("<|im_start|>", "<|im_end|>", "<think>", "</think>") if x not in tok.get_vocab()
+            ]
+        }
     )
     tok.chat_template = CHAT_TEMPLATE
     tok.eos_token = "<|im_end|>"
@@ -53,8 +57,7 @@ TOK = _make_tokenizer()
 needs_tok = pytest.mark.skipif(TOK is None, reason="gpt2 tokenizer not cached (offline)")
 
 ROWS = [
-    {"messages": [{"role": "user", "content": f"Q{i}"}, {"role": "assistant", "content": f"A{i}"}]}
-    for i in range(12)
+    {"messages": [{"role": "user", "content": f"Q{i}"}, {"role": "assistant", "content": f"A{i}"}]} for i in range(12)
 ]
 
 
@@ -147,8 +150,12 @@ def test_cache_validity_lifecycle(tmp_path):
 
 def _seqs_from_dataset(cfg):
     return [
-        (ex["input_ids"].tolist(), ex["labels"].tolist(), ex["attention_mask"].tolist(),
-         ex.get("position_ids").tolist() if "position_ids" in ex else None)
+        (
+            ex["input_ids"].tolist(),
+            ex["labels"].tolist(),
+            ex["attention_mask"].tolist(),
+            ex.get("position_ids").tolist() if "position_ids" in ex else None,
+        )
         for ex in build_dataset(cfg, TOK, cfg, 0, 1, 1)
     ]
 
@@ -160,8 +167,12 @@ def _seqs_from_cache(cache, cfg):
 
     ds = load_dataset("parquet", data_files=str(cache / PRETOK_DATA), split="train", streaming=False)
     return [
-        (ex["input_ids"].tolist(), ex["labels"].tolist(), ex["attention_mask"].tolist(),
-         ex.get("position_ids").tolist() if "position_ids" in ex else None)
+        (
+            ex["input_ids"].tolist(),
+            ex["labels"].tolist(),
+            ex["attention_mask"].tolist(),
+            ex.get("position_ids").tolist() if "position_ids" in ex else None,
+        )
         for ex in PretokenizedDataset(ds, 0, 1)
     ]
 

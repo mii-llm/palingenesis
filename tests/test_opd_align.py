@@ -54,7 +54,7 @@ def check_chunks(al, completion, view):
     to every text ("▁The" for "The"); the offsets still place it on "The".
     """
     ch = view.chunks
-    teacher_ids = view.input_ids[view.prompt_len:]
+    teacher_ids = view.input_ids[view.prompt_len :]
     assert len(ch.student) == len(completion) and len(ch.teacher) == len(teacher_ids)
     s_text = {c: b"" for c in range(ch.n_chunks)}
     t_text = {c: b"" for c in range(ch.n_chunks)}
@@ -66,8 +66,11 @@ def check_chunks(al, completion, view):
         t_text[c] += al.teacher_bytes[token] or b""
     for c in range(ch.n_chunks):
         prefix_space = c == 0 and not _is_byte_level(al.teacher_tok)
-        assert s_text[c] == (t_text[c][1:] if prefix_space and not s_text[c].startswith(b" ") else t_text[c]), \
-            (c, s_text[c], t_text[c])
+        assert s_text[c] == (t_text[c][1:] if prefix_space and not s_text[c].startswith(b" ") else t_text[c]), (
+            c,
+            s_text[c],
+            t_text[c],
+        )
         if ch.keep[c] and s_text[c]:
             assert not s_text[c].isspace()
     # chunk ids increase along both sequences
@@ -97,7 +100,7 @@ def test_token_bytes_spell_the_text(name):
     for text in TEXTS:
         ids = tok.encode(text, add_special_tokens=False)
         spelled = b"".join(table[i] for i in ids)
-        if name == MISTRAL:     # SentencePiece prefixes a space to the text
+        if name == MISTRAL:  # SentencePiece prefixes a space to the text
             assert spelled.lstrip(b" ") == text.encode().lstrip(b" ")
         else:
             assert spelled == text.encode()
@@ -110,7 +113,7 @@ def test_vocab_map_matches_spellings():
     mapping = vocab_map(s_bytes, t_bytes)
     assert len(mapping) == len(t)
     mapped = [i for i, m in enumerate(mapping) if m >= 0]
-    assert len(mapped) > 0.5 * len(t)          # most of SmolLM2's pieces exist in Qwen3's vocabulary
+    assert len(mapped) > 0.5 * len(t)  # most of SmolLM2's pieces exist in Qwen3's vocabulary
     for i in mapped[:: max(1, len(mapped) // 500)]:
         assert s_bytes[mapping[i]] == t_bytes[i]
     the = t.encode(" the", add_special_tokens=False)
@@ -142,12 +145,12 @@ def test_non_canonical_student_tokenization():
     s = tokenizer(QWEN3)
     text = "hello world, unbelievable 🙂"
     canonical = s.encode(text, add_special_tokens=False)
-    by_char = [t for ch in text for t in s.encode(ch, add_special_tokens=False)]   # one piece per character
+    by_char = [t for ch in text for t in s.encode(ch, add_special_tokens=False)]  # one piece per character
     assert by_char != canonical and s.decode(by_char) == text
     view = al.view([], by_char)
     check_chunks(al, by_char, view)
     t = tokenizer(SMOL)
-    assert view.input_ids == t.encode(text, add_special_tokens=False)      # the teacher sees its own canonical ids
+    assert view.input_ids == t.encode(text, add_special_tokens=False)  # the teacher sees its own canonical ids
     assert all(c >= 0 for c in view.chunks.student)
     # the student sampled " " and "🙂" separately; SmolLM2's first piece of " 🙂" spans the space and
     # half the emoji, so both student tokens fall in one chunk
@@ -159,14 +162,14 @@ def test_truncated_utf8_and_mid_completion_specials():
     al = aligner(QWEN3, QWEN35)
     s = tokenizer(QWEN3)
     head = s.encode("ok ", add_special_tokens=False)
-    emoji = [s.convert_tokens_to_ids(p) for p in ["ð", "Ł", "Ļ", "Ĥ"]]      # 🙂 byte by byte
+    emoji = [s.convert_tokens_to_ids(p) for p in ["ð", "Ł", "Ļ", "Ĥ"]]  # 🙂 byte by byte
     im_start = s.convert_tokens_to_ids("<|im_start|>")
     # completion hit the length limit in the middle of the emoji: its bytes are left out
     completion = head + [im_start] + emoji[:2]
     view = al.view([], completion)
     check_chunks(al, completion, view)
-    assert view.chunks.student[len(head)] == -1                     # the special token carries no text
-    assert view.chunks.student[-2:] == [-1, -1]                     # incomplete UTF-8 at the end
+    assert view.chunks.student[len(head)] == -1  # the special token carries no text
+    assert view.chunks.student[-2:] == [-1, -1]  # incomplete UTF-8 at the end
     assert tokenizer(QWEN35).decode(view.input_ids) == "ok "
     # the complete emoji aligns
     view = al.view([], head + emoji)

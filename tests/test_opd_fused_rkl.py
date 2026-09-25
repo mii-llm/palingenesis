@@ -107,12 +107,15 @@ def test_supported_for_bias_free_heads_with_any_transform_without_swap():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or fused_rkl.triton is None, reason="needs CUDA and Triton")
-@pytest.mark.parametrize("v_s, v_t, n_shared, transforms", [
-    (248320, 248320, 248320, TRANSFORMS[0]),                 # Qwen3.5
-    (151936, 151669, 151643, TRANSFORMS[0]),                 # a student-only tail
-    (256000, 256000, 256000, ((1.0, 30.0), (1.0, 30.0))),    # Gemma 2: softcap 30
-    (49159, 49159, 49159, ((0.125, None), (0.0625, None))),  # Granite 3.3 2B / 8B: logits_scaling 8 / 16
-])
+@pytest.mark.parametrize(
+    "v_s, v_t, n_shared, transforms",
+    [
+        (248320, 248320, 248320, TRANSFORMS[0]),  # Qwen3.5
+        (151936, 151669, 151643, TRANSFORMS[0]),  # a student-only tail
+        (256000, 256000, 256000, ((1.0, 30.0), (1.0, 30.0))),  # Gemma 2: softcap 30
+        (49159, 49159, 49159, ((0.125, None), (0.0625, None))),  # Granite 3.3 2B / 8B: logits_scaling 8 / 16
+    ],
+)
 def test_triton_kernels_match_fp64(v_s, v_t, n_shared, transforms):
     """The kernels on fp32 logits against the fused math in fp64, at real vocabulary sizes."""
     (m_s, c_s), (m_t, c_t) = transforms
@@ -121,19 +124,24 @@ def test_triton_kernels_match_fp64(v_s, v_t, n_shared, transforms):
     g = torch.Generator(device="cuda").manual_seed(0)
     rows = 64
     zs = torch.randn(rows, v_s, device="cuda", generator=g) * 4
-    zt = zs[:, :v_t] + torch.randn(rows, v_t, device="cuda", generator=g) if v_t <= v_s else \
-        torch.randn(rows, v_t, device="cuda", generator=g) * 4
+    zt = (
+        zs[:, :v_t] + torch.randn(rows, v_t, device="cuda", generator=g)
+        if v_t <= v_s
+        else torch.randn(rows, v_t, device="cuda", generator=g) * 4
+    )
     targets = torch.randint(0, n_shared, (rows,), device="cuda", generator=g)
     weights = torch.rand(rows, device="cuda", generator=g)
-    zs, zt = zs / m_s, zt / m_t                              # logits of the usual scale after the transform
+    zs, zt = zs / m_s, zt / m_t  # logits of the usual scale after the transform
     stats, grad = fused_rkl._slice_triton(zs, zt, targets, weights, n_shared, torch.float32, student, teacher)
-    ref_stats, ref_grad = fused_rkl._slice_torch(zs.double(), zt.double(), targets, weights.double(), n_shared,
-                                                 torch.float64, student, teacher)
+    ref_stats, ref_grad = fused_rkl._slice_torch(
+        zs.double(), zt.double(), targets, weights.double(), n_shared, torch.float64, student, teacher
+    )
     fp32_stats, fp32_grad = fused_rkl._slice_torch(zs, zt, targets, weights, n_shared, torch.float32, student, teacher)
     torch.testing.assert_close(stats.double(), ref_stats, rtol=1e-5, atol=2e-5)
 
     def norm_error(grad):
         return ((grad.double() - ref_grad).norm() / ref_grad.norm()).item()
+
     # as exact as fp32 allows: within a small factor of the same math in fp32 torch (~1e-6)
     assert norm_error(grad) < 2 * norm_error(fp32_grad) + 1e-7
 
@@ -144,20 +152,28 @@ def test_fused_on_gpu_is_closer_to_fp64_than_autocast():
     hidden, head, t_hidden, t_head, weights = setup(300, 256, 50000, 50000, device="cuda", dtype=torch.float32)
     targets = torch.randint(0, 50000, (300,), device="cuda")
     weights = weights / 300
-    h, w, th, tw = (t.detach().double().requires_grad_(i < 2)
-                    for i, t in enumerate((hidden, head.weight, t_hidden, t_head.weight)))
+    h, w, th, tw = (
+        t.detach().double().requires_grad_(i < 2) for i, t in enumerate((hidden, head.weight, t_hidden, t_head.weight))
+    )
     lq, lp = F.log_softmax(h @ w.T, -1), F.log_softmax(th @ tw.T, -1)
     want = (weights.double() * (lq.exp() * (lq - lp)).sum(-1)).sum()
     want_grads = torch.autograd.grad(want, [h, w])
 
     def errors(loss):
-        return [abs(loss.item() / want.item() - 1)] + [((a.double() - b).norm() / b.norm()).item()
-                                                       for a, b in zip(grads(loss, hidden, head), want_grads)]
+        return [abs(loss.item() / want.item() - 1)] + [
+            ((a.double() - b).norm() / b.norm()).item() for a, b in zip(grads(loss, hidden, head), want_grads)
+        ]
 
     fused, _ = fused_rkl.fused_full_rkl(hidden, head, t_hidden, t_head, targets, weights, 50000, rows=128)
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        generic, _ = losses.full_rkl(hidden, head, targets, weights, losses.SharedVocab(50000),
-                                     lambda a, b: torch.log_softmax(t_head(t_hidden[a:b]).float(), -1))
+        generic, _ = losses.full_rkl(
+            hidden,
+            head,
+            targets,
+            weights,
+            losses.SharedVocab(50000),
+            lambda a, b: torch.log_softmax(t_head(t_hidden[a:b]).float(), -1),
+        )
     ours, autocast = errors(fused), errors(generic)
     assert ours[0] < 1e-5 and max(ours[1:]) < 0.02
     assert all(o < a for o, a in zip(ours, autocast))

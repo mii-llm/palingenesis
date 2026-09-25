@@ -449,7 +449,7 @@ class HealthMonitor:
             logger.warning(f"Low stable rank detected: {min(stable_ranks.values()):.1f} — collapse risk")
         if layer_norms and max(norms) / max(min(norms), 1e-8) > 100:
             warnings += 1
-            logger.warning(f"Weight norm imbalance: {max(norms)/max(min(norms),1e-8):.0f}x ratio across layers")
+            logger.warning(f"Weight norm imbalance: {max(norms) / max(min(norms), 1e-8):.0f}x ratio across layers")
         if "health/weight_drift_max" in metrics and metrics["health/weight_drift_max"] > 0.5:
             warnings += 1
             logger.warning(f"High weight drift from init: {metrics['health/weight_drift_max']:.1%}")

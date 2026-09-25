@@ -88,8 +88,9 @@ def autopilot(
         num_layers = getattr(model_cfg, "num_hidden_layers", 32)
         model_params_b = (num_layers * (12 * hidden_size**2) + vocab_size * hidden_size * 2) / 1e9
 
-        recommended = auto_config(model_params_b, seq_length, vocab_size, hardware,
-                                  hidden_size=hidden_size, num_layers=num_layers)
+        recommended = auto_config(
+            model_params_b, seq_length, vocab_size, hardware, hidden_size=hidden_size, num_layers=num_layers
+        )
 
         # Estimate optimal LR from scaling laws (used as sweep center point)
         effective_batch_tokens = (
@@ -113,7 +114,7 @@ def autopilot(
             f"  Auto-config: batch={recommended['train.per_device_batch_size']}, "
             f"grad_accum={recommended['train.gradient_accumulation_steps']}"
         )
-        logger.info(f"  Phase 1 done ({time.perf_counter()-t0:.1f}s)")
+        logger.info(f"  Phase 1 done ({time.perf_counter() - t0:.1f}s)")
     else:
         recommended = state["recommended"]
         logger.info("[Phase 1] Profile: cached, skipping")
@@ -201,6 +202,7 @@ def autopilot(
                 result = TrialResult(lr=lr, final_loss=float("inf"), initial_loss=0.0)
                 try:
                     from palingenesis.train import train as full_train
+
                     full_train(trial_cfg)
 
                     # Extract loss curve from output (best-effort)
@@ -213,6 +215,7 @@ def autopilot(
                         trial_model_path = Path(trial_dir)
 
                     from transformers import AutoModelForCausalLM as AMLM
+
                     trial_model = AMLM.from_pretrained(
                         trial_model_path,
                         torch_dtype=torch.bfloat16,
@@ -267,15 +270,16 @@ def autopilot(
             sweep_results = []
 
         state["best_lr"] = best_lr
-        state["sweep_results"] = [
-            {"lr": r.lr, "final_loss": r.final_loss, "score": r.score, "diverged": r.diverged}
-            for r in sweep_results
-        ] if sweep_results else []
+        state["sweep_results"] = (
+            [{"lr": r.lr, "final_loss": r.final_loss, "score": r.score, "diverged": r.diverged} for r in sweep_results]
+            if sweep_results
+            else []
+        )
         state.setdefault("completed_phases", []).append("lr_sweep")
         _save_state(state, state_path)
 
         logger.info(f"  Best LR: {best_lr:.1e}")
-        logger.info(f"  Phase 2 done ({time.perf_counter()-t0:.1f}s)")
+        logger.info(f"  Phase 2 done ({time.perf_counter() - t0:.1f}s)")
     else:
         best_lr = state["best_lr"]
         logger.info(f"[Phase 2] LR Sweep: cached (best_lr={best_lr:.1e}), skipping")
@@ -323,7 +327,7 @@ def autopilot(
         ]
         state.setdefault("completed_phases", []).append("ablation")
         _save_state(state, state_path)
-        logger.info(f"  Phase 2.5 done ({time.perf_counter()-t0:.1f}s)")
+        logger.info(f"  Phase 2.5 done ({time.perf_counter() - t0:.1f}s)")
     elif do_ablation:
         logger.info("[Phase 2.5] Ablations: cached, skipping")
 

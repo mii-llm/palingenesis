@@ -23,10 +23,19 @@ def tiny_model(tmp_path, tokenizer_name, name, seed):
     except Exception as e:  # noqa: BLE001 — offline or not cached
         pytest.skip(f"tokenizer {tokenizer_name} unavailable: {e}")
     torch.manual_seed(seed)
-    config = transformers.Qwen3Config(vocab_size=len(tok), hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                                      num_attention_heads=2, num_key_value_heads=1, head_dim=16,
-                                      max_position_embeddings=1024, tie_word_embeddings=True,
-                                      eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
+    config = transformers.Qwen3Config(
+        vocab_size=len(tok),
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        max_position_embeddings=1024,
+        tie_word_embeddings=True,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
     path = tmp_path / name
     transformers.Qwen3ForCausalLM(config).save_pretrained(path)
     tok.save_pretrained(path)
@@ -36,14 +45,18 @@ def tiny_model(tmp_path, tokenizer_name, name, seed):
 @pytest.fixture(scope="module")
 def models(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("opd_models")
-    return {"student": tiny_model(tmp, "Qwen/Qwen3-0.6B", "student", 0),
-            "same": tiny_model(tmp, "Qwen/Qwen3-0.6B", "teacher_same", 1),
-            "other": tiny_model(tmp, "Qwen/Qwen3.5-0.8B", "teacher_other", 2)}
+    return {
+        "student": tiny_model(tmp, "Qwen/Qwen3-0.6B", "student", 0),
+        "same": tiny_model(tmp, "Qwen/Qwen3-0.6B", "teacher_same", 1),
+        "other": tiny_model(tmp, "Qwen/Qwen3.5-0.8B", "teacher_other", 2),
+    }
 
 
 def write_prompts(path, n=24):
-    rows = [{"messages": [{"role": "user", "content": f"What is {i} plus {i + 1}?"}], "answer": str(2 * i + 1)}
-            for i in range(n)]
+    rows = [
+        {"messages": [{"role": "user", "content": f"What is {i} plus {i + 1}?"}], "answer": str(2 * i + 1)}
+        for i in range(n)
+    ]
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     return str(path)
 
@@ -54,17 +67,30 @@ def make_config(tmp_path, models, **teacher_losses):
     config = OPDConfig()
     prompts = write_prompts(tmp_path / "prompts.jsonl")
     settings = {
-        "model.student": models["student"], "model.chat_template_kwargs": {"enable_thinking": False},
+        "model.student": models["student"],
+        "model.chat_template_kwargs": {"enable_thinking": False},
         # Liger patches the model classes process-wide; later tests here run Qwen3 on the CPU
         "model.use_liger_kernel": False,
-        "teachers.same.model": models["same"], "teachers.other.model": models["other"],
-        "sources.math.path": prompts, "sources.math.teacher": "same", "sources.math.max_new_tokens": 8,
+        "teachers.same.model": models["same"],
+        "teachers.other.model": models["other"],
+        "sources.math.path": prompts,
+        "sources.math.teacher": "same",
+        "sources.math.max_new_tokens": 8,
         "sources.math.dev_size": 4,
-        "sources.chat.path": prompts, "sources.chat.teacher": "other", "sources.chat.max_new_tokens": 8,
+        "sources.chat.path": prompts,
+        "sources.chat.teacher": "other",
+        "sources.chat.max_new_tokens": 8,
         "sources.chat.dev_size": 4,
-        "rollout.batch_prompts": 6, "rollout.group_size": 2, "loss.xtok_dense_weight": 0.5,
-        "train.output_dir": str(tmp_path / "run"), "train.steps": 2, "train.learning_rate": 1e-3,
-        "train.warmup_steps": 1, "train.eval_every": 1, "train.eval_samples": 4, "train.score_micro_seqs": 4,
+        "rollout.batch_prompts": 6,
+        "rollout.group_size": 2,
+        "loss.xtok_dense_weight": 0.5,
+        "train.output_dir": str(tmp_path / "run"),
+        "train.steps": 2,
+        "train.learning_rate": 1e-3,
+        "train.warmup_steps": 1,
+        "train.eval_every": 1,
+        "train.eval_samples": 4,
+        "train.score_micro_seqs": 4,
     }
     for name, loss in teacher_losses.items():
         settings[f"teachers.{name}.loss"] = loss
@@ -84,17 +110,17 @@ def test_multi_teacher_training_run(tmp_path, models, caplog):
 
     steps = [m for kind, _, m in logged if kind == "step"]
     evals = [m for kind, _, m in logged if kind == "eval"]
-    assert len(steps) == 2 and len(evals) == 3                  # before, after step 1, final
+    assert len(steps) == 2 and len(evals) == 3  # before, after step 1, final
     for metrics in steps:
         assert metrics["staleness"] == 0 and metrics["dropped_samples"] == 0
         assert metrics["rollout_tokens"] > 0 and metrics["grad_norm"] > 0
         routed = [k for k in metrics if k.startswith("tokens/")]
         assert routed and set(routed) <= {"tokens/same", "tokens/other"}
     both = {k.split("/")[1] for m in steps for k in m if k.startswith("kl/")}
-    assert both == {"same", "other"}                            # each source's prompts went to its teacher
-    assert any("dense_kl/other" in m for m in steps)            # xtok's dense term (xtok_dense_weight 0.5)
+    assert both == {"same", "other"}  # each source's prompts went to its teacher
+    assert any("dense_kl/other" in m for m in steps)  # xtok's dense term (xtok_dense_weight 0.5)
     assert {"dev_kl/math", "dev_kl_full/math", "dev_kl/chat", "dev_acc/math"} <= set(evals[0])
-    assert "dev_kl_full/chat" not in evals[0]                   # xtok has no exact KL
+    assert "dev_kl_full/chat" not in evals[0]  # xtok has no exact KL
 
     saved = tmp_path / "run" / "final"
     reloaded = transformers.AutoModelForCausalLM.from_pretrained(saved)
@@ -130,8 +156,10 @@ def test_score_pool_reads_the_option_letter_logits(models):
 
     tok = transformers.AutoTokenizer.from_pretrained(models["same"])
     model = transformers.AutoModelForCausalLM.from_pretrained(models["same"]).eval()
-    rows = [{"question": f"Q{i}?", "options": [("A", "x"), ("B", "y"), ("C", "z")], "answer": "B",
-             "category": "c"} for i in range(5)]
+    rows = [
+        {"question": f"Q{i}?", "options": [("A", "x"), ("B", "y"), ("C", "z")], "answer": "B", "category": "c"}
+        for i in range(5)
+    ]
     letters = letter_token_ids(tok)
     scored = list(score_rows(model, tok, rows, [], letters, batch_size=2, device="cpu"))
     for row, out in zip(rows, scored):
@@ -153,7 +181,7 @@ def test_hf_rollout_records_the_sampling_log_probs(models):
     for prompt, rollout in zip(prompts, rollouts):
         ids = torch.tensor([prompt + rollout.completion_ids])
         with torch.no_grad():
-            logits = model(ids).logits[0, len(prompt) - 1: -1] / 0.7
+            logits = model(ids).logits[0, len(prompt) - 1 : -1] / 0.7
         want = torch.log_softmax(logits.float(), -1).gather(1, torch.tensor(rollout.completion_ids)[:, None])
         torch.testing.assert_close(torch.tensor(rollout.logprobs), want.squeeze(1), atol=1e-4, rtol=1e-4)
     assert all(r.finish_reason in ("stop", "length") for r in rollouts)
@@ -180,7 +208,7 @@ def test_resume_continues_from_the_checkpoint(tmp_path, models):
     assert (run / "step_2" / TRAINER_STATE_FILE).exists() and not (run / "final" / TRAINER_STATE_FILE).exists()
     saved = transformers.AutoModelForCausalLM.from_pretrained(run / "step_2")
     saved_state = torch.load(run / "step_2" / TRAINER_STATE_FILE, weights_only=False)
-    (run / "step_9").mkdir()                                    # a save interrupted before its trainer state
+    (run / "step_9").mkdir()  # a save interrupted before its trainer state
 
     resumed = OPDTrainer(config(4, resume_from="auto"))
     assert resumed.resume_path == str(run / "step_2") and resumed.start_step == 2
@@ -194,8 +222,8 @@ def test_resume_continues_from_the_checkpoint(tmp_path, models):
     resumed.train()
     steps = [(step, m) for kind, step, m in logged if kind == "step"]
     assert [step for step, _ in steps] == [3, 4]
-    assert all(m["staleness"] == 0 and m["dropped_samples"] == 0 for _, m in steps)   # no batch generated stale
-    assert steps[0][1]["lr"] == pytest.approx(resumed._lr_at(2)) != resumed._lr_at(0)   # the schedule continues
+    assert all(m["staleness"] == 0 and m["dropped_samples"] == 0 for _, m in steps)  # no batch generated stale
+    assert steps[0][1]["lr"] == pytest.approx(resumed._lr_at(2)) != resumed._lr_at(0)  # the schedule continues
     assert (run / "step_4" / TRAINER_STATE_FILE).exists()
 
 
@@ -204,13 +232,13 @@ def test_resume_from_path_needs_a_complete_checkpoint(tmp_path):
     from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, resolve_resume
 
     assert resolve_resume("", str(tmp_path)) is None
-    assert resolve_resume("auto", str(tmp_path / "missing")) is None                   # fresh start
+    assert resolve_resume("auto", str(tmp_path / "missing")) is None  # fresh start
     for step, complete in [(2, True), (10, True), (12, False)]:
         (tmp_path / f"step_{step}").mkdir()
         if complete:
             (tmp_path / f"step_{step}" / TRAINER_STATE_FILE).write_bytes(b"")
     (tmp_path / "final").mkdir()
-    assert resolve_resume("auto", str(tmp_path)) == str(tmp_path / "step_10")          # numeric, complete only
+    assert resolve_resume("auto", str(tmp_path)) == str(tmp_path / "step_10")  # numeric, complete only
     assert checkpoint_steps(str(tmp_path), complete=False)[-1] == str(tmp_path / "step_12")
     with pytest.raises(OPDConfigError, match="not a complete OPD checkpoint"):
         resolve_resume(str(tmp_path / "final"), str(tmp_path))
@@ -252,5 +280,8 @@ def test_token_weighting_rules():
     torch.testing.assert_close(run(token_weighting="sure", sure_alpha=0.5), weights * (1 + 0.5 * (1 - behaviour.exp())))
     kept = run(token_weighting="entropy", entropy_keep=0.3)
     from palingenesis.opd import losses
+
     entropy = losses.token_entropy(hidden, head)
-    assert (kept > 0).sum() == 3 and set((kept > 0).nonzero().flatten().tolist()) == set(entropy.topk(3).indices.tolist())
+    assert (kept > 0).sum() == 3 and set((kept > 0).nonzero().flatten().tolist()) == set(
+        entropy.topk(3).indices.tolist()
+    )

@@ -127,7 +127,7 @@ def generate_coarse_candidates(
         effective_batch_tokens = per_device_batch_size * max_seq_length * gradient_accumulation_steps * num_gpus
 
     # ── Model size factor: LR ∝ N^{-0.5} (Step Law, arxiv:2503.04715) ────
-    model_factor = model_params_b ** -0.5
+    model_factor = model_params_b**-0.5
 
     # ── Batch size factor: surge-aware (arxiv:2405.14578) ─────────────────
     batch_factor = _surge_aware_batch_factor(effective_batch_tokens)
@@ -145,7 +145,7 @@ def generate_coarse_candidates(
     candidates = [
         10 ** (log_center - 1.2),
         10 ** (log_center - 0.6),
-        10 ** log_center,
+        10**log_center,
         10 ** (log_center + 0.6),
         10 ** (log_center + 1.2),
     ]
@@ -199,7 +199,7 @@ def _surge_aware_batch_factor(effective_batch_tokens: int) -> float:
     # Normalized so f(1) = 1: f(1) = 1 / 2^1.5 = 0.354
     # So normalized_f(r) = [r / (1+r)^1.5] / [1 / 2^1.5]
     raw = ratio / (1 + ratio) ** 1.5
-    peak = 1.0 / (2.0 ** 1.5)  # value at ratio=1
+    peak = 1.0 / (2.0**1.5)  # value at ratio=1
     factor = raw / peak
 
     # The factor tells us how much to scale LR relative to B_crit reference:
@@ -246,7 +246,7 @@ def generate_refinement_candidates(
         # Span ±0.2 decades around the estimated minimum (tight refinement)
         candidates = [
             10 ** (log_min - 0.15),
-            10 ** log_min,
+            10**log_min,
             10 ** (log_min + 0.15),
         ][:n_refine]
         logger.info(
@@ -327,9 +327,7 @@ def _fit_parabola_minimum(results: list[TrialResult]) -> float | None:
     # |sum_x4  sum_x3  sum_x2| |a|   |sum_x2y|
     # |sum_x3  sum_x2  sum_x | |b| = |sum_xy |
     # |sum_x2  sum_x   n     | |c|   |sum_y  |
-    A = [[sum_x4, sum_x3, sum_x2],
-         [sum_x3, sum_x2, sum_x],
-         [sum_x2, sum_x, n]]
+    A = [[sum_x4, sum_x3, sum_x2], [sum_x3, sum_x2, sum_x], [sum_x2, sum_x, n]]
     B = [sum_x2y, sum_xy, sum_y]
 
     det = _det3(A)
@@ -345,7 +343,7 @@ def _fit_parabola_minimum(results: list[TrialResult]) -> float | None:
 
     # Minimum at x* = -b / (2a)
     x_min = -b / (2 * a)
-    lr_min = 10 ** x_min
+    lr_min = 10**x_min
 
     # Sanity: minimum should be within 1 decade of the observed range
     x_lo = min(xs)
@@ -356,9 +354,9 @@ def _fit_parabola_minimum(results: list[TrialResult]) -> float | None:
 
     # Compute R² to validate fit quality
     y_pred = [a * x**2 + b * x + (sum_y - a * sum_x2 - b * sum_x) / n for x in xs]
-    ss_res = sum((y - yp)**2 for y, yp in zip(ys, y_pred))
+    ss_res = sum((y - yp) ** 2 for y, yp in zip(ys, y_pred))
     y_mean = sum_y / n
-    ss_tot = sum((y - y_mean)**2 for y in ys)
+    ss_tot = sum((y - y_mean) ** 2 for y in ys)
     r_squared = 1 - ss_res / max(ss_tot, 1e-15) if ss_tot > 1e-15 else 0
 
     if r_squared < 0.7:
@@ -375,9 +373,11 @@ def _det3(matrix, col_replace: int | None = None) -> float:
         # This is a simplified interface — just compute det of 3x3
         pass
     m = matrix
-    return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -437,8 +437,7 @@ def estimate_horizon_exponent(results: list[TrialResult]) -> float:
     alpha = max(0.04, min(0.20, alpha))
 
     logger.info(
-        f"Adaptive horizon exponent: α={alpha:.3f} "
-        f"(base=0.062, curvature={curvature:.4f}, best LR={best.lr:.2e})"
+        f"Adaptive horizon exponent: α={alpha:.3f} (base=0.062, curvature={curvature:.4f}, best LR={best.lr:.2e})"
     )
     return alpha
 
@@ -571,7 +570,7 @@ def adaptive_lr_sweep(
     coarse_candidates = generate_coarse_candidates(model_params_b, effective_batch_tokens)
 
     for i, lr in enumerate(coarse_candidates[:n_coarse]):
-        logger.info(f"  [{i+1}/{n_coarse}] LR={lr:.2e}")
+        logger.info(f"  [{i + 1}/{n_coarse}] LR={lr:.2e}")
         t0 = time.perf_counter()
         result = run_trial_fn(lr, steps_per_trial)
         result.time_s = time.perf_counter() - t0
@@ -579,7 +578,7 @@ def adaptive_lr_sweep(
         all_results.append(result)
         logger.info(
             f"    loss: {result.initial_loss:.4f} -> {result.final_loss:.4f} "
-            f"(reduction={result.loss_reduction*100:.1f}%, {result.time_s:.1f}s)"
+            f"(reduction={result.loss_reduction * 100:.1f}%, {result.time_s:.1f}s)"
         )
 
     # ── Phase 2: Refinement ───────────────────────────────────────────────
@@ -591,7 +590,7 @@ def adaptive_lr_sweep(
         logger.info("=" * 50)
 
         for i, lr in enumerate(refine_candidates):
-            logger.info(f"  [{i+1}/{n_refine}] LR={lr:.2e}")
+            logger.info(f"  [{i + 1}/{n_refine}] LR={lr:.2e}")
             t0 = time.perf_counter()
             result = run_trial_fn(lr, steps_per_trial)
             result.time_s = time.perf_counter() - t0
@@ -619,9 +618,7 @@ def adaptive_lr_sweep(
     logger.info(f"  Best trial: LR={best.lr:.2e} (score={best.score:.4f})")
 
     # Adaptive horizon correction (replaces fixed 0.12)
-    corrected_lr = correct_lr_adaptive(
-        best.lr, steps_per_trial, full_training_steps, all_results
-    )
+    corrected_lr = correct_lr_adaptive(best.lr, steps_per_trial, full_training_steps, all_results)
 
     # Final clamping to sane SFT range
     corrected_lr = max(1e-6, min(5e-4, corrected_lr))

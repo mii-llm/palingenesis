@@ -11,8 +11,6 @@ Other lines also contain "step=" and "loss" (e.g. "Best model updated: step=10,
 eval_loss=0.3454"); only lines with a `loss=` key of their own count.
 """
 
-from __future__ import annotations
-
 import re
 
 _STEP = re.compile(r"(?:^|[\s|])step=(\d+)\s")
@@ -34,7 +32,7 @@ def parse_steps(text: str) -> list[dict]:
         m = _STEP.search(line)
         if not m:
             continue
-        fields = {k: _number(v) for k, v in _KV.findall(line[m.start():])}
+        fields = {k: _number(v) for k, v in _KV.findall(line[m.start() :])}
         if fields.get("loss") is None:
             continue
         fields = {k: v for k, v in fields.items() if v is not None}

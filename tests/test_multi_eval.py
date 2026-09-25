@@ -25,6 +25,7 @@ class TinyModel(nn.Module):
         from pathlib import Path
 
         from safetensors.torch import save_file
+
         Path(path).mkdir(parents=True, exist_ok=True)
         state = {k: v.contiguous() for k, v in self.state_dict().items()}
         save_file(state, str(Path(path) / "model.safetensors"))
@@ -177,7 +178,9 @@ def test_multi_eval_unknown_mode_skips():
 
     ev = MultiEvaluator(
         [{"name": "bad", "dataset": p, "mode": "nonsense", "weight": 1.0, "samples": 1, "split": "train"}],
-        FakeTok(), max_seq_length=32, device=torch.device("cpu"),
+        FakeTok(),
+        max_seq_length=32,
+        device=torch.device("cpu"),
     )
     assert ev.sources[0]["batches"] == []
     print("✓ test_multi_eval_unknown_mode_skips PASSED\n")
@@ -194,6 +197,7 @@ def test_multi_eval_best_model_integration():
         class FakeTokenizer:
             def save_pretrained(self, path):
                 from pathlib import Path
+
                 Path(path).mkdir(parents=True, exist_ok=True)
 
         model = TinyModel()

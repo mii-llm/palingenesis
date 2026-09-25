@@ -84,7 +84,7 @@ def _embed_texts(texts: Sequence[str], model_name: str, batch_size: int) -> np.n
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
-        raise ImportError("TFP requires sentence-transformers. Install with: " "pip install sentence-transformers")
+        raise ImportError("TFP requires sentence-transformers. Install with: pip install sentence-transformers")
 
     model = SentenceTransformer(model_name)
     # Truncate very long texts (embeddings don't benefit from >512 tokens)

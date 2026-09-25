@@ -19,8 +19,6 @@ token is fed to the teacher and when it is used as a scoring target.
 Tokenizers that do not share a vocabulary go through align.ByteChunkAligner.
 """
 
-from __future__ import annotations
-
 import logging
 from dataclasses import dataclass, field
 
@@ -35,7 +33,7 @@ DEFAULT_PROBE_TEXTS = (
     "The quick brown fox jumps over the lazy dog. 12,345.67!",
     "Perché città, così — l'aquila d'oro? È già qui: 'sì', naïve café.",
     "Wo wäre die größte Straße? ¿Dónde está la número três? Ç'est ça.",
-    "x = [n**2 for n in range(10)]  # docstring: \"answer: A\"",
+    'x = [n**2 for n in range(10)]  # docstring: "answer: A"',
 )
 
 
@@ -134,9 +132,7 @@ def check_compatible(
         s_ids = student_tok.encode(text, add_special_tokens=False)
         t_ids = teacher_tok.encode(text, add_special_tokens=False)
         if s_ids != t_ids:
-            raise TokenBridgeError(
-                f"Tokenizers diverge on shared text!\n{text!r}\nstudent={s_ids}\nteacher={t_ids}"
-            )
+            raise TokenBridgeError(f"Tokenizers diverge on shared text!\n{text!r}\nstudent={s_ids}\nteacher={t_ids}")
 
     for s_id, t_id in bridge.swap.items():
         if s_id < bridge.shared_vocab_size:

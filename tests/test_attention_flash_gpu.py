@@ -27,7 +27,8 @@ def test_flash_route_matches_reference(heads, kv_heads, head_dim, length):
     rep = heads // kv_heads
     qf, kf, vf = (t.detach().float().requires_grad_() for t in (q, k, v))
     ref = torch.nn.functional.scaled_dot_product_attention(
-        qf, kf.repeat_interleave(rep, 1), vf.repeat_interleave(rep, 1), is_causal=True)
+        qf, kf.repeat_interleave(rep, 1), vf.repeat_interleave(rep, 1), is_causal=True
+    )
     ref_grads = torch.autograd.grad(ref, (qf, kf, vf), dout.float())
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
     for got, want in zip(grads, ref_grads):

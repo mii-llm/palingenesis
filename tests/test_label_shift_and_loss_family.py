@@ -81,7 +81,7 @@ def test_shift_labels_perfect_predictor_gets_zero_loss():
         logits[0, t, tokens[t + 1]] = 10.0
     logits[0, S - 1, 0] = 10.0  # last position: irrelevant, gets masked
 
-    valid = (S - 1)
+    valid = S - 1
     loss_shifted = cross_entropy_loss(logits, shift_labels(labels), global_valid_tokens=valid)
     loss_unshifted = cross_entropy_loss(logits, labels, global_valid_tokens=S)
 
@@ -308,9 +308,7 @@ def test_chunked_deft_matches_unchunked_and_reports_ce():
     valid = (labels != IGNORE_INDEX).sum().item()
 
     stats: dict = {}
-    loss_chunked = chunked_deft_loss(
-        hidden, labels, lm_head, num_chunks=3, global_valid_tokens=valid, stats=stats
-    )
+    loss_chunked = chunked_deft_loss(hidden, labels, lm_head, num_chunks=3, global_valid_tokens=valid, stats=stats)
 
     logits = lm_head(hidden.detach())
     loss_ref = _deft_loss_fused(logits, labels) / valid

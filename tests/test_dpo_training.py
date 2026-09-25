@@ -50,28 +50,34 @@ def test_valid_dpo_config_passes():
     _dpo_config(loss_type="robust", label_smoothing=0.1).validate()
 
 
-@pytest.mark.parametrize("dpo,match", [
-    ({"loss_type": "kto"}, "loss_type"),
-    ({"beta": 0.0}, "beta"),
-    ({"loss_type": "robust", "label_smoothing": 0.5}, "label_smoothing"),
-    ({"label_smoothing": 0.1}, "only used by loss_type=robust"),
-    ({"ld_alpha": 1.5}, "ld_alpha"),
-    ({"sft_weight": -1.0}, "sft_weight"),
-])
+@pytest.mark.parametrize(
+    "dpo,match",
+    [
+        ({"loss_type": "kto"}, "loss_type"),
+        ({"beta": 0.0}, "beta"),
+        ({"loss_type": "robust", "label_smoothing": 0.5}, "label_smoothing"),
+        ({"label_smoothing": 0.1}, "only used by loss_type=robust"),
+        ({"ld_alpha": 1.5}, "ld_alpha"),
+        ({"sft_weight": -1.0}, "sft_weight"),
+    ],
+)
 def test_invalid_dpo_settings_raise(dpo, match):
     with pytest.raises(ConfigError, match=match):
         _dpo_config(**dpo).validate()
 
 
-@pytest.mark.parametrize("section,field,value", [
-    ("data", "packing", True),
-    ("data", "sources", [{"dataset": "x"}]),
-    ("data", "pretokenize", True),
-    ("data", "pretrain_replay_dataset", "some/corpus"),
-    ("parallel", "context_parallel", True),
-    ("plugins", "deft", True),
-    ("preprocess", "enabled", True),
-])
+@pytest.mark.parametrize(
+    "section,field,value",
+    [
+        ("data", "packing", True),
+        ("data", "sources", [{"dataset": "x"}]),
+        ("data", "pretokenize", True),
+        ("data", "pretrain_replay_dataset", "some/corpus"),
+        ("parallel", "context_parallel", True),
+        ("plugins", "deft", True),
+        ("preprocess", "enabled", True),
+    ],
+)
 def test_sft_only_features_are_rejected(section, field, value):
     config = _dpo_config()
     setattr(getattr(config, section), field, value)
@@ -105,15 +111,19 @@ def test_dataloader_yields_chosen_then_rejected(qwen_tokenizer):
     from datasets import Dataset
 
     rows = [
-        {**PAIR, "chosen": [{"role": "assistant", "content": f"answer {i}", "reasoning": f"why {i}"}],
-         "rejected": [{"role": "assistant", "content": f"bad {i} " * (i + 1)}],
-         "chat_template_kwargs": {"enable_thinking": i % 2 == 0}}
+        {
+            **PAIR,
+            "chosen": [{"role": "assistant", "content": f"answer {i}", "reasoning": f"why {i}"}],
+            "rejected": [{"role": "assistant", "content": f"bad {i} " * (i + 1)}],
+            "chat_template_kwargs": {"enable_thinking": i % 2 == 0},
+        }
         for i in range(6)
     ]
     config = _dpo_config()
     config.data.num_workers = 0
-    loader = build_preference_dataloader(Dataset.from_list(rows), qwen_tokenizer, config.data, config.dpo,
-                                         rank=0, world_size=1, batch_size=2)
+    loader = build_preference_dataloader(
+        Dataset.from_list(rows), qwen_tokenizer, config.data, config.dpo, rank=0, world_size=1, batch_size=2
+    )
     batches = list(loader)
     assert len(batches) == 3
     for batch in batches:
@@ -134,10 +144,17 @@ def _micro_step(model, ref_model, ids, mask, labels, *, world_size=1, current_ga
     global_chosen = (shift_labels(labels[:num_pairs]) != IGNORE_INDEX).sum()
     ref = reference_logps(ref_model, _get_hidden_states, _get_lm_head, ids, mask, labels, 2)
     hidden = _get_hidden_states(model, ids, mask, None)
-    return preference_step(hidden, labels, _get_lm_head(model), ref, num_pairs,
-                           pair_denom=num_pairs * world_size * current_ga,
-                           chosen_token_denom=max(global_chosen.item(), 1) * current_ga,
-                           num_chunks=2, **kw)
+    return preference_step(
+        hidden,
+        labels,
+        _get_lm_head(model),
+        ref,
+        num_pairs,
+        pair_denom=num_pairs * world_size * current_ga,
+        chosen_token_denom=max(global_chosen.item(), 1) * current_ga,
+        num_chunks=2,
+        **kw,
+    )
 
 
 def _grads(model):
@@ -149,16 +166,16 @@ def test_grad_accumulation_equals_one_big_batch(loss_type):
     """Two micro-batches with the GA denominator give the gradient of the mean
     loss over all their pairs — the same guarantee SFT's token denominator gives."""
     policy = _tiny_model()
-    with torch.no_grad():                      # move off the reference so the loss is non-trivial
+    with torch.no_grad():  # move off the reference so the loss is non-trivial
         for p in policy.parameters():
             p.add_(0.05 * torch.randn_like(p))
     ref = _tiny_model()
 
     ids, mask, labels = _toy_batch(num_pairs=4)
-    halves = [torch.cat([t[i:i + 2], t[4 + i:4 + i + 2]]) for i in (0, 2) for t in (ids, mask, labels)]
+    halves = [torch.cat([t[i : i + 2], t[4 + i : 4 + i + 2]]) for i in (0, 2) for t in (ids, mask, labels)]
     policy.zero_grad()
     for i in range(2):
-        a, m, lab = halves[3 * i: 3 * i + 3]
+        a, m, lab = halves[3 * i : 3 * i + 3]
         _micro_step(policy, ref, a, m, lab, current_ga=2, loss_type=loss_type).loss.backward()
     accumulated = _grads(policy).clone()
 
@@ -172,7 +189,7 @@ def test_a_few_steps_learn_the_preference():
     """End to end on CPU: frozen reference, AdamW, the trainer's micro-step."""
     policy = _tiny_model().float().train()
     ref = copy.deepcopy(policy).eval().requires_grad_(False)
-    assert disable_dropout(policy) > 0          # GPT-2 has dropout; the trainer zeroes it
+    assert disable_dropout(policy) > 0  # GPT-2 has dropout; the trainer zeroes it
     ids, mask, labels = _toy_batch(num_pairs=3)
     opt = torch.optim.AdamW(policy.parameters(), lr=1e-2)
     first = None
@@ -182,7 +199,7 @@ def test_a_few_steps_learn_the_preference():
         opt.step()
         opt.zero_grad()
         first = first if first is not None else step.metrics
-    assert abs(first["dpo/loss"] - math.log(2)) < 1e-6     # policy == reference at step 0
+    assert abs(first["dpo/loss"] - math.log(2)) < 1e-6  # policy == reference at step 0
     assert step.metrics["dpo/loss"] < 0.3
     assert step.metrics["rewards/accuracies"] == 1.0
     assert step.metrics["rewards/chosen"] > 0 > step.metrics["rewards/rejected"]
@@ -195,15 +212,22 @@ def test_a_few_steps_learn_the_preference():
 
 def _evaluator(ids, mask, labels, **kw):
     batch = {"input_ids": ids, "attention_mask": mask, "labels": labels}
-    return PreferenceEvaluator([batch], loss_type=kw.get("loss_type", "sigmoid"), beta=0.1,
-                               label_smoothing=0.0, ld_alpha=kw.get("ld_alpha"), num_chunks_for=lambda n: 3)
+    return PreferenceEvaluator(
+        [batch],
+        loss_type=kw.get("loss_type", "sigmoid"),
+        beta=0.1,
+        label_smoothing=0.0,
+        ld_alpha=kw.get("ld_alpha"),
+        num_chunks_for=lambda n: 3,
+    )
 
 
 def test_evaluator_at_the_reference_policy():
     model = _tiny_model()
     ids, mask, labels = _toy_batch()
-    metrics = _evaluator(ids, mask, labels).evaluate(model, copy.deepcopy(model), _get_hidden_states,
-                                                     _get_lm_head, torch.device("cpu"), torch.float64, False)
+    metrics = _evaluator(ids, mask, labels).evaluate(
+        model, copy.deepcopy(model), _get_hidden_states, _get_lm_head, torch.device("cpu"), torch.float64, False
+    )
     assert abs(metrics["eval/loss"] - math.log(2)) < 1e-12
     assert metrics["eval/rewards/margins"] == 0.0
     assert metrics["eval/rewards/accuracies"] == 0.0
@@ -217,8 +241,9 @@ def test_evaluator_matches_direct_computation(ld_alpha):
             p.add_(0.05 * torch.randn_like(p))
     ids, mask, labels = _toy_batch()
     evaluator = _evaluator(ids, mask, labels, ld_alpha=ld_alpha)
-    metrics = evaluator.evaluate(policy, ref, _get_hidden_states, _get_lm_head,
-                                 torch.device("cpu"), torch.float64, False)
+    metrics = evaluator.evaluate(
+        policy, ref, _get_hidden_states, _get_lm_head, torch.device("cpu"), torch.float64, False
+    )
 
     shifted = shift_labels(labels)
     a = score_weights(shifted, 3, ld_alpha)
@@ -228,8 +253,7 @@ def test_evaluator_matches_direct_computation(ld_alpha):
     expected = preference_loss(s_pol, s_ref, a.sum(1), beta=0.1).mean()
     assert abs(metrics["eval/loss"] - float(expected)) < 1e-12
     # the reference is scored once and cached; a second call must agree exactly
-    again = evaluator.evaluate(policy, ref, _get_hidden_states, _get_lm_head,
-                               torch.device("cpu"), torch.float64, False)
+    again = evaluator.evaluate(policy, ref, _get_hidden_states, _get_lm_head, torch.device("cpu"), torch.float64, False)
     assert again == metrics
 
 
@@ -240,5 +264,6 @@ def test_collated_eval_batch_round_trips(qwen_tokenizer):
     pairs = [ds.process(PAIR), ds.process({**PAIR, "rejected": "totally different"})]
     batch = collate_preferences(pairs, qwen_tokenizer.pad_token_id, pad_to_multiple=64)
     assert batch["input_ids"].shape[0] == 4
-    assert torch.equal(batch["input_ids"][0, : pairs[0]["chosen"]["input_ids"].numel()],
-                       pairs[0]["chosen"]["input_ids"])
+    assert torch.equal(
+        batch["input_ids"][0, : pairs[0]["chosen"]["input_ids"].numel()], pairs[0]["chosen"]["input_ids"]
+    )

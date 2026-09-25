@@ -219,9 +219,7 @@ def test_eval_chunked_ce_matches_oneshot():
     labels = torch.randint(0, V, (B, S))
     labels[:, :5] = IGNORE_INDEX  # masked context tokens must be ignored
 
-    oneshot = F.cross_entropy(
-        logits.view(-1, V).float(), labels.view(-1), reduction="sum", ignore_index=IGNORE_INDEX
-    )
+    oneshot = F.cross_entropy(logits.view(-1, V).float(), labels.view(-1), reduction="sum", ignore_index=IGNORE_INDEX)
     # Chunk size deliberately not a divisor of B*S (=120) to exercise the tail
     chunked = _chunked_ce_sum(logits, labels, chunk_tokens=32)
 
@@ -264,12 +262,16 @@ def test_full_optimizer_stack():
     reduction = 1 - (sum(losses[-5:]) / 5) / (sum(losses[:5]) / 5)
     for p, r in zip(constrained, radii):
         assert abs(p.data.norm().item() - r) / r < 1e-5
-    assert reduction > 0.1, f"Should converge >10%, got {reduction*100:.1f}%"
+    assert reduction > 0.1, f"Should converge >10%, got {reduction * 100:.1f}%"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "MONA (arxiv:2605.26842) makes this task diverge even on plain AdamW without Hyperball "
-    "(measured: AdamW +15.3% loss reduction, AdamW+MONA -19.4%); not yet investigated."))
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "MONA (arxiv:2605.26842) makes this task diverge even on plain AdamW without Hyperball "
+        "(measured: AdamW +15.3% loss reduction, AdamW+MONA -19.4%); not yet investigated."
+    ),
+)
 def test_mona_converges_on_adamw():
     from palingenesis.optim import MONAAcceleration
 
@@ -501,11 +503,11 @@ def test_all_schedulers_produce_valid_lr():
         # LR should never exceed peak (within floating point)
         assert max_lr <= peak_lr + 1e-10, f"{sched_type}: max_lr={max_lr} > peak={peak_lr}"
         # LR should never go below min_lr_ratio * peak (within tolerance)
-        assert min_lr >= peak_lr * min_ratio - 1e-10, f"{sched_type}: min_lr={min_lr} < floor={peak_lr*min_ratio}"
+        assert min_lr >= peak_lr * min_ratio - 1e-10, f"{sched_type}: min_lr={min_lr} < floor={peak_lr * min_ratio}"
         # LR should be monotonically non-increasing after warmup
         post_warmup = lrs[20:]
         for i in range(1, len(post_warmup)):
-            assert post_warmup[i] <= post_warmup[i - 1] + 1e-10, f"{sched_type}: non-monotonic at step {20+i}"
+            assert post_warmup[i] <= post_warmup[i - 1] + 1e-10, f"{sched_type}: non-monotonic at step {20 + i}"
 
     print("  All 5 scheduler types: valid range, monotonic after warmup")
     print("✓ test_all_schedulers_produce_valid_lr PASSED\n")
@@ -626,10 +628,10 @@ def test_mini_training_loop():
     last_5 = sum(losses[-5:]) / 5
     reduction = 1 - last_5 / first_5
 
-    assert reduction > 0.1, f"Loss should decrease by >10%, got {reduction*100:.1f}%"
+    assert reduction > 0.1, f"Loss should decrease by >10%, got {reduction * 100:.1f}%"
     assert all(math.isfinite(x) for x in losses), "No NaN/Inf losses"
 
-    print(f"  Initial: {first_5:.4f}, Final: {last_5:.4f}, Reduction: {reduction*100:.1f}%")
+    print(f"  Initial: {first_5:.4f}, Final: {last_5:.4f}, Reduction: {reduction * 100:.1f}%")
     print("✓ test_mini_training_loop PASSED\n")
 
 

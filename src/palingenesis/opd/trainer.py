@@ -15,8 +15,6 @@ Launch:
     python -m palingenesis.opd.trainer --config configs/distill_math.yaml
 """
 
-from __future__ import annotations
-
 import dataclasses
 import json
 import logging
@@ -55,7 +53,7 @@ from palingenesis.seco import use_chunk_attention
 
 logger = logging.getLogger(__name__)
 
-TRAINER_STATE_FILE = "trainer_state.pt"     # written last: its presence marks a complete checkpoint
+TRAINER_STATE_FILE = "trainer_state.pt"  # written last: its presence marks a complete checkpoint
 
 SHARED_VOCAB_LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "rs_kd")
 
@@ -124,11 +122,17 @@ class OPDTrainer:
             bridge = shared_vocab_bridge(self.tok, teacher_toks[name], teacher, name)
             kind = teacher.loss or ("xtok" if bridge is None else "full_rkl" if teacher.backend == "hf" else "topk_kl")
             if kind == "xtok":
-                aligners[name] = ByteChunkAligner(self.tok, teacher_toks[name], self.stop_ids,
-                                                  end_of_turn_id(teacher_toks[name], chat_kwargs),
-                                                  config.loss.mask_whitespace)
+                aligners[name] = ByteChunkAligner(
+                    self.tok,
+                    teacher_toks[name],
+                    self.stop_ids,
+                    end_of_turn_id(teacher_toks[name], chat_kwargs),
+                    config.loss.mask_whitespace,
+                )
                 if bridge is not None:
-                    logger.warning("teachers.%s shares the student's vocabulary; xtok works but full_rkl is exact", name)
+                    logger.warning(
+                        "teachers.%s shares the student's vocabulary; xtok works but full_rkl is exact", name
+                    )
             else:
                 aligners[name] = SharedVocabAligner(bridge, self.stop_ids)
             self.kinds[name] = kind
@@ -143,19 +147,38 @@ class OPDTrainer:
             import importlib.util
 
             if not rollout.url and importlib.util.find_spec("ray") is None:
-                raise OPDConfigError("rollout.backend vllm_server: vLLM's weight transfer into the server it "
-                                     "launches needs ray. Install it with: pip install 'palingenesis[vllm-server]'")
-            server = self._server(config.model.student, rollout.url, "rollout", [
-                "--gpu-memory-utilization", str(rollout.gpu_memory_utilization),
-                "--max-model-len", str(rollout.max_model_len), "--logprobs-mode", "processed_logprobs",
-                "--weight-transfer-config", '{"backend": "ipc"}', *(["--enforce-eager"] if rollout.enforce_eager else []),
-                *(["--enable-prefix-caching"] if rollout.prefix_caching else []),
-                # a launched server cannot retry a limit its memory refuses: explicit settings only
-                *(["--max-num-seqs", str(rollout.max_num_seqs)] if rollout.max_num_seqs > 0 else [])])
+                raise OPDConfigError(
+                    "rollout.backend vllm_server: vLLM's weight transfer into the server it "
+                    "launches needs ray. Install it with: pip install 'palingenesis[vllm-server]'"
+                )
+            server = self._server(
+                config.model.student,
+                rollout.url,
+                "rollout",
+                [
+                    "--gpu-memory-utilization",
+                    str(rollout.gpu_memory_utilization),
+                    "--max-model-len",
+                    str(rollout.max_model_len),
+                    "--logprobs-mode",
+                    "processed_logprobs",
+                    "--weight-transfer-config",
+                    '{"backend": "ipc"}',
+                    *(["--enforce-eager"] if rollout.enforce_eager else []),
+                    *(["--enable-prefix-caching"] if rollout.prefix_caching else []),
+                    # a launched server cannot retry a limit its memory refuses: explicit settings only
+                    *(["--max-num-seqs", str(rollout.max_num_seqs)] if rollout.max_num_seqs > 0 else []),
+                ],
+            )
 
-        if config.model.use_liger_kernel and self.device == "cuda":     # patches classes: before any model loads
-            for model_type in sorted({model_type_of(m) for m in [config.model.student] + [
-                    t.model for t in config.teachers.values() if t.backend == "hf"]} - {None}):
+        if config.model.use_liger_kernel and self.device == "cuda":  # patches classes: before any model loads
+            for model_type in sorted(
+                {
+                    model_type_of(m)
+                    for m in [config.model.student] + [t.model for t in config.teachers.values() if t.backend == "hf"]
+                }
+                - {None}
+            ):
                 apply_liger_kernel(model_type)
         self.resume_path = resolve_resume(config.train.resume_from, config.train.output_dir)
         student_path = self.resume_path or config.model.student
@@ -165,39 +188,58 @@ class OPDTrainer:
             self.student.gradient_checkpointing_enable()
         self.head = output_head(self.student)
         verify_output_head(self.student, self.head)
-        use_chunk_attention(self.student)       # fused attention under autocast (fp32 master weights)
+        use_chunk_attention(self.student)  # fused attention under autocast (fp32 master weights)
         for name, teacher in config.teachers.items():
             if teacher.backend == "hf":
-                teachers[name] = HFTeacher(teacher.model, teacher.device or self.device, teacher.offload,
-                                           seed=config.train.seed)
+                teachers[name] = HFTeacher(
+                    teacher.model, teacher.device or self.device, teacher.offload, seed=config.train.seed
+                )
                 use_chunk_attention(teachers[name].model)
 
         if rollout.backend == "hf":
             engine = HFRollout(self.student, self.stop_ids, self.pad_id, rollout.micro_seqs)
         elif rollout.backend == "vllm":
-            engine = VLLMColocateRollout(config.model.student, self.stop_ids, rollout.gpu_memory_utilization,
-                                         rollout.max_model_len, rollout.enforce_eager, config.train.seed,
-                                         sleep_mode=rollout.sleep and rollout.max_staleness == 0,
-                                         prefix_caching=rollout.prefix_caching,
-                                         max_num_seqs=rollout_max_num_seqs(config))
+            engine = VLLMColocateRollout(
+                config.model.student,
+                self.stop_ids,
+                rollout.gpu_memory_utilization,
+                rollout.max_model_len,
+                rollout.enforce_eager,
+                config.train.seed,
+                sleep_mode=rollout.sleep and rollout.max_staleness == 0,
+                prefix_caching=rollout.prefix_caching,
+                max_num_seqs=rollout_max_num_seqs(config),
+            )
         else:
             engine = VLLMServerRollout(server, self.stop_ids)
 
         self.routes = {
-            name: TeacherRoute(teacher_toks[name], aligners[name], teachers[name],
-                               top_k=config.loss.top_k if kind == "topk_kl" or (
-                                   kind == "xtok" and config.loss.xtok_dense_weight > 0) else 0,
-                               keep_hidden=kind == "full_rkl",
-                               sample_rounds=config.loss.rs_rounds if kind == "rs_kd" else 0,
-                               sample_temperature=config.loss.rs_temperature)
+            name: TeacherRoute(
+                teacher_toks[name],
+                aligners[name],
+                teachers[name],
+                top_k=config.loss.top_k
+                if kind == "topk_kl" or (kind == "xtok" and config.loss.xtok_dense_weight > 0)
+                else 0,
+                keep_hidden=kind == "full_rkl",
+                sample_rounds=config.loss.rs_rounds if kind == "rs_kd" else 0,
+                sample_temperature=config.loss.rs_temperature,
+            )
             for name, kind in self.kinds.items()
         }
         # full_rkl through the fused kernels where they compute the same thing (fused_rkl.supported)
-        self.fused = {name for name, kind in self.kinds.items()
-                      if kind == "full_rkl" and fused_rkl.supported(self.head, teachers[name].head, aligners[name].bridge.swap)
-                      and teachers[name].head.weight.device == self.head.weight.device}
-        self.teacher_to_student = {name: torch.tensor(a.teacher_to_student, device=self.device)
-                                   for name, a in aligners.items() if isinstance(a, ByteChunkAligner)}
+        self.fused = {
+            name
+            for name, kind in self.kinds.items()
+            if kind == "full_rkl"
+            and fused_rkl.supported(self.head, teachers[name].head, aligners[name].bridge.swap)
+            and teachers[name].head.weight.device == self.head.weight.device
+        }
+        self.teacher_to_student = {
+            name: torch.tensor(a.teacher_to_student, device=self.device)
+            for name, a in aligners.items()
+            if isinstance(a, ByteChunkAligner)
+        }
         self.weights = PublishedWeights(self.student)
         # Rollouts overlapping training run on their own CUDA stream (see Pipeline), except
         # with the in-process vLLM engine: next to the trainer's default-stream kernels it
@@ -207,8 +249,9 @@ class OPDTrainer:
         self.pipeline = self._make_pipeline(engine, overlap)
         self.source = source or self._make_source()
         self.orchestrator = Orchestrator(self.pipeline, self._draw, rollout.temperature, rollout.max_staleness)
-        self.opt = torch.optim.AdamW(self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0,
-                                     fused=self.device == "cuda")
+        self.opt = torch.optim.AdamW(
+            self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0, fused=self.device == "cuda"
+        )
         self.start_step, wandb_id = 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
@@ -217,9 +260,14 @@ class OPDTrainer:
             try:
                 import wandb
 
-                run = wandb.init(project=config.logging.project, name=config.logging.run_name or None,
-                                 config=dataclasses.asdict(config), dir=config.train.output_dir,
-                                 id=wandb_id, resume="allow" if wandb_id else None)
+                run = wandb.init(
+                    project=config.logging.project,
+                    name=config.logging.run_name or None,
+                    config=dataclasses.asdict(config),
+                    dir=config.train.output_dir,
+                    id=wandb_id,
+                    resume="allow" if wandb_id else None,
+                )
                 self.wandb_id = run.id
                 self.wandb = wandb
             except Exception as e:  # noqa: BLE001 — a metrics backend must never kill a training run
@@ -227,24 +275,44 @@ class OPDTrainer:
 
     def _make_pipeline(self, engine, overlap: bool):
         """The rollout pipeline (a subclass for other data shapes, e.g. agent traces)."""
-        return Pipeline(self.tok, engine, self.routes, self.weights, self.config.model.chat_template_kwargs,
-                        self.config.train.score_micro_seqs, torch.cuda.Stream() if overlap else None)
+        return Pipeline(
+            self.tok,
+            engine,
+            self.routes,
+            self.weights,
+            self.config.model.chat_template_kwargs,
+            self.config.train.score_micro_seqs,
+            torch.cuda.Stream() if overlap else None,
+        )
 
     def _make_source(self):
         return build_source(self.config, self.rng)
 
     def _server(self, model: str, url: str, role: str, args: list[str]) -> VLLMServer:
-        server = VLLMServer(model, url=url, args=tuple(args),
-                            log_path=os.path.join(self.config.train.output_dir, f"vllm_{role}.log"))
+        server = VLLMServer(
+            model, url=url, args=tuple(args), log_path=os.path.join(self.config.train.output_dir, f"vllm_{role}.log")
+        )
         self.servers.append(server)
         return server
 
     def _vllm_teacher(self, name: str, teacher: TeacherConfig) -> VLLMTeacher:
         top_k = max(self.config.loss.top_k, 1)
-        return VLLMTeacher(self._server(teacher.model, teacher.url, f"teacher_{name}", [
-            "--gpu-memory-utilization", str(teacher.gpu_memory_utilization),
-            "--max-model-len", str(self.config.rollout.max_model_len + 512),
-            "--max-logprobs", str(top_k + 1), "--enforce-eager"]))
+        return VLLMTeacher(
+            self._server(
+                teacher.model,
+                teacher.url,
+                f"teacher_{name}",
+                [
+                    "--gpu-memory-utilization",
+                    str(teacher.gpu_memory_utilization),
+                    "--max-model-len",
+                    str(self.config.rollout.max_model_len + 512),
+                    "--max-logprobs",
+                    str(top_k + 1),
+                    "--enforce-eager",
+                ],
+            )
+        )
 
     # ----------------------------------------------------------------- batches
 
@@ -278,57 +346,91 @@ class OPDTrainer:
         kind, route, loss = self.kinds[name], self.routes[name], self.config.loss
         device = self.device
         ids, mask = right_pad([s.request.prompt_ids + s.completion[:-1] for s in samples], self.pad_id, device)
-        positions = completion_positions([len(s.request.prompt_ids) for s in samples],
-                                         [len(s.completion) for s in samples], ids.shape[1]).to(device)
+        positions = completion_positions(
+            [len(s.request.prompt_ids) for s in samples], [len(s.completion) for s in samples], ids.shape[1]
+        ).to(device)
         targets = torch.tensor([t for s in samples for t in s.completion], device=device)
         token_weights = torch.tensor([w for s, w in zip(samples, weights) for _ in s.completion], device=device)
         behaviour = None
         if all(len(s.behaviour_lp) == len(s.completion) for s in samples):
             behaviour = torch.tensor([x for s in samples for x in s.behaviour_lp], device=device)
-        if kind != "xtok":            # one teacher token per student token
-            teacher_ids = torch.tensor([t for s in samples for t in s.view.input_ids[s.view.prompt_len:]], device=device)
+        if kind != "xtok":  # one teacher token per student token
+            teacher_ids = torch.tensor(
+                [t for s in samples for t in s.view.input_ids[s.view.prompt_len :]], device=device
+            )
             vocab = losses.SharedVocab(route.aligner.bridge.shared_vocab_size, route.aligner.bridge.swap)
         if kind in ("topk_kl", "sampled_rkl", "rs_kd"):
             token_lp = torch.cat([s.scores.token_lp for s in samples]).to(device)
 
-        with (torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
-              torch.set_grad_enabled(train)):
+        with (
+            torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
+            torch.set_grad_enabled(train),
+        ):
             # right-padded rows: no mask (padding after a row cannot reach it; flash attention)
             hidden = final_hidden_states(self.student, ids, None)[positions]
             token_weights = self._token_weights(token_weights, hidden, behaviour)
             if kind == "full_rkl":
-                for s in samples:       # made on the pipeline's CUDA stream: keep until this stream is done
+                for s in samples:  # made on the pipeline's CUDA stream: keep until this stream is done
                     if s.scores.hidden.is_cuda:
                         s.scores.hidden.record_stream(torch.cuda.current_stream())
                 teacher_hidden = torch.cat([s.scores.hidden for s in samples])
                 if name in self.fused:
-                    value, stats = fused_full_rkl(hidden, self.head, teacher_hidden, route.teacher.head, teacher_ids,
-                                                  token_weights, vocab.size)
+                    value, stats = fused_full_rkl(
+                        hidden, self.head, teacher_hidden, route.teacher.head, teacher_ids, token_weights, vocab.size
+                    )
                 else:
-                    value, stats = losses.full_rkl(hidden, self.head, teacher_ids, token_weights, vocab,
-                                                   lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], vocab.size))
+                    value, stats = losses.full_rkl(
+                        hidden,
+                        self.head,
+                        teacher_ids,
+                        token_weights,
+                        vocab,
+                        lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], vocab.size),
+                    )
             elif kind == "topk_kl":
                 topk_ids = torch.cat([s.scores.topk_ids for s in samples]).to(device)
                 topk_lp = torch.cat([s.scores.topk_lp for s in samples]).to(device)
                 realized_in_topk = (topk_ids == teacher_ids[:, None]).any(1, keepdim=True)
                 support = torch.cat([topk_ids, teacher_ids[:, None]], 1)
                 valid = torch.cat([topk_lp.isfinite(), ~realized_in_topk], 1) & (support < vocab.size)
-                value, stats = losses.topk_kl(hidden, self.head, teacher_ids, token_weights, vocab,
-                                              support.clamp(max=vocab.size - 1),
-                                              torch.cat([topk_lp, token_lp[:, None]], 1), valid, token_lp,
-                                              beta=loss.beta)
+                value, stats = losses.topk_kl(
+                    hidden,
+                    self.head,
+                    teacher_ids,
+                    token_weights,
+                    vocab,
+                    support.clamp(max=vocab.size - 1),
+                    torch.cat([topk_lp, token_lp[:, None]], 1),
+                    valid,
+                    token_lp,
+                    beta=loss.beta,
+                )
             elif kind == "rs_kd":
-                sample = [torch.cat([getattr(s.scores, f) for s in samples]).to(device)
-                          for f in ("sample_ids", "sample_weights", "sample_lp")]
+                sample = [
+                    torch.cat([getattr(s.scores, f) for s in samples]).to(device)
+                    for f in ("sample_ids", "sample_weights", "sample_lp")
+                ]
                 value, stats = losses.rs_kd(hidden, self.head, teacher_ids, token_weights, vocab, *sample, token_lp)
             elif kind == "sampled_rkl":
-                value, stats = losses.sampled_rkl(hidden, self.head, targets, token_weights, token_lp, behaviour,
-                                                  loss.is_low, loss.is_high)
+                value, stats = losses.sampled_rkl(
+                    hidden, self.head, targets, token_weights, token_lp, behaviour, loss.is_low, loss.is_high
+                )
             else:
                 chunks, dense = self._xtok_targets(samples, name)
-                value, stats = losses.xtok(hidden, self.head, targets, token_weights, chunks, behaviour,
-                                           spread=loss.xtok_spread, is_low=loss.is_low, is_high=loss.is_high,
-                                           dense=dense, dense_weight=loss.xtok_dense_weight, beta=loss.beta)
+                value, stats = losses.xtok(
+                    hidden,
+                    self.head,
+                    targets,
+                    token_weights,
+                    chunks,
+                    behaviour,
+                    spread=loss.xtok_spread,
+                    is_low=loss.is_low,
+                    is_high=loss.is_high,
+                    dense=dense,
+                    dense_weight=loss.xtok_dense_weight,
+                    beta=loss.beta,
+                )
         if train:
             value.backward()
         stats["loss"] = float(value.detach())
@@ -376,15 +478,19 @@ class OPDTrainer:
                     last = c
             ends.append(row + len(ch.student))
             if s.scores.topk_ids is not None:
-                for s_pos, t_pos in ch.one_to_one:     # teacher top-k plus the teacher's actual token
+                for s_pos, t_pos in ch.one_to_one:  # teacher top-k plus the teacher's actual token
                     actual = s.view.input_ids[s.view.prompt_len + t_pos]
                     dense_rows.append(row + s_pos)
                     dense_support.append(torch.cat([s.scores.topk_ids[t_pos], torch.tensor([actual])]))
-                    dense_lp.append(torch.cat([s.scores.topk_lp[t_pos], s.scores.token_lp[t_pos:t_pos + 1]]))
+                    dense_lp.append(torch.cat([s.scores.topk_lp[t_pos], s.scores.token_lp[t_pos : t_pos + 1]]))
             row += len(ch.student)
             offset += ch.n_chunks
-        chunks = losses.ChunkTargets(torch.tensor(chunk_ids, device=device), torch.cat(teacher_chunk_lp).to(device),
-                                     torch.tensor(keep, dtype=torch.bool, device=device), sorted(set(ends)))
+        chunks = losses.ChunkTargets(
+            torch.tensor(chunk_ids, device=device),
+            torch.cat(teacher_chunk_lp).to(device),
+            torch.tensor(keep, dtype=torch.bool, device=device),
+            sorted(set(ends)),
+        )
         if not dense_rows:
             return chunks, None
         support = torch.stack(dense_support).to(device)
@@ -392,7 +498,7 @@ class OPDTrainer:
         mapped = torch.where(support < t2s.numel(), t2s[support.clamp(max=t2s.numel() - 1)], -1)
         teacher_lp = torch.stack(dense_lp).to(device)
         valid = (mapped >= 0) & teacher_lp.isfinite()
-        valid[:, -1] &= ~(support[:, -1:] == support[:, :-1]).any(1)      # actual token already in the top-k
+        valid[:, -1] &= ~(support[:, -1:] == support[:, :-1]).any(1)  # actual token already in the top-k
         return chunks, losses.DenseTargets(torch.tensor(dense_rows, device=device), mapped, teacher_lp, valid)
 
     def _scores(self, batch: Batch, train: bool) -> dict[str, float]:
@@ -403,9 +509,11 @@ class OPDTrainer:
         for name in self.routes:
             group = sorted((s for s in samples if s.teacher == name), key=lambda s: len(s.completion))
             for start in range(0, len(group), self.config.train.score_micro_seqs):
-                micro = group[start:start + self.config.train.score_micro_seqs]
-                weights = [1.0 / (len(s.completion) * len(samples)) if self.config.loss.length_norm
-                           else 1.0 / total_tokens for s in micro]
+                micro = group[start : start + self.config.train.score_micro_seqs]
+                weights = [
+                    1.0 / (len(s.completion) * len(samples)) if self.config.loss.length_norm else 1.0 / total_tokens
+                    for s in micro
+                ]
                 for k, v in self._score(micro, weights, train).items():
                     stats[f"{k}/{name}"] += v
                 stats[f"samples/{name}"] += len(micro)
@@ -428,7 +536,7 @@ class OPDTrainer:
                 waited = time.perf_counter() - t0
                 if not batch.samples:
                     logger.warning("step %d: no non-empty completions, skipping", step)
-                    self.weights.publish()      # the producer waits for this step's version
+                    self.weights.publish()  # the producer waits for this step's version
                     continue
                 lr = self._lr_at(step)
                 for group in self.opt.param_groups:
@@ -446,13 +554,25 @@ class OPDTrainer:
                 staleness = self.weights.version - batch.version
                 self.weights.publish()
                 metrics = self._summarize(stats, batch)
-                metrics.update({"lr": lr, "grad_norm": float(grad_norm), "staleness": staleness,
-                                "dropped_samples": self.orchestrator.dropped, "time/train": train_time,
-                                "time/wait_batch": waited, "time/step": time.perf_counter() - t0,
-                                "elapsed": time.time() - start_time})
+                metrics.update(
+                    {
+                        "lr": lr,
+                        "grad_norm": float(grad_norm),
+                        "staleness": staleness,
+                        "dropped_samples": self.orchestrator.dropped,
+                        "time/train": train_time,
+                        "time/wait_batch": waited,
+                        "time/step": time.perf_counter() - t0,
+                        "elapsed": time.time() - start_time,
+                    }
+                )
                 if step % config.logging.log_every == 0:
                     self._log("step", metrics, step + 1)
-                if config.train.eval_every and (step + 1) % config.train.eval_every == 0 and step + 1 < config.train.steps:
+                if (
+                    config.train.eval_every
+                    and (step + 1) % config.train.eval_every == 0
+                    and step + 1 < config.train.steps
+                ):
                     self._log("eval", self.evaluate(), step + 1)
                 if config.train.save_steps and (step + 1) % config.train.save_steps == 0:
                     self.save(f"step_{step + 1}", step + 1)
@@ -486,8 +606,11 @@ class OPDTrainer:
                 if stats.get(f"dense_tokens/{name}"):
                     metrics[f"dense_kl/{name}"] = stats[f"dense_kl/{name}"] / stats[f"dense_tokens/{name}"]
                     metrics[f"dense_fraction/{name}"] = stats[f"dense_tokens/{name}"] / tokens
-        metrics.update(self.source.batch_stats(
-            [(s.request.meta, self.tok.decode(s.completion, skip_special_tokens=True)) for s in batch.samples]))
+        metrics.update(
+            self.source.batch_stats(
+                [(s.request.meta, self.tok.decode(s.completion, skip_special_tokens=True)) for s in batch.samples]
+            )
+        )
         return metrics
 
     # -------------------------------------------------------------------- eval
@@ -512,7 +635,7 @@ class OPDTrainer:
         dev_kl is the sampled estimate sum(log p_S - log p_T) per student token, on one
         scale for every loss; dev_kl_full (full_rkl teachers) the exact per-token KL."""
         requests = [self.pipeline.request(m, max_new_tokens, {}, source, teacher) for m in messages_list]
-        with self.pipeline.lock:      # no rollout engine activity (vLLM sleep) while this scores on the GPU
+        with self.pipeline.lock:  # no rollout engine activity (vLLM sleep) while this scores on the GPU
             batch = self.pipeline.run(requests, self.config.rollout.temperature)
             if not batch.samples:
                 return {"dev_kl": float("nan"), "dev_len": 0.0}
@@ -544,15 +667,20 @@ class OPDTrainer:
 
         path = Path(self.config.train.output_dir) / name
         logger.info("Saving checkpoint -> %s", path)
-        with self.weights.lock:       # a rollout engine may be copying the weights (max_staleness > 0)
+        with self.weights.lock:  # a rollout engine may be copying the weights (max_staleness > 0)
             save_hf_model(self.student, self.tok, path, source_layout=True)
         with open(path / "opd_config.json", "w") as f:
             json.dump(dataclasses.asdict(self.config), f, indent=2)
         if step is not None:
-            state = {"step": step, "optimizer": self.opt.state_dict(), "rng": self.rng.getstate(),
-                     "torch_rng": torch.get_rng_state(),
-                     "cuda_rng": torch.cuda.get_rng_state_all() if self.device == "cuda" else None,
-                     "dropped_samples": self.orchestrator.dropped, "wandb_id": self.wandb_id}
+            state = {
+                "step": step,
+                "optimizer": self.opt.state_dict(),
+                "rng": self.rng.getstate(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state_all() if self.device == "cuda" else None,
+                "dropped_samples": self.orchestrator.dropped,
+                "wandb_id": self.wandb_id,
+            }
             torch.save(state, path / (TRAINER_STATE_FILE + ".tmp"))
             os.replace(path / (TRAINER_STATE_FILE + ".tmp"), path / TRAINER_STATE_FILE)
         keep = self.config.train.keep_checkpoints
@@ -609,8 +737,10 @@ def resolve_resume(resume_from: str, output_dir: str) -> str | None:
             return None
         return found[-1]
     if not os.path.exists(os.path.join(resume_from, TRAINER_STATE_FILE)):
-        raise OPDConfigError(f"train.resume_from: {resume_from} is not a complete OPD checkpoint "
-                             f"(no {TRAINER_STATE_FILE}; `final` holds the model only)")
+        raise OPDConfigError(
+            f"train.resume_from: {resume_from} is not a complete OPD checkpoint "
+            f"(no {TRAINER_STATE_FILE}; `final` holds the model only)"
+        )
     return resume_from
 
 

@@ -43,8 +43,9 @@ def hf_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return clean
 
 
-def save_hf_model(model, tokenizer, path: Path, state: dict[str, torch.Tensor] | None = None,
-                  source_layout: bool = False) -> None:
+def save_hf_model(
+    model, tokenizer, path: Path, state: dict[str, torch.Tensor] | None = None, source_layout: bool = False
+) -> None:
     """Save in Hugging Face format under the architecture's parameter names.
 
     `state` is an already gathered full state dict (FSDP); by default the model's own.
@@ -80,7 +81,7 @@ def _source_checkpoint(model):
         return None
     try:
         config = AutoConfig.from_pretrained(name)
-    except Exception:                                     # noqa: BLE001 — no source to follow
+    except Exception:  # noqa: BLE001 — no source to follow
         return None
     if config.model_type == own.model_type:
         return None
@@ -104,11 +105,11 @@ def _save_in_source_layout(model, state: dict, path: Path, config, name: str) ->
 
     seen: set[int] = set()
     unique = {}
-    for key, tensor in state.items():             # tied weights once, as save_pretrained (before renaming,
-        if tensor.data_ptr() not in seen:          # which may build new tensors)
+    for key, tensor in state.items():  # tied weights once, as save_pretrained (before renaming,
+        if tensor.data_ptr() not in seen:  # which may build new tensors)
             seen.add(tensor.data_ptr())
             unique[key] = tensor
-    weights = revert_weight_conversion(model, unique)                # the source checkpoint's names
+    weights = revert_weight_conversion(model, unique)  # the source checkpoint's names
     source_dir = _source_dir(name)
     files = sorted(source_dir.glob("*.safetensors"))
     source_keys = {}
@@ -119,13 +120,15 @@ def _save_in_source_layout(model, state: dict, path: Path, config, name: str) ->
     if unmatched:
         # Never fill a trained weight's slot from the source: that would silently export the
         # untrained weight. Every trained tensor must land on one of the source's names.
-        raise RuntimeError(f"cannot save in the layout of {name}: trained weights without a counterpart there "
-                           f"({unmatched[:5]}{' ...' if len(unmatched) > 5 else ''})")
+        raise RuntimeError(
+            f"cannot save in the layout of {name}: trained weights without a counterpart there "
+            f"({unmatched[:5]}{' ...' if len(unmatched) > 5 else ''})"
+        )
     copied = 0
     for file in files:
         with safe_open(str(file), framework="pt") as f:
             for key in f.keys():
-                if key not in weights:                   # a module the causal LM does not have (vision)
+                if key not in weights:  # a module the causal LM does not have (vision)
                     weights[key] = f.get_tensor(key)
                     copied += 1
     weights = {k: v.detach().contiguous().cpu() for k, v in weights.items()}
@@ -133,16 +136,23 @@ def _save_in_source_layout(model, state: dict, path: Path, config, name: str) ->
     for filename, keys in split.filename_to_tensors.items():
         safetensors_save({k: weights[k] for k in keys}, str(path / filename), metadata={"format": "pt"})
     if split.is_sharded:
-        index = {"metadata": {"total_size": sum(v.numel() * v.element_size() for v in weights.values())},
-                 "weight_map": split.tensor_to_filename}
+        index = {
+            "metadata": {"total_size": sum(v.numel() * v.element_size() for v in weights.values())},
+            "weight_map": split.tensor_to_filename,
+        }
         (path / "model.safetensors.index.json").write_text(json.dumps(index, indent=2))
     config.save_pretrained(path)
-    for extra in source_dir.glob("*processor*.json"):      # image/video processors: the architecture needs them
+    for extra in source_dir.glob("*processor*.json"):  # image/video processors: the architecture needs them
         shutil.copy(extra, path / extra.name)
     if getattr(model, "generation_config", None) is not None:
         model.generation_config.save_pretrained(path)
-    logger.info("Saved in the layout of %s (%s): %d trained tensors, %d copied from it",
-                name, type(config).__name__, len(weights) - copied, copied)
+    logger.info(
+        "Saved in the layout of %s (%s): %d trained tensors, %d copied from it",
+        name,
+        type(config).__name__,
+        len(weights) - copied,
+        copied,
+    )
 
 
 def save_checkpoint(
@@ -533,7 +543,7 @@ def save_final(model, tokenizer, output_dir: str, is_fsdp: bool = False):
 def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool) -> None:
     """HF-format save; under FSDP the full state is gathered to rank 0 (CPU) and saved
     from there, leaving every rank's sharded model untouched."""
-    if is_fsdp and dist.is_initialized() and dist.get_world_size() > 1:
+    if is_fsdp and dist.is_initialized():  # also one rank: FSDP2 with CPU offload on a single GPU
         from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
         dist.barrier()  # every rank has finished its step before the gather

@@ -14,7 +14,6 @@ Output: Colored text showing which tokens are trained on (green = loss computed,
         gray = masked/ignored), plus statistics.
 """
 
-
 import agent_tooling._path_setup  # noqa: F401 — adds src/ to sys.path
 from agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
@@ -31,7 +30,7 @@ RESET = "\033[0m"
 
 def inspect(config: Config, num_samples: int = 3):
     tokenizer = load_tokenizer(config)
-    chat_ds = training_samples(config, tokenizer)   # exactly what the trainer consumes
+    chat_ds = training_samples(config, tokenizer)  # exactly what the trainer consumes
 
     print(f"{BOLD}{'=' * 80}{RESET}")
     print(f"{BOLD}Batch Inspector — {config.model.name_or_path}{RESET}")
@@ -58,7 +57,7 @@ def inspect(config: Config, num_samples: int = 3):
         side = f" [{sample['side']}]" if "side" in sample else ""
         print(
             f"{BOLD}Sample {count + 1}{side}{RESET} — {seq_len} tokens, {num_trained} trained "
-            f"({100*num_trained/seq_len:.1f}%)"
+            f"({100 * num_trained / seq_len:.1f}%)"
         )
         print(f"{'-' * 60}")
 
@@ -108,11 +107,11 @@ def inspect(config: Config, num_samples: int = 3):
     print(f"\n{BOLD}{'=' * 80}{RESET}")
     print(f"{BOLD}Summary across {count} samples:{RESET}")
     print(f"  Total tokens: {total_tokens}")
-    print(f"  Trained tokens: {total_trained} ({100*total_trained/max(total_tokens,1):.1f}%)")
+    print(f"  Trained tokens: {total_trained} ({100 * total_trained / max(total_tokens, 1):.1f}%)")
     print(
-        f"  Masked tokens: {total_tokens - total_trained} ({100*(total_tokens-total_trained)/max(total_tokens,1):.1f}%)"
+        f"  Masked tokens: {total_tokens - total_trained} ({100 * (total_tokens - total_trained) / max(total_tokens, 1):.1f}%)"
     )
-    print(f"  Avg sequence length: {total_tokens/max(count,1):.0f}")
+    print(f"  Avg sequence length: {total_tokens / max(count, 1):.0f}")
 
     # Sanity checks
     issues = []
@@ -122,7 +121,7 @@ def inspect(config: Config, num_samples: int = 3):
         issues.append(f"{YELLOW}WARNING: ALL tokens are trained on — assistant masking may not be working.{RESET}")
     if total_trained / max(total_tokens, 1) < 0.05:
         issues.append(
-            f"{YELLOW}WARNING: Only {100*total_trained/max(total_tokens,1):.1f}% of tokens trained — very low ratio.{RESET}"
+            f"{YELLOW}WARNING: Only {100 * total_trained / max(total_tokens, 1):.1f}% of tokens trained — very low ratio.{RESET}"
         )
 
     if issues:

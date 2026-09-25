@@ -127,7 +127,8 @@ def normalize_messages(
         # Build normalized message. Keys the template may read (tool_call_id, name, ...)
         # and per-message training flags (loss) pass through unchanged.
         msg: dict[str, Any] = {
-            k: v for k, v in turn.items()
+            k: v
+            for k, v in turn.items()
             if k not in (role_key, content_key, "reasoning", "reasoning_content", "think", "function_call")
         }
         msg["role"] = role
@@ -137,8 +138,14 @@ def normalize_messages(
         # `think` are accepted as legacy input. As vLLM does before rendering, the
         # trace is exposed under both keys: templates such as Qwen3.5's still read
         # `message.reasoning_content` in their Jinja.
-        reasoning = next((turn[k] for k in ("reasoning", "reasoning_content", "think")
-                          if isinstance(turn.get(k), str) and turn[k].strip()), None)
+        reasoning = next(
+            (
+                turn[k]
+                for k in ("reasoning", "reasoning_content", "think")
+                if isinstance(turn.get(k), str) and turn[k].strip()
+            ),
+            None,
+        )
         if role == "assistant" and isinstance(msg["content"], str):
             baked, rest = split_leading_think(msg["content"], think_tags)
             if baked is not None:
@@ -154,7 +161,8 @@ def normalize_messages(
             msg["reasoning"] = reasoning
             msg["reasoning_content"] = reasoning
         elif role == "assistant" and (think_tags or THINK_TAGS)[1] in (
-                msg["content"] if isinstance(msg["content"], str) else ""):
+            msg["content"] if isinstance(msg["content"], str) else ""
+        ):
             # Think tags inside the answer are text: an explicit (empty) reasoning field stops
             # templates such as Qwen3.x's from splitting the content at "</think>".
             msg["reasoning"] = msg["reasoning_content"] = ""
@@ -178,8 +186,12 @@ THINK_TAGS = ("<think>", "</think>")
 
 def valid_think_tags(tags) -> bool:
     """Whether a configured `think_tags` is [open, close]: two different non-empty strings."""
-    return (isinstance(tags, (list, tuple)) and len(tags) == 2
-            and all(isinstance(t, str) and t.strip() for t in tags) and tags[0] != tags[1])
+    return (
+        isinstance(tags, (list, tuple))
+        and len(tags) == 2
+        and all(isinstance(t, str) and t.strip() for t in tags)
+        and tags[0] != tags[1]
+    )
 
 
 @functools.lru_cache(maxsize=16)
@@ -208,7 +220,7 @@ def split_leading_think(content: str, tags: tuple[str, str] | None = None) -> tu
     m = _leading_think(tuple(tags or THINK_TAGS)).match(content)
     if m is None:
         return None, content
-    return m.group(1).strip("\n"), content[m.end():]
+    return m.group(1).strip("\n"), content[m.end() :]
 
 
 def normalize_tools(tools: Any) -> list[dict] | None:
@@ -367,9 +379,7 @@ def validate_tool_calls(
                 # Check 3: required parameters present
                 for param_name, param_info in tool_def["parameters"].items():
                     if param_info.get("required", False) and param_name not in args:
-                        errors.append(
-                            f"turn {i}, call {j}: tool '{name}' missing required parameter '{param_name}'"
-                        )
+                        errors.append(f"turn {i}, call {j}: tool '{name}' missing required parameter '{param_name}'")
 
     return errors
 

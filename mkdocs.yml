@@ -99,6 +99,7 @@ nav:
     - Autopilot: guides/autopilot.md
     - On-Policy Distillation: guides/distillation.md
     - Preference Optimization (DPO): guides/dpo.md
+    - Reinforcement Learning: guides/rl.md
     - SFT → RL Transition: guides/sft-to-rl.md
   - Reference:
     - Configuration: reference/configuration.md

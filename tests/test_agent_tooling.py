@@ -35,7 +35,7 @@ LOG = """\
 def test_parse_steps_reads_every_objective_and_skips_eval_lines():
     steps = parse_steps(LOG)
     assert [s["step"] for s in steps] == [9, 10, 11, 12]
-    assert [s["loss"] for s in steps] == [0.2697, 0.2917, 0.3121, 0.9027]   # never eval_loss=0.3454
+    assert [s["loss"] for s in steps] == [0.2697, 0.2917, 0.3121, 0.9027]  # never eval_loss=0.3454
     assert steps[1]["acc"] == 1.0 and steps[1]["eval"] == 0.3454 and steps[1]["dt"] == 68.30
     assert steps[2]["ce"] == 1.2044 and steps[3]["grad_norm"] == 283.619
 
@@ -59,15 +59,17 @@ def test_monitor_parses_dpo_and_deft_lines():
 def test_monitor_without_step_lines_reports_no_data(capsys):
     result = analyze_run(parse_training_log("nothing useful here\n"))
     assert result["status"] == "NO_DATA"
-    print_brief(result)                                   # used to raise KeyError
+    print_brief(result)  # used to raise KeyError
     assert "NO_DATA" in capsys.readouterr().out
 
 
 def test_monitor_grad_norm_is_judged_against_the_run_itself():
     lines = [f"step={i} loss=1.0 lr=1e-5 tok/s=100 grad_norm=15.0 dt=1s" for i in range(1, 30)]
     calm = analyze_run(parse_training_log("\n".join(lines)))
-    assert not any("Gradient norm" in i for i in calm["issues"])      # 15 is normal for this run
-    spiked = analyze_run(parse_training_log("\n".join(lines + ["step=30 loss=1.0 lr=1e-5 tok/s=100 grad_norm=120 dt=1s"])))
+    assert not any("Gradient norm" in i for i in calm["issues"])  # 15 is normal for this run
+    spiked = analyze_run(
+        parse_training_log("\n".join(lines + ["step=30 loss=1.0 lr=1e-5 tok/s=100 grad_norm=120 dt=1s"]))
+    )
     assert any("spiked" in i for i in spiked["issues"])
 
 
@@ -89,8 +91,16 @@ def model_dir(tmp_path):
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.chat_template = TEMPLATE
     torch.manual_seed(0)
-    model = LlamaForCausalLM(LlamaConfig(vocab_size=len(tok), hidden_size=32, intermediate_size=64,
-                                         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2))
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=len(tok),
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+    )
     path = tmp_path / "model"
     model.save_pretrained(path)
     tok.save_pretrained(path)
@@ -102,7 +112,7 @@ def _config(tmp_path, model_dir, rows, **data):
     data_file.write_text("".join(json.dumps(r) + "\n" for r in rows))
     config = Config()
     config.model.name_or_path = str(model_dir)
-    config.data.dataset = str(data_file)          # a local file: the trainer's common case
+    config.data.dataset = str(data_file)  # a local file: the trainer's common case
     config.data.streaming = False
     config.data.max_seq_length = 256
     config.data.length_group_buffer = 0
@@ -111,8 +121,10 @@ def _config(tmp_path, model_dir, rows, **data):
     return config
 
 
-CHATS = [{"messages": [{"role": "user", "content": f"question {i}"},
-                       {"role": "assistant", "content": f"answer number {i}"}]} for i in range(6)]
+CHATS = [
+    {"messages": [{"role": "user", "content": f"question {i}"}, {"role": "assistant", "content": f"answer number {i}"}]}
+    for i in range(6)
+]
 
 
 def test_training_samples_are_the_trainers_stream(tmp_path, model_dir):
@@ -134,9 +146,13 @@ def test_training_samples_are_the_trainers_stream(tmp_path, model_dir):
 def test_training_samples_follow_dpo(tmp_path, model_dir):
     from agent_tooling._pipeline import load_tokenizer, training_samples
 
-    pairs = [{"prompt": [{"role": "user", "content": "q"}],
-              "chosen": [{"role": "assistant", "content": "good"}],
-              "rejected": [{"role": "assistant", "content": "bad bad"}]}] * 2
+    pairs = [
+        {
+            "prompt": [{"role": "user", "content": "q"}],
+            "chosen": [{"role": "assistant", "content": "good"}],
+            "rejected": [{"role": "assistant", "content": "bad bad"}],
+        }
+    ] * 2
     config = _config(tmp_path, model_dir, pairs)
     config.dpo.enabled = True
     samples = list(training_samples(config, load_tokenizer(config)))
@@ -146,7 +162,7 @@ def test_training_samples_follow_dpo(tmp_path, model_dir):
 def test_validate_masking_runs_on_local_data_without_false_pad_bug(tmp_path, model_dir):
     from agent_tooling.validate_masking import validate
 
-    config = _config(tmp_path, model_dir, CHATS)       # gpt2: pad token == eos token
+    config = _config(tmp_path, model_dir, CHATS)  # gpt2: pad token == eos token
     report = validate(config, num_samples=6)
     assert report["total_samples"] == 6
     assert report["pad_tokens_trained"] == 0
@@ -168,7 +184,7 @@ def test_profile_counts_parameters_exactly(tmp_path, model_dir):
     n = sum(p.numel() for p in real.parameters())
     assert est["total_params_B"] * 1e9 == pytest.approx(n)
     assert est["params_memory_gb"] == pytest.approx(n * 4 / 2**30)
-    assert est["optimizer_memory_gb"] == pytest.approx(2 * n * 4 / 2**30)      # AdamW: 2 states, fp32 weights
+    assert est["optimizer_memory_gb"] == pytest.approx(2 * n * 4 / 2**30)  # AdamW: 2 states, fp32 weights
     config.model.torch_dtype = "bfloat16"
     config.train.optimizer = "lion8bit"
     assert estimate_memory(config)["optimizer_memory_gb"] == pytest.approx(n / 2**30)
@@ -189,8 +205,9 @@ def test_profile_accepts_gpu_flag(tmp_path, model_dir, monkeypatch, capsys):
     from agent_tooling import profile_memory
 
     config_file = tmp_path / "c.yaml"
-    config_file.write_text(yaml.safe_dump({"model": {"name_or_path": str(model_dir)},
-                                           "data": {"dataset": "x", "max_seq_length": 128}}))
+    config_file.write_text(
+        yaml.safe_dump({"model": {"name_or_path": str(model_dir)}, "data": {"dataset": "x", "max_seq_length": 128}})
+    )
     monkeypatch.setattr(sys, "argv", ["pgs", "--config", str(config_file), "--gpu", "40"])
     with pytest.raises(SystemExit) as exit_info:
         profile_memory.main()

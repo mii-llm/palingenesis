@@ -105,9 +105,17 @@ def test_packing_position_ids_reset_at_boundaries():
         def __iter__(self):
             # Two documents: length 10 and length 12
             yield {"input_ids": torch.arange(10) + 1, "labels": torch.arange(10) + 1, "attention_mask": torch.ones(10)}
-            yield {"input_ids": torch.arange(12) + 100, "labels": torch.arange(12) + 100, "attention_mask": torch.ones(12)}
+            yield {
+                "input_ids": torch.arange(12) + 100,
+                "labels": torch.arange(12) + 100,
+                "attention_mask": torch.ones(12),
+            }
             # Filler to complete a pack
-            yield {"input_ids": torch.arange(10) + 200, "labels": torch.arange(10) + 200, "attention_mask": torch.ones(10)}
+            yield {
+                "input_ids": torch.arange(10) + 200,
+                "labels": torch.arange(10) + 200,
+                "attention_mask": torch.ones(10),
+            }
 
     packed = PackedDataset(FakeDataset(), max_len=32, eos_id=0, sort_buffer=0)
     outputs = list(packed)
@@ -206,7 +214,7 @@ def test_spike_detector_variance_transition():
     assert std < 1.0, f"Std should be reasonable, got {std}"
 
     print(f"  At transition: mean={mean_at_transition:.4f}, std={std:.4f}")
-    print(f"  Value 1.5 is spike: {is_spike} (z≈{(1.5-mean_at_transition)/std:.1f})")
+    print(f"  Value 1.5 is spike: {is_spike} (z≈{(1.5 - mean_at_transition) / std:.1f})")
     print("✓ test_spike_detector_variance_transition PASSED\n")
 
 

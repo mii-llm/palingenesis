@@ -112,7 +112,9 @@ def _build_bnb_optimizer(
     if name == "adamw8bit":
         optimizer = bnb.optim.AdamW8bit(param_groups, lr=lr, betas=(0.9, 0.95))
         total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"AdamW 8-bit (bitsandbytes): {total/1e6:.1f}M params, ~{total*6/1e9:.1f} GB optimizer memory")
+        logger.info(
+            f"AdamW 8-bit (bitsandbytes): {total / 1e6:.1f}M params, ~{total * 6 / 1e9:.1f} GB optimizer memory"
+        )
     elif name == "lion8bit":
         # NO hidden LR scaling: config learning_rate is what the optimizer gets.
         # (A silent lr*3 here used to stack with configs that already adjusted
@@ -121,14 +123,14 @@ def _build_bnb_optimizer(
         optimizer = bnb.optim.Lion8bit(param_groups, lr=lr, betas=(0.95, 0.98))
         total = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(
-            f"Lion 8-bit (bitsandbytes): {total/1e6:.1f}M params, lr={lr:.2e}, "
-            f"~{total*4/1e9:.1f} GB optimizer memory"
+            f"Lion 8-bit (bitsandbytes): {total / 1e6:.1f}M params, lr={lr:.2e}, "
+            f"~{total * 4 / 1e9:.1f} GB optimizer memory"
         )
     elif name == "paged_adamw8bit":
         # Paged: automatically offloads optimizer states to CPU when GPU OOMs
         optimizer = bnb.optim.PagedAdamW8bit(param_groups, lr=lr, betas=(0.9, 0.95))
         total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"Paged AdamW 8-bit (bitsandbytes): {total/1e6:.1f}M params, auto-pages to CPU on OOM")
+        logger.info(f"Paged AdamW 8-bit (bitsandbytes): {total / 1e6:.1f}M params, auto-pages to CPU on OOM")
     else:
         raise ValueError(f"Unknown bnb optimizer: {name}")
 
@@ -183,8 +185,8 @@ def _build_muon_optimizer(model: torch.nn.Module, lr: float, weight_decay: float
 
     total = muon_count + adam_count
     logger.info(
-        f"Muon hybrid: {muon_count/1e6:.1f}M params (Muon, lr={muon_lr:.2e}) + "
-        f"{adam_count/1e6:.1f}M params (AdamW, lr={lr:.2e}) = {total/1e6:.1f}M total"
+        f"Muon hybrid: {muon_count / 1e6:.1f}M params (Muon, lr={muon_lr:.2e}) + "
+        f"{adam_count / 1e6:.1f}M params (AdamW, lr={lr:.2e}) = {total / 1e6:.1f}M total"
     )
 
     return _HybridOptimizer(muon_opt, adam_opt)
@@ -509,8 +511,13 @@ class Hyperball:
     R is each matrix's norm at the first step.
     """
 
-    def __init__(self, optimizer: torch.optim.Optimizer, constrained_params: list[torch.Tensor],
-                 angular_lr: float = 0.0, snapshot_bytes: int = 1 << 30):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        constrained_params: list[torch.Tensor],
+        angular_lr: float = 0.0,
+        snapshot_bytes: int = 1 << 30,
+    ):
         self.optimizer = optimizer
         self.angular_lr = angular_lr
         ids = {id(p) for p in constrained_params}
@@ -537,9 +544,11 @@ class Hyperball:
         self.optimizer.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self):
-        return {"base": self.optimizer.state_dict(),
-                "radius": [self._radius.get(id(p)) for p in self._constrained],
-                "eta": [self._eta.get(id(p)) for p in self._constrained]}
+        return {
+            "base": self.optimizer.state_dict(),
+            "radius": [self._radius.get(id(p)) for p in self._constrained],
+            "eta": [self._eta.get(id(p)) for p in self._constrained],
+        }
 
     def load_state_dict(self, state):
         self.optimizer.load_state_dict(state["base"])

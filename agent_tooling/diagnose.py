@@ -70,8 +70,7 @@ def diagnose_pre(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     }
 
     # Overall
-    report["overall"] = "ISSUES_FOUND" if any(c["status"] == "fail" for c in report["checks"].values()) \
-        else "HEALTHY"
+    report["overall"] = "ISSUES_FOUND" if any(c["status"] == "fail" for c in report["checks"].values()) else "HEALTHY"
     return report
 
 
@@ -130,8 +129,7 @@ def diagnose_full(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     else:
         report["checks"]["gradients"] = {"status": "skip", "reason": "No GPU available"}
 
-    report["overall"] = "ISSUES_FOUND" if any(c["status"] == "fail" for c in report["checks"].values()) \
-        else "HEALTHY"
+    report["overall"] = "ISSUES_FOUND" if any(c["status"] == "fail" for c in report["checks"].values()) else "HEALTHY"
     return report
 
 

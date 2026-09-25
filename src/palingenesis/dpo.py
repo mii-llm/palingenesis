@@ -69,8 +69,6 @@ where delta = (policy - reference) log-ratio of chosen minus that of rejected.
 `sft_weight` adds the mean NLL over chosen tokens (RPO, arXiv:2404.19733).
 """
 
-from __future__ import annotations
-
 import json
 import logging
 from dataclasses import dataclass
@@ -177,16 +175,20 @@ class PreferenceDataset(IterableDataset):
         # One renderer per side. The rejected one is allowed a very long render so
         # it can be measured and truncated here, instead of being cut by the
         # tokenizer's truncation, which would silently truncate chosen too.
-        common = dict(messages_field="messages", last_turn_only=last_turn_only,
-                      train_on_reasoning=train_on_reasoning)
+        common = dict(messages_field="messages", last_turn_only=last_turn_only, train_on_reasoning=train_on_reasoning)
         self._chosen = ChatDataset([], tokenizer, max_seq_length=10**7, **common)
         self._rejected = ChatDataset([], tokenizer, max_seq_length=10**7, **common)
-        self.stats = {"pairs": 0, "dropped_unusable": 0, "dropped_chosen_too_long": 0,
-                      "dropped_rejected_too_long": 0, "dropped_identical": 0, "rejected_truncated": 0}
+        self.stats = {
+            "pairs": 0,
+            "dropped_unusable": 0,
+            "dropped_chosen_too_long": 0,
+            "dropped_rejected_too_long": 0,
+            "dropped_identical": 0,
+            "rejected_truncated": 0,
+        }
 
     def __iter__(self):
-        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size,
-                                      self.shuffle_buffer, self.shuffle_seed)
+        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed)
         for example in dataset:
             pair = self.process(example)
             if pair is not None:
@@ -218,8 +220,9 @@ class PreferenceDataset(IterableDataset):
                 self.stats["dropped_rejected_too_long"] += 1  # nothing scored survives the cut
                 return None
             self.stats["rejected_truncated"] += 1
-        if (chosen["input_ids"].numel() == rejected["input_ids"].numel()
-                and torch.equal(chosen["input_ids"], rejected["input_ids"])):
+        if chosen["input_ids"].numel() == rejected["input_ids"].numel() and torch.equal(
+            chosen["input_ids"], rejected["input_ids"]
+        ):
             self.stats["dropped_identical"] += 1  # no preference to learn
             return None
         self.stats["pairs"] += 1
@@ -320,7 +323,7 @@ def token_logps(
         logits = lm_head(h).to(dtype)
         valid = lab != IGNORE_INDEX
         picked = logits.gather(-1, lab.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-        out[:, offset: offset + width] = torch.where(valid, picked - torch.logsumexp(logits, dim=-1), 0.0)
+        out[:, offset : offset + width] = torch.where(valid, picked - torch.logsumexp(logits, dim=-1), 0.0)
         offset += width
         del logits
     return out
@@ -335,7 +338,7 @@ def score_weights(shifted_labels: torch.Tensor, num_pairs: int, ld_alpha: float 
     mask = (shifted_labels != IGNORE_INDEX).float()
     if ld_alpha is None:
         return mask
-    position = mask.cumsum(dim=1)                      # 1-based index among scored tokens
+    position = mask.cumsum(dim=1)  # 1-based index among scored tokens
     lengths = mask.sum(dim=1)
     shared = torch.minimum(lengths[:num_pairs], lengths[num_pairs:])
     shared = torch.cat([shared, shared]).unsqueeze(1)
@@ -422,20 +425,20 @@ def preference_step(
     pair_denom = float(pair_denom if pair_denom is not None else num_pairs)
     scores = (policy_logps * a).sum(dim=1).requires_grad_(True)
     ref_scores = (ref_logps * a).sum(dim=1)
-    per_pair = preference_loss(scores, ref_scores, lengths, loss_type=loss_type, beta=beta,
-                               label_smoothing=label_smoothing)
+    per_pair = preference_loss(
+        scores, ref_scores, lengths, loss_type=loss_type, beta=beta, label_smoothing=label_smoothing
+    )
     dpo_loss = per_pair.sum() / pair_denom
     (grad_scores,) = torch.autograd.grad(dpo_loss, scores)
-    weights = grad_scores.unsqueeze(1) * a            # dL/dlog pi(y_t) for every token
+    weights = grad_scores.unsqueeze(1) * a  # dL/dlog pi(y_t) for every token
 
     chosen_mask = torch.zeros_like(a)
     chosen_mask[:num_pairs] = (shifted[:num_pairs] != IGNORE_INDEX).float()
     sft_value = torch.zeros((), device=hidden.device)
     if sft_weight:
-        denom = float(chosen_token_denom if chosen_token_denom is not None
-                      else max(chosen_mask.sum().item(), 1.0))
+        denom = float(chosen_token_denom if chosen_token_denom is not None else max(chosen_mask.sum().item(), 1.0))
         sft_value = -(policy_logps * chosen_mask).sum() / denom
-        weights = weights - (sft_weight / denom) * chosen_mask   # d(-mean logp)/dlog pi
+        weights = weights - (sft_weight / denom) * chosen_mask  # d(-mean logp)/dlog pi
 
     total = dpo_loss.detach() + sft_weight * sft_value
     loss = _weighted_logp_backward(hidden, shifted, lm_head, weights, total, num_chunks)
@@ -477,9 +480,11 @@ def _weighted_logp_backward(
     dtype = _loss_dtype(hidden)
     grad_buffer = torch.zeros_like(hidden, dtype=dtype)
     offset = 0
-    for h, lab, w in zip(torch.chunk(hidden.detach(), num_chunks, dim=1),
-                         torch.chunk(shifted_labels, num_chunks, dim=1),
-                         torch.chunk(weights, num_chunks, dim=1)):
+    for h, lab, w in zip(
+        torch.chunk(hidden.detach(), num_chunks, dim=1),
+        torch.chunk(shifted_labels, num_chunks, dim=1),
+        torch.chunk(weights, num_chunks, dim=1),
+    ):
         width = h.shape[1]
         h = h.contiguous().requires_grad_(True)
         logits = lm_head(h).to(dtype)
@@ -487,7 +492,7 @@ def _weighted_logp_backward(
         logp = picked - torch.logsumexp(logits, dim=-1)
         surrogate = (logp * w.to(dtype) * (lab != IGNORE_INDEX)).sum()
         surrogate.backward()
-        grad_buffer[:, offset: offset + width] = h.grad.to(dtype)
+        grad_buffer[:, offset : offset + width] = h.grad.to(dtype)
         offset += width
         del logits
     return _BackwardBridge.apply(hidden, grad_buffer.to(hidden.dtype), loss_value)
@@ -519,14 +524,22 @@ class PreferenceEvaluator:
     The reference model never changes, so its sequence scores are computed once,
     on the first call, and reused; later evaluations run the policy only."""
 
-    def __init__(self, batches: list[dict[str, torch.Tensor]], *, loss_type: str, beta: float,
-                 label_smoothing: float, ld_alpha: float | None, num_chunks_for):
+    def __init__(
+        self,
+        batches: list[dict[str, torch.Tensor]],
+        *,
+        loss_type: str,
+        beta: float,
+        label_smoothing: float,
+        ld_alpha: float | None,
+        num_chunks_for,
+    ):
         self.batches = batches
         self.loss_type = loss_type
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.ld_alpha = ld_alpha
-        self.num_chunks_for = num_chunks_for   # tokens -> loss chunks
+        self.num_chunks_for = num_chunks_for  # tokens -> loss chunks
         self._ref_scores: list[torch.Tensor] | None = None
 
     def _scores(self, model, get_hidden, lm_head, batch, device):
@@ -545,13 +558,22 @@ class PreferenceEvaluator:
         model.eval()
         with torch.amp.autocast("cuda", dtype=dtype, enabled=autocast):
             if self._ref_scores is None:
-                self._ref_scores = [self._scores(ref_model, get_hidden, get_lm_head(ref_model), b, device)[0]
-                                    for b in self.batches]
+                self._ref_scores = [
+                    self._scores(ref_model, get_hidden, get_lm_head(ref_model), b, device)[0] for b in self.batches
+                ]
             losses, chosen, rejected, correct = [], [], [], []
             for batch, ref in zip(self.batches, self._ref_scores):
                 policy, lengths = self._scores(model, get_hidden, get_lm_head(model), batch, device)
-                losses.append(preference_loss(policy, ref, lengths, loss_type=self.loss_type, beta=self.beta,
-                                              label_smoothing=self.label_smoothing))
+                losses.append(
+                    preference_loss(
+                        policy,
+                        ref,
+                        lengths,
+                        loss_type=self.loss_type,
+                        beta=self.beta,
+                        label_smoothing=self.label_smoothing,
+                    )
+                )
                 r_c, r_r = (self.beta * (policy - ref)).chunk(2)
                 chosen.append(r_c)
                 rejected.append(r_r)

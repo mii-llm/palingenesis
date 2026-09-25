@@ -49,7 +49,7 @@ def test_on_policy_generates_each_batch_with_the_newest_weights():
         for step in range(4):
             batch = orch.next(pipeline.weights.version)
             assert batch.version == pipeline.weights.version == step
-            time.sleep(0.05)                     # "training": the producer must not run ahead
+            time.sleep(0.05)  # "training": the producer must not run ahead
             assert pipeline.generated == list(range(step + 1))
             pipeline.weights.publish()
     finally:
@@ -61,7 +61,7 @@ def test_staleness_one_overlaps_one_batch():
     try:
         wait_until(lambda: len(pipeline.generated) == 2)
         time.sleep(0.05)
-        assert pipeline.generated == [0, 0]      # batch 1 generated during step 0; batch 2 waits for version 1
+        assert pipeline.generated == [0, 0]  # batch 1 generated during step 0; batch 2 waits for version 1
         versions = []
         for _ in range(5):
             batch = orch.next(pipeline.weights.version)
@@ -104,13 +104,13 @@ def test_weight_sync_waits_for_the_optimizer():
             self.version = version
 
     engine = Engine()
-    weights.lock.acquire()                       # the trainer is mid-step
+    weights.lock.acquire()  # the trainer is mid-step
     weights.publish()
     done = threading.Event()
     threading.Thread(target=lambda: (weights.sync(engine), done.set())).start()
     time.sleep(0.05)
     assert not done.is_set()
     weights.lock.release()
-    assert done.wait(60) and engine.version == 1          # (the first sync imports transformers)
+    assert done.wait(60) and engine.version == 1  # (the first sync imports transformers)
     assert [n for n, _ in engine.seen] == ["weight", "bias"]
-    assert weights.sync(engine) == 0.0           # up to date: nothing to do
+    assert weights.sync(engine) == 0.0  # up to date: nothing to do

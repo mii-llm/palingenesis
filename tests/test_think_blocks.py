@@ -21,15 +21,16 @@ def test_split_leading_think():
 
 
 def assistant(content, **extra):
-    return normalize_messages({"messages": [{"role": "user", "content": "q"},
-                                            {"role": "assistant", "content": content, **extra}]})[1]
+    return normalize_messages(
+        {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": content, **extra}]}
+    )[1]
 
 
 def test_normalization():
     m = assistant("<think>\nplan\n</think>\n\nIt is 4.")
     assert (m["reasoning_content"], m["content"]) == ("plan", "It is 4.")
     m = assistant("<think>\nbaked\n</think>\n\nIt is 4.", reasoning_content="explicit")
-    assert (m["reasoning_content"], m["content"]) == ("explicit", "It is 4.")        # explicit wins, no second block
+    assert (m["reasoning_content"], m["content"]) == ("explicit", "It is 4.")  # explicit wins, no second block
     m = assistant("You write <think> then </think>.")
     assert m["content"] == "You write <think> then </think>." and m["reasoning_content"] == ""
     m = assistant("<think>\n\n</think>\n\nIt is 4.")
@@ -39,12 +40,17 @@ def test_normalization():
 
 
 ROWS = {
-    "baked": ([{"role": "user", "content": "2+2?"},
-               {"role": "assistant", "content": "<think>\nadd them\n</think>\n\nIt is 4."}],
-              "<think>\nadd them\n</think>\n\nIt is 4."),
-    "literal": ([{"role": "user", "content": "how?"},
-                 {"role": "assistant", "content": "You write <think> then </think>."}],
-                "You write <think> then </think>."),
+    "baked": (
+        [
+            {"role": "user", "content": "2+2?"},
+            {"role": "assistant", "content": "<think>\nadd them\n</think>\n\nIt is 4."},
+        ],
+        "<think>\nadd them\n</think>\n\nIt is 4.",
+    ),
+    "literal": (
+        [{"role": "user", "content": "how?"}, {"role": "assistant", "content": "You write <think> then </think>."}],
+        "You write <think> then </think>.",
+    ),
 }
 
 
@@ -59,14 +65,15 @@ def test_rendered_and_trained(model, thinking, row):
     except Exception as e:  # noqa: BLE001 — offline
         pytest.skip(f"tokenizer unavailable: {e}")
     messages, answer = ROWS[row]
-    ex = next(iter(ChatDataset([{"messages": messages, "chat_template_kwargs": {"enable_thinking": thinking}}],
-                               tok, 4096)))
+    ex = next(
+        iter(ChatDataset([{"messages": messages, "chat_template_kwargs": {"enable_thinking": thinking}}], tok, 4096))
+    )
     text = tok.decode(ex["input_ids"])
     trained = tok.decode([t for t, lab in zip(ex["input_ids"], ex["labels"]) if lab != -100])
-    assert "</think>\n\n<think>" not in text and "<think>\n\n</think>\n\n<think>" not in text   # never two blocks
-    assert trained.startswith(answer) or answer in trained                                       # all of the answer
+    assert "</think>\n\n<think>" not in text and "<think>\n\n</think>\n\n<think>" not in text  # never two blocks
+    assert trained.startswith(answer) or answer in trained  # all of the answer
     if row == "literal":
-        assert "You write <think> then </think>." in trained                                     # tags are text
+        assert "You write <think> then </think>." in trained  # tags are text
 
 
 # A template whose reasoning delimiters are not <think></think> (Magistral-style).
@@ -112,8 +119,14 @@ def test_detect_think_tags():
 def test_custom_tags_in_data_and_template():
     """Data baked with the template's own [THINK] tags: one block, parsed without configuration."""
     tok = _tokenizer(template=BRACKET_TEMPLATE)
-    rows = [{"messages": [{"role": "user", "content": "2+2?"},
-                          {"role": "assistant", "content": "[THINK]add them[/THINK]It is 4."}]}]
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "2+2?"},
+                {"role": "assistant", "content": "[THINK]add them[/THINK]It is 4."},
+            ]
+        }
+    ]
     [(text, trained)] = _trained(tok, rows)
     assert text.count("[THINK]") == 1 and "[THINK]add them[/THINK]It is 4.<|im_end|>" in text
     assert trained.startswith("[THINK]add them[/THINK]It is 4.")
@@ -123,23 +136,37 @@ def test_custom_tags_in_data_and_template():
 
 def test_data_tags_converted_to_template_format():
     """Data written with another model's tags (think_tags) renders in this template's format."""
-    tok = _tokenizer()                                                   # Qwen3: <think></think>
-    rows = [{"messages": [{"role": "user", "content": "2+2?"},
-                          {"role": "assistant", "content": "◁think▷add them◁/think▷It is 4."}]}]
+    tok = _tokenizer()  # Qwen3: <think></think>
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "2+2?"},
+                {"role": "assistant", "content": "◁think▷add them◁/think▷It is 4."},
+            ]
+        }
+    ]
     [(text, trained)] = _trained(tok, rows, think_tags=["◁think▷", "◁/think▷"])
     assert "◁think▷" not in text and "<think>\nadd them\n</think>\n\nIt is 4." in text
     assert "add them" in trained
-    [(text, _)] = _trained(tok, rows)                                    # unconfigured: text, verbatim
+    [(text, _)] = _trained(tok, rows)  # unconfigured: text, verbatim
     assert "◁think▷add them◁/think▷It is 4." in text
 
 
 def test_mixed_thinking_rows():
     """Dataset-level chat_template_kwargs apply to every row; a row's own override them."""
     tok = _tokenizer("Qwen/Qwen3.5-0.8B")
-    rows = [{"messages": [{"role": "user", "content": "q"},
-                          {"role": "assistant", "content": "<think>\nplan\n</think>\n\nA."}]},
-            {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "B."}],
-             "chat_template_kwargs": {"enable_thinking": False}}]
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "<think>\nplan\n</think>\n\nA."},
+            ]
+        },
+        {
+            "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "B."}],
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    ]
     ds_kwargs = {"chat_template_kwargs": {"enable_thinking": True}}
     from palingenesis.data import ChatDataset
 

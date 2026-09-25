@@ -372,8 +372,8 @@ def filter_samples(
         sorted_ppls = sorted(finite_ppls)
         ppl_summary = (
             f", ppl_stats=min={sorted_ppls[0]:.2f}, "
-            f"p50={sorted_ppls[len(sorted_ppls)//2]:.2f}, "
-            f"p95={sorted_ppls[int(len(sorted_ppls)*0.95)]:.2f}, max={sorted_ppls[-1]:.2f}"
+            f"p50={sorted_ppls[len(sorted_ppls) // 2]:.2f}, "
+            f"p95={sorted_ppls[int(len(sorted_ppls) * 0.95)]:.2f}, max={sorted_ppls[-1]:.2f}"
         )
     max_desc = "disabled" if not use_max_ppl else str(max_ppl)
     logger.info(
@@ -438,7 +438,7 @@ def select_by_budget(
         logger.info(
             f"Optimal mix for budget={budget}: "
             f"{frac_easy:.0%} easy / {frac_medium:.0%} medium / "
-            f"{frac_hard:.0%} hard / {n_very_hard/budget:.0%} very-hard"
+            f"{frac_hard:.0%} hard / {n_very_hard / budget:.0%} very-hard"
         )
 
         # Within each bucket, prefer high-IFD samples (instruction informativeness)
@@ -687,7 +687,12 @@ def prepare_data(
     # Score
     logger.info("Scoring samples with model perplexity...")
     samples = score_samples_with_model(
-        model_name, samples, messages_field, max_seq_length, batch_size, max_batch_tokens=max_batch_tokens,
+        model_name,
+        samples,
+        messages_field,
+        max_seq_length,
+        batch_size,
+        max_batch_tokens=max_batch_tokens,
         chat_options=chat_options,
     )
 
@@ -779,8 +784,8 @@ def prepare_data(
     logger.info(f"Output: {out_file} ({len(samples)} samples)")
     if ppls:
         logger.info(
-            f"Perplexity stats: min={min(ppls):.1f}, median={sorted(ppls)[len(ppls)//2]:.1f}, "
-            f"max={max(ppls):.1f}, mean={sum(ppls)/len(ppls):.1f}"
+            f"Perplexity stats: min={min(ppls):.1f}, median={sorted(ppls)[len(ppls) // 2]:.1f}, "
+            f"max={max(ppls):.1f}, mean={sum(ppls) / len(ppls):.1f}"
         )
         logger.info(f"Difficulty distribution: {buckets}")
 
@@ -985,7 +990,7 @@ def prepare_multi_source(
         budget = src_config.get("budget", budget_per_source)
         messages_field = src_config.get("messages_field", "messages")
 
-        logger.info(f"\n{'='*60}")
+        logger.info(f"\n{'=' * 60}")
         logger.info(f"Processing source: {name}")
         logger.info(f"  dataset={dataset_id}, split={split}, weight={weight}")
 
@@ -1138,7 +1143,9 @@ def main():
     )
     parser.add_argument("--batch_size", type=int, default=4, help="Max samples per scoring forward")
     parser.add_argument(
-        "--max_batch_tokens", type=int, default=16384,
+        "--max_batch_tokens",
+        type=int,
+        default=16384,
         help="Padded-token cap per scoring forward (bounds logits memory; 32768+ OK on 80GB GPUs)",
     )
     parser.add_argument("--split", default="train", help="Dataset split (for HF datasets)")
@@ -1146,7 +1153,9 @@ def main():
     parser.add_argument("--hes", action="store_true", help="Also compute HES reasoning quality scores")
     parser.add_argument("--hes_top_k", type=float, default=0.5, help="Top-k%% tokens for HES metric")
     parser.add_argument(
-        "--eval_holdout", type=int, default=0,
+        "--eval_holdout",
+        type=int,
+        default=0,
         help="Reserve N samples as a held-out eval set (eval_data.parquet, excluded from training)",
     )
     parser.add_argument("--min_ppl", type=float, default=1.5, help="Outlier filter lower PPL bound")

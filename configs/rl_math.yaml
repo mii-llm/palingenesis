@@ -1,0 +1,36 @@
+# RL on verifiable math: GSM8K-style rows {"prompt": ..., "answer": ...}, reward 1 when the
+# final \boxed{} answer is right. One A100 80GB; vLLM generates in-process and sleeps while
+# the trainer steps.
+#
+#   pgs rl --config configs/rl_math.yaml
+#
+# Data: any JSONL/parquet/HF dataset with a prompt column (messages, prompt, question or
+# problem) and the answer column the reward reads (rewards.correct.args.field).
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/gsm8k_train.jsonl
+  eval_dataset: data/gsm8k_test.jsonl
+  retire_above: 0.9               # stop drawing prompts the policy solves 90% of the time
+
+rollout:
+  backend: vllm
+  batch_prompts: 64               # groups per step (x group_size = 512 rollouts)
+  group_size: 8
+  max_new_tokens: 1024
+  max_model_len: 2048
+  gpu_memory_utilization: 0.35
+
+rewards:
+  correct: {fn: math, args: {field: answer}}
+
+train:
+  output_dir: runs/rl_math
+  steps: 200
+  learning_rate: 2.0e-6
+  eval_every: 25
+  eval_samples: 512
+  save_steps: 50

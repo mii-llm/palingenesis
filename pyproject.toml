@@ -63,6 +63,9 @@ vllm = [
     "torchaudio==2.11.0; sys_platform == 'linux'",
     "torchcodec>=0.14; sys_platform == 'linux'",
 ]
+# pgs rl: symbolic answer checking for the math reward, and the Kubernetes Agent Sandbox client
+rl = ["math-verify>=0.8"]
+agent-sandbox = ["k8s-agent-sandbox[async]>=1.0"]
 # rollout.backend vllm_server: vLLM's weight transfer into a running server imports ray
 vllm-server = [
     "palingenesis[vllm]",

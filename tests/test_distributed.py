@@ -64,15 +64,21 @@ class TinyDistributedLM(nn.Module):
 
     def __init__(self, vocab_size=256, hidden=64, num_layers=4):
         super().__init__()
-        self.config = type("Config", (), {
-            "vocab_size": vocab_size,
-            "tie_word_embeddings": False,
-        })()
-        self.model = nn.ModuleDict({
-            "embed_tokens": nn.Embedding(vocab_size, hidden),
-            "layers": nn.ModuleList([TinyTransformerLayer(hidden) for _ in range(num_layers)]),
-            "norm": nn.LayerNorm(hidden),
-        })
+        self.config = type(
+            "Config",
+            (),
+            {
+                "vocab_size": vocab_size,
+                "tie_word_embeddings": False,
+            },
+        )()
+        self.model = nn.ModuleDict(
+            {
+                "embed_tokens": nn.Embedding(vocab_size, hidden),
+                "layers": nn.ModuleList([TinyTransformerLayer(hidden) for _ in range(num_layers)]),
+                "norm": nn.LayerNorm(hidden),
+            }
+        )
         self.lm_head = nn.Linear(hidden, vocab_size, bias=False)
 
     def forward(self, input_ids, attention_mask=None, position_ids=None):
@@ -130,12 +136,15 @@ def _get_reference_gradients(model, batch, valid_tokens):
     model.zero_grad()
     output = model(batch["input_ids"])
     logits = output.logits
-    loss = F.cross_entropy(
-        logits.view(-1, logits.size(-1)).float(),
-        batch["labels"].view(-1),
-        reduction="sum",
-        ignore_index=IGNORE_INDEX,
-    ) / valid_tokens
+    loss = (
+        F.cross_entropy(
+            logits.view(-1, logits.size(-1)).float(),
+            batch["labels"].view(-1),
+            reduction="sum",
+            ignore_index=IGNORE_INDEX,
+        )
+        / valid_tokens
+    )
     loss.backward()
     grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
     return loss.item(), grads
@@ -171,6 +180,7 @@ def _fsdp_gradient_worker(rank, world_size, ref_state_dict, batch, expected_loss
 
     # Disable gradient division (we normalize by global_valid_tokens)
     from torch.distributed._composable.fsdp import FSDPModule
+
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
@@ -191,12 +201,15 @@ def _fsdp_gradient_worker(rank, world_size, ref_state_dict, batch, expected_loss
     # But for gradient equivalence test, we normalize same as reference
     global_valid_tokens = local_valid.item()  # Use per-rank to match reference
 
-    loss = F.cross_entropy(
-        logits.view(-1, logits.size(-1)).float(),
-        batch["labels"].view(-1),
-        reduction="sum",
-        ignore_index=IGNORE_INDEX,
-    ) / global_valid_tokens
+    loss = (
+        F.cross_entropy(
+            logits.view(-1, logits.size(-1)).float(),
+            batch["labels"].view(-1),
+            reduction="sum",
+            ignore_index=IGNORE_INDEX,
+        )
+        / global_valid_tokens
+    )
     loss.backward()
 
     # Gather results on rank 0
@@ -233,16 +246,18 @@ def test_fsdp2_gradient_equivalence():
 
     try:
         run_distributed(
-            _fsdp_gradient_worker, 2,
-            ref_state_dict, batch, ref_loss, results_path,
+            _fsdp_gradient_worker,
+            2,
+            ref_state_dict,
+            batch,
+            ref_loss,
+            results_path,
         )
 
         with open(results_path) as f:
             results = json.load(f)
 
-        assert results["loss_matches"], (
-            f"FSDP loss {results['loss']:.6f} != reference {ref_loss:.6f}"
-        )
+        assert results["loss_matches"], f"FSDP loss {results['loss']:.6f} != reference {ref_loss:.6f}"
         print(f"  FSDP loss: {results['loss']:.6f}, Reference: {ref_loss:.6f}")
         print(f"  Grad norms computed for {len(results['grad_norms'])} parameters")
         print("✓ test_fsdp2_gradient_equivalence PASSED\n")
@@ -286,12 +301,15 @@ def _global_norm_worker(rank, world_size, results_path):
     # Each rank computes loss normalized by GLOBAL count
     model = nn.Linear(vocab_size, vocab_size)  # Simple model for testing
     logits = model(F.one_hot(input_ids, vocab_size).float())
-    loss = F.cross_entropy(
-        logits.view(-1, vocab_size),
-        labels.view(-1),
-        reduction="sum",
-        ignore_index=IGNORE_INDEX,
-    ) / global_valid_tokens
+    loss = (
+        F.cross_entropy(
+            logits.view(-1, vocab_size),
+            labels.view(-1),
+            reduction="sum",
+            ignore_index=IGNORE_INDEX,
+        )
+        / global_valid_tokens
+    )
 
     loss.backward()
     grad_norm = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
@@ -329,8 +347,7 @@ def test_global_valid_token_normalization():
             result = json.load(f)
 
         assert result["normalization_correct"], (
-            f"Global valid tokens = {result['global_valid']}, "
-            f"expected = {result['expected_global']}"
+            f"Global valid tokens = {result['global_valid']}, expected = {result['expected_global']}"
         )
         assert result["global_valid"] == 64
         assert result["local_valid"] == 16  # rank 0 has 16 valid
@@ -366,9 +383,7 @@ def test_context_parallel_sharding_roundtrip():
 
         from palingenesis.context_parallel import shard_for_context_parallel
 
-        ids_shard, mask_shard, labels_shard = shard_for_context_parallel(
-            input_ids, attention_mask, labels, mock_mesh
-        )
+        ids_shard, mask_shard, labels_shard = shard_for_context_parallel(input_ids, attention_mask, labels, mock_mesh)
 
         # Each shard should be seq_len / cp_world_size = 16 tokens
         assert ids_shard.shape == (batch_size, 16), f"Expected (2,16), got {ids_shard.shape}"
@@ -377,10 +392,8 @@ def test_context_parallel_sharding_roundtrip():
 
         # Verify correct slice
         expected_start = cp_rank * 16
-        expected_ids = input_ids[:, expected_start:expected_start + 16]
-        assert torch.equal(ids_shard, expected_ids), (
-            f"Rank {cp_rank}: shard content mismatch"
-        )
+        expected_ids = input_ids[:, expected_start : expected_start + 16]
+        assert torch.equal(ids_shard, expected_ids), f"Rank {cp_rank}: shard content mismatch"
 
     # Verify all shards together reconstruct the original
     all_shards = []
@@ -388,9 +401,7 @@ def test_context_parallel_sharding_roundtrip():
         mock_mesh = MagicMock()
         mock_mesh.get_local_rank.return_value = cp_rank
         mock_mesh.size.return_value = 4
-        ids_shard, _, _ = shard_for_context_parallel(
-            input_ids, attention_mask, labels, mock_mesh
-        )
+        ids_shard, _, _ = shard_for_context_parallel(input_ids, attention_mask, labels, mock_mesh)
         all_shards.append(ids_shard)
 
     reconstructed = torch.cat(all_shards, dim=1)
@@ -456,7 +467,7 @@ def _grad_accum_worker(rank, world_size, results_path):
     model.zero_grad()
 
     for micro in range(grad_accum_steps):
-        is_last = (micro == grad_accum_steps - 1)
+        is_last = micro == grad_accum_steps - 1
         # Disable sync for non-final microsteps (avoid premature reduce-scatter)
         model.set_requires_gradient_sync(is_last)
 
@@ -663,9 +674,7 @@ def test_apply_fsdp_layer_structure():
         with open(results_path) as f:
             results = json.load(f)
 
-        assert results["has_enough_fsdp_layers"], (
-            f"Expected >= 5 FSDP modules, got {results['fsdp_module_count']}"
-        )
+        assert results["has_enough_fsdp_layers"], f"Expected >= 5 FSDP modules, got {results['fsdp_module_count']}"
         assert results["model_has_parameters"], "Model lost parameters after FSDP"
 
         print(f"  FSDP module count: {results['fsdp_module_count']}")
@@ -765,13 +774,13 @@ def test_fsdp_multi_step_convergence():
 
         assert results["all_finite"], "Training produced NaN/Inf losses"
         assert results["converged"], (
-            f"Loss didn't decrease enough: {results['reduction']*100:.1f}% "
+            f"Loss didn't decrease enough: {results['reduction'] * 100:.1f}% "
             f"(first_5={results['first_5_avg']:.4f}, last_5={results['last_5_avg']:.4f})"
         )
 
         print(f"  First 5 avg: {results['first_5_avg']:.4f}")
         print(f"  Last 5 avg:  {results['last_5_avg']:.4f}")
-        print(f"  Reduction:   {results['reduction']*100:.1f}%")
+        print(f"  Reduction:   {results['reduction'] * 100:.1f}%")
         print("✓ test_fsdp_multi_step_convergence PASSED\n")
     finally:
         os.unlink(results_path)
@@ -862,15 +871,14 @@ def test_fsdp_dcp_checkpoint_roundtrip():
         with open(results_path) as f:
             results = json.load(f)
 
-        assert results["roundtrip_correct"], (
-            f"Checkpoint roundtrip failed: max_diff={results['max_output_diff']:.2e}"
-        )
+        assert results["roundtrip_correct"], f"Checkpoint roundtrip failed: max_diff={results['max_output_diff']:.2e}"
 
         print(f"  Output diff after load: {results['max_output_diff']:.2e}")
         print("✓ test_fsdp_dcp_checkpoint_roundtrip PASSED\n")
     finally:
         os.unlink(results_path)
         import shutil
+
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

@@ -33,8 +33,6 @@ the model's logit transform, and the student's terminator needs no remapping
 (SharedVocab.swap empty). Anything else takes losses.full_rkl.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import torch
@@ -59,7 +57,7 @@ class Head:
 
     weight: Tensor
     multiplier: float = 1.0
-    softcap: float = 0.0          # 0: none
+    softcap: float = 0.0  # 0: none
 
 
 def unwrap(head: nn.Module) -> Head | None:
@@ -89,9 +87,24 @@ if triton is not None:
         return tl.where(valid, y, -float("inf"))
 
     @triton.jit
-    def _stats_kernel(zs_ptr, zt_ptr, target_ptr, out_ptr, v_s, v_t, n_shared, stride_s, stride_t,
-                      mult_s, cap_s, mult_t, cap_t,
-                      SOFTCAP_S: tl.constexpr, SOFTCAP_T: tl.constexpr, BLOCK: tl.constexpr):
+    def _stats_kernel(
+        zs_ptr,
+        zt_ptr,
+        target_ptr,
+        out_ptr,
+        v_s,
+        v_t,
+        n_shared,
+        stride_s,
+        stride_t,
+        mult_s,
+        cap_s,
+        mult_t,
+        cap_t,
+        SOFTCAP_S: tl.constexpr,
+        SOFTCAP_T: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
         """Per row: lse_s, lse_t, KL, S, k1 in one streaming pass over both rows of logits."""
         row = tl.program_id(0).to(tl.int64)
         zs_row = zs_ptr + row * stride_s
@@ -100,8 +113,8 @@ if triton is not None:
         l_s = 0.0
         m_t = -float("inf")
         l_t = 0.0
-        a = 0.0             # sum_{v<n} exp(y_s - m_s) (y_s - y_t)
-        b = 0.0             # sum_{v<n} exp(y_s - m_s)
+        a = 0.0  # sum_{v<n} exp(y_s - m_s) (y_s - y_t)
+        b = 0.0  # sum_{v<n} exp(y_s - m_s)
         v_max = tl.maximum(v_s, v_t)
         for start in range(0, v_max, BLOCK):
             cols = start + tl.arange(0, BLOCK)
@@ -134,9 +147,25 @@ if triton is not None:
         tl.store(out + 4, k1)
 
     @triton.jit
-    def _grad_kernel(zs_ptr, zt_ptr, stats_ptr, weight_ptr, grad_ptr, v_s, n_shared, stride_s, stride_t, stride_g,
-                     mult_s, cap_s, mult_t, cap_t,
-                     SOFTCAP_S: tl.constexpr, SOFTCAP_T: tl.constexpr, BLOCK: tl.constexpr):
+    def _grad_kernel(
+        zs_ptr,
+        zt_ptr,
+        stats_ptr,
+        weight_ptr,
+        grad_ptr,
+        v_s,
+        n_shared,
+        stride_s,
+        stride_t,
+        stride_g,
+        mult_s,
+        cap_s,
+        mult_t,
+        cap_t,
+        SOFTCAP_S: tl.constexpr,
+        SOFTCAP_T: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
         """grad[j] = w q_j ((d_j + 1) [j < n] - (KL + S)) dy_s/dz_s, in the gradient buffer's dtype."""
         row = tl.program_id(0).to(tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -148,11 +177,12 @@ if triton is not None:
         w = tl.load(weight_ptr + row)
         shared = cols < n_shared
         ys = _transform(tl.load(zs_ptr + row * stride_s + cols, mask=valid, other=0.0), valid, mult_s, cap_s, SOFTCAP_S)
-        yt = _transform(tl.load(zt_ptr + row * stride_t + cols, mask=shared, other=0.0), shared, mult_t, cap_t,
-                        SOFTCAP_T)
+        yt = _transform(
+            tl.load(zt_ptr + row * stride_t + cols, mask=shared, other=0.0), shared, mult_t, cap_t, SOFTCAP_T
+        )
         lq = ys - lse_s
         g = w * tl.exp(lq) * (tl.where(shared, lq - (yt - lse_t) + 1.0, 0.0) - c)
-        if SOFTCAP_S:       # dtanh(x) = 1 - tanh(x)^2 = 4 sigmoid(2x) sigmoid(-2x): no cancellation near saturation
+        if SOFTCAP_S:  # dtanh(x) = 1 - tanh(x)^2 = 4 sigmoid(2x) sigmoid(-2x): no cancellation near saturation
             x2 = 2.0 * mult_s * tl.load(zs_ptr + row * stride_s + cols, mask=valid, other=0.0) / cap_s
             g = g * mult_s * 4.0 * tl.sigmoid(x2) * tl.sigmoid(-x2)
         else:
@@ -160,21 +190,48 @@ if triton is not None:
         tl.store(grad_ptr + row * stride_g + cols, g.to(grad_ptr.dtype.element_ty), mask=valid)
 
 
-def _slice_triton(zs: Tensor, zt: Tensor, targets: Tensor, weights: Tensor, n_shared: int, grad_dtype,
-                  student: Head, teacher: Head):
+def _slice_triton(
+    zs: Tensor, zt: Tensor, targets: Tensor, weights: Tensor, n_shared: int, grad_dtype, student: Head, teacher: Head
+):
     rows, v_s = zs.shape
     transforms = (student.multiplier, student.softcap or 1.0, teacher.multiplier, teacher.softcap or 1.0)
     flags = {"SOFTCAP_S": student.softcap > 0, "SOFTCAP_T": teacher.softcap > 0}
     stats = torch.empty(rows, 5, device=zs.device, dtype=torch.float32)
-    _stats_kernel[(rows,)](zs, zt, targets, stats, v_s, zt.shape[1], n_shared, zs.stride(0), zt.stride(0),
-                           *transforms, **flags, BLOCK=4096, num_warps=16)
+    _stats_kernel[(rows,)](
+        zs,
+        zt,
+        targets,
+        stats,
+        v_s,
+        zt.shape[1],
+        n_shared,
+        zs.stride(0),
+        zt.stride(0),
+        *transforms,
+        **flags,
+        BLOCK=4096,
+        num_warps=16,
+    )
     grad = None
     if grad_dtype is not None:
         grad = torch.empty(rows, v_s, device=zs.device, dtype=grad_dtype)
         block = 4096
-        _grad_kernel[(rows, triton.cdiv(v_s, block))](zs, zt, stats, weights, grad, v_s, n_shared, zs.stride(0),
-                                                      zt.stride(0), grad.stride(0), *transforms, **flags,
-                                                      BLOCK=block, num_warps=8)
+        _grad_kernel[(rows, triton.cdiv(v_s, block))](
+            zs,
+            zt,
+            stats,
+            weights,
+            grad,
+            v_s,
+            n_shared,
+            zs.stride(0),
+            zt.stride(0),
+            grad.stride(0),
+            *transforms,
+            **flags,
+            BLOCK=block,
+            num_warps=8,
+        )
     return stats, grad
 
 
@@ -183,8 +240,9 @@ def _apply(z: Tensor, head: Head) -> Tensor:
     return torch.tanh(y / head.softcap) * head.softcap if head.softcap else y
 
 
-def _slice_torch(zs: Tensor, zt: Tensor, targets: Tensor, weights: Tensor, n_shared: int, grad_dtype,
-                 student: Head, teacher: Head):
+def _slice_torch(
+    zs: Tensor, zt: Tensor, targets: Tensor, weights: Tensor, n_shared: int, grad_dtype, student: Head, teacher: Head
+):
     """The same statistics and gradient as the kernels, in plain torch."""
     ys, yt = _apply(zs, student), _apply(zt, teacher)
     lq = torch.log_softmax(ys, -1)
@@ -235,13 +293,21 @@ class _FusedRKL(torch.autograd.Function):
         want_hidden, want_weight = hidden.requires_grad, weight.requires_grad
         grad_hidden = torch.empty_like(hidden) if want_hidden else None
         grad_weight = torch.zeros(weight.shape, device=weight.device, dtype=acc) if want_weight else None
-        totals = torch.zeros(4, device=hidden.device, dtype=acc)     # loss, kl, k1, residual
+        totals = torch.zeros(4, device=hidden.device, dtype=acc)  # loss, kl, k1, residual
         for a in range(0, h.shape[0], rows):
             b = min(a + rows, h.shape[0])
             zs = _mm_fp32(h[a:b], w.T)
             zt = _mm_fp32(th[a:b], tw.T)
-            stats, grad = slice_fn(zs, zt, targets[a:b], weights[a:b], n_shared,
-                                   dtype if want_hidden or want_weight else None, student, teacher)
+            stats, grad = slice_fn(
+                zs,
+                zt,
+                targets[a:b],
+                weights[a:b],
+                n_shared,
+                dtype if want_hidden or want_weight else None,
+                student,
+                teacher,
+            )
             del zs, zt
             kl = stats[:, 2]
             totals += torch.stack([(weights[a:b] * kl).sum(), kl.sum(), stats[:, 4].sum(), (1 - stats[:, 3]).sum()])
@@ -254,21 +320,39 @@ class _FusedRKL(torch.autograd.Function):
                     grad_weight.addmm_(grad.T, h[a:b])
         stats_out.append(totals)
         ctx.has = (want_hidden, want_weight)
-        ctx.save_for_backward(grad_hidden if want_hidden else torch.empty(0),
-                              grad_weight.to(weight.dtype) if want_weight else torch.empty(0))
+        ctx.save_for_backward(
+            grad_hidden if want_hidden else torch.empty(0),
+            grad_weight.to(weight.dtype) if want_weight else torch.empty(0),
+        )
         return totals[0].clone()
 
     @staticmethod
     def backward(ctx, grad_output):
         grad_hidden, grad_weight = ctx.saved_tensors
-        return (grad_hidden * grad_output if ctx.has[0] else None,
-                grad_weight * grad_output if ctx.has[1] else None,
-                None, None, None, None, None, None, None, None)
+        return (
+            grad_hidden * grad_output if ctx.has[0] else None,
+            grad_weight * grad_output if ctx.has[1] else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
-def fused_full_rkl(hidden: Tensor, head: nn.Module, teacher_hidden: Tensor, teacher_head: nn.Module,
-                   targets: Tensor, weights: Tensor, n_shared: int,
-                   rows: int | None = None) -> tuple[Tensor, dict[str, float]]:
+def fused_full_rkl(
+    hidden: Tensor,
+    head: nn.Module,
+    teacher_hidden: Tensor,
+    teacher_head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    n_shared: int,
+    rows: int | None = None,
+) -> tuple[Tensor, dict[str, float]]:
     """losses.full_rkl for heads `supported` accepts, fused: (sum_t weights[t] KL_t, stats sums).
 
     `targets` are the completion ids (k1); ids below `n_shared` are the same token
@@ -278,8 +362,9 @@ def fused_full_rkl(hidden: Tensor, head: nn.Module, teacher_hidden: Tensor, teac
         raise ValueError("fused_full_rkl needs bias-free linear heads (see fused_rkl.supported)")
     rows = rows or max(1, SLICE_ELEMENTS // max(student.weight.shape[0], teacher.weight.shape[0]))
     stats: list[Tensor] = []
-    with torch.autocast(hidden.device.type, enabled=False):      # the dtypes are chosen explicitly
-        loss = _FusedRKL.apply(hidden, student.weight, teacher_hidden, student, teacher, targets, weights, n_shared,
-                               rows, stats)
-    kl, k1, residual = stats[0][1:].tolist()        # the call's one host sync
+    with torch.autocast(hidden.device.type, enabled=False):  # the dtypes are chosen explicitly
+        loss = _FusedRKL.apply(
+            hidden, student.weight, teacher_hidden, student, teacher, targets, weights, n_shared, rows, stats
+        )
+    kl, k1, residual = stats[0][1:].tolist()  # the call's one host sync
     return loss, {"kl": kl, "k1": k1, "residual": residual}

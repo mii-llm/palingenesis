@@ -19,9 +19,9 @@ import torch.nn.functional as F  # noqa: E402
 from palingenesis.logits import PostProcessedHead  # noqa: E402
 from palingenesis.opd import losses  # noqa: E402
 
-N, H, V = 11, 8, 13          # tokens, hidden size, student vocab
-SHARED = 10                  # teacher vocab = shared prefix
-SWAP = {12: 4}               # student-only terminator 12 -> teacher terminator 4
+N, H, V = 11, 8, 13  # tokens, hidden size, student vocab
+SHARED = 10  # teacher vocab = shared prefix
+SWAP = {12: 4}  # student-only terminator 12 -> teacher terminator 4
 
 
 @pytest.fixture(autouse=True)
@@ -84,7 +84,7 @@ def test_full_rkl_matches_naive(softcap):
     k1 = lq.gather(1, targets[:, None]).squeeze(1) - t_logp.gather(1, targets[:, None]).squeeze(1)
     assert stats["k1"] == pytest.approx(k1.sum().item())
     p = F.softmax(head(hidden), -1)
-    residual = p[:, SHARED:].sum(-1) - p[:, 12]                  # student-only mass that is not swapped
+    residual = p[:, SHARED:].sum(-1) - p[:, 12]  # student-only mass that is not swapped
     assert stats["residual"] == pytest.approx(residual.sum().item(), abs=1e-9)
 
 
@@ -92,8 +92,9 @@ def test_full_rkl_is_zero_when_student_equals_teacher():
     hidden, head, weights, _ = make()
     vocab = losses.SharedVocab(V)
     t_logp = F.log_softmax(head(hidden), -1).detach()
-    loss, stats = losses.full_rkl(hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab,
-                                  lambda a, b: t_logp[a:b])
+    loss, stats = losses.full_rkl(
+        hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab, lambda a, b: t_logp[a:b]
+    )
     assert loss.item() == pytest.approx(0.0, abs=1e-12)
     assert all(g.abs().max() < 1e-12 for g in grads(loss, hidden, head))
 
@@ -103,11 +104,9 @@ def test_chunked_gradient_respects_downstream_scaling():
     hidden, head, weights, g = make()
     t_logp = teacher_logp(g)
     vocab = losses.SharedVocab(SHARED, SWAP)
-    loss, _ = losses.full_rkl(hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab,
-                              lambda a, b: t_logp[a:b])
+    loss, _ = losses.full_rkl(hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab, lambda a, b: t_logp[a:b])
     once = grads(loss, hidden, head)
-    loss, _ = losses.full_rkl(hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab,
-                              lambda a, b: t_logp[a:b])
+    loss, _ = losses.full_rkl(hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab, lambda a, b: t_logp[a:b])
     thrice = grads(3.0 * loss, hidden, head)
     for a, b in zip(once, thrice):
         torch.testing.assert_close(3.0 * a, b)
@@ -117,11 +116,13 @@ def test_no_grad_path_gives_the_same_value():
     hidden, head, weights, g = make()
     t_logp = teacher_logp(g)
     vocab = losses.SharedVocab(SHARED, SWAP)
-    with_grad, stats = losses.full_rkl(hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab,
-                                       lambda a, b: t_logp[a:b])
+    with_grad, stats = losses.full_rkl(
+        hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab, lambda a, b: t_logp[a:b]
+    )
     with torch.no_grad():
-        without, stats_ng = losses.full_rkl(hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab,
-                                            lambda a, b: t_logp[a:b])
+        without, stats_ng = losses.full_rkl(
+            hidden, head, torch.zeros(N, dtype=torch.long), weights, vocab, lambda a, b: t_logp[a:b]
+        )
     assert without.item() == pytest.approx(with_grad.item())
     assert stats_ng == pytest.approx(stats)
     assert head.weight.grad is None
@@ -145,11 +146,11 @@ def naive_coarse_kl(lq, lp, valid, beta):
 
 def topk_inputs(g, k=4):
     support = torch.randint(0, SHARED, (N, k), generator=g)
-    for i in range(N):                                   # distinct ids per row
+    for i in range(N):  # distinct ids per row
         support[i] = torch.randperm(SHARED, generator=g)[:k]
     t_lp = torch.log(torch.rand(N, k, generator=g, dtype=torch.float64) * 0.2)
     valid = torch.ones(N, k, dtype=torch.bool)
-    valid[0, -1] = False                                 # padding
+    valid[0, -1] = False  # padding
     valid[3, 1:] = False
     return support, t_lp, valid
 
@@ -177,7 +178,7 @@ def test_coarse_kl_tail_edge_cases():
     kl = losses.coarse_kl(lq, lp, valid, beta=1.0)
     assert torch.isfinite(kl).all()
     torch.testing.assert_close(kl, naive_coarse_kl(lq, lp, valid, 1.0))
-    assert kl.item() > 6.0        # dominated by the student's 0.5 tail against a ~1e-6 teacher tail
+    assert kl.item() > 6.0  # dominated by the student's 0.5 tail against a ~1e-6 teacher tail
     # identical coarse distributions: zero in both directions
     same = losses.coarse_kl(lp, lp, valid, beta=0.5)
     assert same.item() == pytest.approx(0.0, abs=1e-9)
@@ -207,7 +208,7 @@ def test_sampled_rkl_matches_naive(with_behaviour):
     teacher_lp = torch.log(torch.rand(N, generator=g, dtype=torch.float64))
     lp_ref = F.log_softmax(head(hidden), -1).gather(1, targets[:, None]).squeeze(1)
     behaviour = None
-    if with_behaviour:   # some ratios inside [0.5, 2], some outside (ICE-POP zeroes those)
+    if with_behaviour:  # some ratios inside [0.5, 2], some outside (ICE-POP zeroes those)
         shift = torch.tensor([0.0, 0.3, -0.3, 1.0, -1.0, 0.1, 2.0, -0.6, 0.0, 0.69, -0.69], dtype=torch.float64)
         behaviour = (lp_ref + shift).detach()
     ours = losses.sampled_rkl(hidden, head, targets, weights, teacher_lp, behaviour)
@@ -217,7 +218,7 @@ def test_sampled_rkl_matches_naive(with_behaviour):
     assert_same(ours, ref, hidden, head)
     stats = ours[1]
     assert stats["k1"] == pytest.approx((lp_ref - teacher_lp).sum().item())
-    assert stats["is_dropped"] == (3 if with_behaviour else 0)   # |shift| > ln 2
+    assert stats["is_dropped"] == (3 if with_behaviour else 0)  # |shift| > ln 2
 
 
 def test_sampled_rkl_gradient_is_the_reverse_kl_gradient():
@@ -234,8 +235,9 @@ def test_sampled_rkl_gradient_is_the_reverse_kl_gradient():
     want = torch.autograd.grad(kl, hidden)[0]
     got = torch.zeros_like(hidden)
     for y in range(V):
-        loss, _ = losses.sampled_rkl(hidden, head, torch.tensor([y]), torch.ones(1, dtype=torch.float64),
-                                     t_logp[0, y:y + 1])
+        loss, _ = losses.sampled_rkl(
+            hidden, head, torch.tensor([y]), torch.ones(1, dtype=torch.float64), t_logp[0, y : y + 1]
+        )
         got += logp[0, y].exp().detach() * torch.autograd.grad(loss, hidden)[0]
     torch.testing.assert_close(got, want)
 
@@ -286,7 +288,7 @@ def test_xtok_dense_term_matches_naive():
     hidden, head, weights, g = make()
     targets = torch.randint(0, V, (N,), generator=g)
     chunks = xtok_inputs(g)
-    rows = torch.tensor([2, 7, 8])                    # one-to-one chunks
+    rows = torch.tensor([2, 7, 8])  # one-to-one chunks
     support = torch.stack([torch.randperm(V, generator=g)[:5] for _ in rows])
     t_lp = torch.log(torch.rand(3, 5, generator=g, dtype=torch.float64) * 0.2)
     valid = torch.ones(3, 5, dtype=torch.bool)
@@ -330,8 +332,8 @@ def test_teacher_samples_estimate_the_distribution_without_bias():
             total += torch.zeros_like(logp).scatter_add_(1, ids, w)
         return total / repeats
 
-    assert (estimate(12, 1.0, 4000) - logp.exp()).abs().max() < 0.01          # small samples, unbiased on average
-    assert (estimate(20000, 0.7, 1) - logp.exp()).abs().max() < 0.01         # flatter proposal, reweighted
+    assert (estimate(12, 1.0, 4000) - logp.exp()).abs().max() < 0.01  # small samples, unbiased on average
+    assert (estimate(20000, 0.7, 1) - logp.exp()).abs().max() < 0.01  # flatter proposal, reweighted
 
 
 def test_rs_kd_gradient_is_the_forward_kl_gradient_in_expectation():
@@ -339,18 +341,19 @@ def test_rs_kd_gradient_is_the_forward_kl_gradient_in_expectation():
 
     hidden, head, weights, g = make()
     teacher_full = F.log_softmax(torch.randn(N, SHARED + 3, generator=g, dtype=torch.float64), -1)
-    t_logp = teacher_full[:, :SHARED]                           # the teacher's ids beyond SHARED have no student match
+    t_logp = teacher_full[:, :SHARED]  # the teacher's ids beyond SHARED have no student match
     vocab = losses.SharedVocab(SHARED, SWAP)
     targets = torch.randint(0, SHARED, (N,), generator=g)
     lq = project(F.log_softmax(head(hidden), -1))
-    full = (weights * (t_logp.exp() * (t_logp - lq)).sum(-1)).sum()          # forward KL over the shared vocabulary
+    full = (weights * (t_logp.exp() * (t_logp - lq)).sum(-1)).sum()  # forward KL over the shared vocabulary
     want = grads(full, hidden, head)
 
     repeats, got, values = 400, [torch.zeros_like(x) for x in want], []
     for _ in range(repeats):
         ids, w, lp = sample_teacher(teacher_full, 16, 1.0, g)
-        loss, stats = losses.rs_kd(hidden, head, targets, weights, vocab, ids, w, lp,
-                                   t_logp.gather(1, targets[:, None]).squeeze(1))
+        loss, stats = losses.rs_kd(
+            hidden, head, targets, weights, vocab, ids, w, lp, t_logp.gather(1, targets[:, None]).squeeze(1)
+        )
         values.append(loss.item())
         for acc, x in zip(got, grads(loss, hidden, head)):
             acc += x / repeats
@@ -363,7 +366,7 @@ def test_rs_kd_gradient_is_the_forward_kl_gradient_in_expectation():
 def test_rs_kd_drops_draws_outside_the_shared_vocabulary():
     hidden, head, weights, g = make()
     vocab = losses.SharedVocab(SHARED)
-    ids = torch.tensor([[1, SHARED + 1]] * N)                   # the second draw has no student counterpart
+    ids = torch.tensor([[1, SHARED + 1]] * N)  # the second draw has no student counterpart
     w = torch.full((N, 2), 0.5, dtype=torch.float64)
     lp = torch.full((N, 2), -1.0, dtype=torch.float64)
     targets = torch.ones(N, dtype=torch.long)

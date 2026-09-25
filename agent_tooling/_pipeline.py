@@ -7,8 +7,6 @@ local files, multi-source mixes, prepared datasets, masking options and
 packing all behave as in training.
 """
 
-from __future__ import annotations
-
 from collections.abc import Iterator
 
 import agent_tooling._path_setup  # noqa: F401

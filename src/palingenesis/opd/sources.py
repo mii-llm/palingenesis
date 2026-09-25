@@ -25,8 +25,6 @@ source (hence which teacher) each prompt came from. A custom source is any
 object with the three methods; pass it as ``OPDTrainer(config, source=...)``.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import random
@@ -123,8 +121,13 @@ class McqaPoolSource:
 
         def _acc(fast: bool, template, max_new_tokens: int, last: bool) -> float:
             prompts = [
-                build_messages(r, few_shots=self.reference_shots, fast=fast,
-                               system_message=self.config.system_message or None, template=template)
+                build_messages(
+                    r,
+                    few_shots=self.reference_shots,
+                    fast=fast,
+                    system_message=self.config.system_message or None,
+                    template=template,
+                )
                 for r in rows
             ]
             texts = engine.greedy_generate(prompts, max_new_tokens=max_new_tokens)
@@ -140,7 +143,8 @@ class McqaPoolSource:
         if not rollouts:
             return {}
         ok = sum(
-            1 for meta, text in rollouts
+            1
+            for meta, text in rollouts
             if (letter := extract_letter(text)) and letter in {le for le, _ in meta["row"]["options"]}
         )
         return {"format_ok": ok / len(rollouts)}

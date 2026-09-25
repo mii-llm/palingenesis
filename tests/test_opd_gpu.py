@@ -35,14 +35,24 @@ from palingenesis.opd.rollout import (  # noqa: E402
 CONVERSATIONS = [
     ("What is 17 * 23?", "17 * 23 = 391. Answer: 391"),
     ("Write a haiku about autumn.", "Crimson leaves drifting,\nquiet rivers carry them\ntoward the winter sea."),
-    ("Explain what a hash map is in one sentence.", "A hash map stores key-value pairs and finds a value by hashing its key."),
+    (
+        "Explain what a hash map is in one sentence.",
+        "A hash map stores key-value pairs and finds a value by hashing its key.",
+    ),
 ]
 
 
 def probes(tok):
-    return [tok.encode(tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False,
-                                               add_generation_prompt=True, enable_thinking=False) + a,
-                       add_special_tokens=False) for q, a in CONVERSATIONS]
+    return [
+        tok.encode(
+            tok.apply_chat_template(
+                [{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            + a,
+            add_special_tokens=False,
+        )
+        for q, a in CONVERSATIONS
+    ]
 
 
 @torch.no_grad()
@@ -84,12 +94,20 @@ def test_colocated_engine_receives_the_weights():
     tok = AutoTokenizer.from_pretrained(name)
     seqs = probes(tok)
     model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).cuda()
-    engine = VLLMColocateRollout(name, (tok.eos_token_id,), gpu_memory_utilization=0.3, max_model_len=1024,
-                                 enforce_eager=False, seed=0, sleep_mode=True)
+    engine = VLLMColocateRollout(
+        name,
+        (tok.eos_token_id,),
+        gpu_memory_utilization=0.3,
+        max_model_len=1024,
+        enforce_eager=False,
+        seed=0,
+        sleep_mode=True,
+    )
 
     def engine_logprobs():
-        outs = engine.llm.generate([{"prompt_token_ids": s} for s in seqs],
-                                   SamplingParams(max_tokens=1, prompt_logprobs=0), use_tqdm=False)
+        outs = engine.llm.generate(
+            [{"prompt_token_ids": s} for s in seqs], SamplingParams(max_tokens=1, prompt_logprobs=0), use_tqdm=False
+        )
         return torch.tensor([o.prompt_logprobs[i][s[i]].logprob for o, s in zip(outs, seqs) for i in range(1, len(s))])
 
     check_sync(model, engine, engine_logprobs, seqs, sleep=True)
@@ -100,17 +118,27 @@ def test_server_receives_the_weights_over_cuda_ipc(tmp_path):
     name = "Qwen/Qwen3-0.6B"
     tok = AutoTokenizer.from_pretrained(name)
     seqs = probes(tok)
-    server = VLLMServer(name, args=("--gpu-memory-utilization", "0.3", "--max-model-len", "1024",
-                                    "--weight-transfer-config", '{"backend": "ipc"}'),
-                        log_path=str(tmp_path / "server.log"))
+    server = VLLMServer(
+        name,
+        args=(
+            "--gpu-memory-utilization",
+            "0.3",
+            "--max-model-len",
+            "1024",
+            "--weight-transfer-config",
+            '{"backend": "ipc"}',
+        ),
+        log_path=str(tmp_path / "server.log"),
+    )
     try:
         model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).cuda()
         engine = VLLMServerRollout(server, (tok.eos_token_id,))
 
         def engine_logprobs():
             choices = server.complete(seqs, parallel=1, max_tokens=1, temperature=1.0, prompt_logprobs=0)
-            return torch.tensor([c["prompt_logprobs"][i][str(s[i])]["logprob"]
-                                 for c, s in zip(choices, seqs) for i in range(1, len(s))])
+            return torch.tensor(
+                [c["prompt_logprobs"][i][str(s[i])]["logprob"] for c, s in zip(choices, seqs) for i in range(1, len(s))]
+            )
 
         check_sync(model, engine, engine_logprobs, seqs, sleep=False)
     finally:

@@ -15,8 +15,6 @@ the GPU trains: the turns to regenerate (`branches_per_trace`, each
      recorded turns, gradients through the whole shared context.
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import logging
@@ -46,7 +44,7 @@ from palingenesis.seco_tree import Branch, tree_forward_backward, tree_hidden_st
 
 logger = logging.getLogger(__name__)
 
-PLAN_ATTEMPTS = 20        # traces drawn before giving up on one that has a usable turn
+PLAN_ATTEMPTS = 20  # traces drawn before giving up on one that has a usable turn
 
 
 @dataclass
@@ -77,13 +75,18 @@ class TraceSources:
             if source.dev_path:
                 train, dev = rows, load_trace_rows(source.dev_path, source.messages_field, source.tools_field, tags)
             else:
+
                 def key(row):
-                    return hashlib.sha1(json.dumps(row["messages"], sort_keys=True, ensure_ascii=False,
-                                                   default=str).encode()).hexdigest()
+                    return hashlib.sha1(
+                        json.dumps(row["messages"], sort_keys=True, ensure_ascii=False, default=str).encode()
+                    ).hexdigest()
+
                 ranked = sorted(rows, key=key)
-                dev, train = ranked[:source.dev_size], ranked[source.dev_size:]
+                dev, train = ranked[: source.dev_size], ranked[source.dev_size :]
             if not train:
-                raise ValueError(f"sources.{name}: no training traces left after holding out dev_size={source.dev_size}")
+                raise ValueError(
+                    f"sources.{name}: no training traces left after holding out dev_size={source.dev_size}"
+                )
             self.names.append(name)
             self.weights.append(source.weight)
             self.train[name], self.dev[name] = train, dev
@@ -97,10 +100,18 @@ class TraceSources:
 class TracePipeline(Pipeline):
     """Rollouts of every regenerated turn, then each trace scored by its teacher (see module doc)."""
 
-    def __init__(self, *args, chunk_size: int, branch_tokens: int, min_gap: int, prefix_caching: bool,
-                 regenerate: bool = True, **kwargs):
+    def __init__(
+        self,
+        *args,
+        chunk_size: int,
+        branch_tokens: int,
+        min_gap: int,
+        prefix_caching: bool,
+        regenerate: bool = True,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.regenerate = regenerate          # False: recorded turns only (no rollouts)
+        self.regenerate = regenerate  # False: recorded turns only (no rollouts)
         self.chunk_size = chunk_size
         self.branch_tokens = branch_tokens
         self.min_gap = min_gap
@@ -116,7 +127,7 @@ class TracePipeline(Pipeline):
             t0 = time.perf_counter()
             self.engine.wake()
             t1 = time.perf_counter()
-            if self.prefix_caching:     # prefill each trunk once: every turn of the trace then reuses it
+            if self.prefix_caching:  # prefill each trunk once: every turn of the trace then reuses it
                 self.engine.generate([r.plan.trunk for r in requests], [1] * len(requests), 0.0)
             t2 = time.perf_counter()
             prompts = [b.context for r in requests for b in r.plan.branches]
@@ -135,23 +146,32 @@ class TracePipeline(Pipeline):
                     if completion:
                         keep.append(i)
                         completions.append(completion)
-                        behaviour.append(rollout.logprobs[:len(completion)])
+                        behaviour.append(rollout.logprobs[: len(completion)])
                         ends.append(rollout.finish_reason)
                 pos += len(r.plan.branches)
                 if keep:
-                    samples.append(TraceSample(select(r.plan, keep), completions, behaviour, ends, r.teacher,
-                                               {**r.meta, "_src": r.source}))
+                    samples.append(
+                        TraceSample(
+                            select(r.plan, keep), completions, behaviour, ends, r.teacher, {**r.meta, "_src": r.source}
+                        )
+                    )
             t4 = time.perf_counter()
             for sample in samples:
                 self._score(sample)
             t5 = time.perf_counter()
         tokens = sum(len(c) for s in samples for c in s.completions)
-        stats = {"time/sync": sync, "time/wake_sleep": (t1 - t0) + (t4 - t3), "time/prefill": t2 - t1,
-                 "time/rollout": t3 - t2, "time/teacher": t5 - t4, "rollout_tokens": tokens,
-                 "rollout_tok_s": tokens / max(t3 - t2, 1e-9),
-                 "stop_rate": sum(f == "stop" for f in finish) / max(1, len(finish)),
-                 "trunk_tokens": sum(len(s.plan.trunk) for s in samples) / max(1, len(samples)),
-                 "branches": sum(len(s.completions) for s in samples)}
+        stats = {
+            "time/sync": sync,
+            "time/wake_sleep": (t1 - t0) + (t4 - t3),
+            "time/prefill": t2 - t1,
+            "time/rollout": t3 - t2,
+            "time/teacher": t5 - t4,
+            "rollout_tokens": tokens,
+            "rollout_tok_s": tokens / max(t3 - t2, 1e-9),
+            "stop_rate": sum(f == "stop" for f in finish) / max(1, len(finish)),
+            "trunk_tokens": sum(len(s.plan.trunk) for s in samples) / max(1, len(samples)),
+            "branches": sum(len(s.completions) for s in samples),
+        }
         version = min((rollouts[i].policy_version for i in range(len(rollouts))), default=self.engine.version)
         return TraceBatch(samples, version, stats)
 
@@ -159,12 +179,20 @@ class TracePipeline(Pipeline):
         """No rollouts: each trace is scored by its teacher on its recorded turns alone."""
         with self._exclusive():
             start = time.perf_counter()
-            samples = [TraceSample(TracePlan(r.plan.trunk, [], r.plan.kd_spans), [], [], [], r.teacher,
-                                   {**r.meta, "_src": r.source}) for r in requests if r.plan.kd_spans]
+            samples = [
+                TraceSample(
+                    TracePlan(r.plan.trunk, [], r.plan.kd_spans), [], [], [], r.teacher, {**r.meta, "_src": r.source}
+                )
+                for r in requests
+                if r.plan.kd_spans
+            ]
             for sample in samples:
                 self._score(sample)
-            stats = {"time/teacher": time.perf_counter() - start, "branches": 0,
-                     "trunk_tokens": sum(len(s.plan.trunk) for s in samples) / max(1, len(samples))}
+            stats = {
+                "time/teacher": time.perf_counter() - start,
+                "branches": 0,
+                "trunk_tokens": sum(len(s.plan.trunk) for s in samples) / max(1, len(samples)),
+            }
         return TraceBatch(samples, self.weights.version, stats)
 
     @torch.no_grad()
@@ -178,12 +206,21 @@ class TracePipeline(Pipeline):
             bridge = self.routes[sample.teacher].aligner.bridge
             trunk = torch.tensor([bridge.to_teacher(sample.plan.trunk)], device=device)
             inputs = [bridge.to_teacher(ids) for ids in branch_inputs(sample.plan, sample.completions)]
-            branches = [Branch(b.attach, torch.tensor([ids], device=device))
-                        for b, ids in zip(sample.plan.branches, inputs)]
-            with torch.autocast(torch.device(device).type, dtype=torch.bfloat16, enabled=torch.device(device).type == "cuda"):
-                hidden, kd = tree_hidden_states(teacher.model, trunk, branches,
-                                                trunk_positions=sample.plan.kd_positions(), chunk_size=self.chunk_size,
-                                                branch_tokens=self.branch_tokens, min_gap=self.min_gap)
+            branches = [
+                Branch(b.attach, torch.tensor([ids], device=device)) for b, ids in zip(sample.plan.branches, inputs)
+            ]
+            with torch.autocast(
+                torch.device(device).type, dtype=torch.bfloat16, enabled=torch.device(device).type == "cuda"
+            ):
+                hidden, kd = tree_hidden_states(
+                    teacher.model,
+                    trunk,
+                    branches,
+                    trunk_positions=sample.plan.kd_positions(),
+                    chunk_size=self.chunk_size,
+                    branch_tokens=self.branch_tokens,
+                    min_gap=self.min_gap,
+                )
             rows = completion_rows(sample.plan, sample.completions)
             sample.teacher_hidden = [h[0, r] for h, r in zip(hidden, rows)]
             sample.teacher_kd_hidden = kd
@@ -196,39 +233,60 @@ class TraceTrainer(OPDTrainer):
     """OPDTrainer on agent traces: same models, rollout engines, schedule, checkpoints."""
 
     def _make_pipeline(self, engine, overlap: bool):
-        return TracePipeline(self.tok, engine, self.routes, self.weights, self.config.model.chat_template_kwargs,
-                             self.config.train.score_micro_seqs, torch.cuda.Stream() if overlap else None,
-                             chunk_size=self.config.train.tree_chunk_size,
-                             branch_tokens=self.config.train.tree_branch_tokens,
-                             min_gap=self.config.train.tree_min_gap,
-                             regenerate=self.config.loss.trace_branch_weight > 0,
-                             prefix_caching=self.config.rollout.prefix_caching and self.config.rollout.backend != "hf")
+        return TracePipeline(
+            self.tok,
+            engine,
+            self.routes,
+            self.weights,
+            self.config.model.chat_template_kwargs,
+            self.config.train.score_micro_seqs,
+            torch.cuda.Stream() if overlap else None,
+            chunk_size=self.config.train.tree_chunk_size,
+            branch_tokens=self.config.train.tree_branch_tokens,
+            min_gap=self.config.train.tree_min_gap,
+            regenerate=self.config.loss.trace_branch_weight > 0,
+            prefix_caching=self.config.rollout.prefix_caching and self.config.rollout.backend != "hf",
+        )
 
     def _make_source(self):
         config = self.config
         self.planners = {
-            name: TracePlanner(self.tok, config.model.chat_template_kwargs, self.stop_ids, source.max_context,
-                               # recorded turns only: every turn that fits, so the trunk holds as many as can be
-                               source.branches_per_trace if config.loss.trace_branch_weight > 0 else 0,
-                               recorded_kd=config.loss.trace_kd_weight > 0)
-            for name, source in config.sources.items()}
+            name: TracePlanner(
+                self.tok,
+                config.model.chat_template_kwargs,
+                self.stop_ids,
+                source.max_context,
+                # recorded turns only: every turn that fits, so the trunk holds as many as can be
+                source.branches_per_trace if config.loss.trace_branch_weight > 0 else 0,
+                recorded_kd=config.loss.trace_kd_weight > 0,
+            )
+            for name, source in config.sources.items()
+        }
         # Evaluation regenerates turns in every configuration (the one metric all compare on)
         self.eval_planners = {
-            name: TracePlanner(self.tok, config.model.chat_template_kwargs, self.stop_ids, source.max_context,
-                               source.branches_per_trace, recorded_kd=False)
-            for name, source in config.sources.items()}
+            name: TracePlanner(
+                self.tok,
+                config.model.chat_template_kwargs,
+                self.stop_ids,
+                source.max_context,
+                source.branches_per_trace,
+                recorded_kd=False,
+            )
+            for name, source in config.sources.items()
+        }
         return TraceSources(config, self.rng, {name: p.think_tags for name, p in self.planners.items()})
 
     def _request(self, name: str, row: dict, rng: random.Random, planners=None) -> TraceRequest | None:
         source = self.config.sources[name]
         plan = (planners or self.planners)[name].plan(row["messages"], row.get("tools"), rng)
         if plan is None or (planners is None and self.config.loss.trace_branch_weight == 0 and not plan.kd_spans):
-            return None          # recorded turns only, and this trace has none the trunk could hold
+            return None  # recorded turns only, and this trace has none the trunk could hold
         group = self.config.rollout.group_size
         if group > 1:
             plan = TracePlan(plan.trunk, [b for b in plan.branches for _ in range(group)], plan.kd_spans)
-        teacher = topic_teacher(row, source.topic_field, source.topic_teachers,
-                                source.teacher or next(iter(self.routes)))
+        teacher = topic_teacher(
+            row, source.topic_field, source.topic_teachers, source.teacher or next(iter(self.routes))
+        )
         topic = row.get(source.topic_field) if source.topic_field else None
         return TraceRequest(name, teacher, plan, source.max_new_tokens, {"_topic": topic})
 
@@ -255,8 +313,12 @@ class TraceTrainer(OPDTrainer):
         stats: dict[str, float] = defaultdict(float)
         branch_weight = loss_cfg.trace_branch_weight
         for sample in batch.samples:
-            for k, v in self._score_trace(sample, train, branch_weight / max(branch_tokens, 1),
-                                          loss_cfg.trace_kd_weight / max(kd_tokens, 1) if kd_tokens else 0.0).items():
+            for k, v in self._score_trace(
+                sample,
+                train,
+                branch_weight / max(branch_tokens, 1),
+                loss_cfg.trace_kd_weight / max(kd_tokens, 1) if kd_tokens else 0.0,
+            ).items():
                 stats[k] += v
         return stats
 
@@ -266,16 +328,19 @@ class TraceTrainer(OPDTrainer):
         if name in self.fused:
             return fused_full_rkl(hidden, self.head, teacher_hidden, route.teacher.head, targets, weights, size)
         vocab = losses.SharedVocab(size, route.aligner.bridge.swap)
-        return losses.full_rkl(hidden, self.head, targets, weights, vocab,
-                               lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], size))
+        return losses.full_rkl(
+            hidden, self.head, targets, weights, vocab, lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], size)
+        )
 
     def _score_trace(self, sample: TraceSample, train: bool, branch_weight: float, kd_weight: float):
         name, device = sample.teacher, self.device
         bridge = self.routes[name].aligner.bridge
         plan = sample.plan
         trunk = torch.tensor([plan.trunk], device=device)
-        branches = [Branch(b.attach, torch.tensor([ids], device=device))
-                    for b, ids in zip(plan.branches, branch_inputs(plan, sample.completions))]
+        branches = [
+            Branch(b.attach, torch.tensor([ids], device=device))
+            for b, ids in zip(plan.branches, branch_inputs(plan, sample.completions))
+        ]
         rows = completion_rows(plan, sample.completions)
         targets = [torch.tensor(bridge.to_teacher(c), device=device) for c in sample.completions]
         teacher_hidden = [h.to(device) for h in sample.teacher_hidden]
@@ -300,8 +365,7 @@ class TraceTrainer(OPDTrainer):
             """KL at trunk `positions` (each predicting the next trunk token) from their hidden states h."""
             index = torch.tensor(positions, device=device)
             weights = torch.full((len(positions),), kd_weight, device=device)
-            value, s = self._kl(name, h, kd_hidden[[kd_index[p] for p in positions]], trunk_targets[index + 1],
-                                weights)
+            value, s = self._kl(name, h, kd_hidden[[kd_index[p] for p in positions]], trunk_targets[index + 1], weights)
             stats[f"kd_kl/{name}"] += s["kl"]
             stats[f"kd_tokens/{name}"] += len(positions)
             stats[f"loss/{name}"] += float(value.detach())
@@ -316,15 +380,27 @@ class TraceTrainer(OPDTrainer):
         chunk = self.config.train.tree_chunk_size
         with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             if train:
-                tree_forward_backward(self.student, trunk, branches, branch_loss,
-                                      trunk_loss_fn=trunk_loss if kd_positions else None, chunk_size=chunk,
-                                      branch_tokens=self.config.train.tree_branch_tokens,
-                                      min_gap=self.config.train.tree_min_gap)
+                tree_forward_backward(
+                    self.student,
+                    trunk,
+                    branches,
+                    branch_loss,
+                    trunk_loss_fn=trunk_loss if kd_positions else None,
+                    chunk_size=chunk,
+                    branch_tokens=self.config.train.tree_branch_tokens,
+                    min_gap=self.config.train.tree_min_gap,
+                )
             else:
                 with torch.no_grad():
-                    hidden, kd = tree_hidden_states(self.student, trunk, branches, trunk_positions=kd_positions,
-                                                    chunk_size=chunk, branch_tokens=self.config.train.tree_branch_tokens,
-                                      min_gap=self.config.train.tree_min_gap)
+                    hidden, kd = tree_hidden_states(
+                        self.student,
+                        trunk,
+                        branches,
+                        trunk_positions=kd_positions,
+                        chunk_size=chunk,
+                        branch_tokens=self.config.train.tree_branch_tokens,
+                        min_gap=self.config.train.tree_min_gap,
+                    )
                     for i, h in enumerate(hidden):
                         branch_loss(i, h)
                     if kd_positions:
@@ -361,8 +437,9 @@ class TraceTrainer(OPDTrainer):
             for name in self.config.sources:
                 rows = self.source.dev[name][: self.config.train.eval_samples]
                 rng = random.Random(self.config.train.seed)
-                requests = [r for r in (self._request(name, row, rng, self.eval_planners) for row in rows)
-                            if r is not None]
+                requests = [
+                    r for r in (self._request(name, row, rng, self.eval_planners) for row in rows) if r is not None
+                ]
                 if not requests:
                     continue
                 with self.pipeline.lock:

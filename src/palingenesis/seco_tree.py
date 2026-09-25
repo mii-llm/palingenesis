@@ -37,8 +37,6 @@ them can share a boundary.
 branch runs as soon as the trunk reaches its start, from a copy of the cache.
 """
 
-from __future__ import annotations
-
 import bisect
 from collections import defaultdict
 from collections.abc import Callable
@@ -84,7 +82,7 @@ class Branch:
 
 @dataclass
 class TreeResult:
-    loss: float                 # sum of the branch losses (and the trunk's)
+    loss: float  # sum of the branch losses (and the trunk's)
     trunk_chunks: int
     branches: int
 
@@ -100,7 +98,9 @@ def _bounds(length: int, starts: list[int], chunk_size: int, min_gap: int = 1) -
     return list(zip(cuts[:-1], cuts[1:]))
 
 
-def _rebase(branches: list[Branch], trunk_ids: torch.Tensor, bounds: list[tuple[int, int]]) -> tuple[list[Branch], list[int]]:
+def _rebase(
+    branches: list[Branch], trunk_ids: torch.Tensor, bounds: list[tuple[int, int]]
+) -> tuple[list[Branch], list[int]]:
     """Each branch moved to the last trunk boundary at or before its start, carrying the trunk
     tokens in between; and how many leading positions of its output are those (to drop)."""
     cuts = [lo for lo, _ in bounds] + [trunk_ids.shape[1]]
@@ -110,7 +110,7 @@ def _rebase(branches: list[Branch], trunk_ids: torch.Tensor, bounds: list[tuple[
         if cut == b.start:
             moved.append(b)
         else:
-            moved.append(Branch(cut, torch.cat([trunk_ids[:, cut:b.start], b.input_ids], 1)))
+            moved.append(Branch(cut, torch.cat([trunk_ids[:, cut : b.start], b.input_ids], 1)))
         skip.append(b.start - cut)
     return moved, skip
 
@@ -129,15 +129,21 @@ def _cast_dtype(ids: torch.Tensor):
     return torch.get_autocast_dtype("cuda") if ids.is_cuda and torch.is_autocast_enabled("cuda") else None
 
 
-BRANCH_TOKENS = 16384      # padded tokens per batched branch forward (activation memory)
-MIN_GAP = 1024             # trunk tokens between cuts at branch starts (see tree_forward_backward)
+BRANCH_TOKENS = 16384  # padded tokens per batched branch forward (activation memory)
+MIN_GAP = 1024  # trunk tokens between cuts at branch starts (see tree_forward_backward)
 
 
-def tree_forward_backward(model: nn.Module, trunk_ids: torch.Tensor, branches: list[Branch],
-                          loss_fn: Callable[[int, torch.Tensor], torch.Tensor], *,
-                          trunk_loss_fn: Callable[[int, int, torch.Tensor], torch.Tensor | None] | None = None,
-                          chunk_size: int = 4096, branch_tokens: int = BRANCH_TOKENS,
-                          min_gap: int = MIN_GAP) -> TreeResult:
+def tree_forward_backward(
+    model: nn.Module,
+    trunk_ids: torch.Tensor,
+    branches: list[Branch],
+    loss_fn: Callable[[int, torch.Tensor], torch.Tensor],
+    *,
+    trunk_loss_fn: Callable[[int, int, torch.Tensor], torch.Tensor | None] | None = None,
+    chunk_size: int = 4096,
+    branch_tokens: int = BRANCH_TOKENS,
+    min_gap: int = MIN_GAP,
+) -> TreeResult:
     """Accumulate d(sum_b loss_fn(b, hidden_b) + sum_chunks trunk_loss_fn)/d(params) into
     `.grad`; the caller must NOT call `.backward()` afterwards.
 
@@ -156,8 +162,9 @@ def tree_forward_backward(model: nn.Module, trunk_ids: torch.Tensor, branches: l
     bounds = _bounds(trunk_ids.shape[1], [b.start for b in branches], chunk_size, min_gap)
     moved, skip = _rebase(branches, trunk_ids, bounds)
     with _chunk_attention(model), differentiable_decode(model):
-        return _tree(model, trunk_ids, moved, lambda i, h: loss_fn(i, h[:, skip[i]:]), trunk_loss_fn, bounds,
-                     branch_tokens)
+        return _tree(
+            model, trunk_ids, moved, lambda i, h: loss_fn(i, h[:, skip[i] :]), trunk_loss_fn, bounds, branch_tokens
+        )
 
 
 def _batches(branches: list[Branch], indices: list[int], max_tokens: int) -> list[list[int]]:
@@ -166,7 +173,7 @@ def _batches(branches: list[Branch], indices: list[int], max_tokens: int) -> lis
     order = sorted(indices, key=lambda i: branches[i].input_ids.shape[1])
     groups, group = [], []
     for i in order:
-        width = branches[i].input_ids.shape[1]          # the longest so far (sorted)
+        width = branches[i].input_ids.shape[1]  # the longest so far (sorted)
         if group and width * (len(group) + 1) > max_tokens:
             groups.append(group)
             group = []
@@ -188,7 +195,7 @@ def _padded(branches: list[Branch], group: list[int]) -> tuple[torch.Tensor, tor
     device = branches[group[0]].input_ids.device
     ids = torch.zeros(len(group), width, dtype=torch.long, device=device)
     for r, i in enumerate(group):
-        ids[r, :branches[i].input_ids.shape[1]] = branches[i].input_ids[0]
+        ids[r, : branches[i].input_ids.shape[1]] = branches[i].input_ids[0]
     starts = torch.tensor([branches[i].start for i in group], device=device)
     return ids, starts[:, None] + torch.arange(width, device=device)
 
@@ -203,8 +210,10 @@ def _batchable(in_store: list[bool], append: list[bool]) -> bool:
 def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tokens) -> TreeResult:
     backbone = _backbone(model)
     if getattr(backbone, "gradient_checkpointing", False) and backbone.training:
-        raise RuntimeError("the tree forward needs the cache during training, which HF gradient checkpointing "
-                           "disables. Use palingenesis activation checkpointing instead.")
+        raise RuntimeError(
+            "the tree forward needs the cache during training, which HF gradient checkpointing "
+            "disables. Use palingenesis activation checkpointing instead."
+        )
     seq_len = trunk_ids.shape[1]
     k = len(bounds)
     lo_index = {lo: j for j, (lo, _) in enumerate(bounds)}
@@ -227,10 +236,13 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
             rng_states.append(_rng_state(devices))
             _attach_stores(cache, in_store, stores, seq_len, lo, write=True, offload=False)
             _run(backbone, trunk_ids[:, lo:hi], cache)
-        starts.append([_state(layer, app, clone=True) for layer, app in zip(cache.layers, append)])   # boundary k
-    kv = [tuple(getattr(layer, a).detach().requires_grad_(True) for a in _KV)
-          if app and not stored and seq_len and getattr(layer, "is_initialized", False) else None
-          for layer, app, stored in zip(cache.layers, append, in_store)]
+        starts.append([_state(layer, app, clone=True) for layer, app in zip(cache.layers, append)])  # boundary k
+    kv = [
+        tuple(getattr(layer, a).detach().requires_grad_(True) for a in _KV)
+        if app and not stored and seq_len and getattr(layer, "is_initialized", False)
+        else None
+        for layer, app, stored in zip(cache.layers, append, in_store)
+    ]
     del cache
     for store in stores.values():
         store.start_gradients()
@@ -238,8 +250,9 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
     # Grad-carrying leaves of every boundary's state: the branches and the trunk chunk
     # starting there all read (clones of) them, and their gradients meet in them.
     bound_lo = [lo for lo, _ in bounds] + [seq_len]
-    leaves = [[(_leafify(_onto(s, trunk_ids.device)) if bound_lo[j] > 0 else {}) for s in starts[j]]
-              for j in range(k + 1)]
+    leaves = [
+        [(_leafify(_onto(s, trunk_ids.device)) if bound_lo[j] > 0 else {}) for s in starts[j]] for j in range(k + 1)
+    ]
     del starts
 
     def clones(state: dict) -> dict:
@@ -270,15 +283,16 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
             cache = fresh_cache(branches[i].start, [clones(s) for s in leaves[boundary[i]]])
             ids, positions = branches[i].input_ids, None
         else:
-            cache = fresh_cache([branches[i].start for i in group],
-                                [_stacked([clones(leaves[boundary[i]][idx]) for i in group])
-                                 for idx in range(len(append))])
+            cache = fresh_cache(
+                [branches[i].start for i in group],
+                [_stacked([clones(leaves[boundary[i]][idx]) for i in group]) for idx in range(len(append))],
+            )
             ids, positions = _padded(branches, group)
         before = [_snapshot(layer) for layer in cache.layers]
         hidden = _run(backbone, ids, cache, positions)
-        for layer, state in zip(cache.layers, before):     # activation checkpointing re-runs forwards
+        for layer, state in zip(cache.layers, before):  # activation checkpointing re-runs forwards
             _restore(layer, state)
-        loss = sum(loss_fn(i, hidden[r:r + 1, :branches[i].input_ids.shape[1]]) for r, i in enumerate(group))
+        loss = sum(loss_fn(i, hidden[r : r + 1, : branches[i].input_ids.shape[1]]) for r, i in enumerate(group))
         if loss.requires_grad:
             loss.backward()
         total += float(loss.detach())
@@ -302,8 +316,10 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
                 chunk_k, chunk_v = layer._chunk_kv
                 pairs += [(chunk_k, store.grad_k[..., lo:hi, :]), (chunk_v, store.grad_v[..., lo:hi, :])]
             elif app and kv[idx] is not None:
-                pairs += [(getattr(layer, a)[..., lo:, :], None if leaf.grad is None else leaf.grad[..., lo:hi, :])
-                          for a, leaf in zip(_KV, kv[idx])]
+                pairs += [
+                    (getattr(layer, a)[..., lo:, :], None if leaf.grad is None else leaf.grad[..., lo:hi, :])
+                    for a, leaf in zip(_KV, kv[idx])
+                ]
             after = _state(layer, app, clone=False)
             pairs += [(after[path], leaf.grad) for path, leaf in _tensors(leaves[j + 1][idx])]
             for out, grad in pairs:
@@ -321,16 +337,22 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
         if roots:
             torch.autograd.backward(roots, grads)
         del cache, hidden, before, chunk_loss, roots, grads
-        leaves[j + 1] = None                          # its gradients are relayed: free it
+        leaves[j + 1] = None  # its gradients are relayed: free it
     _ACTIVE.clear()
     return TreeResult(loss=total, trunk_chunks=k, branches=len(branches))
 
 
 @torch.no_grad()
-def tree_hidden_states(model: nn.Module, trunk_ids: torch.Tensor, branches: list[Branch], *,
-                       trunk_positions: list[int] | None = None, chunk_size: int = 4096,
-                       branch_tokens: int = BRANCH_TOKENS,
-                       min_gap: int = MIN_GAP) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+def tree_hidden_states(
+    model: nn.Module,
+    trunk_ids: torch.Tensor,
+    branches: list[Branch],
+    *,
+    trunk_positions: list[int] | None = None,
+    chunk_size: int = 4096,
+    branch_tokens: int = BRANCH_TOKENS,
+    min_gap: int = MIN_GAP,
+) -> tuple[list[torch.Tensor], torch.Tensor | None]:
     """Final hidden states [1, L, H] of every branch (no grad), the trunk run once; and the
     trunk's own at `trunk_positions` [P, H] (sorted ascending), collected on the way."""
     _check(trunk_ids, branches)
@@ -365,15 +387,20 @@ def _tree_hidden(model, trunk_ids, branches, trunk_positions, bounds, branch_tok
             _attach_stores(new, in_store, stores, seq_len, pos, write=False, offload=False)
             for idx, layer in enumerate(new.layers):
                 _apply_state(layer, states[idx])
-                if src is not None and append[idx] and not in_store[idx] and pos > 0 \
-                        and getattr(src.layers[idx], "is_initialized", False):
+                if (
+                    src is not None
+                    and append[idx]
+                    and not in_store[idx]
+                    and pos > 0
+                    and getattr(src.layers[idx], "is_initialized", False)
+                ):
                     _seed_kv(layer, [getattr(src.layers[idx], a)[..., :pos, :] for a in _KV])
             return new
 
         def at_position(pos: int) -> None:
             if not at.get(pos):
                 return
-            if batched and pos > 0:       # snapshot now, run once the store holds the whole trunk
+            if batched and pos > 0:  # snapshot now, run once the store holds the whole trunk
                 snapshots[pos] = [_state(layer, app, clone=True) for layer, app in zip(cache.layers, append)]
                 return
             for i in at[pos]:
@@ -392,11 +419,13 @@ def _tree_hidden(model, trunk_ids, branches, trunk_positions, bounds, branch_tok
             if snapshots:
                 pending = [i for pos in snapshots for i in at[pos]]
                 for group in _batches(branches, pending, branch_tokens):
-                    states = [_stacked([snapshots[branches[i].start][idx] for i in group]) for idx in range(len(append))]
+                    states = [
+                        _stacked([snapshots[branches[i].start][idx] for i in group]) for idx in range(len(append))
+                    ]
                     ids, positions = _padded(branches, group)
                     hidden = _run(backbone, ids, branch_cache([branches[i].start for i in group], states), positions)
                     for r, i in enumerate(group):
-                        out[i] = hidden[r:r + 1, :branches[i].input_ids.shape[1]]
+                        out[i] = hidden[r : r + 1, : branches[i].input_ids.shape[1]]
         finally:
             _ACTIVE.clear()
         return out, (torch.cat(collected) if collected else None)

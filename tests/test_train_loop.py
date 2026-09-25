@@ -51,11 +51,13 @@ class TinyLM(nn.Module):
     def __init__(self, vocab_size=256, hidden=64, layers=4):
         super().__init__()
         self.config = type("C", (), {"vocab_size": vocab_size, "tie_word_embeddings": False})()
-        self.model = nn.ModuleDict({
-            "embed_tokens": nn.Embedding(vocab_size, hidden),
-            "layers": nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(layers)]),
-            "norm": nn.LayerNorm(hidden),
-        })
+        self.model = nn.ModuleDict(
+            {
+                "embed_tokens": nn.Embedding(vocab_size, hidden),
+                "layers": nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(layers)]),
+                "norm": nn.LayerNorm(hidden),
+            }
+        )
         self.lm_head = nn.Linear(hidden, vocab_size, bias=False)
 
     def forward(self, input_ids, attention_mask=None, position_ids=None):
@@ -108,7 +110,11 @@ def test_quickstart_path():
     scheduler = build_scheduler(optimizer, "power_decay", num_steps=20, warmup_ratio=0.1, min_lr_ratio=0.1)
 
     losses = run_steps(
-        model, optimizer, scheduler, batch, 20,
+        model,
+        optimizer,
+        scheduler,
+        batch,
+        20,
         lambda logits, labels, valid, **kw: cross_entropy_loss(logits, labels, valid),
     )
 
@@ -231,7 +237,8 @@ def test_gradient_release_with_lion():
             assert p.grad is None, f"{name} grad not freed"
 
     changed = sum(
-        1 for n, p in model.named_parameters()
+        1
+        for n, p in model.named_parameters()
         if n in initial_weights and not torch.allclose(p.data, initial_weights[n])
     )
     assert changed > 0, "Weights should have been updated via Lion step"
@@ -298,7 +305,7 @@ def test_ga_ramp_counter():
     last = sum(losses_per_step[-5:]) / 5
     assert last < first, f"GA ramp didn't converge: {first:.4f} -> {last:.4f}"
 
-    print(f"  GA ramp ({ga_ramp_start}→{grad_accum}): {total_steps} steps, {micro_step+1} micro-steps")
+    print(f"  GA ramp ({ga_ramp_start}→{grad_accum}): {total_steps} steps, {micro_step + 1} micro-steps")
     print(f"  Loss: {first:.4f} -> {last:.4f}")
     print("✓ test_ga_ramp_counter PASSED\n")
 
@@ -362,11 +369,14 @@ def test_adamc_with_llrd():
     """AdamC uses per-group peak LR, not global peak."""
     # Simulate LLRD: 3 groups with different LRs
     params = [nn.Parameter(torch.randn(10, 10)) for _ in range(3)]
-    optimizer = torch.optim.AdamW([
-        {"params": [params[0]], "lr": 1e-5, "weight_decay": 0.1},  # early layer
-        {"params": [params[1]], "lr": 2e-5, "weight_decay": 0.1},  # mid layer
-        {"params": [params[2]], "lr": 3e-5, "weight_decay": 0.1},  # late layer
-    ], lr=3e-5)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [params[0]], "lr": 1e-5, "weight_decay": 0.1},  # early layer
+            {"params": [params[1]], "lr": 2e-5, "weight_decay": 0.1},  # mid layer
+            {"params": [params[2]], "lr": 3e-5, "weight_decay": 0.1},  # late layer
+        ],
+        lr=3e-5,
+    )
 
     adamc = AdamCCorrection(optimizer, peak_lr=3e-5)
 
@@ -380,9 +390,7 @@ def test_adamc_with_llrd():
     for i, group in enumerate(optimizer.param_groups):
         expected_wd = 0.1 * 0.5  # 50% of base for ALL groups (each decayed to 50% of own peak)
         actual_wd = group["weight_decay"]
-        assert abs(actual_wd - expected_wd) < 1e-6, (
-            f"Group {i}: expected wd={expected_wd:.4f}, got {actual_wd:.4f}"
-        )
+        assert abs(actual_wd - expected_wd) < 1e-6, f"Group {i}: expected wd={expected_wd:.4f}, got {actual_wd:.4f}"
 
     print(f"  All groups at 50% decay: wd={optimizer.param_groups[0]['weight_decay']:.4f} (expected 0.05)")
     print("✓ test_adamc_with_llrd PASSED\n")
@@ -476,8 +484,8 @@ def test_health_monitor_during_training():
 def test_flagship_configs_validate():
     """All shipped YAML configs pass validation (no hard errors)."""
     configs_dir = Path(__file__).parent.parent / "configs"
-    # on-policy distillation configs have their own schema (palingenesis.opd.config)
-    yaml_files = [p for p in configs_dir.rglob("*.yaml") if not p.name.startswith("distill_")]
+    # distillation and RL configs have their own schemas (palingenesis.opd.config, palingenesis.rl.config)
+    yaml_files = [p for p in configs_dir.rglob("*.yaml") if not p.name.startswith(("distill_", "rl_"))]
     assert len(yaml_files) >= 5, f"Expected >=5 configs, found {len(yaml_files)}"
 
     errors = []
@@ -527,10 +535,14 @@ def test_chunked_deft_matches_standard():
 
     # Chunked DEFT
     h_detached = h.detach().requires_grad_(True)
-    chunked_loss = chunked_deft_loss(h_detached, batch["labels"], model.lm_head, num_chunks=4, global_valid_tokens=valid)
+    chunked_loss = chunked_deft_loss(
+        h_detached, batch["labels"], model.lm_head, num_chunks=4, global_valid_tokens=valid
+    )
 
     diff = abs(std_loss.item() - chunked_loss.item())
-    assert diff < 0.01, f"Chunked DEFT diverges: std={std_loss.item():.4f}, chunked={chunked_loss.item():.4f}, diff={diff:.4f}"
+    assert diff < 0.01, (
+        f"Chunked DEFT diverges: std={std_loss.item():.4f}, chunked={chunked_loss.item():.4f}, diff={diff:.4f}"
+    )
 
     print(f"  Standard DEFT: {std_loss.item():.4f}")
     print(f"  Chunked DEFT: {chunked_loss.item():.4f}")

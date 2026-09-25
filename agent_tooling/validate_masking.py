@@ -26,7 +26,7 @@ from palingenesis.data import IGNORE_INDEX
 def validate(config: Config, num_samples: int = 100) -> dict:
     """Run masking validation. Returns a report dict."""
     tokenizer = load_tokenizer(config)
-    chat_ds = training_samples(config, tokenizer)   # exactly what the trainer consumes
+    chat_ds = training_samples(config, tokenizer)  # exactly what the trainer consumes
 
     results = {
         "total_samples": 0,
@@ -95,7 +95,7 @@ def validate(config: Config, num_samples: int = 100) -> dict:
 
     if avg_ratio < 0.03:
         results["issues"].append(
-            f"WARNING: Very low train ratio ({avg_ratio:.1%}). " "Check if assistant messages exist in your data."
+            f"WARNING: Very low train ratio ({avg_ratio:.1%}). Check if assistant messages exist in your data."
         )
 
     if avg_ratio > 0.95:
@@ -123,16 +123,18 @@ def print_report(results: dict):
     print(f"  Samples processed: {results['total_samples']}")
     print(f"  Total tokens: {results['total_tokens']:,}")
     print(
-        f"  Trained tokens: {results['total_trained']:,} ({100*results['total_trained']/max(results['total_tokens'],1):.1f}%)"
+        f"  Trained tokens: {results['total_trained']:,} ({100 * results['total_trained'] / max(results['total_tokens'], 1):.1f}%)"
     )
-    print(f"  Avg sequence length: {sum(results['seq_lengths'])/max(len(results['seq_lengths']),1):.0f}")
+    print(f"  Avg sequence length: {sum(results['seq_lengths']) / max(len(results['seq_lengths']), 1):.0f}")
     print(f"  Samples w/ 0% trained: {results['samples_all_masked']}")
     print(f"  Samples w/ 100% trained: {results['samples_all_trained']}")
     print(f"  Pad tokens incorrectly trained: {results['pad_tokens_trained']}")
 
     if results["train_ratios"]:
         ratios = results["train_ratios"]
-        print(f"  Train ratio: min={min(ratios):.1%} median={sorted(ratios)[len(ratios)//2]:.1%} max={max(ratios):.1%}")
+        print(
+            f"  Train ratio: min={min(ratios):.1%} median={sorted(ratios)[len(ratios) // 2]:.1%} max={max(ratios):.1%}"
+        )
 
     print()
     for issue in results["issues"]:

@@ -195,7 +195,7 @@ class S0States(nn.Module):
             self.layer_names.append(info.name)
 
         total_params = sum(s.numel() for s in self.states)
-        logger.info(f"S0States: {len(self.states)} recurrent layers, " f"{total_params/1e6:.1f}M params total")
+        logger.info(f"S0States: {len(self.states)} recurrent layers, {total_params / 1e6:.1f}M params total")
 
     def get_scaled(self, alpha: float) -> list[torch.Tensor]:
         """Return alpha-scaled states for injection."""
@@ -235,6 +235,7 @@ class S0InjectionHooks:
         self.remove()  # clear any existing hooks
 
         for i, info in enumerate(self.layer_infos):
+
             def make_hook(idx: int, layer_info: RecurrentLayerInfo):
                 def hook(module, args, kwargs=None):
                     # Inject the scaled state
@@ -326,7 +327,9 @@ class S0Trainer:
 
         # 5. Optimizer (AdamW on S0 states only)
         self.optimizer = torch.optim.AdamW(
-            self.s0_states.parameters(), lr=lr, weight_decay=0.0  # we handle WD manually
+            self.s0_states.parameters(),
+            lr=lr,
+            weight_decay=0.0,  # we handle WD manually
         )
 
     @torch.enable_grad()

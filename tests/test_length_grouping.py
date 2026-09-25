@@ -34,9 +34,7 @@ def test_length_grouped_dataset_groups_similar_lengths():
 
     assert sorted(out) == sorted(lengths), "Every sample must be yielded exactly once"
     groups = [set(out[i : i + 4]) for i in range(0, 8, 4)]
-    assert {1, 2, 3, 4} in groups and {97, 98, 99, 100} in groups, (
-        f"Expected length-homogeneous groups, got {groups}"
-    )
+    assert {1, 2, 3, 4} in groups and {97, 98, 99, 100} in groups, f"Expected length-homogeneous groups, got {groups}"
     print("✓ test_length_grouped_dataset_groups_similar_lengths PASSED")
 
 

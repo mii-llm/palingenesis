@@ -28,8 +28,6 @@ distillation on those recorded turns at the cost of the output-head projections
 only (off-policy, next to the on-policy branches).
 """
 
-from __future__ import annotations
-
 import bisect
 import json
 import logging
@@ -51,17 +49,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BranchPlan:
-    turn: int                   # index of the assistant message the student regenerates
-    context: list[int]          # the full context the student generates from
-    attach: int                 # trunk position the branch continues from
-    prefix: list[int]           # branch tokens before the completion (the context's tail, or its last token)
+    turn: int  # index of the assistant message the student regenerates
+    context: list[int]  # the full context the student generates from
+    attach: int  # trunk position the branch continues from
+    prefix: list[int]  # branch tokens before the completion (the context's tail, or its last token)
 
 
 @dataclass
 class TracePlan:
     trunk: list[int]
     branches: list[BranchPlan]
-    kd_spans: list[tuple[int, int]] = field(default_factory=list)   # trunk token ranges of recorded turns
+    kd_spans: list[tuple[int, int]] = field(default_factory=list)  # trunk token ranges of recorded turns
 
     def kd_positions(self) -> list[int]:
         """Trunk positions whose hidden state predicts a recorded-turn token (p predicts trunk[p + 1])."""
@@ -69,15 +67,25 @@ class TracePlan:
 
 
 def is_trainable_turn(message: dict) -> bool:
-    return (message.get("role") == "assistant" and message.get("loss", True) is not False
-            and bool(message.get("content") or message.get("reasoning_content") or message.get("tool_calls")))
+    return (
+        message.get("role") == "assistant"
+        and message.get("loss", True) is not False
+        and bool(message.get("content") or message.get("reasoning_content") or message.get("tool_calls"))
+    )
 
 
 class TracePlanner:
     """Renders a trace's contexts with the student's chat template and lays them out as a tree."""
 
-    def __init__(self, tok, chat_template_kwargs: dict, stop_ids: tuple[int, ...], max_context: int,
-                 branches_per_trace: int, recorded_kd: bool):
+    def __init__(
+        self,
+        tok,
+        chat_template_kwargs: dict,
+        stop_ids: tuple[int, ...],
+        max_context: int,
+        branches_per_trace: int,
+        recorded_kd: bool,
+    ):
         self.tok = tok
         self.kwargs = chat_template_kwargs
         self.stop_ids = set(stop_ids)
@@ -91,10 +99,13 @@ class TracePlanner:
         # and its part that every rendered assistant turn starts with, reasoning kept or not (the
         # header, "<|im_start|>assistant\n"): templates drop earlier turns' reasoning once a new user
         # query arrives, and those turns then render without the opening's think block.
-        self.turn_opening = with_prompt[len(without):] if with_prompt.startswith(without) else ""
-        history = tok.apply_chat_template(probe + [{"role": "assistant", "content": "y"}, {"role": "user", "content": "z"}],
-                                          tokenize=False, **chat_template_kwargs)
-        rewritten = history[len(without):] if history.startswith(without) else ""
+        self.turn_opening = with_prompt[len(without) :] if with_prompt.startswith(without) else ""
+        history = tok.apply_chat_template(
+            probe + [{"role": "assistant", "content": "y"}, {"role": "user", "content": "z"}],
+            tokenize=False,
+            **chat_template_kwargs,
+        )
+        rewritten = history[len(without) :] if history.startswith(without) else ""
         self.turn_header = os.path.commonprefix([self.turn_opening, rewritten]) or self.turn_opening
         self.bos = tok.bos_token_id
         from palingenesis.data import detect_think_tags, renders_reasoning
@@ -107,8 +118,9 @@ class TracePlanner:
         self.think_tags = detect_think_tags(probe_render) or THINK_TAGS
 
     def render(self, messages: list[dict], tools: list[dict] | None, turn: int) -> str:
-        return self.tok.apply_chat_template(messages[:turn], tools=tools or None, add_generation_prompt=True,
-                                            tokenize=False, **self.kwargs)
+        return self.tok.apply_chat_template(
+            messages[:turn], tools=tools or None, add_generation_prompt=True, tokenize=False, **self.kwargs
+        )
 
     def _encode(self, text: str) -> tuple[list[int], list[int]]:
         enc = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
@@ -148,7 +160,7 @@ class TracePlanner:
             # it), so it also holds as many recorded turns as can be distilled, the chosen ones included.
             candidates = [k for k in pool if k >= chosen[-1]] if self.recorded_kd else [chosen[-1]]
             trunk = None
-            lo_c, hi_c = 0, len(candidates)             # contexts grow with the turn: binary search
+            lo_c, hi_c = 0, len(candidates)  # contexts grow with the turn: binary search
             while lo_c < hi_c:
                 mid = (lo_c + hi_c) // 2
                 ids, offsets = self._encode(text(candidates[mid]))
@@ -159,14 +171,14 @@ class TracePlanner:
                     hi_c = mid
             if trunk is not None:
                 break
-            pool = [k for k in pool if k < chosen[-1]]        # the longest one does not fit: drop it and retry
+            pool = [k for k in pool if k < chosen[-1]]  # the longest one does not fit: drop it and retry
         else:
             return None
         branches = []
         for k in chosen:
             s = text(k)
             common = len(os.path.commonprefix([s, trunk_text]))
-            t = bisect.bisect_right(ends, common)             # trunk tokens entirely inside the common prefix
+            t = bisect.bisect_right(ends, common)  # trunk tokens entirely inside the common prefix
             cut = ends[t - 1] if t else 0
             tail = self.tok.encode(s[cut:], add_special_tokens=False) if cut < len(s) else []
             if t == 0 and not tail:
@@ -176,8 +188,8 @@ class TracePlanner:
                 continue
             if tail:
                 branches.append(BranchPlan(k, context, t, tail))
-            else:                                             # re-feed the last context token: its output predicts
-                branches.append(BranchPlan(k, context, t - 1, [trunk[t - 1]]))   # the first completion token
+            else:  # re-feed the last context token: its output predicts
+                branches.append(BranchPlan(k, context, t - 1, [trunk[t - 1]]))  # the first completion token
         if not branches:
             return None
         plan = TracePlan(trunk, branches)
@@ -185,8 +197,9 @@ class TracePlanner:
             plan.kd_spans = self._recorded_turns(messages, trunk_turn, trunk_text, trunk, ends)
         return plan
 
-    def _recorded_turns(self, messages: list[dict], last_turn: int, trunk_text: str, trunk: list[int],
-                        ends: list[int]) -> list[tuple[int, int]]:
+    def _recorded_turns(
+        self, messages: list[dict], last_turn: int, trunk_text: str, trunk: list[int], ends: list[int]
+    ) -> list[tuple[int, int]]:
         """Token ranges [a, b) of the recorded assistant turns inside the trunk, each through its
         end-of-turn token. The trunk renders messages[:last_turn] and then opens the next turn, so
         the template's turn headers in it number one more than those assistant messages, in
@@ -195,7 +208,7 @@ class TracePlanner:
             return []
         assistants = [m for m in messages[:last_turn] if m.get("role") == "assistant"]
         starts, pos = [], trunk_text.find(self.turn_header)
-        while pos >= 0:      # a turn's text starts after the full opening where it has one, else after the header
+        while pos >= 0:  # a turn's text starts after the full opening where it has one, else after the header
             opening = self.turn_opening if trunk_text.startswith(self.turn_opening, pos) else self.turn_header
             starts.append(pos + len(opening))
             pos = trunk_text.find(self.turn_header, pos + 1)
@@ -219,8 +232,9 @@ class TracePlanner:
 # -------------------------------------------------------------------- data
 
 
-def load_trace_rows(path: str, messages_field: str = "messages", tools_field: str = "tools",
-                    think_tags: tuple[str, str] | None = None) -> list[dict]:
+def load_trace_rows(
+    path: str, messages_field: str = "messages", tools_field: str = "tools", think_tags: tuple[str, str] | None = None
+) -> list[dict]:
     """Agent traces from JSONL or parquet: rows with messages (list or JSON string) and
     optional tools; the other columns (topic, id, ...) are kept. `think_tags` delimit
     reasoning baked into assistant content (default <think></think>)."""
@@ -241,8 +255,13 @@ def load_trace_rows(path: str, messages_field: str = "messages", tools_field: st
         if not messages or not any(is_trainable_turn(m) for m in messages):
             skipped += 1
             continue
-        rows.append({**{k: v for k, v in record.items() if k not in (messages_field, tools_field)},
-                     "messages": messages, "tools": tools})
+        rows.append(
+            {
+                **{k: v for k, v in record.items() if k not in (messages_field, tools_field)},
+                "messages": messages,
+                "tools": tools,
+            }
+        )
     if skipped:
         logger.warning("%s: skipped %d rows without a trainable assistant turn", path, skipped)
     if not rows:
@@ -255,13 +274,13 @@ class TraceSample:
     """One trace's rollouts, ready for the teacher and the student."""
 
     plan: TracePlan
-    completions: list[list[int]]          # per branch (cleaned: through the end-of-turn token)
+    completions: list[list[int]]  # per branch (cleaned: through the end-of-turn token)
     behaviour_lp: list[list[float]]
     finish: list[str]
     teacher: str
     meta: dict[str, Any]
-    teacher_hidden: list[Tensor] | None = None      # per branch [len(completion), H]
-    teacher_kd_hidden: Tensor | None = None         # [len(plan.kd_positions()), H]
+    teacher_hidden: list[Tensor] | None = None  # per branch [len(completion), H]
+    teacher_kd_hidden: Tensor | None = None  # [len(plan.kd_positions()), H]
 
 
 def branch_inputs(plan: TracePlan, completions: list[list[int]]) -> list[list[int]]:

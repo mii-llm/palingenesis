@@ -78,7 +78,7 @@ def run_ablations(
         name = ablation.get("name", f"trial_{i}")
         overrides = ablation.get("overrides", {})
 
-        logger.info(f"  [{i+1}/{len(ablation_configs)}] {name}")
+        logger.info(f"  [{i + 1}/{len(ablation_configs)}] {name}")
         t0 = time.perf_counter()
 
         # Build trial config
@@ -208,10 +208,10 @@ def _make_ablation_config(
 def generate_lr_ablations(base_lr: float) -> list[dict]:
     """Generate ablation configs for learning rate comparison."""
     return [
-        {"name": f"lr={base_lr*0.5:.1e}", "overrides": {"train.learning_rate": base_lr * 0.5}},
+        {"name": f"lr={base_lr * 0.5:.1e}", "overrides": {"train.learning_rate": base_lr * 0.5}},
         {"name": f"lr={base_lr:.1e} (base)", "overrides": {}},
-        {"name": f"lr={base_lr*2:.1e}", "overrides": {"train.learning_rate": base_lr * 2}},
-        {"name": f"lr={base_lr*5:.1e}", "overrides": {"train.learning_rate": base_lr * 5}},
+        {"name": f"lr={base_lr * 2:.1e}", "overrides": {"train.learning_rate": base_lr * 2}},
+        {"name": f"lr={base_lr * 5:.1e}", "overrides": {"train.learning_rate": base_lr * 5}},
     ]
 
 

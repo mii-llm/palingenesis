@@ -30,8 +30,6 @@ including ``k1``, the sampled estimate sum(log p_S - log p_T) that every loss ca
 report, so runs with different losses are compared on one scale.
 """
 
-from __future__ import annotations
-
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -86,8 +84,9 @@ class _ChunkedHead(torch.autograd.Function):
                 h = hidden[a:b].detach().requires_grad_(hidden.requires_grad)
                 loss, slice_stats = fn(_upcast(head(h)), a, b)
             if loss.requires_grad:
-                grads = list(torch.autograd.grad(loss, ([h] if hidden.requires_grad else []) + inputs_of,
-                                                 allow_unused=True))
+                grads = list(
+                    torch.autograd.grad(loss, ([h] if hidden.requires_grad else []) + inputs_of, allow_unused=True)
+                )
                 if hidden.requires_grad and (g := grads.pop(0)) is not None:
                     grad_hidden[a:b] = g
                 for i, p in enumerate(params):
@@ -127,8 +126,13 @@ def slice_bounds(n: int, rows: int, ends: list[int] | None = None) -> list[tuple
     return bounds
 
 
-def chunked_head(hidden: Tensor, head: nn.Module, fn: Callable[[Tensor, int, int], tuple[Tensor, dict]],
-                 ends: list[int] | None = None, rows: int | None = None) -> tuple[Tensor, dict[str, float]]:
+def chunked_head(
+    hidden: Tensor,
+    head: nn.Module,
+    fn: Callable[[Tensor, int, int], tuple[Tensor, dict]],
+    ends: list[int] | None = None,
+    rows: int | None = None,
+) -> tuple[Tensor, dict[str, float]]:
     """Run `fn(logits[a:b] (fp32), a, b) -> (loss, stats)` over row slices of the head's output."""
     rows = rows or max(1, SLICE_ELEMENTS // head.weight.shape[0])
     bounds = slice_bounds(hidden.shape[0], rows, ends)
@@ -178,8 +182,9 @@ def coarse_kl(student_lp: Tensor, teacher_lp: Tensor, valid: Tensor, beta: float
     return beta * reverse + (1.0 - beta) * forward
 
 
-def _policy_gradient(lp: Tensor, advantage: Tensor, behaviour: Tensor | None, is_low: float,
-                     is_high: float) -> tuple[Tensor, Tensor, Tensor]:
+def _policy_gradient(
+    lp: Tensor, advantage: Tensor, behaviour: Tensor | None, is_low: float, is_high: float
+) -> tuple[Tensor, Tensor, Tensor]:
     """Per-token -ratio * advantage, ratio = pi/mu zeroed outside [is_low, is_high].
 
     Without behaviour log-probs the ratio is exp(lp - sg(lp)) = 1 with the
@@ -196,8 +201,14 @@ def _policy_gradient(lp: Tensor, advantage: Tensor, behaviour: Tensor | None, is
 # ----------------------------------------------------------------------- losses
 
 
-def full_rkl(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, vocab: SharedVocab,
-             teacher_logprobs: Callable[[int, int], Tensor]) -> tuple[Tensor, dict[str, float]]:
+def full_rkl(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    vocab: SharedVocab,
+    teacher_logprobs: Callable[[int, int], Tensor],
+) -> tuple[Tensor, dict[str, float]]:
     """Exact reverse KL sum_v q(v) (log q(v) - log p(v)) per token, over the shared vocabulary.
 
     `targets` are the completion ids in the teacher's vocabulary (for k1);
@@ -220,9 +231,18 @@ def full_rkl(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, 
     return chunked_head(hidden, head, fn)
 
 
-def topk_kl(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, vocab: SharedVocab,
-            support: Tensor, teacher_support_lp: Tensor, valid: Tensor, teacher_token_lp: Tensor,
-            beta: float = 1.0) -> tuple[Tensor, dict[str, float]]:
+def topk_kl(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    vocab: SharedVocab,
+    support: Tensor,
+    teacher_support_lp: Tensor,
+    valid: Tensor,
+    teacher_token_lp: Tensor,
+    beta: float = 1.0,
+) -> tuple[Tensor, dict[str, float]]:
     """coarse_kl over the teacher's support tokens [N, K] (ids in the shared vocabulary).
 
     The support is the teacher's top-k plus the realized token (so reverse KL sees
@@ -240,9 +260,16 @@ def topk_kl(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, v
     return chunked_head(hidden, head, fn)
 
 
-def sampled_rkl(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, teacher_token_lp: Tensor,
-                behaviour_lp: Tensor | None = None, is_low: float = 0.5,
-                is_high: float = 2.0) -> tuple[Tensor, dict[str, float]]:
+def sampled_rkl(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    teacher_token_lp: Tensor,
+    behaviour_lp: Tensor | None = None,
+    is_low: float = 0.5,
+    is_high: float = 2.0,
+) -> tuple[Tensor, dict[str, float]]:
     """REINFORCE on the per-token reward log p_T(y) - log p_S(y) (sampled reverse KL).
 
     `targets` are the sampled ids in the student's vocabulary; `teacher_token_lp`
@@ -254,16 +281,28 @@ def sampled_rkl(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tenso
         advantage = (teacher_token_lp[a:b] - lp).detach()
         mu = behaviour_lp[a:b] if behaviour_lp is not None else None
         loss, kept, abs_log_ratio = _policy_gradient(lp, advantage, mu, is_low, is_high)
-        stats = {"kl": -advantage.sum(), "k1": -advantage.sum(), "is_dropped": (~kept).sum(),
-                 "abs_log_ratio": abs_log_ratio.sum()}
+        stats = {
+            "kl": -advantage.sum(),
+            "k1": -advantage.sum(),
+            "is_dropped": (~kept).sum(),
+            "abs_log_ratio": abs_log_ratio.sum(),
+        }
         return (weights[a:b] * loss).sum(), stats
 
     return chunked_head(hidden, head, fn)
 
 
-def rs_kd(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, vocab: SharedVocab,
-          sample_ids: Tensor, sample_weights: Tensor, sample_lp: Tensor,
-          teacher_token_lp: Tensor) -> tuple[Tensor, dict[str, float]]:
+def rs_kd(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    vocab: SharedVocab,
+    sample_ids: Tensor,
+    sample_weights: Tensor,
+    sample_lp: Tensor,
+    teacher_token_lp: Tensor,
+) -> tuple[Tensor, dict[str, float]]:
     """Random Sampling KD (arXiv 2503.16870): forward KL to the teacher's sampled tokens.
 
     Per token, the teacher drew R ids from its distribution (teachers.sample_teacher);
@@ -298,7 +337,7 @@ def token_entropy(hidden: Tensor, head: nn.Module) -> Tensor:
     rows = max(1, SLICE_ELEMENTS // head.weight.shape[0])
     out = []
     for a in range(0, hidden.shape[0], rows):
-        lp = F.log_softmax(_upcast(head(hidden[a:a + rows])), -1)
+        lp = F.log_softmax(_upcast(head(hidden[a : a + rows])), -1)
         out.append(-(lp.exp() * lp).sum(-1))
     return torch.cat(out) if out else hidden.new_zeros(0, dtype=torch.float32)
 
@@ -332,10 +371,20 @@ class DenseTargets:
     valid: Tensor
 
 
-def xtok(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, chunks: ChunkTargets,
-         behaviour_lp: Tensor | None = None, spread: str = "chunk", is_low: float = 0.5, is_high: float = 2.0,
-         dense: DenseTargets | None = None, dense_weight: float = 0.0,
-         beta: float = 1.0) -> tuple[Tensor, dict[str, float]]:
+def xtok(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    chunks: ChunkTargets,
+    behaviour_lp: Tensor | None = None,
+    spread: str = "chunk",
+    is_low: float = 0.5,
+    is_high: float = 2.0,
+    dense: DenseTargets | None = None,
+    dense_weight: float = 0.0,
+    beta: float = 1.0,
+) -> tuple[Tensor, dict[str, float]]:
     """Cross-tokenizer REINFORCE with chunk advantages A_c = sg[l_T(c) - l_S(c)].
 
     spread="chunk" gives every token of chunk c the advantage A_c: the chunk's
@@ -352,7 +401,7 @@ def xtok(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, chun
         logp = F.log_softmax(logits, -1)
         lp = logp.gather(1, targets[a:b, None]).squeeze(1)
         cid = chunks.chunk[a:b]
-        scratch = torch.full_like(cid, n_chunks)                           # off tokens go to a scratch slot
+        scratch = torch.full_like(cid, n_chunks)  # off tokens go to a scratch slot
         keep = torch.cat([chunks.keep, chunks.keep.new_zeros(1)])
         on = keep[torch.where(cid >= 0, cid, scratch)]
         safe = torch.where(on, cid, scratch)
@@ -370,8 +419,13 @@ def xtok(hidden: Tensor, head: nn.Module, targets: Tensor, weights: Tensor, chun
         present = torch.zeros(n_chunks + 1, device=lp.device, dtype=torch.bool)
         present[safe[on]] = True
         k1 = (student_chunk - teacher_chunk)[:n_chunks][present[:n_chunks]].sum()
-        stats = {"kl": k1.detach(), "k1": k1.detach(), "is_dropped": (~kept & on).sum(),
-                 "abs_log_ratio": (abs_log_ratio * on).sum(), "supervised": on.sum()}
+        stats = {
+            "kl": k1.detach(),
+            "k1": k1.detach(),
+            "is_dropped": (~kept & on).sum(),
+            "abs_log_ratio": (abs_log_ratio * on).sum(),
+            "supervised": on.sum(),
+        }
         rows = [i for i, r in enumerate(dense_rows) if a <= r < b]
         if rows:
             sel = torch.tensor(rows, device=lp.device)

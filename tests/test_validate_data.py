@@ -143,7 +143,15 @@ def test_tool_validation_unknown_tool():
                 "tool_calls": [{"function": {"name": "delete_everything", "arguments": "{}"}}],
             },
         ],
-        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ],
     }
 
     errors = validate_tool_calls(sample)
@@ -164,7 +172,9 @@ def test_tool_validation_invalid_param():
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"function": {"name": "read_file", "arguments": '{"path": "/a.py", "encoding": "utf-8"}'}}],
+                "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": '{"path": "/a.py", "encoding": "utf-8"}'}}
+                ],
             },
         ],
         "tools": [
@@ -192,7 +202,11 @@ def test_tool_validation_missing_required():
     sample = {
         "messages": [
             {"role": "user", "content": "Read"},
-            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": "{}"}}]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "read_file", "arguments": "{}"}}],
+            },
         ],
         "tools": [
             {
@@ -237,16 +251,40 @@ def test_dataset_validation_report():
         {
             "messages": [
                 {"role": "user", "content": "Read file"},
-                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}]},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}],
+                },
             ],
-            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
         },
         {
             "messages": [
                 {"role": "user", "content": "Delete"},
                 {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "nuke", "arguments": "{}"}}]},
             ],
-            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    },
+                }
+            ],
         },
     ]
 

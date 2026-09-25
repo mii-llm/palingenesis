@@ -28,8 +28,6 @@ Usage (any --section.option override works, same as pgs distill):
     pgs distill-score --config configs/distill_opd.yaml --out scored.jsonl --source italic
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import logging
@@ -48,17 +46,30 @@ logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
-def score_rows(model, tok, rows, shots, letter_ids, batch_size: int, device: str,
-               system_message: str | None = None, template: str | None = None,
-               chat_template_kwargs: dict | None = None, log_every: int = 50):
+def score_rows(
+    model,
+    tok,
+    rows,
+    shots,
+    letter_ids,
+    batch_size: int,
+    device: str,
+    system_message: str | None = None,
+    template: str | None = None,
+    chat_template_kwargs: dict | None = None,
+    log_every: int = 50,
+):
     """Yield rows annotated with teacher_answer / teacher_correct."""
     head = output_head(model)
     t0 = time.time()
     for start in range(0, len(rows), batch_size):
         chunk = rows[start : start + batch_size]
         prompts = [
-            encode_prompt(tok, build_messages(r, few_shots=shots, fast=True, system_message=system_message,
-                                              template=template), chat_template_kwargs)
+            encode_prompt(
+                tok,
+                build_messages(r, few_shots=shots, fast=True, system_message=system_message, template=template),
+                chat_template_kwargs,
+            )
             for r in chunk
         ]
         # logits at the last prompt position = distribution over the first completion token
@@ -70,14 +81,18 @@ def score_rows(model, tok, rows, shots, letter_ids, batch_size: int, device: str
             candidates = [letter for letter, _ in row["options"] if letter in letter_ids]
             scores = {letter: row_logits[letter_ids[letter]].item() for letter in candidates}
             answer = max(scores, key=scores.get)
-            yield {**row, "options": [list(o) for o in row["options"]],
-                   "teacher_answer": answer,
-                   "teacher_correct": answer == row["answer"]}
+            yield {
+                **row,
+                "options": [list(o) for o in row["options"]],
+                "teacher_answer": answer,
+                "teacher_correct": answer == row["answer"],
+            }
         if (start // batch_size) % log_every == 0:
             done = start + len(chunk)
             rate = done / max(time.time() - t0, 1e-9)
-            logger.info("scored %d/%d rows (%.1f rows/s, ETA %.0f min)",
-                        done, len(rows), rate, (len(rows) - done) / rate / 60)
+            logger.info(
+                "scored %d/%d rows (%.1f rows/s, ETA %.0f min)", done, len(rows), rate, (len(rows) - done) / rate / 60
+            )
 
 
 def main():
@@ -88,7 +103,9 @@ def main():
         description="Annotate an mcqa prompt pool with the teacher's answers",
         epilog="Any OPDConfig override is accepted too, e.g. --teachers.big.model X --sources.pool.path Y",
     )
-    ap.add_argument("--config", required=True, help="OPD config (the source's pool, shots and teacher are read from it)")
+    ap.add_argument(
+        "--config", required=True, help="OPD config (the source's pool, shots and teacher are read from it)"
+    )
     ap.add_argument("--out", required=True, help="Output JSONL (pool rows + teacher_answer/teacher_correct)")
     ap.add_argument("--source", default="", help="mcqa source to score (default: the first mcqa source)")
     ap.add_argument("--batch-size", type=int, default=48)
@@ -116,18 +133,32 @@ def main():
 
     n_correct = 0
     with open(args.out, "w") as f:
-        for i, scored in enumerate(score_rows(
-            model, tok, rows, shots, letter_ids, args.batch_size, device,
-            system_message=source.system_message or None, template=source.fast_template or None,
-            chat_template_kwargs=config.model.chat_template_kwargs,
-        )):
+        for i, scored in enumerate(
+            score_rows(
+                model,
+                tok,
+                rows,
+                shots,
+                letter_ids,
+                args.batch_size,
+                device,
+                system_message=source.system_message or None,
+                template=source.fast_template or None,
+                chat_template_kwargs=config.model.chat_template_kwargs,
+            )
+        ):
             n_correct += scored["teacher_correct"]
             f.write(json.dumps(scored, ensure_ascii=False) + "\n")
             if (i + 1) % 10000 == 0:
                 f.flush()
 
-    logger.info("Done: teacher correct on %d/%d rows (%.1f%%) -> %s",
-                n_correct, len(rows), 100 * n_correct / max(1, len(rows)), args.out)
+    logger.info(
+        "Done: teacher correct on %d/%d rows (%.1f%%) -> %s",
+        n_correct,
+        len(rows),
+        100 * n_correct / max(1, len(rows)),
+        args.out,
+    )
 
 
 if __name__ == "__main__":

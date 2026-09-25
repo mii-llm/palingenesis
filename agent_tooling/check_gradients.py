@@ -53,12 +53,16 @@ def check_gradients(config: Config) -> dict:
             break
 
     if not samples:
-        return {"issues": ["CRITICAL: No samples processed from dataset."], "loss": float("nan"),
-                "total_grad_norm": 0.0, "dead_layers": []}
+        return {
+            "issues": ["CRITICAL: No samples processed from dataset."],
+            "loss": float("nan"),
+            "total_grad_norm": 0.0,
+            "dead_layers": [],
+        }
 
     pad_id = tokenizer.pad_token_id or 0
     batch = collate_fn(samples, pad_id)
-    batch.pop("position_ids", None)   # packed rows: document masking is the trainer's job, not needed here
+    batch.pop("position_ids", None)  # packed rows: document masking is the trainer's job, not needed here
     batch = {k: v.to(device) for k, v in batch.items()}
 
     # Forward-backward
@@ -112,7 +116,7 @@ def check_gradients(config: Config) -> dict:
         issues.append("CRITICAL: Inf in gradients — loss explosion.")
     if len(dead_layers) > len(layer_norms) * 0.3:
         issues.append(
-            f"WARNING: {len(dead_layers)} layers have zero gradient ({100*len(dead_layers)/len(layer_norms):.0f}%)."
+            f"WARNING: {len(dead_layers)} layers have zero gradient ({100 * len(dead_layers) / len(layer_norms):.0f}%)."
         )
     if tiny_grad:
         issues.append(f"WARNING: {len(tiny_grad)} layers have vanishing gradients (<1e-7).")

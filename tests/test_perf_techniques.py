@@ -413,7 +413,7 @@ def test_full_perf_stack_composition():
     for t in ema._shadow.values():
         assert t.isfinite().all(), "EMA shadow should be finite"
 
-    print(f"  Loss: {initial:.3f} → {final:.3f} ({(1-final/initial)*100:.0f}% reduction)")
+    print(f"  Loss: {initial:.3f} → {final:.3f} ({(1 - final / initial) * 100:.0f}% reduction)")
     print(f"  Spikes: {spike_det.spikes_detected}, AdaGC clips: {adagc.total_clips}")
     print("✓ test_full_perf_stack_composition PASSED\n")
 
@@ -465,6 +465,6 @@ def test_spike_detector_accepts_a_permanent_change_of_gradient_scale():
     for i in range(100):
         det.check(1.0 + 0.01 * (i % 3))
     skipped = [det.check(40.0) for _ in range(60)]
-    assert sum(skipped) == 10          # ten spikes skipped, then the new scale is accepted
+    assert sum(skipped) == 10  # ten spikes skipped, then the new scale is accepted
     assert det.regime_changes == 1
     assert not any(skipped[11:])

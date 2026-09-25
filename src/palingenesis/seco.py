@@ -49,8 +49,6 @@ Rows may be right-padded (padding only follows real tokens, and causality keeps
 it inert). Packed sequences are not supported.
 """
 
-from __future__ import annotations
-
 import logging
 import random
 from contextlib import contextmanager
@@ -77,11 +75,15 @@ _DICT_STATES = isinstance(cu.LinearAttentionLayer().conv_states, dict)
 # Cache layer classes this module understands (any subclass of these that
 # overrides their update logic is rejected: its semantics are unknown).
 _APPEND_ONLY = (cu.DynamicLayer,)
-_BOUNDED = tuple(c for c in (
-    getattr(cu, "DynamicSlidingWindowLayer", None),
-    cu.LinearAttentionLayer,
-    getattr(cu, "LinearAttentionAndSlidingWindowAttentionLayer", None),
-) if c is not None)
+_BOUNDED = tuple(
+    c
+    for c in (
+        getattr(cu, "DynamicSlidingWindowLayer", None),
+        cu.LinearAttentionLayer,
+        getattr(cu, "LinearAttentionAndSlidingWindowAttentionLayer", None),
+    )
+    if c is not None
+)
 _HYBRID = tuple(c for c in (getattr(cu, "LinearAttentionAndFullAttentionLayer", None),) if c is not None)
 _KV = ("keys", "values")
 # Per-chunk bookkeeping set on cache layers by this module, not model state.
@@ -107,15 +109,19 @@ _BIASES: dict[tuple[int, int], object] = {}
 # Full-attention layers served from a KVStore in the current forward:
 # layer_idx -> (store, prefix length, block size). Filled by the layers' update().
 _ACTIVE: dict[int, tuple[KVStore, int, int]] = {}
-KV_BLOCK = 8192        # prefix tokens per attention block (bounds per-block memory and transfers)
+KV_BLOCK = 8192  # prefix tokens per attention block (bounds per-block memory and transfers)
 
 
 def _mask(*args, **kwargs):
     from transformers.masking_utils import causal_mask_function, sdpa_mask
 
-    plain_causal = (kwargs.get("mask_function") is causal_mask_function and kwargs.get("attention_mask") is None
-                    and not kwargs.get("kv_offset") and kwargs.get("local_size") is None
-                    and kwargs.get("allow_is_causal_skip", True))
+    plain_causal = (
+        kwargs.get("mask_function") is causal_mask_function
+        and kwargs.get("attention_mask") is None
+        and not kwargs.get("kv_offset")
+        and kwargs.get("local_size") is None
+        and kwargs.get("allow_is_causal_skip", True)
+    )
     return None if plain_causal else sdpa_mask(*args, **kwargs)
 
 
@@ -146,11 +152,12 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
             key, value = torch.cat([pk, key], dim=-2), torch.cat([pv, value], dim=-2)
             kv_len = key.shape[2]
     if attention_mask is not None or not causal or special or q_len == 1:
-        if query.is_cuda and torch.is_autocast_enabled("cuda"):      # see below: one dtype, a fused kernel
+        if query.is_cuda and torch.is_autocast_enabled("cuda"):  # see below: one dtype, a fused kernel
             dtype = torch.get_autocast_dtype("cuda")
             query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
-        return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
-                                      is_causal=is_causal, **kwargs)
+        return sdpa_attention_forward(
+            module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs
+        )
     # Under autocast, RoPE's fp32 cos/sin promote q/k to fp32 while v stays bf16.
     # The CausalBias dispatcher picks its kernel BEFORE autocast casts anything, and
     # with fp32 inputs it rules out flash and materialises the [q, kv] scores. Cast
@@ -158,8 +165,9 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
     if query.is_cuda and torch.is_autocast_enabled("cuda"):
         dtype = torch.get_autocast_dtype("cuda")
         query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
-    flash_capable = (query.is_cuda and query.dtype in (torch.float16, torch.bfloat16)
-                     and key.shape[-1] == value.shape[-1] <= 256)
+    flash_capable = (
+        query.is_cuda and query.dtype in (torch.float16, torch.bfloat16) and key.shape[-1] == value.shape[-1] <= 256
+    )
     if flash_capable and q_len == kv_len and not dropout and query.shape[-1] % 8 == 0:
         # Plain causal self-attention: the flash kernel itself, grouped K/V heads natively.
         # SDPA's dispatcher rules flash out for some shapes it supports (Qwen3.5: head_dim 256
@@ -170,7 +178,7 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
     if key.shape[1] != query.shape[1]:
         if flash_capable:
             extra["enable_gqa"] = True
-        else:                                 # the other kernels need matching head counts
+        else:  # the other kernels need matching head counts
             key = repeat_kv(key, query.shape[1] // key.shape[1])
             value = repeat_kv(value, query.shape[1] // value.shape[1])
     bias = None
@@ -179,10 +187,11 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
         if bias is None:
             try:
                 bias = causal_lower_right(q_len, kv_len)
-            except RuntimeError:              # e.g. inside selective checkpointing: explicit mask
+            except RuntimeError:  # e.g. inside selective checkpointing: explicit mask
                 bias = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(kv_len - q_len)
     out = torch.nn.functional.scaled_dot_product_attention(
-        query, key, value, attn_mask=bias, dropout_p=dropout, scale=scaling, is_causal=q_len == kv_len, **extra)
+        query, key, value, attn_mask=bias, dropout_p=dropout, scale=scaling, is_causal=q_len == kv_len, **extra
+    )
     return out.transpose(1, 2).contiguous(), None
 
 
@@ -222,8 +231,9 @@ def _chunk_attention(model: nn.Module):
         AttentionInterface.register(_ATTN, _attention)
         AttentionMaskInterface.register(_ATTN, _mask)
         _REGISTERED = True
-    configs = {id(m.config): m.config for m in model.modules()
-               if isinstance(getattr(m, "config", None), PretrainedConfig)}
+    configs = {
+        id(m.config): m.config for m in model.modules() if isinstance(getattr(m, "config", None), PretrainedConfig)
+    }
     original = {key: cfg._attn_implementation for key, cfg in configs.items()}
     try:
         for key, cfg in configs.items():
@@ -250,13 +260,16 @@ def seco_forward_backward(model, input_ids, labels, *, chunk_size: int = 4096, *
     return chunkwise_forward_backward(model, input_ids, labels, chunk_size=chunk_size, budget=None, **kwargs)
 
 
-def spaco_forward_backward(model, input_ids, labels, *, chunk_size: int = 4096, budget: int = 8,
-                           **kwargs) -> ChunkwiseResult:
+def spaco_forward_backward(
+    model, input_ids, labels, *, chunk_size: int = 4096, budget: int = 8, **kwargs
+) -> ChunkwiseResult:
     """SpaCO: backpropagate `budget` random chunks (a stochastic gradient estimate)."""
     return chunkwise_forward_backward(model, input_ids, labels, chunk_size=chunk_size, budget=budget, **kwargs)
 
 
-def chunkwise_forward_backward(model: nn.Module, input_ids: torch.Tensor, labels: torch.Tensor, **kwargs) -> ChunkwiseResult:
+def chunkwise_forward_backward(
+    model: nn.Module, input_ids: torch.Tensor, labels: torch.Tensor, **kwargs
+) -> ChunkwiseResult:
     """Accumulate d(loss)/d(params) into `.grad`, chunk by chunk; the caller must
     NOT call `.backward()` afterwards. See `_chunkwise` for the arguments."""
     with _chunk_attention(model), differentiable_decode(model):
@@ -336,9 +349,13 @@ def _chunkwise(
     def chunk_loss(hidden, lo, hi, weight=1.0):
         # The weight goes into the denominator: chunked CE computes lm_head's
         # gradients inside this call, so scaling the returned loss would miss them.
-        return chunked_cross_entropy_loss(hidden, shifted[:, lo:hi], lm_head,
-                                          num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
-                                          global_valid_tokens=denom / weight)
+        return chunked_cross_entropy_loss(
+            hidden,
+            shifted[:, lo:hi],
+            lm_head,
+            num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
+            global_valid_tokens=denom / weight,
+        )
 
     # K/V are cached in the autocast dtype: attention consumes them in that dtype
     # anyway (autocast casts its inputs), so this matches the full forward exactly
@@ -362,25 +379,28 @@ def _chunkwise(
     cache = _new_cache(backbone, cast)
     append = [_is_append_only(layer) for layer in cache.layers]
     in_store = [app and use_stores and _storable(layer) for layer, app in zip(cache.layers, append)]
-    starts: list[list[dict]] = []       # starts[i][layer]: layer state chunk i starts from (bounded part)
-    rng_states = []                     # RNG state each chunk starts from (dropout replay)
+    starts: list[list[dict]] = []  # starts[i][layer]: layer state chunk i starts from (bounded part)
+    rng_states = []  # RNG state each chunk starts from (dropout replay)
     devices = [input_ids.device] if input_ids.device.type == "cuda" else []
     logged = 0.0
     with torch.no_grad():
         for lo, hi in bounds:
-            starts.append([_offload(_state(layer, app, clone=True), kv_offload)
-                           for layer, app in zip(cache.layers, append)])
+            starts.append(
+                [_offload(_state(layer, app, clone=True), kv_offload) for layer, app in zip(cache.layers, append)]
+            )
             rng_states.append(_rng_state(devices))
             _attach_stores(cache, in_store, stores, seq_len, lo, write=True, offload=kv_offload)
             hidden = _run(backbone, input_ids[:, lo:hi], cache)
-            if sparse:   # skipped chunks are not recomputed; report their loss from here
+            if sparse:  # skipped chunks are not recomputed; report their loss from here
                 logged += float(chunk_loss(hidden, lo, hi))
             del hidden
     # Append-only checkpoints: ONE leaf per layer holding the whole sequence's K/V.
     # A chunk's prefix is a view of it (no copy), and every chunk's gradient
     # accumulates into a single buffer of the same size.
-    kv = [tuple(getattr(layer, a).detach().requires_grad_(True) for a in _KV) if app and not stored else None
-          for layer, app, stored in zip(cache.layers, append, in_store)]
+    kv = [
+        tuple(getattr(layer, a).detach().requires_grad_(True) for a in _KV) if app and not stored else None
+        for layer, app, stored in zip(cache.layers, append, in_store)
+    ]
     del cache
     for store in stores.values():
         store.start_gradients()
@@ -392,7 +412,7 @@ def _chunkwise(
     else:
         order, scale = list(reversed(range(k))), 1.0
 
-    next_leaves, next_chunk = None, None        # state leaves of the chunk processed last
+    next_leaves, next_chunk = None, None  # state leaves of the chunk processed last
     for i in order:
         lo, hi = bounds[i]
         cache = _new_cache(backbone, cast)
@@ -402,17 +422,18 @@ def _chunkwise(
             state = _leafify(_onto(starts[i][idx], input_ids.device)) if i > 0 else {}
             # clones of the leaves (the gradient still reaches them): a one-token chunk updates the
             # conv state in place (the decode path), which a leaf does not allow
-            _apply_state(layer, {path: (v.clone() if torch.is_tensor(v) and v.requires_grad else v)
-                                 for path, v in state.items()})
+            _apply_state(
+                layer, {path: (v.clone() if torch.is_tensor(v) and v.requires_grad else v) for path, v in state.items()}
+            )
             if app and i > 0 and not in_store[idx]:
                 _seed_kv(layer, [t[..., :lo, :] for t in kv[idx]])
             leaves.append(state)
         before = [_snapshot(layer) for layer in cache.layers]
 
         with torch.random.fork_rng(devices=devices):
-            _set_rng_state(rng_states[i], devices)          # same dropout masks as stage 1
+            _set_rng_state(rng_states[i], devices)  # same dropout masks as stage 1
             hidden = _run(backbone, input_ids[:, lo:hi], cache)
-        loss = chunk_loss(hidden, lo, hi, weight=scale)   # SpaCO: J_i scaled by k/t (module doc)
+        loss = chunk_loss(hidden, lo, hi, weight=scale)  # SpaCO: J_i scaled by k/t (module doc)
         # The relay, d<out, scale * grad>/dθ for every output later chunks read, passed to
         # autograd as (root, incoming gradient) pairs next to the loss (no scalar to build).
         roots, grads = ([loss], [torch.ones_like(loss)]) if loss.requires_grad else ([], [])
@@ -423,8 +444,10 @@ def _chunkwise(
                 chunk_k, chunk_v = layer._chunk_kv
                 pairs += [(chunk_k, store.grad_k[..., lo:hi, :]), (chunk_v, store.grad_v[..., lo:hi, :])]
             elif app:
-                pairs += [(getattr(layer, a)[..., lo:, :], None if leaf.grad is None else leaf.grad[..., lo:hi, :])
-                          for a, leaf in zip(_KV, kv[idx])]
+                pairs += [
+                    (getattr(layer, a)[..., lo:, :], None if leaf.grad is None else leaf.grad[..., lo:hi, :])
+                    for a, leaf in zip(_KV, kv[idx])
+                ]
             if next_chunk == i + 1:
                 after = _state(layer, app, clone=False)
                 pairs += [(after[path], leaf.grad) for path, leaf in _tensors(next_leaves[idx])]
@@ -458,7 +481,7 @@ def _backbone(model: nn.Module) -> nn.Module:
 
 
 def _lm_head(model: nn.Module) -> nn.Module:
-    head = output_head(model)            # lm_head + the model's logit transform, if any
+    head = output_head(model)  # lm_head + the model's logit transform, if any
     if head is None:
         raise RuntimeError("SeCO needs the model's output projection (get_output_embeddings()).")
     return head
@@ -476,8 +499,9 @@ def _set_rng_state(state, devices) -> None:
 
 
 @torch.no_grad()
-def verify_chunked_forward(model: nn.Module, chunk_size: int = 64, num_chunks: int = 3,
-                           tolerance: float | None = None) -> float:
+def verify_chunked_forward(
+    model: nn.Module, chunk_size: int = 64, num_chunks: int = 3, tolerance: float | None = None
+) -> float:
     """Check the one assumption SeCO rests on: running the model chunk by chunk
     with a cache gives the same logits as one full forward (through the same
     attention path SeCO uses). Returns the relative max difference; raises if it
@@ -509,14 +533,16 @@ def verify_chunked_forward(model: nn.Module, chunk_size: int = 64, num_chunks: i
         with _chunk_attention(model):
             full = head(_run(backbone, ids, None)).float()
             cache = _new_cache(backbone)
-            in_store = [_is_append_only(layer) and _uses_chunk_attention(backbone) and _storable(layer)
-                        for layer in cache.layers]
+            in_store = [
+                _is_append_only(layer) and _uses_chunk_attention(backbone) and _storable(layer)
+                for layer in cache.layers
+            ]
             stores: dict[int, KVStore] = {}
             try:
                 outs = []
                 for lo in range(0, ids.shape[1], chunk_size):
                     _attach_stores(cache, in_store, stores, ids.shape[1], lo, write=True, offload=False)
-                    outs.append(head(_run(backbone, ids[:, lo:lo + chunk_size], cache)).float())
+                    outs.append(head(_run(backbone, ids[:, lo : lo + chunk_size], cache)).float())
                 chunked = torch.cat(outs, dim=1)
             except NotImplementedError:
                 raise
@@ -571,16 +597,31 @@ def _prefix_length(cache) -> int:
     """Tokens already in the full-attention layers of the cache (0 if none)."""
     if cache is None:
         return 0
-    return max((layer.keys.shape[-2] for layer in cache.layers
-                if _is_append_only(layer) and "_store_ctx" not in layer.__dict__
-                and getattr(layer, "is_initialized", False) and layer.keys.numel()), default=0)
+    return max(
+        (
+            layer.keys.shape[-2]
+            for layer in cache.layers
+            if _is_append_only(layer)
+            and "_store_ctx" not in layer.__dict__
+            and getattr(layer, "is_initialized", False)
+            and layer.keys.numel()
+        ),
+        default=0,
+    )
 
 
 class _StoreCtx:
     """Where a full-attention cache layer's K/V live during one chunk."""
 
     def __init__(self, stores, idx, seq_len, lo, write, offload):
-        self.stores, self.idx, self.seq_len, self.lo, self.write, self.offload = stores, idx, seq_len, lo, write, offload
+        self.stores, self.idx, self.seq_len, self.lo, self.write, self.offload = (
+            stores,
+            idx,
+            seq_len,
+            lo,
+            write,
+            offload,
+        )
 
 
 def _offloaded_bytes(backbone: nn.Module, batch: int, seq_len: int, cast: torch.dtype | None) -> int:
@@ -610,7 +651,7 @@ def _attach_stores(cache, in_store, stores, seq_len, lo, write, offload) -> None
     for idx, layer in enumerate(cache.layers):
         if in_store[idx]:
             layer._store_ctx = _StoreCtx(stores, idx, seq_len, lo, write, offload)
-            layer.__dict__.pop("_chunk_kv", None)    # the previous chunk's (stage 1 reuses the cache)
+            layer.__dict__.pop("_chunk_kv", None)  # the previous chunk's (stage 1 reuses the cache)
 
 
 def _offload(state: dict, offload: bool) -> dict:
@@ -628,8 +669,10 @@ def _offload(state: dict, offload: bool) -> dict:
 
 
 def _onto(state: dict, device: torch.device) -> dict:
-    return {path: (v.to(device, non_blocking=True) if torch.is_tensor(v) and v.device != device else v)
-            for path, v in state.items()}
+    return {
+        path: (v.to(device, non_blocking=True) if torch.is_tensor(v) and v.device != device else v)
+        for path, v in state.items()
+    }
 
 
 def _new_cache(backbone: nn.Module, cast: torch.dtype | None = None):
@@ -670,8 +713,10 @@ def _state(layer, append_only: bool, clone: bool) -> dict:
 
 
 def _leafify(state: dict) -> dict:
-    return {path: (v.detach().requires_grad_(True) if torch.is_tensor(v) and v.is_floating_point() else v)
-            for path, v in state.items()}
+    return {
+        path: (v.detach().requires_grad_(True) if torch.is_tensor(v) and v.is_floating_point() else v)
+        for path, v in state.items()
+    }
 
 
 def _tensors(state: dict):
@@ -712,8 +757,9 @@ def _snapshot_copy(snapshot: dict) -> dict:
 # reassigns instead, with otherwise identical semantics.
 
 
-def _update_conv_state(self, conv_states: torch.Tensor, state_idx: int = 0, conv_kernel_size: int | None = None,
-                       **kwargs) -> torch.Tensor:
+def _update_conv_state(
+    self, conv_states: torch.Tensor, state_idx: int = 0, conv_kernel_size: int | None = None, **kwargs
+) -> torch.Tensor:
     self.dtype, self.device = conv_states.dtype, conv_states.device
     if not _DICT_STATES:
         # Called with the conv window already padded/cropped to the kernel size

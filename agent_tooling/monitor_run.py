@@ -37,8 +37,14 @@ def parse_training_log(text: str) -> list[StepInfo]:
     from agent_tooling._logparse import parse_steps
 
     return [
-        StepInfo(step=f["step"], loss=f["loss"], lr=f.get("lr", 0.0), tokens_per_sec=f.get("tok/s", 0.0),
-                 grad_norm=f.get("grad_norm", 0.0), step_time=f.get("dt", 0.0))
+        StepInfo(
+            step=f["step"],
+            loss=f["loss"],
+            lr=f.get("lr", 0.0),
+            tokens_per_sec=f.get("tok/s", 0.0),
+            grad_norm=f.get("grad_norm", 0.0),
+            step_time=f.get("dt", 0.0),
+        )
         for f in parse_steps(text)
     ]
 
@@ -96,6 +102,7 @@ def analyze_run(steps: list[StepInfo], max_steps: int | None = None) -> dict:
     # Throughput: per-step tok/s varies by design with variable-length batches, so
     # look for a sustained slowdown (recent median well below the earlier median).
     if n >= 20:
+
         def median(xs):
             xs = sorted(xs)
             return xs[len(xs) // 2]
@@ -138,9 +145,9 @@ def _format_time(seconds: float | None) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
     elif seconds < 3600:
-        return f"{seconds/60:.1f}m"
+        return f"{seconds / 60:.1f}m"
     else:
-        return f"{seconds/3600:.1f}h"
+        return f"{seconds / 3600:.1f}h"
 
 
 def print_brief(result: dict):

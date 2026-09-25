@@ -191,7 +191,7 @@ class AdaptiveSourceTracker:
                     if state.consecutive_increases == 1:
                         logger.info(
                             f"MSFT: '{name}' overfitting detected (val_loss={val_loss:.4f} > "
-                            f"best={state.best_val_loss:.4f}), weight {state.weight/state.original_weight:.0%} of original"
+                            f"best={state.best_val_loss:.4f}), weight {state.weight / state.original_weight:.0%} of original"
                         )
                 else:
                     # PLATEAU: val loss roughly unchanged

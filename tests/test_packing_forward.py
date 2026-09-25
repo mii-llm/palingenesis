@@ -27,7 +27,7 @@ def _batch():
 def test_rows_kept_without_flattening():
     ids, labels, pos = _batch()
     b = PackedBatch.build(ids, labels, pos, flatten=False, attn_implementation="sdpa")
-    assert b.forward_kwargs["attention_mask"] is None       # lets transformers build the packed mask
+    assert b.forward_kwargs["attention_mask"] is None  # lets transformers build the packed mask
     assert b.input_ids.shape == (2, 8) and "cu_seq_lens_q" not in b.forward_kwargs
 
 
@@ -47,9 +47,17 @@ def test_documents_isolated_in_a_real_forward():
     from transformers import LlamaConfig, LlamaForCausalLM
 
     torch.manual_seed(0)
-    model = LlamaForCausalLM(LlamaConfig(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                                         num_attention_heads=4, num_key_value_heads=2,
-                                         attn_implementation="sdpa")).eval()
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attn_implementation="sdpa",
+        )
+    ).eval()
     model.config.use_cache = False
     a, b = torch.randint(0, 64, (1, 5)), torch.randint(0, 64, (1, 7))
     ids = torch.cat([a, b], 1)

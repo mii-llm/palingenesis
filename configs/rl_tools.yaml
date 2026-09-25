@@ -1,0 +1,45 @@
+# Multi-turn tool use: the policy calls a Python tool (run in the sandbox) as often as it
+# likes within max_turns, then answers; the final \boxed{} answer is graded. Tool results
+# are context (never trained); every sampled token of every turn is (token-in/token-out:
+# nothing is re-tokenized between turns).
+#
+#   pgs rl --config configs/rl_tools.yaml
+#
+# The environment is a plain class (examples/rl/python_env.py): public methods are the
+# tools, reset(**row) starts an episode. Write your own the same way.
+
+model:
+  policy: Qwen/Qwen3.5-4B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/math_rl.jsonl
+  eval_size: 256
+  system_prompt: "Use the python tool to compute. Put your final answer within \\boxed{}."
+
+env:
+  type: examples/rl/python_env.py:PythonEnv
+  max_turns: 6
+  max_tool_output_tokens: 512
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 8
+  max_new_tokens: 1024
+  max_completion_tokens: 4096
+  max_model_len: 8192
+  gpu_memory_utilization: 0.4
+  max_staleness: 1
+
+rewards:
+  correct: {fn: math, args: {field: answer}}
+
+sandbox:
+  backend: docker
+
+train:
+  output_dir: runs/rl_tools
+  steps: 200
+  learning_rate: 1.0e-6
+  eval_every: 25

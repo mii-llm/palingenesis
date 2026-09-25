@@ -171,16 +171,28 @@ class TurnMarkers:
 
 # Probe strings: plain ASCII words that no template rewrites and no tokenizer splits oddly.
 _PROBE_USER, _PROBE_ANSWER, _PROBE_USER2, _PROBE_ANSWER2, _PROBE_REASONING = (
-    "PgsProbeUserOne", "PgsProbeAnswerOne", "PgsProbeUserTwo", "PgsProbeAnswerTwo", "PgsProbeReasoningOne"
+    "PgsProbeUserOne",
+    "PgsProbeAnswerOne",
+    "PgsProbeUserTwo",
+    "PgsProbeAnswerTwo",
+    "PgsProbeReasoningOne",
 )
 
 
 def renders_reasoning(render) -> bool:
     """Whether a chat template puts an assistant turn's reasoning field into the text."""
     try:
-        text = render([{"role": "user", "content": _PROBE_USER},
-                       {"role": "assistant", "content": _PROBE_ANSWER, "reasoning_content": _PROBE_REASONING,
-                        "reasoning": _PROBE_REASONING}])
+        text = render(
+            [
+                {"role": "user", "content": _PROBE_USER},
+                {
+                    "role": "assistant",
+                    "content": _PROBE_ANSWER,
+                    "reasoning_content": _PROBE_REASONING,
+                    "reasoning": _PROBE_REASONING,
+                },
+            ]
+        )
     except Exception:
         return False
     return _PROBE_REASONING in text
@@ -193,16 +205,24 @@ def detect_think_tags(render) -> tuple[str, str] | None:
     "</seed:think>"). None when the template does not render reasoning or its delimiters
     do not follow that pattern (the caller then uses the configured tags)."""
     try:
-        text = render([{"role": "user", "content": _PROBE_USER},
-                       {"role": "assistant", "content": _PROBE_ANSWER, "reasoning_content": _PROBE_REASONING,
-                        "reasoning": _PROBE_REASONING}])
+        text = render(
+            [
+                {"role": "user", "content": _PROBE_USER},
+                {
+                    "role": "assistant",
+                    "content": _PROBE_ANSWER,
+                    "reasoning_content": _PROBE_REASONING,
+                    "reasoning": _PROBE_REASONING,
+                },
+            ]
+        )
     except Exception:
         return None
     i = text.find(_PROBE_REASONING)
     j = text.find(_PROBE_ANSWER, i + len(_PROBE_REASONING)) if i != -1 else -1
     if j == -1:
         return None
-    close = text[i + len(_PROBE_REASONING): j].strip()
+    close = text[i + len(_PROBE_REASONING) : j].strip()
     if "/" not in close or any(c.isspace() for c in close):
         return None
     open_ = close.replace("/", "", 1)
@@ -226,13 +246,15 @@ def derive_turn_markers(render, tokenizer) -> TurnMarkers | None:
         base = render([user])
         gen = render([user], add_generation_prompt=True)
         final = render([user, answer])
-        history = render([user, answer, {"role": "user", "content": _PROBE_USER2},
-                          {"role": "assistant", "content": _PROBE_ANSWER2}])
+        history = render(
+            [user, answer, {"role": "user", "content": _PROBE_USER2}, {"role": "assistant", "content": _PROBE_ANSWER2}]
+        )
     except Exception:
         return None
     try:
-        with_reasoning = render([user, {**answer, "reasoning_content": _PROBE_REASONING,
-                                        "reasoning": _PROBE_REASONING}])
+        with_reasoning = render(
+            [user, {**answer, "reasoning_content": _PROBE_REASONING, "reasoning": _PROBE_REASONING}]
+        )
     except Exception:
         with_reasoning = None
 
@@ -248,7 +270,7 @@ def derive_turn_markers(render, tokenizer) -> TurnMarkers | None:
         heads.append(text[:i])
     if not gen.startswith(base):
         return None
-    header = os.path.commonprefix([h[len(base):] for h in heads])
+    header = os.path.commonprefix([h[len(base) :] for h in heads])
     if not header.strip():
         return None
 
@@ -261,16 +283,16 @@ def derive_turn_markers(render, tokenizer) -> TurnMarkers | None:
                 return o0, o1
         return None
 
-    after = final[final.index(_PROBE_ANSWER) + len(_PROBE_ANSWER):]
+    after = final[final.index(_PROBE_ANSWER) + len(_PROBE_ANSWER) :]
     found = first_special(after)
     if found is None or after[: found[0]].strip():
         return None
-    end = after[found[0]: found[1]]
-    after_history = history[history.index(_PROBE_ANSWER) + len(_PROBE_ANSWER):]
+    end = after[found[0] : found[1]]
+    after_history = history[history.index(_PROBE_ANSWER) + len(_PROBE_ANSWER) :]
     if not after_history.lstrip().startswith(end):
         return None
     opener = first_special(header)
-    turn_open = header[opener[0]: opener[1]] if opener is not None and not header[: opener[0]].strip() else ""
+    turn_open = header[opener[0] : opener[1]] if opener is not None and not header[: opener[0]].strip() else ""
     return TurnMarkers(header=header, end=end, turn_open=turn_open)
 
 
@@ -426,8 +448,7 @@ class ChatDataset(IterableDataset):
         """Whether the chat template (with this row's kwargs) renders a turn's reasoning field;
         cached per kwargs."""
         cache = self.__dict__.setdefault("_reasoning_cache", {})
-        key = json.dumps({k: v for k, v in self._template_kwargs.items() if k != "tools"}, sort_keys=True,
-                         default=str)
+        key = json.dumps({k: v for k, v in self._template_kwargs.items() if k != "tools"}, sort_keys=True, default=str)
         if key not in cache:
             cache[key] = renders_reasoning(lambda m, **kw: self._render_chat(m, tokenize=False, **kw))
         return cache[key]
@@ -435,8 +456,7 @@ class ChatDataset(IterableDataset):
     def _render_tags(self) -> tuple[str, str]:
         """Reasoning delimiters in the rendered text: the template's, else the configured ones."""
         cache = self.__dict__.setdefault("_tags_cache", {})
-        key = json.dumps({k: v for k, v in self._template_kwargs.items() if k != "tools"}, sort_keys=True,
-                         default=str)
+        key = json.dumps({k: v for k, v in self._template_kwargs.items() if k != "tools"}, sort_keys=True, default=str)
         if key not in cache:
             detected = detect_think_tags(lambda m, **kw: self._render_chat(m, tokenize=False, **kw))
             cache[key] = detected or self.think_tags or THINK_TAGS
@@ -452,8 +472,7 @@ class ChatDataset(IterableDataset):
         return self.tokenizer.apply_chat_template(messages, **{**self._template_kwargs, **kwargs})
 
     def __iter__(self):
-        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size,
-                                      self.shuffle_buffer, self.shuffle_seed)
+        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed)
         self.stats.clear()
         for example in dataset:
             too_long = self.stats["dropped_too_long"]
@@ -538,7 +557,7 @@ class ChatDataset(IterableDataset):
         normalized = normalize_messages(example, self.messages_field, think_tags=self._data_tags())
         if normalized:
             messages = normalized
-            if not self._renders_reasoning():        # baked <think> blocks stay in the content
+            if not self._renders_reasoning():  # baked <think> blocks stay in the content
                 messages = restore_baked_think(messages)
         elif not isinstance(messages, list):
             return None
@@ -553,9 +572,7 @@ class ChatDataset(IterableDataset):
 
         # The template's {% generation %} mask cannot tell turns apart, so per-message
         # training flags (`"loss": false`) need the turn-aware masker.
-        per_turn_flags = any(
-            m.get("role") == "assistant" and not is_trained_message(m) for m in messages
-        )
+        per_turn_flags = any(m.get("role") == "assistant" and not is_trained_message(m) for m in messages)
         if per_turn_flags or self.turn_scaling != "uniform" or not self._template_has_generation_span():
             return self._fallback(messages)
 
@@ -624,7 +641,7 @@ class ChatDataset(IterableDataset):
                 return rc.strip(), content.strip()
         from palingenesis.validate_data import split_leading_think
 
-        baked, rest = split_leading_think(content, self._data_tags())   # only a LEADING block is reasoning
+        baked, rest = split_leading_think(content, self._data_tags())  # only a LEADING block is reasoning
         if baked is not None:
             return (baked.strip() or None), rest.strip()
         return None, content.strip()
@@ -694,6 +711,7 @@ class ChatDataset(IterableDataset):
         kwargs = {k: v for k, v in self._template_kwargs.items() if k != "tools"}
         key = json.dumps(kwargs, sort_keys=True, default=str)
         if key not in self._markers_cache:
+
             def render(messages, **kw):
                 return self.tokenizer.apply_chat_template(messages, tokenize=False, **{**kwargs, **kw})
 
@@ -783,8 +801,7 @@ class ChatDataset(IterableDataset):
 
         return result
 
-    def _locate_turns_by_markers(self, full: str, messages: list[dict], spans: "_TokenSpans",
-                                 markers: "TurnMarkers"):
+    def _locate_turns_by_markers(self, full: str, messages: list[dict], spans: "_TokenSpans", markers: "TurnMarkers"):
         """Token indices of every assistant turn (header excluded, end-of-turn included),
         and of the ECHO-trained tool/observation contents."""
         echo_roles = {"tool", "observation", "ipython", "function"} if self.include_observations else set()
@@ -795,8 +812,14 @@ class ChatDataset(IterableDataset):
 
         def next_turn(start: int) -> int:
             """Where the next turn opens (bounds an assistant turn and a content search)."""
-            nxt = [p for p in (full.find(markers.turn_open, start) if markers.turn_open else -1,
-                               full.find(markers.header, start)) if p != -1]
+            nxt = [
+                p
+                for p in (
+                    full.find(markers.turn_open, start) if markers.turn_open else -1,
+                    full.find(markers.header, start),
+                )
+                if p != -1
+            ]
             return min(nxt) if nxt else n
 
         for msg in messages:
@@ -827,7 +850,8 @@ class ChatDataset(IterableDataset):
                 # Only a block that OPENS the turn is reasoning; <think> tags later in the answer
                 # are text the model writes, and trained as such.
                 lead = _think_block(self._render_tags()).match(
-                    full, start + (len(full[start:end]) - len(full[start:end].lstrip())), end)
+                    full, start + (len(full[start:end]) - len(full[start:end].lstrip())), end
+                )
                 excluded = [lead.span()] if lead else []
                 if reasoning and not self.train_on_reasoning:
                     # Reasoning rendered outside <think> tags (other templates' channels).
@@ -839,8 +863,7 @@ class ChatDataset(IterableDataset):
             turns.append((tset, msg))
         return turns, echo
 
-    def _locate_turns_by_content(self, full: str, messages: list[dict], spans: "_TokenSpans",
-                                 input_ids: torch.Tensor):
+    def _locate_turns_by_content(self, full: str, messages: list[dict], spans: "_TokenSpans", input_ids: torch.Tensor):
         """Legacy locator for templates whose turn markers cannot be derived: finds each
         turn's reasoning/answer TEXT in the render, plus one end-of-turn special token.
         Text the template renders from other fields (tool calls) is not found."""
@@ -945,9 +968,7 @@ class ChatDataset(IterableDataset):
         for i, msg in enumerate(messages):
             try:
                 # Tokenize prefix including this turn
-                prefix_text = self._render_chat(
-                    messages[: i + 1], tokenize=False, add_generation_prompt=False
-                )
+                prefix_text = self._render_chat(messages[: i + 1], tokenize=False, add_generation_prompt=False)
                 prefix_ids = self.tokenizer(prefix_text, truncation=True, max_length=self.max_seq_length)["input_ids"]
                 curr_len = len(prefix_ids)
             except Exception:
@@ -981,10 +1002,10 @@ class ChatDataset(IterableDataset):
                         stub_msg.pop("reasoning_content", None)
                     stub_messages = messages[:i] + [stub_msg]
                     try:
-                        stub_text = self._render_chat(
-                            stub_messages, tokenize=False, add_generation_prompt=False
-                        )
-                        stub_ids = self.tokenizer(stub_text, truncation=True, max_length=self.max_seq_length)["input_ids"]
+                        stub_text = self._render_chat(stub_messages, tokenize=False, add_generation_prompt=False)
+                        stub_ids = self.tokenizer(stub_text, truncation=True, max_length=self.max_seq_length)[
+                            "input_ids"
+                        ]
                         # The stub renders the turn-CLOSING tokens (e.g. <|im_end|>)
                         # right after the header, so len(stub_ids) overshoots the
                         # content start by the closing-tag length. The exact
@@ -1171,8 +1192,11 @@ class ChatDataset(IterableDataset):
             except Exception:
                 return False
 
-        ends = [k for k in range(1, len(messages) + 1)
-                if messages[k - 1].get("role") == "assistant" and is_trained_message(messages[k - 1])]
+        ends = [
+            k
+            for k in range(1, len(messages) + 1)
+            if messages[k - 1].get("role") == "assistant" and is_trained_message(messages[k - 1])
+        ]
         # Largest end whose ESTIMATED length fits (renders only; they grow with the turns).
         lo, hi, guess = 0, len(ends) - 1, -1
         while lo <= hi:
@@ -1223,8 +1247,7 @@ class PretrainDataset(IterableDataset):
         self.shuffle_seed = shuffle_seed
 
     def __iter__(self):
-        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size,
-                                      self.shuffle_buffer, self.shuffle_seed)
+        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed)
         for example in dataset:
             result = self._process(example)
             if result is not None:
@@ -1336,8 +1359,9 @@ class PackedDataset(IterableDataset):
       - position_ids: restart at 0 at each document
     """
 
-    def __init__(self, base: IterableDataset, max_len: int, eos_id: int = 0, sort_buffer: int = 256,
-                 max_open: int = 64):
+    def __init__(
+        self, base: IterableDataset, max_len: int, eos_id: int = 0, sort_buffer: int = 256, max_open: int = 64
+    ):
         self.base = base
         self.max_len = max_len
         self.eos_id = eos_id  # unused; kept for call-site compatibility
@@ -1465,9 +1489,7 @@ class LengthGroupedDataset(IterableDataset):
             yield from g
 
 
-def _collate_fn(
-    batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multiple: int = 1
-) -> dict[str, torch.Tensor]:
+def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multiple: int = 1) -> dict[str, torch.Tensor]:
     """Pad to longest in batch (rounded up to pad_to_multiple).
 
     pad_to_multiple > 1 keeps shapes tensor-core aligned and drastically cuts
@@ -1565,8 +1587,10 @@ def build_dataset(
                     shuffle_seed=config.seed,
                     tools_field=src.get("tools_field", config.tools_field),
                     think_tags=src.get("think_tags", getattr(config, "think_tags", None)),
-                    chat_template_kwargs={**(getattr(config, "chat_template_kwargs", None) or {}),
-                                          **(src.get("chat_template_kwargs") or {})},
+                    chat_template_kwargs={
+                        **(getattr(config, "chat_template_kwargs", None) or {}),
+                        **(src.get("chat_template_kwargs") or {}),
+                    },
                 )
             elif mode == "pretrain":
                 ds = PretrainDataset(
@@ -1661,9 +1685,7 @@ def build_dataset(
     elif batch_size > 1 and getattr(config, "length_group_buffer", 512) > 0:
         # No packing → pad-to-longest batches. Group similar lengths so the
         # padding (= wasted FLOPs) collapses to the within-group spread.
-        final_ds = LengthGroupedDataset(
-            final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed
-        )
+        final_ds = LengthGroupedDataset(final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed)
         logger.info(
             f"Length-grouped batching: buffer={config.length_group_buffer} "
             f"(cuts pad-token compute; set data.length_group_buffer: 0 to disable)"
@@ -1755,9 +1777,7 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
     if d.sources:
         sources_sig = [_src_sig(s) for s in d.sources]
     else:
-        sources_sig = [
-            _src_sig({"dataset": d.dataset, "split": d.dataset_split, "messages_field": d.messages_field})
-        ]
+        sources_sig = [_src_sig({"dataset": d.dataset, "split": d.dataset_split, "messages_field": d.messages_field})]
 
     payload = {
         "version": 1,
@@ -1914,8 +1934,6 @@ def build_pretokenized_dataloader(cache_dir, tokenizer, config: DataConfig, rank
     final_ds: IterableDataset = PretokenizedDataset(ds, rank=rank, world_size=world_size)
 
     if not config.packing and batch_size > 1 and getattr(config, "length_group_buffer", 512) > 0:
-        final_ds = LengthGroupedDataset(
-            final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed
-        )
+        final_ds = LengthGroupedDataset(final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed)
 
     return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)

@@ -8,8 +8,6 @@ Teachers and prompt sources are named mappings (``teachers: {name: {...}}``,
 ``sources: {name: {...}}``); each source routes its prompts to one teacher.
 """
 
-from __future__ import annotations
-
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,8 +87,8 @@ class SourceConfig:
     # Delimiters of reasoning baked into the assistant content, e.g. ["[THINK]", "[/THINK]"]
     # (empty = the student template's own, else <think></think>); see data.think_tags.
     think_tags: list = field(default_factory=list)
-    branches_per_trace: int = 8       # turns regenerated per sampled trace (0 = all)
-    max_context: int = 32768          # tokens of context a regenerated turn may have
+    branches_per_trace: int = 8  # turns regenerated per sampled trace (0 = all)
+    max_context: int = 32768  # tokens of context a regenerated turn may have
     max_new_tokens: int = 512
     # Held-out rows: split off `path` (deterministic, hash-ranked, unique), or all
     # of `dev_path` when set (e.g. a benchmark's test split, same format as path).
@@ -122,22 +120,22 @@ class OPDRolloutConfig:
     # "vllm": an in-process vLLM engine on the student's GPU (sleeps while training).
     # "vllm_server": a separate vLLM server fed weights over CUDA IPC (experimental).
     backend: str = "hf"
-    batch_prompts: int = 32           # prompts per optimizer step
-    group_size: int = 1               # rollouts per prompt
+    batch_prompts: int = 32  # prompts per optimizer step
+    group_size: int = 1  # rollouts per prompt
     temperature: float = 1.0
     # Policy versions a batch may lag behind the weights it trains (0 = on-policy).
     # > 0 overlaps rollout with training (vllm backends only).
     max_staleness: int = 0
-    micro_seqs: int = 64              # hf: sequences per generate() call
-    gpu_memory_utilization: float = 0.3   # vllm: GPU fraction for weights + KV cache
-    max_model_len: int = 4096         # vllm: prompt + completion tokens
-    enforce_eager: bool = False       # vllm: no CUDA graphs (faster start, slower decode)
+    micro_seqs: int = 64  # hf: sequences per generate() call
+    gpu_memory_utilization: float = 0.3  # vllm: GPU fraction for weights + KV cache
+    max_model_len: int = 4096  # vllm: prompt + completion tokens
+    enforce_eager: bool = False  # vllm: no CUDA graphs (faster start, slower decode)
     # vllm: automatic prefix caching (agent traces: the turns of one trace share its prefill)
     prefix_caching: bool = False
     # vllm, max_staleness 0: release the engine's memory while the trainer trains. Off keeps
     # it resident (no wake-up per step) when its gpu_memory_utilization fits beside training.
     sleep: bool = True
-    url: str = ""                     # vllm_server: a running server (empty = launch one)
+    url: str = ""  # vllm_server: a running server (empty = launch one)
     # vllm: sequences decoded concurrently. 0 = every sequence a step generates at once
     # (at least 256; vLLM's own default on an A100 is 256, which caps larger batches).
     max_num_seqs: int = 0
@@ -155,14 +153,14 @@ def rollout_max_num_seqs(config) -> int:
 
 @dataclass(slots=True)
 class OPDLossConfig:
-    top_k: int = 8                    # teacher top-k for topk_kl and xtok's dense term
-    beta: float = 1.0                 # topk_kl / dense: weight of reverse KL (1 - beta: forward)
-    is_low: float = 0.5               # sampled_rkl / xtok: importance ratios outside
-    is_high: float = 2.0              # [is_low, is_high] are zeroed (ICE-POP)
-    length_norm: bool = False         # per-sequence mean instead of per-token mean
-    xtok_spread: str = "chunk"        # "chunk" or "proportional" (see losses.xtok)
-    xtok_dense_weight: float = 0.0    # xtok: top-k KL at one-to-one chunks
-    mask_whitespace: bool = True      # xtok: no loss on whitespace-only chunks
+    top_k: int = 8  # teacher top-k for topk_kl and xtok's dense term
+    beta: float = 1.0  # topk_kl / dense: weight of reverse KL (1 - beta: forward)
+    is_low: float = 0.5  # sampled_rkl / xtok: importance ratios outside
+    is_high: float = 2.0  # [is_low, is_high] are zeroed (ICE-POP)
+    length_norm: bool = False  # per-sequence mean instead of per-token mean
+    xtok_spread: str = "chunk"  # "chunk" or "proportional" (see losses.xtok)
+    xtok_dense_weight: float = 0.0  # xtok: top-k KL at one-to-one chunks
+    mask_whitespace: bool = True  # xtok: no loss on whitespace-only chunks
     # rs_kd (Random Sampling KD, arXiv 2503.16870): forward KL to `rs_rounds` tokens drawn
     # from the teacher's distribution raised to `rs_temperature`, importance-weighted.
     rs_rounds: int = 50
@@ -189,18 +187,18 @@ class OPDTrainConfig:
     steps: int = 1000
     learning_rate: float = 1e-6
     warmup_steps: int = 20
-    lr_scheduler: str = "cosine"      # "cosine" or "constant"
+    lr_scheduler: str = "cosine"  # "cosine" or "constant"
     max_grad_norm: float = 1.0
     seed: int = 0
-    score_micro_seqs: int = 16        # sequences per scoring forward (student and teacher)
-    eval_every: int = 50              # dev metrics every N steps, and before the first (0 = off)
-    eval_samples: int = 200           # dev prompts per source
-    save_steps: int = 0               # checkpoint every N steps (0 = final only)
-    keep_checkpoints: int = 3         # newest step_* dirs kept on disk (0 = keep all)
-    tree_chunk_size: int = 8192       # agent_traces: tokens per chunk of the trunk (activation memory)
-    tree_branch_tokens: int = 8192    # agent_traces: padded tokens per batched forward of regenerated turns
-    tree_min_gap: int = 1024          # agent_traces: trunk tokens between cuts at turns (fewer, larger passes)
-    resume_from: str = ""             # a step_* checkpoint dir, or "auto": the newest in output_dir
+    score_micro_seqs: int = 16  # sequences per scoring forward (student and teacher)
+    eval_every: int = 50  # dev metrics every N steps, and before the first (0 = off)
+    eval_samples: int = 200  # dev prompts per source
+    save_steps: int = 0  # checkpoint every N steps (0 = final only)
+    keep_checkpoints: int = 3  # newest step_* dirs kept on disk (0 = keep all)
+    tree_chunk_size: int = 8192  # agent_traces: tokens per chunk of the trunk (activation memory)
+    tree_branch_tokens: int = 8192  # agent_traces: padded tokens per batched forward of regenerated turns
+    tree_min_gap: int = 1024  # agent_traces: trunk tokens between cuts at turns (fewer, larger passes)
+    resume_from: str = ""  # a step_* checkpoint dir, or "auto": the newest in output_dir
 
 
 @dataclass(slots=True)
@@ -216,7 +214,7 @@ _MOVED = {
     "bridge": "moved: eos_map and probe_texts to teachers.<name>, extra_stop_tokens to model.stop_tokens.",
     "data": "replaced by `sources: {<name>: {format, path, ...}}` (prompts_path is now path).",
     "sampling": "replaced by `rollout:` (batch_prompts, group_size, temperature); max_new_tokens, "
-                "cot_fraction and cot_max_new_tokens are per source.",
+    "cot_fraction and cot_max_new_tokens are per source.",
     "model.teacher": "moved to `teachers: {<name>: {model: ...}}`.",
     "model.teacher_device": "moved to teachers.<name>.device.",
     "train.loss_fn": "moved to teachers.<name>.loss (full_kl is now full_rkl, sampled_rkl is unchanged).",
@@ -227,8 +225,8 @@ _MOVED = {
 @dataclass(slots=True)
 class OPDConfig:
     model: OPDModelConfig = field(default_factory=OPDModelConfig)
-    teachers: dict = field(default_factory=dict)      # name -> TeacherConfig
-    sources: dict = field(default_factory=dict)       # name -> SourceConfig
+    teachers: dict = field(default_factory=dict)  # name -> TeacherConfig
+    sources: dict = field(default_factory=dict)  # name -> SourceConfig
     rollout: OPDRolloutConfig = field(default_factory=OPDRolloutConfig)
     loss: OPDLossConfig = field(default_factory=OPDLossConfig)
     train: OPDTrainConfig = field(default_factory=OPDTrainConfig)
@@ -284,7 +282,9 @@ class OPDConfig:
                 config.set(args[i][2:], args[i + 1], where="command line")
                 i += 2
             else:
-                raise ConfigError(f"command line: unexpected argument {args[i]!r} (overrides are --section.option value).")
+                raise ConfigError(
+                    f"command line: unexpected argument {args[i]!r} (overrides are --section.option value)."
+                )
         return config
 
     def set(self, key: str, value, where: str) -> None:
@@ -307,7 +307,7 @@ class OPDConfig:
             section, section_name, option = _section(self, parts[0], where=where), parts[0], parts[1]
         field_names = {f.name for f in dataclasses.fields(section)}
         if option in field_names and isinstance(getattr(section, option), (dict, list)) and isinstance(value, str):
-            value = yaml.safe_load(value)       # mappings/lists given on the command line
+            value = yaml.safe_load(value)  # mappings/lists given on the command line
         _set_option(section, section_name, option, value, where=where)
 
     def teacher_of(self, source: str) -> str:
@@ -338,9 +338,11 @@ class OPDConfig:
             if teacher.loss and teacher.loss not in LOSSES:
                 errors.append(f"{where}.loss must be one of {LOSSES} (or empty for auto), got {teacher.loss!r}.")
             if teacher.loss in ("full_rkl", "rs_kd") and teacher.backend == "vllm":
-                errors.append(f"{where}: {teacher.loss} needs the teacher's full distribution; a vllm teacher only "
-                              "returns its top-k. Use loss topk_kl (top-k plus a tail bucket) or sampled_rkl, "
-                              "or backend hf.")
+                errors.append(
+                    f"{where}: {teacher.loss} needs the teacher's full distribution; a vllm teacher only "
+                    "returns its top-k. Use loss topk_kl (top-k plus a tail bucket) or sampled_rkl, "
+                    "or backend hf."
+                )
             if teacher.backend == "vllm" and (teacher.device or teacher.offload):
                 errors.append(f"{where}: device and offload apply to hf teachers only.")
             if teacher.backend == "hf" and teacher.url:
@@ -350,21 +352,27 @@ class OPDConfig:
             if source.format not in SOURCE_FORMATS:
                 errors.append(f"{where}.format must be one of {SOURCE_FORMATS}, got {source.format!r}.")
             if source.think_tags and not valid_think_tags(source.think_tags):
-                errors.append(f"{where}.think_tags must be two different non-empty strings [open, close], "
-                              f"got {source.think_tags!r}.")
+                errors.append(
+                    f"{where}.think_tags must be two different non-empty strings [open, close], "
+                    f"got {source.think_tags!r}."
+                )
             if source.topic_teachers and not source.topic_field:
                 errors.append(f"{where}.topic_teachers needs topic_field (the row field holding the topic).")
             seen: dict = {}
             for teacher, topics in source.topic_teachers.items():
                 if teacher not in self.teachers:
-                    errors.append(f"{where}.topic_teachers: {teacher!r} is not one of the teachers {list(self.teachers)}.")
+                    errors.append(
+                        f"{where}.topic_teachers: {teacher!r} is not one of the teachers {list(self.teachers)}."
+                    )
                 if not isinstance(topics, list):
                     errors.append(f"{where}.topic_teachers.{teacher} must be a list of topics, got {topics!r}.")
                     continue
                 for topic in topics:
                     if topic in seen and seen[topic] != teacher:
-                        errors.append(f"{where}.topic_teachers: topic {topic!r} is assigned to both "
-                                      f"{seen[topic]!r} and {teacher!r}.")
+                        errors.append(
+                            f"{where}.topic_teachers: topic {topic!r} is assigned to both "
+                            f"{seen[topic]!r} and {teacher!r}."
+                        )
                     seen[topic] = teacher
             if source.format == "agent_traces":
                 if source.max_context < 16:
@@ -387,7 +395,9 @@ class OPDConfig:
             if source.format == "messages" and source.cot_fraction > 0:
                 warnings.append(f"{where}.cot_fraction is an mcqa-only option and is ignored.")
             if source.format == "mcqa" and source.p_reference_shots > 0 and not source.shots_path:
-                warnings.append(f"{where}: p_reference_shots > 0 without shots_path: that regime falls back to zero-shot.")
+                warnings.append(
+                    f"{where}: p_reference_shots > 0 without shots_path: that regime falls back to zero-shot."
+                )
         if self.sources and sum(s.weight for s in self.sources.values()) <= 0:
             errors.append("the source weights must not all be 0.")
         formats = {s.format for s in self.sources.values()}
@@ -396,11 +406,15 @@ class OPDConfig:
                 errors.append("agent_traces sources cannot be mixed with other formats in one run.")
             for name, teacher in self.teachers.items():
                 if teacher.backend != "hf" or teacher.loss not in ("", "full_rkl"):
-                    errors.append(f"teachers.{name}: agent traces are distilled with full_rkl from an hf teacher "
-                                  "(the teacher scores each regenerated turn from the trace's shared prefill).")
+                    errors.append(
+                        f"teachers.{name}: agent traces are distilled with full_rkl from an hf teacher "
+                        "(the teacher scores each regenerated turn from the trace's shared prefill)."
+                    )
             if rollout.backend in ("vllm", "vllm_server") and not rollout.prefix_caching:
-                warnings.append("agent_traces without rollout.prefix_caching: every regenerated turn prefills its "
-                                "whole context; with it the turns of a trace share one prefill.")
+                warnings.append(
+                    "agent_traces without rollout.prefix_caching: every regenerated turn prefills its "
+                    "whole context; with it the turns of a trace share one prefill."
+                )
             if self.train.tree_chunk_size < 64:
                 errors.append(f"train.tree_chunk_size must be >= 64, got {self.train.tree_chunk_size}.")
             if self.train.tree_branch_tokens < 0:
@@ -417,15 +431,19 @@ class OPDConfig:
         if rollout.max_staleness < 0:
             errors.append("rollout.max_staleness must be >= 0.")
         if rollout.max_staleness > 0 and rollout.backend == "hf":
-            errors.append("rollout.max_staleness > 0 overlaps generation with training, which the hf backend "
-                          "cannot do (it generates with the model being trained). Use a vllm backend.")
+            errors.append(
+                "rollout.max_staleness > 0 overlaps generation with training, which the hf backend "
+                "cannot do (it generates with the model being trained). Use a vllm backend."
+            )
         if rollout.temperature <= 0:
             errors.append("rollout.temperature must be > 0 (distillation samples from the student).")
         if rollout.url and rollout.backend != "vllm_server":
             errors.append("rollout.url applies to the vllm_server backend only.")
         if rollout.temperature != 1.0:
-            warnings.append(f"rollout.temperature={rollout.temperature}: the losses compare the teacher with the "
-                            "student's temperature-scaled distribution, not the student itself.")
+            warnings.append(
+                f"rollout.temperature={rollout.temperature}: the losses compare the teacher with the "
+                "student's temperature-scaled distribution, not the student itself."
+            )
         if not 0.0 <= loss.beta <= 1.0:
             errors.append(f"loss.beta must be in [0, 1], got {loss.beta}.")
         if loss.xtok_spread not in ("chunk", "proportional"):
@@ -448,7 +466,9 @@ class OPDConfig:
             errors.append(f"train.lr_scheduler must be 'cosine' or 'constant', got {self.train.lr_scheduler!r}.")
 
         if errors:
-            raise OPDConfigError("OPD configuration has incompatible settings:\n" + "\n".join(f"  ✗ {e}" for e in errors))
+            raise OPDConfigError(
+                "OPD configuration has incompatible settings:\n" + "\n".join(f"  ✗ {e}" for e in errors)
+            )
         return warnings
 
 
@@ -470,8 +490,10 @@ def _check_template(name: str, template: str) -> list[str]:
         return [f"{name} is not a valid format string: {e}"]
     errors = []
     if unknown := fields - _TEMPLATE_FIELDS_ALLOWED:
-        errors.append(f"{name} has unknown placeholders {sorted(unknown)}; "
-                      f"allowed: {sorted(_TEMPLATE_FIELDS_ALLOWED)}. Escape literal braces as '{{{{'.")
+        errors.append(
+            f"{name} has unknown placeholders {sorted(unknown)}; "
+            f"allowed: {sorted(_TEMPLATE_FIELDS_ALLOWED)}. Escape literal braces as '{{{{'."
+        )
     if missing := _TEMPLATE_FIELDS_REQUIRED - fields:
         errors.append(f"{name} is missing required placeholders {sorted(missing)}.")
     return errors

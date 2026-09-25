@@ -57,8 +57,9 @@ def test_single_process_still_shuffles():
 def test_chat_dataset_wires_shuffle_after_shard():
     from palingenesis.data import ChatDataset
 
-    ds = ChatDataset(FakeStream(), tokenizer=None, max_seq_length=64,
-                     rank=0, world_size=2, shuffle_buffer=50, shuffle_seed=3)
+    ds = ChatDataset(
+        FakeStream(), tokenizer=None, max_seq_length=64, rank=0, world_size=2, shuffle_buffer=50, shuffle_seed=3
+    )
     iterator = iter(ds)
     next(iterator, None)  # drives __iter__ far enough to apply shard+shuffle
     assert ds.dataset.log == [("shard", 2, 0), ("shuffle", 3, 50)]

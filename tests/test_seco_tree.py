@@ -45,8 +45,8 @@ def _naive(model, trunk, branches, targets, weights):
     head = output_head(model)
     total = 0.0
     for b, t, w in zip(branches, targets, weights):
-        ids = torch.cat([trunk[:, :b.start], b.input_ids], 1)
-        hidden = model.base_model(input_ids=ids).last_hidden_state[:, b.start:]
+        ids = torch.cat([trunk[:, : b.start], b.input_ids], 1)
+        hidden = model.base_model(input_ids=ids).last_hidden_state[:, b.start :]
         loss = _branch_loss(head, hidden, t, w)
         loss.backward()
         total += loss.item()
@@ -56,16 +56,22 @@ def _naive(model, trunk, branches, targets, weights):
 def _treed(model, trunk, branches, targets, weights, chunk_size, branch_tokens=64, min_gap=1):
     model.zero_grad()
     head = output_head(model)
-    result = tree_forward_backward(model, trunk, branches,
-                                   lambda i, h: _branch_loss(head, h, targets[i], weights[i]), chunk_size=chunk_size,
-                                   branch_tokens=branch_tokens, min_gap=min_gap)
+    result = tree_forward_backward(
+        model,
+        trunk,
+        branches,
+        lambda i, h: _branch_loss(head, h, targets[i], weights[i]),
+        chunk_size=chunk_size,
+        branch_tokens=branch_tokens,
+        min_gap=min_gap,
+    )
     return result, {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
 
 @pytest.mark.parametrize("arch", MODELS)
 @pytest.mark.parametrize("chunk_size", [8, 16, 64])
-@pytest.mark.parametrize("branch_tokens", [0, 64])      # one branch at a time; batched (several groups)
-@pytest.mark.parametrize("min_gap", [1, 16])            # a cut at every start; some branches re-read gaps
+@pytest.mark.parametrize("branch_tokens", [0, 64])  # one branch at a time; batched (several groups)
+@pytest.mark.parametrize("min_gap", [1, 16])  # a cut at every start; some branches re-read gaps
 def test_tree_equals_every_branch_as_its_own_sequence(arch, chunk_size, branch_tokens, min_gap):
     model = MODELS[arch]()
     trunk, branches, targets, weights = _tree()
@@ -86,8 +92,8 @@ def test_gradient_reaches_the_trunk(arch):
     model.zero_grad()
     head = output_head(model)
     with torch.no_grad():
-        ctx = [model.base_model(input_ids=trunk[:, :b.start]) if b.start else None for b in branches]
-    for b, c, t, w in zip(branches, ctx, targets, weights):     # context detached: truncated backprop
+        ctx = [model.base_model(input_ids=trunk[:, : b.start]) if b.start else None for b in branches]
+    for b, c, t, w in zip(branches, ctx, targets, weights):  # context detached: truncated backprop
         past = c.past_key_values if c is not None else None
         hidden = model.base_model(input_ids=b.input_ids, past_key_values=past).last_hidden_state
         _branch_loss(head, hidden, t, w).backward()
@@ -102,12 +108,13 @@ def test_hidden_states_equal_full_forwards(arch, branch_tokens, min_gap):
     model = MODELS[arch]().eval()
     trunk, branches, _, _ = _tree()
     positions = [0, 5, 16, 17, 40, TRUNK - 1]
-    got, trunk_hidden = tree_hidden_states(model, trunk, branches, trunk_positions=positions, chunk_size=16,
-                                           branch_tokens=branch_tokens, min_gap=min_gap)
+    got, trunk_hidden = tree_hidden_states(
+        model, trunk, branches, trunk_positions=positions, chunk_size=16, branch_tokens=branch_tokens, min_gap=min_gap
+    )
     with torch.no_grad():
         for b, h in zip(branches, got):
-            ids = torch.cat([trunk[:, :b.start], b.input_ids], 1)
-            want = model.base_model(input_ids=ids).last_hidden_state[:, b.start:]
+            ids = torch.cat([trunk[:, : b.start], b.input_ids], 1)
+            want = model.base_model(input_ids=ids).last_hidden_state[:, b.start :]
             torch.testing.assert_close(h, want, rtol=1e-5, atol=1e-6)
         full = model.base_model(input_ids=trunk).last_hidden_state[0, positions]
         torch.testing.assert_close(trunk_hidden, full, rtol=1e-5, atol=1e-6)
@@ -145,24 +152,32 @@ def test_trunk_loss_is_the_full_sequence_loss_of_the_trunk(arch):
     head = output_head(model)
     g = torch.Generator().manual_seed(9)
     trunk_targets = torch.randint(0, VOCAB, (TRUNK,), generator=g)
-    scored = torch.rand(TRUNK, generator=g) < 0.4              # positions that carry a trunk loss
+    scored = torch.rand(TRUNK, generator=g) < 0.4  # positions that carry a trunk loss
 
     def trunk_loss(lo, hi, hidden):
         keep = scored[lo:hi]
         if not keep.any():
             return None
-        return 0.7 * torch.nn.functional.cross_entropy(head(hidden[0][keep]).double(), trunk_targets[lo:hi][keep],
-                                                       reduction="sum")
+        return 0.7 * torch.nn.functional.cross_entropy(
+            head(hidden[0][keep]).double(), trunk_targets[lo:hi][keep], reduction="sum"
+        )
 
-    want_loss, _ = _naive(model, trunk, branches, targets, weights)     # leaves the branch gradients in .grad
+    want_loss, _ = _naive(model, trunk, branches, targets, weights)  # leaves the branch gradients in .grad
     hidden = model.base_model(input_ids=trunk).last_hidden_state
     full = trunk_loss(0, TRUNK, hidden)
-    full.backward()                                                     # adds the trunk loss's
+    full.backward()  # adds the trunk loss's
     want_loss += full.item()
     want = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
     model.zero_grad()
-    result = tree_forward_backward(model, trunk, branches, lambda i, h: _branch_loss(head, h, targets[i], weights[i]),
-                                   trunk_loss_fn=trunk_loss, chunk_size=16, min_gap=8)
+    result = tree_forward_backward(
+        model,
+        trunk,
+        branches,
+        lambda i, h: _branch_loss(head, h, targets[i], weights[i]),
+        trunk_loss_fn=trunk_loss,
+        chunk_size=16,
+        min_gap=8,
+    )
     got = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
     assert result.loss == pytest.approx(want_loss, rel=1e-6)
     assert _max_rel_err(got, want) < TOL[arch]
@@ -185,6 +200,13 @@ def test_bounds_merge_close_cuts():
     from palingenesis.seco_tree import _bounds
 
     assert _bounds(100, [10, 15, 40, 45, 99], chunk_size=64, min_gap=1) == [
-        (0, 10), (10, 15), (15, 40), (40, 45), (45, 64), (64, 99), (99, 100)]
+        (0, 10),
+        (10, 15),
+        (15, 40),
+        (40, 45),
+        (45, 64),
+        (64, 99),
+        (99, 100),
+    ]
     # cut at a start only 20+ past the previous cut; the grid (every 64) always stays
     assert _bounds(100, [10, 15, 40, 45, 99], chunk_size=64, min_gap=20) == [(0, 40), (40, 64), (64, 99), (99, 100)]

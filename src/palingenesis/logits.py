@@ -17,8 +17,6 @@ that skips the transform trains on the wrong logits:
 transform is caught instead of silently mis-training.
 """
 
-from __future__ import annotations
-
 import torch
 import torch.nn as nn
 
@@ -53,14 +51,14 @@ def _transform(model: nn.Module) -> tuple[float, float | None]:
     config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
     model_type = (getattr(model.config, "model_type", "") or "").lower()
     multiplier = 1.0
-    if getattr(config, "logit_scale", None) is not None:                    # Cohere
+    if getattr(config, "logit_scale", None) is not None:  # Cohere
         multiplier *= float(config.logit_scale)
     if getattr(config, "logits_scaling", None) is not None:
         if model_type.startswith("hyperclovax"):
             multiplier *= float(config.logits_scaling)
-        else:                                                                # Granite family
+        else:  # Granite family
             multiplier /= float(config.logits_scaling)
-    if getattr(config, "lm_head_multiplier", None) is not None:             # Falcon-H1
+    if getattr(config, "lm_head_multiplier", None) is not None:  # Falcon-H1
         multiplier *= float(config.lm_head_multiplier)
     softcap = getattr(config, "final_logit_softcapping", None)
     return multiplier, (float(softcap) if softcap else None)
@@ -79,16 +77,23 @@ def output_head(model: nn.Module) -> nn.Module | None:
 
 
 @torch.no_grad()
-def verify_output_head(model: nn.Module, head: nn.Module, backbone: nn.Module | None = None, tokens: int = 32) -> float:
+def verify_output_head(
+    model: nn.Module,
+    head: nn.Module,
+    backbone: nn.Module | None = None,
+    tokens: int = 32,
+    device: torch.device | str | None = None,
+) -> float:
     """Raise if head(backbone(x)) differs from model(x).logits. Random tokens,
-    eval mode (restored afterwards). Returns the relative max difference."""
-    device = next(model.parameters()).device
+    eval mode (restored afterwards). Returns the relative max difference. `device` is
+    where the inputs go (default: the parameters'; FSDP with CPU offload needs the GPU)."""
+    device = device or next(model.parameters()).device
     vocab = head.weight.shape[0]
     ids = torch.randint(0, vocab, (1, tokens), generator=torch.Generator().manual_seed(0)).to(device)
     was_training = model.training
     model.eval()
     matmul_precision = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("highest")       # compare implementations, not TF32 noise
+    torch.set_float32_matmul_precision("highest")  # compare implementations, not TF32 noise
     try:
         reference = model(input_ids=ids).logits.float()
         hidden = final_hidden_states(model, ids) if backbone is None else _last_hidden(backbone(input_ids=ids))
@@ -114,8 +119,9 @@ def _last_hidden(outputs):
     return outputs[0] if isinstance(outputs, tuple) else outputs
 
 
-def final_hidden_states(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None,
-                        **kwargs) -> torch.Tensor:
+def final_hidden_states(
+    model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, **kwargs
+) -> torch.Tensor:
     """The backbone's output: the hidden states the output head projects.
 
     Normally the backbone is called directly. Under FSDP2 the call goes through the
@@ -157,9 +163,16 @@ def backbone_of(model: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def scored_ce_sum(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                  shifted_labels: torch.Tensor, dtype: torch.dtype, autocast: bool = True,
-                  ignore_index: int = -100, chunk_bytes: float = 1e9) -> tuple[float, int]:
+def scored_ce_sum(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    shifted_labels: torch.Tensor,
+    dtype: torch.dtype,
+    autocast: bool = True,
+    ignore_index: int = -100,
+    chunk_bytes: float = 1e9,
+) -> tuple[float, int]:
     """Summed cross-entropy over the scored positions, and their count, for evaluation.
 
     Equivalent to cross_entropy(model(...).logits, labels, reduction="sum") but the
@@ -179,7 +192,7 @@ def scored_ce_sum(model: nn.Module, input_ids: torch.Tensor, attention_mask: tor
         separable = False
     targets = shifted_labels[valid]
     with torch.amp.autocast("cuda", dtype=dtype, enabled=autocast and input_ids.is_cuda):
-        if not separable:                        # no separable head: score the model's own logits
+        if not separable:  # no separable head: score the model's own logits
             out = model(input_ids=input_ids, attention_mask=attention_mask)
             rows = (out.logits if hasattr(out, "logits") else out[0])[valid]
             project = None
@@ -190,7 +203,7 @@ def scored_ce_sum(model: nn.Module, input_ids: torch.Tensor, attention_mask: tor
         step = max(1, int(chunk_bytes // (vocab * 4)))
         total = torch.zeros((), dtype=torch.float64, device=rows.device)
         for start in range(0, rows.shape[0], step):
-            logits = rows[start:start + step] if project is None else project(rows[start:start + step])
+            logits = rows[start : start + step] if project is None else project(rows[start : start + step])
             logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
-            total += torch.nn.functional.cross_entropy(logits, targets[start:start + step], reduction="sum").double()
+            total += torch.nn.functional.cross_entropy(logits, targets[start : start + step], reduction="sum").double()
     return float(total), count

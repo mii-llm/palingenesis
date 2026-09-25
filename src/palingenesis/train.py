@@ -240,7 +240,9 @@ def train(config: Config):
     # faster in our measurements; dynamo also cannot trace through Liger's autograd
     # functions (compilation fails), so compile takes precedence.
     if config.model.use_liger_kernel and config.model.compile:
-        logger.info("Liger Kernel not applied: model.compile fuses the same ops (set model.compile: false to use Liger)")
+        logger.info(
+            "Liger Kernel not applied: model.compile fuses the same ops (set model.compile: false to use Liger)"
+        )
     elif config.model.use_liger_kernel:
         apply_liger_kernel(model_type_of(config.model.name_or_path, config.model.trust_remote_code))
 
@@ -319,8 +321,10 @@ def train(config: Config):
     # ── sdpa: fused attention kernels under autocast (see seco.use_chunk_attention) ──
     if config.model.attn_implementation == "sdpa":
         rerouted = use_chunk_attention(model)
-        logger.info(f"attention: {'fused (flash) path' if rerouted else 'sdpa as configured'} "
-                    f"({getattr(model.config, '_attn_implementation', None)})")
+        logger.info(
+            f"attention: {'fused (flash) path' if rerouted else 'sdpa as configured'} "
+            f"({getattr(model.config, '_attn_implementation', None)})"
+        )
 
     # ── Hybrid model freeze (DeltaNet/SSM layers frozen, only attention trains) ──
     if config.train.freeze_non_attention:
@@ -375,14 +379,13 @@ def train(config: Config):
                 logger.info(f"  Pre-tokenizing dataset → {cache_dir} (reason: {reason})…")
                 bs = config.train.per_device_batch_size
                 if config.data.sources:
+
                     def _factory():
                         # world_size=1 → materialize the COMPLETE stream; sharding
                         # happens at load time across ranks/workers.
                         return build_dataset(config.data, tokenizer, config.data, 0, 1, bs)
                 else:
-                    src = _load_dataset_source(
-                        config.data.dataset, config.data.dataset_split, config.data.streaming
-                    )
+                    src = _load_dataset_source(config.data.dataset, config.data.dataset_split, config.data.streaming)
                     src = (
                         src.shuffle(seed=config.train.seed, buffer_size=10_000)
                         if config.data.streaming
@@ -409,6 +412,7 @@ def train(config: Config):
             logger.info(
                 f"    {src.get('dataset', '?')} (weight={src.get('weight', 1.0)}, mode={src.get('mode', 'sft')})"
             )
+
         def _make_dataloader():
             return build_dataloader(
                 config.data, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
@@ -477,6 +481,7 @@ def train(config: Config):
                     shuffle_seed=config.train.seed,
                 )
         else:
+
             def _make_dataloader():
                 return build_dataloader(
                     dataset,
@@ -530,8 +535,11 @@ def train(config: Config):
             _hyperball = Hyperball(optimizer, constrained, angular_lr=config.train.hyperball_lr)
             logger.info(
                 f"Hyperball: {len(constrained)} matrices constrained, angular step "
-                + (f"{config.train.hyperball_lr:.2e}" if config.train.hyperball_lr
-                   else "calibrated per matrix to the base optimizer's first update")
+                + (
+                    f"{config.train.hyperball_lr:.2e}"
+                    if config.train.hyperball_lr
+                    else "calibrated per matrix to the base optimizer's first update"
+                )
             )
 
     # ── MONA: curvature-aware acceleration for Muon/Lion (arxiv:2605.26842) ──
@@ -666,9 +674,7 @@ def train(config: Config):
     # ── Best Model Tracker (saves best eval-loss checkpoint) ──────────────
     # Driven by either the single eval_dataset OR the multi-source composite score.
     _best_tracker = (
-        BestModelTracker(config.train.output_dir)
-        if (config.data.eval_dataset or config.data.eval_sources)
-        else None
+        BestModelTracker(config.train.output_dir) if (config.data.eval_dataset or config.data.eval_sources) else None
     )
 
     # ── Multi-source eval (per-capability losses + weighted composite) ─────
@@ -681,9 +687,7 @@ def train(config: Config):
     if config.data.eval_sources:
         from palingenesis.multi_eval import MultiEvaluator
 
-        _multi_evaluator = MultiEvaluator(
-            config.data.eval_sources, tokenizer, config.data.max_seq_length, device
-        )
+        _multi_evaluator = MultiEvaluator(config.data.eval_sources, tokenizer, config.data.max_seq_length, device)
 
     # ── Validation Set (optional) ─────────────────────────────────────────
     # Skipped when eval_sources is configured (the multi-evaluator takes over).
@@ -713,8 +717,10 @@ def train(config: Config):
             eval_pairs.sort(key=lambda x: max(x["chosen"]["input_ids"].numel(), x["rejected"]["input_ids"].numel()))
             pad_id = tokenizer.pad_token_id or 0
             _pref_evaluator = PreferenceEvaluator(
-                [collate_preferences(eval_pairs[i : i + 4], pad_id, pad_to_multiple=64)
-                 for i in range(0, len(eval_pairs), 4)],
+                [
+                    collate_preferences(eval_pairs[i : i + 4], pad_id, pad_to_multiple=64)
+                    for i in range(0, len(eval_pairs), 4)
+                ],
                 loss_type=dpo.loss_type,
                 beta=dpo.beta,
                 label_smoothing=dpo.label_smoothing,
@@ -838,7 +844,7 @@ def train(config: Config):
 
     # ── EMA: Exponential Moving Average of Weights ────────────────────────
     # Updated every ema_every steps: the per-update decay keeps ema_decay's per-step window.
-    _ema = ModelEMA(model, decay=config.train.ema_decay ** config.train.ema_every) if config.train.ema else None
+    _ema = ModelEMA(model, decay=config.train.ema_decay**config.train.ema_every) if config.train.ema else None
 
     # ── Base Model Merge: Periodic pull-back toward pretrained (SFA) ──────
     _base_merge = (
@@ -854,7 +860,13 @@ def train(config: Config):
         """eval/* metrics on the configured eval set(s); {} if there is none."""
         if _pref_evaluator is not None:
             return _pref_evaluator.evaluate(
-                model, ref_model, _get_hidden_states, _get_lm_head, device, compute_dtype, config.train.bf16,
+                model,
+                ref_model,
+                _get_hidden_states,
+                _get_lm_head,
+                device,
+                compute_dtype,
+                config.train.bf16,
             )
         if eval_batches:
             loss = _compute_eval_loss(model, eval_batches, device, compute_dtype, config.train.bf16)
@@ -910,8 +922,12 @@ def train(config: Config):
     # Whether train/loss IS a cross-entropy (ppl and eval/gap only make sense
     # against a CE; DEFT/DFT/CADFT/InfoSFT values are differently scaled)
     _objective_is_ce = not (
-        config.plugins.deft or config.plugins.dft or config.plugins.cadft
-        or config.plugins.info_sft or config.plugins.pre_rl or dpo is not None
+        config.plugins.deft
+        or config.plugins.dft
+        or config.plugins.cadft
+        or config.plugins.info_sft
+        or config.plugins.pre_rl
+        or dpo is not None
     )
     accum_dpo: dict[str, float] = {}  # DPO metrics summed over the accumulation window
     accum_dpo_micro = 0
@@ -961,8 +977,9 @@ def train(config: Config):
             loss_weights = shift_weights(batch["loss_weights"]) if "loss_weights" in batch else None
             if position_ids is not None:
                 # Packed: forward arguments that keep the documents apart (palingenesis.packing)
-                packed = PackedBatch.build(input_ids, labels, position_ids, flatten_packed,
-                                           config.model.attn_implementation, loss_weights)
+                packed = PackedBatch.build(
+                    input_ids, labels, position_ids, flatten_packed, config.model.attn_implementation, loss_weights
+                )
                 input_ids, labels, loss_weights = packed.input_ids, packed.labels, packed.loss_weights
                 fwd_kwargs = {"input_ids": input_ids, **packed.forward_kwargs}
             else:
@@ -977,7 +994,8 @@ def train(config: Config):
                 # attention; with one, transformers builds an explicit [L, L] mask and SDPA falls
                 # back to a slower kernel (3x at 32k tokens) that may materialize it (31 GiB).
                 right_padded = attention_mask is not None and not bool(
-                    (attention_mask[:, 1:] > attention_mask[:, :-1]).any())
+                    (attention_mask[:, 1:] > attention_mask[:, :-1]).any()
+                )
                 fwd_kwargs = {"input_ids": input_ids, "attention_mask": None if right_padded else attention_mask}
 
             # ── Gradient sync control for accumulation ────────────────
@@ -1049,8 +1067,13 @@ def train(config: Config):
                     else:
                         global_chosen = local_chosen
                     ref_logps = reference_logps(
-                        ref_model, _get_hidden_states, _get_lm_head,
-                        input_ids, attention_mask, raw_labels, num_chunks,
+                        ref_model,
+                        _get_hidden_states,
+                        _get_lm_head,
+                        input_ids,
+                        attention_mask,
+                        raw_labels,
+                        num_chunks,
                     )
                     hidden = _get_hidden_states(model, input_ids, attention_mask, None)
                     step_out = preference_step(
@@ -1159,11 +1182,7 @@ def train(config: Config):
                     loss = cross_entropy_loss(logits, labels, loss_denom, weights=loss_weights)
 
             # ── RL-readiness: record output entropy (once per logged step) ──
-            if (
-                config.logging.rl_readiness
-                and is_last_micro
-                and (global_step + 1) % config.train.logging_steps == 0
-            ):
+            if config.logging.rl_readiness and is_last_micro and (global_step + 1) % config.train.logging_steps == 0:
                 if use_cce or _chunked_objective or use_chunked_loss:
                     health.record_entropy_from_hidden(hidden.detach(), labels, lm_head)
                 else:
@@ -1229,12 +1248,11 @@ def train(config: Config):
                                 _adamc.step()
                         global_step += 1
                         logger.warning(
-                            f"step={global_step} SPIKE SKIPPED (grad_norm={gn_val:.1f}, "
-                            f"avg={_spike_detector.mean:.2f})"
+                            f"step={global_step} SPIKE SKIPPED (grad_norm={gn_val:.1f}, avg={_spike_detector.mean:.2f})"
                         )
                     else:
                         if _hyperball is not None:
-                            _hyperball.step()   # base step + Hyperball update on constrained matrices
+                            _hyperball.step()  # base step + Hyperball update on constrained matrices
                         else:
                             optimizer.step()
                         if scheduler is not None:
@@ -1265,9 +1283,7 @@ def train(config: Config):
                 # ── Log (and evaluate) ────────────────────────────────
                 # Evaluation runs every eval_every steps and at the last step,
                 # whatever logging_steps is; its step is always logged.
-                is_eval_step = has_eval and (
-                    global_step % config.data.eval_every == 0 or global_step == total_steps
-                )
+                is_eval_step = has_eval and (global_step % config.data.eval_every == 0 or global_step == total_steps)
                 if global_step % config.train.logging_steps == 0 or is_eval_step:
                     tok_s = accum_tokens / max(dt, 1e-6)
                     lr = scheduler.get_last_lr()[0] if scheduler is not None else config.train.learning_rate
@@ -1628,12 +1644,13 @@ def _freeze_non_attention_layers(model: torch.nn.Module):
 
     total = frozen_count + trainable_count
     if frozen_count == 0:
-        logger.warning("train.freeze_non_attention: this model has no linear-attention or recurrent layers; "
-                       "nothing was frozen.")
+        logger.warning(
+            "train.freeze_non_attention: this model has no linear-attention or recurrent layers; nothing was frozen."
+        )
         return
     logger.info(
-        f"Hybrid freeze: {trainable_count:,} trainable ({100*trainable_count/total:.1f}%), "
-        f"{frozen_count:,} frozen ({100*frozen_count/total:.1f}%)"
+        f"Hybrid freeze: {trainable_count:,} trainable ({100 * trainable_count / total:.1f}%), "
+        f"{frozen_count:,} frozen ({100 * frozen_count / total:.1f}%)"
     )
 
 

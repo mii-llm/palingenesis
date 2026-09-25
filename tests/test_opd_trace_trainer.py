@@ -25,20 +25,30 @@ from test_opd_trainer import tiny_model  # noqa: E402
 @pytest.fixture(scope="module")
 def models(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("trace_models")
-    return {"student": tiny_model(tmp, "Qwen/Qwen3-0.6B", "student", 0),
-            "coder": tiny_model(tmp, "Qwen/Qwen3-0.6B", "coder", 1),
-            "general": tiny_model(tmp, "Qwen/Qwen3-0.6B", "general", 2)}
+    return {
+        "student": tiny_model(tmp, "Qwen/Qwen3-0.6B", "student", 0),
+        "coder": tiny_model(tmp, "Qwen/Qwen3-0.6B", "coder", 1),
+        "general": tiny_model(tmp, "Qwen/Qwen3-0.6B", "general", 2),
+    }
 
 
 def write_traces(path, n=12):
     rows = []
     for i in range(n):
         messages = agent_trace(2 + i % 3)
-        if i % 4 == 3:          # a second user query: the template rewrites the earlier turns
-            messages += [{"role": "user", "content": "And now?"},
-                         {"role": "assistant", "reasoning_content": "Think again.", "content": "Fine."}]
-        rows.append({"messages": json.dumps(messages), "tools": json.dumps(TOOLS),
-                     "domain": ["code", "search", "office"][i % 3], "uuid": f"t{i}"})
+        if i % 4 == 3:  # a second user query: the template rewrites the earlier turns
+            messages += [
+                {"role": "user", "content": "And now?"},
+                {"role": "assistant", "reasoning_content": "Think again.", "content": "Fine."},
+            ]
+        rows.append(
+            {
+                "messages": json.dumps(messages),
+                "tools": json.dumps(TOOLS),
+                "domain": ["code", "search", "office"][i % 3],
+                "uuid": f"t{i}",
+            }
+        )
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     return str(path)
 
@@ -48,15 +58,28 @@ def make_config(tmp_path, models, **overrides):
 
     config = OPDConfig()
     settings = {
-        "model.student": models["student"], "model.chat_template_kwargs": {"enable_thinking": True},
-        "teachers.coder.model": models["coder"], "teachers.general.model": models["general"],
-        "sources.traces.format": "agent_traces", "sources.traces.path": write_traces(tmp_path / "traces.jsonl"),
-        "sources.traces.dev_size": 3, "sources.traces.max_new_tokens": 6, "sources.traces.branches_per_trace": 3,
-        "sources.traces.teacher": "general", "sources.traces.topic_field": "domain",
+        "model.student": models["student"],
+        "model.chat_template_kwargs": {"enable_thinking": True},
+        "teachers.coder.model": models["coder"],
+        "teachers.general.model": models["general"],
+        "sources.traces.format": "agent_traces",
+        "sources.traces.path": write_traces(tmp_path / "traces.jsonl"),
+        "sources.traces.dev_size": 3,
+        "sources.traces.max_new_tokens": 6,
+        "sources.traces.branches_per_trace": 3,
+        "sources.traces.teacher": "general",
+        "sources.traces.topic_field": "domain",
         "sources.traces.topic_teachers": {"coder": ["code", "search"]},
-        "rollout.batch_prompts": 3, "rollout.group_size": 2, "loss.trace_kd_weight": 0.5,
-        "train.output_dir": str(tmp_path / "run"), "train.steps": 2, "train.learning_rate": 1e-3,
-        "train.warmup_steps": 1, "train.eval_every": 1, "train.eval_samples": 3, "train.tree_chunk_size": 64,
+        "rollout.batch_prompts": 3,
+        "rollout.group_size": 2,
+        "loss.trace_kd_weight": 0.5,
+        "train.output_dir": str(tmp_path / "run"),
+        "train.steps": 2,
+        "train.learning_rate": 1e-3,
+        "train.warmup_steps": 1,
+        "train.eval_every": 1,
+        "train.eval_samples": 3,
+        "train.tree_chunk_size": 64,
         "model.use_liger_kernel": False,
     }
     settings.update(overrides)
@@ -65,12 +88,13 @@ def make_config(tmp_path, models, **overrides):
     return config
 
 
-@pytest.mark.parametrize("branch, kd", [(1.0, 0.5), (0.0, 0.5), (1.0, 0.0)])   # the ablation arms
+@pytest.mark.parametrize("branch, kd", [(1.0, 0.5), (0.0, 0.5), (1.0, 0.0)])  # the ablation arms
 def test_training_run(tmp_path, models, branch, kd):
     from palingenesis.opd.trace_trainer import TraceTrainer
 
-    trainer = TraceTrainer(make_config(tmp_path, models, **{"loss.trace_branch_weight": branch,
-                                                           "loss.trace_kd_weight": kd}))
+    trainer = TraceTrainer(
+        make_config(tmp_path, models, **{"loss.trace_branch_weight": branch, "loss.trace_kd_weight": kd})
+    )
     logged = []
     trainer._log = lambda kind, metrics, step: logged.append((kind, step, metrics))
     trainer.train()
@@ -79,14 +103,14 @@ def test_training_run(tmp_path, models, branch, kd):
     assert len(steps) == 2 and len(evals) == 3
     for m in steps:
         assert m["grad_norm"] > 0 and m["staleness"] == 0
-        assert (m["branches"] > 0) == (branch > 0)                     # no rollouts in the recorded-only arm
-        assert any(k.startswith("kd_kl/") for k in m) == (kd > 0)      # recorded turns distilled
+        assert (m["branches"] > 0) == (branch > 0)  # no rollouts in the recorded-only arm
+        assert any(k.startswith("kd_kl/") for k in m) == (kd > 0)  # recorded turns distilled
     routed = {k.split("/")[1] for m in steps for k in m if k.startswith(("tokens/", "kd_tokens/"))}
-    assert routed <= {"coder", "general"} and routed               # topic routing picked the teachers
+    assert routed <= {"coder", "general"} and routed  # topic routing picked the teachers
     # every arm is evaluated the same way: the student regenerating held-out turns
     assert {"dev_kl/traces", "dev_kl_full/traces", "dev_stop_rate/traces"} <= set(evals[0])
     assert evals[0]["dev_len/traces"] > 0
-    assert any(k.startswith("dev_kl_full/traces/") for k in evals[0])   # per topic
+    assert any(k.startswith("dev_kl_full/traces/") for k in evals[0])  # per topic
     assert (tmp_path / "run" / "final" / "config.json").exists()
 
 
@@ -98,13 +122,15 @@ def test_trace_loss_equals_every_turn_as_its_own_sequence(tmp_path, models):
 
     trainer = TraceTrainer(make_config(tmp_path, models, **{"rollout.group_size": 1}))
     student, teacher = trainer.student, trainer.routes["general"].teacher
-    messages = agent_trace(4) + [{"role": "user", "content": "And now?"},
-                                 {"role": "assistant", "reasoning_content": "Hm.", "content": "Ok."}]
+    messages = agent_trace(4) + [
+        {"role": "user", "content": "And now?"},
+        {"role": "assistant", "reasoning_content": "Hm.", "content": "Ok."},
+    ]
     plan = trainer.planners["traces"].plan(messages, TOOLS, random.Random(0))
     assert len(plan.branches) >= 3 and plan.kd_spans
     g = torch.Generator().manual_seed(0)
-    completions = [torch.randint(10, 1000, (n,), generator=g).tolist() for n in (3, 5, 2, 4)][:len(plan.branches)]
-    plan.branches = plan.branches[:len(completions)]
+    completions = [torch.randint(10, 1000, (n,), generator=g).tolist() for n in (3, 5, 2, 4)][: len(plan.branches)]
+    plan.branches = plan.branches[: len(completions)]
     sample = TraceSample(plan, completions, [[]] * len(completions), ["stop"] * len(completions), "general", {})
     trainer.pipeline._score(sample)
     kd_positions = plan.kd_positions()
@@ -114,7 +140,9 @@ def test_trace_loss_equals_every_turn_as_its_own_sequence(tmp_path, models):
     # The teacher's tree pass equals its naive forwards (bf16 weights: to bf16 rounding).
     for b, c, h in zip(plan.branches, completions, sample.teacher_hidden):
         with torch.no_grad():
-            want = teacher.model.base_model(input_ids=torch.tensor([b.context + c[:-1]])).last_hidden_state[0, -len(c):]
+            want = teacher.model.base_model(input_ids=torch.tensor([b.context + c[:-1]])).last_hidden_state[
+                0, -len(c) :
+            ]
         torch.testing.assert_close(h.float(), want.float(), rtol=2e-2, atol=3e-2)
     trunk = torch.tensor([plan.trunk])
     with torch.no_grad():
@@ -126,14 +154,27 @@ def test_trace_loss_equals_every_turn_as_its_own_sequence(tmp_path, models):
     student.zero_grad()
     head, t_head = output_head(student), teacher.head
     for b, c, t_hidden in zip(plan.branches, completions, sample.teacher_hidden):
-        hidden = student.base_model(input_ids=torch.tensor([b.context + c[:-1]])).last_hidden_state[0, -len(c):]
-        loss, _ = fused_full_rkl(hidden, head, t_hidden, t_head, torch.tensor(c), torch.full((len(c),), 1 / total),
-                                 trainer.routes["general"].aligner.bridge.shared_vocab_size)
+        hidden = student.base_model(input_ids=torch.tensor([b.context + c[:-1]])).last_hidden_state[0, -len(c) :]
+        loss, _ = fused_full_rkl(
+            hidden,
+            head,
+            t_hidden,
+            t_head,
+            torch.tensor(c),
+            torch.full((len(c),), 1 / total),
+            trainer.routes["general"].aligner.bridge.shared_vocab_size,
+        )
         loss.backward()
     s_trunk = student.base_model(input_ids=trunk).last_hidden_state[0, kd_positions]
-    loss, _ = fused_full_rkl(s_trunk, head, sample.teacher_kd_hidden, t_head, trunk[0, [p + 1 for p in kd_positions]],
-                             torch.full((len(kd_positions),), kd_w),
-                             trainer.routes["general"].aligner.bridge.shared_vocab_size)
+    loss, _ = fused_full_rkl(
+        s_trunk,
+        head,
+        sample.teacher_kd_hidden,
+        t_head,
+        trunk[0, [p + 1 for p in kd_positions]],
+        torch.full((len(kd_positions),), kd_w),
+        trainer.routes["general"].aligner.bridge.shared_vocab_size,
+    )
     loss.backward()
     want = {n: p.grad.clone() for n, p in student.named_parameters() if p.grad is not None}
 
@@ -146,8 +187,10 @@ def test_trace_loss_equals_every_turn_as_its_own_sequence(tmp_path, models):
         assert err < 1e-4, (n, err)
     # the rows that predict each completion: its last len(completion) hidden states
     assert all(r.stop - r.start == len(c) for r, c in zip(completion_rows(plan, completions), completions))
-    assert all(len(ids) == len(b.prefix) + len(c) - 1 for ids, b, c in
-               zip(branch_inputs(plan, completions), plan.branches, completions))
+    assert all(
+        len(ids) == len(b.prefix) + len(c) - 1
+        for ids, b, c in zip(branch_inputs(plan, completions), plan.branches, completions)
+    )
 
 
 def test_trace_config_validation(tmp_path, models):

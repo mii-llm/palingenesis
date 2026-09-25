@@ -656,8 +656,7 @@ class SpikeDetector:
             optimizer.step()
     """
 
-    def __init__(self, z_threshold: float = 5.0, warmup: int = 50, ema_decay: float = 0.99,
-                 max_consecutive: int = 10):
+    def __init__(self, z_threshold: float = 5.0, warmup: int = 50, ema_decay: float = 0.99, max_consecutive: int = 10):
         self.z_threshold = z_threshold
         self.warmup = warmup
         self.ema_decay = ema_decay
@@ -766,10 +765,20 @@ class StepProfiler:
             events = self.prof.key_averages()
             gpu = sum(e.self_device_time_total for e in events) / 1e6
             cpu = sum(e.self_cpu_time_total for e in events) / 1e6
-            logger.info("profile: %d steps, wall %.2fs, GPU busy %.2fs (%.0f%%), CPU %.2fs",
-                        self.count, wall, gpu, 100 * gpu / max(wall, 1e-9), cpu)
-            logger.info("profile, top GPU time:\n%s", events.table(sort_by="self_device_time_total", row_limit=25,
-                                                                  max_name_column_width=60))
-            logger.info("profile, top CPU time:\n%s", events.table(sort_by="self_cpu_time_total", row_limit=15,
-                                                                  max_name_column_width=60))
+            logger.info(
+                "profile: %d steps, wall %.2fs, GPU busy %.2fs (%.0f%%), CPU %.2fs",
+                self.count,
+                wall,
+                gpu,
+                100 * gpu / max(wall, 1e-9),
+                cpu,
+            )
+            logger.info(
+                "profile, top GPU time:\n%s",
+                events.table(sort_by="self_device_time_total", row_limit=25, max_name_column_width=60),
+            )
+            logger.info(
+                "profile, top CPU time:\n%s",
+                events.table(sort_by="self_cpu_time_total", row_limit=15, max_name_column_width=60),
+            )
             self.prof = None

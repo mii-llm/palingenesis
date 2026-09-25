@@ -19,8 +19,6 @@ canonical encoding of its own text ("hel" + "lo" instead of "hello"), and
 re-encoding would silently describe other tokens than the ones trained on.
 """
 
-from __future__ import annotations
-
 import json
 import re
 from dataclasses import dataclass, field
@@ -188,8 +186,9 @@ class ByteChunkAligner:
     teacher still supervises when to stop.
     """
 
-    def __init__(self, student_tok, teacher_tok, stop_ids: tuple[int, ...], teacher_eot: int,
-                 mask_whitespace: bool = True):
+    def __init__(
+        self, student_tok, teacher_tok, stop_ids: tuple[int, ...], teacher_eot: int, mask_whitespace: bool = True
+    ):
         self.teacher_tok = teacher_tok
         self.stop_ids = stop_ids
         self.teacher_eot = teacher_eot
@@ -239,7 +238,7 @@ class ByteChunkAligner:
             for j in t_range:
                 teacher_chunk[j] = c
             start = student_ends[s_range.start - 1] if s_range.start else 0
-            chunk_text = text[start:student_ends[s_range[-1]]] if len(s_range) else b""
+            chunk_text = text[start : student_ends[s_range[-1]]] if len(s_range) else b""
             keep.append(bool(len(s_range) and len(t_range)) and not (self.mask_whitespace and chunk_text.isspace()))
             if keep[-1] and len(s_range) == 1 and len(t_range) == 1:
                 one_to_one.append((student_pos[s_range[0]], t_range[0]))
@@ -251,8 +250,9 @@ class ByteChunkAligner:
             one_to_one.append((len(completion) - 1, len(teacher_ids)))
             teacher_ids = teacher_ids + [self.teacher_eot]
             keep.append(True)
-        return TeacherView(teacher_prompt + teacher_ids, len(teacher_prompt),
-                           ChunkMap(student_chunk, teacher_chunk, keep, one_to_one))
+        return TeacherView(
+            teacher_prompt + teacher_ids, len(teacher_prompt), ChunkMap(student_chunk, teacher_chunk, keep, one_to_one)
+        )
 
     def _encode(self, text: str) -> tuple[list[int], list[float]]:
         """Teacher ids for `text` and each token's byte end.

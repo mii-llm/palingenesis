@@ -260,12 +260,15 @@ def chunked_cross_entropy_loss(
         logits = lm_head(h_chunk)
 
         # CE with sum reduction (weighted per token under turn scaling)
-        chunk_loss = _weighted_sum(F.cross_entropy(
-            logits.view(-1, logits.size(-1)).float(),
-            l_chunk.reshape(-1),
-            reduction="none" if w_chunk is not None else "sum",
-            ignore_index=IGNORE_INDEX,
-        ), w_chunk)
+        chunk_loss = _weighted_sum(
+            F.cross_entropy(
+                logits.view(-1, logits.size(-1)).float(),
+                l_chunk.reshape(-1),
+                reduction="none" if w_chunk is not None else "sum",
+                ignore_index=IGNORE_INDEX,
+            ),
+            w_chunk,
+        )
         scaled_loss = chunk_loss / global_valid_tokens
         total_loss = total_loss + scaled_loss.detach()
 

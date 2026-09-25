@@ -34,7 +34,8 @@ from palingenesis.autopilot.adaptive_sweep import (
 def test_coarse_candidates_cover_reasonable_range():
     """Coarse candidates span ~2.4 decades centered on scaling-law estimate."""
     candidates = generate_coarse_candidates(
-        model_params_b=4.0, effective_batch_tokens=524288,
+        model_params_b=4.0,
+        effective_batch_tokens=524288,
     )
 
     assert len(candidates) == 5
@@ -60,8 +61,7 @@ def test_coarse_candidates_scale_with_model_size():
     small_center = small[len(small) // 2]
     large_center = large[len(large) // 2]
     assert large_center < small_center, (
-        f"Large model center ({large_center:.2e}) should be < "
-        f"small model center ({small_center:.2e})"
+        f"Large model center ({large_center:.2e}) should be < small model center ({small_center:.2e})"
     )
 
     print(f"  0.5B center: {small_center:.2e}")
@@ -83,12 +83,8 @@ def test_coarse_candidates_scale_with_batch_size():
     large_center = large_batch[len(large_batch) // 2]
 
     # Surge: at B_crit center should be HIGHER than both small and large
-    assert bcrit_center > small_center, (
-        f"B_crit center ({bcrit_center:.2e}) should be > small ({small_center:.2e})"
-    )
-    assert bcrit_center > large_center, (
-        f"B_crit center ({bcrit_center:.2e}) should be > large ({large_center:.2e})"
-    )
+    assert bcrit_center > small_center, f"B_crit center ({bcrit_center:.2e}) should be > small ({small_center:.2e})"
+    assert bcrit_center > large_center, f"B_crit center ({bcrit_center:.2e}) should be > large ({large_center:.2e})"
 
     print(f"  Small batch (4K tok): {small_center:.2e}")
     print(f"  At B_crit (100K tok): {bcrit_center:.2e}")
@@ -243,9 +239,7 @@ def test_horizon_exponent_from_flat_curve():
     alpha_linear = estimate_horizon_exponent(linear_results)
 
     # Flat curve should get higher alpha (stronger correction)
-    assert alpha_flat > alpha_linear, (
-        f"Flat curve α={alpha_flat:.3f} should be > linear α={alpha_linear:.3f}"
-    )
+    assert alpha_flat > alpha_linear, f"Flat curve α={alpha_flat:.3f} should be > linear α={alpha_linear:.3f}"
     # Both should be in valid range
     assert 0.05 <= alpha_flat <= 0.25
     assert 0.05 <= alpha_linear <= 0.25
@@ -267,8 +261,7 @@ def test_horizon_exponent_fallback():
 def test_adaptive_correction_bounded():
     """Adaptive correction never goes beyond 5x in either direction."""
     results = [
-        TrialResult(lr=2e-5, final_loss=2.0, initial_loss=3.0,
-                    loss_curve=[3.0, 2.8, 2.6, 2.4, 2.2, 2.0]),
+        TrialResult(lr=2e-5, final_loss=2.0, initial_loss=3.0, loss_curve=[3.0, 2.8, 2.6, 2.4, 2.2, 2.0]),
     ]
 
     # Very long horizon (should correct down significantly)
@@ -287,8 +280,7 @@ def test_adaptive_correction_bounded():
 def test_correction_is_monotonic_with_horizon():
     """Longer horizons always produce lower corrected LR."""
     results = [
-        TrialResult(lr=3e-5, final_loss=2.0, initial_loss=3.0,
-                    loss_curve=[3.0, 2.7, 2.4, 2.2, 2.0]),
+        TrialResult(lr=3e-5, final_loss=2.0, initial_loss=3.0, loss_curve=[3.0, 2.7, 2.4, 2.2, 2.0]),
     ]
 
     corrected_1k = correct_lr_adaptive(3e-5, 100, 1000, results)
@@ -381,9 +373,12 @@ def test_adaptive_sweep_end_to_end():
         if lr > 1e-4:
             # Divergence
             return TrialResult(
-                lr=lr, final_loss=float("inf"), initial_loss=initial_loss,
+                lr=lr,
+                final_loss=float("inf"),
+                initial_loss=initial_loss,
                 loss_curve=[initial_loss, initial_loss * 1.5, float("inf")],
-                steps_completed=steps // 3, diverged=True,
+                steps_completed=steps // 3,
+                diverged=True,
             )
 
         # Closer to optimal → lower final loss
@@ -392,8 +387,12 @@ def test_adaptive_sweep_end_to_end():
         curve = [initial_loss - (initial_loss - final_loss) * (i / steps) for i in range(steps)]
 
         return TrialResult(
-            lr=lr, final_loss=final_loss, initial_loss=initial_loss,
-            loss_curve=curve, steps_completed=steps, diverged=False,
+            lr=lr,
+            final_loss=final_loss,
+            initial_loss=initial_loss,
+            loss_curve=curve,
+            steps_completed=steps,
+            diverged=False,
         )
 
     best_lr, all_results = adaptive_lr_sweep(
@@ -427,8 +426,11 @@ def test_adaptive_sweep_all_diverged_fallback():
 
     def always_diverge(lr: float, steps: int) -> TrialResult:
         return TrialResult(
-            lr=lr, final_loss=float("inf"), initial_loss=3.0,
-            loss_curve=[3.0, float("inf")], diverged=True,
+            lr=lr,
+            final_loss=float("inf"),
+            initial_loss=3.0,
+            loss_curve=[3.0, float("inf")],
+            diverged=True,
         )
 
     best_lr, results = adaptive_lr_sweep(
@@ -454,21 +456,27 @@ def test_trial_result_curvature():
     """Curvature property correctly identifies loss curve shape."""
     # Decelerating (flattening): positive curvature
     decelerating = TrialResult(
-        lr=2e-5, final_loss=2.4, initial_loss=3.0,
+        lr=2e-5,
+        final_loss=2.4,
+        initial_loss=3.0,
         loss_curve=[3.0, 2.6, 2.5, 2.45, 2.4],
     )
     assert decelerating.curvature > 0, f"Expected positive curvature, got {decelerating.curvature}"
 
     # Accelerating (still dropping fast at end): negative curvature
     accelerating = TrialResult(
-        lr=2e-5, final_loss=1.0, initial_loss=3.0,
+        lr=2e-5,
+        final_loss=1.0,
+        initial_loss=3.0,
         loss_curve=[3.0, 2.9, 2.7, 2.2, 1.0],
     )
     assert accelerating.curvature < 0, f"Expected negative curvature, got {accelerating.curvature}"
 
     # Linear: near-zero curvature (equal spacing)
     linear = TrialResult(
-        lr=2e-5, final_loss=1.0, initial_loss=3.0,
+        lr=2e-5,
+        final_loss=1.0,
+        initial_loss=3.0,
         loss_curve=[3.0, 2.5, 2.0, 1.5, 1.0],
     )
     assert abs(linear.curvature) < 0.05, f"Expected ~0 curvature, got {linear.curvature}"

@@ -408,7 +408,9 @@ class Config:
                 key, value = args[i][2:], args[i + 1]
                 parts = key.split(".")
                 if len(parts) != 2:
-                    raise ConfigError(f"--{key}: overrides are --section.option value (e.g. --train.learning_rate 1e-5).")
+                    raise ConfigError(
+                        f"--{key}: overrides are --section.option value (e.g. --train.learning_rate 1e-5)."
+                    )
                 section_name, field_name = parts
                 section = _section(config, section_name, where="command line")
                 _set_option(section, section_name, field_name, value, where="command line")
@@ -435,8 +437,10 @@ class Config:
         from palingenesis.validate_data import valid_think_tags
 
         for where, tags in [("data.think_tags", self.data.think_tags)] + [
-                (f"data.sources[{i}].think_tags", s.get("think_tags")) for i, s in enumerate(self.data.sources)
-                if isinstance(s, dict)]:
+            (f"data.sources[{i}].think_tags", s.get("think_tags"))
+            for i, s in enumerate(self.data.sources)
+            if isinstance(s, dict)
+        ]:
             if tags and not valid_think_tags(tags):
                 errors.append(f"{where} must be two different non-empty strings [open, close], got {tags!r}.")
         if self.memory.gradient_release:
@@ -468,8 +472,10 @@ class Config:
         if self.train.optimizer not in OPTIMIZERS:
             errors.append(f"train.optimizer={self.train.optimizer!r} is not one of {', '.join(OPTIMIZERS)}.")
         if self.train.lr_scheduler not in ("cosine", "linear", "constant", "power_decay", "wsd"):
-            errors.append(f"train.lr_scheduler={self.train.lr_scheduler!r} is not one of cosine, linear, "
-                          "constant, power_decay, wsd.")
+            errors.append(
+                f"train.lr_scheduler={self.train.lr_scheduler!r} is not one of cosine, linear, "
+                "constant, power_decay, wsd."
+            )
 
         if self.data.packing and self.parallel.context_parallel:
             errors.append(
@@ -503,13 +509,15 @@ class Config:
             )
 
         # Multiple exclusive loss functions
-        active_losses = sum([
-            self.plugins.dft,
-            self.plugins.cadft,
-            self.plugins.deft,
-            self.plugins.info_sft,
-            self.plugins.pre_rl,
-        ])
+        active_losses = sum(
+            [
+                self.plugins.dft,
+                self.plugins.cadft,
+                self.plugins.deft,
+                self.plugins.info_sft,
+                self.plugins.pre_rl,
+            ]
+        )
         if active_losses > 1:
             errors.append(
                 f"Only one training objective plugin can be active at a time ({active_losses} enabled). "
@@ -535,18 +543,30 @@ class Config:
                 )
 
         if self.data.turn_scaling not in ("uniform", "progressive", "last_heavy"):
-            errors.append(f"data.turn_scaling={self.data.turn_scaling!r} is not one of uniform, progressive, last_heavy.")
+            errors.append(
+                f"data.turn_scaling={self.data.turn_scaling!r} is not one of uniform, progressive, last_heavy."
+            )
         elif self.data.turn_scaling != "uniform":
             # Per-token weights reach CE, chunked CE, CCE and the chunked gated objectives.
             gated = self.plugins.dft or self.plugins.cadft or self.plugins.info_sft or self.plugins.deft
-            unweighted = [name for name, on in (
-                ("plugins.pre_rl", self.plugins.pre_rl),
-                ("plugins.deft/dft/cadft/info_sft without memory.chunked_loss", gated and not self.memory.chunked_loss),
-                ("memory.seco", self.memory.seco), ("dpo.enabled", self.dpo.enabled),
-            ) if on]
+            unweighted = [
+                name
+                for name, on in (
+                    ("plugins.pre_rl", self.plugins.pre_rl),
+                    (
+                        "plugins.deft/dft/cadft/info_sft without memory.chunked_loss",
+                        gated and not self.memory.chunked_loss,
+                    ),
+                    ("memory.seco", self.memory.seco),
+                    ("dpo.enabled", self.dpo.enabled),
+                )
+                if on
+            ]
             if unweighted:
-                errors.append(f"data.turn_scaling={self.data.turn_scaling!r} is not applied by {', '.join(unweighted)}; "
-                              "use turn_scaling: uniform with it.")
+                errors.append(
+                    f"data.turn_scaling={self.data.turn_scaling!r} is not applied by {', '.join(unweighted)}; "
+                    "use turn_scaling: uniform with it."
+                )
 
         if self.dpo.enabled:
             errors.extend(self._dpo_errors())
@@ -624,7 +644,6 @@ class Config:
 
         return warnings
 
-
     def _dpo_errors(self) -> list[str]:
         from palingenesis.dpo import LOSS_TYPES
 
@@ -667,7 +686,6 @@ class Config:
                 errors.append(f"dpo.enabled=true does not support {name}; disable it for preference training.")
         return errors
 
-
     def _seco_errors(self) -> list[str]:
         m = self.memory
         errors: list[str] = []
@@ -679,8 +697,7 @@ class Config:
             "data.packing (packed documents need per-document attention)": self.data.packing,
             "parallel.context_parallel (both split the sequence)": self.parallel.context_parallel,
             "dpo.enabled": self.dpo.enabled,
-            "memory.gradient_release (it steps inside every backward; SeCO runs one per chunk)":
-                self.memory.gradient_release,
+            "memory.gradient_release (it steps inside every backward; SeCO runs one per chunk)": self.memory.gradient_release,
             "plugins.sym_noise (noise would differ between the two passes)": self.plugins.sym_noise,
             "plugins.dft": self.plugins.dft,
             "plugins.cadft": self.plugins.cadft,
@@ -697,13 +714,14 @@ class Config:
 
 class ConfigError(Exception):
     """Raised when config has hard incompatibilities that prevent safe training."""
+
     pass
 
 
 # Options that existed once: a config that still sets them gets told why they are gone.
 _REMOVED_OPTIONS = {
     ("data", "seq_len_curriculum"): "it never took effect (the curriculum was not wired into the data "
-                                    "pipeline). Remove it; set data.max_seq_length directly.",
+    "pipeline). Remove it; set data.max_seq_length directly.",
     ("data", "seq_len_curriculum_min"): "see data.seq_len_curriculum.",
     ("data", "seq_len_curriculum_ramp_steps"): "see data.seq_len_curriculum.",
 }
@@ -716,8 +734,10 @@ def _section(config: Config, name: str, where: str):
     names = [f.name for f in dataclasses.fields(config)]
     if name not in names:
         hint = difflib.get_close_matches(name, names, n=1)
-        raise ConfigError(f"{where}: unknown config section `{name}`"
-                          + (f" (did you mean `{hint[0]}`?)" if hint else f"; sections: {', '.join(names)}"))
+        raise ConfigError(
+            f"{where}: unknown config section `{name}`"
+            + (f" (did you mean `{hint[0]}`?)" if hint else f"; sections: {', '.join(names)}")
+        )
     return getattr(config, name)
 
 
@@ -732,8 +752,10 @@ def _set_option(section, section_name: str, key: str, value, where: str) -> None
         if (section_name, key) in _REMOVED_OPTIONS:
             raise ConfigError(f"{where}: {section_name}.{key} was removed: {_REMOVED_OPTIONS[(section_name, key)]}")
         hint = difflib.get_close_matches(key, names, n=1)
-        raise ConfigError(f"{where}: unknown option {section_name}.{key}"
-                          + (f" (did you mean {section_name}.{hint[0]}?)" if hint else ""))
+        raise ConfigError(
+            f"{where}: unknown option {section_name}.{key}"
+            + (f" (did you mean {section_name}.{hint[0]}?)" if hint else "")
+        )
     current = getattr(section, key)
     if isinstance(value, str):
         # YAML reads `2e-5` (no dot) as a string, and command-line values are strings.
@@ -750,8 +772,9 @@ def _set_option(section, section_name: str, key: str, value, where: str) -> None
             elif current is None and text.lower() in ("none", "null", ""):
                 value = None
         except ValueError:
-            raise ConfigError(f"{where}: {section_name}.{key}={value!r} is not a valid "
-                              f"{type(current).__name__}.") from None
+            raise ConfigError(
+                f"{where}: {section_name}.{key}={value!r} is not a valid {type(current).__name__}."
+            ) from None
     elif isinstance(current, float) and isinstance(value, int) and not isinstance(value, bool):
         value = float(value)
     setattr(section, key, value)

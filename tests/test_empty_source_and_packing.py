@@ -40,8 +40,9 @@ def test_empty_source_is_dropped_not_fatal(caplog):
 
     got = sorted(int(x["input_ids"][0]) for x in out)
     assert got == [0, 1, 2, 3, 4], "all items from the non-empty source must survive the empty one"
-    assert any("BAD_EMPTY" in r.message and "0 usable" in r.message for r in caplog.records), \
+    assert any("BAD_EMPTY" in r.message and "0 usable" in r.message for r in caplog.records), (
         "the empty source must be named in a loud warning"
+    )
 
 
 def test_all_empty_sources_yields_nothing_without_hanging():
@@ -117,7 +118,7 @@ def test_packing_never_splits_a_document(sort_buffer):
     for b in blocks:  # each document's tokens stay together and in order
         ids = b["input_ids"].tolist()
         for a, n in zip([0] + list(itertools.accumulate(_doc_lengths(b))), _doc_lengths(b)):
-            assert ids[a:a + n] == list(range(ids[a], ids[a] + n))
+            assert ids[a : a + n] == list(range(ids[a], ids[a] + n))
 
 
 def test_bin_packing_fills_blocks():
@@ -130,8 +131,12 @@ def test_bin_packing_fills_blocks():
 def test_collate_pads_packed_rows_as_one_extra_document():
     from palingenesis.data import collate_fn
 
-    block = {"input_ids": torch.tensor([5, 6, 7]), "labels": torch.tensor([5, 6, 7]),
-             "attention_mask": torch.ones(3, dtype=torch.long), "position_ids": torch.tensor([0, 1, 0])}
+    block = {
+        "input_ids": torch.tensor([5, 6, 7]),
+        "labels": torch.tensor([5, 6, 7]),
+        "attention_mask": torch.ones(3, dtype=torch.long),
+        "position_ids": torch.tensor([0, 1, 0]),
+    }
     out = collate_fn([block], pad_id=0, pad_to_multiple=8)
     assert out["position_ids"].tolist() == [[0, 1, 0, 0, 1, 2, 3, 4]]
     assert out["labels"].tolist()[0][3:] == [-100] * 5

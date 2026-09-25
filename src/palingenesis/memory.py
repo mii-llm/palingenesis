@@ -175,7 +175,7 @@ class GradientRelease:
 
             # Track gradient norm for monitoring
             grad_norm = p.grad.data.float().norm().item()
-            self._grad_norm_sq_accum += grad_norm ** 2
+            self._grad_norm_sq_accum += grad_norm**2
 
             # Per-tensor AdaGC clipping (if enabled)
             if self.adagc is not None:
@@ -284,7 +284,7 @@ class GradientRelease:
         grad_norm to always log as 0.0 — hasattr() consumed the value).
         """
         if self._grad_norm_sq_accum > 0.0:
-            self._last_norm = self._grad_norm_sq_accum ** 0.5
+            self._last_norm = self._grad_norm_sq_accum**0.5
             self._grad_norm_sq_accum = 0.0  # reset accumulator for next backward
         return self._last_norm
 

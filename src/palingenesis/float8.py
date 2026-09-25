@@ -34,7 +34,7 @@ def apply_float8_training(model: nn.Module) -> bool:
         from torchao.float8 import Float8LinearConfig, convert_to_float8_training
     except ImportError:
         logger.warning(
-            "torchao not installed or too old for float8 training. " "Install torchao >= 0.9.0: pip install torchao"
+            "torchao not installed or too old for float8 training. Install torchao >= 0.9.0: pip install torchao"
         )
         return False
 
@@ -46,8 +46,7 @@ def apply_float8_training(model: nn.Module) -> bool:
     capability = torch.cuda.get_device_capability()
     if capability < (8, 9):
         logger.warning(
-            f"Float8 training requires SM89+ (H100/B200). "
-            f"Current device is SM{capability[0]}{capability[1]}. Skipping."
+            f"Float8 training requires SM89+ (H100/B200). Current device is SM{capability[0]}{capability[1]}. Skipping."
         )
         return False
 

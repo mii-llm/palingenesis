@@ -17,8 +17,8 @@ CONFIGS = Path(__file__).parent.parent / "configs"
 # ---------------------------------------------------------------------------
 
 SHARED = 128256
-IM_END = 128256   # student-only ChatML terminator
-EOT_ID = 128009   # teacher end-of-turn
+IM_END = 128256  # student-only ChatML terminator
+EOT_ID = 128009  # teacher end-of-turn
 END_OF_TEXT = 128001  # shared end-of-text
 
 
@@ -135,6 +135,7 @@ def test_bridge_rejects_student_smaller_than_teacher():
 # Prompt pool
 # ---------------------------------------------------------------------------
 
+
 def test_question_hash_normalizes_accents_case_punctuation():
     from palingenesis.opd.pool import question_hash
 
@@ -145,8 +146,7 @@ def test_question_hash_normalizes_accents_case_punctuation():
 def test_split_pool_deterministic_and_disjoint():
     from palingenesis.opd.pool import question_hash, split_pool
 
-    rows = [{"question": f"q{i}", "options": [("A", "x"), ("B", "y")], "answer": "A"}
-            for i in range(50)]
+    rows = [{"question": f"q{i}", "options": [("A", "x"), ("B", "y")], "answer": "A"} for i in range(50)]
     train1, dev1 = split_pool(rows, dev_size=10, seed=0)
     train2, dev2 = split_pool(list(reversed(rows)), dev_size=10, seed=0)
 
@@ -161,8 +161,7 @@ def test_split_pool_with_duplicated_rows():
     """Upweighted (duplicated) pools: dev stays unique, no dev question leaks into train."""
     from palingenesis.opd.pool import question_hash, split_pool
 
-    rows = [{"question": f"q{i}", "options": [("A", "x"), ("B", "y")], "answer": "A"}
-            for i in range(30)]
+    rows = [{"question": f"q{i}", "options": [("A", "x"), ("B", "y")], "answer": "A"} for i in range(30)]
     duplicated = rows + rows[:15] * 3  # upweight the first 15 questions x4
     train, dev = split_pool(duplicated, dev_size=10)
 
@@ -177,8 +176,9 @@ def test_split_pool_with_duplicated_rows():
 def test_pool_roundtrip(tmp_path):
     from palingenesis.opd.pool import load_pool, write_pool
 
-    rows = [{"question": "q", "options": [["A", "sì"], ["B", "no"]], "answer": "A",
-             "category": "storia", "source": "test"}]
+    rows = [
+        {"question": "q", "options": [["A", "sì"], ["B", "no"]], "answer": "A", "category": "storia", "source": "test"}
+    ]
     path = tmp_path / "pool.jsonl"
     assert write_pool(rows, str(path)) == 1
     loaded = load_pool(str(path))
@@ -190,9 +190,9 @@ def test_valid_row_rejects_malformed():
 
     opts = [("A", "x"), ("B", "y")]
     assert valid_row("q", opts, "A")
-    assert not valid_row("", opts, "A")            # no question
-    assert not valid_row("q", opts, "C")           # answer not among options
-    assert not valid_row("q", [("A", "x")], "A")   # single option
+    assert not valid_row("", opts, "A")  # no question
+    assert not valid_row("q", opts, "C")  # answer not among options
+    assert not valid_row("q", [("A", "x")], "A")  # single option
     assert not valid_row("q", [("A", " "), ("B", "y")], "A")  # blank option text
 
 
@@ -200,9 +200,12 @@ def test_valid_row_rejects_malformed():
 # Formatting
 # ---------------------------------------------------------------------------
 
-ROW = {"question": "Chi scrisse la Divina Commedia?",
-       "options": [("A", "Dante"), ("B", "Petrarca")],
-       "answer": "A", "category": "letteratura"}
+ROW = {
+    "question": "Chi scrisse la Divina Commedia?",
+    "options": [("A", "Dante"), ("B", "Petrarca")],
+    "answer": "A",
+    "category": "letteratura",
+}
 
 
 def test_default_templates_are_neutral_english():
@@ -283,19 +286,16 @@ def test_renderer_regimes():
 
     pool = [dict(ROW, question=f"q{i}") for i in range(30)]
     shots = [dict(ROW, question="shot")]
-    renderer = PromptRenderer(pool, shots, p_reference_shots=1.0, p_pool_shots=0.0,
-                              rng=random.Random(0))
+    renderer = PromptRenderer(pool, shots, p_reference_shots=1.0, p_pool_shots=0.0, rng=random.Random(0))
     messages, row, fast = renderer.sample()
     assert fast is True  # cot_fraction=0
     assert messages[1]["content"].count("shot") == 1  # the reference shot turn
 
-    zero = PromptRenderer(pool, [], p_reference_shots=0.0, p_pool_shots=0.0,
-                          rng=random.Random(0))
+    zero = PromptRenderer(pool, [], p_reference_shots=0.0, p_pool_shots=0.0, rng=random.Random(0))
     messages, _, _ = zero.sample()
     assert [m["role"] for m in messages] == ["system", "user"]
 
-    pooled = PromptRenderer(pool, [], p_reference_shots=0.0, p_pool_shots=1.0,
-                            pool_shots_max_k=3, rng=random.Random(0))
+    pooled = PromptRenderer(pool, [], p_reference_shots=0.0, p_pool_shots=1.0, pool_shots_max_k=3, rng=random.Random(0))
     messages, row, _ = pooled.sample()
     n_shots = sum(1 for m in messages if m["role"] == "assistant")
     assert 1 <= n_shots <= 3
@@ -311,7 +311,7 @@ def test_extract_letter():
     assert extract_letter("nessuna lettera") is None
     # CoT: incidental capitals early, answer at the end
     cot = "A causa della regola X, la risposta corretta è B"
-    assert extract_letter(cot) == "A"          # first (wrong for CoT)
+    assert extract_letter(cot) == "A"  # first (wrong for CoT)
     assert extract_letter(cot, last=True) == "B"
 
 
@@ -319,8 +319,8 @@ def test_extract_number():
     from palingenesis.opd.formatting import extract_number
 
     assert extract_number("3 apples + 4 = 7\nAnswer: 7") == "7"
-    assert extract_number("Answer: $1,250.50 total, 3 items") == "1250.50"    # after "Answer:", not the last
-    assert extract_number("so it is -12") == "-12"                             # no "Answer:": the last number
+    assert extract_number("Answer: $1,250.50 total, 3 items") == "1250.50"  # after "Answer:", not the last
+    assert extract_number("so it is -12") == "-12"  # no "Answer:": the last number
     assert extract_number("no digits") is None
 
 
@@ -347,10 +347,10 @@ def test_load_reference_shots_both_layouts(tmp_path):
 
     path = tmp_path / "shots.jsonl"
     path.write_text(
-        json.dumps({"question": "q1", "options": [{"A": "x"}, {"B": "y"}],
-                    "answer": "A", "category": "c"}) + "\n" +
-        json.dumps({"question": "q2", "options": [["A", "x"], ["B", "y"]],
-                    "answer": "B", "category": "c"}) + "\n"
+        json.dumps({"question": "q1", "options": [{"A": "x"}, {"B": "y"}], "answer": "A", "category": "c"})
+        + "\n"
+        + json.dumps({"question": "q2", "options": [["A", "x"], ["B", "y"]], "answer": "B", "category": "c"})
+        + "\n"
     )
     shots = load_reference_shots(str(path))
     assert shots[0]["options"] == [("A", "x"), ("B", "y")]
@@ -360,6 +360,7 @@ def test_load_reference_shots_both_layouts(tmp_path):
 # ---------------------------------------------------------------------------
 # Prompt sources
 # ---------------------------------------------------------------------------
+
 
 class FakeEngine:
     """Engine stub: greedy answers 'A' (or "Answer: 7") to everything; dev_kl returns a constant."""
@@ -378,9 +379,16 @@ class FakeEngine:
 
 
 def write_mcqa_pool(tmp_path, n=20):
-    rows = [{"question": f"Domanda {i}?", "options": [["A", "sì"], ["B", "no"]],
-             "answer": "A" if i % 2 == 0 else "B", "category": "storia", "source": "t"}
-            for i in range(n)]
+    rows = [
+        {
+            "question": f"Domanda {i}?",
+            "options": [["A", "sì"], ["B", "no"]],
+            "answer": "A" if i % 2 == 0 else "B",
+            "category": "storia",
+            "source": "t",
+        }
+        for i in range(n)
+    ]
     path = tmp_path / "pool.jsonl"
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
     return path
@@ -390,8 +398,12 @@ def test_mcqa_source(tmp_path):
     from palingenesis.opd.config import SourceConfig
     from palingenesis.opd.sources import McqaPoolSource
 
-    source = McqaPoolSource(SourceConfig(format="mcqa", path=str(write_mcqa_pool(tmp_path)), dev_size=4,
-                                         max_new_tokens=16), eval_samples=4, seed=0, rng=random.Random(0))
+    source = McqaPoolSource(
+        SourceConfig(format="mcqa", path=str(write_mcqa_pool(tmp_path)), dev_size=4, max_new_tokens=16),
+        eval_samples=4,
+        seed=0,
+        rng=random.Random(0),
+    )
     messages, mnt, meta = source.sample()
     assert messages[-1]["role"] == "user"
     assert mnt == 16  # cot_fraction=0 -> always fast
@@ -413,8 +425,9 @@ def test_mcqa_source_cot_eval(tmp_path):
     from palingenesis.opd.config import SourceConfig
     from palingenesis.opd.sources import McqaPoolSource
 
-    config = SourceConfig(format="mcqa", path=str(write_mcqa_pool(tmp_path)), dev_size=4, cot_fraction=0.3,
-                          cot_max_new_tokens=300)
+    config = SourceConfig(
+        format="mcqa", path=str(write_mcqa_pool(tmp_path)), dev_size=4, cot_fraction=0.3, cot_max_new_tokens=300
+    )
     source = McqaPoolSource(config, eval_samples=4, seed=0, rng=random.Random(0))
     engine = FakeEngine()
     metrics = source.evaluate(engine)
@@ -432,8 +445,9 @@ def test_messages_source(tmp_path):
     from palingenesis.opd.sources import ChatMessagesSource
 
     rows = [{"messages": [{"role": "user", "content": f"Ciao {i}"}]} for i in range(12)]
-    rows.append({"messages": [{"role": "user", "content": "x"},
-                              {"role": "assistant", "content": "ends wrong"}]})  # skipped
+    rows.append(
+        {"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "ends wrong"}]}
+    )  # skipped
     config = SourceConfig(path=write_chat(tmp_path / "chat.jsonl", rows), dev_size=3, max_new_tokens=64)
     source = ChatMessagesSource(config, eval_samples=3, seed=0, rng=random.Random(0))
     assert len(source.dev_rows) == 3 and len(source.train_rows) == 9  # 12 usable - 3 dev
@@ -442,7 +456,7 @@ def test_messages_source(tmp_path):
     assert messages[-1]["role"] == "user" and mnt == 64 and meta == {}
 
     engine = FakeEngine()
-    assert source.evaluate(engine) == {"dev_kl": 0.5, "dev_len": 3.0}   # no answers: no accuracy
+    assert source.evaluate(engine) == {"dev_kl": 0.5, "dev_len": 3.0}  # no answers: no accuracy
     assert engine.calls == [("dev_kl", 3, 64)]
     assert source.batch_stats([({}, "whatever")]) == {}
 
@@ -454,8 +468,11 @@ def test_messages_source_dev_path_and_answers(tmp_path):
 
     train = [{"messages": [{"role": "user", "content": f"q{i}"}], "answer": "1"} for i in range(5)]
     dev = [{"messages": [{"role": "user", "content": f"t{i}"}], "answer": a} for i, a in enumerate(["7", "8", "7.0"])]
-    config = SourceConfig(path=write_chat(tmp_path / "train.jsonl", train),
-                          dev_path=write_chat(tmp_path / "dev.jsonl", dev), max_new_tokens=32)
+    config = SourceConfig(
+        path=write_chat(tmp_path / "train.jsonl", train),
+        dev_path=write_chat(tmp_path / "dev.jsonl", dev),
+        max_new_tokens=32,
+    )
     source = ChatMessagesSource(config, eval_samples=10, seed=0, rng=random.Random(0))
     assert len(source.train_rows) == 5 and len(source.dev_rows) == 3
     engine = FakeEngine(answer="so 3 + 4\nAnswer: 7")
@@ -472,9 +489,11 @@ def test_build_source_mixes_the_configured_sources(tmp_path):
     config.set("sources.pool.format", "mcqa", "test")
     config.set("sources.pool.path", str(write_mcqa_pool(tmp_path)), "test")
     config.set("sources.pool.dev_size", 4, "test")
-    config.set("sources.chat.path", write_chat(tmp_path / "chat.jsonl",
-                                               [{"messages": [{"role": "user", "content": f"c{i}"}]}
-                                                for i in range(8)]), "test")
+    config.set(
+        "sources.chat.path",
+        write_chat(tmp_path / "chat.jsonl", [{"messages": [{"role": "user", "content": f"c{i}"}]} for i in range(8)]),
+        "test",
+    )
     config.set("sources.chat.dev_size", 2, "test")
     source = build_source(config, rng=random.Random(0))
     assert isinstance(source, MixedSource)
@@ -486,6 +505,7 @@ def test_build_source_mixes_the_configured_sources(tmp_path):
 # Config
 # ---------------------------------------------------------------------------
 
+
 def test_opd_config_from_yaml_and_cli(tmp_path):
     from palingenesis.opd.config import OPDConfig
 
@@ -496,18 +516,30 @@ def test_opd_config_from_yaml_and_cli(tmp_path):
         "sources:\n  chat:\n    path: chat.jsonl\n    teacher: big\n"
         "train:\n  learning_rate: 5.0e-6\n  steps: 100\n"
     )
-    config = OPDConfig.from_cli(["--config", str(path), "--train.steps", "250",
-                                 "--teachers.big.backend", "vllm",
-                                 "--teachers.small.model", "my/small",
-                                 "--sources.chat.max_new_tokens", "128",
-                                 "--model.stop_tokens", "['<|end_of_text|>']",
-                                 "--model.gradient_checkpointing", "true"])
+    config = OPDConfig.from_cli(
+        [
+            "--config",
+            str(path),
+            "--train.steps",
+            "250",
+            "--teachers.big.backend",
+            "vllm",
+            "--teachers.small.model",
+            "my/small",
+            "--sources.chat.max_new_tokens",
+            "128",
+            "--model.stop_tokens",
+            "['<|end_of_text|>']",
+            "--model.gradient_checkpointing",
+            "true",
+        ]
+    )
     assert config.model.student == "my/student"
     assert config.model.chat_template_kwargs == {"enable_thinking": False}
     assert config.model.stop_tokens == ["<|end_of_text|>"]
     assert config.teachers["big"].eos_map == {"<|im_end|>": "<|eot_id|>"}
     assert config.teachers["big"].backend == "vllm"
-    assert config.teachers["small"].model == "my/small"            # a new teacher from the command line
+    assert config.teachers["small"].model == "my/small"  # a new teacher from the command line
     assert config.sources["chat"].max_new_tokens == 128
     assert config.train.learning_rate == 5.0e-6
     assert config.train.steps == 250  # CLI wins over YAML
@@ -566,8 +598,9 @@ def test_opd_config_validate():
         with pytest.raises(OPDConfigError, match=match):
             config.validate()
 
-    invalid("full_rkl needs the teacher's full distribution", teachers__big__backend="vllm",
-            teachers__big__loss="full_rkl")
+    invalid(
+        "full_rkl needs the teacher's full distribution", teachers__big__backend="vllm", teachers__big__loss="full_rkl"
+    )
     invalid("loss must be one of", teachers__big__loss="full_kl")
     invalid("hf backend cannot", rollout__max_staleness=1)
     invalid("not one of the teachers", sources__pool__teacher="nobody")
@@ -585,10 +618,10 @@ def test_opd_config_validate():
     config = _valid_base_config()
     config.set("rollout.backend", "vllm", "test")
     config.set("rollout.max_staleness", 1, "test")
-    config.set("teachers.big.backend", "vllm", "test")      # auto loss: topk_kl
+    config.set("teachers.big.backend", "vllm", "test")  # auto loss: topk_kl
     assert config.validate() == []
 
-    config.set("sources.pool.cot_fraction", 0.2, "test")     # legal but meaningless for messages
+    config.set("sources.pool.cot_fraction", 0.2, "test")  # legal but meaningless for messages
     warnings = config.validate()
     assert len(warnings) == 1 and "cot_fraction" in warnings[0]
 
@@ -606,6 +639,7 @@ def test_example_configs_load_and_validate(path):
 # ---------------------------------------------------------------------------
 # MixedSource (compose sub-sources into one OPD run)
 # ---------------------------------------------------------------------------
+
 
 class _FakeSub:
     """Minimal PromptSource: samples a fixed mnt, reports a per-source metric."""

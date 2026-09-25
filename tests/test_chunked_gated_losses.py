@@ -42,7 +42,8 @@ def test_chunked_equals_full_logits(objective, num_chunks):
 
     got = plugins.chunked_gated_loss(hidden, labels, head, objective, num_chunks=num_chunks, global_valid_tokens=denom)
     got.backward()
-    torch.testing.assert_close(got, ref.float() if got.dtype == torch.float32 else ref, rtol=1e-5, atol=1e-7,
-                               check_dtype=False)
+    torch.testing.assert_close(
+        got, ref.float() if got.dtype == torch.float32 else ref, rtol=1e-5, atol=1e-7, check_dtype=False
+    )
     torch.testing.assert_close(hidden.grad, ref_h, rtol=1e-5, atol=1e-8)
     torch.testing.assert_close(head.weight.grad, ref_w, rtol=1e-5, atol=1e-8)

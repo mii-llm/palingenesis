@@ -27,8 +27,16 @@ def _gpt2():
     from transformers import GPT2Config, GPT2LMHeadModel
 
     torch.manual_seed(0)
-    cfg = GPT2Config(n_layer=3, n_head=2, n_embd=32, n_positions=256, vocab_size=VOCAB,
-                     resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0)
+    cfg = GPT2Config(
+        n_layer=3,
+        n_head=2,
+        n_embd=32,
+        n_positions=256,
+        vocab_size=VOCAB,
+        resid_pdrop=0.0,
+        embd_pdrop=0.0,
+        attn_pdrop=0.0,
+    )
     return GPT2LMHeadModel(cfg).double().train()
 
 
@@ -37,11 +45,21 @@ def _qwen35():
 
     torch.manual_seed(0)
     cfg = Qwen3_5TextConfig(
-        vocab_size=VOCAB, hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+        vocab_size=VOCAB,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
         layer_types=["linear_attention", "linear_attention", "full_attention", "linear_attention"],
-        num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-        linear_num_value_heads=4, linear_num_key_heads=2, linear_key_head_dim=16, linear_value_head_dim=16,
-        linear_conv_kernel_dim=4, max_position_embeddings=512, attention_dropout=0.0,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        max_position_embeddings=512,
+        attention_dropout=0.0,
     )
     model = Qwen3_5ForCausalLM(cfg).double().train()
     # Random init leaves A_log/dt_bias at values that make the recurrence nearly
@@ -60,9 +78,9 @@ def _batch(batch=1, seq=70, pad_to=None, seed=1):
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(1, VOCAB, (batch, seq), generator=g)
     labels = ids.clone()
-    labels[:, :5] = IGNORE_INDEX                     # a "prompt" that is not scored
+    labels[:, :5] = IGNORE_INDEX  # a "prompt" that is not scored
     mask = torch.ones_like(ids)
-    if pad_to:                                        # right padding, as the collator does
+    if pad_to:  # right padding, as the collator does
         pad = pad_to - seq
         ids = torch.cat([ids, torch.zeros(batch, pad, dtype=torch.long)], 1)
         labels = torch.cat([labels, torch.full((batch, pad), IGNORE_INDEX)], 1)
@@ -74,8 +92,9 @@ def _full(model, ids, labels, mask):
     model.zero_grad()
     logits = model(input_ids=ids, attention_mask=mask).logits
     shifted = shift_labels(labels)
-    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB).double(), shifted.reshape(-1),
-                                             ignore_index=IGNORE_INDEX, reduction="sum")
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, VOCAB).double(), shifted.reshape(-1), ignore_index=IGNORE_INDEX, reduction="sum"
+    )
     loss = loss / (shifted != IGNORE_INDEX).sum()
     loss.backward()
     return loss.item(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
@@ -116,7 +135,7 @@ def test_seco_equals_full_backprop(arch, chunk_size):
 def test_right_padded_batch(arch):
     model = MODELS[arch]()
     ids, labels, mask = _batch(batch=2, seq=50, pad_to=64)
-    ids[1, 40:] = 0                                   # second row shorter: more padding
+    ids[1, 40:] = 0  # second row shorter: more padding
     labels[1, 40:] = IGNORE_INDEX
     mask[1, 40:] = 0
     _, full_grads = _full(model, ids, labels, mask)
@@ -165,9 +184,9 @@ def test_spaco_with_full_budget_is_seco(arch):
     model = MODELS[arch]()
     ids, labels, _ = _batch()
     _, seco = _chunked(model, ids, labels, chunk_size=16)
-    result, spaco = _chunked(model, ids, labels, chunk_size=16, budget=5)   # k = 5
+    result, spaco = _chunked(model, ids, labels, chunk_size=16, budget=5)  # k = 5
     assert result.backpropagated == 5
-    assert _max_rel_err(spaco, seco) == 0.0          # identical computation
+    assert _max_rel_err(spaco, seco) == 0.0  # identical computation
 
 
 def test_spaco_single_chunk_has_no_relay():
@@ -186,11 +205,18 @@ def test_spaco_single_chunk_has_no_relay():
     with torch.no_grad():
         past = model(input_ids=ids[:, :lo], use_cache=True).past_key_values if lo else None
     logits = model(input_ids=ids[:, lo:hi], past_key_values=past, use_cache=True).logits
-    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB), shift_labels(labels)[:, lo:hi].reshape(-1),
-                                             ignore_index=IGNORE_INDEX, reduction="sum") / n
+    loss = (
+        torch.nn.functional.cross_entropy(
+            logits.reshape(-1, VOCAB),
+            shift_labels(labels)[:, lo:hi].reshape(-1),
+            ignore_index=IGNORE_INDEX,
+            reduction="sum",
+        )
+        / n
+    )
     loss.backward()
     expected = {k: p.grad for k, p in model.named_parameters() if p.grad is not None}
-    assert _max_rel_err({n: g / 5 for n, g in spaco.items()}, expected) < TOL["gpt2"]   # k/t = 5
+    assert _max_rel_err({n: g / 5 for n, g in spaco.items()}, expected) < TOL["gpt2"]  # k/t = 5
     # the reported loss is still the full-sequence loss (from the no-grad pass)
     full_loss, _ = _full(model, ids, labels, torch.ones_like(ids))
     assert abs(result.loss - full_loss) < LOSS_TOL * full_loss
@@ -226,8 +252,9 @@ def test_spaco_expectation_approximates_the_gradient(arch, budget, min_scale, mi
     _, true = _full(model, ids, labels, mask)
     flat = lambda g: torch.cat([g[n].flatten() for n in sorted(g)])  # noqa: E731
     subsets = list(itertools.combinations(range(5), budget))
-    mean = sum(flat(_chunked(model, ids, labels, chunk_size=16, budget=budget, rng=_FixedSubset(s))[1])
-               for s in subsets) / len(subsets)
+    mean = sum(
+        flat(_chunked(model, ids, labels, chunk_size=16, budget=budget, rng=_FixedSubset(s))[1]) for s in subsets
+    ) / len(subsets)
     target = flat(true)
     scale = float(mean @ target / (target @ target))
     cos = float(mean @ target / (mean.norm() * target.norm()))
@@ -281,8 +308,8 @@ def test_architecture_exact_iff_verified(arch, attn):
     forward, SeCO's gradients equal full backprop; if not, the model is rejected
     (and SeCO would indeed be wrong on it)."""
     try:
-        model = build(arch, attn=attn).eval()   # eval: no dropout, the relay alone is tested
-    except Exception as exc:                # architecture absent from this transformers version
+        model = build(arch, attn=attn).eval()  # eval: no dropout, the relay alone is tested
+    except Exception as exc:  # architecture absent from this transformers version
         pytest.skip(f"cannot build {arch}: {type(exc).__name__}")
     ids, labels, mask = _batch()
     try:
@@ -298,7 +325,7 @@ def test_architecture_exact_iff_verified(arch, attn):
         if _is_cpu_kernel_gap(exc):
             pytest.skip("kernel unavailable on CPU")
         if not verified:
-            return                           # rejected, and indeed unable to run chunk-wise
+            return  # rejected, and indeed unable to run chunk-wise
         raise
     err = _max_rel_err(grads, full_grads)
     if verified:
@@ -314,8 +341,22 @@ def test_dropout_is_replayed_exactly():
     from transformers import DynamicCache, GPT2Config, GPT2LMHeadModel
 
     torch.manual_seed(0)
-    model = GPT2LMHeadModel(GPT2Config(n_layer=3, n_head=2, n_embd=32, n_positions=256, vocab_size=VOCAB,
-                                       resid_pdrop=0.3, embd_pdrop=0.3, attn_pdrop=0.3)).double().train()
+    model = (
+        GPT2LMHeadModel(
+            GPT2Config(
+                n_layer=3,
+                n_head=2,
+                n_embd=32,
+                n_positions=256,
+                vocab_size=VOCAB,
+                resid_pdrop=0.3,
+                embd_pdrop=0.3,
+                attn_pdrop=0.3,
+            )
+        )
+        .double()
+        .train()
+    )
     ids, labels, _ = _batch()
     shifted = shift_labels(labels)
     n = (shifted != IGNORE_INDEX).sum()
@@ -323,10 +364,18 @@ def test_dropout_is_replayed_exactly():
     model.zero_grad()
     torch.manual_seed(7)
     cache, loss = DynamicCache(config=model.config), 0.0
-    for lo in range(0, 70, 16):              # chunked forward WITH grad through the cache
-        logits = model(input_ids=ids[:, lo:lo + 16], past_key_values=cache, use_cache=True).logits
-        loss = loss + torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB), shifted[:, lo:lo + 16].reshape(-1),
-                                                        ignore_index=IGNORE_INDEX, reduction="sum") / n
+    for lo in range(0, 70, 16):  # chunked forward WITH grad through the cache
+        logits = model(input_ids=ids[:, lo : lo + 16], past_key_values=cache, use_cache=True).logits
+        loss = (
+            loss
+            + torch.nn.functional.cross_entropy(
+                logits.reshape(-1, VOCAB),
+                shifted[:, lo : lo + 16].reshape(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="sum",
+            )
+            / n
+        )
     loss.backward()
     expected = {k: p.grad.clone() for k, p in model.named_parameters() if p.grad is not None}
 
@@ -341,7 +390,7 @@ def test_rejects_a_model_whose_chunked_forward_differs():
     model = build("gpt2").eval()
     original = model.transformer.forward
 
-    def drop_cache(*args, past_key_values=None, **kwargs):   # a model that ignores its cache
+    def drop_cache(*args, past_key_values=None, **kwargs):  # a model that ignores its cache
         return original(*args, past_key_values=None, **{**kwargs, "use_cache": False})
 
     model.transformer.forward = drop_cache
@@ -355,7 +404,7 @@ def test_output_head_reproduces_the_logit_transform(arch):
 
     model = build(arch).eval()
     head = output_head(model)
-    assert head is not model.get_output_embeddings()          # a transform is applied
+    assert head is not model.get_output_embeddings()  # a transform is applied
     verify_output_head(model, head, model.base_model)
     with pytest.raises(NotImplementedError, match="transforms the lm_head output"):
         verify_output_head(model, model.get_output_embeddings(), model.base_model)
@@ -374,8 +423,13 @@ def test_attention_path_is_correct_outside_seco():
         _BIASES.clear()
         full = model(input_ids=ids).logits
         cache = DynamicCache(config=model.config)
-        chunked = torch.cat([model(input_ids=ids[:, lo:lo + 16], past_key_values=cache, use_cache=True).logits
-                             for lo in range(0, 70, 16)], dim=1)
+        chunked = torch.cat(
+            [
+                model(input_ids=ids[:, lo : lo + 16], past_key_values=cache, use_cache=True).logits
+                for lo in range(0, 70, 16)
+            ],
+            dim=1,
+        )
     assert float((chunked - full).abs().max()) < 1e-10
 
 
@@ -390,8 +444,9 @@ def test_scored_ce_sum_equals_cross_entropy_of_the_model_logits(arch):
     shifted = shift_labels(labels)
     with torch.no_grad():
         logits = model(input_ids=ids, attention_mask=mask).logits
-        expected = torch.nn.functional.cross_entropy(logits.reshape(-1, VOCAB).double(), shifted.reshape(-1),
-                                                     ignore_index=IGNORE_INDEX, reduction="sum")
+        expected = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, VOCAB).double(), shifted.reshape(-1), ignore_index=IGNORE_INDEX, reduction="sum"
+        )
     got, count = scored_ce_sum(model, ids, mask, shifted, torch.float64, chunk_bytes=VOCAB * 4 * 7)
     assert count == int((shifted != IGNORE_INDEX).sum())
     assert abs(got - float(expected)) < 1e-9 * abs(float(expected))
@@ -409,16 +464,16 @@ def test_kv_store_path_is_used_and_exact(arch, offload, monkeypatch):
     original = seco_module.chunk_attention
 
     def counting(*args, **kwargs):
-        calls.append(args[4])                 # prefix length seen by the store path
+        calls.append(args[4])  # prefix length seen by the store path
         return original(*args, **kwargs)
 
     monkeypatch.setattr(seco_module, "chunk_attention", counting)
-    monkeypatch.setattr(seco_module, "KV_BLOCK", 10)       # several prefix blocks per chunk
+    monkeypatch.setattr(seco_module, "KV_BLOCK", 10)  # several prefix blocks per chunk
     model = build(arch, attn="sdpa").eval()
     ids, labels, mask = _batch()
     _, full_grads = _full(model, ids, labels, mask)
     _, grads = _chunked(model, ids, labels, chunk_size=16, kv_offload=offload)
-    assert calls and max(calls) == 64                      # the last chunk attended a 64-token prefix
+    assert calls and max(calls) == 64  # the last chunk attended a 64-token prefix
     assert _max_rel_err(grads, full_grads) < _ARCH_TOL.get(arch, 5e-6)
 
 
@@ -440,9 +495,9 @@ def test_offload_budget_is_checked_before_allocating():
     need = _offloaded_bytes(model.model, batch=2, seq_len=1000, cast=torch.bfloat16)
     expected = 2 * cfg.num_hidden_layers * 2 * cfg.num_key_value_heads * cfg.head_dim * 1000 * 2
     assert need == expected
-    check_host_budget(1 << 20)                       # a megabyte is fine anywhere
+    check_host_budget(1 << 20)  # a megabyte is fine anywhere
     with pytest.raises(RuntimeError, match="seco_kv_offload would hold"):
-        check_host_budget(1 << 50)                   # a petabyte is not
+        check_host_budget(1 << 50)  # a petabyte is not
 
 
 def test_offload_budget_counts_only_attention_layers_of_a_hybrid():
@@ -453,4 +508,4 @@ def test_offload_budget_counts_only_attention_layers_of_a_hybrid():
     full_layers = sum(1 for t in cfg.layer_types if t == "full_attention")
     need = _offloaded_bytes(model.model, batch=1, seq_len=512, cast=torch.bfloat16)
     assert need == 2 * full_layers * cfg.num_key_value_heads * cfg.head_dim * 512 * 2
-    assert full_layers < cfg.num_hidden_layers       # the point of a hybrid
+    assert full_layers < cfg.num_hidden_layers  # the point of a hybrid

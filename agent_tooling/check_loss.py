@@ -96,8 +96,12 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
 
     result.initial_loss = losses[0]
     result.final_loss = losses[-1]
-    result.min_loss = min(value for value in losses if math.isfinite(value)) if any(math.isfinite(value) for value in losses) else 0
-    result.max_loss = max(value for value in losses if math.isfinite(value)) if any(math.isfinite(value) for value in losses) else 0
+    result.min_loss = (
+        min(value for value in losses if math.isfinite(value)) if any(math.isfinite(value) for value in losses) else 0
+    )
+    result.max_loss = (
+        max(value for value in losses if math.isfinite(value)) if any(math.isfinite(value) for value in losses) else 0
+    )
 
     # Check NaN/Inf
     for i, value in enumerate(losses):
@@ -140,7 +144,7 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
     plateau_threshold = max(50, len(finite) // 10)
     window = 20
     smoothed = [
-        (idx, sum(v for _, v in finite[max(0, i - window + 1): i + 1]) / (i + 1 - max(0, i - window + 1)))
+        (idx, sum(v for _, v in finite[max(0, i - window + 1) : i + 1]) / (i + 1 - max(0, i - window + 1)))
         for i, (idx, _) in enumerate(finite)
     ]
     best_so_far = smoothed[0][1]

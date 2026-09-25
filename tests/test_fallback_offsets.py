@@ -46,7 +46,11 @@ def _make_tok():
     except Exception:
         return None
     tok.add_special_tokens(
-        {"additional_special_tokens": [t for t in ("<|im_start|>", "<|im_end|>", "<think>", "</think>") if t not in tok.get_vocab()]}
+        {
+            "additional_special_tokens": [
+                t for t in ("<|im_start|>", "<|im_end|>", "<think>", "</think>") if t not in tok.get_vocab()
+            ]
+        }
     )
     tok.chat_template = HISTORY_STRIP_TEMPLATE
     tok.eos_token = "<|im_end|>"
@@ -65,17 +69,21 @@ def _trained(res):
 
 MULTI = [
     {"role": "system", "content": "Sei un assistente utile."},
-    {"role": "user", "content": "Q1"}, {"role": "assistant", "content": "ZEBRA"},
-    {"role": "user", "content": "Q2"}, {"role": "assistant", "content": "QUOKKA"},
-    {"role": "user", "content": "Qreal"}, {"role": "assistant", "content": "FINALX"},
+    {"role": "user", "content": "Q1"},
+    {"role": "assistant", "content": "ZEBRA"},
+    {"role": "user", "content": "Q2"},
+    {"role": "assistant", "content": "QUOKKA"},
+    {"role": "user", "content": "Qreal"},
+    {"role": "assistant", "content": "FINALX"},
 ]
 
 
 @needs_tok
 def test_uses_fallback_not_fast_path():
     """The template has no {% generation %} -> the fast assistant mask must be empty."""
-    enc = TOK.apply_chat_template(MULTI, tokenize=True, add_generation_prompt=False,
-                                  return_assistant_tokens_mask=True, return_dict=True)
+    enc = TOK.apply_chat_template(
+        MULTI, tokenize=True, add_generation_prompt=False, return_assistant_tokens_mask=True, return_dict=True
+    )
     mk = "assistant_masks" if "assistant_masks" in enc else "assistant_tokens_mask"
     assert sum(enc.get(mk, []) or []) == 0
 

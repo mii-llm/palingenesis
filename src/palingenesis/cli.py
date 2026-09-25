@@ -28,6 +28,7 @@ Commands:
   train       Start training (use with torchrun for multi-GPU)
   distill     On-policy distillation: the student samples, its teachers score, KL update
   distill-score  Annotate an mcqa distillation pool with the teacher's answers (filter before training)
+  rl          Reinforcement learning: rollouts scored by rewards (math, code, tools, your own)
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
   prepare     Score and filter data by difficulty (offline, uses model inference)
   prepare-multi  Prepare multiple sources with per-source scoring + MSFT allocation
@@ -43,6 +44,7 @@ Commands:
 Usage:
   pgs train --config configs/quickstart.yaml
   pgs distill --config configs/distill_math.yaml
+  pgs rl --config configs/rl_math.yaml
   pgs autopilot --model Qwen/Qwen3.5-4B --dataset my_data.jsonl
   pgs prepare --model Qwen/Qwen3.5-4B --data traces.jsonl --strategy optimal
 
@@ -77,6 +79,11 @@ def main():
             from palingenesis.opd.trainer import main as distill_main
 
             distill_main()
+
+        case "rl":
+            from palingenesis.rl.trainer import main as rl_main
+
+            rl_main()
 
         case "distill-score":
             from palingenesis.opd.score_pool import main as distill_score_main
@@ -309,7 +316,7 @@ def _run_s0_tune():
             epoch_loss += loss
         avg_loss = epoch_loss / max(len(batches), 1)
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            logger.info(f"Epoch {epoch+1}/{args.epochs}: avg_loss={avg_loss:.4f}")
+            logger.info(f"Epoch {epoch + 1}/{args.epochs}: avg_loss={avg_loss:.4f}")
 
     # Save
     trainer.save(args.output)

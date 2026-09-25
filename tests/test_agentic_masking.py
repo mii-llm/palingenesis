@@ -62,14 +62,25 @@ def _make_tok():
 TOK = _make_tok()
 needs_tok = pytest.mark.skipif(TOK is None, reason="gpt2 tokenizer not cached (offline)")
 
-TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Weather for a city.",
-                                           "parameters": {"type": "object",
-                                                          "properties": {"city": {"type": "string"}}}}}]
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Weather for a city.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }
+]
 
 AGENT = [
     {"role": "user", "content": "Weather in Rome?"},
-    {"role": "assistant", "content": "Let me check.", "reasoning_content": "Need the tool.",
-     "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Rome"}'}}]},
+    {
+        "role": "assistant",
+        "content": "Let me check.",
+        "reasoning_content": "Need the tool.",
+        "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Rome"}'}}],
+    },
     {"role": "tool", "content": "SUNNY_24C"},
     {"role": "assistant", "content": "It is sunny, 24C."},
 ]
@@ -87,8 +98,9 @@ def _render(tok, row):
 @needs_tok
 def test_markers_derived_from_template():
     ds = ChatDataset(None, TOK, 4096)
-    assert ds._turn_markers() == TurnMarkers(header="<|im_start|>assistant\n", end="<|im_end|>",
-                                             turn_open="<|im_start|>")
+    assert ds._turn_markers() == TurnMarkers(
+        header="<|im_start|>assistant\n", end="<|im_end|>", turn_open="<|im_start|>"
+    )
 
 
 @needs_tok
@@ -137,8 +149,12 @@ def test_tools_field_is_configurable():
 
 @needs_tok
 def test_loss_false_turn_is_context_only():
-    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "GREETING", "loss": False},
-            {"role": "user", "content": "q"}, {"role": "assistant", "content": "ANSWER", "loss": True}]
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "GREETING", "loss": False},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "ANSWER", "loss": True},
+    ]
     res = ChatDataset(None, TOK, 4096)._process({"messages": msgs})
     assert _trained(TOK, res) == "ANSWER<|im_end|>"
     assert "GREETING" in TOK.decode(res["input_ids"])
@@ -181,9 +197,13 @@ def test_reasoning_masked_when_disabled_keeps_tool_call():
 @needs_tok
 def test_truncation_keeps_whole_turns_and_ends_on_an_answer():
     long_answer = " ".join(["word"] * 300)
-    msgs = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "FIRST"},
-            {"role": "user", "content": "q2"}, {"role": "assistant", "content": long_answer},
-            {"role": "user", "content": "q3"}]
+    msgs = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "FIRST"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": long_answer},
+        {"role": "user", "content": "q3"},
+    ]
     ds = ChatDataset(None, TOK, 64)
     res = ds._process({"messages": msgs})
     assert _trained(TOK, res) == "FIRST<|im_end|>"

@@ -80,7 +80,7 @@ def lr_sweep(
     monitor = _seeded_drift_monitor(base_config)
 
     for i, lr in enumerate(lr_candidates):
-        logger.info(f"  [{i+1}/{len(lr_candidates)}] LR={lr:.1e}")
+        logger.info(f"  [{i + 1}/{len(lr_candidates)}] LR={lr:.1e}")
         t0 = time.perf_counter()
 
         # Create a trial-specific config

@@ -47,9 +47,9 @@ def test_power_decay_scheduler():
     lr_at_550 = optimizer.param_groups[0]["lr"]
     # Power decay: (1-0.5)^4 = 0.0625 → LR = 0.1 + 0.9*0.0625 = 0.15625 of peak
     expected_fraction = 0.1 + 0.9 * (0.5**4)
-    assert (
-        abs(lr_at_550 / 1e-3 - expected_fraction) < 0.02
-    ), f"Mid-training LR should be ~{expected_fraction*1e-3:.6f}, got {lr_at_550:.6f}"
+    assert abs(lr_at_550 / 1e-3 - expected_fraction) < 0.02, (
+        f"Mid-training LR should be ~{expected_fraction * 1e-3:.6f}, got {lr_at_550:.6f}"
+    )
 
     # End of training: should be at min_lr_ratio
     for _ in range(450):
@@ -58,8 +58,8 @@ def test_power_decay_scheduler():
     assert lr_end <= 1e-3 * 0.12, f"End LR should be near min_lr_ratio, got {lr_end}"
 
     print(f"  Warmup end: {lr_at_100:.6f}")
-    print(f"  Mid-decay:  {lr_at_550:.6f} (expected ~{expected_fraction*1e-3:.6f})")
-    print(f"  End:        {lr_end:.6f} (floor={1e-3*0.1:.6f})")
+    print(f"  Mid-decay:  {lr_at_550:.6f} (expected ~{expected_fraction * 1e-3:.6f})")
+    print(f"  End:        {lr_end:.6f} (floor={1e-3 * 0.1:.6f})")
     print("✓ test_power_decay_scheduler PASSED\n")
 
 
@@ -127,9 +127,9 @@ def test_scheduler_monotonicity():
         # After warmup (step 50+), LR should be non-increasing
         post_warmup = lrs[50:]
         for i in range(1, len(post_warmup)):
-            assert (
-                post_warmup[i] <= post_warmup[i - 1] + 1e-10
-            ), f"{sched_type}: LR increased at step {50+i}: {post_warmup[i-1]:.8f} -> {post_warmup[i]:.8f}"
+            assert post_warmup[i] <= post_warmup[i - 1] + 1e-10, (
+                f"{sched_type}: LR increased at step {50 + i}: {post_warmup[i - 1]:.8f} -> {post_warmup[i]:.8f}"
+            )
 
         print(f"  {sched_type}: peak={max(lrs):.6f}, end={lrs[-1]:.6f} ✓")
 
@@ -259,7 +259,7 @@ def _adam_direction(grads, beta1=0.9, beta2=0.95, eps=1e-8):
         m = beta1 * m + (1 - beta1) * g
         v = beta2 * v + (1 - beta2) * g * g
     t = len(grads)
-    return (m / (1 - beta1 ** t)) / ((v / (1 - beta2 ** t)).sqrt() + eps)
+    return (m / (1 - beta1**t)) / ((v / (1 - beta2**t)).sqrt() + eps)
 
 
 def test_hyperball_matches_the_paper_update():
@@ -269,10 +269,14 @@ def test_hyperball_matches_the_paper_update():
 
     torch.manual_seed(0)
     W = nn.Parameter(torch.randn(16, 8, dtype=torch.float64))
-    b = nn.Parameter(torch.randn(8, dtype=torch.float64))            # unconstrained
+    b = nn.Parameter(torch.randn(8, dtype=torch.float64))  # unconstrained
     R = W.detach().norm()
-    base = torch.optim.AdamW([{"params": [W], "weight_decay": 0.3}, {"params": [b], "weight_decay": 0.0}],
-                             lr=0.123, betas=(0.9, 0.95), eps=1e-8)
+    base = torch.optim.AdamW(
+        [{"params": [W], "weight_decay": 0.3}, {"params": [b], "weight_decay": 0.0}],
+        lr=0.123,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
     hb = Hyperball(base, [W], angular_lr=0.05)
     reference, grads = W.detach().clone(), []
     for _ in range(5):
@@ -285,8 +289,8 @@ def test_hyperball_matches_the_paper_update():
         trial = reference - 0.05 * R * u / u.norm()
         reference = R * trial / trial.norm()
         assert torch.allclose(W.detach(), reference, rtol=0, atol=1e-9)
-        assert not torch.equal(b.detach(), b_before)                 # the rest still trains
-    assert base.param_groups[0]["weight_decay"] == 0.3             # restored after the step
+        assert not torch.equal(b.detach(), b_before)  # the rest still trains
+    assert base.param_groups[0]["weight_decay"] == 0.3  # restored after the step
 
 
 def test_hyperball_keeps_norm_sets_angular_step_and_follows_schedule():
@@ -296,16 +300,16 @@ def test_hyperball_keeps_norm_sets_angular_step_and_follows_schedule():
     W = nn.Parameter(torch.randn(32, 64))
     R = W.detach().norm().item()
     base = torch.optim.AdamW([W], lr=1.0)
-    sched = build_scheduler(base, "linear", 10, 0.0, 0.1)              # lr factor 1 -> 0.1
+    sched = build_scheduler(base, "linear", 10, 0.0, 0.1)  # lr factor 1 -> 0.1
     hb = Hyperball(base, [W], angular_lr=1e-2)
     for _ in range(10):
         before = W.detach().clone()
         factor = base.param_groups[0]["lr"] / base.param_groups[0]["initial_lr"]
-        W.grad = torch.randn_like(W) * 1e3                           # gradient scale must not matter
+        W.grad = torch.randn_like(W) * 1e3  # gradient scale must not matter
         hb.step()
         sched.step()
         assert abs(W.detach().norm().item() - R) / R < 1e-5
-        moved = (W.detach() - before).norm().item() / R               # chord <= eta, ~eta for small eta
+        moved = (W.detach() - before).norm().item() / R  # chord <= eta, ~eta for small eta
         assert 0.99 * 1e-2 * factor / (1 + (1e-2 * factor) ** 2) ** 0.5 < moved <= 1e-2 * factor * 1.0001
 
 
@@ -336,8 +340,8 @@ def test_hyperball_buckets_bound_memory_and_match_one_bucket():
             hb.step()
         return len(hb._buckets), [m.detach().clone() for m in mats]
 
-    n_small, small = run(8 * 8 * 8)          # one matrix per bucket
-    n_big, big = run(1 << 30)                # everything at once
+    n_small, small = run(8 * 8 * 8)  # one matrix per bucket
+    n_big, big = run(1 << 30)  # everything at once
     assert (n_small, n_big) == (5, 1)
     assert all(torch.equal(a, b) for a, b in zip(small, big))
 
@@ -350,8 +354,11 @@ def test_hyperball_convergence(base_name):
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(32, 64, bias=False), nn.Tanh(), nn.Linear(64, 16, bias=False))
     teacher = nn.Sequential(nn.Linear(32, 64, bias=False), nn.Tanh(), nn.Linear(64, 16, bias=False))
-    base = (torch.optim.AdamW(model.parameters(), lr=1e-2) if base_name == "adamw"
-            else torch.optim.SGD(model.parameters(), lr=1e-2, momentum=0.9))
+    base = (
+        torch.optim.AdamW(model.parameters(), lr=1e-2)
+        if base_name == "adamw"
+        else torch.optim.SGD(model.parameters(), lr=1e-2, momentum=0.9)
+    )
     hb = Hyperball(base, [p for n, p in model.named_parameters() if is_hyperball_param(n, p)], angular_lr=2e-2)
     losses = []
     for _ in range(300):
@@ -458,7 +465,7 @@ def test_sage_basic_convergence():
     final = sum(losses[-5:]) / 5
     print(f"  Initial loss: {initial:.4f}")
     print(f"  Final loss:   {final:.4f}")
-    assert final < initial * 0.5, f"SAGE should converge, only {(1-final/initial)*100:.0f}% reduction"
+    assert final < initial * 0.5, f"SAGE should converge, only {(1 - final / initial) * 100:.0f}% reduction"
     print("✓ test_sage_basic_convergence PASSED\n")
 
 
