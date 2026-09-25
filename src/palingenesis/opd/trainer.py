@@ -139,10 +139,16 @@ class OPDTrainer:
         rollout = config.rollout
         server = None
         if rollout.backend == "vllm_server":
+            import importlib.util
+
+            if not rollout.url and importlib.util.find_spec("ray") is None:
+                raise OPDConfigError("rollout.backend vllm_server: vLLM's weight transfer into the server it "
+                                     "launches needs ray. Install it with: pip install 'palingenesis[vllm-server]'")
             server = self._server(config.model.student, rollout.url, "rollout", [
                 "--gpu-memory-utilization", str(rollout.gpu_memory_utilization),
                 "--max-model-len", str(rollout.max_model_len), "--logprobs-mode", "processed_logprobs",
-                "--weight-transfer-config", '{"backend": "ipc"}', *(["--enforce-eager"] if rollout.enforce_eager else [])])
+                "--weight-transfer-config", '{"backend": "ipc"}', *(["--enforce-eager"] if rollout.enforce_eager else []),
+                *(["--enable-prefix-caching"] if rollout.prefix_caching else [])])
 
         if config.model.use_liger_kernel and self.device == "cuda":     # patches classes: before any model loads
             for model_type in sorted({model_type_of(m) for m in [config.model.student] + [
@@ -166,7 +172,8 @@ class OPDTrainer:
         elif rollout.backend == "vllm":
             engine = VLLMColocateRollout(config.model.student, self.stop_ids, rollout.gpu_memory_utilization,
                                          rollout.max_model_len, rollout.enforce_eager, config.train.seed,
-                                         sleep_mode=rollout.sleep and rollout.max_staleness == 0)
+                                         sleep_mode=rollout.sleep and rollout.max_staleness == 0,
+                                         prefix_caching=rollout.prefix_caching)
         else:
             engine = VLLMServerRollout(server, self.stop_ids)
 
@@ -191,9 +198,8 @@ class OPDTrainer:
         # hit illegal memory accesses (vLLM 0.26) that CUDA_LAUNCH_BLOCKING=1 made vanish,
         # a race between streams. On the default stream only its host work overlaps.
         overlap = rollout.max_staleness > 0 and rollout.backend == "vllm_server" and self.device == "cuda"
-        self.pipeline = Pipeline(self.tok, engine, self.routes, self.weights, chat_kwargs,
-                                 config.train.score_micro_seqs, torch.cuda.Stream() if overlap else None)
-        self.source = source or build_source(config, self.rng)
+        self.pipeline = self._make_pipeline(engine, overlap)
+        self.source = source or self._make_source()
         self.orchestrator = Orchestrator(self.pipeline, self._draw, rollout.temperature, rollout.max_staleness)
         self.opt = torch.optim.AdamW(self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0,
                                      fused=self.device == "cuda")
@@ -212,6 +218,14 @@ class OPDTrainer:
                 self.wandb = wandb
             except Exception as e:  # noqa: BLE001 — a metrics backend must never kill a training run
                 logger.warning("wandb init failed (%s); continuing without it", e)
+
+    def _make_pipeline(self, engine, overlap: bool):
+        """The rollout pipeline (a subclass for other data shapes, e.g. agent traces)."""
+        return Pipeline(self.tok, engine, self.routes, self.weights, self.config.model.chat_template_kwargs,
+                        self.config.train.score_micro_seqs, torch.cuda.Stream() if overlap else None)
+
+    def _make_source(self):
+        return build_source(self.config, self.rng)
 
     def _server(self, model: str, url: str, role: str, args: list[str]) -> VLLMServer:
         server = VLLMServer(model, url=url, args=tuple(args),
@@ -524,7 +538,7 @@ class OPDTrainer:
         path = Path(self.config.train.output_dir) / name
         logger.info("Saving checkpoint -> %s", path)
         with self.weights.lock:       # a rollout engine may be copying the weights (max_staleness > 0)
-            save_hf_model(self.student, self.tok, path)
+            save_hf_model(self.student, self.tok, path, source_layout=True)
         with open(path / "opd_config.json", "w") as f:
             json.dump(dataclasses.asdict(self.config), f, indent=2)
         if step is not None:
@@ -613,7 +627,13 @@ def main():
     from palingenesis.logging import setup_logging
 
     setup_logging(rank=0)
-    OPDTrainer(OPDConfig.from_cli()).train()
+    config = OPDConfig.from_cli()
+    if any(source.format == "agent_traces" for source in config.sources.values()):
+        from palingenesis.opd.trace_trainer import TraceTrainer
+
+        TraceTrainer(config).train()
+    else:
+        OPDTrainer(config).train()
 
 
 if __name__ == "__main__":

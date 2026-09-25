@@ -63,6 +63,11 @@ vllm = [
     "torchaudio==2.11.0; sys_platform == 'linux'",
     "torchcodec>=0.14; sys_platform == 'linux'",
 ]
+# rollout.backend vllm_server: vLLM's weight transfer into a running server imports ray
+vllm-server = [
+    "palingenesis[vllm]",
+    "ray>=2.40; sys_platform == 'linux'",
+]
 # Logging backends
 logging = [
     "trackio>=0.25.0",

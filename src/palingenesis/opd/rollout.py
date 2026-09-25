@@ -196,14 +196,15 @@ class VLLMColocateRollout:
     """
 
     def __init__(self, model: str, stop_ids: tuple[int, ...], gpu_memory_utilization: float, max_model_len: int,
-                 enforce_eager: bool, seed: int, sleep_mode: bool):
+                 enforce_eager: bool, seed: int, sleep_mode: bool, prefix_caching: bool = False):
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         vllm = _import_vllm()
         self.stop_ids = stop_ids
         self.sleep_mode = sleep_mode
         self.llm = vllm.LLM(model=model, dtype="bfloat16", gpu_memory_utilization=gpu_memory_utilization,
                             max_model_len=max_model_len, enforce_eager=enforce_eager, seed=seed,
-                            enable_sleep_mode=sleep_mode, logprobs_mode="processed_logprobs")
+                            enable_sleep_mode=sleep_mode, logprobs_mode="processed_logprobs",
+                            enable_prefix_caching=prefix_caching)
         self.SamplingParams = vllm.SamplingParams
         self.version = 0               # -1 while asleep: the weights are gone until the next update
         self.asleep = False            # KV cache released

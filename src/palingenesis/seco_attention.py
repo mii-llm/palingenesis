@@ -187,41 +187,84 @@ def _merge(out_acc, lse_acc, out, lse):
 
 class ChunkAttention(torch.autograd.Function):
     """softmax attention of chunk queries over [stored prefix; chunk] with causal
-    masking inside the chunk. q: [B, H, L, D]; k/v: the chunk's own [B, Hkv, L, D]."""
+    masking inside the chunk. q: [B, H, L, D]; k/v: the chunk's own [B, Hkv, L, D].
+
+    `prefix` is the stored prefix length, the same for every row, or one per row
+    (branches of a tree continuing the stored trunk from different positions; the
+    store then holds the trunk once, batch 1, and serves every row). Prefix blocks
+    that every row covers are one call; a block that only some rows reach is
+    computed row by row over each row's own keys."""
 
     @staticmethod
-    def forward(ctx, q, k, v, store: KVStore, prefix: int, scale: float, block: int):
+    def forward(ctx, q, k, v, store: KVStore, prefix, scale: float, block: int):
+        rows = q.shape[0]
+        prefixes = [prefix] * rows if isinstance(prefix, int) else list(prefix)
+        shared = store.k.shape[0] != rows              # one stored row serving every query row
         out_acc = lse_acc = None
-        auxes = []
-        for start in range(0, prefix, block):
-            end = min(start + block, prefix)
+        parts = []
+        for start in range(0, max(prefixes, default=0), block):
+            end = min(start + block, max(prefixes))
             kb, vb = store.load(start, end)
-            out, lse, aux = _block_forward(q, kb, vb, False, scale)
+            valid = [min(max(p - start, 0), end - start) for p in prefixes]
+            if all(n == end - start for n in valid):
+                kx, vx = (_broadcast(kb, rows), _broadcast(vb, rows)) if shared else (kb, vb)
+                out, lse, aux = _block_forward(q, kx, vx, False, scale)
+                parts.append((start, end, None, aux))
+            else:
+                out = q.new_zeros(q.shape, dtype=torch.promote_types(q.dtype, torch.float32))
+                lse = torch.full(q.shape[:3], float("-inf"), dtype=torch.float32, device=q.device)
+                per_row = []
+                for b, n in enumerate(valid):
+                    if n == 0:
+                        continue
+                    src = slice(0, 1) if shared else slice(b, b + 1)
+                    o, l_, a = _block_forward(q[b:b + 1], kb[src][..., :n, :], vb[src][..., :n, :], False, scale)
+                    out[b:b + 1], lse[b:b + 1] = o.to(out.dtype), l_.to(lse.dtype)
+                    per_row.append((b, n, a))
+                parts.append((start, end, per_row, None))
             out_acc, lse_acc = _merge(out_acc, lse_acc, out, lse)
-            auxes.append((start, end, aux))
         out, lse, aux_local = _block_forward(q, k, v, True, scale)
         out_acc, lse_acc = _merge(out_acc, lse_acc, out, lse)
         out = out_acc.to(q.dtype)
         ctx.save_for_backward(q, k, v, out, lse_acc)
-        ctx.store, ctx.scale, ctx.auxes, ctx.aux_local = store, scale, auxes, aux_local
+        ctx.store, ctx.scale, ctx.parts, ctx.aux_local, ctx.shared = store, scale, parts, aux_local, shared
         return out
 
     @staticmethod
     def backward(ctx, dout):
         q, k, v, out, lse = ctx.saved_tensors
         dout = dout.to(q.dtype).contiguous()
-        store = ctx.store
+        store, rows = ctx.store, q.shape[0]
         dq = torch.zeros(q.shape, dtype=torch.promote_types(q.dtype, torch.float32), device=q.device)
-        for start, end, aux in ctx.auxes:
+        for start, end, per_row, aux in ctx.parts:
             kb, vb = store.load(start, end)
-            dqb, dkb, dvb = _block_backward(dout, q, kb, vb, out, lse, False, ctx.scale, aux)
-            dq += dqb
-            if store.grad_k is not None:
-                store.grad_k[..., start:end, :].add_(dkb)
-                store.grad_v[..., start:end, :].add_(dvb)
+            if per_row is None:
+                kx, vx = (_broadcast(kb, rows), _broadcast(vb, rows)) if ctx.shared else (kb, vb)
+                dqb, dkb, dvb = _block_backward(dout, q, kx, vx, out, lse, False, ctx.scale, aux)
+                dq += dqb
+                if store.grad_k is not None:
+                    if ctx.shared:
+                        dkb, dvb = dkb.sum(0, keepdim=True), dvb.sum(0, keepdim=True)
+                    store.grad_k[..., start:end, :].add_(dkb)
+                    store.grad_v[..., start:end, :].add_(dvb)
+                continue
+            for b, n, a in per_row:
+                src = slice(0, 1) if ctx.shared else slice(b, b + 1)
+                r = slice(b, b + 1)
+                dqb, dkb, dvb = _block_backward(dout[r], q[r], kb[src][..., :n, :], vb[src][..., :n, :], out[r],
+                                                lse[r], False, ctx.scale, a)
+                dq[r] += dqb
+                if store.grad_k is not None:
+                    store.grad_k[src][..., start:start + n, :].add_(dkb)
+                    store.grad_v[src][..., start:start + n, :].add_(dvb)
         dql, dkl, dvl = _block_backward(dout, q, k, v, out, lse, True, ctx.scale, ctx.aux_local)
         dq += dql
         return dq.to(q.dtype), dkl, dvl, None, None, None, None
+
+
+def _broadcast(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """A stored [1, ...] block for `rows` query rows (the kernels need matching batch sizes)."""
+    return t.expand(rows, *t.shape[1:]).contiguous()
 
 
 def chunk_attention(q, k, v, store: KVStore, prefix: int, scale: float | None, block: int) -> torch.Tensor:

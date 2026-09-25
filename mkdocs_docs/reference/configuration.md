@@ -309,10 +309,15 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `format` | str | `messages` | `messages` (chat JSONL `{"messages": [...], "answer"?: ...}`: held-out reverse KL, plus greedy accuracy for rows with an answer) or `mcqa` (pool-row JSONL: letter accuracy). |
+| `format` | str | `messages` | `messages` (chat JSONL `{"messages": [...], "answer"?: ...}`: held-out reverse KL, plus greedy accuracy for rows with an answer), `mcqa` (pool-row JSONL: letter accuracy) or `agent_traces` (recorded agent conversations, JSONL or parquet: the student regenerates their assistant turns; see the distillation guide). |
 | `path` | str | — | Prompt file. |
 | `weight` | float | `1.0` | Sampling weight among the sources. |
 | `teacher` | str | `""` | Teacher of this source's prompts (empty = the first teacher). |
+| `topic_field` | str | `""` | Row field holding a topic (e.g. `domain`), for `topic_teachers`. |
+| `topic_teachers` | dict | `{}` | `{teacher: [topics]}`: rows whose topic is listed go to that teacher, the others to `teacher`. A topic may be listed under one teacher only. |
+| `messages_field` / `tools_field` | str | `messages` / `tools` | agent_traces: the columns holding the conversation and the tool schemas (lists or JSON strings). |
+| `branches_per_trace` | int | `8` | agent_traces: assistant turns regenerated per sampled trace (0 = all). |
+| `max_context` | int | `32768` | agent_traces: longest context (tokens) a regenerated turn may have; later turns are not sampled. |
 | `max_new_tokens` | int | `512` | Completion budget (mcqa: fast-template prompts). |
 | `dev_size` | int | `200` | Held-out rows split off `path` (deterministic, hash-ranked, unique). |
 | `dev_path` | str | `""` | A separate held-out file instead (e.g. a benchmark's test split). |
@@ -336,6 +341,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `micro_seqs` | int | `64` | hf: sequences per `generate()` call. |
 | `gpu_memory_utilization` | float | `0.3` | vllm: GPU fraction for the engine's weights and KV cache. |
 | `max_model_len` | int | `4096` | vllm: prompt + completion tokens. |
+| `prefix_caching` | bool | `false` | vllm: automatic prefix caching. For agent traces: every turn of a trace reuses the trace's one prefill (Qwen3.5 hybrids included). |
 | `enforce_eager` | bool | `false` | vllm: no CUDA graphs. |
 | `sleep` | bool | `true` | vllm, `max_staleness: 0`: release the engine's weights and KV cache while the trainer trains. `false` keeps it resident (no wake-up each step) when its `gpu_memory_utilization` fits beside training. |
 | `url` | str | `""` | vllm_server: a running server (started with `--weight-transfer-config '{"backend": "ipc"}'` on the trainer's GPU). |
@@ -351,6 +357,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `xtok_spread` | str | `chunk` | `chunk`: every token of a chunk gets the chunk's advantage. `proportional`: token t gets A_c · log p(t) / log p(chunk). |
 | `xtok_dense_weight` | float | `0.0` | Weight of a top-k KL at chunks of exactly one token on each side. |
 | `mask_whitespace` | bool | `true` | xtok: no loss on whitespace-only chunks. |
+| `trace_kd_weight` | float | `0.0` | agent_traces: weight of distillation on the recorded assistant turns inside each trace (off-policy, from the teacher pass the regenerated turns need anyway). |
 | `rs_rounds` | int | `50` | rs_kd: tokens drawn from the teacher's distribution per position. |
 | `rs_temperature` | float | `1.0` | rs_kd: the draws' proposal is the teacher's distribution raised to this power; importance weights correct for it. |
 | `token_weighting` | str | `none` | Which completion tokens the loss weighs, for every loss: `none`; `sure`: w = 1 + `sure_alpha` (1 − p), p the student's probability of the sampled token; `entropy`: only the `entropy_keep` fraction of tokens with the highest student entropy in each scoring micro-batch. |
@@ -373,6 +380,9 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `eval_samples` | int | `200` | Dev prompts per source and evaluation. |
 | `save_steps` | int | `0` | Resumable checkpoint (`step_N`: the model in HF format plus optimizer, policy version and random states) every N steps; 0 = only the `final` model export. |
 | `keep_checkpoints` | int | `3` | Newest `step_*` dirs kept (0 = keep all; `final` exempt). |
+| `tree_chunk_size` | int | `8192` | agent_traces: tokens per chunk of a trace's shared context (activation memory). |
+| `tree_branch_tokens` | int | `8192` | agent_traces: padded tokens per batched forward of regenerated turns (0 = one at a time). |
+| `tree_min_gap` | int | `1024` | agent_traces: the context is cut at a turn only this far past the previous cut; turns in between re-read the gap in their batched forward (fewer, larger passes; exact). |
 | `resume_from` | str | `""` | A `step_*` checkpoint dir, or `auto`: the newest complete one in `output_dir`, starting fresh if there is none. |
 
 ### logging

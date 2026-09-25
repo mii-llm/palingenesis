@@ -43,17 +43,106 @@ def hf_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return clean
 
 
-def save_hf_model(model, tokenizer, path: Path, state: dict[str, torch.Tensor] | None = None) -> None:
+def save_hf_model(model, tokenizer, path: Path, state: dict[str, torch.Tensor] | None = None,
+                  source_layout: bool = False) -> None:
     """Save in Hugging Face format under the architecture's parameter names.
 
     `state` is an already gathered full state dict (FSDP); by default the model's own.
     The live model is never modified.
+
+    source_layout: for a model loaded as a causal LM from a checkpoint of another
+    architecture (Qwen3.5's checkpoints are multimodal; transformers loads their
+    language model as Qwen3_5ForCausalLM), save in that checkpoint's layout: its
+    config, the weights under its names, and the weights the causal LM does not have
+    (the vision tower) copied from it. Then it loads wherever the original does (vLLM
+    serves Qwen3.5 only through the multimodal architecture). Exports use it; the
+    trainer's own resume checkpoints keep the model's names.
     """
     path.mkdir(parents=True, exist_ok=True)
     state = hf_state_dict(state if state is not None else model.state_dict())
-    model.save_pretrained(path, state_dict=state, safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
+    source = _source_checkpoint(model) if source_layout else None
+    if source is None:
+        model.save_pretrained(path, state_dict=state, safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
+    else:
+        _save_in_source_layout(model, state, path, *source)
     if tokenizer is not None:
         tokenizer.save_pretrained(path)
+
+
+def _source_checkpoint(model):
+    """(config, name or path) of the checkpoint `model` was loaded from, when its architecture
+    differs from the model's own (a causal-LM view of a multimodal checkpoint); else None."""
+    from transformers import AutoConfig
+
+    own = getattr(model, "config", None)
+    name = getattr(own, "_name_or_path", "") or ""
+    if not name:
+        return None
+    try:
+        config = AutoConfig.from_pretrained(name)
+    except Exception:                                     # noqa: BLE001 — no source to follow
+        return None
+    if config.model_type == own.model_type:
+        return None
+    return config, name
+
+
+def _source_dir(name: str) -> Path:
+    """The source checkpoint's directory (local, or its Hub snapshot: weights and json files)."""
+    local = Path(name)
+    if not local.is_dir():
+        from huggingface_hub import snapshot_download
+
+        local = Path(snapshot_download(name, allow_patterns=["*.safetensors", "*.json"]))
+    return local
+
+
+def _save_in_source_layout(model, state: dict, path: Path, config, name: str) -> None:
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from safetensors import safe_open
+    from transformers.core_model_loading import revert_weight_conversion
+
+    seen: set[int] = set()
+    unique = {}
+    for key, tensor in state.items():             # tied weights once, as save_pretrained (before renaming,
+        if tensor.data_ptr() not in seen:          # which may build new tensors)
+            seen.add(tensor.data_ptr())
+            unique[key] = tensor
+    weights = revert_weight_conversion(model, unique)                # the source checkpoint's names
+    source_dir = _source_dir(name)
+    files = sorted(source_dir.glob("*.safetensors"))
+    source_keys = {}
+    for file in files:
+        with safe_open(str(file), framework="pt") as f:
+            source_keys.update(dict.fromkeys(f.keys(), file))
+    unmatched = sorted(k for k in weights if k not in source_keys)
+    if unmatched:
+        # Never fill a trained weight's slot from the source: that would silently export the
+        # untrained weight. Every trained tensor must land on one of the source's names.
+        raise RuntimeError(f"cannot save in the layout of {name}: trained weights without a counterpart there "
+                           f"({unmatched[:5]}{' ...' if len(unmatched) > 5 else ''})")
+    copied = 0
+    for file in files:
+        with safe_open(str(file), framework="pt") as f:
+            for key in f.keys():
+                if key not in weights:                   # a module the causal LM does not have (vision)
+                    weights[key] = f.get_tensor(key)
+                    copied += 1
+    weights = {k: v.detach().contiguous().cpu() for k, v in weights.items()}
+    split = split_torch_state_dict_into_shards(weights, max_shard_size=MAX_SHARD_SIZE)
+    for filename, keys in split.filename_to_tensors.items():
+        safetensors_save({k: weights[k] for k in keys}, str(path / filename), metadata={"format": "pt"})
+    if split.is_sharded:
+        index = {"metadata": {"total_size": sum(v.numel() * v.element_size() for v in weights.values())},
+                 "weight_map": split.tensor_to_filename}
+        (path / "model.safetensors.index.json").write_text(json.dumps(index, indent=2))
+    config.save_pretrained(path)
+    for extra in source_dir.glob("*processor*.json"):      # image/video processors: the architecture needs them
+        shutil.copy(extra, path / extra.name)
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(path)
+    logger.info("Saved in the layout of %s (%s): %d trained tensors, %d copied from it",
+                name, type(config).__name__, len(weights) - copied, copied)
 
 
 def save_checkpoint(
@@ -451,11 +540,11 @@ def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool) -> None
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         state = get_model_state_dict(model, options=opts)
         if dist.get_rank() == 0:
-            save_hf_model(model, tokenizer, path, state=state)
+            save_hf_model(model, tokenizer, path, state=state, source_layout=True)
         del state
         dist.barrier()
     else:
-        save_hf_model(model, tokenizer, path)
+        save_hf_model(model, tokenizer, path, source_layout=True)
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:

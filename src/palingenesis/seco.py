@@ -225,8 +225,37 @@ def spaco_forward_backward(model, input_ids, labels, *, chunk_size: int = 4096, 
 def chunkwise_forward_backward(model: nn.Module, input_ids: torch.Tensor, labels: torch.Tensor, **kwargs) -> ChunkwiseResult:
     """Accumulate d(loss)/d(params) into `.grad`, chunk by chunk; the caller must
     NOT call `.backward()` afterwards. See `_chunkwise` for the arguments."""
-    with _chunk_attention(model):
+    with _chunk_attention(model), differentiable_decode(model):
         return _chunkwise(model, input_ids, labels, **kwargs)
+
+
+@contextmanager
+def differentiable_decode(model: nn.Module):
+    """One-token cached forwards through kernels that backpropagate, for the duration.
+
+    transformers' linear-attention layers (Gated DeltaNet: Qwen3.5, Qwen3-Next, ...)
+    switch to decode kernels when a cached forward gets a single token: fla's
+    fused_recurrent (its backward raises) and causal-conv1d's update (no autograd:
+    gradients would silently stop there). A chunk of one token happens in chunk-wise
+    training (a sequence one token past a multiple of the chunk size, adjacent
+    branch points). Route them to the layer's chunk kernel, which handles any length,
+    and to the model's own torch convolution update."""
+    import sys
+
+    patched = []
+    for module in model.modules():
+        if "recurrent_gated_delta_rule" in module.__dict__ and "chunk_gated_delta_rule" in module.__dict__:
+            patched.append((module, "recurrent_gated_delta_rule", module.recurrent_gated_delta_rule))
+            module.recurrent_gated_delta_rule = module.chunk_gated_delta_rule
+        torch_update = getattr(sys.modules.get(type(module).__module__), "torch_causal_conv1d_update", None)
+        if "causal_conv1d_update" in module.__dict__ and torch_update is not None:
+            patched.append((module, "causal_conv1d_update", module.causal_conv1d_update))
+            module.causal_conv1d_update = torch_update
+    try:
+        yield
+    finally:
+        for module, name, original in patched:
+            setattr(module, name, original)
 
 
 def _chunkwise(
@@ -337,7 +366,10 @@ def _chunkwise(
         leaves = []
         for idx, (layer, app) in enumerate(zip(cache.layers, append)):
             state = _leafify(_onto(starts[i][idx], input_ids.device)) if i > 0 else {}
-            _apply_state(layer, state)
+            # clones of the leaves (the gradient still reaches them): a one-token chunk updates the
+            # conv state in place (the decode path), which a leaf does not allow
+            _apply_state(layer, {path: (v.clone() if torch.is_tensor(v) and v.requires_grad else v)
+                                 for path, v in state.items()})
             if app and i > 0 and not in_store[idx]:
                 _seed_kv(layer, [t[..., :lo, :] for t in kv[idx]])
             leaves.append(state)
@@ -347,7 +379,9 @@ def _chunkwise(
             _set_rng_state(rng_states[i], devices)          # same dropout masks as stage 1
             hidden = _run(backbone, input_ids[:, lo:hi], cache)
         loss = chunk_loss(hidden, lo, hi, weight=scale)   # SpaCO: J_i scaled by k/t (module doc)
-        relay = hidden.new_zeros((), dtype=torch.float32)
+        # The relay, d<out, scale * grad>/dθ for every output later chunks read, passed to
+        # autograd as (root, incoming gradient) pairs next to the loss (no scalar to build).
+        roots, grads = ([loss], [torch.ones_like(loss)]) if loss.requires_grad else ([], [])
         for idx, (layer, app) in enumerate(zip(cache.layers, append)):
             pairs = []
             if in_store[idx]:
@@ -361,18 +395,20 @@ def _chunkwise(
                 after = _state(layer, app, clone=False)
                 pairs += [(after[path], leaf.grad) for path, leaf in _tensors(next_leaves[idx])]
             for out, grad in pairs:
-                if grad is not None:
-                    relay = relay + (out.float() * (scale * grad.float())).sum()
+                if grad is not None and out.requires_grad:
+                    roots.append(out)
+                    grads.append((grad * scale if scale != 1.0 else grad).to(out.dtype))
         # Restore the pre-forward cache: activation checkpointing re-runs layer
         # forwards during backward and must see exactly the same inputs.
         for layer, state in zip(cache.layers, before):
             _restore(layer, state)
-        (loss + relay).backward()
+        if roots:
+            torch.autograd.backward(roots, grads)
         if not sparse:
             logged += float(loss.detach())
 
         next_leaves, next_chunk = leaves, i
-        del cache, hidden, loss, relay, before
+        del cache, hidden, loss, roots, grads, before
     _ACTIVE.clear()
     return ChunkwiseResult(loss=logged, num_chunks=k, backpropagated=len(order))
 
@@ -481,7 +517,7 @@ def _uses_fla_kernels(model: nn.Module) -> bool:
     return is_flash_linear_attention_available()
 
 
-def _run(backbone: nn.Module, input_ids: torch.Tensor, cache) -> torch.Tensor:
+def _run(backbone: nn.Module, input_ids: torch.Tensor, cache, position_ids: torch.Tensor | None = None) -> torch.Tensor:
     # attention_mask=None: rows are right-padded at most, so padding only follows
     # real tokens and causal attention keeps it from influencing them.
     from torch.nn.attention.bias import causal_lower_right
@@ -492,7 +528,8 @@ def _run(backbone: nn.Module, input_ids: torch.Tensor, cache) -> torch.Tensor:
     _ACTIVE.clear()
     if prefix:
         _BIASES[(q_len, prefix + q_len)] = causal_lower_right(q_len, prefix + q_len)
-    out = backbone(input_ids=input_ids, past_key_values=cache, use_cache=cache is not None)
+    extra = {"position_ids": position_ids} if position_ids is not None else {}
+    out = backbone(input_ids=input_ids, past_key_values=cache, use_cache=cache is not None, **extra)
     return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
 
@@ -719,7 +756,10 @@ def _functional(layer, cast: torch.dtype | None = None):
                 if ctx is None:
                     return base_seq_length(self, *args, **kwargs)
                 chunk = self.__dict__.get("_chunk_kv")
-                return ctx.lo + (chunk[0].shape[-2] if chunk is not None else 0)
+                # rows continuing the store from different positions (seco_tree) pass their own
+                # position ids; the cache then reports no shared past
+                lo = ctx.lo if isinstance(ctx.lo, int) else 0
+                return lo + (chunk[0].shape[-2] if chunk is not None else 0)
 
             methods["update"] = update
             methods["get_seq_length"] = get_seq_length

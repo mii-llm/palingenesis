@@ -186,6 +186,52 @@ Same setup (Qwen3.5-4B → 0.8B, 100 steps, one seed each; one standard error on
 
 Also run, 5 steps each: an hf teacher with `offload: true` (moving Qwen3-1.7B on and off the GPU adds 1.4 s per step) and a vLLM teacher (Qwen3.5-0.8B) for `xtok` with the dense term. Runs are in the `palingenesis-validation` wandb project, named `opd2-*`.
 
+## Agent traces: distill every turn of recorded trajectories
+
+Recorded agent conversations (system, user, then assistant turns with reasoning and tool calls, interleaved with tool outputs) are on-policy distillation data without any environment: at every assistant turn the student regenerates the turn from the recorded context, tool outputs included, and the teacher scores what it wrote. One trace gives one training context per assistant turn.
+
+```yaml
+model:
+  student: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: true}   # the traces reason between tool calls
+teachers:
+  big: {model: Qwen/Qwen3.5-4B}
+  small: {model: Qwen/Qwen3.5-2B}
+sources:
+  agent:
+    format: agent_traces
+    path: data/agent_traces.parquet     # rows: messages, tools, and any other columns
+    branches_per_trace: 8               # turns regenerated per sampled trace (0 = all)
+    max_context: 32768
+    max_new_tokens: 2048
+    teacher: small                      # topics not listed below
+    topic_field: domain
+    topic_teachers:
+      big: [Code_Agent, Search_Agent-en]
+rollout: {backend: vllm, prefix_caching: true, max_model_len: 36864}
+loss: {trace_kd_weight: 0.5}            # also distill the recorded turns (off-policy)
+```
+
+`configs/distill_agent_traces.yaml` is the full example (openbmb/UltraData-SFT-Agent-2609: code, search, office and tool-use agents; contexts of 5k–120k tokens, 2–95 assistant turns per trace).
+
+**Each context is the student's own rendering.** Contexts are rendered with the student's chat template exactly as at inference, tools included, and the student generates from those token ids; the teacher (same tokenizer) scores the same ids. Set the template options the traces were made with: with Qwen3.5 small models, `enable_thinking: true` (their template defaults to non-thinking, which would render every recorded turn's reasoning as a history the model never sees at inference).
+
+**Every model reads a trace once.** Inside one agentic loop, chat templates keep the earlier turns' reasoning (Qwen3.5 and MiniMax-M2.x after the last user query, GLM-5.x always unless `clear_thinking`), so turn *k*'s context is a prefix of turn *k+1*'s: the trace is one trunk with the turns hanging off it. Where a template rewrites the history (reasoning dropped once a new user message arrives), a turn leaves the trunk at its longest common prefix with it and carries the rest of its context. Then:
+
+| | reads | instead of |
+|---|---|---|
+| student rollouts | the trace prefilled once (vLLM prefix caching; Qwen3.5 hybrids included) | every turn's whole context |
+| teacher | the trace once, then every turn from its position (`palingenesis.seco_tree`) | every turn's whole context |
+| student training | the same tree, backward included; exact gradients through the shared context, activation memory of one chunk | every turn's whole context, forward and backward |
+
+On an 8-turn, 30k-token trace, prefix caching alone turns 3.2 s of prefill into 0.5 s. The tree's gradients are tested equal to training every turn as its own sequence (Qwen3.5 hybrid and pure attention, turns batched or not), and it runs the regenerated turns of a trace as one batched forward, each from its own position.
+
+**Recorded turns come free.** The trace holds the recorded assistant turns too, and the teacher reads them in the pass it makes anyway: `trace_kd_weight` adds distillation on them (off-policy, the full distribution, reported as `kd_kl/<teacher>`), costing only the output-head projections.
+
+**Routing teachers by topic.** With `topic_field` and `topic_teachers`, each row goes to the teacher of its topic (one shuffled dataset, many topics, a teacher per group of topics); `kl/<teacher>` and, at evaluation, `eval/dev_kl_full/<source>/<topic>` follow each group. It works for `messages` sources too.
+
+**Budget.** A step lasts as long as its longest regenerated turn: `max_new_tokens` bounds it. A truncated turn is still a valid sample (every token of it is a state the student reached); recorded agent turns are mostly short (median 130–340 tokens, p95 0.6–1.5k, office agents writing files up to 5k).
+
 ## Multiple-choice pools
 
 `format: mcqa` sources train on multiple-choice pools in a benchmark's exact prompt format (`configs/distill_opd.yaml` carries ITALIC's verbatim templates), with the reference shots, random pool shots and zero-shot mixed per prompt, and greedy letter accuracy as the dev metric.

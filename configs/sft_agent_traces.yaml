@@ -1,0 +1,45 @@
+# Baseline for configs/distill_agent_traces.yaml: plain SFT on the recorded agent
+# traces (cross-entropy on the assistant turns, tool calls and reasoning included),
+# same student, same train split, same traces per step and steps.
+#
+#   pgs train --config configs/sft_agent_traces.yaml
+#
+# Data: the train split of the distillation run as parquet (messages, tools as JSON
+# strings, a chat_template_kwargs column {enable_thinking: true} per row).
+
+model:
+  name_or_path: Qwen/Qwen3.5-0.8B
+  torch_dtype: float32            # memory.seco needs fp32 master weights (bf16 autocast)
+  attn_implementation: sdpa
+  use_liger_kernel: true
+  compile: false                  # SeCO is validated without compile
+
+data:
+  dataset: data/agent_sft_train.parquet
+  dataset_split: train
+  streaming: false
+  max_seq_length: 32768           # the distillation runs' max_context
+  messages_field: messages
+  tools_field: tools
+  packing: false
+
+train:
+  output_dir: runs/sft_agent_traces
+  max_steps: 100
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 4  # 4 traces per step, as rollout.batch_prompts
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.05              # 5 of 100 steps, as the distillation runs
+  lr_scheduler: cosine
+  max_grad_norm: 1.0
+  save_steps: 100
+  bf16: true
+  gradient_checkpointing: none
+  logging_steps: 1
+
+memory:
+  seco: true                      # traces of 5k-32k tokens: activations of one chunk
+  seco_chunk_size: 8192
+
+logging:
+  use_wandb: false

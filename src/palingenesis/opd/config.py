@@ -18,6 +18,7 @@ import yaml
 
 LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok", "rs_kd")
 TOKEN_WEIGHTINGS = ("none", "sure", "entropy")
+SOURCE_FORMATS = ("messages", "mcqa", "agent_traces")
 ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server")
 TEACHER_BACKENDS = ("hf", "vllm")
 
@@ -66,14 +67,25 @@ class TeacherConfig:
 
 @dataclass(slots=True)
 class SourceConfig:
-    # "messages": chat JSONL of {"messages": [...]} ending with a user turn, optional
-    #             "answer" (then greedy dev accuracy is reported too)
-    # "mcqa":     multiple-choice pool (pool-row JSONL, see palingenesis.opd.pool)
+    # "messages":     chat JSONL of {"messages": [...]} ending with a user turn, optional
+    #                 "answer" (then greedy dev accuracy is reported too)
+    # "mcqa":         multiple-choice pool (pool-row JSONL, see palingenesis.opd.pool)
+    # "agent_traces": recorded agent conversations (JSONL or parquet with messages and
+    #                 tools); the student regenerates their assistant turns (opd.traces)
     format: str = "messages"
     path: str = ""
     weight: float = 1.0
     # Teacher name (empty = the first teacher).
     teacher: str = ""
+    # Route rows to teachers by topic: the row field holding the topic, and
+    # {teacher: [topics]}; topics not listed go to `teacher`.
+    topic_field: str = ""
+    topic_teachers: dict = field(default_factory=dict)
+    # ---- agent_traces ----
+    messages_field: str = "messages"
+    tools_field: str = "tools"
+    branches_per_trace: int = 8       # turns regenerated per sampled trace (0 = all)
+    max_context: int = 32768          # tokens of context a regenerated turn may have
     max_new_tokens: int = 512
     # Held-out rows: split off `path` (deterministic, hash-ranked, unique), or all
     # of `dev_path` when set (e.g. a benchmark's test split, same format as path).
@@ -115,6 +127,8 @@ class OPDRolloutConfig:
     gpu_memory_utilization: float = 0.3   # vllm: GPU fraction for weights + KV cache
     max_model_len: int = 4096         # vllm: prompt + completion tokens
     enforce_eager: bool = False       # vllm: no CUDA graphs (faster start, slower decode)
+    # vllm: automatic prefix caching (agent traces: the turns of one trace share its prefill)
+    prefix_caching: bool = False
     # vllm, max_staleness 0: release the engine's memory while the trainer trains. Off keeps
     # it resident (no wake-up per step) when its gpu_memory_utilization fits beside training.
     sleep: bool = True
@@ -140,6 +154,12 @@ class OPDLossConfig:
     #   sure     w = 1 + sure_alpha (1 - p_student(token)), detached (SuRe, arXiv 2608.25643)
     #   entropy  only the entropy_keep fraction of tokens with the highest student entropy
     #            in each scoring micro-batch ("forking tokens", arXiv 2506.01939)
+    # agent_traces: weight of distillation on the recorded assistant turns inside each trace
+    # (off-policy, from the teacher pass the regenerated turns need anyway; 0 = off)
+    trace_kd_weight: float = 0.0
+    # agent_traces: weight of distillation on the regenerated turns (on-policy). 0 = no
+    # rollouts at all: distillation on the recorded turns only (with trace_kd_weight > 0)
+    trace_branch_weight: float = 1.0
     token_weighting: str = "none"
     sure_alpha: float = 1.0
     entropy_keep: float = 0.2
@@ -159,6 +179,9 @@ class OPDTrainConfig:
     eval_samples: int = 200           # dev prompts per source
     save_steps: int = 0               # checkpoint every N steps (0 = final only)
     keep_checkpoints: int = 3         # newest step_* dirs kept on disk (0 = keep all)
+    tree_chunk_size: int = 8192       # agent_traces: tokens per chunk of the trunk (activation memory)
+    tree_branch_tokens: int = 8192    # agent_traces: padded tokens per batched forward of regenerated turns
+    tree_min_gap: int = 1024          # agent_traces: trunk tokens between cuts at turns (fewer, larger passes)
     resume_from: str = ""             # a step_* checkpoint dir, or "auto": the newest in output_dir
 
 
@@ -306,8 +329,27 @@ class OPDConfig:
                 errors.append(f"{where}.url applies to vllm teachers only.")
         for name, source in self.sources.items():
             where = f"sources.{name}"
-            if source.format not in ("messages", "mcqa"):
-                errors.append(f"{where}.format must be 'messages' or 'mcqa', got {source.format!r}.")
+            if source.format not in SOURCE_FORMATS:
+                errors.append(f"{where}.format must be one of {SOURCE_FORMATS}, got {source.format!r}.")
+            if source.topic_teachers and not source.topic_field:
+                errors.append(f"{where}.topic_teachers needs topic_field (the row field holding the topic).")
+            seen: dict = {}
+            for teacher, topics in source.topic_teachers.items():
+                if teacher not in self.teachers:
+                    errors.append(f"{where}.topic_teachers: {teacher!r} is not one of the teachers {list(self.teachers)}.")
+                if not isinstance(topics, list):
+                    errors.append(f"{where}.topic_teachers.{teacher} must be a list of topics, got {topics!r}.")
+                    continue
+                for topic in topics:
+                    if topic in seen and seen[topic] != teacher:
+                        errors.append(f"{where}.topic_teachers: topic {topic!r} is assigned to both "
+                                      f"{seen[topic]!r} and {teacher!r}.")
+                    seen[topic] = teacher
+            if source.format == "agent_traces":
+                if source.max_context < 16:
+                    errors.append(f"{where}.max_context must be >= 16, got {source.max_context}.")
+                if source.branches_per_trace < 0:
+                    errors.append(f"{where}.branches_per_trace must be >= 0 (0 = every turn).")
             if not source.path:
                 errors.append(f"{where}.path is required.")
             if source.teacher and source.teacher not in self.teachers:
@@ -327,6 +369,27 @@ class OPDConfig:
                 warnings.append(f"{where}: p_reference_shots > 0 without shots_path: that regime falls back to zero-shot.")
         if self.sources and sum(s.weight for s in self.sources.values()) <= 0:
             errors.append("the source weights must not all be 0.")
+        formats = {s.format for s in self.sources.values()}
+        if "agent_traces" in formats:
+            if formats != {"agent_traces"}:
+                errors.append("agent_traces sources cannot be mixed with other formats in one run.")
+            for name, teacher in self.teachers.items():
+                if teacher.backend != "hf" or teacher.loss not in ("", "full_rkl"):
+                    errors.append(f"teachers.{name}: agent traces are distilled with full_rkl from an hf teacher "
+                                  "(the teacher scores each regenerated turn from the trace's shared prefill).")
+            if rollout.backend in ("vllm", "vllm_server") and not rollout.prefix_caching:
+                warnings.append("agent_traces without rollout.prefix_caching: every regenerated turn prefills its "
+                                "whole context; with it the turns of a trace share one prefill.")
+            if self.train.tree_chunk_size < 64:
+                errors.append(f"train.tree_chunk_size must be >= 64, got {self.train.tree_chunk_size}.")
+            if self.train.tree_branch_tokens < 0:
+                errors.append("train.tree_branch_tokens must be >= 0 (0 = one turn at a time).")
+        if self.loss.trace_kd_weight < 0:
+            errors.append(f"loss.trace_kd_weight must be >= 0, got {self.loss.trace_kd_weight}.")
+        if self.loss.trace_branch_weight < 0:
+            errors.append(f"loss.trace_branch_weight must be >= 0, got {self.loss.trace_branch_weight}.")
+        if "agent_traces" in formats and self.loss.trace_branch_weight == 0 and self.loss.trace_kd_weight == 0:
+            errors.append("loss.trace_branch_weight and loss.trace_kd_weight are both 0: nothing to train.")
 
         if rollout.backend not in ROLLOUT_BACKENDS:
             errors.append(f"rollout.backend must be one of {ROLLOUT_BACKENDS}, got {rollout.backend!r}.")

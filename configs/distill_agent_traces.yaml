@@ -1,0 +1,60 @@
+# On-policy distillation on recorded agent traces (openbmb/UltraData-SFT-Agent-2609):
+# the student regenerates the assistant turns of real agent trajectories (tool
+# outputs are the recorded ones: no environment), and each turn is distilled from
+# the teacher of the trace's topic. Every trace is read once per model however many
+# of its turns are regenerated (see palingenesis.opd.traces). One A100 80GB.
+#
+#   pgs distill --config configs/distill_agent_traces.yaml
+#
+# Data: parquet or JSONL rows with `messages` (list or JSON string), `tools`, and a
+# topic column (here `domain`). The guide shows how to stream a subset of the dataset.
+
+model:
+  student: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: true}     # the traces think between tool calls
+
+teachers:
+  qwen35_4b:
+    model: Qwen/Qwen3.5-4B
+  qwen35_2b:
+    model: Qwen/Qwen3.5-2B
+
+sources:
+  agent:
+    format: agent_traces
+    path: data/ultradata_agent_subset.parquet
+    dev_size: 48
+    max_new_tokens: 2048          # one regenerated turn: reasoning + tool call or answer
+    branches_per_trace: 8
+    max_context: 32768
+    teacher: qwen35_2b            # topics not listed below
+    topic_field: domain
+    topic_teachers:
+      qwen35_4b: [Code_Agent, Search_Agent-en, Search_Agent-plan]
+
+rollout:
+  backend: vllm
+  batch_prompts: 4                # traces per step (x branches_per_trace regenerated turns)
+  temperature: 1.0
+  gpu_memory_utilization: 0.25
+  max_model_len: 36864            # max_context + max_new_tokens
+  prefix_caching: true
+  sleep: false
+
+loss:
+  trace_kd_weight: 0.5            # also distill the recorded turns (off-policy, free teacher pass)
+
+train:
+  output_dir: runs/distill_agent_traces
+  steps: 100
+  learning_rate: 3.0e-6
+  warmup_steps: 5
+  tree_chunk_size: 8192
+  eval_every: 25
+  eval_samples: 16
+  save_steps: 25
+
+logging:
+  log_every: 1
+  use_wandb: false
+  project: palingenesis-opd
