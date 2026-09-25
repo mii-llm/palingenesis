@@ -146,6 +146,9 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
             key, value = torch.cat([pk, key], dim=-2), torch.cat([pv, value], dim=-2)
             kv_len = key.shape[2]
     if attention_mask is not None or not causal or special or q_len == 1:
+        if query.is_cuda and torch.is_autocast_enabled("cuda"):      # see below: one dtype, a fused kernel
+            dtype = torch.get_autocast_dtype("cuda")
+            query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
         return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
                                       is_causal=is_causal, **kwargs)
     # Under autocast, RoPE's fp32 cos/sin promote q/k to fp32 while v stays bf16.
@@ -157,6 +160,12 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
         query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
     flash_capable = (query.is_cuda and query.dtype in (torch.float16, torch.bfloat16)
                      and key.shape[-1] == value.shape[-1] <= 256)
+    if flash_capable and q_len == kv_len and not dropout and query.shape[-1] % 8 == 0:
+        # Plain causal self-attention: the flash kernel itself, grouped K/V heads natively.
+        # SDPA's dispatcher rules flash out for some shapes it supports (Qwen3.5: head_dim 256
+        # with grouped K/V) and picks the memory-efficient kernel, measured 3x slower at 32k.
+        out = chunk_attention(query, key, value, None, 0, scaling, KV_BLOCK)
+        return out.transpose(1, 2).contiguous(), None
     extra = {}
     if key.shape[1] != query.shape[1]:
         if flash_capable:
@@ -175,6 +184,31 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
     out = torch.nn.functional.scaled_dot_product_attention(
         query, key, value, attn_mask=bias, dropout_p=dropout, scale=scaling, is_causal=q_len == kv_len, **extra)
     return out.transpose(1, 2).contiguous(), None
+
+
+def use_chunk_attention(model: nn.Module) -> bool:
+    """Route an sdpa-configured model's attention through `_attention` for good (training).
+
+    Under bf16 autocast with fp32 weights, RoPE's fp32 cos/sin promote q and k to fp32
+    while v stays bf16; SDPA then rules out its fused kernels and materializes the
+    [L, L] scores (31 GiB for 32k tokens on Qwen3.5). `_attention` casts q/k/v to the
+    autocast dtype first, so the flash kernel runs; anything it does not handle goes to
+    transformers' sdpa unchanged. Returns whether the model was rerouted."""
+    global _REGISTERED
+    from transformers import AttentionInterface, PretrainedConfig
+    from transformers.masking_utils import AttentionMaskInterface
+
+    if not _REGISTERED:
+        AttentionInterface.register(_ATTN, _attention)
+        AttentionMaskInterface.register(_ATTN, _mask)
+        _REGISTERED = True
+    rerouted = False
+    for m in model.modules():
+        cfg = getattr(m, "config", None)
+        if isinstance(cfg, PretrainedConfig) and cfg._attn_implementation == "sdpa":
+            cfg._attn_implementation_internal = _ATTN
+            rerouted = True
+    return rerouted
 
 
 @contextmanager

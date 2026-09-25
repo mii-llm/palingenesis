@@ -199,7 +199,7 @@ class ChunkAttention(torch.autograd.Function):
     def forward(ctx, q, k, v, store: KVStore, prefix, scale: float, block: int):
         rows = q.shape[0]
         prefixes = [prefix] * rows if isinstance(prefix, int) else list(prefix)
-        shared = store.k.shape[0] != rows              # one stored row serving every query row
+        shared = store is not None and store.k.shape[0] != rows    # one stored row serving every query row
         out_acc = lse_acc = None
         parts = []
         for start in range(0, max(prefixes, default=0), block):

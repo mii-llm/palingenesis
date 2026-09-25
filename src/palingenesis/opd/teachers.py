@@ -143,7 +143,8 @@ class HFTeacher:
             positions = completion_positions([views[i].prompt_len for i in chunk],
                                              [views[i].completion_len for i in chunk], ids.shape[1])
             with torch.autocast(ids.device.type, dtype=torch.bfloat16, enabled=ids.is_cuda):
-                hidden = final_hidden_states(self.model, ids, mask)[positions.to(ids.device)]
+                # right-padded rows: no mask (padding after a row cannot reach it; flash attention)
+                hidden = final_hidden_states(self.model, ids, None)[positions.to(ids.device)]
             if keep_hidden and not top_k:     # full_rkl projects the hidden states in its loss: nothing else needed
                 offset = 0
                 for i in chunk:

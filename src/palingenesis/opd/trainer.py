@@ -51,6 +51,7 @@ from palingenesis.opd.teachers import (
     right_pad,
 )
 from palingenesis.opd.token_bridge import TokenBridge, TokenBridgeError, check_compatible
+from palingenesis.seco import use_chunk_attention
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +163,12 @@ class OPDTrainer:
             self.student.gradient_checkpointing_enable()
         self.head = output_head(self.student)
         verify_output_head(self.student, self.head)
+        use_chunk_attention(self.student)       # fused attention under autocast (fp32 master weights)
         for name, teacher in config.teachers.items():
             if teacher.backend == "hf":
                 teachers[name] = HFTeacher(teacher.model, teacher.device or self.device, teacher.offload,
                                            seed=config.train.seed)
+                use_chunk_attention(teachers[name].model)
 
         if rollout.backend == "hf":
             engine = HFRollout(self.student, self.stop_ids, self.pad_id, rollout.micro_seqs)
@@ -287,7 +290,8 @@ class OPDTrainer:
 
         with (torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
               torch.set_grad_enabled(train)):
-            hidden = final_hidden_states(self.student, ids, mask)[positions]
+            # right-padded rows: no mask (padding after a row cannot reach it; flash attention)
+            hidden = final_hidden_states(self.student, ids, None)[positions]
             token_weights = self._token_weights(token_weights, hidden, behaviour)
             if kind == "full_rkl":
                 for s in samples:       # made on the pipeline's CUDA stream: keep until this stream is done

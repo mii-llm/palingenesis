@@ -726,3 +726,50 @@ class SpikeDetector:
 
         self.consecutive = 0
         return False
+
+
+class StepProfiler:
+    """Opt-in profile of training steps: PALINGENESIS_PROFILE=start:count profiles optimizer
+    steps [start, start + count) and logs the GPU-busy share of their wall time and the top
+    operators (by GPU time and by CPU time). A launch-bound run shows GPU-busy well under
+    wall time with the CPU total close to it; a GPU-bound one shows them equal."""
+
+    def __init__(self, spec: str):
+        start, count = (int(x) for x in spec.split(":"))
+        self.start, self.count, self.step_index = start, count, 0
+        self.prof = None
+        self.t0 = None
+
+    @classmethod
+    def from_env(cls):
+        import os
+
+        spec = os.environ.get("PALINGENESIS_PROFILE")
+        return cls(spec) if spec else None
+
+    def step(self) -> None:
+        """Call once per optimizer step (after it)."""
+        import time
+
+        self.step_index += 1
+        if self.step_index == self.start:
+            from torch.profiler import ProfilerActivity, profile
+
+            torch.cuda.synchronize()
+            self.prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            self.prof.__enter__()
+            self.t0 = time.perf_counter()
+        elif self.prof is not None and self.step_index == self.start + self.count:
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - self.t0
+            self.prof.__exit__(None, None, None)
+            events = self.prof.key_averages()
+            gpu = sum(e.self_device_time_total for e in events) / 1e6
+            cpu = sum(e.self_cpu_time_total for e in events) / 1e6
+            logger.info("profile: %d steps, wall %.2fs, GPU busy %.2fs (%.0f%%), CPU %.2fs",
+                        self.count, wall, gpu, 100 * gpu / max(wall, 1e-9), cpu)
+            logger.info("profile, top GPU time:\n%s", events.table(sort_by="self_device_time_total", row_limit=25,
+                                                                  max_name_column_width=60))
+            logger.info("profile, top CPU time:\n%s", events.table(sort_by="self_cpu_time_total", row_limit=15,
+                                                                  max_name_column_width=60))
+            self.prof = None

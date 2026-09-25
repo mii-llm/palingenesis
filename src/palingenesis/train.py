@@ -96,6 +96,7 @@ from palingenesis.perf import (
     GCControl,
     ModelEMA,
     SpikeDetector,
+    StepProfiler,
 )
 from palingenesis.plugins import (
     GATED_OBJECTIVES,
@@ -108,7 +109,7 @@ from palingenesis.plugins import (
     infosft_weighted_loss,
     pre_rl_loss,
 )
-from palingenesis.seco import chunkwise_forward_backward
+from palingenesis.seco import chunkwise_forward_backward, use_chunk_attention
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,10 @@ def train(config: Config):
     # ── Model ─────────────────────────────────────────────────────────────
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     model_dtype = dtype_map[config.model.torch_dtype]
+    # The dtype train.bf16 computes in: the weights' own (bf16/fp16), or bf16 for fp32 master
+    # weights. Autocasting to the weights' dtype would make fp32 weights compute in fp32:
+    # no fused attention, fp32 GEMMs and activations (measured 1.7x slower on Qwen3.5-0.8B).
+    compute_dtype = torch.bfloat16 if model_dtype == torch.float32 else model_dtype
 
     logger.info(f"Loading model: {config.model.name_or_path}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -310,6 +315,12 @@ def train(config: Config):
     if config.data.packing:
         check_packing_support(model, config.model.attn_implementation)
         flatten_packed = config.model.attn_implementation == "flash_attention_2" or has_linear_attention(model)
+
+    # ── sdpa: fused attention kernels under autocast (see seco.use_chunk_attention) ──
+    if config.model.attn_implementation == "sdpa":
+        rerouted = use_chunk_attention(model)
+        logger.info(f"attention: {'fused (flash) path' if rerouted else 'sdpa as configured'} "
+                    f"({getattr(model.config, '_attn_implementation', None)})")
 
     # ── Hybrid model freeze (DeltaNet/SSM layers frozen, only attention trains) ──
     if config.train.freeze_non_attention:
@@ -797,6 +808,7 @@ def train(config: Config):
     gc_ctrl.disable_auto_gc()
 
     # ── Spike Detection ───────────────────────────────────────────────────
+    _profiler = StepProfiler.from_env() if is_main() and torch.cuda.is_available() else None
     _spike_detector = (
         SpikeDetector(
             z_threshold=config.train.spike_z_threshold,
@@ -842,13 +854,13 @@ def train(config: Config):
         """eval/* metrics on the configured eval set(s); {} if there is none."""
         if _pref_evaluator is not None:
             return _pref_evaluator.evaluate(
-                model, ref_model, _get_hidden_states, _get_lm_head, device, model_dtype, config.train.bf16,
+                model, ref_model, _get_hidden_states, _get_lm_head, device, compute_dtype, config.train.bf16,
             )
         if eval_batches:
-            loss = _compute_eval_loss(model, eval_batches, device, model_dtype, config.train.bf16)
+            loss = _compute_eval_loss(model, eval_batches, device, compute_dtype, config.train.bf16)
             return {"eval/loss": loss, "eval/ppl": math.exp(min(loss, 20.0))}
         if _multi_evaluator is not None:
-            me = _multi_evaluator.evaluate(model, dtype=model_dtype)
+            me = _multi_evaluator.evaluate(model, dtype=compute_dtype)
             # Every source empty (e.g. missing files): the score would be a
             # meaningless 0.0, never logged nor saved as the best checkpoint.
             if not me.per_source:
@@ -959,7 +971,14 @@ def train(config: Config):
                     input_ids, attention_mask, labels = shard_for_context_parallel(
                         input_ids, attention_mask, labels, cp_mesh
                     )
-                fwd_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
+                # Right padding only (the collator's): no mask. Padding after a row's tokens cannot
+                # reach them under causal attention (linear-attention layers included), and its
+                # labels are ignored. Without a mask attention is plain causal, which runs as flash
+                # attention; with one, transformers builds an explicit [L, L] mask and SDPA falls
+                # back to a slower kernel (3x at 32k tokens) that may materialize it (31 GiB).
+                right_padded = attention_mask is not None and not bool(
+                    (attention_mask[:, 1:] > attention_mask[:, :-1]).any())
+                fwd_kwargs = {"input_ids": input_ids, "attention_mask": None if right_padded else attention_mask}
 
             # ── Gradient sync control for accumulation ────────────────
             # Dynamic GA: ramp from ga_ramp_start to grad_accum over training
@@ -1001,7 +1020,7 @@ def train(config: Config):
 
             loss_val = None
             backward_done = False
-            with torch.amp.autocast("cuda", dtype=model_dtype, enabled=config.train.bf16):
+            with torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16):
                 if seco:
                     # Forward AND backward, chunk by chunk (gradients accumulate in .grad).
                     result = chunkwise_forward_backward(
@@ -1367,6 +1386,8 @@ def train(config: Config):
                     if is_main():
                         logger.info(f"step={global_step} base_merge applied (ratio={config.train.base_merge_ratio})")
 
+                if _profiler is not None:
+                    _profiler.step()
                 if config.train.max_steps > 0 and global_step >= config.train.max_steps:
                     break
 
