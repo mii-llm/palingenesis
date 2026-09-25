@@ -18,6 +18,7 @@ train.cpu_offload keeps parameters, gradients and optimizer state in CPU memory 
 offload, also on a single GPU): the GPU holds one layer's weights at a time.
 """
 
+import contextlib
 import logging
 import os
 import socket
@@ -156,3 +157,57 @@ def mean_stats(per_rank: list[dict[str, float]], weights: list[float] | None = N
         total = sum(w for _, w in pairs)
         out[k] = sum(v * w for v, w in pairs) / total if total else 0.0
     return out
+
+
+class MasterWeights:
+    """bf16 compute with fp32 master weights on one GPU (what FSDP2's mixed precision does
+    across ranks, without its gather bookkeeping).
+
+    The module's parameters become bf16, so activations stay bf16 end to end (fp32 weights
+    under autocast re-cast every weight and keep an fp32 residual stream: cast kernels in every
+    layer, forward and backward). Each parameter's fp32 master copy is what the optimizer
+    steps; a post-accumulate hook adds each micro-batch's bf16 gradient into the master's fp32
+    .grad and frees it, so accumulation over micro-batches is fp32. After the step, the
+    masters are copied back into the bf16 parameters. Buffers (e.g. RoPE frequencies) keep
+    their dtype."""
+
+    def __init__(self, model: nn.Module, dtype: torch.dtype = torch.bfloat16):
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.master = [nn.Parameter(p.detach().float().clone()) for p in self.params]
+        for p in self.params:
+            p.data = p.data.to(dtype)
+        for p, m in zip(self.params, self.master):
+            p.register_post_accumulate_grad_hook(self._accumulate(m))
+
+    @staticmethod
+    def _accumulate(master: nn.Parameter):
+        def hook(param: torch.Tensor) -> None:
+            if master.grad is None:
+                master.grad = param.grad.float()
+            else:
+                master.grad.add_(param.grad)
+            param.grad = None
+
+        return hook
+
+    def parameters(self) -> list[nn.Parameter]:
+        """What the optimizer steps and gradient clipping reads."""
+        return self.master
+
+    @torch.no_grad()
+    def publish(self) -> None:
+        """Copy the stepped masters into the bf16 parameters."""
+        torch._foreach_copy_(self.params, self.master)
+
+    @contextlib.contextmanager
+    def fp32(self) -> Iterator[None]:
+        """The module's parameters are the fp32 masters inside the block (saving a checkpoint
+        to resume from exactly)."""
+        low = [p.data for p in self.params]
+        for p, m in zip(self.params, self.master):
+            p.data = m.data
+        try:
+            yield
+        finally:
+            for p, data in zip(self.params, low):
+                p.data = data

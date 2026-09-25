@@ -508,3 +508,74 @@ def test_checkpoint_named_parameters_takes_gathered_tensors():
     assert all(bool((t == 7.0).all()) for t in pushed.values())
     own = dict(checkpoint_named_parameters(model))
     assert torch.equal(own["0.weight"], model[0].weight.detach())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+@pytest.mark.parametrize("vocab", [248320, 1000])
+@pytest.mark.parametrize("multiplier,softcap", [(1.0, None), (0.5, 30.0)])
+def test_fused_head_kernels_match_the_pytorch_path(vocab, multiplier, softcap, monkeypatch):
+    """The Triton vocabulary passes give the PyTorch expression's log-probs, entropies and
+    gradients on the same bf16 GEMM logits."""
+    from palingenesis.logits import PostProcessedHead
+    from palingenesis.rl import head_kernels
+
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(256, vocab, bias=False, device="cuda")
+    head = PostProcessedHead(linear, multiplier, softcap) if softcap else linear
+    hidden = (torch.randn(700, 256, device="cuda") * 2).to(torch.bfloat16).requires_grad_(True)
+    targets = torch.randint(0, vocab, (700,), device="cuda")
+    g = torch.randn(700, device="cuda")
+
+    def run():
+        hidden.grad, linear.weight.grad = None, None
+        lp, ent = target_logprobs(hidden, head, targets, entropy=True)
+        (lp * g).sum().backward()
+        return lp.detach(), ent, hidden.grad.float(), linear.weight.grad.clone()
+
+    fused = run()
+    monkeypatch.setattr(head_kernels, "available", lambda t: False)
+    reference = run()
+    names = ("logprobs", "entropy", "grad hidden", "grad weight")
+    for ours, ref, name in zip(fused[:2] + fused[3:], reference[:2] + reference[3:], names[:2] + names[3:]):
+        err = float((ours - ref).abs().max() / ref.abs().max().clamp(min=1e-6))
+        assert err < (1e-4 if name == "grad weight" else 1e-5), (name, err)  # fp32 sums of bf16 terms
+    # the hidden gradient is bf16 in both paths: compare each with an fp64 computation
+    h64, w64 = hidden.detach().double().requires_grad_(True), linear.weight.detach().to(torch.bfloat16).double()
+    y = (h64 @ w64.T) * multiplier
+    y = softcap * torch.tanh(y / softcap) if softcap else y
+    (torch.log_softmax(y, -1).gather(1, targets[:, None]).squeeze(1) * g.double()).sum().backward()
+    exact = h64.grad
+    errors = [float((ours[2].double() - exact).abs().max() / exact.abs().max()) for ours in (fused, reference)]
+    assert errors[0] <= 1.25 * errors[1] + 1e-4, errors
+
+
+def test_master_weights_accumulate_in_fp32_and_publish():
+    from palingenesis.rl.parallel import MasterWeights
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 1))
+    model.register_buffer("freqs", torch.ones(3))  # buffers keep their dtype
+    reference = [p.detach().clone() for p in model.parameters()]
+    master = MasterWeights(model)
+    assert all(p.dtype == torch.bfloat16 for p in model.parameters()) and model.freqs.dtype == torch.float32
+    assert all(torch.equal(m, r) for m, r in zip(master.parameters(), reference))
+    xs = [torch.randn(4, 8, dtype=torch.bfloat16) for _ in range(3)]
+    expected = [torch.zeros_like(r) for r in reference]
+    for x in xs:  # micro-batches: each bf16 gradient is added into the fp32 master gradient
+        model(x).sum().backward()
+        assert all(p.grad is None for p in model.parameters())
+    for x in xs:
+        grads = torch.autograd.grad(model(x).sum(), list(model.parameters()))
+        expected = [e + g.float() for e, g in zip(expected, grads)]
+    assert all(
+        m.grad.dtype == torch.float32 and torch.allclose(m.grad, e) for m, e in zip(master.parameters(), expected)
+    )
+    opt = torch.optim.SGD(master.parameters(), lr=0.1)
+    opt.step()
+    master.publish()
+    assert all(torch.equal(p, m.to(torch.bfloat16)) for p, m in zip(model.parameters(), master.parameters()))
+    with master.fp32():  # a checkpoint saves the fp32 masters
+        assert all(
+            p.dtype == torch.float32 and torch.equal(p, m) for p, m in zip(model.parameters(), master.parameters())
+        )
+    assert all(p.dtype == torch.bfloat16 for p in model.parameters())

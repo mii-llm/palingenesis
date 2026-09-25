@@ -18,6 +18,7 @@ Or from Python, with your own rewards and environment:
     RLTrainer(RLConfig.from_yaml("configs/rl_math.yaml"), rewards=[my_reward]).train()
 """
 
+import contextlib
 import inspect
 import json
 import logging
@@ -51,7 +52,7 @@ from palingenesis.rl.data import PromptSampler, load_rows, prompt_messages, spli
 from palingenesis.rl.env import EnvPool, ToolEnv, row_tools
 from palingenesis.rl.formats import convert
 from palingenesis.rl.losses import LowPrecisionWeight, assign_advantages, policy_loss, target_logprobs, token_weights
-from palingenesis.rl.parallel import Parallel, mean_stats
+from palingenesis.rl.parallel import MasterWeights, Parallel, mean_stats
 from palingenesis.rl.pipeline import RLBatch, RLPipeline
 from palingenesis.rl.rewards import code_reward, load_object, resolve_rewards
 from palingenesis.rl.sandbox import make_sandbox
@@ -185,6 +186,8 @@ class RLTrainer:
             self.model = self.parallel.shard(self.model)
         verify_output_head(self.model, output_head(self.model), device=self.device)
         self.parallel.reshard(self.model)
+        # one GPU: bf16 parameters, fp32 masters in the optimizer (FSDP2 does this across ranks)
+        self.master = MasterWeights(self.model) if not fsdp and self.device.startswith("cuda") else None
         self.head = output_head(self.model)
         self.head_weight = LowPrecisionWeight()  # bf16 copy of the head, cast once per optimizer step
 
@@ -226,7 +229,7 @@ class RLTrainer:
         )
         self.orchestrator = Orchestrator(self.pipeline, lambda: self.batch_prompts, r.temperature, r.max_staleness)
         self.opt = torch.optim.AdamW(
-            self.model.parameters(),
+            self._trainable(),
             lr=t.learning_rate,
             betas=(t.adam_beta1, t.adam_beta2),
             eps=t.adam_eps,
@@ -319,6 +322,10 @@ class RLTrainer:
             return t.learning_rate
         progress = (step - t.warmup_steps) / max(1, t.steps - t.warmup_steps)
         return t.learning_rate * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+
+    def _trainable(self) -> list[torch.nn.Parameter]:
+        """The parameters the optimizer steps: the fp32 masters, or the module's own."""
+        return self.master.parameters() if self.master is not None else list(self.model.parameters())
 
     def _micro_batches(self, trajectories: list[Trajectory]) -> list[list[Trajectory]]:
         """Micro-batches of at most train.micro_tokens padded tokens, longest trajectories first,
@@ -507,10 +514,12 @@ class RLTrainer:
                 metrics = self._train_step(groups)
                 trained = self.parallel.sum([metrics.get("trained_sequences", 0.0)])[0]
                 with self.weights.lock:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), t.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self._trainable(), t.max_grad_norm)
                     grad_norm = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
                     if trained:  # every rank steps (or none does): the parameters are sharded
                         self.opt.step()
+                        if self.master is not None:
+                            self.master.publish()
                     self.opt.zero_grad(set_to_none=True)
                     if self.device.startswith("cuda"):
                         torch.cuda.synchronize()
@@ -635,7 +644,8 @@ class RLTrainer:
         # pipeline's lock order: pipeline, then weights.
         with self.pipeline.lock, self.weights.lock:
             self.parallel.reshard(self.model)
-            _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
+            with self.master.fp32() if self.master is not None else contextlib.nullcontext():
+                _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
             if step is not None and self.parallel.fsdp:
                 from torch.distributed.checkpoint import save as dcp_save
                 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict

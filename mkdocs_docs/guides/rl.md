@@ -125,8 +125,76 @@ Two adapters make other standards palingenesis environments, with no special cas
 |---|---|
 | `palingenesis.rl.envs.openenv:OpenEnvAdapter` | [OpenEnv](https://github.com/meta-pytorch/OpenEnv) servers, remote over WebSocket (`args: {base_url}`) or the server class in-process (`args: {env_class}`); MCP tools are listed automatically, step environments get one tool taking their Action; `reset_fields` forwards the task selection so a group's rollouts see the same task |
 | `palingenesis.rl.envs.nemo_gym:NemoGymAdapter` | NeMo Gym resources servers: `seed_session`, one route per tool, `verify` with the transcript; a masked sample is skipped. Runs any Nemotron-RL dataset against its own verifier |
+| `palingenesis.rl.envs.mcp:MCPEnv` | Any [MCP](https://modelcontextprotocol.io) server: its tools become the policy's tools (below) |
 
 Tool calls are parsed in the model's own format (Hermes JSON for Qwen2.5/Qwen3, XML for Qwen3-Coder/Qwen3.5), run concurrently with a timeout, and their results (sanitized: a tool cannot inject control tokens; cut to `env.max_tool_output_tokens`) are appended as tokens rendered by the model's own chat template. Nothing is ever re-tokenized: what the trainer scores is exactly what the sampler saw, and only sampled tokens are trained. A tool error is returned to the policy as the tool's answer.
+
+### MCP servers
+
+Any [Model Context Protocol](https://modelcontextprotocol.io/specification/latest) server works as an environment: `tools/list` becomes the policy's tool schemas and each `tools/call` result its observation. A server takes a few lines with the official SDK (`pip install "palingenesis[mcp]"`):
+
+```python
+# shop_server.py
+import uuid
+
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+server = MCPServer("shop")
+PRICES, BASKETS = {"apple": 2, "pear": 3}, {}
+
+
+@server.tool()
+def create_basket() -> dict:
+    """Create an empty basket."""
+    basket_id = f"bsk_{uuid.uuid4().hex}"
+    BASKETS[basket_id] = []
+    return {"basket_id": basket_id}
+
+
+@server.tool()
+def add_item(basket_id: str, sku: str) -> str:
+    """Add an item to the basket.
+
+    Args:
+        basket_id: The basket.
+        sku: apple or pear.
+    """
+    if sku not in PRICES:
+        raise ToolError(f"unknown sku {sku!r}: choose apple or pear")   # the policy reads this
+    BASKETS[basket_id].append(sku)
+    return f"added {sku}"
+
+
+@server.tool()
+def grade(basket_id: str, answer: str) -> dict:
+    """Score the episode (hidden from the policy)."""
+    return {"reward": float(sum(PRICES[s] for s in BASKETS[basket_id]) == 5)}
+
+
+if __name__ == "__main__":
+    server.run("streamable-http", host="0.0.0.0", port=8000)       # http://host:8000/mcp
+```
+
+```yaml
+env:
+  type: palingenesis.rl.envs.mcp:MCPEnv
+  max_concurrent: 256              # episodes in flight: size it to the server
+  max_turns: 8
+  args:
+    server: http://shop:8000/mcp   # or a command, run as a subprocess over stdio: [python, shop_server.py]
+    state_tool: create_basket      # called by reset(): the episode's handle...
+    state_arg: basket_id           # ...hidden from the policy and filled in on every call
+    reward_tool: grade             # optional: the server scores the episode
+```
+
+- **One connection, every episode.** MCP (2026-07-28) is stateless: every request carries what the server needs, so one client serves all concurrent trajectories. Servers on the earlier session-based revisions are detected and supported. `servers: {search: <url>, code: <url>}` combines several servers; their tools are prefixed (`search__query`); `tools: [...]` keeps a subset.
+- **Episode state lives behind a handle.** The protocol has no sessions, so a stateful server returns a handle from a creation tool and takes it on later calls, as in the spec's [stateful tools](https://modelcontextprotocol.io/specification/latest/server/tools#stateful-tools). With `state_tool`/`state_arg`, `reset()` creates it (with the row's `reset_fields` as arguments, so a group's rollouts get the same task) and the policy never sees it. Without them, the policy carries handles itself, as a deployed agent would.
+- **Rewards.** Usually reward functions over the transcript. A server-side grader (`reward_tool`) receives the handle, and `answer` (the final assistant message) and/or `messages` when its schema has them; it returns a number, `{"reward": x}` or components (`{"format": 0.1, "correct": 1.0}`). An `isError` from the grader skips the sample instead of scoring it 0.
+- **Errors are observations.** A result with `isError: true` goes back as `Error: ...` and counts in `tool_errors`. The Python SDK hides the message of an unexpected exception from clients: raise `ToolError` for messages the policy should read.
+- **Serving it for training.** Rollouts call tools at the rate the engine generates: hundreds of calls in flight. Run the server with several workers or replicas behind one URL (the protocol is stateless, so any replica serves any request) and keep episode state in a shared store keyed by the handle. Pin down what varies (live web search, clocks): a group's rollouts are compared with each other, so the same call should give the same result within a group.
+
+Text and embedded text resources reach the policy as text; images and audio become a placeholder. Tool descriptions are the server's; JSON-schema `title` annotations are dropped (prompt tokens in every rollout).
 
 ## The objective
 
@@ -147,10 +215,10 @@ Every step logs what to watch: `reward` and `rewards/*`, `policy/abs_ratio_dev` 
 
 ## How it is made fast
 
-Measured on Qwen3.5-0.8B, GSM8K, one A100 (32 prompts x 8 rollouts per step): 92 s per step in the first version, about 20 s now, with the training pass at ~53% MFU.
+Measured on Qwen3.5-0.8B, GSM8K, one A100 (32 prompts x 8 rollouts per step): 92 s per step in the first version, about 18 s now: 11 s of rollouts (15.5k generated tokens/s) and 6 s for the policy step, which runs at 44% MFU (bf16 peak, model FLOPs: no recompute, no padding). Its matrix multiplies run at about 80% of peak; the rest is Qwen3.5's linear-attention kernels, norms and activations.
 
 - **Rollouts.** One engine call per batch (a flusher gathers every trajectory's pending turn; multi-turn trajectories never wait for the slowest tool of a lock-stepped batch). A group's identical prompts become one vLLM request with `n` samples: the prompt is prefilled once. Groups whose rewards would all be equal are anticipated: `missing / (1 - expected zero-variance rate)` groups are launched at once, instead of refilling in serial rounds that leave the engine half empty.
-- **Policy step.** The log-probabilities of the sampled tokens come from bf16 tensor-core GEMMs with fp32 logits, a slice of rows at a time: `[tokens, vocab]` logits are never materialized, and the backward recomputes each slice from a saved log-sum-exp. Micro-batches hold a power-of-two number of rows, so Triton kernels (flash-linear-attention's included) autotune a handful of times instead of on every new batch size. Statistics stay on the GPU until one sync per step.
+- **Policy step.** The log-probabilities of the sampled tokens come from bf16 tensor-core GEMMs with fp32 logits, a slice of rows at a time: `[tokens, vocab]` logits are never materialized, and the backward recomputes each slice from a saved log-sum-exp. Everything else about a slice takes one pass over its logits (Triton): an online log-sum-exp yields the log-probs and the entropy together, and the backward writes the bf16 gradient directly, instead of separate max, exp, sum, gather, scatter and cast kernels over a 248k-wide vocabulary (34% → 40% MFU). On one GPU the model computes with bf16 parameters while AdamW steps fp32 master weights, and micro-batch gradients accumulate in fp32 (40% → 44%): fp32 weights under autocast would re-cast activations in every layer. Micro-batches hold a power-of-two number of rows, so Triton kernels (flash-linear-attention's included) autotune a handful of times instead of on every new batch size. Statistics stay on the GPU until one sync per step.
 - **Overlap.** `rollout.max_staleness: 1` generates, runs tools and scores step k+1 while step k trains.
 - **FP8 rollouts.** `rollout.kv_cache_dtype: fp8` / `rollout.quantization: fp8` speed up generation; the importance weights and the sequence mask absorb the extra sampler/trainer mismatch (watch `policy/abs_ratio_dev`).
 

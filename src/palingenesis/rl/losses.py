@@ -29,6 +29,7 @@ from torch import Tensor, nn
 
 from palingenesis.opd.fused_rkl import Head, unwrap
 from palingenesis.opd.losses import SLICE_ELEMENTS
+from palingenesis.rl import head_kernels
 
 # ------------------------------------------------------------ token log-probs
 
@@ -73,7 +74,16 @@ class _LinearTargetLogProbs(torch.autograd.Function):
         lp = torch.empty(n, dtype=torch.float32, device=h.device)
         lse = torch.empty(n, dtype=torch.float32, device=h.device)
         ent = torch.empty(n if entropy else 0, dtype=torch.float32, device=h.device)
+        fused = head_kernels.available(h) and h.dtype == torch.bfloat16
         for a in range(0, n, rows):
+            if fused:  # one pass over the slice's logits (head_kernels)
+                z = torch.mm(h[a : a + rows], w_low.T, out_dtype=torch.float32)
+                lp[a : a + rows], lse[a : a + rows], e = head_kernels.forward(
+                    z, targets[a : a + rows], head.multiplier, head.softcap, entropy
+                )
+                if entropy:
+                    ent[a : a + rows] = e
+                continue
             _, y = _logits(h[a : a + rows], w_low, head)
             lse[a : a + rows] = y.logsumexp(-1)
             lp[a : a + rows] = y.gather(1, targets[a : a + rows, None]).squeeze(1) - lse[a : a + rows]
@@ -93,11 +103,24 @@ class _LinearTargetLogProbs(torch.autograd.Function):
         grad_hidden = torch.zeros(h.shape, dtype=ctx.hidden_dtype, device=h.device) if want_hidden else None
         grad_weight = torch.zeros(w_low.shape, dtype=torch.float32, device=h.device) if want_weight else None
         index = torch.arange(rows, device=h.device)
+        fused = head_kernels.available(h) and h.dtype == torch.bfloat16
+        buffer = torch.empty(min(rows, h.shape[0]), w_low.shape[0], dtype=h.dtype, device=h.device) if fused else None
         for a in range(0, h.shape[0], rows):
             g = grad_lp[a : a + rows].float()
             if not g.any():
                 continue
             b = a + g.shape[0]
+            if fused:  # one pass: softmax, one-hot, softcap / multiplier chain rule, bf16 out
+                z = torch.mm(h[a:b], w_low.T, out_dtype=torch.float32)
+                grad_z = head_kernels.backward(
+                    z, targets[a:b], lse[a:b], g.contiguous(), head.multiplier, head.softcap, buffer[: b - a]
+                )
+                del z
+                if want_hidden:
+                    grad_hidden[a:b] = torch.mm(grad_z, w_low).to(ctx.hidden_dtype)
+                if want_weight:
+                    torch.addmm(grad_weight, grad_z.T, h[a:b], out_dtype=torch.float32, out=grad_weight)
+                continue
             _, y = _logits(h[a:b], w_low, head)
             # d lp / d y = onehot(target) - softmax(y)
             grad_y = (y - lse[a:b, None]).exp_().mul_(-g[:, None])

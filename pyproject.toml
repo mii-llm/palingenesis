@@ -66,6 +66,8 @@ vllm = [
 # pgs rl: symbolic answer checking for the math reward, and the Kubernetes Agent Sandbox client
 rl = ["math-verify>=0.8"]
 agent-sandbox = ["k8s-agent-sandbox[async]>=1.0"]
+# MCP servers as RL environments (palingenesis.rl.envs.mcp)
+mcp = ["mcp>=2.2"]
 # rollout.backend vllm_server: vLLM's weight transfer into a running server imports ray
 vllm-server = [
     "palingenesis[vllm]",
@@ -90,7 +92,7 @@ prepare = [
 ]
 # Everything
 all = [
-    "palingenesis[train,float8,logging,loss,optim,prepare]",
+    "palingenesis[train,float8,logging,loss,optim,prepare,rl,mcp]",
 ]
 # Development
 dev = [

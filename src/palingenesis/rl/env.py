@@ -19,7 +19,7 @@ An environment is any class. Per trajectory, the trainer takes an instance from 
     done                                                 optional attribute
         Set it to True (e.g. in a submit tool) to end the episode after this turn's tools.
 
-Tools that are not Python methods (HTTP routes, MCP servers, OpenEnv) come from two
+Tools that are not Python methods (HTTP routes, OpenEnv; MCP servers: palingenesis.rl.envs.mcp) come from two
 optional methods instead, read after reset() so they may depend on the episode:
 
     tool_schemas(self) -> list[dict]                     OpenAI (or Responses-API flat) schemas
@@ -53,6 +53,12 @@ from typing import Any, Callable
 from palingenesis.rl.chat import tool_schema
 
 _LIFECYCLE = ("reset", "get_reward", "close", "aclose", "tool_schemas", "call_tool")
+
+
+class ToolFailed(Exception):
+    """Raised by a tool (or call_tool) whose failure message is the observation as is: the
+    policy sees "Error: <message>" and the call counts as a tool error. MCP's isError results,
+    for example."""
 
 
 class ToolEnv:
@@ -171,6 +177,8 @@ async def run_tool(env: Any, name: str, arguments: dict[str, Any], timeout: floa
         result = await asyncio.wait_for(call, timeout)
     except asyncio.TimeoutError:
         return f"Error: the tool call did not finish within {timeout:g} s.", True
+    except ToolFailed as e:
+        return f"Error: {e}", True
     except TypeError as e:  # wrong or missing arguments
         return f"Error: {e}", True
     except Exception as e:  # noqa: BLE001 — the tool failed on the policy's input: that is the observation
