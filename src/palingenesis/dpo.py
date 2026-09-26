@@ -79,7 +79,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 
-from palingenesis.data import IGNORE_INDEX, ChatDataset, _collate_fn, _shard_then_shuffle
+from palingenesis.data import IGNORE_INDEX, ChatDataset, _collate_fn, _Epochs, _shard_then_shuffle
 from palingenesis.loss import _BackwardBridge, shift_labels
 
 logger = logging.getLogger(__name__)
@@ -137,7 +137,7 @@ def _starts_with(conversation: list[dict], prefix: list[dict]) -> bool:
     )
 
 
-class PreferenceDataset(IterableDataset):
+class PreferenceDataset(_Epochs, IterableDataset):
     """Preference pairs tokenised exactly as SFT conversations are.
 
     Yields {"chosen": {input_ids, attention_mask, labels}, "rejected": {...}}.
@@ -160,6 +160,7 @@ class PreferenceDataset(IterableDataset):
         world_size: int = 1,
         shuffle_buffer: int = 0,
         shuffle_seed: int = 0,
+        shuffle: bool = False,
     ):
         self.dataset = dataset
         self.tools_field = tools_field
@@ -172,6 +173,7 @@ class PreferenceDataset(IterableDataset):
         self.world_size = world_size
         self.shuffle_buffer = shuffle_buffer
         self.shuffle_seed = shuffle_seed
+        self.shuffle = shuffle  # map-style: a new random order every epoch
         # One renderer per side. The rejected one is allowed a very long render so
         # it can be measured and truncated here, instead of being cut by the
         # tokenizer's truncation, which would silently truncate chosen too.
@@ -188,7 +190,9 @@ class PreferenceDataset(IterableDataset):
         }
 
     def __iter__(self):
-        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed)
+        dataset = _shard_then_shuffle(
+            self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed, self.shuffle, self.epoch
+        )
         for example in dataset:
             pair = self.process(example)
             if pair is not None:
@@ -248,6 +252,7 @@ def build_preference_dataloader(
     batch_size: int,
     streaming_shuffle_buffer: int = 0,
     shuffle_seed: int = 0,
+    shuffle: bool = False,
 ):
     """DataLoader over preference pairs: `batch_size` pairs per micro-batch,
     collated as [2 * batch_size, S] (chosen rows first)."""
@@ -268,6 +273,7 @@ def build_preference_dataloader(
         world_size=world_size,
         shuffle_buffer=streaming_shuffle_buffer,
         shuffle_seed=shuffle_seed,
+        shuffle=shuffle,
     )
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     num_workers = data_config.num_workers

@@ -25,7 +25,7 @@
 |-----------|------|---------|-------------|
 | `dataset` | str | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset name, local `.jsonl`/`.json`/`.parquet` file, or a prepared-output directory from `pgs prepare`. |
 | `dataset_split` | str | `train_sft` | Dataset split to use. |
-| `streaming` | bool | `true` | Stream data (infinite, low RAM) or load to memory (finite, faster random access). |
+| `streaming` | bool | `true` | Stream the data instead of loading it (Arrow, memory-mapped). Local JSONL and parquet files stream as many shards read in parallel by ranks and workers; the run is still sized from the files' metadata. |
 | `max_seq_length` | int | `8192` | Maximum sequence length. Longer = more memory. Packing fills to this length. |
 | `messages_field` | str | `messages` | JSON field containing chat messages. Also tries: `conversations`, `chat`, `dialogue`, `turns`. |
 | `num_workers` | int | `4` | DataLoader worker processes. Increase if data loading is the bottleneck. |
@@ -50,7 +50,7 @@
 | `msft_decay_factor` | float | `0.7` | Weight multiplier when a source overfits. |
 | `msft_recovery_factor` | float | `1.15` | Weight multiplier when a source improves. |
 | `msft_floor_ratio` | float | `0.1` | Minimum weight (fraction of original). Never fully excludes a source. |
-| `pretokenize` | bool | `false` | Materialize the fully-assembled stream (tokenize → mask → mix → pack) to disk once, then load the tensors directly on later runs — skips all per-step tokenization **and** turns the exact step-count scan into a cheap read. A fingerprint over tokenizer/template/`max_seq_length`/sources/masking auto-rebuilds a stale cache. Incompatible with `msft_tracking` (it changes the stream during training → hard error). |
+| `pretokenize` | bool | `false` | Materialize the fully-assembled stream (tokenize → mask → mix → pack) to disk once, then load the tensors directly on later runs — skips all per-step tokenization **and** gives the exact step count from the cache's row count. A fingerprint over tokenizer/template/`max_seq_length`/sources/masking auto-rebuilds a stale cache. Incompatible with `msft_tracking` (it changes the stream during training → hard error). |
 | `pretokenize_path` | str | `./pretokenized` | Directory for the pre-tokenized cache (`train.parquet` + `pretokenized_meta.json`). |
 
 !!! note "Reasoning / thinking modes"
@@ -101,7 +101,8 @@
 | `output_dir` | str | `./checkpoints` | Where to save checkpoints and final model. Must be shared filesystem for multi-node. |
 | `resume_from` | str\|null | `null` | Checkpoint path to resume from. `"auto"` finds the latest valid checkpoint in `output_dir`. |
 | `epochs` | int | `1` | Number of training epochs. |
-| `max_steps` | int | `-1` | Maximum optimizer steps. Overrides epochs if positive. When unset, the LR-schedule horizon (warmup + decay) is computed **exactly** by scanning the assembled pipeline once (steps/epoch × epochs). If the count can't be known ahead of time — `streaming: true` or a `ga_ramp` — the run is **refused** with a clear error asking you to set `max_steps` (never a silent 100k guess, which would trap short runs inside warmup). Enable `pretokenize` to make the exact-count scan cheap. |
+| `max_steps` | int | `-1` | Maximum optimizer steps. Overrides epochs if positive. When unset, the LR-schedule horizon (warmup + decay) is **estimated** from the data's row counts and a sample of rows through the pipeline (a few seconds, typically ±1–2%; streaming included), so training starts at once; see the data guide's "Run length and streaming". A Hub stream without published sizes, or a `ga_ramp`, needs `max_steps`. |
+| `exact_steps` | bool | `false` | Scan the whole assembled pipeline once to count the steps exactly instead of estimating them (an extra pass over the data before training; not possible when streaming). |
 | `per_device_batch_size` | int | `1` | Sequences per GPU per forward pass. Increase if memory allows. |
 | `gradient_accumulation_steps` | int | `16` | Micro-batches before optimizer step. Effective batch = batch_size × GA × num_gpus. |
 | `ga_ramp_start` | int | `0` | Batch size scheduling: start GA at this value, linearly ramp to full `gradient_accumulation_steps`. 0 = constant. |

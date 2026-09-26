@@ -181,6 +181,7 @@ How the mix behaves in training (`data.sources`):
 
 - `weight` is a **per-conversation** sampling probability, not a token share: a source of long conversations contributes more tokens than its weight suggests.
 - An epoch ends when the **first** non-empty source runs out, so a small source with a large weight shortens the epoch for all the others.
+- Every epoch draws each source in a **new random order** (`seed + epoch`), so a large source mixed with a small one contributes a fresh random share of its rows each epoch, not the same first rows again. The run's log gives each source's row count and the epoch length at startup.
 
 !!! warning "`data.msft_tracking` has no effect yet"
     `msft.AdaptiveSourceTracker` (per-source weight decay when a source's validation loss rises, after mSFT, arXiv:2603.21606) exists but is not wired into the training loop. Setting `msft_tracking: true` logs a warning and the weights stay fixed. Watch per-source losses with `eval_sources` instead.
@@ -240,11 +241,19 @@ data:
 
 ---
 
+## Run length and streaming
+
+Training starts at once, streaming included: the LR schedule's horizon (the number of optimizer steps of an epoch-based run) is **estimated**, not counted by a pass over the data. Rows come from metadata (a parquet footer, a JSONL's newlines, an in-memory dataset's length, a Hub dataset's published split sizes), and a uniform random sample of 2,000 rows goes through the real pipeline (rendering, filters, packing, the mixture's weights) to measure how many micro-batches a row yields. On 60,000 conversations this took 2 s against 27 s for a full scan, 0.8% off; the log reports the estimate, its sampling error, and at the end of each epoch how many micro-batches it actually had. If the data outlasts the estimate the LR stays at its floor; if it ends a little sooner the decay stops a little early. `train.exact_steps: true` scans the whole pipeline instead; `train.max_steps` skips both.
+
+`data.streaming: true` reads local JSONL and parquet files as many shards (byte ranges, row groups) that ranks and DataLoader workers read in parallel: without that, `datasets` streams a single file through one worker while the others stop, and every rank reads the whole file. Write parquet with several row groups (`pyarrow` `row_group_size`) so it can be split. A Hub dataset without published split sizes cannot be sized from metadata: set `train.max_steps`.
+
+With several GPUs, each rank packs its own shard, so ranks can reach the end of an epoch a micro-batch apart; they agree before every micro-batch (on a CPU group, no GPU sync) and end the epoch together.
+
+---
+
 ## Pre-tokenized cache
 
-By default every sequence is tokenized, masked, mixed and packed **on the fly**, every epoch. When the exact step count is needed for the LR schedule (epoch mode, `max_steps` unset), the pipeline is also scanned once up front — which pays the tokenization cost twice on the first epoch.
-
-`pretokenize` fixes both: it runs the whole assembly **once**, dumps the final tensors to disk, and on every later run loads them directly.
+By default every sequence is tokenized, masked, mixed and packed **on the fly**, every epoch, in a new order each epoch. `pretokenize` runs the whole assembly **once**, dumps the final tensors to disk, and on every later run loads them directly (and reshuffles them every epoch after the first).
 
 ```yaml
 data:
@@ -255,7 +264,7 @@ data:
 What you get:
 
 - **No per-step tokenization** — the cached rows are the final `input_ids` / `labels` / `attention_mask` (plus `position_ids` when packed). The trainer just reads and collates them. With `packing: false`, length-grouped batching (`length_group_buffer`) is still re-applied at load time, so the cache keeps the pad-token throughput win.
-- **Cheap exact step count** — the count scan reads pre-tokenized arrow instead of re-tokenizing, so you keep an exact LR horizon without the up-front cost.
+- **Exact step count for free** — the cache's row count is its number of training sequences, read from the parquet footer.
 - **Automatic invalidation** — a fingerprint over the tokenizer, chat template, `max_seq_length`, `packing`, every source (path + size + mtime + weight + mode + fields + `last_turn_only`), `train_on_reasoning`, `turn_scaling`, `include_observations`, `seed` and replay is stored in `pretokenized_meta.json`. Change any of them and the cache is rebuilt — you can never silently train on a stale tokenization.
 
 The cache is a **static** stream, so `msft_tracking` (which adjusts per-source weights *during* training) is rejected at validation time with a clear error. Disable one of the two to proceed. Under multi-GPU, rank 0 builds the cache once and the other ranks wait on a barrier, then each rank reads a disjoint shard.

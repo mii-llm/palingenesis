@@ -127,6 +127,9 @@ class TrainConfig:
     resume_from: str | None = None  # path to checkpoint dir, or "auto" to find latest
     epochs: int = 1
     max_steps: int = -1
+    # Epoch-based runs size the LR schedule from an estimate (row counts + a sample of rows
+    # through the pipeline: no pass over the data). True: scan the whole pipeline once first.
+    exact_steps: bool = False
     per_device_batch_size: int = 1
     gradient_accumulation_steps: int = 16
     # Batch ramp: start with smaller effective batch, increase late in training

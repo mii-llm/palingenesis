@@ -70,6 +70,15 @@ def _load_dataset_source(dataset_id: str, split: str, streaming: bool):
         if prepared is not None:
             path = prepared
 
+    if streaming and path.is_file() and path.suffix in {".parquet", ".jsonl", ".json"}:
+        # one file as many shards (byte ranges / row groups): ranks and workers read their
+        # own parts in parallel instead of one worker reading it all (see data_size)
+        from palingenesis.data_size import local_stream
+
+        stream = local_stream(path)
+        if stream is not None:
+            return stream
+
     if path.exists() and path.suffix == ".parquet":
         return load_dataset("parquet", data_files=str(path), split="train", streaming=streaming)
 
@@ -136,16 +145,50 @@ def _shard_streaming_dataset(dataset, rank: int, world_size: int):
     return dataset.take_every(shard_count)
 
 
-def _shard_then_shuffle(dataset, rank: int, world_size: int, shuffle_buffer: int, shuffle_seed: int):
-    """Per-worker shard, THEN buffer-shuffle. The order is load-bearing:
-    `shuffle().shard()` on a streaming dataset leaves every worker except the
-    first with an empty shard list (datasets 5.x), killing the DataLoader.
-    Shard-first is also the semantically right order — each worker streams its
-    own files and shuffles locally within its buffer."""
+def _is_streaming(dataset) -> bool:
+    try:
+        from datasets import IterableDataset as _HFIterableDataset
+
+        return isinstance(dataset, _HFIterableDataset)
+    except ImportError:
+        return False
+
+
+def _shard_then_shuffle(
+    dataset, rank: int, world_size: int, shuffle_buffer: int, shuffle_seed: int, shuffle: bool = False, epoch: int = 0
+):
+    """This worker's part of `dataset`, in this epoch's order (seed + epoch: a new order
+    every epoch).
+
+    Map-style (`shuffle`): a global permutation first, the same on every rank and worker, so
+    their contiguous shards stay disjoint. Streaming (`shuffle_buffer`): shard first, THEN
+    buffer-shuffle; `shuffle().shard()` on a streaming dataset leaves every worker except
+    the first with an empty shard list (datasets 5.x), and each worker streams its own
+    files anyway. set_epoch also reshuffles the order of the shards themselves."""
+    if shuffle and not _is_streaming(dataset):
+        dataset = dataset.shuffle(seed=shuffle_seed + epoch)
     dataset = _shard_streaming_dataset(dataset, rank, world_size)
     if shuffle_buffer > 0:
-        dataset = dataset.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer)
+        dataset = dataset.shuffle(seed=shuffle_seed + epoch, buffer_size=shuffle_buffer)
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
     return dataset
+
+
+class _Epochs:
+    """set_epoch(epoch) for a dataset stage: every stage derives its randomness from
+    seed + epoch, and passes the epoch to the stages it wraps. Called before each epoch's
+    DataLoader iterator is created (the workers receive a copy with the epoch set)."""
+
+    epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        for name in ("dataset", "base", "sources"):
+            inner = getattr(self, name, None)
+            for stage in inner if isinstance(inner, list) else [inner]:
+                if isinstance(stage, _Epochs):
+                    stage.set_epoch(epoch)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -378,7 +421,7 @@ def _echo_text_spans(text: str) -> list[tuple[int, int]]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class ChatDataset(IterableDataset):
+class ChatDataset(_Epochs, IterableDataset):
     """SFT dataset: chat template masking, only assistant tokens get loss.
 
     When include_observations=True (ECHO mode), tool/observation role tokens
@@ -401,6 +444,7 @@ class ChatDataset(IterableDataset):
         shuffle_buffer: int = 0,
         shuffle_seed: int = 0,
         tools_field: str = "tools",
+        shuffle: bool = False,
         think_tags: tuple[str, str] | list[str] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
     ):
@@ -424,9 +468,11 @@ class ChatDataset(IterableDataset):
         # `chat_template_kwargs` field overrides them key by key, so thinking and
         # non-thinking rows can be mixed in one dataset.
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
-        # Streaming shuffle, applied per worker AFTER sharding (see _shard_then_shuffle).
+        # A new order every epoch (see _shard_then_shuffle): `shuffle` permutes a map-style
+        # dataset globally, `shuffle_buffer` shuffles a stream per worker after sharding.
         self.shuffle_buffer = shuffle_buffer
         self.shuffle_seed = shuffle_seed
+        self.shuffle = shuffle
         # last_turn_only: mask every assistant turn except the final one. Selects which
         # turns get loss (training) / are scored (eval). Use for eval-format SFT where
         # earlier assistant turns are a FIXED few-shot prefix (e.g. n-shot MCQA
@@ -472,7 +518,9 @@ class ChatDataset(IterableDataset):
         return self.tokenizer.apply_chat_template(messages, **{**self._template_kwargs, **kwargs})
 
     def __iter__(self):
-        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed)
+        dataset = _shard_then_shuffle(
+            self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed, self.shuffle, self.epoch
+        )
         self.stats.clear()
         for example in dataset:
             too_long = self.stats["dropped_too_long"]
@@ -1223,7 +1271,7 @@ class ChatDataset(IterableDataset):
         return messages[: ends[i]]
 
 
-class PretrainDataset(IterableDataset):
+class PretrainDataset(_Epochs, IterableDataset):
     """Pretraining/CPT dataset: loss on ALL tokens (no masking)."""
 
     def __init__(
@@ -1236,6 +1284,7 @@ class PretrainDataset(IterableDataset):
         world_size: int = 1,
         shuffle_buffer: int = 0,
         shuffle_seed: int = 0,
+        shuffle: bool = False,
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -1245,9 +1294,12 @@ class PretrainDataset(IterableDataset):
         self.world_size = world_size
         self.shuffle_buffer = shuffle_buffer
         self.shuffle_seed = shuffle_seed
+        self.shuffle = shuffle
 
     def __iter__(self):
-        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed)
+        dataset = _shard_then_shuffle(
+            self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed, self.shuffle, self.epoch
+        )
         for example in dataset:
             result = self._process(example)
             if result is not None:
@@ -1277,11 +1329,13 @@ class PretrainDataset(IterableDataset):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class MixedDataset(IterableDataset):
+class MixedDataset(_Epochs, IterableDataset):
     """Weighted interleaving of multiple datasets.
 
-    Samples from each source with probability proportional to its weight.
-    Stops when any source is exhausted (epoch boundary).
+    Samples from each source with probability proportional to its weight. An epoch ends
+    when a source is exhausted; every source is drawn in a new random order each epoch, so a
+    large source mixed with a small one is sampled afresh every epoch (not its same first
+    rows).
 
     Each source can be either SFT (chat masking) or pretrain (all-token loss).
     """
@@ -1302,7 +1356,7 @@ class MixedDataset(IterableDataset):
         self.names = names or [f"source[{i}]" for i in range(len(sources))]
 
     def __iter__(self):
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + self.epoch)
         iterators = [iter(s) for s in self.sources]
         indices = list(range(len(self.sources)))
         active = list(indices)
@@ -1338,7 +1392,7 @@ class MixedDataset(IterableDataset):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class PackedDataset(IterableDataset):
+class PackedDataset(_Epochs, IterableDataset):
     """Packs whole conversations into blocks of at most max_len tokens.
 
     Documents are never split: a conversation cut across two blocks would train its
@@ -1441,7 +1495,7 @@ class PackedDataset(IterableDataset):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class LengthGroupedDataset(IterableDataset):
+class LengthGroupedDataset(_Epochs, IterableDataset):
     """Reorder a sample stream so samples in the same batch have similar lengths.
 
     Without packing, `_collate_fn` pads every batch to its longest sample. With
@@ -1467,7 +1521,7 @@ class LengthGroupedDataset(IterableDataset):
         self.seed = seed
 
     def __iter__(self):
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + self.epoch)
         buf: list[dict[str, torch.Tensor]] = []
         for sample in self.dataset:
             buf.append(sample)
@@ -1531,6 +1585,135 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
 collate_fn = _collate_fn
 
 
+def source_name(src: dict, index: int) -> str:
+    return str(src.get("name", src.get("dataset", f"source[{index}]")))
+
+
+def source_stage(
+    raw,
+    tokenizer: PreTrainedTokenizerBase,
+    config: DataConfig,
+    src: dict | None,
+    rank: int,
+    world_size: int,
+    shuffle_buffer: int = 0,
+    shuffle: bool = False,
+) -> "ChatDataset | PretrainDataset":
+    """The per-row stage of one data source: `src` is a data.sources entry (its options
+    override the config's), None for the single data.dataset. The training pipeline and the
+    size estimate (data_size) both build their stages here."""
+    src = src or {}
+    mode = src.get("mode", "sft")
+    if mode == "pretrain":
+        return PretrainDataset(
+            raw,
+            tokenizer,
+            config.max_seq_length,
+            text_field=src.get("text_field", "text"),
+            rank=rank,
+            world_size=world_size,
+            shuffle_buffer=shuffle_buffer,
+            shuffle_seed=config.seed,
+            shuffle=shuffle,
+        )
+    if mode != "sft":
+        raise ValueError(f"Unknown data mode: {mode}. Use 'sft' or 'pretrain'.")
+    return ChatDataset(
+        raw,
+        tokenizer,
+        config.max_seq_length,
+        messages_field=src.get("messages_field", config.messages_field if not src else "messages"),
+        rank=rank,
+        world_size=world_size,
+        include_observations=config.include_observations,
+        turn_scaling=config.turn_scaling,
+        train_on_reasoning=getattr(config, "train_on_reasoning", True),
+        last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
+        shuffle_buffer=shuffle_buffer,
+        shuffle_seed=config.seed,
+        shuffle=shuffle,
+        tools_field=src.get("tools_field", config.tools_field),
+        think_tags=src.get("think_tags", getattr(config, "think_tags", None)),
+        chat_template_kwargs={
+            **(getattr(config, "chat_template_kwargs", None) or {}),
+            **(src.get("chat_template_kwargs") or {}),
+        },
+    )
+
+
+def estimate_pretokenized(cache_dir, world_size: int, batch_size: int):
+    """A pre-tokenized cache holds the final training sequences: its parquet row count is exact."""
+    import pyarrow.parquet as pq
+
+    from palingenesis import data_size
+
+    rows = pq.ParquetFile(Path(cache_dir) / PRETOK_DATA).metadata.num_rows
+    per_rank = rows / world_size
+    source = data_size.SourceEstimate("pre-tokenized cache", rows, 1.0, 1.0)
+    return data_size.StepEstimate(int(per_rank // batch_size), per_rank, per_rank, 0.0, [source])
+
+
+def estimate_run(
+    config: DataConfig,
+    tokenizer: PreTrainedTokenizerBase,
+    world_size: int,
+    batch_size: int,
+    dataset=None,
+    dataset_id: str | None = None,
+):
+    """The data_size estimate of this run's per-rank micro-batches per epoch, from row
+    counts and a sample of rows through the real per-row stages (no pass over the data).
+    `dataset` / `dataset_id`: what the single-dataset path trains on (a prepared dataset,
+    say) instead of config.dataset."""
+    from palingenesis import data_size
+
+    k = data_size.sample_size()
+    entries: list[tuple[str, str, str, dict | None, float, object]] = []  # name, id, split, src, weight, loaded
+    if config.sources:
+        for i, src in enumerate(config.sources):
+            entries.append(
+                (source_name(src, i), src["dataset"], src.get("split", "train"), src, src.get("weight", 1.0), None)
+            )
+    else:
+        loaded = dataset if dataset is not None and not data_size._is_streaming_obj(dataset) else None
+        dataset_id = str(dataset_id or config.dataset)
+        entries.append((dataset_id, dataset_id, config.dataset_split, None, 1.0, loaded))
+    sources = []
+    for i, (name, dataset_id, split, src, weight, loaded) in enumerate(entries):
+        rows = data_size.count_rows(dataset_id, split, loaded)
+        sample, uniform = data_size.sample_rows(dataset_id, split, k, config.seed + i, loaded)
+        sources.append(
+            data_size.measure_source(
+                name,
+                rows,
+                weight,
+                sample,
+                uniform,
+                lambda raw, src=src: source_stage(raw, tokenizer, config, src, 0, 1),
+            )
+        )
+    if config.pretrain_replay_dataset:
+        # replay mixes (1 - w) of the target with w of replay text; its size bounds the epoch only if known
+        w = config.pretrain_replay_weight
+        for s in sources:
+            s.weight *= (1.0 - w) / sum(t.weight for t in sources)
+        replay_src = {"mode": "pretrain", "text_field": "text"}
+        sample, uniform = data_size.sample_rows(config.pretrain_replay_dataset, "train", k, config.seed + 97)
+        sources.append(
+            data_size.measure_source(
+                f"replay:{config.pretrain_replay_dataset}",
+                data_size.count_rows(config.pretrain_replay_dataset, "train"),
+                w,
+                sample,
+                uniform,
+                lambda raw: source_stage(raw, tokenizer, config, replay_src, 0, 1),
+            )
+        )
+    return data_size.estimate_steps(
+        sources, world_size, batch_size, config.packing, config.max_seq_length, seed=config.seed
+    )
+
+
 def build_dataset(
     dataset_or_config,
     tokenizer: PreTrainedTokenizerBase,
@@ -1539,8 +1722,10 @@ def build_dataset(
     world_size: int,
     batch_size: int,
     streaming_shuffle_buffer: int = 0,
+    shuffle: bool = False,
 ) -> IterableDataset:
     """Assemble the final training IterableDataset (everything the DataLoader wraps).
+    `shuffle`: a pre-loaded map-style dataset gets a new random order every epoch.
 
     Handles three cases:
     1. Pre-built dataset object (backward compat)
@@ -1563,95 +1748,48 @@ def build_dataset(
         names = []
         for src in config.sources:
             raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=config.streaming)
-            # Shuffle happens inside the dataset AFTER per-worker sharding —
-            # shuffle-then-shard crashes streaming workers (see _shard_then_shuffle).
-            # Map-style datasets can be shuffled eagerly and use a different
-            # shuffle() signature (no buffer_size).
-            if not config.streaming:
-                raw = raw.shuffle(seed=config.seed)
-            shuffle_buffer = 10_000 if config.streaming else 0
-            mode = src.get("mode", "sft")
-            if mode == "sft":
-                ds = ChatDataset(
+            # A new order every epoch, inside the dataset (see _shard_then_shuffle)
+            source_datasets.append(
+                source_stage(
                     raw,
                     tokenizer,
-                    config.max_seq_length,
-                    messages_field=src.get("messages_field", "messages"),
-                    rank=rank,
-                    world_size=world_size,
-                    include_observations=config.include_observations,
-                    turn_scaling=config.turn_scaling,
-                    train_on_reasoning=getattr(config, "train_on_reasoning", True),
-                    last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
-                    shuffle_buffer=shuffle_buffer,
-                    shuffle_seed=config.seed,
-                    tools_field=src.get("tools_field", config.tools_field),
-                    think_tags=src.get("think_tags", getattr(config, "think_tags", None)),
-                    chat_template_kwargs={
-                        **(getattr(config, "chat_template_kwargs", None) or {}),
-                        **(src.get("chat_template_kwargs") or {}),
-                    },
+                    config,
+                    src,
+                    rank,
+                    world_size,
+                    shuffle_buffer=10_000 if config.streaming else 0,
+                    shuffle=not config.streaming,
                 )
-            elif mode == "pretrain":
-                ds = PretrainDataset(
-                    raw,
-                    tokenizer,
-                    config.max_seq_length,
-                    text_field=src.get("text_field", "text"),
-                    rank=rank,
-                    world_size=world_size,
-                    shuffle_buffer=shuffle_buffer,
-                    shuffle_seed=config.seed,
-                )
-            else:
-                raise ValueError(f"Unknown data mode: {mode}. Use 'sft' or 'pretrain'.")
-
-            source_datasets.append(ds)
+            )
             weights.append(src.get("weight", 1.0))
-            names.append(str(src.get("name", src.get("dataset", f"source[{len(names)}]"))))
+            names.append(source_name(src, len(names)))
 
         final_ds: IterableDataset = MixedDataset(source_datasets, weights, seed=config.seed, names=names)
     elif hasattr(dataset_or_config, "__iter__") and not isinstance(dataset_or_config, DataConfig):
-        # Pre-loaded HF dataset object passed directly. The caller decides
-        # whether to shuffle (streaming_shuffle_buffer > 0) — e.g. curriculum-
-        # ordered prepared data must NOT be shuffled.
-        raw = dataset_or_config
-        final_ds = ChatDataset(
-            raw,
+        # Pre-loaded HF dataset object passed directly. The caller decides whether to
+        # shuffle: curriculum-ordered prepared data must NOT be.
+        final_ds = source_stage(
+            dataset_or_config,
             tokenizer,
-            config.max_seq_length,
-            config.messages_field,
+            config,
+            None,
             rank,
             world_size,
-            include_observations=config.include_observations,
-            turn_scaling=config.turn_scaling,
-            train_on_reasoning=getattr(config, "train_on_reasoning", True),
-            last_turn_only=getattr(config, "last_turn_only", False),
             shuffle_buffer=streaming_shuffle_buffer,
-            shuffle_seed=config.seed,
-            tools_field=config.tools_field,
-            think_tags=getattr(config, "think_tags", None),
-            chat_template_kwargs=getattr(config, "chat_template_kwargs", None),
+            shuffle=shuffle,
         )
     else:
         # Single dataset from config
         raw = _load_dataset_source(config.dataset, config.dataset_split, config.streaming)
-        final_ds = ChatDataset(
+        final_ds = source_stage(
             raw,
             tokenizer,
-            config.max_seq_length,
-            config.messages_field,
+            config,
+            None,
             rank,
             world_size,
-            include_observations=config.include_observations,
-            turn_scaling=config.turn_scaling,
-            train_on_reasoning=getattr(config, "train_on_reasoning", True),
-            last_turn_only=getattr(config, "last_turn_only", False),
             shuffle_buffer=10_000 if config.streaming else 0,
-            shuffle_seed=config.seed,
-            tools_field=config.tools_field,
-            think_tags=getattr(config, "think_tags", None),
-            chat_template_kwargs=getattr(config, "chat_template_kwargs", None),
+            shuffle=not config.streaming,
         )
 
     # ── Pretraining Replay (arxiv:2603.04964) ─────────────────────────────────
@@ -1717,6 +1855,7 @@ def build_dataloader(
     world_size: int,
     batch_size: int,
     streaming_shuffle_buffer: int = 0,
+    shuffle: bool = False,
 ) -> DataLoader:
     """Build the complete data pipeline (assemble the dataset, then wrap in a DataLoader)."""
     final_ds = build_dataset(
@@ -1727,6 +1866,7 @@ def build_dataloader(
         world_size,
         batch_size,
         streaming_shuffle_buffer=streaming_shuffle_buffer,
+        shuffle=shuffle,
     )
     return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)
 
@@ -1894,20 +2034,25 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
     return count
 
 
-class PretokenizedDataset(IterableDataset):
-    """Yields already-tokenized/packed tensors from a cached parquet, sharded by rank/worker.
+class PretokenizedDataset(_Epochs, IterableDataset):
+    """Yields already-tokenized/packed tensors from a cached parquet, sharded by rank/worker:
+    the cached order in the first epoch, a new one every later epoch (`shuffle`, seed + epoch).
 
     No tokenization, masking, mixing or packing — the cached rows are the final
     training sequences produced by an earlier ``materialize_pretokenized`` pass.
     """
 
-    def __init__(self, dataset, rank: int = 0, world_size: int = 1):
+    def __init__(self, dataset, rank: int = 0, world_size: int = 1, shuffle: bool = True, seed: int = 0):
         self.dataset = dataset
         self.rank = rank
         self.world_size = world_size
+        self.shuffle = shuffle
+        self.seed = seed
 
     def __iter__(self):
-        dataset = _shard_streaming_dataset(self.dataset, self.rank, self.world_size)
+        # epoch 0 is the cached order (already the materialized stream's); later epochs permute it
+        shuffle = self.shuffle and self.epoch > 0
+        dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, 0, self.seed, shuffle, self.epoch)
         for ex in dataset:
             out = {
                 "input_ids": torch.as_tensor(ex["input_ids"], dtype=torch.long),
@@ -1931,7 +2076,7 @@ def build_pretokenized_dataloader(cache_dir, tokenizer, config: DataConfig, rank
 
     data_file = Path(cache_dir) / PRETOK_DATA
     ds = load_dataset("parquet", data_files=str(data_file), split="train", streaming=False)
-    final_ds: IterableDataset = PretokenizedDataset(ds, rank=rank, world_size=world_size)
+    final_ds: IterableDataset = PretokenizedDataset(ds, rank=rank, world_size=world_size, seed=config.seed)
 
     if not config.packing and batch_size > 1 and getattr(config, "length_group_buffer", 512) > 0:
         final_ds = LengthGroupedDataset(final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed)
