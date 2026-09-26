@@ -228,14 +228,7 @@ class RLTrainer:
             self.stop_ids,
         )
         self.orchestrator = Orchestrator(self.pipeline, lambda: self.batch_prompts, r.temperature, r.max_staleness)
-        self.opt = torch.optim.AdamW(
-            self._trainable(),
-            lr=t.learning_rate,
-            betas=(t.adam_beta1, t.adam_beta2),
-            eps=t.adam_eps,
-            weight_decay=t.weight_decay,
-            fused=self.device.startswith("cuda") and not t.cpu_offload,
-        )
+        self.opt = _optimizer(self._trainable(), t, self.device)
         self.start_step, self.stale_groups, wandb_id = 0, 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
@@ -267,14 +260,14 @@ class RLTrainer:
             return None
         elif e.type == "tools":
             functions = [load_object(spec) for spec in e.tools]
-            return EnvPool(lambda: ToolEnv(functions), max_concurrent=e.max_concurrent)
+            return EnvPool(lambda: ToolEnv(functions), max_concurrent=e.max_concurrent, allowed=e.allowed_tools)
         else:
             factory = load_object(e.type)
         args = dict(e.args)
         if "sandbox" in _parameters(factory) and "sandbox" not in args:
             self._env_wants_sandbox = True
             args["sandbox"] = _LazySandbox(self)
-        return EnvPool(factory, args, max_concurrent=e.max_concurrent)
+        return EnvPool(factory, args, max_concurrent=e.max_concurrent, allowed=e.allowed_tools)
 
     def _needs_sandbox(self) -> bool:
         return getattr(self, "_env_wants_sandbox", False) or any(
@@ -753,6 +746,18 @@ class _LazySandbox:
 
     def __getattr__(self, name):
         return getattr(self._trainer.sandbox, name)
+
+
+def _optimizer(params: list[torch.nn.Parameter], t: Any, device: str) -> torch.optim.Optimizer:
+    """AdamW over the trained parameters (the fp32 masters on one GPU), with fp32 or 8-bit moments."""
+    eps = t.adam_eps or (1e-15 if t.optimizer == "adamw" else 1e-8)
+    kwargs = dict(lr=t.learning_rate, betas=(t.adam_beta1, t.adam_beta2), eps=eps, weight_decay=t.weight_decay)
+    if t.optimizer == "adamw":
+        return torch.optim.AdamW(params, fused=device.startswith("cuda") and not t.cpu_offload, **kwargs)
+    import bitsandbytes as bnb
+
+    cls = bnb.optim.PagedAdamW8bit if t.optimizer == "paged_adamw8bit" else bnb.optim.AdamW8bit
+    return cls(params, **kwargs)
 
 
 def _parameters(fn: Callable) -> set[str]:

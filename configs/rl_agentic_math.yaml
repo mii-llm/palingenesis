@@ -1,0 +1,77 @@
+# Agentic math on one GPU: Qwen3.5-0.8B solves GSM8K with two tools, `python` (compute) and
+# `submit_answer` (commit the result, which ends the episode). The environment grades the
+# submitted answer; an episode that never submits scores 0.
+#
+#   python examples/rl/prepare_gsm8k.py          # data/gsm8k_{train,test}.jsonl
+#   pgs rl --config configs/rl_agentic_math.yaml
+#
+# The policy writes arbitrary code, and a small model does not know what a command does to
+# the machine it runs on: every program runs in the docker sandbox, never on the host. Each
+# container has no network, a read-only root and noexec scratch space, capped memory (no
+# swap), processes and CPUs; each concurrent slot runs its programs as its own unprivileged
+# user with no capabilities, so programs cannot read, change or signal each other or the
+# worker, and every process a program leaves behind is killed when it ends.
+#
+# Tool results are context (never trained); every sampled token of every turn is trained
+# (token-in/token-out: nothing is re-tokenized between turns).
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/gsm8k_train.jsonl
+  eval_dataset: data/gsm8k_test.jsonl
+  system_prompt: |-
+    You solve math problems with two tools.
+    - python runs a fresh Python 3 program (standard library only) and returns what it prints.
+    - submit_answer records your final answer and ends the task.
+
+    Work like this:
+    1. Identify the quantities and what is asked, in a few sentences.
+    2. Compute with python instead of doing arithmetic in your head: one short program that
+       prints each intermediate value with a label.
+    3. Check the output against the problem (units, rates, what the question asks for). If a
+       value looks wrong or the program failed, fix it and run it again.
+    4. Call submit_answer once, with only the final number or simplified expression: no
+       units, words or \boxed{}.
+  retire_above: 0.9
+
+env:
+  type: examples/rl/math_env.py:MathToolsEnv
+  max_turns: 8                 # assistant turns: a few python runs, then the submission
+  max_tool_output_tokens: 512  # longer program output keeps its head and tail
+  tool_timeout: 20
+
+sandbox:
+  backend: docker              # isolation: see above. "subprocess" would run the policy's code on the host
+  image: python:3.12-slim
+  workers: 8                   # containers
+  slots_per_worker: 4          # concurrent programs per container: 32 in flight
+  memory_mb: 512
+  timeout: 10
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 8
+  # Budgets far above what a solution needs, so that they cut only runaway generations:
+  # a short GSM8K solution is ~300 tokens per turn, and a trajectory a few turns of it plus
+  # tool outputs.
+  max_new_tokens: 2048         # per assistant turn
+  max_completion_tokens: 6144  # sampled tokens of the whole trajectory
+  max_model_len: 8192          # prompt + everything after it (tool outputs included)
+  gpu_memory_utilization: 0.3
+  max_staleness: 1             # tools and rollouts of step k+1 run while step k trains
+
+loss:
+  overlong_buffer: 1024        # the last 1024 tokens of the budget cost up to 1 reward, linearly
+
+train:
+  output_dir: runs/rl_agentic_math
+  steps: 200
+  learning_rate: 2.0e-6
+  warmup_steps: 5
+  optimizer: adamw8bit         # 8-bit moments: 2 bytes per parameter instead of 8
+  eval_every: 25
+  eval_samples: 256

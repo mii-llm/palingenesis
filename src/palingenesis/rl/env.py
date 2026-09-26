@@ -43,16 +43,31 @@ For example, a Python tool whose final answer is graded by hidden tests:
             ...
 
 Stateless tools need no class: env.type "tools" with env.tools: ["module:function", ...].
+
+Which tools the policy gets. By default every public method (other than the lifecycle ones
+above) is a tool, so a public helper would be one too: pin the set with a class attribute,
+
+    class MathEnv:
+        tools = ("python", "submit_answer")
+
+and/or with the config's env.allowed_tools (names or shell-style patterns such as
+"search__*"), which filters any environment, MCP servers and remote ones included. Only the
+episode's exposed tools can be called: a call to anything else (a hidden method, a filtered
+server tool) is answered "unknown tool", whatever the environment would do with it.
 """
 
 import asyncio
+import fnmatch
 import inspect
 import json
+import logging
 from typing import Any, Callable
 
 from palingenesis.rl.chat import tool_schema
 
-_LIFECYCLE = ("reset", "get_reward", "close", "aclose", "tool_schemas", "call_tool")
+logger = logging.getLogger(__name__)
+
+_LIFECYCLE = ("reset", "get_reward", "close", "aclose", "tool_schemas", "call_tool", "tools")
 
 
 class ToolFailed(Exception):
@@ -72,9 +87,16 @@ class ToolEnv:
 
 
 def env_tools(env: Any) -> dict[str, Callable]:
-    """An environment's tools: its public methods other than reset, get_reward and close."""
+    """An environment's tools: its public methods other than the lifecycle ones, or the names in
+    its `tools` class attribute when it pins them."""
     if isinstance(env, ToolEnv):
         return env.tool_functions()
+    pinned = getattr(type(env), "tools", None)
+    if isinstance(pinned, (list, tuple)):
+        missing = [n for n in pinned if not callable(getattr(env, n, None))]
+        if missing:
+            raise ValueError(f"{type(env).__name__}.tools names {missing}, which are not methods of the class.")
+        return {name: getattr(env, name) for name in pinned}
     tools = {}
     for name, member in inspect.getmembers(type(env)):
         if name.startswith("_") or name in _LIFECYCLE or not callable(member) or isinstance(member, type):
@@ -111,25 +133,57 @@ def row_tools(row: dict[str, Any], field: str) -> list[dict] | None:
     return [normalize_tool(t) for t in tools] if tools else None
 
 
+def select_tools(schemas: list[dict], allowed: list[str] | tuple[str, ...], source: str = "") -> list[dict]:
+    """The schemas whose names match `allowed` (names or shell-style patterns; empty = all).
+    A pattern matching no tool is an error: a typo would silently hide a tool."""
+    if not allowed:
+        return schemas
+    names = [s["function"]["name"] for s in schemas]
+    unmatched = [p for p in allowed if not fnmatch.filter(names, p)]
+    if unmatched:
+        raise ValueError(
+            f"env.allowed_tools: {unmatched} match no tool{' of ' + source if source else ''}. "
+            f"Available: {', '.join(names) or 'none'}."
+        )
+    return [s for s in schemas if any(fnmatch.fnmatchcase(s["function"]["name"], p) for p in allowed)]
+
+
 class EnvPool:
     """Instances of one environment class, reused across trajectories when it can reset, at
     most `max_concurrent` live at once (0 = no limit; remote environments have a capacity).
 
     `factory` is the class (or any callable returning an instance), called with `args`.
     Method tools and their schemas are read once from a first instance; environments with
-    tool_schemas() are asked per episode."""
+    tool_schemas() are asked per episode. `allowed` (env.allowed_tools) filters either."""
 
-    def __init__(self, factory: Callable[..., Any], args: dict[str, Any] | None = None, max_concurrent: int = 0):
+    def __init__(
+        self,
+        factory: Callable[..., Any],
+        args: dict[str, Any] | None = None,
+        max_concurrent: int = 0,
+        allowed: list[str] | tuple[str, ...] = (),
+    ):
         self.factory = factory
         self.args = args or {}
+        self.allowed = tuple(allowed)
         self.free: list[Any] = []
         self.slots = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
         probe = self._new()
+        self.name = type(probe).__name__
         self.reusable = hasattr(probe, "reset")
         self.dynamic = hasattr(probe, "tool_schemas")
-        self.schemas = [] if self.dynamic else [tool_schema(fn, name) for name, fn in env_tools(probe).items()]
+        self.schemas = []
+        if not self.dynamic:
+            schemas = [tool_schema(fn, name) for name, fn in env_tools(probe).items()]
+            self.schemas = select_tools(schemas, self.allowed, self.name)
+            self._log(self.schemas)
+        self.logged = not self.dynamic
         self.has_reward = hasattr(probe, "get_reward")
         self.free.append(probe)
+
+    def _log(self, schemas: list[dict]) -> None:
+        names = ", ".join(s["function"]["name"] for s in schemas) or "none"
+        logger.info("Environment %s: the policy's tools are %s", self.name, names)
 
     def _new(self) -> Any:
         return self.factory(**self.args)
@@ -161,11 +215,21 @@ class EnvPool:
         """The tool schemas of `env`'s current episode."""
         if not self.dynamic:
             return self.schemas
-        return [normalize_tool(t) for t in await call_sync_or_async(env.tool_schemas)]
+        schemas = [normalize_tool(t) for t in await call_sync_or_async(env.tool_schemas)]
+        schemas = select_tools(schemas, self.allowed, self.name)
+        if not self.logged:
+            self.logged = True
+            self._log(schemas)
+        return schemas
 
 
-async def run_tool(env: Any, name: str, arguments: dict[str, Any], timeout: float) -> tuple[str, bool]:
-    """(result text, failed): the tool's output for the policy, or the error it caused."""
+async def run_tool(
+    env: Any, name: str, arguments: dict[str, Any], timeout: float, exposed: set[str] | None = None
+) -> tuple[str, bool]:
+    """(result text, failed): the tool's output for the policy, or the error it caused.
+    `exposed`: the episode's tools; anything else is refused before reaching the environment."""
+    if exposed is not None and name not in exposed:
+        return f"Error: unknown tool {name!r}. Available tools: {', '.join(sorted(exposed)) or 'none'}.", True
     if hasattr(env, "call_tool"):
         call = call_sync_or_async(env.call_tool, name, arguments)
     else:

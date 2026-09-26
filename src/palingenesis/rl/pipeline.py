@@ -235,7 +235,7 @@ class RLPipeline:
                     trajectory.finish = "turns"
                     break
                 results = await asyncio.gather(
-                    *(run_tool(env, c.name, c.arguments, e.tool_timeout) for c in parsed.calls)
+                    *(run_tool(env, c.name, c.arguments, e.tool_timeout, set(by_name)) for c in parsed.calls)
                 )
                 observations = [
                     {
@@ -402,4 +402,5 @@ class RLPipeline:
                 self._await(self.sandbox.close())
             except Exception:  # noqa: BLE001 — best effort at shutdown
                 logger.warning("sandbox close failed", exc_info=True)
+        self.client.close()
         self.loop.call_soon_threadsafe(self.loop.stop)

@@ -579,3 +579,81 @@ def test_master_weights_accumulate_in_fp32_and_publish():
             p.dtype == torch.float32 and torch.equal(p, m) for p, m in zip(model.parameters(), master.parameters())
         )
     assert all(p.dtype == torch.bfloat16 for p in model.parameters())
+
+
+def test_eight_bit_optimizers_refuse_a_tiny_eps():
+    config = RLConfig()
+    for key, value in {"model.policy": "x", "data.dataset": "d.jsonl", "rewards.m.fn": "math"}.items():
+        config.set(key, value)
+    config.set("train.optimizer", "adamw8bit")
+    config.validate()  # auto eps
+    config.set("train.adam_eps", 1e-15)
+    with pytest.raises(RLConfigError, match="explode"):
+        config.validate()
+
+
+class _StreamingEngine:
+    """A streaming engine whose requests take `len(prompt)` steps: short turns finish first."""
+
+    def __init__(self):
+        self.live, self.added, self.version = {}, [], 0
+
+    def stream_add(self, request_id, prompt, max_new_tokens, temperature, n):
+        self.added.append((tuple(prompt), n))
+        self.live[request_id] = [len(prompt), prompt, n]
+
+    def stream_pending(self):
+        return bool(self.live)
+
+    def stream_step(self):
+        from palingenesis.opd.rollout import Rollout
+
+        import time
+
+        time.sleep(0.001)  # a decode step
+        if any(p[1] == [666] for p in self.live.values()):
+            raise RuntimeError("engine failure")
+        done = []
+        for request_id, state in list(self.live.items()):
+            state[0] -= 1
+            if state[0] <= 0:
+                del self.live[request_id]
+                done.append((request_id, [Rollout(state[1][:1] * (k + 1), [-0.5], "stop", 0) for k in range(state[2])]))
+        return done
+
+
+def test_streaming_generation_resolves_each_turn_when_it_finishes():
+    import time
+
+    from palingenesis.rl.generation import GenerationClient
+
+    engine = _StreamingEngine()
+    client = GenerationClient(engine)
+
+    async def main():
+        order = []
+
+        async def ask(prompt):
+            out = await client.generate(prompt, 8, 1.0)
+            order.append(len(prompt))
+            return out
+
+        # a long request does not hold back a short one (no lockstep between calls)
+        long_task = asyncio.create_task(ask([1] * 400))
+        await asyncio.sleep(0.01)
+        short = await ask([2] * 3)
+        assert order == [3] and not long_task.done()
+        await long_task
+        # identical requests arriving together become one request with n samples
+        engine.added.clear()
+        outs = await asyncio.gather(*(client.generate([7, 7], 8, 1.0) for _ in range(4)))
+        assert engine.added == [((7, 7), 4)] and sorted(len(o.ids) for o in outs) == [1, 2, 3, 4]
+        # an engine failure reaches the waiting trajectories
+        with pytest.raises(RuntimeError, match="engine failure"):
+            await client.generate([666], 8, 1.0)
+        return short
+
+    start = time.time()
+    assert asyncio.run(main()).ids == [2]
+    client.close()
+    assert not client.thread.is_alive() and time.time() - start < 10

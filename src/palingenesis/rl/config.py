@@ -118,6 +118,10 @@ class RLEnvConfig:
     max_tool_output_tokens: int = 512  # longer tool results keep their head and tail
     tool_timeout: float = 30.0  # seconds per tool call
     max_concurrent: int = 0  # live environment instances at once (0 = no limit; remote envs have a capacity)
+    # The tools the policy gets (and may call): names or shell-style patterns ("search__*"),
+    # for any environment, MCP servers and remote ones included. Empty: all of them (or the
+    # environment class's own `tools` pin).
+    allowed_tools: list = field(default_factory=list)
     # Keyword arguments for the environment's constructor.
     args: dict = field(default_factory=dict)
 
@@ -195,7 +199,14 @@ class RLTrainConfig:
     max_grad_norm: float = 1.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
-    adam_eps: float = 1e-15  # small: RL gradients are tiny (MiniMax-M1, ScaleRL)
+    # 0 = auto: 1e-15 for fp32 AdamW (RL gradients are tiny: MiniMax-M1, ScaleRL), 1e-8 for 8-bit
+    # moments, which quantize small second moments to 0: with a tiny eps their updates explode
+    # (measured: 22,000x the learning rate in 3 steps).
+    adam_eps: float = 0.0
+    # "adamw" (fp32 moments: 8 bytes per parameter), "adamw8bit" (bitsandbytes' blockwise 8-bit
+    # moments: 2 bytes per parameter) or "paged_adamw8bit" (8-bit, paged to CPU memory under
+    # pressure). 8-bit states need one GPU without FSDP.
+    optimizer: str = "adamw"
     weight_decay: float = 0.0
     micro_tokens: int = 16384  # padded tokens per forward/backward micro-batch
     # FSDP2: shard the policy over data-parallel ranks (always under torchrun with > 1 process;
@@ -415,6 +426,8 @@ class RLConfig:
             errors.append("env.args are constructor arguments for a custom environment; single_turn has none.")
         if e.max_turns < 1:
             errors.append("env.max_turns must be >= 1.")
+        if e.type == "single_turn" and e.allowed_tools:
+            errors.append("env.allowed_tools filters an environment's tools; single_turn has none.")
         if e.tool_parser not in TOOL_PARSERS:
             errors.append(f"env.tool_parser must be one of {TOOL_PARSERS}, got {e.tool_parser!r}.")
 
@@ -492,6 +505,19 @@ class RLConfig:
             )
         if (t.fsdp or t.cpu_offload) and r.backend == "hf" and r.max_staleness:
             errors.append("rollout.backend hf generates with the sharded trainer model: max_staleness must be 0.")
+        if t.optimizer not in ("adamw", "adamw8bit", "paged_adamw8bit"):
+            errors.append(f"train.optimizer must be adamw, adamw8bit or paged_adamw8bit, got {t.optimizer!r}.")
+        elif t.optimizer != "adamw" and (t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"):
+            errors.append(
+                f"train.optimizer {t.optimizer} (bitsandbytes) steps local tensors: not with FSDP or cpu_offload."
+            )
+        if t.optimizer != "adamw" and 0 < t.adam_eps < 1e-8:
+            errors.append(
+                f"train.adam_eps {t.adam_eps:g} with {t.optimizer}: 8-bit moments round small second moments to 0, "
+                "and an eps below 1e-8 then lets their updates explode. Leave adam_eps at 0 (auto: 1e-8) or set >= 1e-8."
+            )
+        if t.adam_eps < 0:
+            errors.append("train.adam_eps must be >= 0 (0 = auto).")
         if t.steps < 1 or t.micro_tokens < 1:
             errors.append("train.steps and train.micro_tokens must be >= 1.")
         if t.learning_rate > 1e-5:

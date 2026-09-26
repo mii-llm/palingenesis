@@ -303,30 +303,56 @@ class VLLMColocateRollout:
         for i, (prompt, budget) in enumerate(zip(prompts, max_new_tokens)):
             unique.setdefault((tuple(prompt), budget), []).append(i)
         requests = list(unique.items())
-        params = [
-            self.SamplingParams(
-                n=len(indices),
-                max_tokens=budget,
-                temperature=temperature,
-                top_p=1.0,
-                top_k=0,
-                logprobs=0 if temperature > 0 else None,
-                stop_token_ids=list(self.stop_ids),
-                detokenize=False,
-            )
-            for (_, budget), indices in requests
-        ]
+        params = [self._params(len(indices), budget, temperature) for (_, budget), indices in requests]
         outputs = self.llm.generate(
             [{"prompt_token_ids": list(prompt)} for (prompt, _), _ in requests], params, use_tqdm=False
         )
         rollouts: list[Rollout | None] = [None] * len(prompts)
         for (_, indices), out in zip(requests, outputs):
-            for i, o in zip(indices, out.outputs):
-                tokens = list(o.token_ids)
-                logprobs = [step[t].logprob for step, t in zip(o.logprobs, tokens)] if o.logprobs else []
-                finish = "stop" if o.finish_reason == "stop" else "length"
-                rollouts[i] = Rollout(tokens, logprobs, finish, self.version)
+            for i, rollout in zip(indices, self._rollouts(out)):
+                rollouts[i] = rollout
         return rollouts
+
+    def _params(self, n: int, budget: int, temperature: float, final_only: bool = False):
+        kwargs = {}
+        if final_only:
+            from vllm.sampling_params import RequestOutputKind
+
+            kwargs["output_kind"] = RequestOutputKind.FINAL_ONLY
+        return self.SamplingParams(
+            n=n,
+            max_tokens=budget,
+            temperature=temperature,
+            top_p=1.0,
+            top_k=0,
+            logprobs=0 if temperature > 0 else None,
+            stop_token_ids=list(self.stop_ids),
+            detokenize=False,
+            **kwargs,
+        )
+
+    def _rollouts(self, out) -> list[Rollout]:
+        rollouts = []
+        for o in out.outputs:
+            tokens = list(o.token_ids)
+            logprobs = [step[t].logprob for step, t in zip(o.logprobs, tokens)] if o.logprobs else []
+            finish = "stop" if o.finish_reason == "stop" else "length"
+            rollouts.append(Rollout(tokens, logprobs, finish, self.version))
+        return rollouts
+
+    # Streaming (continuous batching across calls): requests join the running batch the moment
+    # they are added and come back the step they finish. One thread must own these calls.
+
+    def stream_add(self, request_id: str, prompt: list[int], max_new_tokens: int, temperature: float, n: int) -> None:
+        params = self._params(n, max_new_tokens, temperature, final_only=True)
+        self.llm.llm_engine.add_request(request_id, {"prompt_token_ids": list(prompt)}, params)
+
+    def stream_pending(self) -> bool:
+        return self.llm.llm_engine.has_unfinished_requests()
+
+    def stream_step(self) -> list[tuple[str, list[Rollout]]]:
+        """One engine step: (request id, its n rollouts) for every request that finished."""
+        return [(out.request_id, self._rollouts(out)) for out in self.llm.llm_engine.step() if out.finished]
 
 
 def _die_with_parent() -> None:

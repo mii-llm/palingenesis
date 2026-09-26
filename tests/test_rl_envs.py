@@ -255,3 +255,72 @@ def test_verifier_column_routes_rewards():
     math = asyncio.run(Reward("correct", BUILTINS["math"]).score(samples))
     choice = asyncio.run(Reward("mc", BUILTINS["boxed_choice"]).score(samples))
     assert math == [1.0, None, 1.0] and choice == [None, 1.0, 0.0]
+
+
+class _Leaky:
+    """A public helper that must not become a tool once the class pins its tools."""
+
+    tools = ("answer",)
+
+    def reset(self, **row):
+        self.done = False
+
+    def answer(self, value: str) -> str:
+        """Answer.
+
+        Args:
+            value: The answer.
+        """
+        return "ok"
+
+    def grade(self) -> str:
+        """Reveal the solution.
+
+        Returns:
+            The solution.
+        """
+        return "SECRET"
+
+
+def test_pinned_and_allowed_tools_are_the_only_callable_ones():
+    from palingenesis.rl.env import EnvPool, run_tool
+
+    pool = EnvPool(_Leaky)
+    assert [s["function"]["name"] for s in pool.schemas] == ["answer"]
+    exposed = {s["function"]["name"] for s in pool.schemas}
+    env = pool.free[0]
+    text, failed = asyncio.run(run_tool(env, "grade", {}, 5, exposed))
+    assert failed and "unknown tool" in text and "SECRET" not in text  # refused, though the method exists
+    assert asyncio.run(run_tool(env, "answer", {"value": "1"}, 5, exposed)) == ("ok", False)
+
+    class Unpinned(_Leaky):
+        tools = None
+
+    assert sorted(s["function"]["name"] for s in EnvPool(Unpinned).schemas) == ["answer", "grade"]
+    assert [s["function"]["name"] for s in EnvPool(Unpinned, allowed=["ans*"]).schemas] == ["answer"]
+    with pytest.raises(ValueError, match="match no tool"):
+        EnvPool(Unpinned, allowed=["answr"])
+
+    class Typo(_Leaky):
+        tools = ("answr",)
+
+    with pytest.raises(ValueError, match="not methods"):
+        EnvPool(Typo)
+
+
+def test_allowed_tools_filter_dynamic_environments():
+    from palingenesis.rl.env import EnvPool
+
+    class Remote:
+        def tool_schemas(self):
+            return [{"type": "function", "name": n, "parameters": {"type": "object"}} for n in ("a__x", "a__y", "b__x")]
+
+        def call_tool(self, name, arguments):
+            return name
+
+    pool = EnvPool(Remote, allowed=["a__*"])
+    names = [s["function"]["name"] for s in asyncio.run(pool.episode_schemas(pool.free[0]))]
+    assert names == ["a__x", "a__y"]
+    bad = EnvPool(Remote, allowed=["c__*"])
+    with pytest.raises(ValueError, match="match no tool"):
+        asyncio.run(bad.episode_schemas(bad.free[0]))

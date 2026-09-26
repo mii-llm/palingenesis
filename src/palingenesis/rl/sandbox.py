@@ -225,15 +225,21 @@ class DockerSandbox:
             "/work:rw,nosuid,nodev,noexec,mode=1777,size=512m",
             "--tmpfs",
             "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=64m",
+            # a root worker with only what it needs to run each slot as its own unprivileged
+            # user and clean up after it; the programs themselves hold no capability
             "--user",
-            "65534:65534",
+            "0:0",
             "--cap-drop",
             "ALL",
+            *("--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "KILL"),
+            *("--cap-add", "CHOWN", "--cap-add", "FOWNER", "--cap-add", "DAC_OVERRIDE"),
             "--security-opt",
             "no-new-privileges",
             "--pids-limit",
             str(64 * slots),
             "--memory",
+            f"{memory_mb * slots + 256}m",
+            "--memory-swap",  # = --memory: no swap beyond the limit
             f"{memory_mb * slots + 256}m",
             "--cpus",
             str(slots),
