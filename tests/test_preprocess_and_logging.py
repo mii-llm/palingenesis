@@ -506,14 +506,14 @@ def test_optimal_mix_adapts_to_budget():
 def test_select_by_budget_backfills_short_buckets():
     """If a difficulty bucket can't fill its quota, the shortfall is backfilled
     from other buckets instead of silently returning fewer samples."""
-    from palingenesis.prepare import classify_difficulty, select_by_budget
+    from palingenesis.prepare import classify_familiarity, select_by_budget
 
     # Skewed distribution: percentile bucketing still assigns ~25/50/25,
     # but we then delete most of the easy bucket to force a shortfall.
     samples = [{"_score_response_ppl": float(p), "id": i} for i, p in enumerate(range(1, 401))]
-    samples = classify_difficulty(samples)
-    easy = [s for s in samples if s["_score_difficulty_bucket"] == "easy"]
-    skewed = [s for s in samples if s["_score_difficulty_bucket"] != "easy"] + easy[:5]
+    samples = classify_familiarity(samples)
+    easy = [s for s in samples if s["_score_familiarity"] == "familiar"]
+    skewed = [s for s in samples if s["_score_familiarity"] != "familiar"] + easy[:5]
 
     budget = 200
     selected = select_by_budget(skewed, budget=budget, strategy="optimal")

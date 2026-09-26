@@ -43,9 +43,9 @@
 | `eval_split` | str | `test` | Validation split. |
 | `eval_samples` | int | `200` | Number of validation samples (fixed subset). |
 | `eval_every` | int | `100` | Evaluate every N optimizer steps. |
-| `pretrain_replay_dataset` | str | `""` | Generic pretraining data mixed during SFT (anti-forgetting). Empty = disabled. |
-| `pretrain_replay_weight` | float | `0.1` | Fraction of tokens from replay data (0.1 = 10%). |
-| `msft_tracking` | bool | `false` | Adaptive per-source weight scheduling. Decays overfitting sources, recovers improving ones. |
+| `pretrain_replay_dataset` | str | `""` | Raw text (split `train`, field `text`, loss on every token) mixed into SFT. Empty = disabled. Not measured by us; for a chat model, replaying the model's own answers to general prompts (a second `sources` entry) reduced forgetting in our [measurements](../guides/data.md#what-the-measurements-say). |
+| `pretrain_replay_weight` | float | `0.1` | Per-example probability of drawing a replay document (not a token share: replay documents run up to `max_seq_length` tokens). |
+| `msft_tracking` | bool | `false` | **Not wired into training yet** (a warning is logged; weights stay fixed). Intended: adaptive per-source weight scheduling. |
 | `msft_eval_every` | int | `50` | Check per-source validation loss every N steps. |
 | `msft_decay_factor` | float | `0.7` | Weight multiplier when a source overfits. |
 | `msft_recovery_factor` | float | `1.15` | Weight multiplier when a source improves. |
@@ -200,7 +200,8 @@ Offline data preparation, driven by the **same config** as training (see the [Da
 | `format` | str | `parquet` | Output format. `parquet` (order-preserving, fast; falls back to jsonl if the sample schema can't be unified) or `jsonl`. |
 | `max_samples` | int | `0` | Cap on samples read from the raw dataset before scoring. 0 = all. |
 | `budget` | int | `0` | Samples to keep after scoring and filtering. 0 = keep all. |
-| `strategy` | str | `optimal` | Selection strategy: `optimal` (J-shaped, budget-adaptive: easier mix below 2K samples, full 20/50/25/5 above 10K, backfills short buckets), `curriculum` (easy→hard, order preserved at train time), `balanced`, `medium_focus`, `hard_focus`, `flow`, `random`. |
+| `strategy` | str | `random` | How `budget` samples are chosen: `random` (uniform, seeded), `optimal` (heuristic J-shaped familiarity mix; measured below `random`, see the [data guide](../guides/data.md#what-the-measurements-say)), `curriculum` (random subset ordered familiar→unfamiliar, order kept at train time), `balanced`, `medium_focus`, `hard_focus`, `flow` (lowest perplexity). Unknown names are an error. |
+| `group_field` | str | `""` | Row column (e.g. `source`) to profile in `prepared_meta.json`: per group, count, median response NLL, mean response tokens and familiarity buckets, before and after selection. |
 | `eval_holdout` | int | `0` | Reserve N random samples as a held-out eval set (`eval_data.parquet`), excluded from the training selection. Training auto-uses it when `data.eval_dataset` is empty — a true same-distribution holdout, so `eval/loss` and `eval/gap` are trustworthy. |
 | `min_ppl` | float | `1.5` | Drop samples whose response perplexity is below this (already known). |
 | `max_ppl` | float | `500.0` | Drop samples above this (noise, wrong language); `<= 0` disables. |

@@ -1,41 +1,18 @@
-"""Data preparation pipeline — offline scoring, filtering, and curriculum ordering.
+"""Data preparation pipeline — offline scoring, filtering and selection.
 
-Scores training samples using the target model's perplexity, then filters and
-orders them for optimal SFT. Runs entirely offline (inference only, no training).
+Scores every training sample with the model you will fine-tune (one forward pass,
+the tokens training puts loss on), then filters and selects. Inference only.
 
-Key research findings synthesized:
+What the score is: the perplexity of the sample's *response* under the model. Low
+means the model would write something very close to this answer already
+(familiar); high means the answer is far from what the model would write
+(unfamiliar). It is NOT problem difficulty: on 20k NuminaMath problems, the
+Spearman correlation between Qwen3.5-0.8B's pass rate and this score was 0.009.
+Buckets are percentiles of the score over this dataset (bottom 25% familiar,
+top 25% unfamiliar).
 
-1. DATA DIFFICULTY IS NOT UNIVERSAL (arxiv:2605.12906, Tsinghua 2026):
-   - Small datasets: easier data is optimal (model can't generalize from hard)
-   - Large datasets: harder data becomes valuable (easy becomes redundant)
-   - There is ALWAYS an optimal difficulty that depends on data budget
-
-2. EASY SAMPLES PREVENT FORGETTING (arxiv:2502.02797, ICML 2025):
-   - Upweighting easy samples (low pretrained loss) preserves base capabilities
-   - Weight: w = exp(-loss / τ), τ = median(loss). Parameter-free.
-   - This is complementary to DEFT (which handles token-level difficulty)
-
-3. IFD = INSTRUCTION INFORMATIVENESS (arxiv:2308.12032):
-   - IFD = ppl(response|instruction) / ppl(response|no_instruction)
-   - High IFD: instruction is critical for generating the response (USEFUL)
-   - Low IFD: model generates same response regardless of instruction (WASTE)
-   - With 10% of data selected by IFD, matches full-data performance
-
-4. THE J-SHAPED DISTRIBUTION (synthesis of all findings):
-   - Optimal data mix is NOT uniform across difficulty
-   - Shape: 20% easy + 50% medium + 25% hard + 5% very hard
-   - Easy data: maintains capabilities, provides stable gradients
-   - Medium data: maximum information content (InfoSFT sweet spot)
-   - Hard data: pushes the capability frontier
-   - Very hard: only a few, for exposure without overwhelming
-
-5. DIVERSITY > QUANTITY (arxiv:2603.11076, DIVE 2026):
-   - 48K diverse samples >> 200K homogeneous, even with 4× less data
-   - Tool/topic/length diversity all matter
-
-6. DISTRIBUTIONAL ALIGNMENT MATTERS (NeurIPS 2025):
-   - Data IN the model's distribution but slightly beyond capability = optimal
-   - Data FAR from model's distribution = harmful regardless of quality
+Selection strategies are heuristics; compare any of them with `random` on your
+own eval battery (see the data guide for measurements on Qwen3.5).
 
 Usage:
     # Standalone flags
@@ -43,7 +20,7 @@ Usage:
                         --data your-org/agentic-traces \\
                         --output prepared/ \\
                         --budget 10000 \\
-                        --strategy optimal
+                        --strategy random
 
     # Or drive everything from the SAME config used for training
     # (model.name_or_path, data.dataset/split/messages_field/max_seq_length
@@ -92,17 +69,12 @@ def score_samples_with_model(
     max_batch_tokens: int = 16384,
     chat_options: dict | None = None,
 ) -> list[dict]:
-    """Score samples by computing model perplexity on responses.
+    """Score samples by the perplexity of their responses under the model.
 
-    Uses the target model (same one you'll fine-tune) to compute
-    per-sample difficulty. This tells you how hard each sample is
-    FOR THIS SPECIFIC MODEL — which is what matters for SFT.
-
-    High perplexity = hard (model can't predict the response)
-    Low perplexity = easy (model already knows this)
-
-    For SFT, you want samples in the "medium" range — hard enough
-    to be informative, easy enough that the model can learn from them.
+    Uses the model you will fine-tune, on exactly the tokens training puts loss
+    on. Low perplexity = the response is familiar to the model (close to what it
+    would write); high = unfamiliar. This measures the response, not how hard
+    the problem is.
 
     Scoring is truly batched: samples are pre-tokenized, sorted by length,
     packed into padded batches (≤ batch_size samples AND ≤ max_batch_tokens
@@ -292,34 +264,60 @@ def _score_padded_batch(
         sample["_score_response_token_count"] = n_resp
 
 
-def classify_difficulty(
-    samples: list[dict],
-    easy_percentile: float = 25.0,
-    hard_percentile: float = 75.0,
-) -> list[dict]:
-    """Classify samples into easy/medium/hard based on perplexity distribution.
+FAMILIARITY_BUCKETS = ("familiar", "typical", "unfamiliar")
 
-    Uses percentile-based thresholds (adapts to any model/dataset combination).
-    """
+
+def classify_familiarity(
+    samples: list[dict],
+    familiar_percentile: float = 25.0,
+    unfamiliar_percentile: float = 75.0,
+) -> list[dict]:
+    """Bucket samples by response perplexity percentile into `_score_familiarity`:
+    familiar (bottom 25%), typical, unfamiliar (top 25%). Percentiles adapt to any
+    model/dataset pair. The score measures how close the response is to what the
+    model would write, not problem difficulty."""
     ppls = [s["_score_response_ppl"] for s in samples if s.get("_score_response_ppl", float("inf")) < float("inf")]
     if not ppls:
         return samples
 
     ppls_sorted = sorted(ppls)
     n = len(ppls_sorted)
-    easy_thresh = ppls_sorted[int(n * easy_percentile / 100)]
-    hard_thresh = ppls_sorted[int(n * hard_percentile / 100)]
+    low = ppls_sorted[int(n * familiar_percentile / 100)]
+    high = ppls_sorted[int(n * unfamiliar_percentile / 100)]
 
     for s in samples:
         ppl = s.get("_score_response_ppl", float("inf"))
-        if ppl <= easy_thresh:
-            s["_score_difficulty_bucket"] = "easy"
-        elif ppl >= hard_thresh:
-            s["_score_difficulty_bucket"] = "hard"
+        if ppl <= low:
+            s["_score_familiarity"] = "familiar"
+        elif ppl >= high:
+            s["_score_familiarity"] = "unfamiliar"
         else:
-            s["_score_difficulty_bucket"] = "medium"
+            s["_score_familiarity"] = "typical"
 
     return samples
+
+
+def profile_groups(samples: list[dict], field: str) -> dict:
+    """Per-group profile of scored samples: count, median response NLL, mean
+    response tokens and familiarity buckets. Rows without the field go to "<none>"."""
+    groups: dict[str, list[dict]] = {}
+    for s in samples:
+        groups.setdefault(str(s.get(field, "<none>")), []).append(s)
+    out = {}
+    for name, rows in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        nll = sorted(r["_score_response_nll"] for r in rows if isinstance(r.get("_score_response_nll"), float))
+        toks = [r.get("_score_response_token_count", 0) for r in rows]
+        fam: dict[str, int] = {}
+        for r in rows:
+            b = r.get("_score_familiarity", "unknown")
+            fam[b] = fam.get(b, 0) + 1
+        out[name] = {
+            "count": len(rows),
+            "median_response_nll": round(nll[len(nll) // 2], 4) if nll else None,
+            "mean_response_tokens": round(sum(toks) / len(toks), 1),
+            "familiarity": fam,
+        }
+    return out
 
 
 def filter_samples(
@@ -336,7 +334,7 @@ def filter_samples(
     - max_ppl > 500: model has no idea (corrupted, wrong language, noise)
       Set max_ppl <= 0 to disable the upper-bound filter. This is useful for
       multilingual/domain-shifted data where absolute PPL is high but relative
-      difficulty ranking is still useful.
+      familiarity ranking is still useful.
     - min_length: too short to be useful
     - max_length: too long (would dominate training)
 
@@ -384,14 +382,11 @@ def filter_samples(
 
 
 def _optimal_mix(budget: int) -> tuple[float, float, float, float]:
-    """Budget-adaptive J-shape: (easy, medium, hard, very_hard) fractions.
+    """(familiar, typical, unfamiliar, most-unfamiliar) fractions of the `optimal` mix.
 
-    2605.12906's key finding is that the optimal difficulty is NOT fixed — it
-    shifts harder as the data budget grows. With few samples the model needs
-    learnable (easier) data to make any progress; with many samples it can
-    afford to spend budget on the hard tail. Since our buckets are percentiles
-    of the AVAILABLE PPL range (classify_difficulty), this maps the paper's
-    absolute finding onto whatever range this dataset/model pair actually has.
+    A heuristic: the budget thresholds and percentages are ours, not from a paper.
+    (2605.12906 trains base math models on single-difficulty subsets and finds the
+    best difficulty moves harder as the data budget grows; it tests no mixtures.)
     """
     if budget < 2_000:
         return (0.35, 0.50, 0.15, 0.00)  # small budget: easy-shifted, skip the extreme tail
@@ -400,36 +395,53 @@ def _optimal_mix(budget: int) -> tuple[float, float, float, float]:
     return (0.20, 0.50, 0.25, 0.05)  # large budget: full J-shape
 
 
+STRATEGIES = ("optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random")
+
+
 def select_by_budget(
     samples: list[dict],
     budget: int,
-    strategy: str = "optimal",
+    strategy: str = "random",
+    seed: int = 42,
 ) -> list[dict]:
-    """Select optimal subset within a token/sample budget.
+    """Select a subset of `budget` samples.
 
-    Strategies:
-      - "optimal": J-shaped difficulty distribution, ADAPTIVE to the budget
-          (see _optimal_mix). Difficulty buckets are percentile-based, so the
-          mix always maps onto the AVAILABLE difficulty range of this dataset
-          relative to this model — not absolute PPL thresholds.
-          Plus FLOW weighting within each bucket for anti-forgetting.
-      - "balanced": equal parts easy/medium/hard (diversity)
-      - "medium_focus": prioritize medium-difficulty (InfoSFT-style)
-      - "curriculum": order easy→hard for sequential training
-      - "hard_focus": prioritize hard (for large datasets / strong models)
-      - "flow": FLOW anti-forgetting weighting (easy-heavy)
+    Strategies (buckets come from classify_familiarity: response-PPL percentiles
+    of THIS dataset under THIS model):
+      - "optimal": 20/50/25/5 familiar/typical/unfamiliar/most-unfamiliar mix, shifted familiar
+          below 10K samples (_optimal_mix). A heuristic, not a measured optimum: on
+          Qwen3.5-0.8B math SFT it scored below "random" (GSM8K -2.4, HumanEval+ -4.0).
+      - "balanced": equal parts familiar/typical/unfamiliar
+      - "medium_focus": the samples closest to the median PPL
+      - "curriculum": a random subset, ordered familiar→unfamiliar (prepare_data sorts it)
+      - "hard_focus": the highest-PPL samples
+      - "flow": the lowest-PPL samples (the easiest; FLOW's exp(-loss/τ) weights
+          are recorded as `_score_flow_weight` but training does not use them)
+      - "random": a uniform random subset
+
+    Within a bucket, samples are drawn at random (seeded), never in file order:
+    datasets are often grouped by source, and a first-N pick would select sources.
     """
+    if strategy not in STRATEGIES:
+        raise ValueError(f"Unknown selection strategy {strategy!r}; choose one of {STRATEGIES}")
     if budget >= len(samples):
         return samples
 
+    import random
+
+    rng = random.Random(seed)
+
+    def shuffled(lst):
+        out = list(lst)
+        rng.shuffle(out)
+        return out
+
+    def bucket(name):
+        return shuffled(s for s in samples if s.get("_score_familiarity") == name)
+
     if strategy == "optimal":
-        # J-shaped distribution over PERCENTILE buckets (classify_difficulty),
-        # with the mix adapted to the data budget (2605.12906: the optimal
-        # difficulty shifts harder as the budget grows).
         frac_easy, frac_medium, frac_hard, frac_very_hard = _optimal_mix(budget)
-        easy = [s for s in samples if s.get("_score_difficulty_bucket") == "easy"]
-        medium = [s for s in samples if s.get("_score_difficulty_bucket") == "medium"]
-        hard = [s for s in samples if s.get("_score_difficulty_bucket") == "hard"]
+        easy, medium, hard = bucket("familiar"), bucket("typical"), bucket("unfamiliar")
 
         n_easy = int(budget * frac_easy)
         n_medium = int(budget * frac_medium)
@@ -437,98 +449,70 @@ def select_by_budget(
         n_very_hard = budget - n_easy - n_medium - n_hard  # remainder
         logger.info(
             f"Optimal mix for budget={budget}: "
-            f"{frac_easy:.0%} easy / {frac_medium:.0%} medium / "
-            f"{frac_hard:.0%} hard / {n_very_hard / budget:.0%} very-hard"
+            f"{frac_easy:.0%} familiar / {frac_medium:.0%} typical / "
+            f"{frac_hard:.0%} unfamiliar / {n_very_hard / budget:.0%} most-unfamiliar"
         )
 
-        # Within each bucket, prefer high-IFD samples (instruction informativeness)
-        # If IFD not computed, use random selection within bucket
-        def sort_by_ifd(lst):
-            return sorted(lst, key=lambda s: s.get("_score_ifd", 1.0), reverse=True)
-
-        selected_easy = sort_by_ifd(easy)[:n_easy]
-        selected_medium = sort_by_ifd(medium)[:n_medium]
-        # Hard: take the hardest from the hard bucket
+        # Very hard: the highest-PPL samples of the hard bucket; hard: random among the rest
         hard_sorted = sorted(hard, key=lambda s: s.get("_score_response_ppl", 0), reverse=True)
         selected_very_hard = hard_sorted[:n_very_hard]
-        selected_hard = sort_by_ifd(hard_sorted[n_very_hard:])[:n_hard]
-
-        selected = selected_easy + selected_medium + selected_hard + selected_very_hard
+        selected_hard = shuffled(hard_sorted[n_very_hard:])[:n_hard]
+        selected = easy[:n_easy] + medium[:n_medium] + selected_hard + selected_very_hard
 
         # Backfill: if a bucket had fewer samples than its quota, fill the
-        # shortfall from unselected samples (medium first — most informative —
-        # then easy, then hard) instead of silently shrinking the selection.
+        # shortfall from unselected samples (medium first, then easy, then hard)
+        # instead of silently shrinking the selection.
         if len(selected) < budget:
             chosen = {id(s) for s in selected}
-            leftovers = [
-                s
-                for pool in (sort_by_ifd(medium), sort_by_ifd(easy), sort_by_ifd(hard))
-                for s in pool
-                if id(s) not in chosen
-            ]
+            leftovers = [s for pool in (medium, easy, hard) for s in pool if id(s) not in chosen]
             shortfall = budget - len(selected)
             selected += leftovers[:shortfall]
-            logger.info(f"Backfilled {min(shortfall, len(leftovers))} samples (short difficulty buckets)")
-
-        # Apply FLOW weighting as metadata (for weighted sampling during training)
-        ppls = [s.get("_score_response_ppl", 1.0) for s in selected]
-        if ppls:
-            tau = sorted(ppls)[len(ppls) // 2]  # median
-            for s in selected:
-                ppl = s.get("_score_response_ppl", tau)
-                # FLOW: w = exp(-ppl / tau). Easy → high weight, hard → low weight.
-                # This is used as sampling probability during training.
-                s["_score_flow_weight"] = round(math.exp(-ppl / max(tau, 1e-6)), 4)
+            logger.info(f"Backfilled {min(shortfall, len(leftovers))} samples (short familiarity buckets)")
+        _annotate_flow_weight(selected)
 
     elif strategy == "flow":
-        # Pure FLOW: weight by exp(-loss/median_loss), then sample by weight
-        ppls = [s.get("_score_response_ppl", 1.0) for s in samples]
-        tau = sorted(ppls)[len(ppls) // 2]
-        for s in samples:
-            ppl = s.get("_score_response_ppl", tau)
-            s["_score_flow_weight"] = math.exp(-ppl / max(tau, 1e-6))
-        # Weighted selection without replacement (approximate via sorting by weight)
-        weighted = sorted(samples, key=lambda s: s.get("_score_flow_weight", 0), reverse=True)
-        selected = weighted[:budget]
+        _annotate_flow_weight(samples)
+        selected = sorted(samples, key=lambda s: s.get("_score_flow_weight", 0), reverse=True)[:budget]
 
     elif strategy == "balanced":
-        easy = [s for s in samples if s.get("_score_difficulty_bucket") == "easy"]
-        medium = [s for s in samples if s.get("_score_difficulty_bucket") == "medium"]
-        hard = [s for s in samples if s.get("_score_difficulty_bucket") == "hard"]
+        easy, medium, hard = bucket("familiar"), bucket("typical"), bucket("unfamiliar")
         per_bucket = budget // 3
         selected = easy[:per_bucket] + medium[:per_bucket] + hard[:per_bucket]
-        # Fill remaining with medium (most informative)
-        remaining = budget - len(selected)
-        selected += medium[per_bucket : per_bucket + remaining]
+        chosen = {id(s) for s in selected}
+        leftovers = [s for pool in (medium, easy, hard) for s in pool if id(s) not in chosen]
+        selected += leftovers[: budget - len(selected)]
 
     elif strategy == "medium_focus":
-        # InfoSFT-style: prioritize medium-confidence tokens
-        ppls = [s.get("_score_response_ppl", 0) for s in samples]
-        median_ppl = sorted(ppls)[len(ppls) // 2]
-        scored = [(abs(s.get("_score_response_ppl", 0) - median_ppl), s) for s in samples]
-        scored.sort(key=lambda x: x[0])
-        selected = [s for _, s in scored[:budget]]
+        ppls = sorted(s.get("_score_response_ppl", 0) for s in samples)
+        median_ppl = ppls[len(ppls) // 2]
+        selected = sorted(samples, key=lambda s: abs(s.get("_score_response_ppl", 0) - median_ppl))[:budget]
 
     elif strategy == "curriculum":
-        # Easy → hard ordering (for multi-epoch progressive training)
-        sorted_samples = sorted(samples, key=lambda s: s.get("_score_response_ppl", 0))
-        selected = sorted_samples[:budget]
-        for i, s in enumerate(selected):
-            s["_score_rank"] = i
+        # A random subset (all buckets), ordered familiar→unfamiliar by prepare_data.
+        # Keeping the `budget` easiest instead would silently drop the hard tail.
+        selected = shuffled(samples)[:budget]
 
     elif strategy == "hard_focus":
-        # Prioritize hard samples (for large datasets / advanced models)
-        sorted_samples = sorted(samples, key=lambda s: s.get("_score_response_ppl", 0), reverse=True)
-        selected = sorted_samples[:budget]
+        selected = sorted(samples, key=lambda s: s.get("_score_response_ppl", 0), reverse=True)[:budget]
 
-    else:
-        # Random subset
-        import random
-
-        selected = random.sample(samples, budget)
+    else:  # random
+        selected = shuffled(samples)[:budget]
 
     logger.info(f"Selected {len(selected)} samples with strategy='{strategy}'")
     return selected
+
+
+def _annotate_flow_weight(samples: list[dict]) -> None:
+    """FLOW (arXiv:2502.02797) sample weight exp(-loss/τ), τ = median loss, from the
+    mean response NLL under the scoring model. Metadata only: training does not read it."""
+    losses = [s["_score_response_nll"] for s in samples if isinstance(s.get("_score_response_nll"), float)]
+    if not losses:
+        return
+    tau = max(sorted(losses)[len(losses) // 2], 1e-6)
+    for s in samples:
+        loss = s.get("_score_response_nll")
+        if isinstance(loss, float):
+            s["_score_flow_weight"] = round(math.exp(-loss / tau), 4)
 
 
 PREPARED_BASENAME = "scored_data"
@@ -562,7 +546,7 @@ def split_eval_holdout(samples: list[dict], n_holdout: int, seed: int = 42) -> t
     """Reserve n_holdout random samples as a held-out eval set.
 
     Returns (train_pool, eval_holdout) — disjoint, deterministic for a given
-    seed. Random (not difficulty-stratified) so the eval set is an unbiased
+    seed. Random (not familiarity-stratified) so the eval set is an unbiased
     draw from the same distribution the training pool comes from.
     """
     import random
@@ -624,7 +608,7 @@ def prepare_data(
     max_samples: int | None = None,
     max_seq_length: int = 8192,
     budget: int | None = None,
-    strategy: str = "balanced",
+    strategy: str = "random",
     batch_size: int = 4,
     dataset_split: str = "train",
     output_format: str = "parquet",
@@ -636,15 +620,22 @@ def prepare_data(
     filter_score: str = "response",
     max_batch_tokens: int = 16384,
     chat_options: dict | None = None,
+    group_field: str = "",
 ) -> Path:
     """Full data preparation pipeline.
+
+    group_field: a per-row column (e.g. "source", "category") to profile: the
+    manifest reports, per group, the sample count, median response NLL, mean
+    response tokens and familiarity buckets, for the scored pool and for the
+    selection. Public datasets mixing sources differ a lot per source, and
+    familiarity-based selection mostly moves the source mix.
 
     chat_options: ChatDataset options (train_on_reasoning, include_observations,
     last_turn_only, tools_field) so scoring masks exactly what training trains.
 
     1. Load data
     2. Score with model perplexity
-    3. Classify difficulty
+    3. Bucket by familiarity (response-PPL percentiles)
     4. Filter outliers
     5. Reserve a held-out eval set (eval_holdout > 0) — never trained on
     6. Select by budget/strategy from the remaining pool
@@ -669,6 +660,16 @@ def prepare_data(
 
         ds = load_dataset("parquet", data_files=str(data_path), split="train")
         samples = [dict(row) for row in ds]
+    elif max_samples:
+        # HuggingFace dataset, capped: stream a shuffled prefix instead of
+        # downloading the whole dataset to keep max_samples rows of it.
+        import itertools
+
+        from datasets import load_dataset
+
+        ds = load_dataset(str(data_path), split=dataset_split, streaming=True)
+        ds = ds.shuffle(seed=42, buffer_size=max(10_000, 2 * max_samples))
+        samples = [dict(row) for row in itertools.islice(ds, max_samples)]
     else:
         # HuggingFace dataset
         from datasets import load_dataset
@@ -702,8 +703,9 @@ def prepare_data(
             model_name, samples, messages_field, max_seq_length, top_k_pct=hes_top_k_pct, batch_size=batch_size
         )
 
-    # Classify difficulty
-    samples = classify_difficulty(samples)
+    # Bucket by familiarity
+    samples = classify_familiarity(samples)
+    pool_groups = profile_groups(samples, group_field) if group_field else None
 
     # Filter
     samples = filter_samples(samples, min_ppl=min_ppl, max_ppl=max_ppl, score=filter_score)
@@ -750,7 +752,7 @@ def prepare_data(
     ppls = [s["_score_response_ppl"] for s in samples if "_score_response_ppl" in s]
     buckets: dict[str, int] = {}
     for s in samples:
-        b = s.get("_score_difficulty_bucket", "unknown")
+        b = s.get("_score_familiarity", "unknown")
         buckets[b] = buckets.get(b, 0) + 1
 
     meta = {
@@ -764,13 +766,20 @@ def prepare_data(
         "num_samples": len(samples),
         "format": out_file.suffix.lstrip("."),
         "output_file": str(out_file),
-        "difficulty_distribution": buckets,
+        "familiarity_distribution": buckets,
         "eval_holdout": len(eval_samples),
         "eval_file": str(eval_file) if eval_file else None,
         "filter_score": filter_score,
         "min_ppl": min_ppl,
         "max_ppl": max_ppl,
     }
+    tokens = [s["_score_response_token_count"] for s in samples if "_score_response_token_count" in s]
+    if tokens:
+        meta["response_tokens"] = {"total": sum(tokens), "mean": round(sum(tokens) / len(tokens), 1)}
+    if group_field:
+        meta["group_field"] = group_field
+        meta["groups_scored_pool"] = pool_groups
+        meta["groups_selected"] = profile_groups(samples, group_field)
     if ppls:
         meta["ppl_stats"] = {
             "min": round(min(ppls), 2),
@@ -787,7 +796,7 @@ def prepare_data(
             f"Perplexity stats: min={min(ppls):.1f}, median={sorted(ppls)[len(ppls) // 2]:.1f}, "
             f"max={max(ppls):.1f}, mean={sum(ppls) / len(ppls):.1f}"
         )
-        logger.info(f"Difficulty distribution: {buckets}")
+        logger.info(f"Familiarity distribution: {buckets}")
 
     return out_file
 
@@ -937,7 +946,7 @@ def prepare_multi_source(
     output_path: str,
     max_seq_length: int = 8192,
     budget_per_source: int | None = None,
-    strategy: str = "optimal",
+    strategy: str = "random",
     compute_hes: bool = False,
     hes_top_k_pct: float = 0.5,
 ):
@@ -945,7 +954,7 @@ def prepare_multi_source(
 
     MSFT insight: different sub-datasets overfit at different rates.
     By preparing each source independently:
-      1. Each gets its own difficulty scoring (model-relative)
+      1. Each gets its own familiarity scoring (model-relative)
       2. Each gets its own budget allocation (J-shaped within source)
       3. During training, we track per-source val loss to detect overfitting
       4. Sources that overfit early can be dynamically excluded
@@ -1014,7 +1023,7 @@ def prepare_multi_source(
             )
 
         # Classify and filter
-        samples = classify_difficulty(samples)
+        samples = classify_familiarity(samples)
         samples = filter_samples(samples)
 
         # Select by budget
@@ -1034,7 +1043,7 @@ def prepare_multi_source(
         median_ppl = sorted(ppls)[len(ppls) // 2] if ppls else 0
         buckets = {}
         for s in samples:
-            b = s.get("_score_difficulty_bucket", "unknown")
+            b = s.get("_score_familiarity", "unknown")
             buckets[b] = buckets.get(b, 0) + 1
 
         src_meta = {
@@ -1044,7 +1053,7 @@ def prepare_multi_source(
             "num_samples": len(samples),
             "weight": weight,
             "median_ppl": round(median_ppl, 2),
-            "difficulty_distribution": buckets,
+            "familiarity_distribution": buckets,
             # MSFT: estimate relative learning speed (lower ppl = faster learning = earlier overfit)
             "estimated_overfit_risk": "high" if median_ppl < 5 else "medium" if median_ppl < 20 else "low",
         }
@@ -1101,6 +1110,7 @@ def prepare_from_config(config) -> Path:
         max_ppl=config.preprocess.max_ppl,
         filter_score=config.preprocess.filter_score,
         max_batch_tokens=config.preprocess.max_batch_tokens,
+        group_field=config.preprocess.group_field,
         chat_options={
             "train_on_reasoning": config.data.train_on_reasoning,
             "include_observations": config.data.include_observations,
@@ -1128,7 +1138,9 @@ def main():
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="Prepare SFT data with difficulty scoring")
+    parser = argparse.ArgumentParser(
+        description="Score SFT data with the model (response perplexity), filter and select"
+    )
     parser.add_argument("--model", required=True, help="Model name/path for scoring")
     parser.add_argument("--data", required=True, help="Data path (JSONL, JSON, parquet, or HF dataset)")
     parser.add_argument("--output", default="./prepared", help="Output directory")
@@ -1138,8 +1150,8 @@ def main():
     parser.add_argument("--budget", type=int, help="Target number of samples to select")
     parser.add_argument(
         "--strategy",
-        default="optimal",
-        choices=["optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random"],
+        default="random",
+        choices=list(STRATEGIES),
     )
     parser.add_argument("--batch_size", type=int, default=4, help="Max samples per scoring forward")
     parser.add_argument(
@@ -1166,6 +1178,9 @@ def main():
         choices=["response", "full"],
         help="PPL score used by the outlier filter (response=assistant tokens only, full=all tokens)",
     )
+    parser.add_argument(
+        "--group_field", default="", help="Row column (e.g. source) to profile per group in prepared_meta.json"
+    )
     args = parser.parse_args()
 
     prepare_data(
@@ -1187,6 +1202,7 @@ def main():
         max_ppl=args.max_ppl,
         filter_score=args.filter_score,
         max_batch_tokens=args.max_batch_tokens,
+        group_field=args.group_field,
     )
 
 

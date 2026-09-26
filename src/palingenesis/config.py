@@ -94,12 +94,14 @@ class DataConfig:
     # When defined, replaces single eval_dataset for best-model tracking AND MSFT signals.
     # Each: {name, dataset, split, weight, samples, regression_floor, messages_field}
     eval_sources: list = field(default_factory=list)
-    # Pretraining replay: mix generic pretraining data during SFT (arxiv:2603.04964)
-    # Surprising finding: replaying pretraining data IMPROVES target task, not just prevents forgetting
-    # Recommended: 5-15% of training tokens from generic data
-    # Set to empty string to disable, or path/HF dataset for generic corpus
+    # Pretraining replay: mix raw text (split "train", field "text", all-token loss) into SFT.
+    # Kotha & Liang (arXiv:2603.04964) find generic replay can also help the target task,
+    # mostly in 150M-param pretraining simulations (best at 33-67% of fine-tuning steps).
+    # Empty string disables.
     pretrain_replay_dataset: str = ""
-    pretrain_replay_weight: float = 0.1  # 10% of training tokens from replay data
+    # Per-EXAMPLE sampling probability of a replay document (not a token share: replay
+    # documents are up to max_seq_length tokens, so their token share is usually larger).
+    pretrain_replay_weight: float = 0.1
     # MSFT per-source adaptive weight scheduling (arxiv:2603.21606, improved)
     # When sources are defined, track per-source validation loss and dynamically
     # DECAY (never exclude) weights of overfitting sources. Weight decays toward
@@ -258,7 +260,10 @@ class PreprocessConfig:
     min_ppl: float = 1.5  # outlier filter lower bound
     max_ppl: float = 500.0  # outlier filter upper bound (<=0 disables; useful for OOD/multilingual data)
     filter_score: Literal["response", "full"] = "response"  # filter assistant tokens by default
-    strategy: str = "optimal"  # optimal | balanced | medium_focus | curriculum | hard_focus | flow | random
+    # Selection among the scored samples when budget > 0 (prepare.select_by_budget).
+    # `random` by default: on Qwen3.5-0.8B math SFT no familiarity-based strategy beat
+    # a random subset, and `optimal` (the J-shaped mix) was worse (see guides/data.md).
+    strategy: Literal["optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random"] = "random"
     batch_size: int = 4  # max samples per scoring forward (length-sorted padded batches)
     # Padded-token cap per scoring forward (logits are B×S×V, so THIS bounds
     # memory, not batch_size). 16384 ≈ 5GB of bf16 logits for a 150K vocab;
@@ -266,6 +271,9 @@ class PreprocessConfig:
     max_batch_tokens: int = 16384
     hes: bool = False  # also compute HES reasoning-quality scores (slower)
     hes_top_k_pct: float = 0.5
+    # Row column to profile per group in prepared_meta.json (e.g. "source"): count, median
+    # response NLL, mean response tokens and familiarity buckets, before and after selection.
+    group_field: str = ""
 
 
 @dataclass(slots=True)
@@ -476,6 +484,9 @@ class Config:
                 f"train.lr_scheduler={self.train.lr_scheduler!r} is not one of cosine, linear, "
                 "constant, power_decay, wsd."
             )
+        strategies = ("optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random")
+        if self.preprocess.strategy not in strategies:
+            errors.append(f"preprocess.strategy={self.preprocess.strategy!r} is not one of {', '.join(strategies)}.")
 
         if self.data.packing and self.parallel.context_parallel:
             errors.append(
@@ -532,6 +543,11 @@ class Config:
                 "at the per-source scored files."
             )
 
+        if self.data.msft_tracking and not self.data.pretokenize:
+            warnings.append(
+                "data.msft_tracking has no effect yet: msft.AdaptiveSourceTracker is not wired into the "
+                "training loop, so per-source weights stay fixed at data.sources[*].weight."
+            )
         if self.data.pretokenize:
             if self.data.msft_tracking:
                 errors.append(

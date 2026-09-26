@@ -75,18 +75,18 @@ Implemented does not mean reproduced: unless a page says otherwise, the gains be
 |-----------|-------|-------------|
 | TFP packing | Dong et al., Aug 2024 | Greedy TSP ordering with threshold filtering, so related samples share a packed sequence. Needs packed documents to see each other, which palingenesis prevents: available as a standalone utility only. |
 | ECHO | ICML 2026 | Train on tool/observation tokens too. Model becomes world model. |
-| J-shaped difficulty | Synthesis of 2605.12906, 2502.02797 | 20% easy + 50% medium + 25% hard + 5% very hard: our synthesis of those papers, not a measured optimum. |
-| HES scoring | May 2026 | High-Entropy Sum: top-k% highest-entropy tokens predict reasoning quality. |
-| MSFT | Mar 2026 | Per-source adaptive weight decay. Sources that overfit get down-weighted. |
+| J-shaped difficulty | Heuristic, loosely after 2605.12906 and 2502.02797 | 20% easy + 50% medium + 25% hard + 5% very hard. Neither paper tests a difficulty *mixture*: 2605.12906 trains base math models on single-difficulty subsets and finds the best difficulty moves harder as data grows; 2502.02797 (FLOW) re-weights the loss toward low-loss samples. |
+| HES scoring | Li et al., May 2026 (arXiv:2605.22389) | Sum of the top 0.5% token entropies of each *response*; top-20% selection ≈ full-set SFT on math/STEM, worse on code. palingenesis computes it over the whole rendered chat and no selection strategy uses it yet. |
+| mSFT | Koh et al., Mar 2026 (arXiv:2603.21606) | Exclude the earliest-overfitting sub-dataset and roll back to its best checkpoint; +1.8 points on 10 small tasks (base models). `msft.AdaptiveSourceTracker` (a soft-decay variant) exists but is **not wired into training**: `data.msft_tracking` has no effect. |
 
 ### SFT → RL
 
 | Finding | Paper | Implication |
 |---------|-------|-------------|
-| Entropy collapse kills GRPO | Aphale & Liu, Jun 2026 | Monitor entropy. Stop SFT if < 1.5. |
-| Excessive SFT destroys plasticity | Liu et al., Jun 2026 | 2-3 epochs is enough. More is harmful for RL. |
+| Entropy collapse kills GRPO | Aphale & Liu, Jun 2026 (arXiv:2606.18487) | Over-trained SFT lowers entropy and later GRPO peaks; their threshold (0.18 nats mean next-token entropy, Qwen2.5-Coder-3B) is "not universal". |
+| Excessive SFT destroys plasticity | Liu et al., Jun 2026 (arXiv:2606.09932) | A 32-epoch SFT checkpoint trains worse under RL than a 2-epoch one; the paper gives no general epoch limit. |
 | SFT and RL data must be disjoint | Apr 2026 | Overlap causes interference patterns. |
-| Data quality > RL algorithm | CacheRL, Jun 2026 | Strong SFT makes RL redundant. Focus on data. |
+| Data quality > RL algorithm | CacheRL, Jun 2026 (arXiv:2606.14179) | In one tool-calling study (Qwen3-4B-Thinking, GRPO on cached environments) RL added stability but little accuracy over strong SFT. |
 
 ---
 

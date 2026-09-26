@@ -6,7 +6,7 @@
 
 ## How much data do you need?
 
-This depends on your goal, but here are research-backed guidelines:
+This depends on your goal. A rule of thumb (not a measured result; general chat ability tends to plateau after about a thousand samples, while math and code keep improving with more data, Dong et al. 2023):
 
 | Dataset size | Epochs | Expected result |
 |:---:|:---:|---|
@@ -15,7 +15,7 @@ This depends on your goal, but here are research-backed guidelines:
 | 10,000–50,000 samples | 1–2 | Deep specialization. Model becomes genuinely competent at the domain. |
 | 50,000+ samples | 1 | Diminishing returns unless data is highly diverse. Consider `pgs prepare` to select the best subset. |
 
-A surprising finding from the research: 400 high-quality samples trained for 128 epochs outperforms 51,200 samples for 1 epoch. **Quality dominates quantity.** If you have fewer than 5,000 samples, that's fine — just train longer.
+Repetition can beat new data at a fixed number of updates: Kopiczko et al. (2026, arXiv:2602.11149) trained base Qwen3/Olmo3 models on long chain-of-thought data and found 400 random samples for 128 epochs beat 51,200 samples for one epoch on AIME/GPQA, with gains saturating at 32–64 epochs. It is a result about repetition in long-CoT SFT of base models, not about quality versus quantity; for an instruct model, watch your regression evals when you repeat data.
 
 ---
 
@@ -29,7 +29,7 @@ JSONL with chat messages:
 
 Multi-turn is supported. Only assistant tokens get loss.
 
-## (Optional but recommended) Score and filter
+## (Optional) Score, filter and hold out an eval set
 
 Point your config's `data.dataset` at the raw data, add a `preprocess:` section, and run:
 
@@ -41,11 +41,11 @@ pgs prepare --config configs/qwen35_4b/a100_80gb.yaml
 preprocess:
   enabled: true          # training will auto-use the prepared output
   output_dir: ./prepared
-  budget: 5000
-  strategy: optimal
+  budget: 5000           # a random subset of 5,000 (strategy: random, the default)
+  eval_holdout: 200      # held-out eval set, never trained on
 ```
 
-Takes ~10 minutes for 50K samples. Removes bad data, selects the optimal difficulty mix, and dumps `prepared/scored_data.parquet` plus a provenance manifest. With `enabled: true`, training picks it up automatically — no path editing needed. (The flag-based `pgs prepare --model ... --data ...` mode still exists; see the [Data guide](../guides/data.md).)
+One forward pass over the data with the model you will train: 20,000 math conversations (10M tokens) took 7 minutes for Qwen3.5-0.8B on one A100, and the time grows with model size and token count. It drops outliers, records how familiar each response is to the model, and dumps `prepared/scored_data.parquet` plus a provenance manifest. It does not know which samples will teach the model most: no familiarity-based selection beat a random subset in our [measurements](../guides/data.md#what-the-measurements-say). With `enabled: true`, training picks it up automatically — no path editing needed. (The flag-based `pgs prepare --model ... --data ...` mode still exists; see the [Data guide](../guides/data.md).)
 
 ## Choose your config
 

@@ -46,7 +46,7 @@ Usage:
   pgs distill --config configs/distill_math.yaml
   pgs rl --config configs/rl_math.yaml
   pgs autopilot --model Qwen/Qwen3.5-4B --dataset my_data.jsonl
-  pgs prepare --model Qwen/Qwen3.5-4B --data traces.jsonl --strategy optimal
+  pgs prepare --model Qwen/Qwen3.5-4B --data traces.jsonl --budget 10000
 
   # Preprocess driven by the SAME config as training (model/data/preprocess
   # sections are shared; output is parquet in preprocess.output_dir):
@@ -189,7 +189,7 @@ def _run_prepare_multi():
     parser.add_argument("--output", default="./prepared", help="Output directory")
     parser.add_argument("--max_seq_length", type=int, default=8192)
     parser.add_argument("--budget", type=int, help="Budget per source")
-    parser.add_argument("--strategy", default="optimal")
+    parser.add_argument("--strategy", default="random")
     parser.add_argument("--hes", action="store_true", help="Also compute HES reasoning quality scores")
     parser.add_argument("--hes_top_k", type=float, default=0.5, help="Top-k%% for HES")
     args = parser.parse_args()

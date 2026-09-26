@@ -54,7 +54,7 @@ You can override any of these. The implementations are checked against their pap
 
 Palingenesis is an SFT tool with offline preference optimization ([DPO and variants](../guides/dpo.md)) and [on-policy distillation](../guides/distillation.md). It doesn't do GRPO, PPO or other reward-driven RL. This is a deliberate scope decision.
 
-The research finding that motivates this (CacheRL, June 2026): *"RL provides stability but yields limited gains beyond strong SFT. Data quality and reward design are more important than complex optimization."*
+One study that motivates this (CacheRL, June 2026, tool-calling agents on Qwen3-4B-Thinking with GRPO over cached environments): *"reinforcement learning improves training stability but yields limited gains beyond strong SFT, suggesting that data quality and reward design are more important than complex optimization."*
 
 In other words: if your SFT is strong enough, RL adds marginal value. And getting SFT right — proper token weighting, correct masking, optimal scheduling, good data curation — is where 90% of the quality comes from.
 
@@ -68,12 +68,9 @@ That said, palingenesis is *RL-aware*: it monitors output entropy, warns before 
 
 Most practitioners dump their entire dataset into training and hope for the best. This is inefficient at best, harmful at worst.
 
-The research is clear:
-- Samples the model already knows (PPL < 1.5) contribute zero gradient signal
-- Samples the model can't follow at all (PPL > 500) produce random gradients
-- The sweet spot is medium difficulty: informative enough to learn from, tractable enough to generalize
+What the evidence supports is narrower than "train on medium difficulty": which samples help depends on the model, the data budget and where the responses come from (see the [data guide](../guides/data.md#what-the-measurements-say) for our measurements on Qwen3.5).
 
-Palingenesis's `prepare` command scores every sample with the model you will train (on exactly the tokens training will use) and selects by difficulty. Compare against a random subset of the same size to see what it buys on your task.
+Palingenesis's `prepare` command scores every sample with the model you will train (on exactly the tokens training will use) records how familiar each response is to the model, drops outliers and selects a subset. In our measurements the most useful lever was not selection but the *source* of the responses: on the same prompts, the model's own verified answers kept its math and instruction following far better than the dataset's answers, and replaying its own answers to general prompts forgot less than replaying a chat dataset. Compare any selection against a random subset of the same size on your task.
 
 ---
 

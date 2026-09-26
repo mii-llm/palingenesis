@@ -1,18 +1,14 @@
 # Data Preparation
 
-*The model can only learn from data at the edge of its capability. Too easy teaches nothing. Too hard overwhelms. Finding that edge is what preparation does.*
+*Which samples you train on decides what the model gains and what it loses. `pgs prepare` measures every sample with the model you will train, so you can choose instead of guessing.*
 
 ---
 
-## The difficulty problem
+## What preparation measures
 
-Imagine teaching calculus. If every example is `2+2=4`, the student learns nothing new. If every example is a Millennium Prize problem, the student can't follow the reasoning. The optimal teaching material is *just beyond* current competence — hard enough to be informative, easy enough to be learnable.
+For every sample, `pgs prepare` runs the model you are about to fine-tune over the conversation and records the perplexity of the tokens training will put loss on (the assistant turns). A low value means the model already writes this response almost verbatim; a high value means the response is far from what the model would write. It is a property of the (model, response) pair, not of the problem: a correct but unusual solution to an easy problem can score "hard".
 
-Language models work the same way. A sample where the model already assigns 95% probability to the correct tokens provides almost zero gradient signal — the loss is near zero, the weights barely move. A sample where the model is completely lost (5% on everything) provides gradient, but in random directions that don't generalize.
-
-The sweet spot is medium difficulty: samples where the model gets roughly 30-70% of tokens right. These produce strong, directional gradients that push the model toward useful generalizations.
-
-Palingenesis finds this sweet spot automatically.
+What to select is an empirical question. The [measured results](#what-the-measurements-say) below are for post-trained Qwen3.5 models; compare any selection against a random subset of the same size on your own eval battery.
 
 ---
 
@@ -48,19 +44,18 @@ Palingenesis finds this sweet spot automatically.
         --data my_data.jsonl \
         --output prepared/ \
         --budget 10000 \
-        --strategy optimal \
         --format parquet
     ```
 
 What this does, step by step:
 
 1. **Score**: runs each sample through the target model, computes per-token perplexity using the model's own chat template to identify exactly which tokens are assistant responses
-2. **Classify**: assigns each sample to easy/medium/hard based on percentile thresholds (adaptive to your data distribution)
-3. **Filter**: removes trivial samples (PPL < 1.5 — the model already knows this perfectly) and impossible ones (PPL > 500 — noise, wrong language, corruption)
-4. **Select**: picks an optimal subset within your budget
+2. **Bucket**: assigns each sample to familiar / typical / unfamiliar by response-perplexity percentile (bottom 25% / middle / top 25% of *your* dataset under *your* model)
+3. **Filter**: drops outliers by response perplexity, below `min_ppl` (1.5: near-verbatim answers) and above `max_ppl` (500: usually broken or wrong-language samples). Both are tunable defaults, not research findings
+4. **Select**: keeps `budget` samples with the chosen `strategy` (see [Strategies](#strategies))
 5. **Dump**: writes `scored_data.parquet` (order-preserving, fast to load) plus a `prepared_meta.json` manifest recording exactly which model, dataset, and strategy produced it
 
-The scoring uses the *exact same masking* as training: only assistant tokens are measured. System prompts and user turns don't count. This is important — a long system prompt with a trivial answer would look "hard" by naive perplexity but is actually easy from the model's perspective.
+The scoring uses the *exact same masking* as training: only assistant tokens are measured. System prompts and user turns don't count. A long system prompt therefore cannot make a short, familiar answer look unfamiliar.
 
 ---
 
@@ -88,7 +83,7 @@ preprocess:
   output_dir: ./prepared/qwen35_4b
   format: parquet                   # parquet (default) or jsonl
   budget: 10000                     # samples to keep (0 = all)
-  strategy: optimal                 # optimal | curriculum | balanced | flow | ...
+  strategy: random                  # default; see Strategies below
   eval_holdout: 100                 # reserve a held-out eval set (never trained on)
 ```
 
@@ -96,52 +91,61 @@ preprocess:
     Set `eval_holdout: N` and prepare reserves N random samples (drawn **after** outlier filtering, **before** budget selection) into `eval_data.parquet`. They are guaranteed disjoint from the training data. If `data.eval_dataset` is left empty, training picks this file up automatically — giving you a genuine same-distribution eval, so `eval/loss`, `eval/ppl` and `eval/gap` actually measure generalization instead of memorization.
 
 !!! tip "Provenance travels with the data"
-    Every prepare run writes `prepared_meta.json` next to the data: scoring model, source dataset, strategy, sample count, perplexity statistics, and difficulty distribution. Training logs this manifest at startup, so every run records exactly which preparation produced its data.
+    Every prepare run writes `prepared_meta.json` next to the data: scoring model, source dataset, strategy, sample count, perplexity statistics, the familiarity distribution and, with `group_field: source`, a per-source profile before and after selection (public mixtures differ a lot per source, and any perplexity-based selection mostly changes the source mix). Training logs this manifest at startup, so every run records exactly which preparation produced its data.
 
 !!! warning "No silent fallback"
     If `preprocess.enabled: true` but nothing has been prepared yet, training **fails immediately** with the exact command to run. It will never silently fall back to the raw dataset.
 
 Two details worth knowing:
 
-- **Curriculum ordering survives.** With `strategy: curriculum`, samples are stored easy→hard and training skips shuffling so the ordering reaches the model intact. Every other strategy shuffles normally.
+- **Curriculum ordering survives.** With `strategy: curriculum`, samples are stored familiar→unfamiliar and training skips shuffling so the ordering reaches the model intact. Every other strategy shuffles normally.
 - **Parquet is the default** because it preserves sample order, loads far faster than JSONL, and is consumed directly by the training data loader (you can point `data.dataset` at any `.parquet` file or prepared directory manually, too). If your samples have a schema Arrow can't unify, the writer falls back to JSONL automatically.
-
----
-
-## The J-shaped distribution
-
-The `optimal` strategy selects data with a difficulty distribution that research has converged on. Two properties make it robust across datasets:
-
-1. **Difficulty is relative, not absolute.** Buckets are percentiles of the perplexity distribution *of your dataset as seen by your model* (bottom 25% = easy, top 25% = hard). A multilingual or domain-shifted dataset with high absolute PPL still gets a proper easy/medium/hard split — the J-shape always maps onto the difficulty range that's actually available.
-2. **The mix adapts to your budget.** The Tsinghua scaling result (2605.12906) shows the optimal difficulty shifts harder as the data budget grows — small budgets need learnable data, large budgets can afford the hard tail:
-
-| Budget | Easy | Medium | Hard | Very hard |
-|--------|------|--------|------|-----------|
-| < 2K samples | 35% | 50% | 15% | 0% |
-| 2K–10K | 25% | 50% | 20% | 5% |
-| > 10K | 20% | 50% | 25% | 5% |
-
-If a bucket has fewer samples than its quota, the shortfall is backfilled from the other buckets (medium first) so you always get the full budget.
-
-This isn't arbitrary. It synthesizes findings from three papers:
-
-- Easy samples prevent forgetting (FLOW, ICML 2025): upweighting easy data preserves pretrained capabilities during SFT
-- Medium samples maximize learning (InfoSFT, 2025): information content peaks at the model's decision boundary
-- Hard samples are only useful with sufficient data budget (Tsinghua, 2026): at small data scales, easy dominates; at large scales, hard becomes valuable
-
-The `optimal` strategy interpolates these findings into one distribution.
 
 ---
 
 ## Strategies
 
-| Strategy | When to use | What it does |
-|----------|------------|--------------|
-| `optimal` | Default. Works best in most scenarios. | J-shaped difficulty mix |
-| `balanced` | You want maximum diversity | Equal parts easy/medium/hard |
-| `curriculum` | Multi-epoch training with progressive difficulty | Orders samples easy→hard |
-| `hard_focus` | Strong base model + large dataset | Overweights challenging samples |
-| `flow` | Anti-forgetting is your primary concern | Exponential weighting by easiness |
+`strategy` only matters when `budget` is set (below the pool size). Buckets are percentiles of response perplexity *of your dataset under your model*: familiar (bottom 25%), typical, unfamiliar (top 25%).
+
+| Strategy | What it does | Evidence |
+|----------|--------------|----------|
+| `random` (default) | Uniform random subset (seeded) | The baseline every other strategy must beat. |
+| `optimal` | J-shaped mix: 20% familiar / 50% typical / 25% unfamiliar / 5% most unfamiliar above 10K samples; 25/50/20/5 from 2K to 10K; 35/50/15/0 below 2K | A heuristic of ours, loosely after two papers that test neither mixtures nor these thresholds (2605.12906: single-difficulty subsets of base math models; FLOW, 2502.02797: loss re-weighting). **Measured below `random`** (see below). |
+| `flow` | The lowest-perplexity (most familiar) samples | Named after FLOW, which *re-weights* the loss by exp(−loss/τ); palingenesis records that weight as `_score_flow_weight` but training does not use it, so this is plain "most familiar N" selection. |
+| `curriculum` | A random subset, ordered familiar→unfamiliar; training keeps the order | Not measured. |
+| `balanced` | Equal thirds of familiar / typical / unfamiliar | Not measured. |
+| `medium_focus` | The samples closest to the median perplexity | Not measured. |
+| `hard_focus` | The highest-perplexity samples | Not measured. |
+
+Within a bucket samples are drawn at random, never in file order (concatenated datasets are grouped by source, so a first-N pick would silently select sources). If a bucket is short, the shortfall is backfilled from the others so you always get the full budget.
+
+## What the measurements say
+
+One controlled study, so read it as evidence for one setting, not as a law: **Qwen3.5-0.8B** (the post-trained hybrid checkpoint, non-thinking), fine-tuned on **4,000 math conversations** for 2 epochs (LR 1e-5 cosine, 32 conversations/step, full fine-tuning); only the data changes between runs. Evaluated with sampling on GSM8K, MATH-500, IFEval, MMLU-Pro, HumanEval+, MBPP+ and a chat sanity check; differences are paired per item against the untouched model.
+
+| Data (4,000 conversations) | GSM8K | MATH-500 | IFEval | MMLU-Pro | HumanEval+ |
+|---|---|---|---|---|---|
+| untouched model | 56.3 | 40.8 | 56.7 | 31.8 | 28.7 |
+| random subset, dataset (GPT-4o) solutions | −1.7 | −6.3 | −23.2 | −1.0 | −10.4 |
+| `optimal` (J-mix) subset | −4.2 | −8.3 | −25.9 | −1.2 | −14.3 |
+| most familiar 20% (≈ `flow`) | +0.5 | −8.4 | −23.1 | +1.2 | −8.8 |
+| same prompts, dataset solutions | −0.5 | −6.8 | −28.5 | −1.6 | −5.8 |
+| same prompts, **the model's own verified solutions** | +1.4 | +1.8 | −17.5 | +1.1 | −3.0 |
+| random subset at LR 2e-6 instead of 1e-5 | −3.7 | −3.8 | −11.3 | −3.1 | −7.9 |
+| random subset + 4,000 general chat conversations | −3.4 | −6.7 | −18.9 | −3.4 | −11.9 |
+| random subset + the same 4,000 chat prompts **answered by the model itself** | −2.9 | −6.6 | −10.2 | +2.4 | −1.8 |
+
+Standard errors of a single cell are about 1.3 (GSM8K, MMLU-Pro), 2.1 (MATH-500), 2.4 (IFEval) and 3.5 (HumanEval+); two training seeds of the same data differ by up to 3 points. Every row averages two seeds except the LR 2e-6 row and the last row (one seed each).
+
+What this supports:
+
+- **Selection by perplexity did not help.** No strategy beat a random subset on the target skill, and `optimal` was worse than random on GSM8K (−2.4 ± 1.1) and HumanEval+ (−4.0 ± 1.8), consistently across both seeds. Hence `random` is the default.
+- **The score is not difficulty.** On 20,000 NuminaMath problems, the Spearman correlation between the model's pass rate (4 samples) and the response perplexity of the reference solution was 0.009. Selecting the problems the model solves sometimes (pass rate between 0 and 1) did not help either.
+- **Where the responses come from matters more than which samples you pick.** On identical prompts, the model's own verified solutions (sample 4 answers, keep a correct one) beat the dataset's solutions by +8.6 ± 1.7 on MATH-500, +11.0 ± 1.8 on IFEval and +2.7 ± 1.1 on MMLU-Pro (two seeds each). They did not *raise* math above the untouched model, though: at this scale they preserve the skill rather than improve it. The dataset solutions are much shorter than what the model writes, and the model learns that: its MATH-500 answers shrink from ~1,250 to ~460 tokens and its accuracy drops. The price: the model keeps its habit of long answers that sometimes never terminate (chat sanity −7.5 ± 1.6 and MBPP+ −3.4 ± 1.8 vs dataset solutions).
+- **Forgetting is the main effect, and data selection does not fix it.** Every run lost 11–29 points of IFEval. A 5× lower learning rate halved the IFEval loss (−11.3 vs −23.2) but still gave no math gain; mixing in an equal amount of general chat data recovered only +4.3 ± 1.7, because that chat data itself costs IFEval when trained alone (−20.9).
+- **Replay the model's own answers, not a dataset's.** Answering the same 4,000 general prompts with the model itself (sampled once, unfinished answers dropped) and mixing them in instead of the dataset's answers kept +8.7 ± 2.3 IFEval, +6.2 ± 1.4 MMLU-Pro and +9.1 ± 3.4 HumanEval+ more (one seed). It does not protect the target skill: that depends on where the target responses come from (above). To do this in palingenesis, generate the answers with vLLM and add them as a second `data.sources` entry; `pretrain_replay_dataset` replays raw text, which we did not test.
+
+What it does not show: other model sizes, thinking mode, base (non-instruct) models, larger budgets, or skills other than math. On base models the cited papers find harder data more useful as the budget grows (2605.12906). Before relying on any selection, run the same comparison against `random` on your own model and eval battery.
 
 ---
 
@@ -173,17 +177,13 @@ Real projects have multiple data sources: agentic traces, general instruction-fo
 pgs prepare-multi --model Qwen/Qwen3.5-4B --sources sources.yaml --output prepared/
 ```
 
-During training, enable MSFT adaptive weighting:
+How the mix behaves in training (`data.sources`):
 
-```yaml
-data:
-  msft_tracking: true
-  msft_eval_every: 50
-```
+- `weight` is a **per-conversation** sampling probability, not a token share: a source of long conversations contributes more tokens than its weight suggests.
+- An epoch ends when the **first** non-empty source runs out, so a small source with a large weight shortens the epoch for all the others.
 
-MSFT monitors per-source validation loss. When a source starts overfitting (val loss increases), its weight decays. When it improves, weight recovers. Weights never reach zero (floor at 10% of original) — the model always sees some of every source.
-
-This prevents the common failure mode where one high-quality but small source gets memorized in the first epoch while the training loop continues wasting compute on it.
+!!! warning "`data.msft_tracking` has no effect yet"
+    `msft.AdaptiveSourceTracker` (per-source weight decay when a source's validation loss rises, after mSFT, arXiv:2603.21606) exists but is not wired into the training loop. Setting `msft_tracking: true` logs a warning and the weights stay fixed. Watch per-source losses with `eval_sources` instead.
 
 ---
 
@@ -321,6 +321,6 @@ Per-source keys: `name`, `dataset`, `split`, `weight` (composite importance), `s
 
 ## The cardinal rule
 
-> Train on the samples the model finds *informative*. Not the ones that are easy. Not the ones that are impressive. The ones where the gradient points somewhere useful.
+> Measure what you lose, not only what you gain.
 
-Scoring costs one forward pass over the data with the model you will train, a small fraction of a training run. Whether the selection helps on your task is an empirical question: compare against a random subset of the same size on your eval set.
+Fine-tuning a post-trained model on one skill costs it others, and a loss curve shows none of it. Keep a small regression battery (instruction following, knowledge, code, plain chat) next to your target eval, and compare every data choice against a random subset of the same size.
