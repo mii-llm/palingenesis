@@ -40,8 +40,14 @@ def test_count_rows_and_uniform_jsonl_sampling(tmp_path):
     path = _write_jsonl(tmp_path / "d.jsonl", rows)
     assert data_size.count_rows(str(path)) == 4000
     sample = data_size._jsonl_sample(path, 4000, rng)
-    long_share = sum(len(r["pad"]) == 500 for r in sample) / len(sample)
-    assert abs(long_share - 0.5) < 0.05, long_share  # uniform over rows, not over bytes
+    raw_share = sum(len(r["pad"]) == 500 for r in sample.rows) / len(sample.rows)
+    assert raw_share > 0.8  # byte offsets land in long lines far more often...
+    share, _ = data_size.stratified_mean(sample, [float(len(r["pad"]) == 500) for r in sample.rows], None)
+    assert abs(share - 0.5) < 0.05, share  # ...the 1/length weights make it uniform over rows
+    census = data_size.census(str(path))
+    assert census.rows == 4000
+    exact, error = data_size.stratified_mean(sample, [float(len(r["pad"]) == 500) for r in sample.rows], census)
+    assert abs(exact - 0.5) < 0.005 and error < 0.005  # size-stratified: known from the census
 
 
 def test_local_jsonl_stream_shards_cover_every_line_once(tmp_path):

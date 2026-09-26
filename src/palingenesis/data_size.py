@@ -7,16 +7,17 @@ count is estimated instead:
 
   rows       from metadata: a map-style dataset's length, a parquet footer, a JSONL's
              newlines (a byte scan, ~GB/s), a Hub dataset's published split sizes
-  per row    a uniform random sample of rows (default 2,000) goes through the real
-             per-row pipeline: how many training examples a row yields (filters, long
-             documents split) and how long they are
-  mixture    an epoch of weighted sources ends when the first source runs out (the
-             MixedDataset rule), which fixes how many examples each source contributes
-  packing    the real packer runs over a synthetic stream of the sampled lengths drawn
-             in mixture proportions: packed sequences per example
+  per row    uniform random rows go through the real per-row pipeline: the examples a row
+             yields (filters, long documents split), their tokens, kept preference pairs
+  by size    the row count's scan also records every row's size (Arrow: string sizes), and
+             the sample is used per size bin weighted by the bin's share of all rows: what a
+             row's length decides (the long tail filters drop) is known for every row
+  rounds     rows are drawn in rounds until the reported error reaches target_error()
+  mixture    data.mix_epoch: the sources' rows together (or until the first runs out)
+  packing    tokens / (max_len * the real packer's fill rate on a synthetic stream)
 
-The per-rank micro-batches per epoch follow; the error is that of a sample mean (about
-1-2% at 2,000 rows). train.exact_steps runs the full scan instead.
+The per-rank micro-batches per epoch follow, with a calibrated standard error (about 0.1% for
+packed SFT, 0.5% for preference pairs in the tests). train.exact_steps runs the full scan instead.
 
 Streaming local files: `datasets` shards a stream by file, so one JSONL or parquet file
 streams through one DataLoader worker (the others stop) and every rank reads the whole
@@ -67,14 +68,131 @@ def _is_jsonl(path: Path) -> bool:
     return head[:1] == b"{"
 
 
+# Row sizes (bytes of a JSONL line, or of a row's strings in Arrow data) predict most of
+# what a row becomes (its token count, whether it fits max_seq_length), and the whole
+# population's sizes cost no tokenization: the newline scan that counts a JSONL's rows finds
+# every line's length, and Arrow computes string sizes column-wise. Estimates are
+# post-stratified on them: per size bin from the sample, weighted by the bin's share of the
+# population, so the length-driven part of a row's fate (the long tail that filters drop) is
+# known for every row instead of sampled.
+
+_BIN_RATIO = 1.15  # geometric size bins: rows in a bin are within 15% of each other's size
+
+
+def size_bin(size: float) -> int:
+    return int(math.log(max(size, 1.0)) / math.log(_BIN_RATIO))
+
+
+@dataclass
+class Census:
+    """How many rows the population has in each size bin."""
+
+    counts: dict[int, int]
+
+    @property
+    def rows(self) -> int:
+        return sum(self.counts.values())
+
+
+_CENSUS_CACHE: dict[tuple, Census] = {}
+
+
+def jsonl_census(path: Path) -> Census:
+    """Row count and line-size histogram of a JSONL file in one byte scan (cached per file)."""
+    import numpy as np
+
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    if key not in _CENSUS_CACHE:
+        counts: dict[int, int] = {}
+        carry = 0  # bytes of the line in progress from the previous chunk
+        log_ratio = math.log(_BIN_RATIO)
+        with open(path, "rb") as f:
+            while chunk := f.read(_CHUNK):
+                ends = np.flatnonzero(np.frombuffer(chunk, dtype=np.uint8) == 10)
+                if len(ends):
+                    lengths = np.diff(np.concatenate(([-1], ends))).astype(np.int64)
+                    lengths[0] += carry
+                    lengths = lengths[lengths > 1]  # blank lines are not rows
+                    bins = (np.log(np.maximum(lengths, 1)) / log_ratio).astype(np.int64)
+                    for value, n in zip(*np.unique(bins, return_counts=True)):
+                        counts[int(value)] = counts.get(int(value), 0) + int(n)
+                    carry = len(chunk) - 1 - int(ends[-1])
+                else:
+                    carry += len(chunk)
+        if carry > 0:  # a last line without a newline
+            counts[size_bin(carry + 1)] = counts.get(size_bin(carry + 1), 0) + 1
+        _CENSUS_CACHE[key] = Census(counts)
+    return _CENSUS_CACHE[key]
+
+
 def count_lines(path: Path) -> int:
-    """Lines of a text file (a final line without a newline included): a byte scan in large chunks."""
-    lines, last = 0, b"\n"
-    with open(path, "rb") as f:
-        while chunk := f.read(_CHUNK):
-            lines += chunk.count(b"\n")
-            last = chunk[-1:]
-    return lines + (last != b"\n")
+    """Rows of a JSONL file (non-blank lines, a last line without a newline included)."""
+    return jsonl_census(path).rows
+
+
+def arrow_row_sizes(table) -> "list[int]":
+    """Bytes of every string in each row (nested lists and structs included): the Arrow
+    counterpart of a JSONL line's length, computed column-wise."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    n = table.num_rows
+    total = np.zeros(n, dtype=np.int64)
+
+    def add(array, owner):
+        if isinstance(array, pa.ChunkedArray):
+            array = array.combine_chunks()
+        t = array.type
+        if pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_binary(t) or pa.types.is_large_binary(t):
+            lengths = pc.fill_null(pc.binary_length(array), 0).to_numpy(zero_copy_only=False)
+            np.add.at(total, owner, lengths)
+        elif pa.types.is_list(t) or pa.types.is_large_list(t):
+            parents = pc.list_parent_indices(array).to_numpy(zero_copy_only=False)
+            add(pc.list_flatten(array), owner[parents])
+        elif pa.types.is_struct(t):
+            for i in range(t.num_fields):
+                add(array.field(i), owner)
+
+    for column in table.columns:
+        add(column, np.arange(n))
+    return total.tolist()
+
+
+def _census_of_sizes(sizes) -> Census:
+    counts: dict[int, int] = {}
+    for size in sizes:
+        b = size_bin(size)
+        counts[b] = counts.get(b, 0) + 1
+    return Census(counts)
+
+
+def census(dataset_id: str, split: str = "train", dataset: Any = None) -> Census | None:
+    """The population's size histogram (None when it would take reading a remote stream)."""
+    if dataset is not None and not _is_streaming_obj(dataset):
+        table = dataset.data.table if hasattr(dataset, "data") else None
+        if table is None:
+            return None
+        if getattr(dataset, "_indices", None) is not None:
+            table = table.take(dataset._indices.column(0))
+        return _census_of_sizes(arrow_row_sizes(table))
+    path = local_file(dataset_id)
+    if path is None:
+        return None
+    if path.suffix == ".parquet":
+        import pyarrow.parquet as pq
+
+        stat = path.stat()
+        key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+        if key not in _CENSUS_CACHE:
+            pf = pq.ParquetFile(path)
+            sizes: list[int] = []
+            for g in range(pf.num_row_groups):
+                sizes.extend(arrow_row_sizes(pf.read_row_group(g)))
+            _CENSUS_CACHE[key] = _census_of_sizes(sizes)
+        return _CENSUS_CACHE[key]
+    return jsonl_census(path) if _is_jsonl(path) else None
 
 
 def count_rows(dataset_id: str, split: str = "train", dataset: Any = None) -> int | None:
@@ -115,14 +233,32 @@ def _is_streaming_obj(dataset) -> bool:
 # ------------------------------------------------------------------ sampling
 
 
-def _jsonl_sample(path: Path, k: int, rng: random.Random) -> list[dict]:
-    """Uniform rows of a JSONL file without reading it: random byte offsets pick lines with
-    probability proportional to their length, so each picked line is kept with weights
-    1/length (a weighted resample back to uniform)."""
+@dataclass
+class Sample:
+    """Sampled rows with their sizes and sampling weights (1/length for byte-offset picks:
+    weighted, they are uniform over rows)."""
+
+    rows: list[dict]
+    sizes: list[int]
+    weights: list[float]
+    uniform: bool = True
+    exhaustive: bool = False  # every row of the population, once: the estimate is exact
+
+    def extend(self, other: "Sample") -> None:
+        """Pool another round of draws (independent draws of the same design)."""
+        self.rows += other.rows
+        self.sizes += other.sizes
+        self.weights += other.weights
+        self.uniform = self.uniform and other.uniform
+
+
+def _jsonl_sample(path: Path, k: int, rng: random.Random) -> Sample:
+    """Rows of a JSONL file without reading it: random byte offsets pick the line they fall
+    in, with probability proportional to its length; weights 1/length undo that."""
     size = path.stat().st_size
-    picked: list[tuple[bytes, int]] = []
+    rows, sizes, weights = [], [], []
     with open(path, "rb") as f:
-        for _ in range(4 * k):
+        for _ in range(k):
             offset = rng.randrange(size)
             back = max(0, offset - (1 << 20))
             f.seek(back)
@@ -130,47 +266,119 @@ def _jsonl_sample(path: Path, k: int, rng: random.Random) -> list[dict]:
             start = back + before.rfind(b"\n") + 1 if b"\n" in before else back
             f.seek(start)
             line = f.readline()
-            if line.strip():
-                picked.append((line, len(line)))
-    if not picked:
-        return []
-    rows = rng.choices([line for line, _ in picked], weights=[1.0 / n for _, n in picked], k=min(k, len(picked)))
-    return [json.loads(line) for line in rows]
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:  # a line longer than the look-back window: skip it
+                continue
+            n = len(line.rstrip(b"\n")) + 1
+            sizes.append(n)
+            weights.append(1.0 / n)
+    return Sample(rows, sizes, weights)
 
 
-def _parquet_sample(path: Path, k: int, rng: random.Random) -> list[dict]:
+def _arrow_sample(table, k: int, rng: random.Random) -> Sample:
+    take = sorted(rng.sample(range(table.num_rows), min(k, table.num_rows)))
+    part = table.take(take)
+    return Sample(part.to_pylist(), arrow_row_sizes(part), [1.0] * len(take))
+
+
+def _parquet_sample(path: Path, k: int, rng: random.Random) -> Sample:
     """Rows from up to 16 random row groups (reading whole groups: a footer has no row index)."""
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     pf = pq.ParquetFile(path)
     groups = rng.sample(range(pf.num_row_groups), min(16, pf.num_row_groups))
-    rows: list[dict] = []
+    parts = []
     for g in groups:
         table = pf.read_row_group(g)
         take = rng.sample(range(table.num_rows), min(table.num_rows, math.ceil(k / len(groups))))
-        rows.extend(table.take(sorted(take)).to_pylist())
-    return rows[:k]
+        parts.append(table.take(sorted(take)))
+    table = pa.concat_tables(parts)
+    return Sample(table.to_pylist(), arrow_row_sizes(table), [1.0] * table.num_rows)
 
 
-def sample_rows(dataset_id: str, split: str, k: int, seed: int, dataset: Any = None) -> tuple[list[dict], bool]:
-    """(up to k rows drawn uniformly, whether the draw is uniform). A Hub stream can only be
+def sample_rows(dataset_id: str, split: str, k: int, seed: int, dataset: Any = None) -> Sample:
+    """About k rows drawn uniformly (weighted), with their sizes. A Hub stream can only be
     sampled from its start (through a shuffle buffer): not uniform when its order is not."""
     rng = random.Random(seed)
-    if dataset is not None:
-        try:
-            n = len(dataset)
-            return [dataset[i] for i in sorted(rng.sample(range(n), min(k, n)))], True
-        except TypeError:
-            return list(dataset.shuffle(seed=seed, buffer_size=10_000).take(k)), False
-    path = local_file(dataset_id)
-    if path is not None and path.suffix == ".parquet":
-        return _parquet_sample(path, k, rng), True
-    if path is not None and _is_jsonl(path):
-        return _jsonl_sample(path, k, rng), True
-    from datasets import load_dataset
+    if dataset is not None and not _is_streaming_obj(dataset):
+        table = dataset.data.table
+        if getattr(dataset, "_indices", None) is not None:
+            table = table.take(dataset._indices.column(0))
+        sample = _arrow_sample(table, k, rng)
+        sample.exhaustive = table.num_rows <= k
+        return sample
+    if dataset is None:
+        path = local_file(dataset_id)
+        if path is not None and path.suffix == ".parquet":
+            import pyarrow.parquet as pq
 
-    stream = load_dataset(dataset_id, split=split, streaming=True)
-    return list(stream.shuffle(seed=seed, buffer_size=10_000).take(k)), False
+            if pq.ParquetFile(path).metadata.num_rows <= k:  # small: all of it, exactly
+                table = pq.read_table(path)
+                return Sample(table.to_pylist(), arrow_row_sizes(table), [1.0] * table.num_rows, exhaustive=True)
+            return _parquet_sample(path, k, rng)
+        if path is not None and _is_jsonl(path):
+            if count_lines(path) <= k:  # small: all of it, exactly
+                lines = [line for line in open(path, "rb") if line.strip()]
+                return Sample(
+                    [json.loads(line) for line in lines],
+                    [len(line.rstrip(b"\n")) + 1 for line in lines],
+                    [1.0] * len(lines),
+                    exhaustive=True,
+                )
+            return _jsonl_sample(path, 2 * k, rng)  # weighted picks: twice as many for the same precision
+        from datasets import load_dataset
+
+        dataset = load_dataset(dataset_id, split=split, streaming=True)
+    rows = list(dataset.shuffle(seed=seed, buffer_size=10_000).take(k))
+    return Sample(rows, [len(json.dumps(r, default=str)) for r in rows], [1.0] * len(rows), uniform=False)
+
+
+def stratified_mean(sample: Sample, values: list[float], population: Census | None, min_per_bin: int = 12):
+    """(mean of `values` over the population, its standard error). With a census: per size
+    bin (adjacent bins merged until each holds min_per_bin sampled rows), weighted by the
+    bin's share of the population. Without: the weighted sample mean."""
+    w = sample.weights
+    if population is None or not values:
+        total = sum(w) or 1.0
+        mean = sum(wi * v for wi, v in zip(w, values)) / total
+        n_eff = total**2 / max(sum(wi * wi for wi in w), 1e-30)
+        var = sum(wi * (v - mean) ** 2 for wi, v in zip(w, values)) / total
+        return mean, math.sqrt(var / max(n_eff, 1.0))
+    by_bin: dict[int, list[int]] = {}
+    for i, size in enumerate(sample.sizes):
+        by_bin.setdefault(size_bin(size), []).append(i)
+    # strata: runs of consecutive bins (over sample and population) with enough sampled rows
+    keys = sorted(set(by_bin) | set(population.counts))
+    strata, current, filled = [], [], 0
+    for key in keys:
+        current.append(key)
+        filled += len(by_bin.get(key, ()))
+        if filled >= min_per_bin:
+            strata.append(current)
+            current, filled = [], 0
+    if current:
+        if strata:
+            strata[-1].extend(current)
+        else:
+            strata.append(current)
+    rows = population.rows
+    mean = var = 0.0
+    for stratum in strata:
+        share = sum(population.counts.get(k, 0) for k in stratum) / rows
+        idx = [i for k in stratum for i in by_bin.get(k, ())]
+        if not idx or share == 0:
+            continue
+        ws = sum(w[i] for i in idx)
+        m = sum(w[i] * values[i] for i in idx) / ws
+        v = sum(w[i] * (values[i] - m) ** 2 for i in idx) / ws
+        n_eff = ws**2 / sum(w[i] ** 2 for i in idx)
+        mean += share * m
+        var += share * share * v / max(n_eff, 1.0)
+    return mean, math.sqrt(var)
 
 
 # ------------------------------------------------------------------ parallel local streams
@@ -241,8 +449,35 @@ class SourceEstimate:
     rows: int | None  # None: unknown (a stream without metadata): treated as never exhausted
     weight: float
     examples_per_row: float  # training examples a row yields (after filters / splitting)
-    lengths: list[int] = field(default_factory=list)  # tokens per sampled example
+    lengths: list[int] = field(default_factory=list)  # tokens per example, over the sample
     uniform: bool = True
+    per_row: list[list[int]] = field(default_factory=list)  # each sampled row's example lengths
+    sample: Sample | None = None
+    population: Census | None = None
+    examples_error: float = 0.0  # standard error of examples_per_row
+    tokens_per_row: float = 0.0  # tokens a row yields (all its examples)
+    tokens_error: float = 0.0
+
+    def draw_rows(self, rng: random.Random, n: int) -> list[list[int]]:
+        """n rows' example lengths, drawn as the population's rows would be: a size bin by its
+        population share, then a sampled row of that bin by weight."""
+        if self.sample is None or not self.per_row:
+            return [[length] for length in rng.choices(self.lengths or [1], k=n)]
+        by_bin: dict[int, list[int]] = {}
+        for i, size in enumerate(self.sample.sizes):
+            by_bin.setdefault(size_bin(size), []).append(i)
+        if self.population is not None:
+            bins = [b for b in self.population.counts if b in by_bin]
+            shares = [self.population.counts[b] for b in bins]
+        else:
+            bins = list(by_bin)
+            shares = [sum(self.sample.weights[i] for i in by_bin[b]) for b in bins]
+        out = []
+        for b in rng.choices(bins, weights=shares, k=n):
+            idx = by_bin[b]
+            i = rng.choices(idx, weights=[self.sample.weights[j] for j in idx])[0]
+            out.append(self.per_row[i])
+        return out
 
 
 @dataclass
@@ -250,7 +485,7 @@ class StepEstimate:
     micro_batches_per_epoch: int  # per rank
     examples_per_epoch: float  # per rank, before packing
     sequences_per_epoch: float  # per rank, after packing
-    relative_error: float  # sampling error of the mean length (1 sigma)
+    relative_error: float  # standard error of the estimate, relative (1 sigma)
     sources: list[SourceEstimate]
 
     def describe(self) -> str:
@@ -258,8 +493,9 @@ class StepEstimate:
         for s in self.sources:
             rows = f"{s.rows:,}" if s.rows is not None else "unbounded"
             parts.append(
-                f"{s.name}: {rows} rows, {s.examples_per_row:.2f} examples/row, "
+                f"{s.name}: {rows} rows, {s.examples_per_row:.3f} examples/row, "
                 f"mean {sum(s.lengths) / max(1, len(s.lengths)):.0f} tokens"
+                + (", size-stratified" if s.population is not None else "")
                 + ("" if s.uniform else " (sampled from the stream's start: not uniform)")
             )
         return "; ".join(parts)
@@ -284,24 +520,29 @@ def mixture_epoch(
     return min(lasts), probs
 
 
-def packed_per_example(sources: list[SourceEstimate], probs: list[float], max_len: int, seed: int) -> float:
-    """Packed sequences per example: the real packer over a synthetic stream of the sampled
-    lengths in mixture proportions."""
+def packing_fill(sources: list[SourceEstimate], probs: list[float], max_len: int, seed: int) -> float:
+    """How full the packer's blocks are (tokens / (blocks * max_len)): the real packer over a
+    synthetic stream of examples, drawn row by row as the population's rows (by size) in
+    mixture proportions. A ratio, so the stream's own token total cancels out: the number of
+    tokens comes from the stratified estimate, only the packer's efficiency from here."""
     import torch
 
     from palingenesis.data import PackedDataset
 
     rng = random.Random(seed)
-    pools = [(s.lengths, p) for s, p in zip(sources, probs) if p > 0 and s.lengths]
-    n = 8192
-    stream = []
-    for _ in range(n):
-        lengths = rng.choices([pl for pl, _ in pools], weights=[p for _, p in pools])[0]
-        length = min(max_len, rng.choice(lengths))
-        ids = torch.zeros(length, dtype=torch.long)
-        stream.append({"input_ids": ids, "labels": ids})
+    live = [(s, p) for s, p in zip(sources, probs) if p > 0 and (s.lengths or s.per_row)]
+    stream: list[dict] = []
+    tokens = 0
+    while len(stream) < 16384:
+        source = rng.choices([s for s, _ in live], weights=[p for _, p in live])[0]
+        for lengths in source.draw_rows(rng, 64):
+            for length in lengths:
+                n = min(max_len, length)
+                ids = torch.zeros(n, dtype=torch.long)
+                stream.append({"input_ids": ids, "labels": ids})
+                tokens += n
     blocks = sum(1 for _ in PackedDataset(stream, max_len, sort_buffer=256)._bin_packing())
-    return blocks / n
+    return tokens / (blocks * max_len)
 
 
 def estimate_steps(
@@ -314,48 +555,87 @@ def estimate_steps(
     epoch_examples: float | None = None,
 ) -> StepEstimate:
     examples, probs = mixture_epoch(sources, world_size, epoch_examples)
-    sequences = examples * (packed_per_example(sources, probs, max_len, seed) if packing else 1.0)
-    # sampling error of the mixture's mean example length
-    variances = []
-    for s, p in zip(sources, probs):
-        if p > 0 and len(s.lengths) > 1:
-            mean = sum(s.lengths) / len(s.lengths)
-            var = sum((x - mean) ** 2 for x in s.lengths) / (len(s.lengths) - 1)
-            variances.append((p, mean, var, len(s.lengths)))
-    mean_all = sum(p * m for p, m, _, _ in variances) or 1.0
-    length_error = math.sqrt(sum(p * p * v / n for p, _, v, n in variances)) / mean_all if packing else 0.0
-    # the share of rows the filters keep is a sampled proportion too (binomial error)
-    rate_error = max(
-        (
-            math.sqrt(min(s.examples_per_row, 1.0) * max(0.0, 1.0 - s.examples_per_row) / max(1, len(s.lengths)))
-            / max(s.examples_per_row, 1e-9)
-            for s, p in zip(sources, probs)
-            if p > 0
-        ),
-        default=0.0,
-    )
+    live = [(s, p) for s, p in zip(sources, probs) if p > 0]
+    if packing:
+        # sequences = tokens / (max_len * fill): tokens per example from the stratified
+        # per-row estimates (capped at max_len, as the packer cuts), fill from the packer
+        tokens_per_example = sum(p * s.tokens_per_row / max(s.examples_per_row, 1e-9) for s, p in live)
+        sequences = examples * tokens_per_example / (max_len * packing_fill(sources, probs, max_len, seed))
+        error = math.sqrt(sum((p * s.tokens_error / max(s.tokens_per_row, 1e-9)) ** 2 for s, p in live))
+    else:
+        sequences = examples
+        error = math.sqrt(sum((p * s.examples_error / max(s.examples_per_row, 1e-9)) ** 2 for s, p in live))
     return StepEstimate(
         micro_batches_per_epoch=int(sequences // batch_size),
         examples_per_epoch=examples,
         sequences_per_epoch=sequences,
-        relative_error=math.sqrt(length_error**2 + rate_error**2),
+        relative_error=error,
         sources=sources,
     )
 
 
 def measure_source(
-    name: str, rows: int | None, weight: float, sample: list[dict], uniform: bool, make_stage
+    name: str,
+    rows: int | None,
+    weight: float,
+    sample: Sample,
+    population: Census | None,
+    make_stage,
+    per_row: list[list[int]] | None = None,
 ) -> SourceEstimate:
     """Run the sampled rows through the source's per-row pipeline (make_stage(dataset) -> the
-    ChatDataset/PretrainDataset for it) and measure what they yield."""
-    from datasets import Dataset
-
-    if not sample:
-        return SourceEstimate(name, rows, weight, 0.0, [], uniform)
-    stage = make_stage(Dataset.from_list(sample))
-    lengths = [int(ex["input_ids"].numel()) for ex in stage]
-    return SourceEstimate(name, rows, weight, len(lengths) / len(sample), lengths, uniform)
+    ChatDataset/PretrainDataset for it) and estimate what a row of the population yields
+    (post-stratified on row size). `per_row`: the measured rows of earlier rounds, extended
+    in place."""
+    if not sample.rows:
+        return SourceEstimate(name, rows, weight, 0.0, [], sample.uniform)
+    stage = make_stage([])  # its per-row step (_process) is what its iteration applies to each row
+    per_row = per_row if per_row is not None else []
+    for row in sample.rows[len(per_row) :]:  # rows of earlier rounds are measured already
+        out = stage._process(row)
+        per_row.append([] if out is None else [int(out["input_ids"].numel())])
+    examples, examples_error = stratified_mean(sample, [len(r) for r in per_row], population)
+    tokens, tokens_error = stratified_mean(sample, [sum(r) for r in per_row], population)
+    lengths = [n for r in per_row for n in r]
+    return SourceEstimate(
+        name,
+        rows,
+        weight,
+        examples,
+        lengths,
+        sample.uniform,
+        per_row,
+        sample,
+        population,
+        examples_error,
+        tokens,
+        tokens_error,
+    )
 
 
 def sample_size() -> int:
     return int(os.environ.get("PALINGENESIS_SIZE_SAMPLE", SAMPLE_ROWS))
+
+
+def target_error() -> float:
+    """Relative standard error sequential sampling stops at (PALINGENESIS_SIZE_PRECISION)."""
+    return float(os.environ.get("PALINGENESIS_SIZE_PRECISION", 0.005))
+
+
+def sequential(draw, evaluate, rounds: int = 8, population: int | None = None):
+    """Sample until the estimate is precise enough: draw(round) -> a Sample, evaluate(sample)
+    -> (estimate, relative standard error). Stops at target_error(), after `rounds` rounds,
+    or once the pooled sample reaches a quarter of the `population` (two rounds at least):
+    past that, sampling costs about what the exact count would. Returns the pooled sample
+    and its evaluation."""
+    sample = draw(0)
+    result = evaluate(sample)
+    limit = max(2 * len(sample.rows), population // 4) if population else None
+    for r in range(1, rounds):
+        if not sample.rows or sample.exhaustive or not sample.uniform or result[1] <= target_error():
+            break
+        if limit is not None and len(sample.rows) >= limit:
+            break
+        sample.extend(draw(r))
+        result = evaluate(sample)
+    return sample, result

@@ -1749,17 +1749,31 @@ def estimate_run(
     sources = []
     for i, (name, dataset_id, split, src, weight, loaded) in enumerate(entries):
         rows = data_size.count_rows(dataset_id, split, loaded)
-        sample, uniform = data_size.sample_rows(dataset_id, split, k, config.seed + i, loaded)
-        sources.append(
-            data_size.measure_source(
+        population = data_size.census(dataset_id, split, loaded)
+        per_row: list[list[int]] = []
+
+        def draw(r, dataset_id=dataset_id, split=split, i=i, loaded=loaded):
+            return data_size.sample_rows(dataset_id, split, k, config.seed + i + 7919 * r, loaded)
+
+        def evaluate(sample, name=name, rows=rows, weight=weight, population=population, src=src, per_row=per_row):
+            est = data_size.measure_source(
                 name,
                 rows,
                 weight,
                 sample,
-                uniform,
-                lambda raw, src=src: source_stage(raw, tokenizer, config, src, 0, 1),
+                population,
+                lambda raw: source_stage(raw, tokenizer, config, src, 0, 1),
+                per_row,
             )
-        )
+            if est.examples_per_row == 0:  # nothing to measure (reported below): no more rounds
+                return est, 0.0
+            if config.packing:  # packed sequences follow the tokens a row yields
+                return est, est.tokens_error / max(est.tokens_per_row, 1e-9)
+            return est, est.examples_error / max(est.examples_per_row, 1e-9)
+
+        # rounds of rows until this source's yield is known to data_size.target_error()
+        _, (estimate, _) = data_size.sequential(draw, evaluate, population=rows)
+        sources.append(estimate)
     for source in sources:
         if source.examples_per_row == 0 and source.rows:
             logger.warning(
@@ -1780,14 +1794,14 @@ def estimate_run(
         if config.mix_epoch == "total" and target_rows is not None and w < 1:
             epoch_examples = target_rows / world_size / (1.0 - w)
         replay_src = {"mode": "pretrain", "text_field": "text"}
-        sample, uniform = data_size.sample_rows(config.pretrain_replay_dataset, "train", k, config.seed + 97)
+        sample = data_size.sample_rows(config.pretrain_replay_dataset, "train", k, config.seed + 97)
         sources.append(
             data_size.measure_source(
                 f"replay:{config.pretrain_replay_dataset}",
                 data_size.count_rows(config.pretrain_replay_dataset, "train"),
                 w,
                 sample,
-                uniform,
+                data_size.census(config.pretrain_replay_dataset, "train"),
                 lambda raw: source_stage(raw, tokenizer, config, replay_src, 0, 1),
             )
         )

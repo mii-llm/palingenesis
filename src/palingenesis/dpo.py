@@ -71,7 +71,6 @@ where delta = (policy - reference) log-ratio of chosen minus that of rejected.
 
 import json
 import logging
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -290,10 +289,14 @@ def build_preference_dataloader(
 
 
 def estimate_preferences(dataset_id, dataset, tokenizer, data_config, dpo_config, world_size: int, batch_size: int):
-    """Per-rank micro-batches per epoch of a preference run without a pass over the data:
-    rows from metadata, and the share of pairs kept (usable, within max_seq_length, not
-    identical) measured on a uniform sample of rows through the real pair processing.
-    A micro-batch is `batch_size` pairs; nothing is packed or mixed."""
+    """Per-rank micro-batches per epoch of a preference run without a pass over the data.
+    A micro-batch is `batch_size` pairs (nothing is packed or mixed), so the run is its row
+    count times the share of pairs kept (usable, within max_seq_length, not identical). That
+    share is measured on a sample of rows through the real pair processing, post-stratified
+    on row size (data_size): pairs are dropped mostly for their length, which the census of
+    every row's size predicts, so only the rows near the length limit and drops that length
+    does not explain (identical pairs) add sampling error; rows are sampled in rounds until
+    that error reaches data_size.target_error()."""
     from palingenesis import data_size
 
     k = data_size.sample_size()
@@ -302,7 +305,7 @@ def estimate_preferences(dataset_id, dataset, tokenizer, data_config, dpo_config
     rows = data_size.count_rows(dataset_id, split, loaded)
     if rows is None:
         raise ValueError(f"the number of rows of {dataset_id} is unknown")
-    sample, uniform = data_size.sample_rows(dataset_id, split, k, data_config.seed, loaded)
+    population = data_size.census(dataset_id, split, loaded)
     pairs = PreferenceDataset(
         [],
         tokenizer,
@@ -315,12 +318,24 @@ def estimate_preferences(dataset_id, dataset, tokenizer, data_config, dpo_config
         truncate_rejected=dpo_config.truncate_rejected,
         tools_field=getattr(data_config, "tools_field", "tools"),
     )
-    kept = sum(pairs.process(row) is not None for row in sample)
-    rate = kept / max(1, len(sample))
+    kept: list[float] = []
+
+    def draw(r):
+        return data_size.sample_rows(dataset_id, split, k, data_config.seed + 7919 * r, loaded)
+
+    def evaluate(sample):  # pairs processed once each, as rounds are pooled
+        kept.extend(float(pairs.process(row) is not None) for row in sample.rows[len(kept) :])
+        rate, error = data_size.stratified_mean(sample, kept, population)
+        return rate, error / max(rate, 1e-9)
+
+    # more rounds of rows until the kept share is known to data_size.target_error()
+    sample, (rate, relative) = data_size.sequential(draw, evaluate, population=rows)
+    error = relative * rate
     per_rank = rows * rate / world_size
-    source = data_size.SourceEstimate(f"{dataset_id} (preference pairs)", rows, 1.0, rate, [], uniform)
-    error = math.sqrt(rate * (1 - rate) / max(1, len(sample))) / max(rate, 1e-9)
-    return data_size.StepEstimate(int(per_rank // batch_size), per_rank, per_rank, error, [source])
+    source = data_size.SourceEstimate(
+        f"{dataset_id} (preference pairs)", rows, 1.0, rate, [], sample.uniform, [], sample, population, error
+    )
+    return data_size.StepEstimate(int(per_rank // batch_size), per_rank, per_rank, error / max(rate, 1e-9), [source])
 
 
 def disable_dropout(model: nn.Module) -> int:
