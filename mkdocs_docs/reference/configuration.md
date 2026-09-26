@@ -26,6 +26,7 @@
 | `dataset` | str | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset name, local `.jsonl`/`.json`/`.parquet` file, or a prepared-output directory from `pgs prepare`. |
 | `dataset_split` | str | `train_sft` | Dataset split to use. |
 | `streaming` | bool | `true` | Stream the data instead of loading it (Arrow, memory-mapped). Local JSONL and parquet files stream as many shards read in parallel by ranks and workers; the run is still sized from the files' metadata. |
+| `mix_epoch` | str | `"total"` | What an epoch of `sources` is: `total` = as many examples as the sources hold together, drawn by weight (a source without a weight gets its share of the rows; sources above their share repeat, those below contribute a fresh random subset each epoch); `first_exhausted` = until a source runs out. |
 | `max_seq_length` | int | `8192` | Maximum sequence length. Longer = more memory. Packing fills to this length. |
 | `messages_field` | str | `messages` | JSON field containing chat messages. Also tries: `conversations`, `chat`, `dialogue`, `turns`. |
 | `num_workers` | int | `4` | DataLoader worker processes. Increase if data loading is the bottleneck. |

@@ -110,32 +110,58 @@ def test_estimate_of_a_weighted_mixture(tmp_path, monkeypatch):
 
 
 @needs_tok
-def test_each_epoch_has_a_new_order_and_mixtures_draw_afresh(tmp_path):
+def test_each_epoch_has_a_new_order_and_a_mixture_epoch_is_the_rows_together(tmp_path):
     from palingenesis.config import DataConfig
     from palingenesis.data import build_dataset
 
     small = _write_jsonl(tmp_path / "small.jsonl", _rows(200, seed=1, tag="small"))
     large = _write_jsonl(tmp_path / "large.jsonl", _rows(2000, seed=2, tag="large"))
-    config = DataConfig(
-        sources=[{"dataset": str(small), "weight": 0.5}, {"dataset": str(large), "weight": 0.5}],
-        max_seq_length=256,
-        packing=False,
-        length_group_buffer=0,
-    )
-    ds = build_dataset(config, TOK, config, 0, 1, 1)
+
+    def config(**kw):
+        return DataConfig(
+            sources=[{"dataset": str(small), "weight": 0.5}, {"dataset": str(large), "weight": 0.5}],
+            max_seq_length=4096,
+            packing=False,
+            length_group_buffer=0,
+            **kw,
+        )
+
+    cfg = config()
+    ds = build_dataset(cfg, TOK, cfg, 0, 1, 1)
 
     def epoch(e):
         ds.set_epoch(e)
         return [TOK.decode(x["input_ids"]) for x in ds]
 
     first, again, second = epoch(0), epoch(0), epoch(1)
-    assert first == again  # an epoch's order is reproducible
-    assert first != second  # and changes between epochs
+    assert first == again and first != second  # reproducible, and a new order every epoch
+    assert len(first) == 2200  # as many examples as the sources hold together
+    small_draws = [t for t in first if "small" in t]
+    assert 900 < len(small_draws) < 1300 and len(set(small_draws)) == 200  # upsampled: every row, ~5.5 passes
     large_first = {t for t in first if "large" in t}
     large_second = {t for t in second if "large" in t}
-    # the large source contributes ~200 rows per epoch: a fresh random draw each epoch, not
-    # its same first rows
-    assert len(large_first & large_second) < 0.5 * len(large_first)
+    assert 900 < len(large_first) < 1300  # subsampled: about half its rows...
+    assert len(large_first & large_second) < 0.7 * len(large_first)  # ...a fresh random half each epoch
+
+    # the former rule, on request: the epoch ends when a source runs out
+    old = config(mix_epoch="first_exhausted")
+    legacy = build_dataset(old, TOK, old, 0, 1, 1)
+    assert 300 < sum(1 for _ in legacy) < 500
+
+
+@needs_tok
+def test_unweighted_sources_are_one_shuffled_concatenation(tmp_path):
+    from palingenesis.config import DataConfig
+    from palingenesis.data import build_dataset
+
+    a = _write_jsonl(tmp_path / "a.jsonl", _rows(150, seed=1, tag="alpha"))
+    b = _write_jsonl(tmp_path / "b.jsonl", _rows(600, seed=2, tag="beta"))
+    cfg = DataConfig(
+        sources=[{"dataset": str(a)}, {"dataset": str(b)}], max_seq_length=4096, packing=False, length_group_buffer=0
+    )
+    texts = [TOK.decode(x["input_ids"]) for x in build_dataset(cfg, TOK, cfg, 0, 1, 1)]
+    assert len(texts) == 750
+    assert 110 < sum("alpha" in t for t in texts) < 190  # its natural share, 20%
 
 
 def test_lockstep_single_rank_passes_everything():
@@ -188,3 +214,26 @@ def test_lockstep_ends_the_epoch_on_every_rank_together():
     for p in procs:
         p.join(timeout=30)
     assert results == {0: [0, 1, 2], 1: [0, 1, 2]}
+
+
+@needs_tok
+def test_preference_runs_are_sized_without_a_pass(tmp_path, monkeypatch):
+    from palingenesis.config import DataConfig, DPOConfig
+    from palingenesis.dpo import build_preference_dataloader, estimate_preferences
+
+    monkeypatch.setenv("PALINGENESIS_SIZE_SAMPLE", "800")
+    rng = random.Random(4)
+    rows = []
+    for i in range(2400):
+        answer = " ".join("w" for _ in range(int(rng.lognormvariate(3.5, 1.0))))
+        worse = answer if i % 10 == 0 else answer + " no"  # 10% identical pairs: dropped
+        rows.append({"prompt": f"q{i}", "chosen": answer, "rejected": worse})
+    path = _write_jsonl(tmp_path / "pairs.jsonl", rows)
+    data = DataConfig(dataset=str(path), max_seq_length=192, num_workers=0)
+    dpo = DPOConfig(enabled=True)
+    est = estimate_preferences(str(path), None, TOK, data, dpo, 1, 4)
+    from datasets import load_dataset
+
+    loaded = load_dataset("json", data_files=str(path), split="train")
+    exact = sum(1 for _ in build_preference_dataloader(loaded, TOK, data, dpo, 0, 1, 4))
+    assert abs(est.micro_batches_per_epoch - exact) / exact < 0.06, (est.micro_batches_per_epoch, exact)

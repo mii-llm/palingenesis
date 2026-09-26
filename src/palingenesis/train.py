@@ -432,7 +432,7 @@ def train(config: Config):
         logger.info(f"  Multi-source mode: {len(config.data.sources)} datasets")
         for src in config.data.sources:
             logger.info(
-                f"    {src.get('dataset', '?')} (weight={src.get('weight', 1.0)}, mode={src.get('mode', 'sft')})"
+                f"    {src.get('dataset', '?')} (weight={src.get('weight', 'its share of the rows')}, mode={src.get('mode', 'sft')})"
             )
 
         def _make_dataloader():
@@ -499,6 +499,11 @@ def train(config: Config):
                     shuffle_seed=config.train.seed,
                     shuffle=shuffle_rows,
                 )
+
+            def _estimate():
+                from palingenesis.dpo import estimate_preferences
+
+                return estimate_preferences(dataset_id, dataset, tokenizer, config.data, dpo, world_size, bs)
         else:
 
             def _make_dataloader():

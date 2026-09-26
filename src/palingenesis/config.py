@@ -48,6 +48,12 @@ class DataConfig:
     # Multi-dataset mode: list of source dicts
     # Each: {dataset, split, weight, mode("sft"|"pretrain"), messages_field|text_field}
     sources: list = field(default_factory=list)
+    # What an epoch of data.sources is. "total": as many examples as the sources hold together,
+    # drawn by weight (a source weighted above its share of the rows is repeated, one below
+    # it contributes a fresh random subset each epoch); a source without a weight gets its
+    # share of the rows, so unweighted sources behave like one shuffled concatenation.
+    # "first_exhausted": the epoch ends when a source runs out (sizes unknown fall back to it).
+    mix_epoch: str = "total"
     # ECHO-style observation loss: include tool/environment outputs in training
     # Paper: "Terminal Agents Learn World Models for Free" (ICML 2026, arxiv:2605.24517)
     # When true, tool/observation role tokens get loss (not just assistant)
@@ -487,6 +493,8 @@ class Config:
                 f"train.lr_scheduler={self.train.lr_scheduler!r} is not one of cosine, linear, "
                 "constant, power_decay, wsd."
             )
+        if self.data.mix_epoch not in ("total", "first_exhausted"):
+            errors.append(f"data.mix_epoch must be total or first_exhausted, got {self.data.mix_epoch!r}.")
         strategies = ("optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random")
         if self.preprocess.strategy not in strategies:
             errors.append(f"preprocess.strategy={self.preprocess.strategy!r} is not one of {', '.join(strategies)}.")

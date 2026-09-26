@@ -179,9 +179,10 @@ pgs prepare-multi --model Qwen/Qwen3.5-4B --sources sources.yaml --output prepar
 
 How the mix behaves in training (`data.sources`):
 
-- `weight` is a **per-conversation** sampling probability, not a token share: a source of long conversations contributes more tokens than its weight suggests.
-- An epoch ends when the **first** non-empty source runs out, so a small source with a large weight shortens the epoch for all the others.
-- Every epoch draws each source in a **new random order** (`seed + epoch`), so a large source mixed with a small one contributes a fresh random share of its rows each epoch, not the same first rows again. The run's log gives each source's row count and the epoch length at startup.
+- **An epoch is as many examples as the sources hold together**, drawn by weight (`data.mix_epoch: total`). `weight` is a relative **per-conversation** sampling probability, not a token share: a source of long conversations contributes more tokens than its weight suggests.
+- **A source without a weight gets its share of the rows**, so a mix without weights is one shuffled concatenation of its sources, one pass per epoch. A source weighted above its share is repeated (a new order every pass); one weighted below it contributes a fresh random subset every epoch.
+- The log gives every source's share, rows and passes per epoch at startup, e.g. `mix math: 50.0% of examples, 20,000 rows, 2.50 passes/epoch (upsampled)`.
+- `data.mix_epoch: first_exhausted` ends the epoch when a source runs out instead (the former rule; also what happens when a source's size cannot be read from its metadata). Replay (`pretrain_replay_dataset`) adds its share on top of one pass over the target data.
 
 !!! warning "`data.msft_tracking` has no effect yet"
     `msft.AdaptiveSourceTracker` (per-source weight decay when a source's validation loss rises, after mSFT, arXiv:2603.21606) exists but is not wired into the training loop. Setting `msft_tracking: true` logs a warning and the weights stay fixed. Watch per-source losses with `eval_sources` instead.
@@ -243,7 +244,7 @@ data:
 
 ## Run length and streaming
 
-Training starts at once, streaming included: the LR schedule's horizon (the number of optimizer steps of an epoch-based run) is **estimated**, not counted by a pass over the data. Rows come from metadata (a parquet footer, a JSONL's newlines, an in-memory dataset's length, a Hub dataset's published split sizes), and a uniform random sample of 2,000 rows goes through the real pipeline (rendering, filters, packing, the mixture's weights) to measure how many micro-batches a row yields. On 60,000 conversations this took 2 s against 27 s for a full scan, 0.8% off; the log reports the estimate, its sampling error, and at the end of each epoch how many micro-batches it actually had. If the data outlasts the estimate the LR stays at its floor; if it ends a little sooner the decay stops a little early. `train.exact_steps: true` scans the whole pipeline instead; `train.max_steps` skips both.
+Training starts at once, streaming included: the LR schedule's horizon (the number of optimizer steps of an epoch-based run) is **estimated**, not counted by a pass over the data. Rows come from metadata (a parquet footer, a JSONL's newlines, an in-memory dataset's length, a Hub dataset's published split sizes), and a uniform random sample of 2,000 rows goes through the real pipeline (rendering, filters, packing, the mixture's weights) to measure how many micro-batches a row yields. On 60,000 conversations this took 2 s against 27 s for a full scan, 0.8% off; the log reports the estimate, its sampling error, and at the end of each epoch how many micro-batches it actually had. If the data outlasts the estimate the LR stays at its floor; if it ends a little sooner the decay stops a little early. `train.exact_steps: true` scans the whole pipeline instead; `train.max_steps` skips both. Preference (DPO) runs are sized the same way: their row count times the share of pairs the sample keeps (usable, within `max_seq_length`, not identical).
 
 `data.streaming: true` reads local JSONL and parquet files as many shards (byte ranges, row groups) that ranks and DataLoader workers read in parallel: without that, `datasets` streams a single file through one worker while the others stop, and every rank reads the whole file. Write parquet with several row groups (`pyarrow` `row_group_size`) so it can be split. A Hub dataset without published split sizes cannot be sized from metadata: set `train.max_steps`.
 

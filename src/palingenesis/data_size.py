@@ -265,12 +265,17 @@ class StepEstimate:
         return "; ".join(parts)
 
 
-def mixture_epoch(sources: list[SourceEstimate], world_size: int) -> tuple[float, list[float]]:
-    """(examples per rank per epoch, mixture probabilities). An epoch ends when the first
-    source with a known size runs out: source i lasts rows_i * examples_per_row_i / p_i
+def mixture_epoch(
+    sources: list[SourceEstimate], world_size: int, epoch_examples: float | None = None
+) -> tuple[float, list[float]]:
+    """(examples per rank per epoch, mixture probabilities). `epoch_examples` given (the
+    MixedDataset draws of data.mix_epoch "total"): that. Otherwise the epoch ends when the
+    first source with a known size runs out: source i lasts rows_i * examples_per_row_i / p_i
     draws."""
     total = sum(s.weight for s in sources if s.examples_per_row > 0)
     probs = [(s.weight / total if s.examples_per_row > 0 else 0.0) for s in sources]
+    if epoch_examples is not None:
+        return epoch_examples, probs
     lasts = [
         s.rows * s.examples_per_row / world_size / p for s, p in zip(sources, probs) if p > 0 and s.rows is not None
     ]
@@ -306,8 +311,9 @@ def estimate_steps(
     packing: bool,
     max_len: int,
     seed: int = 0,
+    epoch_examples: float | None = None,
 ) -> StepEstimate:
-    examples, probs = mixture_epoch(sources, world_size)
+    examples, probs = mixture_epoch(sources, world_size, epoch_examples)
     sequences = examples * (packed_per_example(sources, probs, max_len, seed) if packing else 1.0)
     # sampling error of the mixture's mean example length
     variances = []

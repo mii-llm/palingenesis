@@ -71,6 +71,7 @@ where delta = (policy - reference) log-ratio of chosen minus that of rejected.
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -286,6 +287,40 @@ def build_preference_dataloader(
         drop_last=True,
         prefetch_factor=2 if num_workers > 0 else None,
     )
+
+
+def estimate_preferences(dataset_id, dataset, tokenizer, data_config, dpo_config, world_size: int, batch_size: int):
+    """Per-rank micro-batches per epoch of a preference run without a pass over the data:
+    rows from metadata, and the share of pairs kept (usable, within max_seq_length, not
+    identical) measured on a uniform sample of rows through the real pair processing.
+    A micro-batch is `batch_size` pairs; nothing is packed or mixed."""
+    from palingenesis import data_size
+
+    k = data_size.sample_size()
+    loaded = dataset if dataset is not None and not data_size._is_streaming_obj(dataset) else None
+    split = getattr(data_config, "dataset_split", "train")
+    rows = data_size.count_rows(dataset_id, split, loaded)
+    if rows is None:
+        raise ValueError(f"the number of rows of {dataset_id} is unknown")
+    sample, uniform = data_size.sample_rows(dataset_id, split, k, data_config.seed, loaded)
+    pairs = PreferenceDataset(
+        [],
+        tokenizer,
+        data_config.max_seq_length,
+        prompt_field=dpo_config.prompt_field,
+        chosen_field=dpo_config.chosen_field,
+        rejected_field=dpo_config.rejected_field,
+        last_turn_only=data_config.last_turn_only,
+        train_on_reasoning=data_config.train_on_reasoning,
+        truncate_rejected=dpo_config.truncate_rejected,
+        tools_field=getattr(data_config, "tools_field", "tools"),
+    )
+    kept = sum(pairs.process(row) is not None for row in sample)
+    rate = kept / max(1, len(sample))
+    per_rank = rows * rate / world_size
+    source = data_size.SourceEstimate(f"{dataset_id} (preference pairs)", rows, 1.0, rate, [], uniform)
+    error = math.sqrt(rate * (1 - rate) / max(1, len(sample))) / max(rate, 1e-9)
+    return data_size.StepEstimate(int(per_rank // batch_size), per_rank, per_rank, error, [source])
 
 
 def disable_dropout(model: nn.Module) -> int:

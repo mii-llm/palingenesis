@@ -37,6 +37,7 @@ import bisect
 import functools
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -1330,14 +1331,17 @@ class PretrainDataset(_Epochs, IterableDataset):
 
 
 class MixedDataset(_Epochs, IterableDataset):
-    """Weighted interleaving of multiple datasets.
+    """Weighted interleaving of multiple datasets: each example comes from source i with
+    probability proportional to its weight.
 
-    Samples from each source with probability proportional to its weight. An epoch ends
-    when a source is exhausted; every source is drawn in a new random order each epoch, so a
-    large source mixed with a small one is sampled afresh every epoch (not its same first
-    rows).
+    An epoch is `epoch_draws` examples per rank (split across DataLoader workers): as many as
+    the sources hold together (data.mix_epoch "total"). A source that runs out before the
+    epoch ends starts a new pass in a new order (weighted above its share: upsampled); one
+    weighted below its share contributes a fresh random subset every epoch. epoch_draws None
+    (data.mix_epoch "first_exhausted", or sizes unknown): the epoch ends when a source runs out.
 
-    Each source can be either SFT (chat masking) or pretrain (all-token loss).
+    A source that yields nothing at all is a misconfiguration and is dropped with a warning.
+    Each source can be SFT (chat masking) or pretraining text (all-token loss).
     """
 
     def __init__(
@@ -1346,6 +1350,7 @@ class MixedDataset(_Epochs, IterableDataset):
         weights: list[float],
         seed: int = 42,
         names: list[str] | None = None,
+        epoch_draws: int | None = None,
     ):
         assert len(sources) == len(weights)
         assert all(w >= 0 for w in weights)
@@ -1354,37 +1359,58 @@ class MixedDataset(_Epochs, IterableDataset):
         self.probs = [w / total for w in weights]
         self.seed = seed
         self.names = names or [f"source[{i}]" for i in range(len(sources))]
+        self.epoch_draws = epoch_draws
+
+    def _restart(self, i: int, passes: int):
+        """Source i's next pass, in its own order (a seed no epoch uses)."""
+        stage = self.sources[i]
+        if isinstance(stage, _Epochs):
+            stage.set_epoch(self.epoch + 1_000_003 * passes)
+        return iter(stage)
 
     def __iter__(self):
         rng = random.Random(self.seed + self.epoch)
         iterators = [iter(s) for s in self.sources]
-        indices = list(range(len(self.sources)))
-        active = list(indices)
-        yielded = [0] * len(self.sources)
-
-        while active:
-            # When every source is still active this is identical to sampling over
-            # `indices` with `self.probs` (determinism preserved for the healthy case).
-            probs = [self.probs[i] for i in active]
-            idx = rng.choices(active, weights=probs, k=1)[0]
-            try:
-                item = next(iterators[idx])
-                yielded[idx] += 1
-                yield item
-            except StopIteration:
-                if yielded[idx] == 0:
-                    # A source that produced NOTHING is a misconfiguration (wrong
-                    # field/format/split, empty file), not an epoch boundary. Drop
-                    # it loudly and keep training on the rest instead of silently
-                    # ending the epoch (which, with packing, yields 0 steps).
-                    logger.warning(
-                        "Data source '%s' yielded 0 usable examples — dropping it from the "
-                        "mix. Check its messages/text field, format and split.",
-                        self.names[idx],
-                    )
-                    active.remove(idx)
+        active = list(range(len(self.sources)))
+        yielded = [0] * len(self.sources)  # in the current pass
+        passes = [0] * len(self.sources)
+        if self.epoch_draws is None:
+            draws = None
+        else:
+            info = torch.utils.data.get_worker_info()
+            workers, wid = (info.num_workers, info.id) if info is not None else (1, 0)
+            draws = self.epoch_draws // workers + (wid < self.epoch_draws % workers)
+        try:
+            while active and (draws is None or draws > 0):
+                idx = rng.choices(active, weights=[self.probs[i] for i in active], k=1)[0]
+                try:
+                    item = next(iterators[idx])
+                except StopIteration:
+                    if yielded[idx] == 0:
+                        # A source that produced NOTHING is a misconfiguration (wrong
+                        # field/format/split, empty file), not an epoch boundary. Drop it
+                        # loudly and keep training on the rest.
+                        logger.warning(
+                            "Data source '%s' yielded 0 usable examples — dropping it from the "
+                            "mix. Check its messages/text field, format and split.",
+                            self.names[idx],
+                        )
+                        active.remove(idx)
+                        continue
+                    if draws is None:
+                        break  # first_exhausted: a non-empty source ran out → epoch boundary
+                    passes[idx] += 1
+                    yielded[idx] = 0
+                    iterators[idx] = self._restart(idx, passes[idx])
                     continue
-                break  # A non-empty source exhausted → epoch boundary.
+                yielded[idx] += 1
+                if draws is not None:
+                    draws -= 1
+                yield item
+        finally:
+            for i, stage in enumerate(self.sources):  # the next epoch starts from set_epoch's order
+                if passes[i] and isinstance(stage, _Epochs):
+                    stage.set_epoch(self.epoch)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1585,6 +1611,49 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
 collate_fn = _collate_fn
 
 
+def mixture_plan(config: DataConfig, world_size: int, dataset=None) -> tuple[list[float], list, int | None]:
+    """(weights, rows per source, examples per rank per epoch or None) of data.sources, or
+    of the single dataset when there are none (one weight 1.0).
+
+    A source without a weight gets its share of all rows; explicit weights are relative on
+    the same scale. The epoch (data.mix_epoch "total") is as many examples as the sources
+    hold together; None when that is first_exhausted, or a size is unknown."""
+    from palingenesis import data_size
+
+    if not config.sources:
+        rows = [data_size.count_rows(str(config.dataset), config.dataset_split, dataset)]
+        return [1.0], rows, None
+    rows = [data_size.count_rows(src["dataset"], src.get("split", "train")) for src in config.sources]
+    known = sum(r for r in rows if r)
+    weights = []
+    for src, n in zip(config.sources, rows):
+        if src.get("weight") is not None:
+            weights.append(float(src["weight"]))
+        elif n is None:
+            raise ValueError(f"data source {src['dataset']} has no weight and its size is unknown: give it a weight")
+        else:
+            weights.append(n / known)
+    if config.mix_epoch == "first_exhausted" or any(n is None for n in rows):
+        return weights, rows, None
+    return weights, rows, math.ceil(sum(rows) / world_size)
+
+
+def _log_mixture(names: list[str], weights: list[float], rows: list, draws: int | None, world_size: int) -> None:
+    total = sum(weights)
+    for name, w, n in zip(names, weights, rows):
+        share = w / total
+        if draws is not None and n:
+            passes = share * draws * world_size / n
+            note = "upsampled" if passes > 1.05 else "subsampled" if passes < 0.95 else "one pass"
+            logger.info(f"  mix {name}: {share:.1%} of examples, {n:,} rows, {passes:.2f} passes/epoch ({note})")
+        else:
+            logger.info(f"  mix {name}: {share:.1%} of examples, {n if n is not None else 'unknown'} rows")
+    if draws is None:
+        logger.info("  mix epoch: ends when a source runs out (data.mix_epoch first_exhausted, or sizes unknown)")
+    else:
+        logger.info(f"  mix epoch: {draws * world_size:,} examples (the sources' rows together)")
+
+
 def source_name(src: dict, index: int) -> str:
     return str(src.get("name", src.get("dataset", f"source[{index}]")))
 
@@ -1669,13 +1738,12 @@ def estimate_run(
 
     k = data_size.sample_size()
     entries: list[tuple[str, str, str, dict | None, float, object]] = []  # name, id, split, src, weight, loaded
+    loaded = dataset if dataset is not None and not data_size._is_streaming_obj(dataset) else None
+    weights, _, draws = mixture_plan(config, world_size, loaded)
     if config.sources:
-        for i, src in enumerate(config.sources):
-            entries.append(
-                (source_name(src, i), src["dataset"], src.get("split", "train"), src, src.get("weight", 1.0), None)
-            )
+        for i, (src, weight) in enumerate(zip(config.sources, weights)):
+            entries.append((source_name(src, i), src["dataset"], src.get("split", "train"), src, weight, None))
     else:
-        loaded = dataset if dataset is not None and not data_size._is_streaming_obj(dataset) else None
         dataset_id = str(dataset_id or config.dataset)
         entries.append((dataset_id, dataset_id, config.dataset_split, None, 1.0, loaded))
     sources = []
@@ -1692,11 +1760,25 @@ def estimate_run(
                 lambda raw, src=src: source_stage(raw, tokenizer, config, src, 0, 1),
             )
         )
+    for source in sources:
+        if source.examples_per_row == 0 and source.rows:
+            logger.warning(
+                "Data source %s: none of %d sampled rows gives a training example. Check its "
+                "messages_field / text_field, format and split; it will be dropped from the mix.",
+                source.name,
+                min(k, source.rows),
+            )
+    epoch_examples = draws if config.sources else None  # None: one source, sized by its own rows
     if config.pretrain_replay_dataset:
-        # replay mixes (1 - w) of the target with w of replay text; its size bounds the epoch only if known
+        # replay mixes (1 - w) of the target with w of replay text: an epoch is one pass over
+        # the target plus the replay drawn alongside (data.mix_epoch "total")
         w = config.pretrain_replay_weight
-        for s in sources:
-            s.weight *= (1.0 - w) / sum(t.weight for t in sources)
+        target = sum(t.weight for t in sources)
+        for t in sources:
+            t.weight *= (1.0 - w) / target
+        target_rows = _target_rows(config, loaded)
+        if config.mix_epoch == "total" and target_rows is not None and w < 1:
+            epoch_examples = target_rows / world_size / (1.0 - w)
         replay_src = {"mode": "pretrain", "text_field": "text"}
         sample, uniform = data_size.sample_rows(config.pretrain_replay_dataset, "train", k, config.seed + 97)
         sources.append(
@@ -1710,8 +1792,25 @@ def estimate_run(
             )
         )
     return data_size.estimate_steps(
-        sources, world_size, batch_size, config.packing, config.max_seq_length, seed=config.seed
+        sources,
+        world_size,
+        batch_size,
+        config.packing,
+        config.max_seq_length,
+        seed=config.seed,
+        epoch_examples=epoch_examples,
     )
+
+
+def _target_rows(config: DataConfig, dataset=None) -> int | None:
+    """Rows of the data replay is mixed into (data.sources together, or the one dataset)."""
+    from palingenesis import data_size
+
+    if config.sources:
+        rows = [data_size.count_rows(src["dataset"], src.get("split", "train")) for src in config.sources]
+        return None if any(n is None for n in rows) else sum(rows)
+    loaded = dataset if dataset is not None and not isinstance(dataset, DataConfig) else None
+    return data_size.count_rows(str(config.dataset), config.dataset_split, loaded)
 
 
 def build_dataset(
@@ -1744,8 +1843,8 @@ def build_dataset(
     if config.sources:
         # Multi-dataset mode: build each source and mix
         source_datasets = []
-        weights = []
         names = []
+        weights, rows, draws = mixture_plan(config, world_size)
         for src in config.sources:
             raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=config.streaming)
             # A new order every epoch, inside the dataset (see _shard_then_shuffle)
@@ -1761,10 +1860,12 @@ def build_dataset(
                     shuffle=not config.streaming,
                 )
             )
-            weights.append(src.get("weight", 1.0))
             names.append(source_name(src, len(names)))
-
-        final_ds: IterableDataset = MixedDataset(source_datasets, weights, seed=config.seed, names=names)
+        if rank == 0:
+            _log_mixture(names, weights, rows, draws, world_size)
+        final_ds: IterableDataset = MixedDataset(
+            source_datasets, weights, seed=config.seed, names=names, epoch_draws=draws
+        )
     elif hasattr(dataset_or_config, "__iter__") and not isinstance(dataset_or_config, DataConfig):
         # Pre-loaded HF dataset object passed directly. The caller decides whether to
         # shuffle: curriculum-ordered prepared data must NOT be.
@@ -1808,13 +1909,19 @@ def build_dataset(
             shuffle_buffer=10_000,
             shuffle_seed=config.seed,
         )
-        # Mix: (1-w) * target_data + w * replay_data
+        # Mix: (1-w) * target_data + w * replay_data. An epoch is one pass over the target
+        # (its rows) plus the replay examples drawn alongside: target rows / (1 - w) draws.
         w = config.pretrain_replay_weight
+        target_rows = _target_rows(config, dataset_or_config)
+        draws = None
+        if config.mix_epoch == "total" and target_rows is not None and w < 1:
+            draws = math.ceil(target_rows / world_size / (1.0 - w))
         final_ds = MixedDataset(
             [final_ds, replay_ds],
             [1.0 - w, w],
             seed=config.seed,
             names=["target_mix", f"replay:{config.pretrain_replay_dataset} (text_field='text')"],
+            epoch_draws=draws,
         )
 
     # Optional packing
