@@ -6,8 +6,12 @@ Streaming engines (the colocated vLLM engine): one engine thread owns the engine
 request is added to the running batch the moment it arrives and resolved the step it
 finishes, so a multi-turn trajectory whose turn ended runs its tools and comes back while
 the rest keep decoding: continuous batching across turns. Requests that arrive together
-with the same prompt and budget (a group's first turn) become one request with n samples,
-so their prompt is prefilled once.
+with the same prompt and budget (a group's first turn) become one request with n samples
+when `merge` (single-turn: a group needs all its answers anyway), so their prompt is
+prefilled once. Multi-turn requests stay separate: vLLM returns an n-sample request when
+its last sample ends, which would hold every trajectory's first tool call until the group's
+longest first turn (measured: 83-token turns waiting 7.9 s); the prefix cache shares the
+prompt instead.
 
 Batch engines (HF generate, a vLLM server): the requests pending at once are gathered into
 one engine.generate call on the engine's thread, as soon as every live trajectory is waiting
@@ -19,6 +23,7 @@ import asyncio
 import itertools
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -38,12 +43,17 @@ def _generation(r) -> Generation:
 
 
 class GenerationClient:
-    def __init__(self, engine: RolloutEngine, window: float = 0.02):
+    def __init__(self, engine: RolloutEngine, window: float = 0.02, merge: bool = True):
         self.engine = engine
+        self.merge = merge
         self.window = window
         self.calls = 0  # engine calls (batch) or requests added (streaming)
         self.active = 0  # live trajectories (each may ask for another turn)
         self.streaming = hasattr(engine, "stream_add")
+        self.timeline: list[tuple[float, int, int]] = []  # per engine step: (time, sequences in flight, finished)
+        # held by the engine thread for each add + step; weight updates take it between steps,
+        # so requests in flight keep their state and continue with the new weights
+        self.engine_lock = threading.Lock()
         if self.streaming:
             self.inbox: queue.Queue = queue.Queue()
             self.ids = itertools.count()
@@ -80,9 +90,8 @@ class GenerationClient:
     # -------------------------------------------------------------- streaming
 
     def _engine_loop(self) -> None:
-        """The engine thread: add what arrived, step, resolve what finished. It touches the
-        engine only while requests are in flight, so weight updates and sleep/wake (between
-        batches, with nothing in flight) never race with it."""
+        """The engine thread: add what arrived, step, resolve what finished. Each add + step
+        holds engine_lock, which weight updates take between steps (see paused())."""
         inflight: dict[str, list[tuple[asyncio.Future, asyncio.AbstractEventLoop]]] = {}
         while True:
             items = []
@@ -97,29 +106,39 @@ class GenerationClient:
                     break
             if any(item is None for item in items):
                 return
-            groups: dict[tuple, list] = {}
-            for prompt, budget, temperature, future, loop in items:
-                groups.setdefault((tuple(prompt), budget, temperature), []).append((future, loop))
-            for (prompt, budget, temperature), waiters in groups.items():
-                request_id = str(next(self.ids))
-                try:
-                    self.engine.stream_add(request_id, list(prompt), budget, temperature, len(waiters))
-                except BaseException as e:  # noqa: BLE001 — the waiting trajectories see the failure
-                    self._resolve(waiters, error=e)
-                    continue
-                inflight[request_id] = waiters
-                self.calls += 1
-            if not inflight:
-                continue
-            try:
-                finished = self.engine.stream_step()
-            except BaseException as e:  # noqa: BLE001 — every trajectory in flight sees the failure
-                for waiters in inflight.values():
-                    self._resolve(waiters, error=e)
-                inflight.clear()
+            with self.engine_lock:
+                finished = self._add_and_step(items, inflight)
+            if finished is None:
                 continue
             for request_id, rollouts in finished:
                 self._resolve(inflight.pop(request_id), rollouts)
+            self.timeline.append((time.monotonic(), sum(len(w) for w in inflight.values()), len(finished)))
+
+    def _add_and_step(self, items, inflight):
+        """Add the arrived requests, then one engine step: its finished requests (None when
+        nothing is in flight)."""
+        groups: dict[tuple, list] = {}
+        for i, (prompt, budget, temperature, future, loop) in enumerate(items):
+            key = (tuple(prompt), budget, temperature) if self.merge else (tuple(prompt), budget, temperature, i)
+            groups.setdefault(key, []).append((future, loop))
+        for (prompt, budget, temperature, *_), waiters in groups.items():
+            request_id = str(next(self.ids))
+            try:
+                self.engine.stream_add(request_id, list(prompt), budget, temperature, len(waiters))
+            except BaseException as e:  # noqa: BLE001 — the waiting trajectories see the failure
+                self._resolve(waiters, error=e)
+                continue
+            inflight[request_id] = waiters
+            self.calls += 1
+        if not inflight:
+            return None
+        try:
+            return self.engine.stream_step()
+        except BaseException as e:  # noqa: BLE001 — every trajectory in flight sees the failure
+            for waiters in inflight.values():
+                self._resolve(waiters, error=e)
+            inflight.clear()
+            return None
 
     @staticmethod
     def _resolve(waiters, rollouts=None, error: BaseException | None = None) -> None:
@@ -135,6 +154,12 @@ class GenerationClient:
                     future.set_result(value)
 
             loop.call_soon_threadsafe(settle)
+
+    def paused(self):
+        """A context in which the engine does not step: load weights while requests are in
+        flight (they continue with the new weights; their tokens keep the log-probs they were
+        sampled with, which is what the importance ratio uses)."""
+        return self.engine_lock
 
     def close(self) -> None:
         if self.streaming and self.thread.is_alive():

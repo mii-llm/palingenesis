@@ -269,6 +269,7 @@ class VLLMColocateRollout:
         self.SamplingParams = vllm.SamplingParams
         self.version = 0  # -1 while asleep: the weights are gone until the next update
         self.asleep = False  # KV cache released
+        self.prompt_tokens = self.cached_tokens = 0  # streaming: prefill accounting
 
     def update_weights(self, named_tensors, version: int) -> None:
         if self.version < 0:
@@ -351,8 +352,13 @@ class VLLMColocateRollout:
         return self.llm.llm_engine.has_unfinished_requests()
 
     def stream_step(self) -> list[tuple[str, list[Rollout]]]:
-        """One engine step: (request id, its n rollouts) for every request that finished."""
-        return [(out.request_id, self._rollouts(out)) for out in self.llm.llm_engine.step() if out.finished]
+        """One engine step: (request id, its n rollouts) for every request that finished.
+        Counts the finished requests' prompt tokens and those served by the prefix cache."""
+        finished = [out for out in self.llm.llm_engine.step() if out.finished]
+        for out in finished:
+            self.prompt_tokens += len(out.prompt_token_ids or ())
+            self.cached_tokens += out.num_cached_tokens or 0
+        return [(out.request_id, self._rollouts(out)) for out in finished]
 
 
 def _die_with_parent() -> None:

@@ -195,6 +195,7 @@ class RLTrainer:
             self.engine = HFRollout(self.model, self.stop_ids, self.pad_id, r.micro_seqs)
         elif r.backend == "vllm":
             extra = {k: v for k, v in (("kv_cache_dtype", r.kv_cache_dtype), ("quantization", r.quantization)) if v}
+            extra.update(r.vllm_args)
             self.engine = VLLMColocateRollout(
                 m.policy,
                 self.stop_ids,

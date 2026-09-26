@@ -324,3 +324,84 @@ def test_allowed_tools_filter_dynamic_environments():
     bad = EnvPool(Remote, allowed=["c__*"])
     with pytest.raises(ValueError, match="match no tool"):
         asyncio.run(bad.episode_schemas(bad.free[0]))
+
+
+class _SlowWhenAsked:
+    """A tool that is slow for rows marked slow: their groups straggle."""
+
+    tools = ("work",)
+
+    def reset(self, slow=False, **row):
+        self.slow, self.done = slow, False
+
+    async def work(self) -> str:
+        """Do the work.
+
+        Returns:
+            Done.
+        """
+        await asyncio.sleep(1.5 if self.slow else 0.0)
+        self.done = True
+        return "done"
+
+    def get_reward(self):
+        import random
+
+        return random.random()  # groups always disagree
+
+
+def test_partial_rollouts_continue_into_the_next_batch():
+    """With max_staleness >= 1 a batch ends when it is full; groups still running continue and
+    join the next batch instead of holding this one."""
+    import time
+
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from tests.test_rl import ScriptedEngine, tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    eot = end_of_turn_id(tok, kwargs)
+    engine = ScriptedEngine(tok, eot, ['<tool_call>\n{"name": "work", "arguments": {}}\n</tool_call>'])
+    config = RLConfig()
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 3,
+        "rollout.group_size": 2,
+        "rollout.max_new_tokens": 32,
+        "rollout.max_model_len": 4096,
+        "rollout.max_staleness": 1,
+    }.items():
+        config.set(key, value)
+    rows = [{"prompt": f"task {i}", "slow": i % 2 == 1} for i in range(8)]
+    pipeline = RLPipeline(
+        tok,
+        ChatFormat(tok, eot, kwargs),
+        engine,
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        PromptSampler(rows, seed=0),
+        [],
+        EnvPool(_SlowWhenAsked),
+        None,
+        (eot,),
+    )
+    pipeline.drop_rate = 0.5  # launch twice the groups a batch needs
+    try:
+        start = time.time()
+        first = pipeline.run(2, 1.0)
+        assert time.time() - start < 1.4, "the batch waited for its slow groups"
+        assert len(first.samples) == 2 and pipeline.continuing  # the slow ones keep running
+        second = pipeline.run(2, 1.0)
+        assert second.stats["groups/continued"] >= 1 and len(second.samples) == 2
+    finally:
+        pipeline.close()
+    assert not pipeline.continuing

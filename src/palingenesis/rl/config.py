@@ -102,6 +102,10 @@ class RLRolloutConfig:
     # the sequence mask absorb the mismatch (watch policy/abs_ratio_dev). Empty = bf16.
     kv_cache_dtype: str = ""
     quantization: str = ""
+    # Extra vllm.LLM arguments for the colocated engine, e.g. {max_num_batched_tokens: 2048}
+    # (smaller prefill chunks: decoding sequences wait less behind new prompts) or
+    # {speculative_config: {method: ngram, num_speculative_tokens: 4, prompt_lookup_max: 4}}.
+    vllm_args: dict = field(default_factory=dict)
     micro_seqs: int = 64  # hf: sequences per generate() call
 
 
@@ -232,6 +236,10 @@ class RLTrainConfig:
 @dataclass(slots=True)
 class RLLoggingConfig:
     log_every: int = 1
+    # Every N steps, write the batch's trajectories (turns, tool calls and outputs, rewards,
+    # per-turn timing; zero-variance groups too) and the engine's concurrency timeline to
+    # <output_dir>/rollouts/step_<n>.jsonl (0 = never).
+    dump_trajectories: int = 0
     use_wandb: bool = False
     project: str = "palingenesis-rl"
     run_name: str = ""

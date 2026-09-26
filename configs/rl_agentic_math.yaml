@@ -55,17 +55,21 @@ rollout:
   backend: vllm
   batch_prompts: 32
   group_size: 8
-  # Budgets far above what a solution needs, so that they cut only runaway generations:
-  # a short GSM8K solution is ~300 tokens per turn, and a trajectory a few turns of it plus
-  # tool outputs.
+  # Budgets from dumped rollouts (logging.dump_trajectories): correct trajectories used a
+  # median of 287 sampled tokens (p99 3,185; at most 7 turns). 3,072 cuts 1% of them and
+  # halves the longest serial chain a batch waits for (a group is done when its slowest
+  # rollout is): 6,144 -> 3,072 took agentic steps from 81-99 s to 46-63 s on an A100.
   max_new_tokens: 2048         # per assistant turn
-  max_completion_tokens: 6144  # sampled tokens of the whole trajectory
+  max_completion_tokens: 3072  # sampled tokens of the whole trajectory
   max_model_len: 8192          # prompt + everything after it (tool outputs included)
   gpu_memory_utilization: 0.3
   max_staleness: 1             # tools and rollouts of step k+1 run while step k trains
 
 loss:
-  overlong_buffer: 1024        # the last 1024 tokens of the budget cost up to 1 reward, linearly
+  overlong_buffer: 512         # the last 512 tokens of the budget cost up to 1 reward, linearly
+
+logging:
+  dump_trajectories: 25        # every 25 steps: runs/rl_agentic_math/rollouts/step_<n>.jsonl
 
 train:
   output_dir: runs/rl_agentic_math

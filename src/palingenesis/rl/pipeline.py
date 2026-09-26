@@ -67,12 +67,17 @@ class RLPipeline:
             sandbox,
         )
         self.stop_ids = set(stop_ids)
-        self.client = GenerationClient(engine)
+        # n-sample merging only helps when a group's rollouts are one turn each
+        self.client = GenerationClient(engine, merge=env_pool is None)
         self.lock = threading.RLock()
         self.group_ids = itertools.count()
         self.carry: list[list[Trajectory]] = []  # surplus informative groups (max_staleness > 0)
+        self.continuing: set[asyncio.Task] = set()  # groups still generating at the last batch's end
         self.drop_rate = 0.0  # expected fraction of zero-variance groups (running, per batch)
         self.reported_errors = 0
+        self.batches = 0  # batches collected (the dump's step numbers)
+        self.rollout_start = 0.0  # loop time the current batch's collection started
+        self.dropped: list[list[Trajectory]] = []  # zero-variance groups of the batch (dumps)
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, name="pgs-rl-rollouts", daemon=True).start()
 
@@ -85,12 +90,25 @@ class RLPipeline:
         """`n_prompts` informative groups sampled with the newest weights (fewer when the refill
         budget runs out). Called by the orchestrator's producer thread."""
         with self.lock:
-            sync = self.weights.sync(self.engine)
+            with self.client.paused():  # between engine steps: groups in flight continue with the new weights
+                sync = self.weights.sync(self.engine)
             self.engine.wake()
             start = time.perf_counter()
+            self.client.timeline.clear()
+            prefill = (getattr(self.engine, "prompt_tokens", 0), getattr(self.engine, "cached_tokens", 0))
+            self.dropped = []
             groups, stats = self._await(self._collect(n_prompts, temperature))
             elapsed = time.perf_counter() - start
             self.engine.sleep()
+        self.batches += 1
+        stats.update(_timeline_stats(self.client.timeline))
+        if hasattr(self.engine, "prompt_tokens"):
+            prompt = self.engine.prompt_tokens - prefill[0]
+            stats["engine/prefill_tokens"] = prompt - (self.engine.cached_tokens - prefill[1])
+            stats["engine/prefix_hit"] = (self.engine.cached_tokens - prefill[1]) / max(prompt, 1)
+        every = self.config.logging.dump_trajectories
+        if every and self.batches % every == 0:
+            self._dump(groups, self.batches)
         trajectories = [t for g in groups for t in g]
         tokens = sum(t.sampled_tokens for t in trajectories) + stats.pop("_dropped_tokens", 0)
         stats.update(
@@ -112,8 +130,13 @@ class RLPipeline:
         Groups are launched speculatively, `missing / (1 - expected zero-variance rate)` at a
         time, so a batch usually fills in one wave instead of serial refill rounds that leave
         the engine half empty. Surplus informative groups wait for the next batch when
-        max_staleness allows it, and are discarded otherwise. Every group launched is awaited
-        before returning: the engine must be idle before it sleeps."""
+        max_staleness allows it, and are discarded otherwise.
+
+        The batch ends when it is full. On-policy (max_staleness 0) every group launched is
+        then awaited, since the engine sleeps next. Otherwise the groups still generating keep
+        going (partial rollouts): they overlap the training step and join the next batch, so
+        the engine never drains waiting for a batch's slowest trajectories (measured: the last
+        60% of an agentic batch's rollout time ran at under a quarter of the peak batch)."""
         r = self.config.rollout
         budget = target + math.ceil(target * r.max_refill)
         keep_surplus = r.max_staleness > 0
@@ -121,8 +144,14 @@ class RLPipeline:
         self.carry = self.carry[target:]
         counts: Counter = Counter()
         dropped_tokens = 0
-        in_flight: set[asyncio.Task] = set()
+        # groups continuing from the last batch are a bonus: new launches do not count on them,
+        # since they are its slowest groups (whatever finishes first joins the batch)
+        in_flight, self.continuing = self.continuing, set()
+        adopted = set(in_flight)
+        continued = len(in_flight)
         launched = 0
+        self.rollout_start = asyncio.get_running_loop().time()
+        dumping = bool(self.config.logging.dump_trajectories)
 
         def account(group: list[Trajectory]) -> bool:
             nonlocal dropped_tokens
@@ -131,10 +160,12 @@ class RLPipeline:
                 return True
             counts["zero_variance"] += 1
             dropped_tokens += sum(t.sampled_tokens for t in group)
+            if dumping:
+                self.dropped.append(group)
             return False
 
         while len(kept) < target:
-            missing = target - len(kept) - len(in_flight)
+            missing = target - len(kept) - len(in_flight - adopted)
             if missing > 0:
                 missing = math.ceil(missing / (1.0 - min(self.drop_rate, 0.8)))
             for _ in range(max(0, min(missing, budget - launched))):
@@ -148,9 +179,11 @@ class RLPipeline:
                 group = task.result()
                 if account(group):
                     (kept if len(kept) < target else self.carry if keep_surplus else []).append(group)
-        for group in await asyncio.gather(*in_flight):
-            if account(group) and keep_surplus:
-                self.carry.append(group)
+        if keep_surplus:
+            self.continuing = in_flight  # partial rollouts: they finish during the next batch
+        else:
+            for group in await asyncio.gather(*in_flight):
+                account(group)
         if counts["groups"]:
             self.drop_rate = 0.5 * self.drop_rate + 0.5 * counts["zero_variance"] / counts["groups"]
         stats = self._group_stats([t for g in kept for t in g])
@@ -160,6 +193,7 @@ class RLPipeline:
                 "groups/kept": len(kept),
                 "groups/zero_variance": counts["zero_variance"] / max(counts["groups"], 1),
                 "groups/carried": len(self.carry),
+                "groups/continued": continued,
                 "_dropped_tokens": dropped_tokens,
             }
         )
@@ -189,6 +223,8 @@ class RLPipeline:
         env = await self.env_pool.acquire() if self.env_pool is not None else None
         messages = prompt_messages(row, config.data.prompt_field, config.data.system_prompt)
         trajectory = Trajectory(row, gid, [], messages)
+        clock = asyncio.get_running_loop().time
+        timing = trajectory.info["timing"] = {"start": clock() - self.rollout_start, "turns": []}
         self.client.enter()
         try:
             if env is not None and hasattr(env, "reset"):
@@ -216,7 +252,10 @@ class RLPipeline:
                 if room <= 0:
                     trajectory.finish = "length"
                     break
+                t_generate = clock()
                 out = await self.client.generate(trajectory.prompt_ids + trajectory.tokens, room, temperature)
+                turn_timing = {"generate_s": clock() - t_generate, "tokens": len(out.ids), "context": context}
+                timing["turns"].append(turn_timing)
                 logprobs = out.logprobs if out.logprobs or training else [0.0] * len(out.ids)
                 trajectory.append_generated(out.ids, logprobs, out.version)
                 text = self.tok.decode(
@@ -234,9 +273,11 @@ class RLPipeline:
                 if turn == max_turns - 1:
                     trajectory.finish = "turns"
                     break
+                t_tools = clock()
                 results = await asyncio.gather(
                     *(run_tool(env, c.name, c.arguments, e.tool_timeout, set(by_name)) for c in parsed.calls)
                 )
+                turn_timing["tools_s"] = clock() - t_tools
                 observations = [
                     {
                         "role": "tool",
@@ -263,6 +304,10 @@ class RLPipeline:
                     break
                 trajectory.append_context(context_ids)
                 trajectory.messages.extend(observations)
+        except asyncio.CancelledError:  # shutdown with the rollout in flight
+            if env is not None and self.env_pool is not None:
+                await self.env_pool.release(env)
+            raise
         except Exception as error:  # noqa: BLE001 — one broken rollout must not stop training; it is counted
             trajectory.finish, trajectory.scored, trajectory.trained = (
                 "error",
@@ -274,8 +319,41 @@ class RLPipeline:
                 self.reported_errors += 1
                 logger.exception("rollout failed (the trajectory is left out of training)")
         finally:
+            timing["end"] = clock() - self.rollout_start
             self.client.exit()
         return trajectory, env
+
+    def _dump(self, groups: list[list[Trajectory]], step: int) -> None:
+        """Every trajectory of the batch (kept and zero-variance) and the engine's concurrency
+        timeline, to <output_dir>/rollouts/step_<n>.jsonl: to read what the policy does."""
+        import json
+        from pathlib import Path
+
+        path = Path(self.config.train.output_dir) / "rollouts"
+        path.mkdir(parents=True, exist_ok=True)
+        with open(path / f"step_{step}.jsonl", "w") as f:
+            for kept, batch in ((True, groups), (False, self.dropped)):
+                for group in batch:
+                    for t in group:
+                        record = {
+                            "group": t.group,
+                            "kept": kept,
+                            "finish": t.finish,
+                            "reward": t.reward,
+                            "rewards": t.rewards,
+                            "turns": t.turns,
+                            "tool_calls": t.tool_calls,
+                            "tool_errors": t.tool_errors,
+                            "prompt_tokens": len(t.prompt_ids),
+                            "sampled_tokens": t.sampled_tokens,
+                            "context_tokens": len(t.tokens) - t.sampled_tokens,
+                            "version": t.version,
+                            "messages": t.messages,
+                            "info": t.info,
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        with open(path / f"step_{step}.timeline.json", "w") as f:
+            json.dump(self.client.timeline, f)
 
     async def _score(self, group: list[Trajectory], envs: list[Any]) -> None:
         """Rewards of a group, their weighted sum, and the length shaping and masking."""
@@ -392,6 +470,15 @@ class RLPipeline:
         return list(await asyncio.gather(*(self._group(-1, row, temperature, 1, False) for row in rows)))
 
     def close(self) -> None:
+        if self.continuing:  # partial rollouts nobody will train on
+
+            async def cancel(tasks):
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            self._await(cancel(self.continuing))
+            self.continuing = set()
         if self.env_pool is not None:
             try:
                 self._await(self.env_pool.shutdown())
@@ -404,3 +491,26 @@ class RLPipeline:
                 logger.warning("sandbox close failed", exc_info=True)
         self.client.close()
         self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+def _timeline_stats(timeline: list[tuple[float, int, int]]) -> dict[str, float]:
+    """Engine utilization over a batch from (time, sequences in flight, finished) per step:
+    the time-weighted mean of sequences decoding at once, and the tail, the time from when
+    fewer than a quarter of the peak were left until the last step."""
+    if len(timeline) < 2:
+        return {}
+    times = [t for t, _, _ in timeline]
+    live = [n for _, n, _ in timeline]
+    span = times[-1] - times[0]
+    weighted = sum(live[i] * (times[i + 1] - times[i]) for i in range(len(times) - 1))
+    peak = max(live)
+    tail_start = next(
+        (times[i] for i in range(len(live)) if live[i] < peak / 4 and times[i] > times[live.index(peak)]), times[-1]
+    )
+    return {
+        "engine/steps": len(timeline),
+        "engine/seqs_mean": weighted / max(span, 1e-9),
+        "engine/seqs_peak": peak,
+        "engine/tail_s": times[-1] - tail_start,
+        "engine/step_ms": 1000 * span / (len(timeline) - 1),
+    }
