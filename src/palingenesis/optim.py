@@ -33,12 +33,14 @@ def build_optimizer(
     llrd_decay: float = 1.0,
     use_muon: bool = False,
     optimizer_name: str = "adamw",
+    muon: dict | None = None,
 ) -> torch.optim.Optimizer:
     """Build optimizer with optional LLRD, Muon, or 8-bit support.
 
     Options:
       - "adamw": standard AdamW (16 bytes/param)
-      - "muon": hybrid Muon + AdamW (8 bytes/param, 1.5× convergence)
+      - "muon": Muon on hidden matrices (Gram Newton-Schulz, Moonlight RMS matching: same LR and weight decay as
+        AdamW) + AdamW on embeddings / head / norms / thin matrices (palingenesis.muon); `muon` = its options
       - "adamw8bit": bitsandbytes 8-bit AdamW (6 bytes/param)
       - "lion8bit": bitsandbytes 8-bit Lion (4 bytes/param, sign-based)
       - "paged_adamw8bit": 8-bit AdamW whose states page to CPU memory under pressure
@@ -46,7 +48,9 @@ def build_optimizer(
     if optimizer_name not in OPTIMIZERS:
         raise ValueError(f"train.optimizer={optimizer_name!r} is not one of {', '.join(OPTIMIZERS)}.")
     if use_muon or optimizer_name == "muon":
-        return _build_muon_optimizer(model, lr, weight_decay)
+        from palingenesis.muon import build_muon
+
+        return build_muon(model, lr, weight_decay, **(muon or {}))
 
     if optimizer_name in ("adamw8bit", "lion8bit", "paged_adamw8bit"):
         return _build_bnb_optimizer(model, lr, weight_decay, optimizer_name)
@@ -135,97 +139,6 @@ def _build_bnb_optimizer(
         raise ValueError(f"Unknown bnb optimizer: {name}")
 
     return optimizer
-
-
-def _build_muon_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
-    """Hybrid Muon + AdamW optimizer.
-
-    Muon for 2D weight matrices (1.5-2× faster, 50% less memory).
-    AdamW for 1D parameters (embeddings, norms, biases).
-
-    Returns a _HybridMuonAdamW wrapper that steps both optimizers.
-    """
-    from torch.optim import Muon
-
-    muon_params = []
-    adam_decay = []
-    adam_no_decay = []
-
-    muon_count = 0
-    adam_count = 0
-
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        # Muon orthogonalises hidden 2-D matrices; embeddings and the output head stay
-        # on AdamW (as in the Muon paper), and so do stacked 3-D expert weights, which
-        # torch's Muon does not accept.
-        if p.ndim == 2 and not any(k in name.lower() for k in ("embed", "lm_head")):
-            muon_params.append(p)
-            muon_count += p.numel()
-        elif any(k in name.lower() for k in ("bias", "norm")):
-            adam_no_decay.append(p)
-            adam_count += p.numel()
-        else:
-            adam_decay.append(p)
-            adam_count += p.numel()
-
-    # Muon LR is typically 10× AdamW LR for same convergence speed
-    muon_lr = lr * 10
-
-    muon_opt = Muon(muon_params, lr=muon_lr, momentum=0.95, nesterov=True, weight_decay=weight_decay)
-
-    adam_groups = []
-    if adam_decay:
-        adam_groups.append({"params": adam_decay, "weight_decay": weight_decay})
-    if adam_no_decay:
-        adam_groups.append({"params": adam_no_decay, "weight_decay": 0.0})
-
-    adam_opt = AdamW(adam_groups, lr=lr, betas=(0.9, 0.95)) if adam_groups else None
-
-    total = muon_count + adam_count
-    logger.info(
-        f"Muon hybrid: {muon_count / 1e6:.1f}M params (Muon, lr={muon_lr:.2e}) + "
-        f"{adam_count / 1e6:.1f}M params (AdamW, lr={lr:.2e}) = {total / 1e6:.1f}M total"
-    )
-
-    return _HybridOptimizer(muon_opt, adam_opt)
-
-
-class _HybridOptimizer(torch.optim.Optimizer):
-    """Wraps two optimizers (Muon + AdamW) into one interface.
-
-    Steps both optimizers, exposes unified param_groups for scheduler compatibility.
-    """
-
-    def __init__(self, primary: torch.optim.Optimizer, secondary: torch.optim.Optimizer | None):
-        self._primary = primary
-        self._secondary = secondary
-        # Expose combined param_groups for LR scheduler
-        self.param_groups = list(primary.param_groups)
-        if secondary:
-            self.param_groups.extend(secondary.param_groups)
-
-    def step(self, closure=None):
-        self._primary.step(closure)
-        if self._secondary:
-            self._secondary.step(closure)
-
-    def zero_grad(self, set_to_none=True):
-        self._primary.zero_grad(set_to_none=set_to_none)
-        if self._secondary:
-            self._secondary.zero_grad(set_to_none=set_to_none)
-
-    def state_dict(self):
-        return {
-            "primary": self._primary.state_dict(),
-            "secondary": self._secondary.state_dict() if self._secondary else None,
-        }
-
-    def load_state_dict(self, state_dict):
-        self._primary.load_state_dict(state_dict["primary"])
-        if self._secondary and state_dict.get("secondary"):
-            self._secondary.load_state_dict(state_dict["secondary"])
 
 
 def _build_simple_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> AdamW:

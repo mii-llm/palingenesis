@@ -266,6 +266,10 @@ class OPDTrainer:
             self.opt = torch.optim.AdamW(
                 self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0, fused=self.device == "cuda"
             )
+        elif config.train.optimizer == "muon":  # Muon on hidden matrices, AdamW on the rest (palingenesis.muon)
+            from palingenesis.muon import build_muon
+
+            self.opt = build_muon(self.student, config.train.learning_rate, 0.0, **config.train.muon_options())
         else:  # 8-bit moments (bitsandbytes)
             import bitsandbytes as bnb
 

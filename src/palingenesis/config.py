@@ -149,6 +149,21 @@ class TrainConfig:
     max_grad_norm: float = 1.0
     lr_scheduler: Literal["cosine", "linear", "constant", "power_decay", "wsd"] = "cosine"
     optimizer: str = "adamw"  # "adamw", "muon", "adamw8bit", "lion8bit", "paged_adamw8bit"
+    # Muon (optimizer: muon; palingenesis.muon). muon_ns: "gram" (Gram Newton-Schulz with a restart, ~half the FLOPs
+    # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
+    # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
+    # muon_backend: "auto" (quack symmetric-GEMM kernels on Hopper/Blackwell when installed, torch otherwise),
+    # "torch" or "quack"; muon_compile: torch.compile the Newton-Schulz step.
+    muon_ns: str = "gram"
+    muon_scale: str = "moonlight"
+    muon_momentum: float = 0.95
+    muon_min_dim: int = 32
+    muon_backend: str = "auto"
+    muon_compile: bool = True
+
+    def muon_options(self) -> dict:
+        return {"ns_method": self.muon_ns, "scale": self.muon_scale, "momentum": self.muon_momentum,
+                "min_dim": self.muon_min_dim, "backend": self.muon_backend, "compile": self.muon_compile}
     seed: int = 42
     save_steps: int = 500
     save_final: bool = True  # write the final model at the end (off for dry runs such as `pgs profile --measure`)
@@ -488,6 +503,20 @@ class Config:
 
         if self.train.optimizer not in OPTIMIZERS:
             errors.append(f"train.optimizer={self.train.optimizer!r} is not one of {', '.join(OPTIMIZERS)}.")
+        if self.train.optimizer == "muon":
+            if self.train.muon_ns not in ("gram", "standard"):
+                errors.append(f"train.muon_ns must be gram or standard, got {self.train.muon_ns!r}.")
+            if self.train.muon_scale not in ("moonlight", "spectral"):
+                errors.append(f"train.muon_scale must be moonlight or spectral, got {self.train.muon_scale!r}.")
+            if not 0 <= self.train.muon_momentum < 1:
+                errors.append(f"train.muon_momentum must be in [0, 1), got {self.train.muon_momentum}.")
+            if self.train.llrd_decay < 1.0:
+                warnings.append("train.llrd_decay is ignored with optimizer=muon (one learning rate per group kind).")
+            if self.train.muon_scale == "spectral":
+                warnings.append(
+                    "train.muon_scale=spectral: Muon updates are not RMS-matched to AdamW, so the AdamW learning rate "
+                    "is far too small for the Muon matrices (moonlight scaling avoids this)."
+                )
         if self.train.lr_scheduler not in ("cosine", "linear", "constant", "power_decay", "wsd"):
             errors.append(
                 f"train.lr_scheduler={self.train.lr_scheduler!r} is not one of cosine, linear, "

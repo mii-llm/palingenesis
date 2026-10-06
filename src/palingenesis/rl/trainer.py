@@ -252,7 +252,7 @@ class RLTrainer:
             self.stop_ids,
         )
         self.orchestrator = Orchestrator(self.pipeline, lambda: self.batch_prompts, r.temperature, r.max_staleness)
-        self.opt = _optimizer(self._trainable(), t, self.device)
+        self.opt = _optimizer(self._trainable(), t, self.device, self._trainable_names())
         self.start_step, self.stale_groups, wandb_id = 0, 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
@@ -343,6 +343,12 @@ class RLTrainer:
     def _trainable(self) -> list[torch.nn.Parameter]:
         """The parameters the optimizer steps: the fp32 masters, or the module's own."""
         return self.master.parameters() if self.master is not None else list(self.model.parameters())
+
+    def _trainable_names(self) -> list[str]:
+        """Names of _trainable(), in order (the fp32 masters mirror the module's trainable parameters)."""
+        if self.master is not None:
+            return [n for n, p in self.model.named_parameters() if p.requires_grad]
+        return [n for n, _ in self.model.named_parameters()]
 
     def _micro_batches(self, trajectories: list[Trajectory]) -> list[list[Trajectory]]:
         """Micro-batches of at most train.micro_tokens padded tokens, longest trajectories first,
@@ -803,10 +809,17 @@ class _LazySandbox:
         return getattr(self._trainer.sandbox, name)
 
 
-def _optimizer(params: list[torch.nn.Parameter], t: Any, device: str) -> torch.optim.Optimizer:
-    """AdamW over the trained parameters (the fp32 masters on one GPU), with fp32 or 8-bit moments."""
-    eps = t.adam_eps or (1e-15 if t.optimizer == "adamw" else 1e-8)
+def _optimizer(params: list[torch.nn.Parameter], t: Any, device: str, names: list[str] | None = None) -> torch.optim.Optimizer:
+    """AdamW over the trained parameters (the fp32 masters on one GPU), with fp32 or 8-bit moments; or Muon on the
+    hidden matrices with AdamW on the rest (`names` route the parameters, palingenesis.muon)."""
+    eps = t.adam_eps or (1e-15 if t.optimizer in ("adamw", "muon") else 1e-8)
     kwargs = dict(lr=t.learning_rate, betas=(t.adam_beta1, t.adam_beta2), eps=eps, weight_decay=t.weight_decay)
+    if t.optimizer == "muon":
+        from palingenesis.muon import build_muon
+
+        params = list(params)
+        named = list(zip(names, params)) if names and len(names) == len(params) else [(str(i), p) for i, p in enumerate(params)]
+        return build_muon(named, t.learning_rate, t.weight_decay, betas=kwargs["betas"], eps=eps, **t.muon_options())
     if t.optimizer == "adamw":
         return torch.optim.AdamW(params, fused=device.startswith("cuda") and not t.cpu_offload, **kwargs)
     import bitsandbytes as bnb

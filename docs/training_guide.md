@@ -172,14 +172,44 @@ This creates per-source scored data + a `manifest.json` with recommended compute
 | Optimizer | Memory/Param | Best For | Config |
 |-----------|-------------|----------|--------|
 | AdamW | 16 bytes | Default, well-understood | `optimizer: adamw` |
-| Muon | 8 bytes | Speed (1.5× convergence), memory | `optimizer: muon` |
+| Muon | 12 bytes on Muon matrices (fp32 weight + grad + one momentum), 16 on the rest | Pretraining / long runs: faster convergence per token | `optimizer: muon` |
 | Lion 8-bit | 4 bytes | Absolute minimum memory | `optimizer: lion8bit` |
 | AdamW 8-bit | 6 bytes | Memory savings, AdamW behavior | `optimizer: adamw8bit` |
 
 **Decision tree:**
 - Fits in memory with AdamW? → Use AdamW (safest)
-- Tight on memory? → Muon (same quality, 50% less optimizer memory)
+- Pretraining or a long continued pretraining from scratch-like data? → Muon (one momentum per matrix instead of two
+  Adam moments; RMS-matched to AdamW, so the same `learning_rate` and `weight_decay` work)
+- Fine-tuning a model that was pre-trained with AdamW? → measure Muon against AdamW first (an optimizer mismatch the
+  Moonlight paper reports; see "Muon" below)
 - Still tight? → Lion 8-bit (75% less memory than AdamW)
+
+### Muon
+
+`optimizer: muon` (`palingenesis.muon`) orthogonalizes the (Nesterov) momentum of every hidden 2-D weight matrix by a
+Newton-Schulz iteration and steps the rest (embeddings, output head, norms, biases, convolution kernels, matrices
+thinner than `muon_min_dim`, e.g. the rank-16 gate projections of Gated DeltaNet) with AdamW, all in one optimizer.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `muon_scale` | `moonlight` | update × 0.2·√max(rows, cols): RMS matched to AdamW (Moonlight), so Muon matrices share `learning_rate` and decoupled `weight_decay`; `spectral` (√max(1, rows/cols), Jordan's) needs a much larger LR |
+| `muon_ns` | `gram` | Gram Newton-Schulz (Dao et al., 2026): iterate on the n×n Gram matrix of a rectangular matrix, with a restart after iteration 2 for fp16 stability: about half the FLOPs at aspect ratio 4 (square matrices use standard Newton-Schulz); `standard` |
+| `muon_backend` | `auto` | GEMMs: quack's symmetric CuTeDSL kernels on Hopper / Blackwell (sm90+: H100, B200/B300, RTX 50) when `quack-kernels` is installed and both sides are ≥ 256 (every n×n product of the iteration is symmetric, so half of each is computed); dense cuBLAS GEMMs otherwise (A100, older GPUs, CPU) |
+| `muon_compile` | `true` | `torch.compile` the Newton-Schulz function (fuses normalisation, casts and scalar epilogues; one graph per matrix shape) |
+| `muon_momentum` | `0.95` | Nesterov momentum |
+| `muon_min_dim` | `32` | thinner matrices go to AdamW |
+
+Coefficients: Polar Express (Amsel et al., 2025) with a 1.05 safety factor, computed in fp16 after Frobenius
+normalisation. Same-shaped matrices are orthogonalized as one batch. Under `torch.distributed`, each rank
+orthogonalizes 1/world of each batch and an all-gather returns the rest (so the optimizer step shrinks with the number
+of GPUs instead of every rank computing every matrix); with FSDP2, the full gradient of each matrix is gathered for the
+iteration and every rank keeps its shard of the update. The same options exist for distillation (`palingenesis.opd`)
+and RL (`palingenesis.rl`) configs.
+
+Hardware: on Hopper/Blackwell install `quack-kernels` (`pip install quack-kernels`, CUDA 12.9+; Apache-2.0) to get
+the symmetric kernels; without it, or on Ampere, the torch backend runs everywhere. Measure on your machine with
+`python scripts/bench_muon.py --model <model>`: it times every Newton-Schulz variant × backend × compile setting on the
+model's real matrix shapes and checks the accuracy against the exact polar factor.
 
 ### The Optimal Config (Copy This)
 

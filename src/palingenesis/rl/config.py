@@ -223,6 +223,21 @@ class RLTrainConfig:
     # moments: 2 bytes per parameter) or "paged_adamw8bit" (8-bit, paged to CPU memory under
     # pressure). 8-bit states need one GPU without FSDP.
     optimizer: str = "adamw"
+    # Muon (optimizer: muon; palingenesis.muon). muon_ns: "gram" (Gram Newton-Schulz with a restart, ~half the FLOPs
+    # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
+    # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
+    # muon_backend: "auto" (quack symmetric-GEMM kernels on Hopper/Blackwell when installed, torch otherwise),
+    # "torch" or "quack"; muon_compile: torch.compile the Newton-Schulz step.
+    muon_ns: str = "gram"
+    muon_scale: str = "moonlight"
+    muon_momentum: float = 0.95
+    muon_min_dim: int = 32
+    muon_backend: str = "auto"
+    muon_compile: bool = True
+
+    def muon_options(self) -> dict:
+        return {"ns_method": self.muon_ns, "scale": self.muon_scale, "momentum": self.muon_momentum,
+                "min_dim": self.muon_min_dim, "backend": self.muon_backend, "compile": self.muon_compile}
     weight_decay: float = 0.0
     micro_tokens: int = 16384  # padded tokens per forward/backward micro-batch
     # FSDP2: shard the policy over data-parallel ranks (always under torchrun with > 1 process;
@@ -531,13 +546,13 @@ class RLConfig:
             )
         if (t.fsdp or t.cpu_offload) and r.backend == "hf" and r.max_staleness:
             errors.append("rollout.backend hf generates with the sharded trainer model: max_staleness must be 0.")
-        if t.optimizer not in ("adamw", "adamw8bit", "paged_adamw8bit"):
-            errors.append(f"train.optimizer must be adamw, adamw8bit or paged_adamw8bit, got {t.optimizer!r}.")
-        elif t.optimizer != "adamw" and (t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"):
+        if t.optimizer not in ("adamw", "muon", "adamw8bit", "paged_adamw8bit"):
+            errors.append(f"train.optimizer must be adamw, muon, adamw8bit or paged_adamw8bit, got {t.optimizer!r}.")
+        elif t.optimizer not in ("adamw", "muon") and (t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"):
             errors.append(
                 f"train.optimizer {t.optimizer} (bitsandbytes) steps local tensors: not with FSDP or cpu_offload."
             )
-        if t.optimizer != "adamw" and 0 < t.adam_eps < 1e-8:
+        if t.optimizer not in ("adamw", "muon") and 0 < t.adam_eps < 1e-8:
             errors.append(
                 f"train.adam_eps {t.adam_eps:g} with {t.optimizer}: 8-bit moments round small second moments to 0, "
                 "and an eps below 1e-8 then lets their updates explode. Leave adam_eps at 0 (auto: 1e-8) or set >= 1e-8."

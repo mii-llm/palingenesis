@@ -208,6 +208,21 @@ class OPDTrainConfig:
     # "adamw" (fp32 moments, 16 bytes/param with the fp32 weights and grads) or "adamw8bit" /
     # "paged_adamw8bit" (bitsandbytes 8-bit moments): room for a large teacher on the same GPU.
     optimizer: str = "adamw"
+    # Muon (optimizer: muon; palingenesis.muon). muon_ns: "gram" (Gram Newton-Schulz with a restart, ~half the FLOPs
+    # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
+    # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
+    # muon_backend: "auto" (quack symmetric-GEMM kernels on Hopper/Blackwell when installed, torch otherwise),
+    # "torch" or "quack"; muon_compile: torch.compile the Newton-Schulz step.
+    muon_ns: str = "gram"
+    muon_scale: str = "moonlight"
+    muon_momentum: float = 0.95
+    muon_min_dim: int = 32
+    muon_backend: str = "auto"
+    muon_compile: bool = True
+
+    def muon_options(self) -> dict:
+        return {"ns_method": self.muon_ns, "scale": self.muon_scale, "momentum": self.muon_momentum,
+                "min_dim": self.muon_min_dim, "backend": self.muon_backend, "compile": self.muon_compile}
     warmup_steps: int = 20
     lr_scheduler: str = "cosine"  # "cosine" or "constant"
     max_grad_norm: float = 1.0
@@ -520,8 +535,10 @@ class OPDConfig:
             errors.append(f"loss.xtok_spread must be 'chunk' or 'proportional', got {loss.xtok_spread!r}.")
         if not 0 < loss.is_low <= 1.0 <= loss.is_high:
             errors.append("loss.is_low must be in (0, 1] and loss.is_high >= 1.")
-        if self.train.optimizer not in ("adamw", "adamw8bit", "paged_adamw8bit"):
-            errors.append(f"train.optimizer must be adamw, adamw8bit or paged_adamw8bit, got {self.train.optimizer!r}.")
+        if self.train.optimizer not in ("adamw", "muon", "adamw8bit", "paged_adamw8bit"):
+            errors.append(
+                f"train.optimizer must be adamw, muon, adamw8bit or paged_adamw8bit, got {self.train.optimizer!r}."
+            )
         if loss.top_k < 1:
             errors.append(f"loss.top_k must be >= 1, got {loss.top_k}.")
         if loss.rs_rounds < 1:

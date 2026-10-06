@@ -565,6 +565,7 @@ def train(config: Config):
             config.train.llrd_decay,
             use_muon=(config.train.optimizer == "muon"),
             optimizer_name=config.train.optimizer,
+            muon=config.train.muon_options(),
         )
         scheduler = build_scheduler(
             optimizer,
