@@ -260,7 +260,7 @@ class MuonAdamW(torch.optim.Optimizer):
         betas=(0.9, 0.95),
         eps: float = 1e-8,
         backend: str = "auto",
-        compile: bool = True,
+        compile: bool = False,
         distribute: bool = True,
     ):
         """backend: Newton-Schulz GEMMs ("auto": quack's symmetric kernels on sm90+ when installed, torch otherwise);
@@ -401,7 +401,7 @@ def build_muon(
     betas=(0.9, 0.95),
     eps: float = 1e-8,
     backend: str = "auto",
-    compile: bool = True,
+    compile: bool = False,
     distribute: bool = True,
 ) -> MuonAdamW:
     groups, counts = muon_param_groups(model, weight_decay, min_dim)
