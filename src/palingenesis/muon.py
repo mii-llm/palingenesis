@@ -158,19 +158,37 @@ def gram_newton_schulz(
 
 
 _COMPILED: dict = {}
+_COMPILE_FAILED: set = set()
 
 
-def _kernel(method: str, ops, compile_: bool):
-    """The Newton-Schulz function for (method, backend), compiled once (torch.compile fuses the normalisation, casts
-    and scalar epilogues around the GEMMs; dynamic=False: one graph per matrix shape, reused every step)."""
+def _kernel(method: str, ops, compile_: bool, shape: tuple):
+    """The Newton-Schulz function for (method, backend, batch shape). Compiled functions are kept one per shape (each
+    a separate torch.compile object with its own graph): a model's handful of matrix shapes compile once each and are
+    reused every step, and no single function runs into torch's recompile limit (one shared function with
+    fullgraph=True failed hard at the 9th shape). torch.compile fuses the normalisation, casts and scalar epilogues
+    around the GEMMs."""
     fn = gram_newton_schulz if method == "gram" else newton_schulz
-    key = (method, ops.name, compile_)
-    if key not in _COMPILED:
-        def run(X, fn=fn, ops=ops):
-            return fn(X, POLAR_EXPRESS_COEFFICIENTS, ops=ops)
 
-        _COMPILED[key] = torch.compile(run, fullgraph=True, dynamic=False) if compile_ else run
-    return _COMPILED[key]
+    def run(X, fn=fn, ops=ops):
+        return fn(X, POLAR_EXPRESS_COEFFICIENTS, ops=ops)
+
+    if not compile_ or (method, ops.name) in _COMPILE_FAILED:
+        return run
+    key = (method, ops.name, shape)
+    if key not in _COMPILED:
+        _COMPILED[key] = torch.compile(run, fullgraph=True, dynamic=False)
+    compiled = _COMPILED[key]
+
+    def safe(X):
+        try:
+            return compiled(X)
+        except Exception as e:  # noqa: BLE001 — compilation must never stop training: fall back to eager
+            logger.warning("Muon: compiling %s Newton-Schulz (%s) failed, running eager from now on: %s", method,
+                           ops.name, str(e)[:200])
+            _COMPILE_FAILED.add((method, ops.name))
+            return run(X)
+
+    return safe
 
 
 def orthogonalize(G: Tensor, method: str = "gram", coefficients=None, dtype=None, backend: str = "auto",
@@ -194,7 +212,7 @@ def orthogonalize(G: Tensor, method: str = "gram", coefficients=None, dtype=None
         fn = gram_newton_schulz if use == "gram" else newton_schulz
         out = fn(X, coefficients or POLAR_EXPRESS_COEFFICIENTS, dtype=dtype, ops=ops)
     else:
-        out = _kernel(use, ops, compile and X.is_cuda)(X)
+        out = _kernel(use, ops, compile and X.is_cuda, tuple(X.shape))(X)
     out = out.to(G.dtype)
     return out.squeeze(0) if one else out
 

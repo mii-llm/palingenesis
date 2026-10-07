@@ -139,3 +139,34 @@ def test_muon_weight_decay_is_decoupled():
     lin.weight.grad = torch.zeros_like(lin.weight)  # zero gradient: only the decay acts
     opt.step()
     assert torch.allclose(lin.weight, w0 * (1 - 0.1 * 0.5), atol=1e-6)
+
+
+def test_compiled_kernels_are_per_shape_and_fall_back_to_eager(monkeypatch):
+    import palingenesis.muon as mu
+
+    made = []
+
+    def fake_compile(fn, **kw):  # one compile object per call, like torch.compile
+        made.append(kw)
+        return fn
+
+    monkeypatch.setattr(mu, "_COMPILED", {})
+    monkeypatch.setattr(mu, "_COMPILE_FAILED", set())
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    shapes = [(b, 32, 32 + 8 * k) for k in range(10) for b in (1, 3)]  # 20 batch shapes: past the recompile limit (8)
+    for s in shapes * 2:
+        X = torch.randn(*s)
+        torch.testing.assert_close(mu._kernel("gram", mu._TorchOps, True, s)(X), mu.gram_newton_schulz(X))
+    assert len(made) == len(shapes)  # one compiled function per shape, reused on the second pass
+
+    def broken_compile(fn, **kw):
+        def boom(X):
+            raise RuntimeError("Hard failure due to fullgraph=True")
+
+        return boom
+
+    monkeypatch.setattr(mu, "_COMPILED", {})
+    monkeypatch.setattr(torch, "compile", broken_compile)
+    X = torch.randn(2, 32, 96)
+    torch.testing.assert_close(mu._kernel("gram", mu._TorchOps, True, tuple(X.shape))(X), mu.gram_newton_schulz(X))
+    assert ("gram", "torch") in mu._COMPILE_FAILED  # later calls skip compilation
