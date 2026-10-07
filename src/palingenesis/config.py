@@ -153,13 +153,14 @@ class TrainConfig:
     # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
     # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
     # muon_backend: "auto" (quack symmetric-GEMM kernels on Hopper/Blackwell when installed, torch otherwise),
-    # "torch" or "quack"; muon_compile: torch.compile the Newton-Schulz step.
+    # "torch" or "quack"; muon_compile: torch.compile the Newton-Schulz step (off: the step is GEMM-bound, compiling
+    # gave 0-5% on an A100 for seconds of compile time per matrix shape).
     muon_ns: str = "gram"
     muon_scale: str = "moonlight"
     muon_momentum: float = 0.95
     muon_min_dim: int = 32
     muon_backend: str = "auto"
-    muon_compile: bool = True
+    muon_compile: bool = False
 
     def muon_options(self) -> dict:
         return {"ns_method": self.muon_ns, "scale": self.muon_scale, "momentum": self.muon_momentum,

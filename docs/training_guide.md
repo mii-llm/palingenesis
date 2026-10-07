@@ -195,7 +195,7 @@ thinner than `muon_min_dim`, e.g. the rank-16 gate projections of Gated DeltaNet
 | `muon_scale` | `moonlight` | update × 0.2·√max(rows, cols): RMS matched to AdamW (Moonlight), so Muon matrices share `learning_rate` and decoupled `weight_decay`; `spectral` (√max(1, rows/cols), Jordan's) needs a much larger LR |
 | `muon_ns` | `gram` | Gram Newton-Schulz (Dao et al., 2026): iterate on the n×n Gram matrix of a rectangular matrix, with a restart after iteration 2 for fp16 stability: about half the FLOPs at aspect ratio 4 (square matrices use standard Newton-Schulz); `standard` |
 | `muon_backend` | `auto` | GEMMs: quack's symmetric CuTeDSL kernels on Hopper / Blackwell (sm90+: H100, B200/B300, RTX 50) when `quack-kernels` is installed and both sides are ≥ 256 (every n×n product of the iteration is symmetric, so half of each is computed); dense cuBLAS GEMMs otherwise (A100, older GPUs, CPU) |
-| `muon_compile` | `true` | `torch.compile` the Newton-Schulz function (fuses normalisation, casts and scalar epilogues; one graph per matrix shape) |
+| `muon_compile` | `false` | `torch.compile` the Newton-Schulz function (one graph per matrix shape): the step is GEMM-bound, so it gave 0–5% on an A100 |
 | `muon_momentum` | `0.95` | Nesterov momentum |
 | `muon_min_dim` | `32` | thinner matrices go to AdamW |
 
@@ -207,7 +207,7 @@ iteration and every rank keeps its shard of the update. The same options exist f
 and RL (`palingenesis.rl`) configs.
 
 Hardware: on Hopper/Blackwell install `quack-kernels` (`pip install quack-kernels`, CUDA 12.9+; Apache-2.0) to get
-the symmetric kernels; without it, or on Ampere, the torch backend runs everywhere. Measure on your machine with
+the symmetric kernels; without it, or on Ampere, the torch backend runs everywhere. Measured on an A100 80GB (Qwen3.5-0.8B, 150 matrices, one step): standard Newton-Schulz 77.8 ms, Gram 60.9 ms (×1.28); Qwen3-0.6B (with square matrices) 72.4 → 64.0 ms (×1.13); same accuracy. Measure on your machine with
 `python scripts/bench_muon.py --model <model>`: it times every Newton-Schulz variant × backend × compile setting on the
 model's real matrix shapes and checks the accuracy against the exact polar factor.
 
