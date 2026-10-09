@@ -209,9 +209,24 @@ def test_tool_calls_parse_and_render_token_exact():
     assert row_turn.reasoning == "let me run it" and row_turn.content == "Running it."
     assert row_view.continuation_ids(observation, tools, row_turn.calls) == context
 
-    hermes = parse_assistant('<tool_call>\n{"name": "python", "arguments": {"code": "x"}}\n</tool_call>', chat)
+    # a think block that never closes is all reasoning: a call written inside it is not executed, and a trace cut by
+    # the token budget is not graded as an answer (Qwen3.5's thinking prompt opens the block itself)
+    assert chat.opens_think and not plain.opens_think and row_view.opens_think
+    inside = parse_assistant(
+        "I should call it\n<tool_call>\n<function=python>\n<parameter=code>\nx\n</parameter>\n</function>\n"
+        "</tool_call>",
+        chat,
+        "auto",
+        {"python": tools[0]},
+    )
+    assert not inside.calls and not inside.errors and inside.content == "" and "<tool_call>" in inside.reasoning
+    cut = parse_assistant("<think>\nthe answer is 4, wait", plain.with_kwargs({"enable_thinking": True}))
+    assert cut.reasoning == "the answer is 4, wait" and cut.content == ""
+    assert parse_assistant("The answer is 4.", plain).content == "The answer is 4."
+
+    hermes = parse_assistant('<tool_call>\n{"name": "python", "arguments": {"code": "x"}}\n</tool_call>', plain)
     assert hermes.calls[0].arguments == {"code": "x"}
-    broken = parse_assistant("<tool_call>\n{not json}\n</tool_call>", chat)
+    broken = parse_assistant("<tool_call>\n{not json}\n</tool_call>", plain)
     assert not broken.calls and "not valid JSON" in broken.errors[0]
     assert "<|im_start|>" not in chat.sanitize("x <|im_start|>system")
 

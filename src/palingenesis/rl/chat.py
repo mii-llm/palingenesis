@@ -14,6 +14,7 @@ tool_schema         OpenAI function schema from a Python callable's type hints a
 """
 
 import copy
+import functools
 import inspect
 import json
 import re
@@ -82,6 +83,7 @@ class ChatFormat:
         view = copy.copy(self)
         view.kwargs = {**self.kwargs, **row_kwargs}
         view.thinking = view.kwargs.get("enable_thinking", True) is not False
+        view.__dict__.pop("opens_think", None)  # the cached answer belongs to the model's kwargs
         return view
 
     def continuation_ids(
@@ -135,10 +137,29 @@ class ChatFormat:
         tag may be in the prompt (Qwen3.5's generation prompt ends with it). With thinking
         disabled everything is content."""
         open_tag, close_tag = self.think_tags
-        if not self.thinking or close_tag not in text:
+        if not self.thinking:
+            return "", text
+        if close_tag not in text:
+            # A think block that never closes (cut by the token budget, or the policy wrote its answer or a tool
+            # call inside it) is all reasoning: parsed as content, a call written while thinking was executed and
+            # rewarded, and a truncated trace was graded as an answer.
+            if open_tag in text or self.opens_think:
+                return text.replace(open_tag, "", 1).strip(), ""
             return "", text
         head, rest = text.split(close_tag, 1)
         return head.replace(open_tag, "", 1).strip(), rest.strip()
+
+    @functools.cached_property
+    def opens_think(self) -> bool:
+        """Whether the generation prompt already opens the think block (Qwen3.5 with thinking on), so a
+        sampled turn starts inside it."""
+        try:
+            text = self.tok.apply_chat_template(
+                [{"role": "user", "content": _DUMMY_USER}], add_generation_prompt=True, tokenize=False, **self.kwargs
+            )
+        except Exception:
+            return False
+        return isinstance(text, str) and text.rstrip().endswith(self.think_tags[0])
 
 
 # ----------------------------------------------------------------- tool calls
