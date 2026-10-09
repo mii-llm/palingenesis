@@ -502,8 +502,9 @@ class RLPipeline:
                 }
             )
         forced = [t for t in trajectories if t.info.get("think_skip")]
-        if forced:  # think-skip: how often it applied and what skipping earned against thinking
-            free = [t.reward for t in trajectories if t.scored and not t.info.get("think_skip")]
+        if forced:  # think-skip: how often it applied and what skipping earned against thinking in the same groups
+            groups = {t.group for t in forced}
+            free = [t.reward for t in trajectories if t.scored and t.group in groups and not t.info.get("think_skip")]
             skipped = [t.reward for t in forced if t.scored]
             stats["think_skip/share"] = len(forced) / n
             if free and skipped:
