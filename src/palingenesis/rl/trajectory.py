@@ -31,6 +31,7 @@ class Trajectory:
     advantage: float = 0.0
     scored: bool = True  # False: no reward (infrastructure failure); out of baseline and loss
     trained: bool = True  # False: out of the loss (unscored, or a masked truncation)
+    forced: list[int] = field(default_factory=list)  # token indices trained with a forcing probability (think-skip)
     info: dict[str, Any] = field(default_factory=dict)  # environment / reward extras, logged
 
     def append_generated(self, ids: list[int], logprobs: list[float], version: int) -> None:
@@ -44,6 +45,14 @@ class Trajectory:
         self.logprobs += [lp if math.isfinite(lp) else 0.0 for lp in logprobs]
         self.versions.append(version)
         self.turns += 1
+
+    def append_forced(self, ids: list[int], logprob: float) -> None:
+        """A prefix the sampler was made to write (think-skip): its first token is trained with the given behaviour
+        log-prob (the forcing probability), the rest is context."""
+        self.forced.append(len(self.tokens))
+        self.tokens += ids
+        self.mask += [True] + [False] * (len(ids) - 1)
+        self.logprobs += [logprob] + [0.0] * (len(ids) - 1)
 
     def append_context(self, ids: list[int]) -> None:
         self.tokens += ids

@@ -216,17 +216,24 @@ def policy_loss(
     n_seq: int,
     seq_len: Tensor,
     config,
+    forced: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
     """The loss over a micro-batch's trained tokens.
 
     lp, behaviour, advantage, weight, seq: [N] per token (seq: the token's sequence index in
-    0..n_seq-1); seq_len: [n_seq] trained tokens per sequence; config: the RLLossConfig.
+    0..n_seq-1); seq_len: [n_seq] trained tokens per sequence; config: the RLLossConfig; forced: [N] bool or None,
+    tokens whose behaviour log-prob is a forcing probability (think-skip): their ratio is an intended importance
+    weight, so it stays out of the sampler-mismatch statistics and the sequence mask.
     Returns the loss (to backward) and summed statistics as 0-d tensors (no host sync).
     """
     with torch.no_grad():
         log_ratio = lp.detach() - behaviour
         ratio = log_ratio.exp()
         deviation = (ratio - 1).abs()
+        seen = ratio  # the sampler-mismatch view of the ratios
+        if forced is not None:
+            deviation = deviation.masked_fill(forced, 0.0)
+            seen = ratio.masked_fill(forced, 1.0)
         seq_deviation = torch.zeros(n_seq, device=lp.device).index_add_(0, seq, deviation) / seq_len
         keep_seq = (
             seq_deviation <= config.seq_mask
@@ -236,10 +243,12 @@ def policy_loss(
         s_mask = keep_seq[seq].float()
         stats = {  # tensors: the caller syncs once per step
             "tokens": torch.tensor(float(lp.numel()), device=lp.device),
-            "ratio": ratio.sum(),
-            "ratio_max": ratio.max(),
+            "ratio": seen.sum(),
+            "ratio_max": seen.max(),
             "abs_ratio_dev": deviation.sum(),
-            "mismatch_k3": (ratio - 1 - log_ratio).sum(),
+            "mismatch_k3": (
+                ratio - 1 - log_ratio if forced is None else (ratio - 1 - log_ratio).masked_fill(forced, 0.0)
+            ).sum(),
             "seq_masked": (~keep_seq).sum().float(),
             "sequences": torch.tensor(float(n_seq), device=lp.device),
         }

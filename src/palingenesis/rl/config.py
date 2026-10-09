@@ -95,6 +95,13 @@ class RLRolloutConfig:
     # prompts until batch_prompts informative groups are collected, at most this many
     # extra prompts per batch, as a multiple of batch_prompts (0 = never refill).
     max_refill: float = 2.0
+    # Think-skip exploration (AdaptThink, 2505.13417): on rows in thinking mode whose generation prompt opens the think
+    # block, this fraction of each training group starts with think_skip_prefix forced (an immediately closed think), so
+    # the decision to skip thinking is sampled and the reward can reinforce it where skipping is as good. The forced
+    # closing token is trained with behaviour log-prob log(think_skip) (importance sampling, capped by is_cap and the
+    # clip); the rest of the prefix is context. First assistant turn only. 0 = off.
+    think_skip: float = 0.0
+    think_skip_prefix: str = "</think>\n\n"
     # vllm
     gpu_memory_utilization: float = 0.3
     max_model_len: int = 8192  # prompt + completion tokens of a trajectory
@@ -524,6 +531,10 @@ class RLConfig:
             errors.append(f"loss.is_cap must be >= 1, got {loss.is_cap}.")
         if not 0 < loss.icepop_low < 1 < loss.icepop_high:
             errors.append("loss.icepop_low must be in (0, 1) and loss.icepop_high > 1.")
+        if not 0.0 <= r.think_skip < 1.0:
+            errors.append("rollout.think_skip must be in [0, 1).")
+        if r.think_skip and loss.type == "gspo":
+            errors.append("rollout.think_skip needs a token-level loss (its forced token has its own ratio), not gspo.")
         if loss.seq_mask < 0:
             errors.append("loss.seq_mask must be >= 0 (0 = off).")
         if loss.overlong_buffer < 0 or loss.overlong_buffer >= self.completion_budget:

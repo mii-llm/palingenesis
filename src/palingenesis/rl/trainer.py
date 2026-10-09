@@ -401,9 +401,10 @@ class RLTrainer:
                 continue
             ids, _ = right_pad([t.prompt_ids + t.tokens[:-1] for t in micro], self.pad_id, device)
             positions = torch.zeros(ids.shape, dtype=torch.bool)
-            targets, behaviour, advantage, weight, seq = [], [], [], [], []
+            targets, behaviour, advantage, weight, seq, forced = [], [], [], [], [], []
             for row, t in enumerate(micro):
                 sampled = [j for j, trained in enumerate(t.mask) if trained]
+                forced += [j in t.forced for j in sampled] if t.forced else [False] * len(sampled)
                 positions[row, [len(t.prompt_ids) + j - 1 for j in sampled]] = True
                 targets += [t.tokens[j] for j in sampled]
                 behaviour += [t.logprobs[j] for j in sampled]
@@ -420,7 +421,10 @@ class RLTrainer:
             if inv_t != 1.0:
                 hidden = hidden * inv_t
             lp, entropy = target_logprobs(hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight)
-            loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config)
+            forced_t = torch.tensor(forced, dtype=torch.bool).to(device, non_blocking=True) if any(forced) else None
+            loss, stats = policy_loss(
+                lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config, forced_t
+            )
             if self.ref_lp:
                 loss = self._kl_term(loss, stats, lp, torch.cat([self.ref_lp[id(t)] for t in micro]), floats[2])
             loss.backward()
@@ -503,7 +507,10 @@ class RLTrainer:
                 lp, entropy = target_logprobs(rows, self.head, targets, loss_config.log_entropy, self.head_weight)
                 seq = torch.zeros(len(sampled), dtype=torch.long, device=device)
                 seq_len = torch.tensor([float(len(sampled))], device=device)
-                loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config)
+                forced = (
+                    torch.tensor([j in t.forced for j in sampled], dtype=torch.bool, device=device) if t.forced else None
+                )
+                loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced)
                 if self.ref_lp:
                     loss = self._kl_term(loss, stats, lp, self.ref_lp[id(t)], floats[2])
                 _accumulate(totals, stats, loss, entropy)

@@ -3,6 +3,7 @@ multi-turn rollout loop, and the trainer end to end on CPU."""
 
 import asyncio
 import json
+import math
 import sys
 from types import SimpleNamespace
 
@@ -925,3 +926,59 @@ def test_group_shaping_hook_sees_the_scored_group_before_the_overlong_penalty(tm
     assert not skipped.scored and "len" not in skipped.rewards
     short, long, wrong, _ = run("broken")  # a failing function leaves the rewards as scored
     assert short.reward == 1.0 and abs(long.reward - 0.5) < 1e-9
+
+
+def test_think_skip_forces_a_closed_think_trained_with_the_forcing_probability():
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.generation import Generation
+    from palingenesis.rl.pipeline import RLPipeline
+
+    tok = tokenizer("Qwen/Qwen3.5-0.8B")
+    kwargs = {"enable_thinking": True}
+    answer = tok.encode("4", add_special_tokens=False)
+    seen = []
+
+    class Client:
+        def enter(self):
+            pass
+
+        def exit(self):
+            pass
+
+        async def generate(self, prompt_ids, room, temperature):
+            seen.append(prompt_ids)
+            return Generation(answer + [eot], [-0.1] * (len(answer) + 1), "stop", 3)
+
+    eot = end_of_turn_id(tok, kwargs)
+    config = RLConfig()
+    config.set("rollout.think_skip", 0.25)
+    pipe = RLPipeline.__new__(RLPipeline)
+    pipe.tok, pipe.chat, pipe.client, pipe.config = tok, ChatFormat(tok, eot, kwargs), Client(), config
+    pipe.env_pool, pipe.stop_ids, pipe.rollout_start, pipe.reported_errors = None, {eot}, 0.0, set()
+
+    async def rollouts(row):
+        return [await pipe._trajectory(row, 0, 1.0, True, skip) for skip in (True, False)]
+
+    (t, _), (free, _) = asyncio.run(rollouts({"prompt": "2+2?"}))
+    prefix = tok.encode("</think>\n\n", add_special_tokens=False)
+    assert t.info["think_skip"] and t.tokens[: len(prefix)] == prefix and seen[0] == t.prompt_ids + prefix
+    assert t.forced == [0] and t.mask[: len(prefix)] == [True] + [False] * (len(prefix) - 1)
+    assert abs(t.logprobs[0] - math.log(0.25)) < 1e-9 and t.messages[-1]["content"] == "4"
+    assert t.messages[-1].get("reasoning_content") is None
+    assert not free.forced and "think_skip" not in free.info and free.tokens == answer + [eot]
+    # a non-thinking row is left alone
+    (t, _), _ = asyncio.run(rollouts({"prompt": "2+2?", "chat_template_kwargs": {"enable_thinking": False}}))
+    assert not t.forced and "think_skip" not in t.info
+
+    # the forced token's ratio is an intended importance weight: out of the sequence mask, still in the gradient
+    loss_config = RLLossConfig(seq_mask=0.1)
+    lp = torch.tensor([math.log(0.1), -0.2, -0.3])
+    behaviour = torch.tensor([math.log(0.25), -0.2, -0.3])
+    seq, seq_len, adv = torch.zeros(3, dtype=torch.long), torch.tensor([3.0]), torch.ones(3)
+    for forced, kept in ((None, False), (torch.tensor([True, False, False]), True)):
+        x = lp.clone().requires_grad_(True)
+        loss, stats = policy_loss(x, behaviour, adv, torch.ones(3), seq, 1, seq_len, loss_config, forced)
+        loss.backward()
+        assert (stats["seq_masked"] == 0) == kept
+    assert abs(x.grad[0] + 0.4) < 1e-6 and stats["ratio_max"] == 1.0  # -ratio x A, ratio 0.1 / 0.25

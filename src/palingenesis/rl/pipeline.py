@@ -209,7 +209,11 @@ class RLPipeline:
 
     async def _group(self, index: int, row: dict, temperature: float, size: int, training: bool) -> list[Trajectory]:
         gid = next(self.group_ids)
-        results = await asyncio.gather(*(self._trajectory(row, gid, temperature, training) for _ in range(size)))
+        # think-skip: a fixed share of each training group starts with a closed think (the row's view decides if it applies)
+        n_skip = round(self.config.rollout.think_skip * size) if training else 0
+        results = await asyncio.gather(
+            *(self._trajectory(row, gid, temperature, training, k < n_skip) for k in range(size))
+        )
         group = [t for t, _ in results]
         envs = [env for _, env in results]
         try:
@@ -223,7 +227,9 @@ class RLPipeline:
                 self.sampler.observe(index, sum(scored) / len(scored))
         return group
 
-    async def _trajectory(self, row: dict, gid: int, temperature: float, training: bool) -> tuple[Trajectory, Any]:
+    async def _trajectory(
+        self, row: dict, gid: int, temperature: float, training: bool, skip: bool = False
+    ) -> tuple[Trajectory, Any]:
         config = self.config
         r, e = config.rollout, config.env
         env = await self.env_pool.acquire() if self.env_pool is not None else None
@@ -252,6 +258,10 @@ class RLPipeline:
             row_new_tokens = int(row.get("max_new_tokens") or r.max_new_tokens)
             trajectory.info["budget"] = budget
             max_turns = 1 if env is None else e.max_turns
+            forced: list[int] = []
+            if skip and chat.thinking and chat.opens_think:
+                forced = self.tok.encode(r.think_skip_prefix, add_special_tokens=False)
+                trajectory.info["think_skip"] = True
             for turn in range(max_turns):
                 context = len(trajectory.prompt_ids) + len(trajectory.tokens)
                 room = min(
@@ -259,9 +269,13 @@ class RLPipeline:
                     budget - trajectory.sampled_tokens,
                     r.max_model_len - context,
                 )
+                prefix, forced = forced, []  # first turn only
+                room -= len(prefix)
                 if room <= 0:
                     trajectory.finish = "length"
                     break
+                if prefix:
+                    trajectory.append_forced(prefix, math.log(r.think_skip))
                 t_generate = clock()
                 out = await self.client.generate(trajectory.prompt_ids + trajectory.tokens, room, temperature)
                 turn_timing = {"generate_s": clock() - t_generate, "tokens": len(out.ids), "context": context}
@@ -269,7 +283,7 @@ class RLPipeline:
                 logprobs = out.logprobs if out.logprobs or training else [0.0] * len(out.ids)
                 trajectory.append_generated(out.ids, logprobs, out.version)
                 text = self.tok.decode(
-                    [t for t in out.ids if t not in self.stop_ids],
+                    prefix + [t for t in out.ids if t not in self.stop_ids],
                     skip_special_tokens=True,
                 )
                 parsed = parse_assistant(text, chat, e.tool_parser, by_name, f"call_{turn}")
@@ -487,6 +501,13 @@ class RLPipeline:
                     "turn_limit": sum(t.finish == "turns" for t in trajectories) / n,
                 }
             )
+        forced = [t for t in trajectories if t.info.get("think_skip")]
+        if forced:  # think-skip: how often it applied and what skipping earned against thinking
+            free = [t.reward for t in trajectories if t.scored and not t.info.get("think_skip")]
+            skipped = [t.reward for t in forced if t.scored]
+            stats["think_skip/share"] = len(forced) / n
+            if free and skipped:
+                stats["think_skip/reward_gap"] = sum(skipped) / len(skipped) - sum(free) / len(free)
         per_reward: dict[str, list[float]] = defaultdict(list)
         for t in trajectories:
             for name, value in t.rewards.items():
