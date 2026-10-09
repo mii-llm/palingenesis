@@ -164,3 +164,35 @@ def test_verifier_network_is_its_own_setting(tmp_path):
         assert env.get_reward()["reward"] == 1.0  # the verifier resolves names, the agent cannot
     finally:
         env.close()
+
+
+@pytest.mark.skipif(not _docker_ok(), reason="docker unavailable")
+def test_containers_of_exited_runs_are_swept_and_failed_starts_leave_none(tmp_path):
+    import sys
+
+    from palingenesis.rl.envs import harbor
+
+    def ours():
+        r = subprocess.run(["docker", "ps", "-aq", "--filter", f"label={harbor._LABEL}"], capture_output=True, text=True)
+        return set(r.stdout.split())
+
+    before = ours()
+    # a run killed mid-episode: its container outlives it
+    code = (
+        "import os\nfrom palingenesis.rl.envs.harbor import HarborEnv\n"
+        f"env = HarborEnv(); env.reset(task_dir={str(FIXTURE)!r}); os._exit(0)\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+    left = ours() - before
+    assert len(left) == 1
+    assert harbor.sweep_orphans() >= 1 and not (ours() & left)
+
+    # a setup that fails removes the container it started
+    task = tmp_path / "task"
+    shutil.copytree(FIXTURE, task)
+    (task / "environment" / "setup.sh").write_text("exit 3\n")
+    env = HarborEnv()
+    with pytest.raises(RuntimeError, match="setup failed"):
+        env.reset(task_dir=str(task))
+    env.close()
+    assert ours() == before and not harbor._live

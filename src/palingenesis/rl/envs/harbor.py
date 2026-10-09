@@ -45,6 +45,7 @@ RL trajectories); that path needs the harbor package and is not wrapped here.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import io
 import json
@@ -53,6 +54,7 @@ import os
 import shlex
 import subprocess
 import tarfile
+import threading
 import tomllib
 import uuid
 from dataclasses import dataclass, field
@@ -145,6 +147,74 @@ def _docker(*args: str, input: bytes | None = None, timeout: float | None = None
     return subprocess.run(["docker", *args], input=input, capture_output=True, timeout=timeout, check=check)
 
 
+# Episode containers carry the owning process in a label, so containers a dead run left behind (killed by a signal,
+# OOM, a timed-out `docker rm`) are removed by the next run on the host instead of piling up: 513 leaked
+# `sleep infinity` containers were found after a week of runs and evals.
+_LABEL = "palingenesis.harbor.owner"
+_HOST = os.uname().nodename
+_live: set[str] = set()
+_live_lock = threading.Lock()
+_swept = False
+
+
+def _remove(names: list[str], timeout: float = 60) -> bool:
+    if not names:
+        return True
+    try:
+        r = _docker("rm", "-f", *names, check=False, timeout=timeout)
+        return r.returncode == 0 or b"No such container" in r.stderr
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweep_orphans() -> int:
+    """Remove episode containers whose owning process on this host has exited; returns how many."""
+    try:
+        r = _docker("ps", "-a", "--filter", f"label={_LABEL}", "--format", f'{{{{.Names}}}} {{{{.Label "{_LABEL}"}}}}',
+                    check=False, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0
+    dead = []
+    for line in r.stdout.decode(errors="replace").splitlines():
+        name, _, owner = line.strip().partition(" ")
+        host, _, pid = owner.rpartition(":")
+        if host == _HOST and pid.isdigit() and not _pid_alive(int(pid)):
+            dead.append(name)
+    for i in range(0, len(dead), 100):
+        _remove(dead[i:i + 100], timeout=300)
+    if dead:
+        logger.warning("removed %d Harbor containers left behind by exited runs", len(dead))
+    return len(dead)
+
+
+def _sweep_once() -> None:
+    global _swept
+    with _live_lock:
+        if _swept:
+            return
+        _swept = True
+    sweep_orphans()
+
+
+@atexit.register
+def _remove_live() -> None:
+    with _live_lock:
+        names = sorted(_live)
+        _live.clear()
+    for i in range(0, len(names), 100):
+        _remove(names[i:i + 100], timeout=300)
+
+
 def build_image(task: HarborTask, timeout: float | None = None) -> str:
     """Build (once) the image of a task's environment; returns its tag. An explicit [environment].docker_image is
     pulled instead."""
@@ -186,7 +256,8 @@ class DockerRuntime:
         [verifier] allow_internet)."""
         env = self.task.environment
         image = build_image(self.task)
-        args = ["run", "-d", "--name", self.name, "--init",
+        _sweep_once()
+        args = ["run", "-d", "--name", self.name, "--init", "--label", f"{_LABEL}={_HOST}:{os.getpid()}",
                 "--cpus", str(env.get("cpus", 1)), "--memory", f"{int(env.get('memory_mb', 2048))}m",
                 "--pids-limit", str(env.get("pids_limit", 512))]
         if not (env.get("allow_internet", False) if allow_internet is None else allow_internet):
@@ -194,8 +265,18 @@ class DockerRuntime:
         for k, v in (env.get("env") or {}).items():
             args += ["-e", f"{k}={os.path.expandvars(str(v))}"]
         args += [image, "sleep", "infinity"]
-        _docker(*args, timeout=120)
-        self.started = True
+        with _live_lock:
+            _live.add(self.name)
+        self.started = True  # before `docker run`: a run that times out or fails may still have created the container
+        try:
+            _docker(*args, timeout=120)
+            self._provision(provision)
+        except BaseException:
+            self.stop()
+            raise
+
+    def _provision(self, provision: bool) -> None:
+        env = self.task.environment
         self.exec(f"mkdir -p {shlex.quote(self.workdir)} /logs/verifier", timeout=30, workdir="/")  # may not exist yet
         seed = self.task.build_context / "workdir"  # starting files copied in (many tasks can share one image)
         if provision and seed.exists():
@@ -313,9 +394,15 @@ class DockerRuntime:
         return {"reward": 0.0, "metric/verifier_failed": 1.0}
 
     def stop(self) -> None:
+        """Remove the container; one that cannot be removed now (a busy daemon) stays in the process's list and is
+        removed at exit, or by the next run's sweep."""
         if self.started:
-            _docker("rm", "-f", self.name, check=False, timeout=60)
             self.started = False
+            if _remove([self.name]):
+                with _live_lock:
+                    _live.discard(self.name)
+            else:
+                logger.warning("could not remove container %s now; it is retried at exit", self.name)
 
 
 # ------------------------------------------------------------------ environment
