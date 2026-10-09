@@ -877,3 +877,51 @@ def test_trained_policy_is_the_sampled_one_at_any_temperature(sharing):
 
     assert ratio_dev(1.0 / temperature) < 1e-5  # the trained policy is the sampled one
     assert ratio_dev(1.0) > 1e-2  # the old behaviour: unscaled policy vs scaled sampler
+
+
+def test_group_shaping_hook_sees_the_scored_group_before_the_overlong_penalty(tmp_path):
+    from palingenesis.rl.pipeline import RLPipeline
+
+    (tmp_path / "shaping.py").write_text(
+        "def shorter_wins(trajectories, row):\n"
+        "    best = min(len(t.messages[-1]['content']) for t in trajectories if t.reward > 0)\n"
+        "    for t in trajectories:\n"
+        "        if t.reward > 0 and len(t.messages[-1]['content']) > best:\n"
+        "            t.rewards['len'] = -0.1\n"
+        "            t.reward -= 0.1\n"
+        "\n"
+        "def broken(trajectories, row):\n"
+        "    trajectories[0].reward = 99.0\n"
+        "    raise RuntimeError('boom')\n"
+    )
+
+    class Exact:
+        name, weight = "exact", 1.0
+
+        async def score(self, samples):
+            return [None if s["completion"] == "skip" else float(s["completion"].startswith("4")) for s in samples]
+
+    def run(fn):
+        config = RLConfig()
+        config.set("loss.group_shaping", f"{tmp_path / 'shaping.py'}:{fn}")
+        config.set("loss.overlong_buffer", 2)
+        config.set("rollout.max_new_tokens", 8)
+        pipe = RLPipeline.__new__(RLPipeline)
+        pipe.config, pipe.rewards, pipe.env_pool, pipe.sandbox = config, [Exact()], None, None
+        pipe.group_shaping = __import__("palingenesis.rl.rewards", fromlist=["x"]).load_object(config.loss.group_shaping)
+        group = []
+        for text, n in [("4", 2), ("4, since 2+2", 7), ("5", 2), ("skip", 2)]:
+            t = Trajectory({"prompt": "2+2?"}, 0, [1], [{"role": "assistant", "content": text}], tokens=[1] * n,
+                           mask=[True] * n, finish="stop")
+            t.info["prompt"] = "2+2?"
+            group.append(t)
+        asyncio.run(pipe._score(group, [None] * len(group)))
+        return group
+
+    short, long, wrong, skipped = run("shorter_wins")
+    assert short.reward == 1.0 and wrong.reward == 0.0 and "len" not in short.rewards
+    # the shaping term, then the overlong penalty (7 of 8 tokens: one token into the 2-token buffer)
+    assert long.rewards["len"] == -0.1 and long.rewards["overlong"] == -0.5 and abs(long.reward - 0.4) < 1e-9
+    assert not skipped.scored and "len" not in skipped.rewards
+    short, long, wrong, _ = run("broken")  # a failing function leaves the rewards as scored
+    assert short.reward == 1.0 and abs(long.reward - 0.5) < 1e-9

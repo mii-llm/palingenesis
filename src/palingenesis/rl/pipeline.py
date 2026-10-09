@@ -32,7 +32,7 @@ from palingenesis.rl.config import RLConfig
 from palingenesis.rl.data import PromptSampler, prompt_messages
 from palingenesis.rl.env import EnvPool, call_sync_or_async, row_tools, run_tool
 from palingenesis.rl.generation import GenerationClient
-from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample
+from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample, load_object
 from palingenesis.rl.trajectory import Trajectory, group_is_informative
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,7 @@ class RLPipeline:
             sandbox,
         )
         self.stop_ids = set(stop_ids)
+        self.group_shaping = load_object(config.loss.group_shaping) if config.loss.group_shaping else None
         # n-sample merging only helps when a group's rollouts are one turn each
         self.client = GenerationClient(engine, merge=env_pool is None)
         self.lock = threading.RLock()
@@ -410,6 +411,20 @@ class RLPipeline:
                 t.scored = t.trained = False
                 continue
             t.reward = sum(w * v for w, v in applicable)
+        if self.group_shaping is not None:
+            scored = [group[i] for i in live if group[i].scored]
+            if scored:
+                before = [(t.reward, dict(t.rewards)) for t in scored]
+                try:
+                    await call_sync_or_async(self.group_shaping, scored, scored[0].row)
+                except Exception:  # noqa: BLE001 — a broken shaping function must not stop the run
+                    logger.exception("loss.group_shaping failed; the group keeps its rewards")
+                    for t, (reward, rewards) in zip(scored, before):
+                        t.reward, t.rewards = reward, rewards
+        for i in live:
+            t = group[i]
+            if not t.scored:
+                continue
             if loss.overlong_buffer:
                 over = t.sampled_tokens - (t.info.get("budget", budget) - loss.overlong_buffer)
                 if over > 0:

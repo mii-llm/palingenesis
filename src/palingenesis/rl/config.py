@@ -203,6 +203,12 @@ class RLLossConfig:
     kl_ref: str = ""
     kl_coef: float = 0.0
     kl_ref_reset: int = 0
+    # A reward term that needs the whole group (e.g. length relative to the group's shortest correct answer): a
+    # function "module:name" or "path/to/file.py:name" called once per group after scoring, before the overlong
+    # penalty, truncation masking and advantages, as fn(trajectories, row) with the group's scored trajectories
+    # (.reward, .rewards, .messages, .finish, .tokens); it changes .reward in place and may log terms in .rewards.
+    # Async functions are awaited; a function that raises leaves the group's rewards as they were (logged).
+    group_shaping: str = ""
 
 
 @dataclass(slots=True)
