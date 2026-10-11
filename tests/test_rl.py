@@ -982,3 +982,28 @@ def test_think_skip_forces_a_closed_think_trained_with_the_forcing_probability()
         loss.backward()
         assert (stats["seq_masked"] == 0) == kept
     assert abs(x.grad[0] + 0.4) < 1e-6 and stats["ratio_max"] == 1.0  # -ratio x A, ratio 0.1 / 0.25
+
+
+def test_eval_reports_per_family_metrics_on_the_fixed_rows():
+    import threading
+
+    from palingenesis.rl.pipeline import RLPipeline
+
+    config = RLConfig()
+    config.set("data.metrics_key", ["source"])
+    pipe = RLPipeline.__new__(RLPipeline)
+    pipe.config, pipe.env_pool, pipe.lock = config, None, threading.RLock()
+    pipe.weights = SimpleNamespace(sync=lambda engine: None)
+    pipe.engine = SimpleNamespace(wake=lambda: None, sleep=lambda: None)
+
+    def traj(source, reward, n):
+        t = Trajectory({"source": source}, 0, [1], [], tokens=[1] * n, mask=[True] * n, finish="stop")
+        t.reward = reward
+        return t
+
+    groups = [[traj("math", 1.0, 10)], [traj("math", 0.0, 30)], [traj("chat", 0.8, 5)], [traj("chat", 0.2, 5)]]
+    pipe._await = lambda coro: (coro.close(), groups)[1]
+    out = pipe.evaluate([{}] * 4, 0.7)
+    assert out["family/math/reward"] == 0.5 and out["family/math/completion_len"] == 20 and out["family/math/n"] == 2
+    assert out["family/chat/pass@1"] == 0.5  # success_threshold 0.5: 0.8 passes, 0.2 does not
+    assert "reward" in out

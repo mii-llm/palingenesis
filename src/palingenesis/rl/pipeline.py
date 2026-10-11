@@ -554,13 +554,29 @@ class RLPipeline:
     # --------------------------------------------------------------- evaluation
 
     def evaluate(self, rows: list[dict], temperature: float) -> dict[str, float]:
-        """One rollout per held-out row with the newest weights; mean rewards and lengths."""
+        """One rollout per held-out row with the newest weights; mean rewards and lengths. With data.metrics_key, also
+        per family (family/<name>/reward, pass@1, completion_len, n): the same fixed prompts at every evaluation, so a
+        family's trend is not confounded by which prompts training happened to sample (training-time family curves
+        are)."""
         with self.lock:
             self.weights.sync(self.engine)
             self.engine.wake()
             groups = self._await(self._eval(rows, temperature))
             self.engine.sleep()
-        return self._group_stats([t for g in groups for t in g])
+        trajectories = [t for g in groups for t in g]
+        stats = self._group_stats(trajectories)
+        d = self.config.data
+        if d.metrics_key:
+            by: dict[str, list[Trajectory]] = defaultdict(list)
+            for t in trajectories:
+                if t.scored:
+                    by[row_family(t.row, d.metrics_key)].append(t)
+            for family, ts in by.items():
+                stats[f"family/{family}/reward"] = sum(t.reward for t in ts) / len(ts)
+                stats[f"family/{family}/pass@1"] = sum(t.reward >= d.success_threshold for t in ts) / len(ts)
+                stats[f"family/{family}/completion_len"] = sum(t.sampled_tokens for t in ts) / len(ts)
+                stats[f"family/{family}/n"] = float(len(ts))
+        return stats
 
     async def _eval(self, rows: list[dict], temperature: float) -> list[list[Trajectory]]:
         return list(await asyncio.gather(*(self._group(-1, row, temperature, 1, False) for row in rows)))
