@@ -1007,3 +1007,13 @@ def test_eval_reports_per_family_metrics_on_the_fixed_rows():
     assert out["family/math/reward"] == 0.5 and out["family/math/completion_len"] == 20 and out["family/math/n"] == 2
     assert out["family/chat/pass@1"] == 0.5  # success_threshold 0.5: 0.8 passes, 0.2 does not
     assert "reward" in out
+
+
+def test_eval_subset_is_a_fixed_sample_covering_the_whole_file():
+    from palingenesis.rl.trainer import _eval_subset
+
+    rows = [{"i": i, "source": "old" if i < 90 else "new"} for i in range(100)]
+    a, b = _eval_subset(rows, 50, 0), _eval_subset(rows, 50, 0)
+    assert a == b and len(a) == 50 and [r["i"] for r in a] == sorted(r["i"] for r in a)
+    assert any(r["source"] == "new" for r in a)  # a head slice would drop the appended family
+    assert _eval_subset(rows, 0, 0) == rows and _eval_subset(rows, 200, 0) == rows

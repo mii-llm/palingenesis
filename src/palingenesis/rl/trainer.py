@@ -118,7 +118,7 @@ class RLTrainer:
                 "no reward: configure rewards:, pass rewards=[...], or use an environment with get_reward"
             )
         train_rows, eval_rows = self._rows(dataset, eval_dataset)
-        eval_rows = eval_rows[: t.eval_samples] if t.eval_samples else eval_rows
+        eval_rows = _eval_subset(eval_rows, t.eval_samples, config.data.seed)
         # every rank owns a disjoint shard of the prompts (a group never spans ranks)
         self.eval_rows = eval_rows[rank::world]
         self.sampler = PromptSampler(train_rows[rank::world], config.data.seed + rank, config.data.retire_above)
@@ -848,6 +848,15 @@ def _think_tags(tok, kwargs: dict) -> tuple[str, str]:
 
     tags = detect_think_tags(lambda m, **kw: tok.apply_chat_template(m, tokenize=False, **{**kwargs, **kw}))
     return tags or ("<think>", "</think>")
+
+
+def _eval_subset(rows: list[dict], k: int, seed: int) -> list[dict]:
+    """At most k held-out rows: a fixed-seed sample in file order (the same rows at every evaluation and on resume), so
+    families appended at the end of a dev file are evaluated too (a head slice silently dropped them)."""
+    if not k or k >= len(rows):
+        return rows
+    keep = sorted(random.Random(seed).sample(range(len(rows)), k))
+    return [rows[i] for i in keep]
 
 
 def _resolve_resume(resume_from: str, output_dir: str) -> str | None:
