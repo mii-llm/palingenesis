@@ -916,6 +916,14 @@ def test_samplings_truncation_and_loop_detector():
     assert not looped("Una risposta normale, con frasi diverse. Poi un'altra idea. Fine.", "stop")
     assert not looped("<think>" + "loop " * 400 + "</think>Risposta breve.", "stop")  # thinking is not judged
 
+    def call(device):
+        return f'<tool_call>\n<function=set_device>\n<parameter=device_id>\n{device}\n</parameter>\n<parameter=state>\noff\n</parameter>\n</function>\n</tool_call>\n'
+
+    # 15 parallel calls to one function with different arguments share their markup: not a loop
+    assert not looped("".join(call(f"luce_{i}") for i in range(15)), "stop")
+    assert looped("".join(call("luce_1") for _ in range(3)), "stop")  # the same call again and again
+    assert looped(call("luce_1") + "Fatto. " + "Ho spento tutte le luci della casa adesso. " * 12, "stop")  # text loop
+
 
 def test_sampling_mix_options_are_validated():
     from palingenesis.opd.config import OPDConfig, OPDConfigError

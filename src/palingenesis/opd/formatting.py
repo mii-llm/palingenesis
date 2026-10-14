@@ -55,12 +55,22 @@ def encode_prompt(
     return ids
 
 
+_TOOL_CALL = re.compile(r"<tool_call>.*?</tool_call>", re.S)
+
+
 def looped(text: str, finish: str) -> bool:
-    """A degenerate answer: it hit the token budget, or its last 1,500 characters repeat a 60-character span at
-    least 4 times (the repetition-loop detector of the research evaluation suite). Thinking is not judged."""
+    """A degenerate answer: it hit the token budget, it repeats the same tool call (same arguments) 3 or more times,
+    or the last 1,500 characters of its text outside tool calls repeat a 60-character span at least 4 times (the
+    repetition-loop detector of the research evaluation suite). Tool calls are judged as calls, not as text: several
+    parallel calls to one function with different arguments share their markup and are not a loop. Thinking is not
+    judged."""
     if finish == "length":
         return True
-    tail = text.split("</think>")[-1][-1500:]
+    answer = text.split("</think>")[-1]
+    calls = [" ".join(c.split()) for c in _TOOL_CALL.findall(answer)]
+    if calls and max(calls.count(c) for c in set(calls)) >= 3:
+        return True
+    tail = _TOOL_CALL.sub("", answer)[-1500:]
     return any(tail.count(tail[i : i + 60]) >= 4 for i in range(0, max(0, len(tail) - 60), 30))
 
 
