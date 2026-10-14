@@ -31,6 +31,7 @@ from palingenesis.dpo import (  # noqa: E402
     preference_loss,
     preference_step,
     score_weights,
+    sft_token_mask,
     token_logps,
 )
 from palingenesis.loss import shift_labels  # noqa: E402
@@ -394,3 +395,93 @@ def test_prompt_not_repeated_when_completions_are_full_conversations():
     # a prompt followed by bare completions is still prepended
     chosen, _ = _to_conversations({"prompt": "Hi?", "chosen": "Hello", "rejected": "Go away"})
     assert [m["role"] for m in chosen] == ["user", "assistant"]
+
+
+# ── sft_scope: "edits" (SFT term restricted to where chosen and rejected differ) ──
+
+
+def _edit_pair_labels():
+    """One pair: a 3-token prompt, then 12 scored tokens that differ only at index 6 (a
+    substitution), plus a second pair whose rejected answer lacks one token (an insertion)."""
+    ign = IGNORE_INDEX
+    c1 = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+    r1 = c1[:6] + [99] + c1[7:]
+    c2 = [30, 31, 32, 33, 34, 35, 36, 37]
+    r2 = c2[:4] + c2[5:]  # chosen has an extra token at index 4
+    rows = [[ign] * 3 + c1, [ign] * 3 + c2 + [ign] * 4, [ign] * 3 + r1, [ign] * 3 + r2 + [ign] * 5]
+    return torch.tensor(rows)
+
+
+def test_sft_token_mask_all_is_every_chosen_token():
+    shifted = _edit_pair_labels()
+    m = sft_token_mask(shifted, 2, "all")
+    assert torch.equal(m[:2], (shifted[:2] != IGNORE_INDEX).float()) and m[2:].sum() == 0
+
+
+def test_sft_token_mask_edits_window():
+    shifted = _edit_pair_labels()
+    m = sft_token_mask(shifted, 2, "edits", window=2)
+    # pair 0: substitution at scored index 6 (position 9) -> scored 4..8 (positions 7..11)
+    assert m[0].nonzero().squeeze(1).tolist() == list(range(7, 12))
+    # pair 1: inserted chosen token at scored index 4 (position 7) -> scored 2..6 (positions 5..9)
+    assert m[1].nonzero().squeeze(1).tolist() == list(range(5, 10))
+    assert m[2:].sum() == 0
+    assert sft_token_mask(shifted, 2, "edits", window=0)[0].nonzero().squeeze(1).tolist() == [9]
+    # answers that share nothing: every chosen token, as with "all"
+    other = shifted.clone()
+    other[2, 3:] = 500
+    assert torch.equal(sft_token_mask(other, 2, "edits")[0], (other[0] != IGNORE_INDEX).float())
+    with pytest.raises(ValueError):
+        sft_token_mask(shifted, 2, "spans")
+
+
+@pytest.mark.parametrize("num_chunks", [1, 3])
+def test_chunked_gradients_equal_naive_with_edit_scoped_sft(num_chunks):
+    model = _tiny_model()
+    ref = copy.deepcopy(model)
+    with torch.no_grad():
+        for p in ref.parameters():
+            p.add_(0.01 * torch.randn_like(p))
+    ids, mask, labels = _toy_batch()
+    P = ids.shape[0] // 2
+    # make each rejected row a minimal edit of its chosen row (same scored span, two tokens changed)
+    for b in range(P):
+        ids[b + P], labels[b + P] = ids[b].clone(), labels[b].clone()
+        valid = (labels[b] != IGNORE_INDEX).nonzero().squeeze(1)
+        for j in (valid[3], valid[-4]):
+            ids[b + P, j] = (ids[b, j] + 1) % 97
+            labels[b + P, j] = ids[b + P, j]
+    with torch.no_grad():
+        ref_logps = token_logps(
+            ref.transformer(input_ids=ids, attention_mask=mask)[0], shift_labels(labels), ref.lm_head, num_chunks=1
+        )
+    logits = model(input_ids=ids, attention_mask=mask).logits.double()
+    shifted = shift_labels(labels)
+    logp = torch.log_softmax(logits, -1).gather(-1, shifted.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    logp = torch.where(shifted != IGNORE_INDEX, logp, 0.0)
+    a = score_weights(shifted, P, None).double()
+    naive = preference_loss((logp * a).sum(1), (ref_logps.double() * a).sum(1), a.sum(1), beta=0.4).sum() / P
+    edits = sft_token_mask(shifted, P, "edits", window=1).double()
+    assert 0 < edits.sum() < (shifted[:P] != IGNORE_INDEX).sum()
+    naive = naive + 0.2 * -(logp * edits).sum() / edits.sum()
+    naive.backward()
+    naive_grads = {n: p.grad.clone() for n, p in model.named_parameters()}
+    model.zero_grad()
+    hidden = model.transformer(input_ids=ids, attention_mask=mask)[0]
+    step = preference_step(
+        hidden,
+        labels,
+        model.lm_head,
+        ref_logps,
+        P,
+        beta=0.4,
+        sft_weight=0.2,
+        num_chunks=num_chunks,
+        sft_scope="edits",
+        sft_edit_window=1,
+    )
+    step.loss.backward()
+    assert torch.allclose(step.loss, naive, atol=1e-12, rtol=1e-10)
+    for n, p in model.named_parameters():
+        scale = naive_grads[n].abs().max().clamp(min=1e-30)
+        assert (p.grad - naive_grads[n]).abs().max() / scale < 1e-6, n

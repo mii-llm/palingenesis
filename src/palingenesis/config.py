@@ -322,6 +322,11 @@ class DPOConfig:
     # Adds sft_weight × mean NLL over chosen tokens (RPO, arxiv:2404.19733). Anchors the
     # chosen answer so the margin cannot grow by only pushing rejected down.
     sft_weight: float = 0.0
+    # Which chosen tokens the SFT term covers: "all" (RPO as published) or "edits" (only
+    # where chosen and rejected differ, ± sft_edit_window tokens; for minimal-edit pairs
+    # whose chosen side is mostly the policy's own uncorrected text).
+    sft_scope: str = "all"
+    sft_edit_window: int = 8
     # Frozen reference policy. Empty = the model being trained, as loaded
     # (model.name_or_path) — the standard choice.
     reference_model: str = ""
@@ -711,6 +716,12 @@ class Config:
             errors.append(f"dpo.ld_alpha must be in [0, 1] (got {d.ld_alpha}; 1.0 = off).")
         if d.sft_weight < 0:
             errors.append(f"dpo.sft_weight must be >= 0 (got {d.sft_weight}).")
+        from palingenesis.dpo import SFT_SCOPES
+
+        if d.sft_scope not in SFT_SCOPES:
+            errors.append(f"dpo.sft_scope={d.sft_scope!r} is not one of {', '.join(SFT_SCOPES)}.")
+        if d.sft_edit_window < 0:
+            errors.append(f"dpo.sft_edit_window must be >= 0 (got {d.sft_edit_window}).")
         # Features that assume one SFT sequence per row, or change the token stream.
         unsupported = {
             "data.packing": self.data.packing,

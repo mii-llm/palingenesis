@@ -64,6 +64,7 @@ from palingenesis.dpo import (
     disable_dropout,
     preference_step,
     reference_logps,
+    sft_token_mask,
 )
 from palingenesis.health import HealthMonitor
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel, model_type_of
@@ -678,7 +679,7 @@ def train(config: Config):
             raise RuntimeError("DPO needs the model's lm_head (model.lm_head) for chunked log-probs.")
         use_chunked_loss = False  # the DPO branch runs its own chunked passes
         logger.info(
-            f"DPO: loss_type={dpo.loss_type} beta={dpo.beta} sft_weight={dpo.sft_weight} "
+            f"DPO: loss_type={dpo.loss_type} beta={dpo.beta} sft_weight={dpo.sft_weight} sft_scope={dpo.sft_scope} "
             f"ld_alpha={dpo.ld_alpha} label_smoothing={dpo.label_smoothing} "
             f"(per_device_batch_size={config.train.per_device_batch_size} pairs)"
         )
@@ -1108,7 +1109,14 @@ def train(config: Config):
                     num_chunks = _dynamic_num_chunks(input_ids.numel(), _loss_vocab_size)
                     # Averages match SFT's global-token denominator: pairs (and chosen
                     # tokens, for the SFT term) summed over ranks and GA micro-steps.
-                    local_chosen = (shift_labels(raw_labels[:num_pairs]) != IGNORE_INDEX).sum()
+                    if dpo.sft_scope == "all":
+                        local_chosen = (shift_labels(raw_labels[:num_pairs]) != IGNORE_INDEX).sum()
+                    else:  # the SFT term averages over the tokens it covers
+                        local_chosen = (
+                            sft_token_mask(shift_labels(raw_labels), num_pairs, dpo.sft_scope, dpo.sft_edit_window)
+                            .sum()
+                            .long()
+                        )
                     if is_fsdp:
                         global_chosen = local_chosen.clone()
                         dist.all_reduce(global_chosen, op=dist.ReduceOp.SUM)
@@ -1138,6 +1146,8 @@ def train(config: Config):
                         pair_denom=num_pairs * world_size * current_ga,
                         chosen_token_denom=max(global_chosen.item(), 1) * current_ga,
                         num_chunks=num_chunks,
+                        sft_scope=dpo.sft_scope,
+                        sft_edit_window=dpo.sft_edit_window,
                     )
                     loss = step_out.loss
                     del ref_logps

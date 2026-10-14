@@ -57,6 +57,8 @@ def test_valid_dpo_config_passes():
         ({"beta": 0.0}, "beta"),
         ({"loss_type": "robust", "label_smoothing": 0.5}, "label_smoothing"),
         ({"label_smoothing": 0.1}, "only used by loss_type=robust"),
+        ({"sft_scope": "spans"}, "sft_scope"),
+        ({"sft_edit_window": -1}, "sft_edit_window"),
         ({"ld_alpha": 1.5}, "ld_alpha"),
         ({"sft_weight": -1.0}, "sft_weight"),
     ],

@@ -67,8 +67,13 @@ Supported `loss_type`s (definitions as in Hugging Face TRL's DPOTrainer):
     sigmoid_norm  length-normalised DPO                 -log sigma(beta * delta_avg)
 where delta = (policy - reference) log-ratio of chosen minus that of rejected.
 `sft_weight` adds the mean NLL over chosen tokens (RPO, arXiv:2404.19733).
+`sft_scope: edits` restricts that NLL to the chosen tokens where chosen and
+rejected differ (a token-level diff of the two answers, ± `sft_edit_window`
+tokens): for minimal-edit pairs, whose chosen side is mostly the policy's own
+uncorrected text, the anchor then lands on the corrections only.
 """
 
+import difflib
 import json
 import logging
 from dataclasses import dataclass
@@ -85,6 +90,7 @@ from palingenesis.loss import _BackwardBridge, shift_labels
 logger = logging.getLogger(__name__)
 
 LOSS_TYPES = ("sigmoid", "hinge", "ipo", "robust", "sigmoid_norm")
+SFT_SCOPES = ("all", "edits")
 
 
 # ==============================================================================
@@ -401,6 +407,38 @@ def score_weights(shifted_labels: torch.Tensor, num_pairs: int, ld_alpha: float 
     return torch.where(position <= shared, mask, ld_alpha * mask)
 
 
+def sft_token_mask(shifted_labels: torch.Tensor, num_pairs: int, scope: str = "all", window: int = 8) -> torch.Tensor:
+    """[2P, S] float mask of the chosen tokens the SFT (RPO) term covers; rejected rows are 0.
+
+    scope "all": every scored chosen token. scope "edits": only the scored chosen tokens
+    inside a non-equal region of a token-level diff between the pair's chosen and
+    rejected answers, widened by `window` scored tokens on each side (a deletion in the
+    chosen answer marks the window around its position). Pairs whose answers share no
+    tokens get every chosen token, as with "all"."""
+    if scope not in SFT_SCOPES:
+        raise ValueError(f"unknown dpo.sft_scope {scope!r}; expected one of {SFT_SCOPES}")
+    valid = shifted_labels != IGNORE_INDEX
+    mask = torch.zeros(shifted_labels.shape, dtype=torch.float32, device=shifted_labels.device)
+    if scope == "all":
+        mask[:num_pairs] = valid[:num_pairs].float()
+        return mask
+    labels_cpu, valid_cpu = shifted_labels.cpu(), valid.cpu()
+    for b in range(num_pairs):
+        pos = valid_cpu[b].nonzero().squeeze(1)
+        chosen = labels_cpu[b][pos].tolist()
+        rejected = labels_cpu[b + num_pairs][valid_cpu[b + num_pairs]].tolist()
+        keep = torch.zeros(len(chosen), dtype=torch.bool)
+        matcher = difflib.SequenceMatcher(None, chosen, rejected, autojunk=False)
+        if matcher.find_longest_match(0, len(chosen), 0, len(rejected)).size == 0:
+            keep[:] = True
+        else:
+            for op, i1, i2, _, _ in matcher.get_opcodes():
+                if op != "equal":
+                    keep[max(0, i1 - window) : min(len(chosen), max(i2, i1 + 1) + window)] = True
+        mask[b, pos[keep].to(mask.device)] = 1.0
+    return mask
+
+
 # ==============================================================================
 # LOSS
 # ==============================================================================
@@ -462,6 +500,8 @@ def preference_step(
     pair_denom: float | None = None,
     chosen_token_denom: float | None = None,
     num_chunks: int = 1,
+    sft_scope: str = "all",
+    sft_edit_window: int = 8,
 ) -> PreferenceStep:
     """The DPO loss for one micro-batch, via two chunked passes (see module doc).
 
@@ -471,7 +511,8 @@ def preference_step(
     pair_denom: normaliser of the summed pair losses; defaults to P. Set it to
                 (global pairs) * (grad-accum steps) so micro-batches and ranks
                 average exactly as SFT's valid-token denominator does.
-    chosen_token_denom: normaliser of the SFT term (defaults to local chosen tokens).
+    chosen_token_denom: normaliser of the SFT term (defaults to the local tokens it covers).
+    sft_scope / sft_edit_window: which chosen tokens the SFT term covers (`sft_token_mask`).
     """
     shifted = shift_labels(labels)
     a = score_weights(shifted, num_pairs, ld_alpha)
@@ -488,8 +529,11 @@ def preference_step(
     (grad_scores,) = torch.autograd.grad(dpo_loss, scores)
     weights = grad_scores.unsqueeze(1) * a  # dL/dlog pi(y_t) for every token
 
-    chosen_mask = torch.zeros_like(a)
-    chosen_mask[:num_pairs] = (shifted[:num_pairs] != IGNORE_INDEX).float()
+    chosen_mask = (
+        sft_token_mask(shifted, num_pairs, sft_scope, sft_edit_window).to(a.dtype)
+        if sft_weight
+        else torch.zeros_like(a)
+    )
     sft_value = torch.zeros((), device=hidden.device)
     if sft_weight:
         denom = float(chosen_token_denom if chosen_token_denom is not None else max(chosen_mask.sum().item(), 1.0))

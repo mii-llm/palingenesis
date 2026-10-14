@@ -78,7 +78,11 @@ Two modifiers combine with any objective:
   [arXiv:2404.19733](https://arxiv.org/abs/2404.19733)). It keeps the chosen
   answer likely. Without
   it, the margin can grow purely by pushing the rejected answer down, which
-  pure DPO is known to do.
+  pure DPO is known to do. **`sft_scope: edits`** restricts that NLL to the
+  chosen tokens where chosen and rejected differ (a token-level diff, widened by
+  `sft_edit_window` tokens, default 8). Use it for minimal-edit pairs, whose
+  chosen answer is mostly the policy's own text: plain RPO would then be SFT on
+  that uncorrected text. The default `all` is RPO as published.
 - **`ld_alpha < 1`** is LD-DPO ([arXiv:2409.06411](https://arxiv.org/abs/2409.06411)): tokens up to the length both answers share count
   fully, and the longer answer's tail counts `ld_alpha`. Leave it at 1.0 when the
   defect you are training against *is* the tail, e.g. a rejected answer that
