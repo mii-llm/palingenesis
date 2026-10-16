@@ -273,7 +273,7 @@
   overflow: hidden;
   background-image:
     linear-gradient(180deg, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.35) 45%, rgba(0,0,0,0.7) 100%),
-    url("../assets/pgs.png");
+    url("../assets/pgs.webp");
   background-size: cover;
   background-position: center 40%;
   color: #f4f1ec;

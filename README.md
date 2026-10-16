@@ -1,7 +1,7 @@
 # palingenesis
 
 <p align="center">
-  <img src="./assets/pgs.png" alt="palingenesis" width="100%">
+  <img src="./assets/pgs.webp" alt="palingenesis" width="100%">
 </p>
 
 **Fire-and-forget LLM fine-tuning with state-of-the-art defaults.**
