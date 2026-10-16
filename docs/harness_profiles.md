@@ -1,5 +1,8 @@
 # Harness profiles (HarborEnv)
 
+> The user guide is on the docs site: `mkdocs_docs/guides/harness-profiles.md` (and `guides/harbor.md` for the
+> environment itself). This page keeps the design notes.
+
 Small agents are deployed inside agent harnesses (opencode, pi, mini-swe-agent, OpenHands, ...), and each harness
 speaks its own dialect: system prompt, tool names and argument names, observation format, error wording, how an
 episode ends and where the final answer comes from. A **harness profile** reproduces one harness at a pinned version

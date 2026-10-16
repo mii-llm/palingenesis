@@ -40,6 +40,33 @@ Annotate a multiple-choice pool with its teacher's own answers (`teacher_answer`
 pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl
 ```
 
+### rl
+
+Reinforcement learning: groups of rollouts scored by rewards (checked answers, tests, judges, environments), one policy-gradient step per batch. See the [Reinforcement Learning guide](../guides/rl.md).
+
+```bash
+pgs rl --config configs/rl_harbor.yaml
+```
+
+### harbor
+
+Harbor task directories (one Docker environment with tests per task). See [Harbor Environments](../guides/harbor.md).
+
+```bash
+pgs harbor check data/harbor_tasks [--workers 8] [--json] [--workdir /app]   # oracle must pass, nop must not; exit 1 if any task is invalid
+pgs harbor rows  data/harbor_tasks data/harbor_rows.jsonl [--no-system]      # training rows {task_dir, messages}
+```
+
+### harness
+
+Harness profiles for Harbor tasks: list them, and record what a real agent harness sends to its model. See [Harness Profiles](../guides/harness-profiles.md#recording-a-real-harness-pgs-harness).
+
+```bash
+pgs harness profiles                                                     # built-in profiles and their sources
+pgs harness serve   --script turns.json --out requests.jsonl [--port 8000] [--model NAME]
+pgs harness capture opencode --task task_steps/ --script turns.json --out captures/opencode [--harbor 0.24.0]
+```
+
 ### autopilot
 
 Zero-config autonomous training. Profiles hardware, sweeps LR, trains to completion.

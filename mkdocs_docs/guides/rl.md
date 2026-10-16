@@ -121,13 +121,14 @@ Tools that are not methods (HTTP routes, MCP servers) come from `tool_schemas()`
 
 **Which tools the policy gets.** Every public method is a tool unless the class pins its set, so a public helper (`grade()`, `check()`) would be callable by the policy, and RL finds such things. Pin them with a class attribute, `tools = ("python", "submit_answer")`, or for any environment (MCP and remote ones included) with `env.allowed_tools: [python, "search__*"]` (names or shell-style patterns; one matching nothing is an error). Only the exposed tools can be called: anything else is answered "unknown tool" before it reaches the environment. The run logs the list at startup. `configs/rl_agentic_math.yaml` is a complete example: GSM8K with `python` (sandboxed) and `submit_answer` (ends the episode; the environment grades it).
 
-Two adapters make other standards palingenesis environments, with no special case in the trainer:
+These adapters make other standards palingenesis environments, with no special case in the trainer:
 
 | `env.type` | |
 |---|---|
 | `palingenesis.rl.envs.openenv:OpenEnvAdapter` | [OpenEnv](https://github.com/meta-pytorch/OpenEnv) servers, remote over WebSocket (`args: {base_url}`) or the server class in-process (`args: {env_class}`); MCP tools are listed automatically, step environments get one tool taking their Action; `reset_fields` forwards the task selection so a group's rollouts see the same task |
 | `palingenesis.rl.envs.nemo_gym:NemoGymAdapter` | NeMo Gym resources servers: `seed_session`, one route per tool, `verify` with the transcript; a masked sample is skipped. Runs any Nemotron-RL dataset against its own verifier |
 | `palingenesis.rl.envs.mcp:MCPEnv` | Any [MCP](https://modelcontextprotocol.io) server: its tools become the policy's tools (below) |
+| `palingenesis.rl.envs.harbor:HarborEnv` | [Harbor](https://harborframework.com) task directories: a fresh Docker container per episode, the task's tests as the reward; optionally the dialect of a real agent harness (opencode, pi, mini-swe-agent, OpenHands, qwen-code, goose, hermes, SWE-agent, terminus-2), one per GRPO group. See [Harbor Environments](harbor.md) and [Harness Profiles](harness-profiles.md) |
 
 Tool calls are parsed in the model's own format (Hermes JSON for Qwen2.5/Qwen3, XML for Qwen3-Coder/Qwen3.5), run concurrently with a timeout, and their results (sanitized: a tool cannot inject control tokens; cut to `env.max_tool_output_tokens`) are appended as tokens rendered by the model's own chat template. Nothing is ever re-tokenized: what the trainer scores is exactly what the sampler saw, and only sampled tokens are trained. A tool error is returned to the policy as the tool's answer.
 

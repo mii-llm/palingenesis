@@ -22,6 +22,8 @@ env:
   max_concurrent: 64          # containers alive at once (each has the task's CPU / memory limits)
   max_tool_output_tokens: 1024
   tool_timeout: 120           # a bash command may run tests or a build
+  # args:                     # train under several real agent harnesses, one per GRPO group (guides/harness-profiles.md)
+  #   profiles: {palingenesis-default: 1, opencode: 1, pi: 1, mini-swe-agent: 1, openhands-sdk: 1, qwen-code: 1}
 
 rollout:
   backend: vllm
