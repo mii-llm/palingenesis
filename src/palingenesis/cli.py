@@ -30,6 +30,7 @@ Commands:
   distill-score  Annotate an mcqa distillation pool with the teacher's answers (filter before training)
   rl          Reinforcement learning: rollouts scored by rewards (math, code, tools, your own)
   harbor      Harbor task directories (Docker envs with tests): check oracle/nop, export RL rows
+  harness     Harness profiles for Harbor tasks: list, record a real harness's requests (capture)
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
   prepare     Score and filter data by difficulty (offline, uses model inference)
   prepare-multi  Prepare multiple sources with per-source scoring + MSFT allocation
@@ -90,6 +91,11 @@ def main():
             from palingenesis.rl.envs.harbor import main as harbor_main
 
             sys.exit(harbor_main())
+
+        case "harness":
+            from palingenesis.rl.envs.harness.capture import main as harness_main
+
+            sys.exit(harness_main())
 
         case "distill-score":
             from palingenesis.opd.score_pool import main as distill_score_main

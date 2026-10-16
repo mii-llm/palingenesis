@@ -77,12 +77,16 @@ class LocalRuntime:
         return {"reward": 1.0 if (Path(self.workdir) / "hello.txt").exists() else 0.0, "extra": 0.5}
 
 
-@pytest.fixture
-def rt(tmp_path):
+def make_runtime(tmp_path) -> LocalRuntime:
     root = tmp_path / "work"
     root.mkdir()
     LocalRuntime.root = root.resolve()
     return LocalRuntime()
+
+
+@pytest.fixture
+def rt(tmp_path):
+    return make_runtime(tmp_path)
 
 
 @pytest.fixture
@@ -212,10 +216,8 @@ def test_list_dir_glob_and_grep(ws, rt):
         ops.glob(ws, "*", ws.abspath("src/a.py"))
 
 
-def test_phase_two_ops_are_stubs(ws):
-    with pytest.raises(NotImplementedError, match="phase 2"):
-        ops.keys(ws, "ls\n")
-    with pytest.raises(NotImplementedError, match="phase 2"):
+def test_apply_patch_is_a_stub(ws):
+    with pytest.raises(NotImplementedError, match="apply_patch grammar"):
         ops.apply_patch(ws, "*** Begin Patch")
 
 
@@ -308,10 +310,10 @@ def test_opencode_wording(rt):
     kept = big.split("\n\n", 2)[2]  # the last 2000 lines ("\n"-split, the trailing empty line included)
     assert kept.startswith("1002\n") and kept.endswith("\n3000\n")
     assert sorted(call("glob", {"pattern": "**/*.txt"}).splitlines()) == [f"{rt.workdir}/f.txt", f"{rt.workdir}/n/x.txt"]
-    assert call("grep", {"pattern": "alpha"}) == f"Found 1 matches\n{p}:\n  Line 1: alpha"
+    assert call("grep", {"pattern": "alpha"}) == f"Found 1 matches\n{p}:\n  Line 1: alpha\n"
     assert call("grep", {"pattern": "nothing-here"}) == "No files found"
-    assert call("todowrite", {}) == ("Model tried to call unavailable tool 'todowrite'. Available tools: bash, read, "
-                                     "write, edit, glob, grep.")
+    assert call("todowrite", {}) == ("The arguments provided to the tool are invalid: Model tried to call unavailable "
+                                     "tool 'todowrite'. Available tools: bash, edit, glob, grep, invalid, read, write.")
 
 
 def test_pi_wording(rt):
@@ -589,7 +591,7 @@ def test_harbor_env_runs_a_profile_and_logs_it(local_harbor):
     assert env.session is None
 
 
-def _pipeline_episode(profile, script):
+def _pipeline_episode(profile, script, env_args=None, kwargs=None):
     import torch
 
     from palingenesis.opd.orchestrator import PublishedWeights
@@ -602,7 +604,7 @@ def _pipeline_episode(profile, script):
     from tests.test_rl import ScriptedEngine, tokenizer
 
     tok = tokenizer("Qwen/Qwen3-0.6B")
-    kwargs = {"enable_thinking": False}
+    kwargs = kwargs or {"enable_thinking": False}
     eot = end_of_turn_id(tok, kwargs)
     config = RLConfig()
     for key, value in {"model.policy": "x", "model.chat_template_kwargs": kwargs, "env.max_turns": 6,
@@ -611,7 +613,7 @@ def _pipeline_episode(profile, script):
     rows = [_row()]
     pipeline = RLPipeline(tok, ChatFormat(tok, eot, kwargs), ScriptedEngine(tok, eot, script),
                           PublishedWeights(torch.nn.Linear(1, 1)), config, PromptSampler(rows), [],
-                          EnvPool(HarborEnv, {"profile": profile}), None, (eot,))
+                          EnvPool(HarborEnv, {"profile": profile, **(env_args or {})}), None, (eot,))
     try:
         (group,) = pipeline._await(pipeline._eval(rows, 1.0))
     finally:

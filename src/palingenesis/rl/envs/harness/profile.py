@@ -29,6 +29,13 @@ from palingenesis.rl.envs.harness.rules import FLAG, AnswerRule, LastText, NoCal
 FORMAT_ERROR = "__format_error__"  # the synthetic action that answers a turn breaking the protocol
 
 
+def fn_schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    """An OpenAI function tool schema."""
+    return {"type": "function", "function": {"name": name, "description": description,
+                                             "parameters": {"type": "object", "properties": properties,
+                                                            "required": required}}}
+
+
 @dataclass
 class ToolSpec:
     schema: dict
@@ -43,7 +50,7 @@ def _default_format_error(reason: str, n: int) -> str:
     return f"Format error: {reason}"
 
 
-def _default_unknown_tool(name: str, names: list[str]) -> str:
+def _default_unknown_tool(name: str, names: list[str], arguments: dict | None = None) -> str:
     return f"Error: unknown tool {name!r}. Available tools: {', '.join(names)}."
 
 
@@ -68,10 +75,15 @@ class HarnessProfile:
     answer: AnswerRule = field(default_factory=LastText)
     context: Context = field(default_factory=Context)
     format_error: Callable[[str, int], str] = _default_format_error
-    unknown_tool: Callable[[str, list[str]], str] = _default_unknown_tool
+    unknown_tool: Callable[[str, list[str], dict], str] = _default_unknown_tool  # (name, tool names, arguments)
+    alias: Callable[[str, dict, list[str]], tuple[str, dict] | None] | None = None  # the harness's own repair of an
+    # unknown tool name (opencode lowercases, OpenHands maps bash -> terminal): (name, arguments) to run instead
+    start: Callable[["Session"], dict[str, str]] | None = None  # per-episode setup (e.g. a tmux session) returning
+    # extra template values for the first turn (e.g. {terminal_state})
     exec_timeout: float = 60  # default shell timeout (seconds) when the call sets none
     runtime_max_output: int = 8_000_000  # the episode runtime's own output cap (the profile truncates first)
-    chat_template_kwargs: dict | None = None  # recorded with the profile (e.g. enable_thinking); not applied yet
+    chat_template_kwargs: dict | None = None  # applied to the episode's chat template (e.g. enable_thinking); None:
+    # the model's default, as a harness that sends no chat_template_kwargs to vLLM gets
     emulates: str = ""  # what was read to write the profile
     legacy: bool = False
     values: dict[str, str] = field(default_factory=dict)  # extra template values (date, model)
@@ -88,7 +100,7 @@ class HarnessProfile:
         return [t.schema for t in self.tools]
 
     def messages(self, instruction: str, **values: str) -> list[dict]:
-        vals = {"workdir": "/workdir", "date": "", "model": "", "system_information": "Linux", "git_repo": "no",
+        vals = {"workdir": "/workdir", "date": "", "model": "", "system_information": "Linux", "git_repo": "no", "git_root": "/",
                 **self.values, **values}
         vals["tools"] = "" if self.protocol.native else self.protocol.instructions(self.schemas())
         vals["instruction"] = instruction
@@ -125,6 +137,11 @@ class Session:
         if self.ws is not None and "{git_repo}" in templates:
             r = self.ws.sh(f"git -C {shlex.quote(self.workdir)} rev-parse --is-inside-work-tree 2>/dev/null", timeout=30)
             values["git_repo"] = "yes" if r.stdout.strip() == "true" else "no"
+        if self.ws is not None and "{git_root}" in templates:
+            r = self.ws.sh(f"git -C {shlex.quote(self.workdir)} rev-parse --show-toplevel 2>/dev/null", timeout=30)
+            values["git_root"] = r.stdout.strip() if r.exit_code == 0 and r.stdout.strip() else "/"
+        if p.start is not None:
+            values.update(p.start(self))
         return p.messages(instruction, **values)
 
     @property
@@ -174,13 +191,22 @@ class Session:
             out = ""
         else:
             spec = p.by_name.get(name)
+            if spec is None and p.alias is not None:  # the harness repairs the name itself
+                routed = p.alias(name, dict(arguments or {}), list(p.by_name))
+                if routed is not None and routed[0] in p.by_name:
+                    name, arguments = routed
+                    spec = p.by_name[name]
             if spec is None or spec.bind is None:
-                return p.unknown_tool(name, list(p.by_name))
+                return p.unknown_tool(name, list(p.by_name), dict(arguments or {}))
             try:
                 out = spec.bind(self, dict(arguments or {}))
             except ops.OpError as e:  # a binding that does not word this error itself
                 out = f"Error: {e.kind}: " + ", ".join(f"{k}={v}" for k, v in e.data.items())
         return p.stop.on_tool(self, name, arguments or {}, out)
+
+    def unknown_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        """A call of a tool the episode does not expose: the harness's alias, or its own error message."""
+        return self.call_tool(name, arguments)
 
     def observation_text(self, results: list[tuple[str, str]]) -> str:
         if results and all(n == FORMAT_ERROR for n, _ in results):

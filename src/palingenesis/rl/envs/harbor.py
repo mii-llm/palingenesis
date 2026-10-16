@@ -467,7 +467,8 @@ class HarborEnv:
 
     def __init__(self, tools: list[str] | None = None, reward_key: str = "reward", workdir: str | None = None,
                  max_output: int = 16000, profile: str | None = None, profiles: dict[str, float] | None = None,
-                 profile_seed: int = 0):
+                 profile_seed: int = 0, profile_chat_kwargs: dict[str, dict] | None = None,
+                 images: dict[str, str] | None = None):
         self.tool_names = list(tools or TOOL_SCHEMAS)
         self.reward_key = reward_key
         self.workdir = workdir
@@ -478,6 +479,8 @@ class HarborEnv:
         self.harness = None
         self.session = None
         self.episode_info: dict = {}
+        self.profile_chat_kwargs = dict(profile_chat_kwargs or {})  # {profile name: chat_template_kwargs} overrides
+        self.images = dict(images or {})  # {task docker_image: image to use}, e.g. harbor3-base:1 -> :3 (tmux)
         if profile or profiles:
             from palingenesis.rl.envs.harness import HarnessMix
 
@@ -487,6 +490,9 @@ class HarborEnv:
         self.close()
         self.task = HarborTask.load(task_dir)
         drawn = self.harness.draw({**row, "task_dir": task_dir}, self.episode_group) if self.harness else None
+        image = self.task.environment.get("docker_image")
+        if image in self.images:  # another image for the same task (one with tmux for terminus-2)
+            self.task.config.setdefault("environment", {})["docker_image"] = self.images[image]
         cap = self.max_output if drawn is None or drawn.legacy else max(self.max_output, drawn.runtime_max_output)
         self.rt = DockerRuntime(self.task, self.workdir, cap)  # workdir None: the task's (or /workdir)
         self.done = False
@@ -497,7 +503,9 @@ class HarborEnv:
         from palingenesis.rl.envs.harness import Session
 
         self.session = Session(drawn, self.rt)
-        self.episode_info = {"harness_profile": drawn.id}
+        kwargs = self.profile_chat_kwargs.get(drawn.name, self.profile_chat_kwargs.get(drawn.id,
+                                                                                         drawn.chat_template_kwargs))
+        self.episode_info = {"harness_profile": drawn.id, **({"chat_template_kwargs": dict(kwargs)} if kwargs else {})}
         user = next((m.get("content") for m in reversed(row.get("messages") or []) if m.get("role") == "user"), None)
         return self.session.conversation(user if isinstance(user, str) and user else self.task.instruction)
 
@@ -515,6 +523,15 @@ class HarborEnv:
         if self.session is not None:  # harness profiles hook
             return self.session.observation_text(results)
         return "\n\n".join(out for _, out in results)
+
+    def unknown_tool(self, name: str, arguments: dict[str, Any]) -> str | None:
+        """A call of a tool the episode does not expose: the harness's own answer (or alias) under a profile; None
+        (the trainer's own message) otherwise."""
+        if self.session is None or self.session.profile.legacy:
+            return None
+        out = self.session.unknown_tool(name, arguments)  # harness profiles hook
+        self.done = self.session.done
+        return out
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         if self.session is not None and not self.session.profile.legacy:  # harness profiles hook

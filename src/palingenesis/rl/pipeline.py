@@ -255,7 +255,9 @@ class RLPipeline:
             schemas = schemas or row_tools(row, config.data.tools_field)
             by_name = {s["function"]["name"]: s for s in schemas or []}
             # a row may carry its own template kwargs (thinking or not) and generation budgets
-            chat = self.chat.with_kwargs(row.get("chat_template_kwargs"))
+            # (the environment's episode kwargs, e.g. a harness profile's enable_thinking, under the row's own)
+            episode = (getattr(env, "episode_info", None) or {}).get("chat_template_kwargs") if env is not None else None
+            chat = self.chat.with_kwargs({**(episode or {}), **(row.get("chat_template_kwargs") or {})})
             trajectory.prompt_ids = encode_prompt(self.tok, messages, schemas, chat.kwargs)
             budget = int(row.get("max_completion_tokens") or config.completion_budget)
             row_new_tokens = int(row.get("max_new_tokens") or r.max_new_tokens)
@@ -581,8 +583,8 @@ class RLPipeline:
                 stats[f"family/{family}/n"] = float(len(ts))
         return stats
 
-    async def _eval(self, rows: list[dict], temperature: float) -> list[list[Trajectory]]:
-        return list(await asyncio.gather(*(self._group(-1, row, temperature, 1, False) for row in rows)))
+    async def _eval(self, rows: list[dict], temperature: float, size: int = 1) -> list[list[Trajectory]]:
+        return list(await asyncio.gather(*(self._group(-1, row, temperature, size, False) for row in rows)))
 
     def close(self) -> None:
         if self.continuing:  # partial rollouts nobody will train on

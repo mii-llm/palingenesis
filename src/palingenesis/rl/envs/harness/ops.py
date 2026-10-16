@@ -16,7 +16,8 @@ edit(path, edits[]) and OpenHands' file_editor(str_replace) with each harness's 
     undo_edit      restore a file's content before its last edit by these ops (single level)
     glob / grep    file search by pattern / content search by regular expression
     end            the final message (stop rules decide what ending means)
-    keys, apply_patch   phase 2 (tmux keystrokes, the apply_patch grammar): NotImplementedError
+    Tmux / keys    a persistent PTY (tmux) driven by keystrokes, with deterministic waits (terminus-2)
+    apply_patch    not implemented (the codex / opencode gpt-* apply_patch grammar): NotImplementedError
 
 Runtime contract (DockerRuntime, or a test double): .workdir, .exec(command, timeout, env=None, workdir=None) ->
 ExecResult(exit_code, stdout, stderr, timed_out), .put_files({path: data}, "/", as_user=True), optionally .scratch
@@ -156,14 +157,99 @@ def reset_shell(ws: Workspace) -> None:
     ws.sh(f"rm -f {st}.env {st}.cwd")
 
 
-def keys(ws: Workspace, keystrokes: str, duration: float = 1.0) -> str:
-    raise NotImplementedError("Keys (tmux keystrokes, terminus-2) is phase 2 of the harness profiles: it needs a "
-                              "persistent PTY (tmux) in the task image")
+class Tmux:
+    """A persistent PTY in the container: a tmux session running `bash --login` (terminus-2's TmuxSession), driven by
+    keystrokes. Waits are deterministic: after the keys, poll until the pane's shell has no child process and the
+    screen is unchanged between two polls, at most `duration` seconds (a real harness sleeps the whole duration;
+    a command that finishes early shows the same screen either way, one still running is cut at the duration)."""
+
+    PASTE_ABOVE = 8000  # bytes: longer literal keys go through a tmux paste buffer (send-keys has a size limit)
+
+    def __init__(self, ws: Workspace, name: str = "pgs", width: int = 160, height: int = 40, poll: float = 0.15):
+        self.ws, self.name, self.width, self.height, self.poll = ws, name, width, height, poll
+        self.previous: str | None = None
+        self.started = False
+
+    def _t(self) -> str:
+        return shlex.quote(self.name)
+
+    def start(self) -> None:
+        r = self.ws.sh("command -v tmux >/dev/null 2>&1 || exit 127; export TERM=xterm-256color SHELL=/bin/bash; "
+                       f"tmux new-session -x {self.width} -y {self.height} -d -s {self._t()} 'bash --login' && "
+                       "tmux set-option -g history-limit 10000000 >/dev/null", timeout=30, workdir=self.ws.workdir)
+        if r.exit_code == 127:
+            raise OpError("no_tmux", detail="tmux is not installed in the task image")
+        if r.exit_code != 0:
+            raise OpError("no_tmux", detail=(r.stderr or r.stdout).strip()[-300:])
+        self.started = True
+
+    def send(self, keys: str) -> None:
+        if not keys:
+            return
+        if len(keys.encode()) > self.PASTE_ABOVE:
+            path = f"{self.ws.scratch}/.pgs_paste_{uuid.uuid4().hex[:8]}"
+            self.ws.rt.put_files({path: keys}, "/", as_user=True)
+            q = shlex.quote(path)
+            self.ws.sh(f"tmux load-buffer -b pgs {q} && tmux paste-buffer -d -b pgs -t {self._t()}; rm -f {q}")
+            return
+        self.ws.sh(f"tmux send-keys -t {self._t()} -- {shlex.quote(keys)}")
+
+    def _probe(self) -> tuple[bool, str]:
+        r = self.ws.sh(f"p=$(tmux display -p -t {self._t()} '#{{pane_pid}}'); "
+                       f"if pgrep -P \"$p\" >/dev/null 2>&1; then echo BUSY; else echo IDLE; fi; "
+                       f"tmux capture-pane -p -t {self._t()} | cksum")
+        lines = r.stdout.splitlines()
+        return (bool(lines) and lines[0] == "IDLE"), (lines[1] if len(lines) > 1 else "")
+
+    def wait(self, duration: float) -> None:
+        import time
+
+        limit = max(0.0, min(float(duration), 60.0))
+        start = time.monotonic()
+        time.sleep(min(self.poll, limit))
+        last = None
+        while True:
+            idle, screen = self._probe()
+            if idle and screen == last:
+                return
+            last = screen
+            if time.monotonic() - start >= limit:
+                return
+            time.sleep(self.poll)
+
+    def capture(self, entire: bool = False) -> str:
+        return self.ws.sh(f"tmux capture-pane -p {'-S - ' if entire else ''}-t {self._t()}").stdout
+
+    def incremental(self) -> str:
+        """New output since the last call ("New Terminal Output:"), else the visible screen ("Current Terminal
+        Screen:"), as terminus-2 reports it."""
+        current = self.capture(entire=True)
+        if self.previous is None:
+            self.previous = current
+            return f"Current Terminal Screen:\n{self.capture()}"
+        pb = self.previous.strip()
+        self.previous = current
+        if pb in current:
+            idx = current.index(pb)
+            if "\n" in pb:
+                idx = pb.rfind("\n")
+            new = current[idx:]
+            if new.strip():
+                return f"New Terminal Output:\n{new}"
+        return f"Current Terminal Screen:\n{self.capture()}"
+
+
+def keys(ws: Workspace, tmux: Tmux, keystrokes: str, duration: float = 1.0) -> None:
+    """Send keystrokes to the persistent PTY and wait (deterministically) up to `duration` seconds."""
+    if not tmux.started:
+        tmux.start()
+    tmux.send(keystrokes)
+    tmux.wait(duration)
 
 
 def apply_patch(ws: Workspace, patch_text: str) -> str:
-    raise NotImplementedError("ApplyPatch (codex / opencode gpt-* apply_patch grammar) is phase 2 of the harness "
-                              "profiles")
+    raise NotImplementedError("ApplyPatch (the codex / opencode gpt-* apply_patch grammar) is not implemented: no "
+                              "built-in profile uses it yet")
 
 
 # ------------------------------------------------------------------ files

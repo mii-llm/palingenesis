@@ -20,8 +20,9 @@ originals (summarised in research/tiny-reliable-agent/harness/profiles/), never 
 Known gaps (phase 1): opencode/pi compaction and OpenHands' condenser are not emulated (rollouts are token-exact);
 opencode's fuzzy edit fallbacks and pi's whitespace-normalised matching are exact-match here; OpenHands' undo is single
 level and its terminal cannot keep a process running between calls (is_input answers that nothing is running);
-OpenHands' task_tracker is left out; schemas of opencode (Effect Schema -> JSON Schema) are reconstructed without the
-"$schema" key. `pgs harness capture` (docs/harness_profiles.md) will diff each profile against a recorded request.
+OpenHands' task_tracker is left out; opencode's skill, task, todowrite and webfetch tools are left out (Harbor does not
+disable them). opencode's parameter schemas are the ones recorded with `pgs harness capture opencode` (Harbor 0.24 CLI);
+tests/test_harness_more.py diffs the profiles against the recorded requests.
 """
 
 from __future__ import annotations
@@ -29,23 +30,22 @@ from __future__ import annotations
 import hashlib
 import json
 import posixpath
+import re
 
 from palingenesis.rl.envs.harness import context as ctx
 from palingenesis.rl.envs.harness import ops
 from palingenesis.rl.envs.harness.context import Context
 from palingenesis.rl.envs.harness.ops import OpError
-from palingenesis.rl.envs.harness.profile import HarnessProfile, ToolSpec, register
+from palingenesis.rl.envs.harness.profile import HarnessProfile, ToolSpec, fn_schema, register
 from palingenesis.rl.envs.harness.protocols import FencedCommand, Native
 from palingenesis.rl.envs.harness.rules import Finish, LastText, NoCall, Sentinel, StopAnswer, Submit
+from palingenesis.rl.envs.harness.schemas import OPENCODE_PARAMETERS
 
 MODEL = "qwen3.5-0.8b"  # the served model name a harness would report (opencode's environment block)
 DATE = "Fri Oct 16 2026"  # fixed so prompts are reproducible (harnesses print today's date)
 
 
-def fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
-    return {"type": "function", "function": {"name": name, "description": description,
-                                             "parameters": {"type": "object", "properties": properties,
-                                                            "required": required}}}
+fn = fn_schema
 
 
 def _spill(s, text: str, path: str) -> str:
@@ -190,6 +190,12 @@ def mini_format_error(reason: str, n: int) -> str:
             "without any other command.")
 
 
+def mini_unknown_tool(name: str, names: list[str], args: dict) -> str:
+    """parse_toolcall_actions: a call of another tool is a format error (the whole turn, upstream)."""
+    reason = f"Unknown tool '{name}'." + ("" if "command" in args else "Missing 'command' argument in bash tool call.")
+    return mini_format_error(reason, 0)
+
+
 def mini_text_format_error(reason: str, n: int) -> str:
     return ("Format error:\n\n<error>\n" + reason + "\n</error>\n\n"
             "Here is general guidance on how to format your response:\n\n"
@@ -219,7 +225,7 @@ def mini_swe_agent() -> HarnessProfile:
         name="mini-swe-agent", version="2.4.6", system=MINI_SYSTEM, user=MINI_USER,
         tools=[ToolSpec(MINI_BASH, _mini_bash(False))], protocol=Native(),
         stop=Sentinel(MINI_SENTINEL, "bash"), answer=StopAnswer(None), context=Context("none"),
-        format_error=mini_format_error, exec_timeout=MINI_TIMEOUT,
+        format_error=mini_format_error, exec_timeout=MINI_TIMEOUT, unknown_tool=mini_unknown_tool,
         emulates="minisweagent 2.4.6 config/mini.yaml, models/utils/actions_toolcall.py, environments/local.py")
 
 
@@ -261,7 +267,7 @@ OPENCODE_SYSTEM = (
     "When referring to code, use the pattern `file_path:line_number`.\n"
     "You are powered by the model named {model}. The exact model ID is vllm/{model}\n"
     "Here is some useful information about the environment you are running in:\n"
-    "<env>\n  Working directory: {workdir}\n  Workspace root folder: {workdir}\n  Is directory a git repo: {git_repo}\n"
+    "<env>\n  Working directory: {workdir}\n  Workspace root folder: {git_root}\n  Is directory a git repo: {git_repo}\n"
     "  Platform: linux\n  Today's date: {date}\n</env>")
 
 OPENCODE_TOOLS = {
@@ -336,6 +342,10 @@ OPENCODE_TOOLS = {
                      "\"*.{ts,tsx}\")"}},
         ["pattern"]),
 }
+
+
+for _n, _t in OPENCODE_TOOLS.items():  # parameter schemas as recorded from opencode 1.19.2 under Harbor 0.24
+    _t["function"]["parameters"] = OPENCODE_PARAMETERS[_n]
 
 
 def _oc_bash(s, a):
@@ -486,7 +496,7 @@ def _oc_grep(s, a):
                 out.append("")
             current = path
             out.append(f"{path}:")
-        out.append(f"  Line {line}: {text}")
+        out.append(f"  Line {line}: {text}\n")  # ripgrep's match text keeps its line terminator
     if more:
         out += ["", "(Results truncated. Consider using a more specific path or pattern.)"]
     return "\n".join(out)
@@ -497,11 +507,14 @@ def opencode() -> HarnessProfile:
              "grep": _oc_grep}
     return HarnessProfile(
         name="opencode", version="1.19.2", system=OPENCODE_SYSTEM,
-        tools=[ToolSpec(OPENCODE_TOOLS[n], binds[n]) for n in ("bash", "read", "write", "edit", "glob", "grep")],
+        tools=[ToolSpec(OPENCODE_TOOLS[n], binds[n]) for n in ("bash", "edit", "glob", "grep", "read", "write")],
+        user='"{instruction}\n"',  # Harbor 0.24's opencode adapter passes the instruction quoted (recorded)
         stop=NoCall(), answer=LastText(), exec_timeout=OC_TIMEOUT_MS / 1000,
         context=Context("compaction", emulated=False, note="automatic summary near the context limit"),
-        unknown_tool=lambda name, names: f"Model tried to call unavailable tool '{name}'. Available tools: "
-                                         f"{', '.join(names)}.",
+        alias=lambda name, args, names: (name.lower(), args) if name.lower() in names else None,  # repairToolCall
+        unknown_tool=lambda name, names, args: ("The arguments provided to the tool are invalid: Model tried to call "
+                                                f"unavailable tool '{name}'. Available tools: "
+                                                f"{', '.join(sorted([*names, 'invalid']))}."),
         values={"model": MODEL, "date": DATE},
         emulates="opencode v1.19.2 session/prompt/default.txt, session/system.ts, tool/{shell,read,write,edit,glob,"
                  "grep}.ts (task, todowrite, webfetch, question disabled as for single-agent runs)")
@@ -699,7 +712,7 @@ def pi() -> HarnessProfile:
         tools=[ToolSpec(PI_TOOLS[n], binds[n]) for n in ("read", "bash", "edit", "write")],
         stop=NoCall(), answer=LastText(), exec_timeout=PI_BASH_CAP,
         context=Context("compaction", emulated=False, note="compaction module on overflow"),
-        unknown_tool=lambda name, names: f"Tool {name} not found",
+        unknown_tool=lambda name, names, args: f"Tool {name} not found",
         emulates="@earendil-works/pi-coding-agent 1.3.0 dist/core/system-prompt.js, dist/core/tools/{read,bash,edit,"
                  "edit-diff,write,truncate}.js (the <docs> section about pi's own documentation is left out)")
 
@@ -836,6 +849,29 @@ OPENHANDS_TOOLS = {
         {"summary": _OH_SUMMARY, "thought": {"type": "string", "description": "The thought to log."}},
         ["thought"]),
 }
+
+
+OH_ALIASES = {"bash": "terminal", "command": "terminal", "execute": "terminal", "execute_bash": "terminal",
+              "git": "terminal", "reset": "terminal", "str_replace": "file_editor", "str_replace_editor": "file_editor"}
+
+
+def openhands_alias(name: str, args: dict, names: list[str]):
+    """normalize_tool_call (openhands-sdk agent/utils.py): legacy names, malformed names ("str_replace</parameter"),
+    git/reset as command prefixes, bare find/git/ls/pwd as terminal commands."""
+    base = (re.match(r"[a-zA-Z_][a-zA-Z0-9_]*", name) or [name])[0]
+    if base != name and base in names:
+        return base, args
+    target = OH_ALIASES.get(base)
+    if target in names:
+        if target == "terminal" and base in ("git", "reset"):
+            cmd = str(args.get("command") or "")
+            keep = {k: v for k, v in args.items() if k in ("security_risk", "summary")}
+            keep["command"] = base if not cmd else (cmd if cmd.split(maxsplit=1)[:1] == [base] else f"{base} {cmd}")
+            return target, keep
+        return target, args
+    if "terminal" in names and base in ("find", "git", "ls", "pwd") and not args:
+        return "terminal", {"command": base}
+    return None
 
 
 def _oh_terminal(s, a):
@@ -991,7 +1027,8 @@ def openhands_sdk() -> HarnessProfile:
         stop=Finish("finish", "message", no_call_ends=True), answer=StopAnswer(LastText()),
         exec_timeout=OH_SOFT_TIMEOUT,
         context=Context("compaction", emulated=False, note="LLMSummarizingCondenser (when configured)"),
-        unknown_tool=lambda name, names: f"Tool '{name}' not found. Available: {sorted(names)}",
+        alias=openhands_alias,
+        unknown_tool=lambda name, names, args: f"Tool '{name}' not found. Available: {list(names)}",
         emulates="openhands-sdk / openhands-tools 1.55.1 as Harbor 0.24's openhands_sdk_runner builds the agent "
                  "(terminal, file_editor, task_tracker left out, finish, think; security analyzer on); schemas from "
                  "Tool.to_openai_tool(add_security_risk_prediction=True)")
@@ -1001,3 +1038,5 @@ for _f, _n, _v in ((palingenesis_default, "palingenesis-default", "1"), (mini_sw
                    (mini_swe_agent_text, "mini-swe-agent-text", "2.4.6"), (opencode, "opencode", "1.19.2"),
                    (pi, "pi", "1.3.0"), (openhands_sdk, "openhands-sdk", "1.55.1")):
     register(_n, _v, _f)
+
+from palingenesis.rl.envs.harness import profiles_more, terminus  # noqa: E402,F401 — phase 2 profiles

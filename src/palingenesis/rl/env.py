@@ -24,7 +24,10 @@ An environment is any class. Per trajectory, the trainer takes an instance from 
     episode_group, episode_info                          optional attributes
         An environment with an episode_group attribute gets the GRPO group id before each reset (to vary something
         per group, the same for every sample of it: HarborEnv's harness profiles); a dict in episode_info after reset
-        is added to the rollout's info (in the rollout dumps).
+        is added to the rollout's info (in the rollout dumps), and its "chat_template_kwargs" apply to the episode
+        (over the model's; a row's own chat_template_kwargs win).
+    unknown_tool(self, name, arguments) -> str           optional, sync or async
+        The answer to a call of a tool the episode does not expose (None, or no method: "Error: unknown tool ...").
 
 Text-protocol environments (tools described in the system prompt in a custom format — XML tags, ReAct lines, JSON
 actions — rather than native function calling) add two optional methods:
@@ -84,7 +87,7 @@ from palingenesis.rl.chat import tool_schema
 logger = logging.getLogger(__name__)
 
 _LIFECYCLE = ("reset", "get_reward", "close", "aclose", "tool_schemas", "call_tool", "tools", "text_actions",
-              "observation_text")
+              "observation_text", "unknown_tool")
 
 
 class ToolFailed(Exception):
@@ -246,6 +249,13 @@ async def run_tool(
     """(result text, failed): the tool's output for the policy, or the error it caused.
     `exposed`: the episode's tools; anything else is refused before reaching the environment."""
     if exposed is not None and name not in exposed:
+        if hasattr(env, "unknown_tool"):  # the environment words it (a harness's own message, or an alias it runs)
+            try:
+                text = await asyncio.wait_for(call_sync_or_async(env.unknown_tool, name, arguments), timeout)
+            except Exception as e:  # noqa: BLE001
+                text = f"Error: {e}"
+            if text is not None:
+                return str(text), True
         return f"Error: unknown tool {name!r}. Available tools: {', '.join(sorted(exposed)) or 'none'}.", True
     if hasattr(env, "call_tool"):
         call = call_sync_or_async(env.call_tool, name, arguments)
