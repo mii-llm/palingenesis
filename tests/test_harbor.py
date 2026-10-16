@@ -196,3 +196,90 @@ def test_containers_of_exited_runs_are_swept_and_failed_starts_leave_none(tmp_pa
         env.reset(task_dir=str(task))
     env.close()
     assert ours() == before and not harbor._live
+
+
+class _FakeDocker:
+    """Records docker calls; answers exec / cp like a container whose capture prints CAPTURE."""
+
+    CAPTURE = b'{"procs": [{"tag": "s1"}]}'
+
+    def __init__(self):
+        self.calls, self.copied = [], {}
+
+    def __call__(self, *args, input=None, timeout=None, check=True):
+        import io
+        import tarfile
+
+        self.calls.append(args)
+        out = b""
+        if args[0] == "exec":
+            cmd = args[-1]
+            if "-u" in args and "capture" in cmd:
+                out = self.CAPTURE
+            elif "reward.json" in cmd:
+                out = b'{"reward": 1.0}'
+        elif args[0] == "cp" and input:  # (the working-directory archive from the fake container is empty)
+            with tarfile.open(fileobj=io.BytesIO(input)) as tar:
+                for m in tar.getmembers():
+                    if m.isfile():
+                        self.copied["/" + m.name] = tar.extractfile(m).read()
+        return subprocess.CompletedProcess(args, 0, out, b"")
+
+
+def _capture_task(tmp_path, capture=True):
+    task = tmp_path / "task"
+    shutil.copytree(FIXTURE, task)
+    if capture:
+        toml = (task / "task.toml").read_text()
+        (task / "task.toml").write_text(toml.replace("[verifier]\n", '[verifier]\ncapture = "python3 /opt/capture.py"\n'))
+    return task
+
+
+def test_verifier_capture_runs_as_root_in_the_agent_container_and_reaches_the_tests(tmp_path, monkeypatch):
+    from palingenesis.rl.envs import harbor
+
+    fake = _FakeDocker()
+    monkeypatch.setattr(harbor, "_docker", fake)
+    monkeypatch.setattr(harbor, "_swept", True)
+    rt = harbor.DockerRuntime(HarborTask.load(_capture_task(tmp_path)))
+    rt.started = True
+    assert rt.verify(final_message="fatto") == {"reward": 1.0}
+    caps = [c for c in fake.calls if c[0] == "exec" and "-u" in c]
+    assert len(caps) == 1 and caps[0][caps[0].index("-u") + 1] == "0" and caps[0][-1] == "python3 /opt/capture.py"
+    assert caps[0][caps[0].index("-w") + 1] == "/" and rt.name in caps[0]  # the agent's container, not the clean one
+    first_cp = next(i for i, c in enumerate(fake.calls) if c[0] == "cp")
+    assert fake.calls.index(caps[0]) < first_cp  # captured before the working directory is copied out
+    assert fake.copied["/logs/agent/capture.json"] == _FakeDocker.CAPTURE
+    assert fake.copied["/logs/agent/final_message.md"] == b"fatto"
+
+
+def test_no_capture_keeps_the_default_verification(tmp_path, monkeypatch):
+    from palingenesis.rl.envs import harbor
+
+    fake = _FakeDocker()
+    monkeypatch.setattr(harbor, "_docker", fake)
+    monkeypatch.setattr(harbor, "_swept", True)
+    rt = harbor.DockerRuntime(HarborTask.load(_capture_task(tmp_path, capture=False)))
+    rt.started = True
+    assert rt.verify() == {"reward": 1.0}
+    assert not any("-u" in c for c in fake.calls if c[0] == "exec")
+    assert "/logs/agent/capture.json" not in fake.copied
+
+
+def test_a_failed_capture_scores_zero(tmp_path, monkeypatch):
+    from palingenesis.rl.envs import harbor
+
+    class Dead(_FakeDocker):
+        def __call__(self, *args, **kw):
+            if args[0] == "exec" and "-u" in args:
+                return subprocess.CompletedProcess(args, 137, b"", b"container not running")
+            return super().__call__(*args, **kw)
+
+    monkeypatch.setattr(harbor, "_docker", Dead())
+    monkeypatch.setattr(harbor, "_swept", True)
+    env = HarborEnv()
+    env.task = HarborTask.load(_capture_task(tmp_path))
+    env.rt = harbor.DockerRuntime(env.task)
+    env.rt.started = True
+    r = env.get_reward([{"role": "assistant", "content": "fatto"}])
+    assert r["reward"] == 0.0 and r["metric/verifier_failed"] == 1.0

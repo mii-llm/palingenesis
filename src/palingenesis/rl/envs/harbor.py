@@ -12,7 +12,10 @@ A task directory follows the Harbor layout (harborframework.com; the format used
                          small tasks can share one image
     tests/test.sh        the verifier: runs after the episode, writes /logs/verifier/reward.txt (a number) or
                          reward.json ({"name": value, ...}); anything else in tests/ is copied to /tests; the agent's
-                         final message (when the trainer passes the conversation) is at /logs/agent/final_message.md
+                         final message (when the trainer passes the conversation) is at /logs/agent/final_message.md;
+                         [verifier] capture (optional) is a command run in the agent's container right before the
+                         tests (as root, cwd /), whose stdout reaches them as /logs/agent/capture.json: live state the
+                         copied working directory cannot carry (processes, listening ports, owners, git internals)
     solution/solve.sh    optional oracle solution (used by check_task: the oracle must pass, doing nothing must not)
 
 palingenesis runs tasks itself (no Harbor dependency): images are built once per build-context hash and cached,
@@ -351,15 +354,31 @@ class DockerRuntime:
         """The tar stream of a directory in the container."""
         return _docker("cp", f"{self.name}:{path}", "-", timeout=120).stdout
 
-    def verify(self, isolated: bool = True, final_message: str | None = None) -> dict[str, float]:
+    def capture(self) -> bytes:
+        """[verifier] capture: the command's stdout, run as root in this container (not cut like tool output). A
+        container the agent stopped (kill -9 -1) cannot be captured and raises, which scores 0. The command runs in the
+        agent's container, so a policy that can rewrite its tools (ps, python) could bias the capture: use absolute paths
+        to binaries the task does not let the agent modify, and treat captured state as evidence, not ground truth."""
+        cmd = self.task.verifier["capture"]
+        r = _docker("exec", "-u", "0", "-w", "/", self.name, "bash", "-c", cmd, check=False,
+                    timeout=float(self.task.verifier.get("capture_timeout_sec", 60)))
+        if r.returncode != 0:
+            raise RuntimeError(f"capture failed for {self.task.name} (exit {r.returncode}): {r.stderr.decode()[-300:]}")
+        return r.stdout
+
+    def verify(self, isolated: bool = True, final_message: str | None = None,
+               capture: bytes | None = None) -> dict[str, float]:
         """Run the task's tests and read the reward. isolated (default): the working directory is copied into a fresh
         container from the pristine image and tested there, so nothing the agent left behind (a background process
         rewriting the reward, a patched package, a pytest.py shadowing pytest) can reach the verifier. That container
         has network only if [verifier] allow_internet (default: the environment's) allows it. final_message: the
-        agent's last reply, given to the tests as /logs/agent/final_message.md."""
+        agent's last reply, given to the tests as /logs/agent/final_message.md. capture: [verifier] capture output
+        (taken here from the live container when the task sets one)."""
         tests = self.task.root / "tests"
         if not tests.exists():
             raise FileNotFoundError(f"{self.task.name}: no tests/ directory")
+        if capture is None and self.task.verifier.get("capture"):
+            capture = self.capture()  # in the agent's container, before anything is copied or removed
         if isolated:
             archive = self.get_dir(self.workdir)
             clean = DockerRuntime(self.task, self.workdir, self.max_output)
@@ -367,13 +386,15 @@ class DockerRuntime:
                 clean.start(provision=False, allow_internet=self.task.verifier.get("allow_internet"))
                 clean.exec(f"rm -rf {shlex.quote(self.workdir)}", timeout=30, workdir="/")
                 _docker("cp", "-", f"{clean.name}:{str(Path(self.workdir).parent)}", input=archive, timeout=120)
-                return clean.verify(isolated=False, final_message=final_message)
+                return clean.verify(isolated=False, final_message=final_message, capture=capture)
             finally:
                 clean.stop()
         self.exec("rm -rf /tests /logs/verifier /logs/agent && mkdir -p /tests /logs/verifier /logs/agent", timeout=30,
                   workdir="/")
         if final_message is not None:
             self.put_files({"/logs/agent/final_message.md": final_message}, "/")
+        if capture is not None:
+            self.put_files({"/logs/agent/capture.json": capture}, "/")
         self.put_dir(tests, "/tests")
         venv = {k: os.path.expandvars(str(v)) for k, v in (self.task.verifier.get("env") or {}).items()}
         r = self.exec("bash /tests/test.sh", timeout=float(self.task.verifier.get("timeout_sec", 120)), env=venv, workdir="/")
