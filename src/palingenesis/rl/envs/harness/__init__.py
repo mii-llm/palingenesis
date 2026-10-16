@@ -3,7 +3,7 @@
 A HarnessProfile (profile.py) is one harness at a pinned version: system / user prompt, exact tool contracts bound
 to a closed op set on the episode's container (ops.py), an action protocol (protocols.py: native function calling or
 a text protocol), observation and error wording, truncation and context policies (context.py), stop and answer rules
-(rules.py). Built-in profiles (profiles.py): palingenesis-default (HarborEnv's own, the default), mini-swe-agent and
+(rules.py). Built-in profiles (profiles.py): palingenesis-default (@2: nanocode's dialect; @1: HarborEnv's own, used without profiles), mini-swe-agent and
 its text variant, opencode, pi, openhands-sdk.
 
     env:

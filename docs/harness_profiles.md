@@ -17,7 +17,8 @@ env:
 ```
 
 `profile: opencode` runs a single profile. Without `profile`/`profiles` HarborEnv behaves exactly as before
-(the `palingenesis-default` profile, tested byte-identical). A row's `harness_profile` field forces a profile.
+(the `palingenesis-default@1` profile, tested byte-identical). The name `palingenesis-default` alone is version 2,
+nanocode's dialect (below); a mix of `@1` and `@2` logs both under `metric/profile/palingenesis-default`. A row's `harness_profile` field forces a profile.
 `pgs harness profiles` lists them.
 
 ## Profiles
@@ -25,6 +26,7 @@ env:
 | profile | protocol | tools | stop | answer | prompt* |
 |---|---|---|---|---|---|
 | `palingenesis-default@1` | native | bash, read_file, write_file, str_replace, submit | submit / no call | last text | — |
+| `palingenesis-default@2` | native | read(path, offset, limit), write, edit(path, old, new, all), glob(pat, path), grep(pat, path), bash(cmd); nanocode's own functions via the container's python3, `/bin/sh`, 30 s | turn without a tool call | last text | 1 line |
 | `mini-swe-agent@2.4.6` | native | bash(command), `/bin/sh` per call, 30 s | `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` | output after the sentinel (no answer channel) | 0.8k |
 | `mini-swe-agent-text@2.4.6` | ```` ```mswea_bash_command ```` block, exactly one | same | same | same | 0.6k |
 | `opencode@1.19.2` | native | bash(command, timeout ms, workdir), edit(filePath, oldString, newString, replaceAll), glob, grep, read, write | turn without a tool call | last text | 2.2k |

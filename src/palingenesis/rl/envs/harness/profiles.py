@@ -5,6 +5,9 @@ originals (summarised in research/tiny-reliable-agent/harness/profiles/), never 
 
     palingenesis-default@1   HarborEnv's own prompt and tools (bash, read_file, write_file, str_replace, submit);
                              rendered byte-identically to HarborEnv without profiles
+    palingenesis-default@2   nanocode's dialect (what "palingenesis-default" names): read(path, offset, limit) with
+                             "   1| " line numbers, write, edit(path, old, new, all), glob(pat, path), grep(pat, path),
+                             bash(cmd); "ok" / "error: ..." / "none" / "(empty)"; stops at a turn without a tool call
     mini-swe-agent@2.4.6     native bash(command) only, JSON {returncode, output} observations (head/tail over 10k
                              characters), /bin/sh per command, sentinel submit, no answer channel (the submission is
                              the output after the sentinel line)
@@ -31,6 +34,8 @@ import hashlib
 import json
 import posixpath
 import re
+import shlex
+import uuid
 
 from palingenesis.rl.envs.harness import context as ctx
 from palingenesis.rl.envs.harness import ops
@@ -71,6 +76,119 @@ def palingenesis_default() -> HarnessProfile:
         name="palingenesis-default", version="1", system=SYSTEM, tools=[ToolSpec(s) for s in TOOL_SCHEMAS.values()],
         stop=Submit("submit"), answer=LastText(), legacy=True,
         emulates="HarborEnv's own prompt and tools (the row's conversation, HarborEnv.call_tool)")
+
+
+# palingenesis-default@2: nanocode's dialect (a minimal Claude Code alternative): a one-line system prompt, six tools
+# with terse schemas, "ok" / "error: ..." / "none" / "(empty)" observations, ends at a turn without a tool call. The
+# file tools run nanocode's own functions with the container's python3 (same results and Python exception wording).
+
+NANO_SYSTEM = "Concise coding assistant. cwd: {workdir}"
+NANO_TIMEOUT = 30
+_NANO_SPEC = (  # name, description, {param: "type" | "type?"} (nanocode's TOOLS; make_schema maps number -> integer)
+    ("read", "Read file with line numbers (file path, not directory)",
+     {"path": "string", "offset": "number?", "limit": "number?"}),
+    ("write", "Write content to file", {"path": "string", "content": "string"}),
+    ("edit", "Replace old with new in file (old must be unique unless all=true)",
+     {"path": "string", "old": "string", "new": "string", "all": "boolean?"}),
+    ("glob", "Find files by pattern, sorted by mtime", {"pat": "string", "path": "string?"}),
+    ("grep", "Search files for regex pattern", {"pat": "string", "path": "string?"}),
+    ("bash", "Run shell command", {"cmd": "string"}),
+)
+
+
+def _nano_schema(name: str, description: str, params: dict) -> dict:
+    props = {k: {"type": "integer" if t.rstrip("?") == "number" else t.rstrip("?")} for k, t in params.items()}
+    return fn(name, description, props, [k for k, t in params.items() if not t.endswith("?")])
+
+
+NANO_TOOLS = {n: _nano_schema(n, d, p) for n, d, p in _NANO_SPEC}
+
+_NANO_PY = r'''
+import glob as globlib, json, os, re, sys
+def read(args):
+    lines = open(args["path"]).readlines()
+    offset = args.get("offset", 0)
+    limit = args.get("limit", len(lines))
+    selected = lines[offset : offset + limit]
+    return "".join(f"{offset + idx + 1:4}| {line}" for idx, line in enumerate(selected))
+def write(args):
+    with open(args["path"], "w") as f:
+        f.write(args["content"])
+    return "ok"
+def edit(args):
+    text = open(args["path"]).read()
+    old, new = args["old"], args["new"]
+    if old not in text:
+        return "error: old_string not found"
+    count = text.count(old)
+    if not args.get("all") and count > 1:
+        return f"error: old_string appears {count} times, must be unique (use all=true)"
+    replacement = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+    with open(args["path"], "w") as f:
+        f.write(replacement)
+    return "ok"
+def glob(args):
+    pattern = (args.get("path", ".") + "/" + args["pat"]).replace("//", "/")
+    files = globlib.glob(pattern, recursive=True)
+    files = sorted(files, key=lambda f: os.path.getmtime(f) if os.path.isfile(f) else 0, reverse=True)
+    return "\n".join(files) or "none"
+def grep(args):
+    pattern = re.compile(args["pat"])
+    hits = []
+    for filepath in globlib.glob(args.get("path", ".") + "/**", recursive=True):
+        try:
+            for line_num, line in enumerate(open(filepath), 1):
+                if pattern.search(line):
+                    hits.append(f"{filepath}:{line_num}:{line.rstrip()}")
+        except Exception:
+            pass
+    return "\n".join(hits[:50]) or "none"
+TOOLS = {"read": read, "write": write, "edit": edit, "glob": glob, "grep": grep}
+path = sys.argv[1]
+with open(path) as f:
+    name, args = json.load(f)
+os.remove(path)
+try:
+    out = TOOLS[name](args)
+except Exception as err:
+    out = f"error: {err}"
+sys.stdout.write(out)
+'''
+
+
+def _nano_py(s, name: str, a: dict) -> str:
+    """nanocode's run_tool for a file tool, run with the container's python3 in the working directory (arguments
+    staged as a file: an argv entry is capped at 128 KiB)."""
+    tmp = f"{s.ws.scratch}/.pgs_nano_{uuid.uuid4().hex[:12]}.json"
+    s.ws.rt.put_files({tmp: json.dumps([name, a])}, "/", as_user=True)
+    r = s.ws.rt.exec(f"python3 -c {shlex.quote(_NANO_PY)} {shlex.quote(tmp)}", 60, workdir=s.workdir)
+    if r.exit_code == 127:
+        return "error: python3 is not installed in the container"
+    if r.exit_code != 0 or r.timed_out:  # the interpreter itself failed (run_tool's own errors exit 0)
+        lines = (r.stderr or r.stdout).strip().splitlines()
+        return f"error: {lines[-1] if lines else 'tool failed'}"
+    return r.stdout
+
+
+def _nano_bash(s, a):
+    if "cmd" not in a:
+        return "error: 'cmd'"
+    r = ops.exec_(s.ws, str(a["cmd"]), NANO_TIMEOUT, workdir=s.workdir, shell="sh")  # Popen(shell=True): /bin/sh
+    s.last_exec = r
+    out = r.output + ("\n(timed out after 30s)" if r.timed_out else "")
+    return out.strip() or "(empty)"
+
+
+def palingenesis_default_2() -> HarnessProfile:
+    tools = [ToolSpec(NANO_TOOLS[n], _nano_bash if n == "bash" else (lambda s, a, n=n: _nano_py(s, n, a)))
+             for n, _, _ in _NANO_SPEC]
+    return HarnessProfile(
+        name="palingenesis-default", version="2", system=NANO_SYSTEM, tools=tools, stop=NoCall(), answer=LastText(),
+        exec_timeout=NANO_TIMEOUT, unknown_tool=lambda name, names, args: f"error: {name!r}",  # TOOLS[name] KeyError
+        emulates="nanocode (minimal Claude Code alternative): system prompt, TOOLS and make_schema, run_tool's "
+                 "'error: {err}' wording, the agentic loop's stop at a reply without tool calls; bash under /bin/sh "
+                 "with stderr merged, a 30 s timeout (the partial output of a timed-out command is not kept), no "
+                 "output cap of its own")
 
 
 # ================================================================== mini-swe-agent 2.4.6
@@ -1034,7 +1152,8 @@ def openhands_sdk() -> HarnessProfile:
                  "Tool.to_openai_tool(add_security_risk_prediction=True)")
 
 
-for _f, _n, _v in ((palingenesis_default, "palingenesis-default", "1"), (mini_swe_agent, "mini-swe-agent", "2.4.6"),
+for _f, _n, _v in ((palingenesis_default, "palingenesis-default", "1"),
+                   (palingenesis_default_2, "palingenesis-default", "2"), (mini_swe_agent, "mini-swe-agent", "2.4.6"),
                    (mini_swe_agent_text, "mini-swe-agent-text", "2.4.6"), (opencode, "opencode", "1.19.2"),
                    (pi, "pi", "1.3.0"), (openhands_sdk, "openhands-sdk", "1.55.1")):
     register(_n, _v, _f)

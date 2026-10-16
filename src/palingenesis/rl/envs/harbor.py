@@ -461,7 +461,7 @@ class HarborEnv:
 
     profile / profiles={name: weight}: harness profiles (palingenesis.rl.envs.harness, docs/harness_profiles.md), the
     prompt, tools, protocol, stop and answer rules of a real agent harness, one per GRPO group; without them the
-    behaviour is HarborEnv's own (the palingenesis-default profile)."""
+    behaviour is HarborEnv's own (the palingenesis-default@1 profile)."""
 
     episode_group = None  # the trainer sets the GRPO group id here before reset (harness profiles: one per group)
 

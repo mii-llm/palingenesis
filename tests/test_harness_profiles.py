@@ -544,7 +544,7 @@ def _row():
 
 
 def test_default_profile_is_byte_identical_to_harbor_env(local_harbor):
-    base, prof = HarborEnv(), HarborEnv(profile="palingenesis-default")
+    base, prof = HarborEnv(), HarborEnv(profile="palingenesis-default@1")
     row = _row()
     assert base.reset(**row) is None and prof.reset(**row) is None
     assert json.dumps(base.tool_schemas()) == json.dumps(prof.tool_schemas())
@@ -665,6 +665,11 @@ def _fenced(cmd):
 # scripted episodes: per turn, native calls [(name, args)] or the assistant's text
 SCRIPTS = {
     "palingenesis-default": {
+        ARCHIVE: [[("bash", {"cmd": TAR})], "Created website.tar.gz."],
+        ENV_EDIT: [[("glob", {"pat": "**/.env*"})], [("read", {"path": "Projects/sito/.env"})],
+                   [("edit", {"path": "Projects/sito/.env", "old": "DEBUG=true", "new": "DEBUG=false"})], "Done."],
+        "noop": ["Done."]},
+    "palingenesis-default@1": {
         ARCHIVE: [[("bash", {"command": TAR})], [("submit", {})]],
         ENV_EDIT: [[("read_file", {"path": "Projects/sito/.env"})],
                    [("str_replace", {"path": "Projects/sito/.env", "old": "DEBUG=true", "new": "DEBUG=false"})],
@@ -745,3 +750,50 @@ def test_scrivania_oracle_and_noop_per_profile(profile):
                     assert env.done and env.session.answer == ""
             finally:
                 env.close()
+
+
+# ================================================================== palingenesis-default@2 (nanocode)
+
+
+def test_nanocode_default_schemas_prompt_and_stop(rt):
+    p = get_profile("palingenesis-default")
+    assert p.id == "palingenesis-default@2" and get_profile("palingenesis-default@1").legacy
+    tools = {t.name: t.schema["function"] for t in p.tools}
+    assert list(tools) == ["read", "write", "edit", "glob", "grep", "bash"]
+    assert tools["read"]["parameters"] == {"type": "object", "properties": {
+        "path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}
+    assert tools["edit"]["parameters"]["required"] == ["path", "old", "new"]
+    assert tools["edit"]["parameters"]["properties"]["all"] == {"type": "boolean"}
+    assert tools["bash"] == {"name": "bash", "description": "Run shell command", "parameters": {
+        "type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}
+    s = Session(p, rt)
+    assert s.conversation("ciao") == [{"role": "system", "content": f"Concise coding assistant. cwd: {rt.workdir}"},
+                                      {"role": "user", "content": "ciao"}]
+    assert s.text_actions("Fatto.") is None
+
+
+def test_nanocode_default_tools_word_results_like_nanocode(rt):
+    s = Session(get_profile("palingenesis-default"), rt)
+    call = s.call_tool
+    assert call("write", {"path": "a.txt", "content": "uno\ndue\ndue\n"}) == "ok"
+    assert call("read", {"path": "a.txt"}) == "   1| uno\n   2| due\n   3| due\n"
+    assert call("read", {"path": "a.txt", "offset": 1, "limit": 1}) == "   2| due\n"
+    assert call("read", {"path": "nope.txt"}) == "error: [Errno 2] No such file or directory: 'nope.txt'"
+    assert call("read", {}) == "error: 'path'"
+    assert call("edit", {"path": "a.txt", "old": "tre", "new": "x"}) == "error: old_string not found"
+    assert call("edit", {"path": "a.txt", "old": "due", "new": "x"}) == \
+        "error: old_string appears 2 times, must be unique (use all=true)"
+    assert call("edit", {"path": "a.txt", "old": "due", "new": "tre", "all": True}) == "ok"
+    assert (Path(rt.workdir) / "a.txt").read_text() == "uno\ntre\ntre\n"
+    assert call("write", {"path": "sub/b.py", "content": "x"}).startswith("error: [Errno 2] No such file")
+    (Path(rt.workdir) / "sub").mkdir()
+    assert call("write", {"path": "sub/b.py", "content": "import os\n"}) == "ok"
+    assert call("glob", {"pat": "**/*.py"}) == "./sub/b.py"
+    assert call("glob", {"pat": "*.md"}) == "none"
+    assert call("grep", {"pat": "^tre"}) == "./a.txt:2:tre\n./a.txt:3:tre"
+    assert call("grep", {"pat": "import", "path": "sub"}) == "sub/b.py:1:import os"
+    assert call("bash", {"cmd": "echo out; echo err >&2"}) == "out\nerr"
+    assert call("bash", {"cmd": "true"}) == "(empty)"
+    assert call("bash", {}) == "error: 'cmd'"
+    assert call("str_replace", {"path": "a.txt"}) == "error: 'str_replace'"
+    assert not s.done
