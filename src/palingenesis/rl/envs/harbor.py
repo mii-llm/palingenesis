@@ -38,9 +38,17 @@ submit() (ends the episode); files the tools write belong to the image's default
 can still change them from the shell. The reward is the verifier's number, or its components (a reward.json dict: every key is
 logged as env/<key>, "reward" or the first key is the reward unless the caller maps them).
 
-The same task directories also run under the Harbor CLI with external harnesses (claude-code, codex, opencode,
-mini-swe-agent) against an OpenAI-compatible endpoint serving the policy, for evaluation or SFT data (not token-exact
-RL trajectories); that path needs the harbor package and is not wrapped here.
+Only tasks that use upstream Harbor features alone (instruction.md, environment/ Dockerfile or docker_image, tests/,
+solution/, an "org/name" [task] name) also run unchanged under the Harbor CLI (checked against harbor 0.24.0) with
+external harnesses (claude-code, codex, opencode, mini-swe-agent) against an OpenAI-compatible endpoint serving the
+policy, for evaluation or SFT data (not token-exact RL trajectories); that path needs the harbor package and is not
+wrapped here. environment/workdir/, environment/setup.sh, [verifier] capture and /logs/agent/final_message.md are
+palingenesis extensions: the Harbor CLI does not stage workdir/ or run setup.sh (both land as plain files), ignores
+capture (its tests run in the agent's container) and never writes the final message, so tests that grade the reply
+score 0 there. Such tasks need converting for the CLI: Harbor's single-step [[steps]] layout (steps/main/
+instruction.md, workdir/ with workdir/setup.sh, solution/, tests/) stages the files and runs the setup, and a
+reply-graded task must have the agent write its answer to a file the tests read. This module does not read the
+[[steps]] layout.
 
     pgs harbor check <tasks_dir> [--workers 8]      oracle / nop check of every task (exit 1 if any is invalid)
     pgs harbor rows <tasks_dir> <out.jsonl>          training rows for the env above
@@ -449,28 +457,70 @@ TOOL_SCHEMAS = {
 class HarborEnv:
     """palingenesis environment over Harbor task directories: a fresh container per episode, coding-agent tools,
     the task's tests as the reward. Rows carry "task_dir". Synchronous (the pipeline runs sync methods in worker threads),
-    so other environments can compose it; the container stops when the episode is released (close)."""
+    so other environments can compose it; the container stops when the episode is released (close).
+
+    profile / profiles={name: weight}: harness profiles (palingenesis.rl.envs.harness, docs/harness_profiles.md), the
+    prompt, tools, protocol, stop and answer rules of a real agent harness, one per GRPO group; without them the
+    behaviour is HarborEnv's own (the palingenesis-default profile)."""
+
+    episode_group = None  # the trainer sets the GRPO group id here before reset (harness profiles: one per group)
 
     def __init__(self, tools: list[str] | None = None, reward_key: str = "reward", workdir: str | None = None,
-                 max_output: int = 16000):
+                 max_output: int = 16000, profile: str | None = None, profiles: dict[str, float] | None = None,
+                 profile_seed: int = 0):
         self.tool_names = list(tools or TOOL_SCHEMAS)
         self.reward_key = reward_key
         self.workdir = workdir
         self.max_output = max_output
         self.rt: DockerRuntime | None = None
         self.done = False
+        # ---- harness profiles hook (palingenesis.rl.envs.harness); None: HarborEnv's own behaviour
+        self.harness = None
+        self.session = None
+        self.episode_info: dict = {}
+        if profile or profiles:
+            from palingenesis.rl.envs.harness import HarnessMix
 
-    def reset(self, task_dir: str, **row) -> None:
+            self.harness = HarnessMix(profile, profiles, profile_seed)
+
+    def reset(self, task_dir: str, **row) -> list[dict] | None:
         self.close()
         self.task = HarborTask.load(task_dir)
-        self.rt = DockerRuntime(self.task, self.workdir, self.max_output)  # workdir None: the task's (or /workdir)
+        drawn = self.harness.draw({**row, "task_dir": task_dir}, self.episode_group) if self.harness else None
+        cap = self.max_output if drawn is None or drawn.legacy else max(self.max_output, drawn.runtime_max_output)
+        self.rt = DockerRuntime(self.task, self.workdir, cap)  # workdir None: the task's (or /workdir)
         self.done = False
         self.rt.start()
+        if drawn is None:
+            return None
+        # ---- harness profiles hook: the profile's conversation (None for palingenesis-default: the row's own)
+        from palingenesis.rl.envs.harness import Session
+
+        self.session = Session(drawn, self.rt)
+        self.episode_info = {"harness_profile": drawn.id}
+        user = next((m.get("content") for m in reversed(row.get("messages") or []) if m.get("role") == "user"), None)
+        return self.session.conversation(user if isinstance(user, str) and user else self.task.instruction)
 
     def tool_schemas(self) -> list[dict]:
+        if self.session is not None and not self.session.profile.legacy:  # harness profiles hook
+            return self.session.tool_schemas()
         return [TOOL_SCHEMAS[n] for n in self.tool_names]
 
+    def text_actions(self, content: str) -> list[tuple[str, dict]] | None:
+        """Harness profiles hook: a text protocol's actions, or a format error the harness answers (None: no action,
+        the episode ends — always so without profiles)."""
+        return self.session.text_actions(content) if self.session is not None else None
+
+    def observation_text(self, results: list[tuple[str, str]]) -> str:
+        if self.session is not None:  # harness profiles hook
+            return self.session.observation_text(results)
+        return "\n\n".join(out for _, out in results)
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        if self.session is not None and not self.session.profile.legacy:  # harness profiles hook
+            out = self.session.call_tool(name, arguments)
+            self.done = self.session.done
+            return out
         rt = self.rt
         if name == "submit":
             self.done = True
@@ -509,16 +559,24 @@ class HarborEnv:
         if rt is None:
             return None
         final = next((m.get("content") or "" for m in reversed(messages or []) if m.get("role") == "assistant"), None)
+        if self.session is not None:  # harness profiles hook: the profile's answer rule
+            final = self.session.final_message(messages)
         try:
             comps = rt.verify(final_message=final)
         except Exception as e:  # noqa: BLE001 — a broken verifier scores 0 and is flagged
             logger.warning("verifier failed for %s: %s", self.task.name, e)
             comps = {"reward": 0.0, "metric/verifier_failed": 1.0}
         main = comps.get(self.reward_key, next(iter(comps.values()), 0.0))
-        return {"reward": float(main), **{(k if k.startswith("metric/") else f"metric/{k}"): v for k, v in comps.items()
-                                           if k != self.reward_key}}
+        out = {"reward": float(main), **{(k if k.startswith("metric/") else f"metric/{k}"): v for k, v in comps.items()
+                                          if k != self.reward_key}}
+        if self.session is not None:  # harness profiles hook: the mix's share and reward per profile
+            name = self.session.profile.name
+            out.update({f"metric/profile/{n}": float(n == name) for n in set(self.harness.names) | {name}})
+            out[f"metric/profile/{name}/reward"] = float(main)
+        return out
 
     def close(self) -> None:
+        self.session = None
         if self.rt is not None:
             rt, self.rt = self.rt, None
             rt.stop()

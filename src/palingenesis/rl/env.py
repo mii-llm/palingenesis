@@ -21,6 +21,10 @@ An environment is any class. Per trajectory, the trainer takes an instance from 
     close(self)                                          optional, sync or async
     done                                                 optional attribute
         Set it to True (e.g. in a submit tool) to end the episode after this turn's tools.
+    episode_group, episode_info                          optional attributes
+        An environment with an episode_group attribute gets the GRPO group id before each reset (to vary something
+        per group, the same for every sample of it: HarborEnv's harness profiles); a dict in episode_info after reset
+        is added to the rollout's info (in the rollout dumps).
 
 Text-protocol environments (tools described in the system prompt in a custom format — XML tags, ReAct lines, JSON
 actions — rather than native function calling) add two optional methods:

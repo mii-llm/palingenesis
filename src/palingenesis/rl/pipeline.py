@@ -240,7 +240,10 @@ class RLPipeline:
         self.client.enter()
         try:
             if env is not None and hasattr(env, "reset"):
+                if hasattr(env, "episode_group"):  # environments that vary per GRPO group (Harbor harness profiles)
+                    env.episode_group = gid
                 start = await call_sync_or_async(env.reset, **row)
+                trajectory.info.update(getattr(env, "episode_info", None) or {})  # e.g. the harness profile drawn
                 if isinstance(start, str) and start:
                     last = next(m for m in reversed(messages) if m["role"] == "user")
                     last["content"] = f"{last['content']}\n\n{start}" if last["content"] else start
