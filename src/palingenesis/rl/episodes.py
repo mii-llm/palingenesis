@@ -7,7 +7,8 @@ rules, truncation and environment rewards as an RL run, so an evaluation scores 
                           temperature=Sampling(0.7, 0.8, 20), chat_template_kwargs={"enable_thinking": False})
     # groups[i]: the k trajectories of rows[i] (t.reward, t.rewards, t.messages, t.finish, t.info)
 
-engine: a rollout engine (palingenesis.opd.rollout: VLLMColocateRollout for vLLM in-process, or anything with
+max_completion_tokens: the generated tokens of a whole episode (all turns); default max_new_tokens x max_turns (the
+context, max_model_len, still bounds it). engine: a rollout engine (palingenesis.opd.rollout: VLLMColocateRollout for vLLM in-process, or anything with
 generate(prompts, max_new_tokens, temperature)); temperature: a float or an opd.rollout.Sampling (top_p / top_k;
 streaming engines only). A group's k samples share the environment's per-group choices (a harness profile).
 """
@@ -19,7 +20,7 @@ from typing import Any, Callable
 
 def run_episodes(engine, tokenizer, rows: list[dict], env: Callable[..., Any], env_args: dict | None = None, *,
                  k: int = 1, temperature=1.0, chat_template_kwargs: dict | None = None, model: str | None = None,
-                 max_turns: int = 16, max_new_tokens: int = 1024, max_completion_tokens: int = 0,
+                 max_turns: int = 16, max_new_tokens: int = 1024, max_completion_tokens: int | None = None,
                  max_model_len: int = 16384, max_concurrent: int = 0, tool_timeout: float = 600.0,
                  max_tool_output_tokens: int = 1536, tool_parser: str = "auto") -> list[list[Any]]:
     import torch
@@ -33,6 +34,8 @@ def run_episodes(engine, tokenizer, rows: list[dict], env: Callable[..., Any], e
     from palingenesis.rl.env import EnvPool
     from palingenesis.rl.pipeline import RLPipeline
 
+    if max_completion_tokens is None:  # the whole episode's generated tokens; the pipeline's 0 means one turn's
+        max_completion_tokens = max_new_tokens * max_turns  # worth, which cuts multi-turn episodes short
     kwargs = dict(chat_template_kwargs or {})
     eot = end_of_turn_id(tokenizer, kwargs)
     stop_ids = student_stop_ids(tokenizer, model, [], kwargs) if model else (eot,)

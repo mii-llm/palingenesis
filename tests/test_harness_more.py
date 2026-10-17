@@ -383,6 +383,24 @@ def test_run_episodes_uses_the_pipeline(local_harbor):
     assert all(t.rewards[f"env/metric/profile/{name.split('@')[0]}"] == 1.0 for t in group)
 
 
+
+def test_run_episodes_budget_covers_every_turn(local_harbor):
+    """The default episode budget is max_new_tokens per turn (the pipeline's own default, one turn's worth, cut
+    multi-turn episodes as "length" after about one turn of tokens)."""
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.episodes import run_episodes
+    from tests.test_rl import ScriptedEngine, tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    call = json.dumps({"name": "write", "arguments": {"filePath": "hello.txt", "content": "ciao\n"}})
+    engine = ScriptedEngine(tok, end_of_turn_id(tok, kwargs), [f"<tool_call>\n{call}\n</tool_call>"] * 3 + ["Done."])
+    n = len(tok.encode(f"<tool_call>\n{call}\n</tool_call>", add_special_tokens=False))
+    [[t]] = run_episodes(engine, tok, [_row()], HarborEnv, {"profile": "opencode"}, k=1, temperature=1.0,
+                         chat_template_kwargs=kwargs, max_turns=6, max_new_tokens=n + 8)
+    assert t.finish != "length" and t.turns == 4
+
+
 # ================================================================== Docker: Scrivania tasks per new profile
 
 TMUX_IMAGE = os.environ.get("PGS_TMUX_IMAGE", "harbor3-base:3")
