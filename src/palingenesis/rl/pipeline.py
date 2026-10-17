@@ -212,7 +212,7 @@ class RLPipeline:
         # think-skip: a fixed share of each training group starts with a closed think (the row's view decides if it applies)
         n_skip = round(self.config.rollout.think_skip * size) if training else 0
         results = await asyncio.gather(
-            *(self._trajectory(row, gid, temperature, training, k < n_skip) for k in range(size))
+            *(self._episode(row, gid, temperature, training, k < n_skip) for k in range(size))
         )
         group = [t for t, _ in results]
         envs = [env for _, env in results]
@@ -226,6 +226,27 @@ class RLPipeline:
             if scored:
                 self.sampler.observe(index, sum(scored) / len(scored))
         return group
+
+    @property
+    def _early_release(self) -> bool:
+        """Score each episode's environment as soon as the episode ends and release it then, instead of holding every
+        finished environment (a Harbor container, a remote session) until the slowest episode of its group ends; only
+        when no reward function asks for the live environment (env / envs)."""
+        pool = self.env_pool
+        return pool is not None and pool.has_reward and not any(
+            r.accepts_all or {"env", "envs"} & r.accepts for r in self.rewards)
+
+    async def _episode(
+        self, row: dict, gid: int, temperature: float, training: bool, skip: bool = False
+    ) -> tuple[Trajectory, Any]:
+        trajectory, env = await self._trajectory(row, gid, temperature, training, skip)
+        if env is not None and trajectory.finish != "error" and self._early_release:
+            try:
+                trajectory.info["_env_reward"] = await self._env_reward(env, trajectory)
+            finally:
+                await self.env_pool.release(env)
+            env = None
+        return trajectory, env
 
     async def _trajectory(
         self, row: dict, gid: int, temperature: float, training: bool, skip: bool = False
@@ -407,7 +428,10 @@ class RLPipeline:
         for reward in self.rewards:
             scores[reward.name] = await reward.score(samples)
         if self.env_pool is not None and self.env_pool.has_reward:
-            scores["env"] = list(await asyncio.gather(*(self._env_reward(envs[i], group[i]) for i in live)))
+            scores["env"] = list(await asyncio.gather(*(self._env_reward(envs[i], group[i]) for i in live
+                                                          if "_env_reward" not in group[i].info)))
+            scores["env"] = [group[i].info.pop("_env_reward") if "_env_reward" in group[i].info else scores["env"].pop(0)
+                             for i in live]
         weights = {r.name: r.weight for r in self.rewards}
         loss = self.config.loss
         budget = self.config.completion_budget

@@ -227,6 +227,72 @@ def test_dynamic_tools_and_environment_ended_episode():
     assert "submit" in tok.decode(t.prompt_ids)  # the dynamic schema reached the prompt
 
 
+
+class _Tracked(Submission):
+    """Records when each instance is scored and closed relative to the others."""
+
+    events: list = []
+    made = 0
+
+    def __init__(self):
+        _Tracked.made += 1
+        self.slow = _Tracked.made % 3 != 1  # two of every three instances take a while to score
+
+    def get_reward(self):
+        import time
+
+        if self.slow:
+            time.sleep(0.4)
+        _Tracked.events.append(("reward", id(self)))
+        return super().get_reward()
+
+    def close(self):
+        _Tracked.events.append(("close", id(self)))
+
+
+def test_environments_are_scored_and_released_when_their_episode_ends():
+    """A finished episode's environment is scored and released right away (not held until the slowest sibling of its
+    group ends); with a reward that asks for the live env, release waits for the group as before."""
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from palingenesis.rl.rewards import Reward
+    from tests.test_rl import ScriptedEngine, tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    eot = end_of_turn_id(tok, kwargs)
+    call = '<tool_call>\n{"name": "submit", "arguments": {"answer": "5"}}\n</tool_call>'
+    config = RLConfig()
+    for key, value in {"model.policy": "x", "model.chat_template_kwargs": kwargs, "env.max_turns": 4,
+                       "rollout.max_new_tokens": 64, "rollout.max_model_len": 4096}.items():
+        config.set(key, value)
+    rows = [{"prompt": "What is 2 + 3? Submit it."}]
+    for rewards, early in (([], True), ([Reward("peek", lambda env, **_: 0.0)], False)):
+        _Tracked.events, _Tracked.made = [], 0
+        pipeline = RLPipeline(tok, ChatFormat(tok, eot, kwargs), ScriptedEngine(tok, eot, [call, "never"]),
+                              PublishedWeights(torch.nn.Linear(1, 1)), config, PromptSampler(rows), rewards,
+                              EnvPool(_Tracked), None, (eot,))
+        try:
+            assert pipeline._early_release is early
+            (group,) = pipeline._await(pipeline._eval(rows, 1.0, 3))
+        finally:
+            pipeline.close()
+        kinds = [k for k, _ in _Tracked.events]
+        assert kinds.count("reward") == 3 and kinds.count("close") == 3
+        assert all(t.rewards["env"] == 1.0 and "_env_reward" not in t.info for t in group)
+        if early:  # the fast instance is released while the slow ones are still being scored
+            assert kinds[:2] == ["reward", "close"] and _Tracked.events[0][1] == _Tracked.events[1][1]
+        else:  # every reward first, then the releases (the reward function saw the live env)
+            assert kinds == ["reward"] * 3 + ["close"] * 3
+
+
 class _ScoredWithMetrics(Submission):
     def get_reward(self):
         ok = float(self.answer == "5")
