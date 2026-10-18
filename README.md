@@ -4,157 +4,77 @@
   <img src="./assets/pgs.webp" alt="palingenesis" width="100%">
 </p>
 
-**Fire-and-forget LLM fine-tuning with state-of-the-art defaults.**
+**Post-train LLMs and agents from one config: SFT, multi-turn RL in tool environments, on-policy distillation, DPO and
+merging, with state-of-the-art defaults.**
 
-Papers distilled into one command. Every optimization applied automatically.
+[Documentation](https://mii-llm.github.io/palingenesis/) · [Quickstart](https://mii-llm.github.io/palingenesis/getting-started/quickstart/) · [Configs](configs/)
 
 ```bash
 git clone https://github.com/mii-llm/palingenesis.git && cd palingenesis
-uv sync --extra train --extra logging     # creates .venv with CUDA-enabled torch
-                                          # (+ --extra hybrid for Qwen3.5: faster, and needed to pack)
+uv sync --extra train --extra logging     # .venv with CUDA-enabled torch (+ --extra hybrid for Qwen3.5: faster, needed to pack)
 source .venv/bin/activate
-./run.sh configs/quickstart.yaml
-```
-
-See [Installation](mkdocs_docs/getting-started/install.md) for pip, other CUDA versions and troubleshooting.
-
-Short CLI alias: `pgs`
-
-```bash
 pgs train --config configs/quickstart.yaml
-pgs autopilot --model Qwen/Qwen3.5-4B --dataset your_data.jsonl
 ```
 
----
+Other install paths (pip, CUDA versions, troubleshooting): [Installation](https://mii-llm.github.io/palingenesis/getting-started/install/).
 
-## What you get
+## What it does
 
-- **Correct by construction**: the loss path is checked against a plain reference loop step by step; packed conversations never see each other; saved models load with plain `from_pretrained`; multi-GPU gradients equal single-GPU ones (tests included)
-- **Agentic masking from the chat template itself**: whole assistant turns, tool calls and end-of-turn tokens included; `tools` rendered into the prompt; per-message `loss: false`
-- **Memory**: chunked losses (never the full logits), selective activation checkpointing, gradient release, 8-bit optimizers; a Qwen3.5-4B fine-tune (attention pathway trained, 36% of the weights) in ~16 GiB
-- **Research options, one line each**: DEFT/DFT/InfoSFT token weighting, Hyperball, power-decay; implemented to their papers' definitions, benefits as reported by the papers (not reproduced here)
-- **Best-model tracking**: eval before training, every `eval_every` steps and at the end; saves the lowest-eval-loss checkpoint
-- **Auto-resume**: crash and re-run, picks up exactly where the last complete checkpoint left off
-- **Multi-node SLURM**: sharded DCP checkpoints
+| | Command | Guide |
+|---|---|---|
+| **Supervised fine-tuning**, including agentic traces with tool calls and reasoning | `pgs train --config configs/quickstart.yaml` | [Data](https://mii-llm.github.io/palingenesis/guides/data/), [Agentic](https://mii-llm.github.io/palingenesis/guides/agentic-training/) |
+| **Reinforcement learning**: verifiable rewards, multi-turn tool use, GRPO-style groups, vLLM rollouts | `pgs rl --config configs/rl_math.yaml` | [RL](https://mii-llm.github.io/palingenesis/guides/rl/) |
+| **Agent environments**: Python classes, MCP servers, OpenEnv, NeMo Gym, Harbor tasks in Docker, with emulated harness dialects (opencode, pi, OpenHands, …) | `pgs rl --config configs/rl_harbor.yaml` | [Harbor](https://mii-llm.github.io/palingenesis/guides/harbor/), [Harness profiles](https://mii-llm.github.io/palingenesis/guides/harness-profiles/) |
+| **On-policy distillation**: the student samples, one or more teachers score those tokens, reverse KL | `pgs distill --config configs/distill_math.yaml` | [Distillation](https://mii-llm.github.io/palingenesis/guides/distillation/) |
+| **Preference optimization**: DPO, IPO, SLiC-HF, robust and length-normalised DPO, SFT anchor | `pgs train --config configs/dpo_qwen35_08b.yaml` | [DPO](https://mii-llm.github.io/palingenesis/guides/dpo/) |
+| **Model merging**: interpolation, soups, task arithmetic | `pgs merge interpolate START END --lam 0.3 -o OUT` | [Merging](https://mii-llm.github.io/palingenesis/guides/merging/) |
+| **Data preparation**: score, filter and select with the same config you train with | `pgs prepare --config configs/qwen35_4b/a100_80gb.yaml` | [Data](https://mii-llm.github.io/palingenesis/guides/data/) |
+| **Autopilot**: profiles the GPU, sweeps the learning rate, trains to completion | `pgs autopilot --model Qwen/Qwen3.5-4B --dataset data.jsonl` | [Autopilot](https://mii-llm.github.io/palingenesis/guides/autopilot/) |
+
+## Highlights
+
+- **Correct by construction.** The loss path is checked step by step against a plain reference loop; packed conversations
+  never see each other; multi-GPU gradients equal single-GPU ones; saved models load with plain `from_pretrained`.
+- **Masking from the chat template itself.** Whole assistant turns are trained as the template renders them, tool calls and
+  end-of-turn tokens included; `tools` are rendered into the prompt; `"loss": false` keeps a message as context only.
+- **Token-exact RL.** What the trainer scores is exactly what the sampler produced, tool results included; nothing is
+  re-tokenized. Rewards are checked answers, hidden tests, LLM judges or any Python function.
+- **Memory.** Chunked losses (the full logits are never materialised), selective activation checkpointing, gradient
+  release, 8-bit optimizers. A Qwen3.5-4B fine-tune (attention pathway, 36% of the weights) fits in about 16 GiB.
+- **Long sequences on one GPU (SeCO).** Chunk-by-chunk training with a cache gives the exact gradient, verified against full
+  backpropagation on 27 architectures, including the Qwen3.5 and LFM2 hybrids.
+- **Training you can inspect.** wandb and trackio with grad norm, spike and clip counters, gradient noise scale, entropy and
+  the generalisation gap on one step axis; best-checkpoint tracking on eval loss.
+- **Crash-safe.** Re-run the same command to resume from the last complete checkpoint, in the same tracker run.
+- **Scale out.** FSDP across GPUs, multi-node SLURM with sharded checkpoints, and a container image for Kubernetes.
+- **Research options, one line each.** DEFT / DFT / InfoSFT token weighting, Hyperball, power-decay schedules: implemented to
+  their papers' definitions; the benefits are as reported by the papers, not reproduced here.
 
 ## Hardware
 
 | GPU | Model | Config |
 |-----|-------|--------|
-| RTX 4090 (24 GB) | Qwen3.5-4B, attention pathway (36% of weights) | `configs/qwen35_4b/a100_40gb.yaml` |
-| A100-80GB | Qwen3.5-4B, batch=4 | `configs/qwen35_4b/a100_80gb.yaml` |
-| 8× A100 | Qwen3.5-35B MoE | `configs/qwen35_35b_moe/a100_80gb_multigpu.yaml` |
-| H100 | Qwen3.5-4B, FP8 | `configs/qwen35_4b/h100_80gb.yaml` |
-
-## Data preparation (one config, closed loop)
-
-Score, filter, and select your data with the *same* config you train with — the scoring model is `model.name_or_path`, the raw data is `data.dataset`, and the `preprocess:` section controls selection. Output is parquet plus a provenance manifest:
+| A100 40 GB | Qwen3.5-4B, attention pathway (36% of weights) | `configs/qwen35_4b/a100_40gb.yaml` |
+| A100 80 GB | Qwen3.5-4B, batch 4 | `configs/qwen35_4b/a100_80gb.yaml` |
+| H100 80 GB | Qwen3.5-4B, FP8 | `configs/qwen35_4b/h100_80gb.yaml` |
+| 8× A100 80 GB | Qwen3.5-35B MoE | `configs/qwen35_35b_moe/a100_80gb_multigpu.yaml` |
 
 ```bash
-pgs prepare --config configs/qwen35_4b/a100_80gb.yaml            # score → filter → parquet
-pgs train   --config configs/qwen35_4b/a100_80gb.yaml \
-            --preprocess.enabled true                            # trains on the prepared data
+./scripts/train_multi_gpu.sh configs/qwen35_4b/a100_80gb_multigpu.yaml           # one node, all GPUs
+sbatch scripts/train_slurm.sh configs/qwen35_35b_moe/a100_80gb_multigpu.yaml     # SLURM
 ```
 
-Strategies: `optimal` (research-backed J-shaped difficulty mix), `curriculum` (easy→hard, ordering preserved during training), `balanced`, `flow`, and more.
+Containers and Kubernetes: [docs/containers.md](docs/containers.md).
 
-## Training dynamics you can actually see
-
-wandb + trackio, wired for real investigation: loss/ppl, grad norm, spike/clip counters, gradient noise scale, output entropy, and the generalization gap (`eval/gap`) — all on a single `train/global_step` axis. Crash-resume continues the *same* wandb run (run id persisted next to your checkpoints), and a tracker outage can never kill training.
-
-## Agentic data support
-
-Native support for reasoning traces with `reasoning` (or legacy `reasoning_content`), `tool_calls`, and tool responses. Each assistant turn is trained exactly as the chat template renders it, tool calls and end-of-turn token included. Tool definitions in a `tools` field are rendered into the prompt; `"loss": false` on a message keeps it as context only. ShareGPT, Alpaca and OpenAI formats (JSON-string tool arguments included) are normalized. Tool-call validation against declared schemas.
-
-```yaml
-data:
-  include_observations: true  # ECHO: train on tool outputs (world model)
-  turn_scaling: progressive   # Later turns weighted more
-```
-
-## Hyper-long sequences on one GPU (SeCO)
-
-Train on sequences far beyond what fits in memory. The model runs chunk by chunk with a cache, keeping one chunk's activations at a time, and gradients are relayed back through the cache. The result is the exact gradient, verified against full backpropagation on 27 architectures, including the Qwen3.5 and LFM2 hybrids.
-
-```yaml
-memory:
-  seco: true
-  seco_chunk_size: 4096
-```
-
-See the [long-sequences guide](mkdocs_docs/guides/long-sequences.md).
-
-## Preference optimization (DPO)
-
-DPO and its variants (IPO, SLiC-HF, robust DPO, length-normalised, plus LD-DPO and an SFT anchor) run on the same trainer, chat templates and masking as SFT, with thinking and non-thinking pairs mixed in one dataset. The full `[B, S, V]` logits are never materialised.
-
-```yaml
-dpo:
-  enabled: true
-  beta: 0.1
-  sft_weight: 0.2
-```
-
-See [docs/dpo.md](docs/dpo.md).
-
-## Autopilot
-
-Zero-config mode. Profiles your GPU, sweeps LR, trains to completion:
+## Development
 
 ```bash
-pgs autopilot --model Qwen/Qwen3.5-4B --dataset your_data.jsonl
+pytest tests/                 # test suite
+mkdocs serve                  # docs locally (pip install mkdocs-material)
 ```
 
-## On-policy distillation
+## License
 
-Shrink a teacher into a student by scoring the student's **own samples**: the student samples with its current weights, the teacher scores those exact tokens, and the student is pulled toward the teacher's distribution (reverse KL). Rollouts from vLLM or the trainer's own `generate`; teachers in-process or on a vLLM server; teachers with another tokenizer (byte-aligned chunks); one teacher per prompt source.
-
-```bash
-pgs distill --config configs/distill_math.yaml     # Qwen3-1.7B -> Qwen3-0.6B, vLLM rollouts
-pgs distill --config configs/distill_xtok.yaml     # teacher with another tokenizer
-pgs distill --config configs/distill_multi.yaml    # one teacher per prompt source
-pgs distill-score --config configs/distill_opd.yaml --out data/prompts_scored.jsonl  # annotate an mcqa pool
-```
-
-`distill-score` marks every multiple-choice pool row with the teacher's own answer so you can filter before training — pure KL faithfully distills the teacher's *errors* too, making its accuracy a hard ceiling. See the [distillation guide](https://mii-llm.github.io/palingenesis/guides/distillation/).
-
-## Agentic RL on Harbor-style task environments
-
-Small verifiable tasks, one directory each in the [Harbor](https://harborframework.com) layout (`task.toml`, `instruction.md`, `environment/`, `tests/test.sh`, `solution/solve.sh`), run in local Docker containers with no cloud sandbox and no Harbor dependency. Each episode gets a fresh container with the task's limits and no network; the policy works through `bash` / `read_file` / `write_file` / `str_replace` / `submit`; the hidden tests then run in a clean container that holds only a copy of the working directory, so the agent cannot tamper with its own reward.
-
-```bash
-pgs harbor check data/harbor_tasks                      # oracle must pass, doing nothing must fail
-pgs harbor rows data/harbor_tasks data/harbor_rows.jsonl
-pgs rl --config configs/rl_harbor.yaml                  # env: palingenesis.rl.envs.harbor:HarborEnv
-```
-
-Many tasks can share one prebuilt image (`[environment] docker_image`), with starting files in `environment/workdir/` and an optional `environment/setup.sh` (a database, a git repository).
-
-## Multi-GPU / Multi-Node
-
-```bash
-./scripts/train_multi_gpu.sh configs/qwen35_4b/a100_80gb_multigpu.yaml
-sbatch scripts/train_slurm.sh configs/qwen35_35b_moe/a100_80gb_multigpu.yaml
-```
-
-## Documentation
-
-```bash
-pip install mkdocs-material
-mkdocs serve  # → http://localhost:8000
-```
-
-## Tests
-
-```bash
-pytest tests/
-```
-
----
-
-## Container deployment
-
-See [Containers and Kubernetes training](docs/containers.md) for the Docker image,
-GHCR publishing workflow, GPU Job manifests, persistent storage and runtime secrets.
+[Apache-2.0](LICENSE).
 
 *A new form emerging from what came before.*
