@@ -67,6 +67,21 @@ pgs harness serve   --script turns.json --out requests.jsonl [--port 8000] [--mo
 pgs harness capture opencode --task task_steps/ --script turns.json --out captures/opencode [--harbor 0.24.0]
 ```
 
+### merge
+
+Weight-space merging of checkpoints that share an architecture. See [Model Merging](../guides/merging.md).
+
+```bash
+pgs merge interpolate START END --lam 0.3 -o OUT          # START + lam (END - START)
+pgs merge linear A:0.7 B:0.3 -o OUT                       # weights sum to 1 (--unnormalized to allow others)
+pgs merge soup A B C -o OUT                               # mean
+pgs merge task-arithmetic --base BASE A:1 B:0.3 -o OUT    # BASE + sum l_i (W_i - BASE)
+pgs merge materialize CKPT --template EXPORT -o OUT       # complete a partial checkpoint
+```
+
+Common options: `--template` (tensor set, layout, dtype and files of the output), `--missing {error,template}`,
+`--dtype {bf16,fp16,fp32}`, `--overwrite`.
+
 ### autopilot
 
 Zero-config autonomous training. Profiles hardware, sweeps LR, trains to completion.

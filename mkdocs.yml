@@ -102,6 +102,7 @@ nav:
     - Reinforcement Learning: guides/rl.md
     - Harbor Environments: guides/harbor.md
     - Harness Profiles: guides/harness-profiles.md
+    - Model Merging: guides/merging.md
     - SFT → RL Transition: guides/sft-to-rl.md
   - Reference:
     - Configuration: reference/configuration.md
