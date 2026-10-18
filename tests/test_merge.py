@@ -9,7 +9,12 @@ from safetensors.torch import load_file, save_file
 from palingenesis import merge as M
 
 NAMES = ["model.embed.weight", "model.layers.0.w", "model.layers.1.w", "lm_head.weight"]
-SHAPES = {"model.embed.weight": (6, 4), "model.layers.0.w": (4, 4), "model.layers.1.w": (4, 4), "lm_head.weight": (6, 4)}
+SHAPES = {
+    "model.embed.weight": (6, 4),
+    "model.layers.0.w": (4, 4),
+    "model.layers.1.w": (4, 4),
+    "lm_head.weight": (6, 4),
+}
 
 
 def make(path, seed, *, shards=1, dtype=torch.bfloat16, names=NAMES, extra=None, files=True):
@@ -51,11 +56,15 @@ def test_interpolate_math_dtype_layout_and_files(tmp_path):
         expect = (0.7 * wa[n].float() + 0.3 * wb[n].float()).to(torch.bfloat16)
         assert wo[n].dtype == torch.bfloat16 and torch.equal(wo[n], expect)
     # the output mirrors the template (the start): its two shards and index, its config; training files are not copied
-    assert sorted(p.name for p in (tmp_path / "out").glob("*.safetensors")) == sorted(p.name for p in a.glob("*.safetensors"))
+    assert sorted(p.name for p in (tmp_path / "out").glob("*.safetensors")) == sorted(
+        p.name for p in a.glob("*.safetensors")
+    )
     index = json.loads((tmp_path / "out" / "model.safetensors.index.json").read_text())
     assert set(index["weight_map"]) == set(NAMES) and index["metadata"]["total_size"] > 0
     assert json.loads((tmp_path / "out" / "config.json").read_text())["seed"] == 0
-    assert (tmp_path / "out" / "chat_template.jinja").exists() and not (tmp_path / "out" / "training_meta.json").exists()
+    assert (tmp_path / "out" / "chat_template.jinja").exists() and not (
+        tmp_path / "out" / "training_meta.json"
+    ).exists()
     cfg = json.loads((tmp_path / "out" / "merge_config.json").read_text())
     assert cfg["method"] == "interpolate" and cfg["lam"] == 0.3 and [s["coef"] for s in cfg["sources"]] == [0.7, 0.3]
     assert r.tensors == len(NAMES) and r.from_template == 0
@@ -95,7 +104,9 @@ def test_missing_tensors_error_or_template(tmp_path):
 
 
 def test_materialize_completes_a_partial_fp32_checkpoint(tmp_path):
-    export = make(tmp_path / "export", 0, extra={"visual.patch.weight": torch.ones(3, 3, dtype=torch.bfloat16)}, shards=2)
+    export = make(
+        tmp_path / "export", 0, extra={"visual.patch.weight": torch.ones(3, 3, dtype=torch.bfloat16)}, shards=2
+    )
     ckpt = make(tmp_path / "ckpt", 5, dtype=torch.float32, files=False)  # text-only training save, fp32, no files
     r = M.materialize(ckpt, export, tmp_path / "out")
     wc, we, wo = weights(ckpt), weights(export), weights(tmp_path / "out")
@@ -151,5 +162,7 @@ def test_cli(tmp_path, capsys):
     assert M.main(["linear", f"{a}:0.5", f"{b}:0.6", "-o", str(tmp_path / "bad")]) == 1  # weights do not sum to 1
     assert "sum to" in capsys.readouterr().err
     wa, wb, wl = weights(a), weights(b), weights(tmp_path / "l")
-    assert torch.equal(wl["model.embed.weight"], (0.25 * wa["model.embed.weight"].float()
-                                                  + 0.75 * wb["model.embed.weight"].float()).to(torch.bfloat16))
+    assert torch.equal(
+        wl["model.embed.weight"],
+        (0.25 * wa["model.embed.weight"].float() + 0.75 * wb["model.embed.weight"].float()).to(torch.bfloat16),
+    )

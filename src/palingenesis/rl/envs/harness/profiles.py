@@ -73,9 +73,15 @@ def palingenesis_default() -> HarnessProfile:
     from palingenesis.rl.envs.harbor import SYSTEM, TOOL_SCHEMAS
 
     return HarnessProfile(
-        name="palingenesis-default", version="1", system=SYSTEM, tools=[ToolSpec(s) for s in TOOL_SCHEMAS.values()],
-        stop=Submit("submit"), answer=LastText(), legacy=True,
-        emulates="HarborEnv's own prompt and tools (the row's conversation, HarborEnv.call_tool)")
+        name="palingenesis-default",
+        version="1",
+        system=SYSTEM,
+        tools=[ToolSpec(s) for s in TOOL_SCHEMAS.values()],
+        stop=Submit("submit"),
+        answer=LastText(),
+        legacy=True,
+        emulates="HarborEnv's own prompt and tools (the row's conversation, HarborEnv.call_tool)",
+    )
 
 
 # palingenesis-default@2: nanocode's dialect (a minimal Claude Code alternative): a one-line system prompt, six tools
@@ -85,11 +91,17 @@ def palingenesis_default() -> HarnessProfile:
 NANO_SYSTEM = "Concise coding assistant. cwd: {workdir}"
 NANO_TIMEOUT = 30
 _NANO_SPEC = (  # name, description, {param: "type" | "type?"} (nanocode's TOOLS; make_schema maps number -> integer)
-    ("read", "Read file with line numbers (file path, not directory)",
-     {"path": "string", "offset": "number?", "limit": "number?"}),
+    (
+        "read",
+        "Read file with line numbers (file path, not directory)",
+        {"path": "string", "offset": "number?", "limit": "number?"},
+    ),
     ("write", "Write content to file", {"path": "string", "content": "string"}),
-    ("edit", "Replace old with new in file (old must be unique unless all=true)",
-     {"path": "string", "old": "string", "new": "string", "all": "boolean?"}),
+    (
+        "edit",
+        "Replace old with new in file (old must be unique unless all=true)",
+        {"path": "string", "old": "string", "new": "string", "all": "boolean?"},
+    ),
     ("glob", "Find files by pattern, sorted by mtime", {"pat": "string", "path": "string?"}),
     ("grep", "Search files for regex pattern", {"pat": "string", "path": "string?"}),
     ("bash", "Run shell command", {"cmd": "string"}),
@@ -103,7 +115,7 @@ def _nano_schema(name: str, description: str, params: dict) -> dict:
 
 NANO_TOOLS = {n: _nano_schema(n, d, p) for n, d, p in _NANO_SPEC}
 
-_NANO_PY = r'''
+_NANO_PY = r"""
 import glob as globlib, json, os, re, sys
 def read(args):
     lines = open(args["path"]).readlines()
@@ -153,7 +165,7 @@ try:
 except Exception as err:
     out = f"error: {err}"
 sys.stdout.write(out)
-'''
+"""
 
 
 def _nano_py(s, name: str, a: dict) -> str:
@@ -180,15 +192,24 @@ def _nano_bash(s, a):
 
 
 def palingenesis_default_2() -> HarnessProfile:
-    tools = [ToolSpec(NANO_TOOLS[n], _nano_bash if n == "bash" else (lambda s, a, n=n: _nano_py(s, n, a)))
-             for n, _, _ in _NANO_SPEC]
+    tools = [
+        ToolSpec(NANO_TOOLS[n], _nano_bash if n == "bash" else (lambda s, a, n=n: _nano_py(s, n, a)))
+        for n, _, _ in _NANO_SPEC
+    ]
     return HarnessProfile(
-        name="palingenesis-default", version="2", system=NANO_SYSTEM, tools=tools, stop=NoCall(), answer=LastText(),
-        exec_timeout=NANO_TIMEOUT, unknown_tool=lambda name, names, args: f"error: {name!r}",  # TOOLS[name] KeyError
+        name="palingenesis-default",
+        version="2",
+        system=NANO_SYSTEM,
+        tools=tools,
+        stop=NoCall(),
+        answer=LastText(),
+        exec_timeout=NANO_TIMEOUT,
+        unknown_tool=lambda name, names, args: f"error: {name!r}",  # TOOLS[name] KeyError
         emulates="nanocode (minimal Claude Code alternative): system prompt, TOOLS and make_schema, run_tool's "
-                 "'error: {err}' wording, the agentic loop's stop at a reply without tool calls; bash under /bin/sh "
-                 "with stderr merged, a 30 s timeout (the partial output of a timed-out command is not kept), no "
-                 "output cap of its own")
+        "'error: {err}' wording, the agentic loop's stop at a reply without tool calls; bash under /bin/sh "
+        "with stderr merged, a 30 s timeout (the partial output of a timed-out command is not kept), no "
+        "output cap of its own",
+    )
 
 
 # ================================================================== mini-swe-agent 2.4.6
@@ -197,8 +218,12 @@ MINI_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 MINI_ENV = {"PAGER": "cat", "MANPAGER": "cat", "LESS": "-R", "PIP_PROGRESS_BAR": "off", "TQDM_DISABLE": "1"}
 MINI_TIMEOUT = 30  # LocalEnvironmentConfig.timeout
 
-MINI_BASH = fn("bash", "Execute a bash command",
-               {"command": {"type": "string", "description": "The bash command to execute"}}, ["command"])
+MINI_BASH = fn(
+    "bash",
+    "Execute a bash command",
+    {"command": {"type": "string", "description": "The bash command to execute"}},
+    ["command"],
+)
 
 MINI_SYSTEM = "You are a helpful assistant that can interact with a computer."
 MINI_SYSTEM_TEXT = (
@@ -208,7 +233,8 @@ MINI_SYSTEM_TEXT = (
     "Format your response as shown in <format_example>.\n\n"
     "<format_example>\nYour reasoning and analysis here. Explain why you want to perform the action.\n\n"
     "```mswea_bash_command\nyour_command_here\n```\n</format_example>\n\n"
-    "Responses that break these rules are rejected.")
+    "Responses that break these rules are rejected."
+)
 
 _MINI_WORKFLOW = (
     "Please solve this issue: {instruction}\n\n"
@@ -222,18 +248,19 @@ _MINI_WORKFLOW = (
     "5. Test edge cases\n"
     f"6. Submit and finish your work with the command `echo {MINI_SENTINEL}`.\n"
     "   Do not combine it with any other command. <important>After this command you cannot continue working on this "
-    "task.</important>\n\n")
+    "task.</important>\n\n"
+)
 _MINI_TAIL = (
     "<system_information>\n{system_information}\n</system_information>\n\n"
     "## Useful command examples\n\n"
     "### Create a new file:\n\n{fence}\ncat <<'EOF' > newfile.py\nhello = \"world\"\nprint(hello)\nEOF\n```\n\n"
     "### Edit files with sed:\n\n{fence}\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n"
     "# Replace only the first occurrence\nsed -i 's/old_string/new_string/' filename.py\n```\n\n"
-    "### View file content:\n\n{fence}\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n")
+    "### View file content:\n\n{fence}\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n"
+)
 
 MINI_USER = (
-    _MINI_WORKFLOW
-    + "## Command Execution Rules\n\n"
+    _MINI_WORKFLOW + "## Command Execution Rules\n\n"
     "You issue at least one command, the system runs it in a subshell, you see the result, then you write your next "
     "command(s).\n\n"
     "Each response should include:\n\n1. **Reasoning text** explaining your analysis and plan\n"
@@ -244,13 +271,12 @@ MINI_USER = (
     "action with `MY_ENV_VAR=MY_VALUE cd /path/to/dir && ...`, or write and load variables from files)\n"
     f"- Submit and finish with `echo {MINI_SENTINEL}`, alone.\n\n"
     "Example of a CORRECT response:\n<example_response>\nI need to understand the structure of the repository first. "
-    "Let me list the files in the current directory.\n\n[Makes bash tool call with {\"command\": \"ls -la\"} as "
-    "arguments]\n</example_response>\n\n"
-    + _MINI_TAIL.replace("{fence}", "```bash"))
+    'Let me list the files in the current directory.\n\n[Makes bash tool call with {"command": "ls -la"} as '
+    "arguments]\n</example_response>\n\n" + _MINI_TAIL.replace("{fence}", "```bash")
+)
 
 MINI_USER_TEXT = (
-    _MINI_WORKFLOW
-    + "## Important Rules\n\n"
+    _MINI_WORKFLOW + "## Important Rules\n\n"
     "1. Every response must contain exactly one action\n"
     "2. The action must be enclosed in triple backticks\n"
     "3. Directory or environment variable changes are not persistent: every action runs in a new subshell (prefix an "
@@ -258,13 +284,19 @@ MINI_USER_TEXT = (
     "## Formatting your response\n\nHere is an example of a correct response:\n\n<example_response>\n"
     "THOUGHT: I need to understand the structure of the repository first. Let me list the files in the current "
     "directory.\n\n```mswea_bash_command\nls -la\n```\n</example_response>\n\n"
-    + _MINI_TAIL.replace("{fence}", "```mswea_bash_command"))
+    + _MINI_TAIL.replace("{fence}", "```mswea_bash_command")
+)
 
 
 def _tojson(value) -> str:
     """Jinja2's |tojson (htmlsafe json.dumps), as mini-swe-agent's observation template renders strings."""
-    return (json.dumps(value, sort_keys=True).replace("<", "\\u003c").replace(">", "\\u003e")
-            .replace("&", "\\u0026").replace("'", "\\u0027"))
+    return (
+        json.dumps(value, sort_keys=True)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("'", "\\u0027")
+    )
 
 
 def mini_observation(output: str, returncode: int, exception_info: str = "") -> str:
@@ -274,8 +306,10 @@ def mini_observation(output: str, returncode: int, exception_info: str = "") -> 
     if cut is None:
         return f'{{\n  "returncode": {returncode},\n  "output": {_tojson(output)}{exc}\n}}'
     head, tail, elided = cut
-    return (f'{{\n  "returncode": {returncode},\n  "output_head": {_tojson(head)},\n  "output_tail": {_tojson(tail)},'
-            f'\n  "elided_chars": {elided},\n  "warning": "Output too long."{exc}\n}}')
+    return (
+        f'{{\n  "returncode": {returncode},\n  "output_head": {_tojson(head)},\n  "output_tail": {_tojson(tail)},'
+        f'\n  "elided_chars": {elided},\n  "warning": "Output too long."{exc}\n}}'
+    )
 
 
 MINI_TEXT_WARNING = (
@@ -283,7 +317,8 @@ MINI_TEXT_WARNING = (
     "output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines "
     "selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search "
     "pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file "
-    "and then search in that file.\n</warning>")
+    "and then search in that file.\n</warning>"
+)
 
 
 def mini_text_observation(output: str, returncode: int, exception_info: str = "") -> str:
@@ -294,18 +329,22 @@ def mini_text_observation(output: str, returncode: int, exception_info: str = ""
     if cut is None:
         return f"{head}<output>\n{output}</output>"
     h, t, elided = cut
-    return (f"{head}{MINI_TEXT_WARNING}<output_head>\n{h}\n</output_head>\n<elided_chars>\n{elided} characters "
-            f"elided\n</elided_chars>\n<output_tail>\n{t}\n</output_tail>")
+    return (
+        f"{head}{MINI_TEXT_WARNING}<output_head>\n{h}\n</output_head>\n<elided_chars>\n{elided} characters "
+        f"elided\n</elided_chars>\n<output_tail>\n{t}\n</output_tail>"
+    )
 
 
 def mini_format_error(reason: str, n: int) -> str:
-    return ("Tool call error:\n\n<error>\n" + reason + "\n</error>\n\n"
-            "Here is general guidance on how to submit correct toolcalls:\n\n"
-            "Every response needs to use the 'bash' tool at least once to execute commands.\n\n"
-            "Call the bash tool with your command as the argument:\n- Tool: bash\n"
-            '- Arguments: {"command": "your_command_here"}\n\n'
-            f"If you want to end the task, please issue the following command: `echo {MINI_SENTINEL}`\n"
-            "without any other command.")
+    return (
+        "Tool call error:\n\n<error>\n" + reason + "\n</error>\n\n"
+        "Here is general guidance on how to submit correct toolcalls:\n\n"
+        "Every response needs to use the 'bash' tool at least once to execute commands.\n\n"
+        "Call the bash tool with your command as the argument:\n- Tool: bash\n"
+        '- Arguments: {"command": "your_command_here"}\n\n'
+        f"If you want to end the task, please issue the following command: `echo {MINI_SENTINEL}`\n"
+        "without any other command."
+    )
 
 
 def mini_unknown_tool(name: str, names: list[str], args: dict) -> str:
@@ -315,14 +354,16 @@ def mini_unknown_tool(name: str, names: list[str], args: dict) -> str:
 
 
 def mini_text_format_error(reason: str, n: int) -> str:
-    return ("Format error:\n\n<error>\n" + reason + "\n</error>\n\n"
-            "Here is general guidance on how to format your response:\n\n"
-            f"Please always provide EXACTLY ONE action in triple backticks, found {n} actions.\n\n"
-            "Please format your action in triple backticks as shown in <response_example>.\n\n"
-            "<response_example>\nHere are some thoughts about why you want to perform the action.\n\n"
-            "```mswea_bash_command\n<action>\n```\n</response_example>\n\n"
-            "If you have completed your assignment, please consult the first message about how to\n"
-            "submit your solution (you will not be able to continue working on this task after that).")
+    return (
+        "Format error:\n\n<error>\n" + reason + "\n</error>\n\n"
+        "Here is general guidance on how to format your response:\n\n"
+        f"Please always provide EXACTLY ONE action in triple backticks, found {n} actions.\n\n"
+        "Please format your action in triple backticks as shown in <response_example>.\n\n"
+        "<response_example>\nHere are some thoughts about why you want to perform the action.\n\n"
+        "```mswea_bash_command\n<action>\n```\n</response_example>\n\n"
+        "If you have completed your assignment, please consult the first message about how to\n"
+        "submit your solution (you will not be able to continue working on this task after that)."
+    )
 
 
 def _mini_bash(text_mode: bool):
@@ -331,29 +372,49 @@ def _mini_bash(text_mode: bool):
         r = ops.exec_(s.ws, cmd, MINI_TIMEOUT, shell="sh", env=MINI_ENV)
         exc = ""
         if r.timed_out:  # subprocess.TimeoutExpired, as LocalEnvironment reports it
-            exc = f"An error occurred while executing the command: Command '{cmd}' timed out after {MINI_TIMEOUT} seconds"
+            exc = (
+                f"An error occurred while executing the command: Command '{cmd}' timed out after {MINI_TIMEOUT} seconds"
+            )
             r = ops.ExecOut(r.output, -1, True)
         s.last_exec = r
         return (mini_text_observation if text_mode else mini_observation)(r.output, r.exit_code, exc)
+
     return bind
 
 
 def mini_swe_agent() -> HarnessProfile:
     return HarnessProfile(
-        name="mini-swe-agent", version="2.4.6", system=MINI_SYSTEM, user=MINI_USER,
-        tools=[ToolSpec(MINI_BASH, _mini_bash(False))], protocol=Native(),
-        stop=Sentinel(MINI_SENTINEL, "bash"), answer=StopAnswer(None), context=Context("none"),
-        format_error=mini_format_error, exec_timeout=MINI_TIMEOUT, unknown_tool=mini_unknown_tool,
-        emulates="minisweagent 2.4.6 config/mini.yaml, models/utils/actions_toolcall.py, environments/local.py")
+        name="mini-swe-agent",
+        version="2.4.6",
+        system=MINI_SYSTEM,
+        user=MINI_USER,
+        tools=[ToolSpec(MINI_BASH, _mini_bash(False))],
+        protocol=Native(),
+        stop=Sentinel(MINI_SENTINEL, "bash"),
+        answer=StopAnswer(None),
+        context=Context("none"),
+        format_error=mini_format_error,
+        exec_timeout=MINI_TIMEOUT,
+        unknown_tool=mini_unknown_tool,
+        emulates="minisweagent 2.4.6 config/mini.yaml, models/utils/actions_toolcall.py, environments/local.py",
+    )
 
 
 def mini_swe_agent_text() -> HarnessProfile:
     return HarnessProfile(
-        name="mini-swe-agent-text", version="2.4.6", system=MINI_SYSTEM_TEXT, user=MINI_USER_TEXT,
-        tools=[ToolSpec(MINI_BASH, _mini_bash(True))], protocol=FencedCommand("mswea_bash_command", "bash", "command"),
-        stop=Sentinel(MINI_SENTINEL, "bash"), answer=StopAnswer(None), context=Context("none"),
-        format_error=mini_text_format_error, exec_timeout=MINI_TIMEOUT,
-        emulates="minisweagent 2.4.6 config/mini_textbased.yaml, models/utils/actions_text.py")
+        name="mini-swe-agent-text",
+        version="2.4.6",
+        system=MINI_SYSTEM_TEXT,
+        user=MINI_USER_TEXT,
+        tools=[ToolSpec(MINI_BASH, _mini_bash(True))],
+        protocol=FencedCommand("mswea_bash_command", "bash", "command"),
+        stop=Sentinel(MINI_SENTINEL, "bash"),
+        answer=StopAnswer(None),
+        context=Context("none"),
+        format_error=mini_text_format_error,
+        exec_timeout=MINI_TIMEOUT,
+        emulates="minisweagent 2.4.6 config/mini_textbased.yaml, models/utils/actions_text.py",
+    )
 
 
 # ================================================================== opencode 1.19.2
@@ -386,7 +447,8 @@ OPENCODE_SYSTEM = (
     "You are powered by the model named {model}. The exact model ID is vllm/{model}\n"
     "Here is some useful information about the environment you are running in:\n"
     "<env>\n  Working directory: {workdir}\n  Workspace root folder: {git_root}\n  Is directory a git repo: {git_repo}\n"
-    "  Platform: linux\n  Today's date: {date}\n</env>")
+    "  Platform: linux\n  Today's date: {date}\n</env>"
+)
 
 OPENCODE_TOOLS = {
     "bash": fn(
@@ -399,11 +461,17 @@ OPENCODE_TOOLS = {
         f"or {OC_MAX_BYTES} bytes, it is truncated and the full output is written to a file you can read with "
         "offset/limit or search with grep. Run independent commands as parallel tool calls; chain dependent ones with "
         "'&&'; do not separate commands with newlines.",
-        {"command": {"type": "string", "description": "The command to execute"},
-         "timeout": {"type": "integer", "exclusiveMinimum": 0, "description": "Optional timeout in milliseconds"},
-         "workdir": {"type": "string", "description": "The working directory to run the command in. Defaults to the "
-                     "current directory. Use this instead of 'cd' commands."}},
-        ["command"]),
+        {
+            "command": {"type": "string", "description": "The command to execute"},
+            "timeout": {"type": "integer", "exclusiveMinimum": 0, "description": "Optional timeout in milliseconds"},
+            "workdir": {
+                "type": "string",
+                "description": "The working directory to run the command in. Defaults to the "
+                "current directory. Use this instead of 'cd' commands.",
+            },
+        },
+        ["command"],
+    ),
     "read": fn(
         "read",
         "Read a file or directory from the local filesystem; a missing path is an error. filePath should be absolute. "
@@ -411,54 +479,86 @@ OPENCODE_TOOLS = {
         "(call again with a larger offset for later sections). Each line is prefixed with its number as `<line>: "
         "<content>`; a directory lists its entries one per line, subdirectories with a trailing `/`. Lines longer than "
         "2000 characters are truncated. Use grep to find content in large files and glob to find file names.",
-        {"filePath": {"type": "string", "description": "The absolute path to the file or directory to read"},
-         "offset": {"type": "integer", "minimum": 0, "description": "The line number to start reading from "
-                    "(1-indexed)"},
-         "limit": {"type": "integer", "minimum": 0, "description": "The maximum number of lines to read (defaults to "
-                   "2000)"}},
-        ["filePath"]),
+        {
+            "filePath": {"type": "string", "description": "The absolute path to the file or directory to read"},
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The line number to start reading from (1-indexed)",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The maximum number of lines to read (defaults to 2000)",
+            },
+        },
+        ["filePath"],
+    ),
     "write": fn(
         "write",
         "Writes a file to the local filesystem, overwriting an existing file. Read an existing file before "
         "overwriting it; prefer editing existing files; do not create documentation files unless asked.",
-        {"content": {"type": "string", "description": "The content to write to the file"},
-         "filePath": {"type": "string", "description": "The absolute path to the file to write (must be absolute, "
-                      "not relative)"}},
-        ["content", "filePath"]),
+        {
+            "content": {"type": "string", "description": "The content to write to the file"},
+            "filePath": {
+                "type": "string",
+                "description": "The absolute path to the file to write (must be absolute, not relative)",
+            },
+        },
+        ["content", "filePath"],
+    ),
     "edit": fn(
         "edit",
         "Performs exact string replacements in files. Read the file first and keep its exact indentation (what follows "
         "the `N: ` line prefix of read; never include the prefix in oldString or newString). The edit fails if "
         "oldString is not found, or is found more than once: give more surrounding context, or set replaceAll to "
         "change every instance (e.g. renaming a variable).",
-        {"filePath": {"type": "string", "description": "The absolute path to the file to modify"},
-         "oldString": {"type": "string", "description": "The text to replace"},
-         "newString": {"type": "string", "description": "The text to replace it with (must be different from "
-                       "oldString)"},
-         "replaceAll": {"type": "boolean", "description": "Replace all occurrences of oldString (default false)"}},
-        ["filePath", "oldString", "newString"]),
+        {
+            "filePath": {"type": "string", "description": "The absolute path to the file to modify"},
+            "oldString": {"type": "string", "description": "The text to replace"},
+            "newString": {
+                "type": "string",
+                "description": "The text to replace it with (must be different from oldString)",
+            },
+            "replaceAll": {"type": "boolean", "description": "Replace all occurrences of oldString (default false)"},
+        },
+        ["filePath", "oldString", "newString"],
+    ),
     "glob": fn(
         "glob",
         "- Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like "
-        "\"**/*.js\" or \"src/**/*.ts\"\n- Returns matching file paths\n- Use it to find files by name patterns; "
+        '"**/*.js" or "src/**/*.ts"\n- Returns matching file paths\n- Use it to find files by name patterns; '
         "batch several speculative searches in one response",
-        {"pattern": {"type": "string", "description": "The glob pattern to match files against"},
-         "path": {"type": "string", "description": "The directory to search in. If not specified, the current working "
-                  "directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter "
-                  "\"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path "
-                  "if provided."}},
-        ["pattern"]),
+        {
+            "pattern": {"type": "string", "description": "The glob pattern to match files against"},
+            "path": {
+                "type": "string",
+                "description": "The directory to search in. If not specified, the current working "
+                "directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter "
+                '"undefined" or "null" - simply omit it for the default behavior. Must be a valid directory path '
+                "if provided.",
+            },
+        },
+        ["pattern"],
+    ),
     "grep": fn(
         "grep",
         "- Fast content search tool that works with any codebase size\n- Searches file contents using regular "
-        "expressions (eg. \"log.*Error\", \"function\\s+\\w+\")\n- Filter files with the include parameter (eg. "
-        "\"*.js\", \"*.{ts,tsx}\")\n- Returns file paths and line numbers with matching lines",
-        {"pattern": {"type": "string", "description": "The regex pattern to search for in file contents"},
-         "path": {"type": "string", "description": "The directory to search in. Defaults to the current working "
-                  "directory."},
-         "include": {"type": "string", "description": "File pattern to include in the search (e.g. \"*.js\", "
-                     "\"*.{ts,tsx}\")"}},
-        ["pattern"]),
+        'expressions (eg. "log.*Error", "function\\s+\\w+")\n- Filter files with the include parameter (eg. '
+        '"*.js", "*.{ts,tsx}")\n- Returns file paths and line numbers with matching lines',
+        {
+            "pattern": {"type": "string", "description": "The regex pattern to search for in file contents"},
+            "path": {
+                "type": "string",
+                "description": "The directory to search in. Defaults to the current working directory.",
+            },
+            "include": {
+                "type": "string",
+                "description": 'File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")',
+            },
+        },
+        ["pattern"],
+    ),
 }
 
 
@@ -480,9 +580,11 @@ def _oc_bash(s, a):
         path = _spill(s, r.output, f"{s.ws.scratch}/opencode/tool-output/tool_{_digest(r.output)}")
         out = f"...output truncated...\n\nFull output saved to: {path}\n\n" + out
     if r.timed_out:
-        out += ("\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout " + str(ms) + " ms. If "
-                "this command is expected to take longer and is not waiting for interactive input, retry with a larger "
-                "timeout value in milliseconds.\n</shell_metadata>")
+        out += (
+            "\n\n<shell_metadata>\nshell tool terminated command after exceeding timeout " + str(ms) + " ms. If "
+            "this command is expected to take longer and is not waiting for interactive input, retry with a larger "
+            "timeout value in milliseconds.\n</shell_metadata>"
+        )
     return out
 
 
@@ -492,8 +594,11 @@ def _oc_miss(s, path: str) -> str:
         entries, _ = ops.list_dir(s.ws, parent, 1, hidden=True)
     except OpError:
         entries = []
-    near = [posixpath.join(parent, e.rstrip("/")) for e in entries
-            if base and (base in e.rstrip("/").lower() or e.rstrip("/").lower() in base)][:3]
+    near = [
+        posixpath.join(parent, e.rstrip("/"))
+        for e in entries
+        if base and (base in e.rstrip("/").lower() or e.rstrip("/").lower() in base)
+    ][:3]
     if near:
         return f"File not found: {path}\n\nDid you mean one of these?\n" + "\n".join(near)
     return f"File not found: {path}"
@@ -507,12 +612,19 @@ def _oc_read(s, a):
         return _oc_miss(s, path)
     if k == "dir":
         entries, _ = ops.list_dir(s.ws, path, 1, hidden=True)
-        sliced = entries[offset - 1:offset - 1 + limit]
+        sliced = entries[offset - 1 : offset - 1 + limit]
         more = offset - 1 + len(sliced) < len(entries)
-        note = (f"\n(Showing {len(sliced)} of {len(entries)} entries. Use 'offset' parameter to read beyond entry "
-                f"{offset + len(sliced)})") if more else f"\n({len(entries)} entries)"
-        return "\n".join([f"<path>{path}</path>", "<type>directory</type>", "<entries>", "\n".join(sliced), note,
-                          "</entries>"])
+        note = (
+            (
+                f"\n(Showing {len(sliced)} of {len(entries)} entries. Use 'offset' parameter to read beyond entry "
+                f"{offset + len(sliced)})"
+            )
+            if more
+            else f"\n({len(entries)} entries)"
+        )
+        return "\n".join(
+            [f"<path>{path}</path>", "<type>directory</type>", "<entries>", "\n".join(sliced), note, "</entries>"]
+        )
     text = ops.read(s.ws, path)
     if "\x00" in text[:8192]:
         return f"Cannot read binary file: {path}"
@@ -521,7 +633,7 @@ def _oc_read(s, a):
     if count < offset and not (count == 0 and offset == 1):
         return f"Offset {offset} is out of range for this file ({count} lines)"
     raw, size, cut, more = [], 0, False, False
-    for line in lines[offset - 1:]:
+    for line in lines[offset - 1 :]:
         if len(raw) >= limit:
             more = True
             break
@@ -549,17 +661,20 @@ def _oc_write(s, a):
     try:
         ops.write(s.ws, path, str(a.get("content", "")))
     except OpError as e:
-        return f"EISDIR: illegal operation on a directory, open '{path}'" if e.kind == "is_dir" else \
-            f"Failed to write {path}: {e.data.get('detail', e.kind)}"
+        return (
+            f"EISDIR: illegal operation on a directory, open '{path}'"
+            if e.kind == "is_dir"
+            else f"Failed to write {path}: {e.data.get('detail', e.kind)}"
+        )
     return "Wrote file successfully."
 
 
 OC_EDIT_ERRORS = {
     "identical": "No changes to apply: oldString and newString are identical.",
     "empty_old": "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use "
-                 "write for an intentional full-file replacement.",
+    "write for an intentional full-file replacement.",
     "no_match": "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and "
-                "line endings.",
+    "line endings.",
     "multiple": "Found multiple matches for oldString. Provide more surrounding context to make the match unique.",
 }
 
@@ -594,8 +709,10 @@ def _oc_glob(s, a):
         return "No files found"
     out = list(files)
     if len(files) == 100:
-        out += ["", "(Results are truncated: showing first 100 results. Consider using a more specific path or "
-                "pattern.)"]
+        out += [
+            "",
+            "(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)",
+        ]
     return "\n".join(out)
 
 
@@ -621,21 +738,34 @@ def _oc_grep(s, a):
 
 
 def opencode() -> HarnessProfile:
-    binds = {"bash": _oc_bash, "read": _oc_read, "write": _oc_write, "edit": _oc_edit, "glob": _oc_glob,
-             "grep": _oc_grep}
+    binds = {
+        "bash": _oc_bash,
+        "read": _oc_read,
+        "write": _oc_write,
+        "edit": _oc_edit,
+        "glob": _oc_glob,
+        "grep": _oc_grep,
+    }
     return HarnessProfile(
-        name="opencode", version="1.19.2", system=OPENCODE_SYSTEM,
+        name="opencode",
+        version="1.19.2",
+        system=OPENCODE_SYSTEM,
         tools=[ToolSpec(OPENCODE_TOOLS[n], binds[n]) for n in ("bash", "edit", "glob", "grep", "read", "write")],
         user='"{instruction}\n"',  # Harbor 0.24's opencode adapter passes the instruction quoted (recorded)
-        stop=NoCall(), answer=LastText(), exec_timeout=OC_TIMEOUT_MS / 1000,
+        stop=NoCall(),
+        answer=LastText(),
+        exec_timeout=OC_TIMEOUT_MS / 1000,
         context=Context("compaction", emulated=False, note="automatic summary near the context limit"),
         alias=lambda name, args, names: (name.lower(), args) if name.lower() in names else None,  # repairToolCall
-        unknown_tool=lambda name, names, args: ("The arguments provided to the tool are invalid: Model tried to call "
-                                                f"unavailable tool '{name}'. Available tools: "
-                                                f"{', '.join(sorted([*names, 'invalid']))}."),
+        unknown_tool=lambda name, names, args: (
+            "The arguments provided to the tool are invalid: Model tried to call "
+            f"unavailable tool '{name}'. Available tools: "
+            f"{', '.join(sorted([*names, 'invalid']))}."
+        ),
         values={"model": MODEL, "date": DATE},
         emulates="opencode v1.19.2 session/prompt/default.txt, session/system.ts, tool/{shell,read,write,edit,glob,"
-                 "grep}.ts (task, todowrite, webfetch, question disabled as for single-agent runs)")
+        "grep}.ts (task, todowrite, webfetch, question disabled as for single-agent runs)",
+    )
 
 
 # ================================================================== pi 1.3.0
@@ -658,7 +788,8 @@ PI_SYSTEM = (
     "- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large "
     "unchanged regions.\n- Use write only for new files or complete rewrites.\n- Be concise in your responses\n"
     "- Show file paths clearly when working with files\n</rules>\n\n"
-    "<cwd>\n{workdir}\n</cwd>")
+    "<cwd>\n{workdir}\n</cwd>"
+)
 
 PI_TOOLS = {
     "read": fn(
@@ -666,44 +797,64 @@ PI_TOOLS = {
         "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as "
         f"attachments. For text files, output is truncated to {PI_MAX_LINES} lines or 50KB (whichever is hit first). "
         "Use offset/limit for large files. When you need the full file, continue with offset until complete.",
-        {"path": {"type": "string", "description": "Path to the file to read (relative or absolute)"},
-         "offset": {"type": "number", "description": "Line number to start reading from (1-indexed)"},
-         "limit": {"type": "number", "description": "Maximum number of lines to read"}},
-        ["path"]),
+        {
+            "path": {"type": "string", "description": "Path to the file to read (relative or absolute)"},
+            "offset": {"type": "number", "description": "Line number to start reading from (1-indexed)"},
+            "limit": {"type": "number", "description": "Maximum number of lines to read"},
+        },
+        ["path"],
+    ),
     "bash": fn(
         "bash",
         "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to "
         f"last {PI_MAX_LINES} lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp "
         "file. Optionally provide a timeout in seconds.",
-        {"command": {"type": "string", "description": "Shell command to execute"},
-         "timeout": {"type": "number", "description": "Timeout in seconds (optional, no default timeout)"}},
-        ["command"]),
+        {
+            "command": {"type": "string", "description": "Shell command to execute"},
+            "timeout": {"type": "number", "description": "Timeout in seconds (optional, no default timeout)"},
+        },
+        ["command"],
+    ),
     "edit": fn(
         "edit",
         "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping "
         "region of the original file. If two changes affect the same block or nearby lines, merge them into one edit "
         "instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant "
         "changes.",
-        {"path": {"type": "string", "description": "Path to the file to edit (relative or absolute)"},
-         "edits": {"type": "array", "items": {
-             "type": "object",
-             "properties": {
-                 "oldText": {"type": "string", "description": "Exact text for one targeted replacement. It must be "
-                             "unique in the original file and must not overlap with any other edits[].oldText in the "
-                             "same call."},
-                 "newText": {"type": "string", "description": "Replacement text for this targeted edit."}},
-             "required": ["oldText", "newText"]},
-             "description": "One or more targeted replacements. Each edit is matched against the original file, not "
-                            "incrementally. Do not include overlapping or nested edits. If two changes touch the same "
-                            "block or nearby lines, merge them into one edit instead."}},
-        ["path", "edits"]),
+        {
+            "path": {"type": "string", "description": "Path to the file to edit (relative or absolute)"},
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "oldText": {
+                            "type": "string",
+                            "description": "Exact text for one targeted replacement. It must be "
+                            "unique in the original file and must not overlap with any other edits[].oldText in the "
+                            "same call.",
+                        },
+                        "newText": {"type": "string", "description": "Replacement text for this targeted edit."},
+                    },
+                    "required": ["oldText", "newText"],
+                },
+                "description": "One or more targeted replacements. Each edit is matched against the original file, not "
+                "incrementally. Do not include overlapping or nested edits. If two changes touch the same "
+                "block or nearby lines, merge them into one edit instead.",
+            },
+        },
+        ["path", "edits"],
+    ),
     "write": fn(
         "write",
         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates "
         "parent directories.",
-        {"path": {"type": "string", "description": "Path to the file to write (relative or absolute)"},
-         "content": {"type": "string", "description": "Content to write to the file"}},
-        ["path", "content"]),
+        {
+            "path": {"type": "string", "description": "Path to the file to write (relative or absolute)"},
+            "content": {"type": "string", "description": "Content to write to the file"},
+        },
+        ["path", "content"],
+    ),
 }
 
 PI_BASH_CAP = 600  # pi has no default timeout; an episode still needs one
@@ -718,8 +869,10 @@ def _pi_output(s, output: str, empty: str) -> str:
         if t.by == "lines":
             text += f"\n\n[Showing lines {t.first_line}-{t.last_line} of {t.total_lines}. Full output: {path}]"
         else:
-            text += (f"\n\n[Showing lines {t.first_line}-{t.last_line} of {t.total_lines} "
-                     f"({ctx.fmt_size(PI_MAX_BYTES)} limit). Full output: {path}]")
+            text += (
+                f"\n\n[Showing lines {t.first_line}-{t.last_line} of {t.total_lines} "
+                f"({ctx.fmt_size(PI_MAX_BYTES)} limit). Full output: {path}]"
+            )
     return text
 
 
@@ -758,14 +911,18 @@ def _pi_read(s, a):
     first = start + 1
     if t.truncated and not t.text and lines[start] and len(lines[start].encode()) > PI_MAX_BYTES:
         size = ctx.fmt_size(len(lines[start].encode()))
-        return (f"[Line {first} is {size}, exceeds {ctx.fmt_size(PI_MAX_BYTES)} limit. Use bash: sed -n '{first}p' "
-                f"{shown} | head -c {PI_MAX_BYTES}]")
+        return (
+            f"[Line {first} is {size}, exceeds {ctx.fmt_size(PI_MAX_BYTES)} limit. Use bash: sed -n '{first}p' "
+            f"{shown} | head -c {PI_MAX_BYTES}]"
+        )
     if t.truncated:
         last = first + t.last_line - 1
         if t.by == "lines":
             return f"{t.text}\n\n[Showing lines {first}-{last} of {len(lines)}. Use offset={last + 1} to continue.]"
-        return (f"{t.text}\n\n[Showing lines {first}-{last} of {len(lines)} ({ctx.fmt_size(PI_MAX_BYTES)} limit). "
-                f"Use offset={last + 1} to continue.]")
+        return (
+            f"{t.text}\n\n[Showing lines {first}-{last} of {len(lines)} ({ctx.fmt_size(PI_MAX_BYTES)} limit). "
+            f"Use offset={last + 1} to continue.]"
+        )
     if limit is not None and end < len(lines):
         return f"{t.text}\n\n[{len(lines) - end} more lines in file. Use offset={end + 1} to continue.]"
     return t.text
@@ -774,23 +931,48 @@ def _pi_read(s, a):
 def _pi_edit_error(e: OpError, shown: str, single: bool) -> str:
     i = e.data.get("index", 0)
     if e.kind == "no_match":
-        return (f"Could not find the exact text in {shown}. The old text must match exactly including all whitespace "
-                "and newlines.") if single else (f"Could not find edits[{i}] in {shown}. The oldText must match "
-                                                 "exactly including all whitespace and newlines.")
+        return (
+            (
+                f"Could not find the exact text in {shown}. The old text must match exactly including all whitespace "
+                "and newlines."
+            )
+            if single
+            else (
+                f"Could not find edits[{i}] in {shown}. The oldText must match "
+                "exactly including all whitespace and newlines."
+            )
+        )
     if e.kind == "multiple":
         n = e.data.get("count")
-        return (f"Found {n} occurrences of the text in {shown}. The text must be unique. Please provide more context "
-                "to make it unique.") if single else (f"Found {n} occurrences of edits[{i}] in {shown}. Each oldText "
-                                                      "must be unique. Please provide more context to make it unique.")
+        return (
+            (
+                f"Found {n} occurrences of the text in {shown}. The text must be unique. Please provide more context "
+                "to make it unique."
+            )
+            if single
+            else (
+                f"Found {n} occurrences of edits[{i}] in {shown}. Each oldText "
+                "must be unique. Please provide more context to make it unique."
+            )
+        )
     if e.kind == "empty_old":
-        return f"oldText must not be empty in {shown}." if single else f"edits[{i}].oldText must not be empty in {shown}."
+        return (
+            f"oldText must not be empty in {shown}." if single else f"edits[{i}].oldText must not be empty in {shown}."
+        )
     if e.kind == "identical":
-        return (f"No changes made to {shown}. The replacement produced identical content. This might indicate an "
-                "issue with special characters or the text not existing as expected.") if single else \
-            f"No changes made to {shown}. The replacements produced identical content."
+        return (
+            (
+                f"No changes made to {shown}. The replacement produced identical content. This might indicate an "
+                "issue with special characters or the text not existing as expected."
+            )
+            if single
+            else f"No changes made to {shown}. The replacements produced identical content."
+        )
     if e.kind == "overlap":
-        return (f"edits[{e.data['first']}] and edits[{e.data['second']}] overlap in {shown}. Merge them into one edit "
-                "or target disjoint regions.")
+        return (
+            f"edits[{e.data['first']}] and edits[{e.data['second']}] overlap in {shown}. Merge them into one edit "
+            "or target disjoint regions."
+        )
     return f"Could not edit file: {shown}. Error code: {'EISDIR' if e.kind == 'is_dir' else e.kind}."
 
 
@@ -818,21 +1000,29 @@ def _pi_write(s, a):
     try:
         ops.write(s.ws, path, str(a.get("content", "")))
     except OpError as e:
-        return f"EISDIR: illegal operation on a directory, open '{path}'" if e.kind == "is_dir" else \
-            f"Failed to write {shown}: {e.data.get('detail', e.kind)}"
+        return (
+            f"EISDIR: illegal operation on a directory, open '{path}'"
+            if e.kind == "is_dir"
+            else f"Failed to write {shown}: {e.data.get('detail', e.kind)}"
+        )
     return f"Successfully wrote to {shown}"
 
 
 def pi() -> HarnessProfile:
     binds = {"read": _pi_read, "bash": _pi_bash, "edit": _pi_edit, "write": _pi_write}
     return HarnessProfile(
-        name="pi", version="1.3.0", system=PI_SYSTEM,
+        name="pi",
+        version="1.3.0",
+        system=PI_SYSTEM,
         tools=[ToolSpec(PI_TOOLS[n], binds[n]) for n in ("read", "bash", "edit", "write")],
-        stop=NoCall(), answer=LastText(), exec_timeout=PI_BASH_CAP,
+        stop=NoCall(),
+        answer=LastText(),
+        exec_timeout=PI_BASH_CAP,
         context=Context("compaction", emulated=False, note="compaction module on overflow"),
         unknown_tool=lambda name, names, args: f"Tool {name} not found",
         emulates="@earendil-works/pi-coding-agent 1.3.0 dist/core/system-prompt.js, dist/core/tools/{read,bash,edit,"
-                 "edit-diff,write,truncate}.js (the <docs> section about pi's own documentation is left out)")
+        "edit-diff,write,truncate}.js (the <docs> section about pi's own documentation is left out)",
+    )
 
 
 # ================================================================== OpenHands SDK 1.55.1
@@ -841,22 +1031,27 @@ OH_MAX_OUTPUT = 30000  # MAX_CMD_OUTPUT_SIZE
 OH_EDITOR_MAX = 16000  # MAX_RESPONSE_LEN_CHAR
 OH_SOFT_TIMEOUT = 30
 OH_ERROR = "[An error occurred during execution.]\n"
-OH_TIMEOUT_HELP = ("You may wait longer to see additional output by sending empty command '', send other commands to "
-                   "interact with the current process, send keys (\"C-c\", \"C-z\", \"C-d\") to interrupt/kill the "
-                   "previous command before sending your new command, or use the timeout parameter in terminal for "
-                   "future commands.")
-OH_CLIP = ("<response clipped><NOTE>Due to the max output limit, only part of the full response has been shown to "
-           "you.</NOTE>")
-OH_FILE_CLIP = ("<response clipped><NOTE>Due to the max output limit, only part of this file has been shown to you. "
-                "You should retry this tool after you have searched inside the file with `grep -n` in order to find the "
-                "line numbers of what you are looking for.</NOTE>")
+OH_TIMEOUT_HELP = (
+    "You may wait longer to see additional output by sending empty command '', send other commands to "
+    'interact with the current process, send keys ("C-c", "C-z", "C-d") to interrupt/kill the '
+    "previous command before sending your new command, or use the timeout parameter in terminal for "
+    "future commands."
+)
+OH_CLIP = (
+    "<response clipped><NOTE>Due to the max output limit, only part of the full response has been shown to you.</NOTE>"
+)
+OH_FILE_CLIP = (
+    "<response clipped><NOTE>Due to the max output limit, only part of this file has been shown to you. "
+    "You should retry this tool after you have searched inside the file with `grep -n` in order to find the "
+    "line numbers of what you are looking for.</NOTE>"
+)
 
 OPENHANDS_SYSTEM = (
     "<SOUL>\nYou are OpenHands agent, a helpful AI assistant that can interact with a computer to solve tasks.\n"
     "</SOUL>\n\n"
     "<ROLE>\n* Your primary role is to assist users by executing commands, modifying code, and solving technical "
     "problems effectively. Be thorough, methodical, and prioritize quality over speed.\n* If the user asks a question, "
-    "like \"why is X happening\", don't try to fix the problem: answer the question.\n</ROLE>\n\n"
+    'like "why is X happening", don\'t try to fix the problem: answer the question.\n</ROLE>\n\n'
     "<EFFICIENCY>\n* Each action is somewhat expensive: combine actions where you can (several shell commands in one, "
     "sed and grep to edit or view several files at once).\n* Explore with find, grep and git and narrow filters.\n"
     "</EFFICIENCY>\n\n"
@@ -878,14 +1073,21 @@ OPENHANDS_SYSTEM = (
     "<TROUBLESHOOTING>\n* After repeated failed attempts, step back, list the likely causes and address the most "
     "likely first.\n</TROUBLESHOOTING>\n\n"
     "<PROCESS_MANAGEMENT>\n* Do not kill processes by broad patterns (pkill -f server); find the exact PID (ps aux) "
-    "and kill that.\n</PROCESS_MANAGEMENT>")
+    "and kill that.\n</PROCESS_MANAGEMENT>"
+)
 
-_OH_SUMMARY = {"type": "string", "description": "A concise summary (approximately 10 words) describing what this "
-               "specific action does. Focus on the key operation and target. Example: 'List all Python files in "
-               "current directory'"}
-_OH_RISK = {"type": "string", "description": "Security risk levels for actions.\n\nBased on OpenHands security risk "
-            "levels but adapted for agent-sdk.\nInteger values allow for easy comparison and ordering.",
-            "enum": ["UNKNOWN", "LOW", "MEDIUM", "HIGH"]}
+_OH_SUMMARY = {
+    "type": "string",
+    "description": "A concise summary (approximately 10 words) describing what this "
+    "specific action does. Focus on the key operation and target. Example: 'List all Python files in "
+    "current directory'",
+}
+_OH_RISK = {
+    "type": "string",
+    "description": "Security risk levels for actions.\n\nBased on OpenHands security risk "
+    "levels but adapted for agent-sdk.\nInteger values allow for easy comparison and ordering.",
+    "enum": ["UNKNOWN", "LOW", "MEDIUM", "HIGH"],
+}
 
 OPENHANDS_TOOLS = {
     "terminal": fn(
@@ -899,25 +1101,41 @@ OPENHANDS_TOOLS = {
         "* Run long-lived commands in the background with output redirected to a file.\n"
         "* Do not use `set -e` or `set -euo pipefail`. Prefer absolute paths; avoid excessive `cd`.\n"
         "* Large output may be truncated. `reset=true` starts a fresh terminal (clears variables, cwd and processes).",
-        {"security_risk": _OH_RISK, "summary": _OH_SUMMARY,
-         "command": {"type": "string", "description": "The shell command to execute. Can be empty string to view "
-                     "additional logs when the previous exit code is `-1`. Can be a special key name when `is_input` "
-                     "is True: `C-c` (Ctrl+C), `C-d` (Ctrl+D/EOF), `C-z` (Ctrl+Z), or any `C-<letter>` for Ctrl "
-                     "sequences; navigation keys `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, `END`, `PGUP`, `PGDN`; and "
-                     "`TAB`, `ESC`, `BS` (Backspace), `ENTER`. You can only execute one command at a time. Use the "
-                     "platform-appropriate shell syntax described in the tool description when chaining commands."},
-         "is_input": {"type": "boolean", "description": "If True, the command is an input to the running process. If "
-                      "False, the command is executed in the terminal session. Default is False."},
-         "timeout": {"type": "number", "description": "Optional. Sets a maximum time limit (in seconds) for running "
-                     "the command. If the command takes longer than this limit, you’ll be asked whether to "
-                     "continue or stop it. If you don’t set a value, the command will instead pause and ask for "
-                     "confirmation when it produces no new output for 30 seconds. Use a higher value if the command "
-                     "is expected to take a long time (like installation or testing), or if it has a known fixed "
-                     "duration (like sleep)."},
-         "reset": {"type": "boolean", "description": "If True, reset the terminal by creating a new session. Use this "
-                   "only when the terminal becomes unresponsive. Note that all previously set environment variables "
-                   "and session state will be lost after reset. Cannot be used with is_input=True."}},
-        ["command"]),
+        {
+            "security_risk": _OH_RISK,
+            "summary": _OH_SUMMARY,
+            "command": {
+                "type": "string",
+                "description": "The shell command to execute. Can be empty string to view "
+                "additional logs when the previous exit code is `-1`. Can be a special key name when `is_input` "
+                "is True: `C-c` (Ctrl+C), `C-d` (Ctrl+D/EOF), `C-z` (Ctrl+Z), or any `C-<letter>` for Ctrl "
+                "sequences; navigation keys `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, `END`, `PGUP`, `PGDN`; and "
+                "`TAB`, `ESC`, `BS` (Backspace), `ENTER`. You can only execute one command at a time. Use the "
+                "platform-appropriate shell syntax described in the tool description when chaining commands.",
+            },
+            "is_input": {
+                "type": "boolean",
+                "description": "If True, the command is an input to the running process. If "
+                "False, the command is executed in the terminal session. Default is False.",
+            },
+            "timeout": {
+                "type": "number",
+                "description": "Optional. Sets a maximum time limit (in seconds) for running "
+                "the command. If the command takes longer than this limit, you’ll be asked whether to "
+                "continue or stop it. If you don’t set a value, the command will instead pause and ask for "
+                "confirmation when it produces no new output for 30 seconds. Use a higher value if the command "
+                "is expected to take a long time (like installation or testing), or if it has a known fixed "
+                "duration (like sleep).",
+            },
+            "reset": {
+                "type": "boolean",
+                "description": "If True, reset the terminal by creating a new session. Use this "
+                "only when the terminal becomes unresponsive. Note that all previously set environment variables "
+                "and session state will be lost after reset. Cannot be used with is_input=True.",
+            },
+        },
+        ["command"],
+    ),
     "file_editor": fn(
         "file_editor",
         "Custom editing tool for viewing, creating and editing files in plain-text format\n"
@@ -932,45 +1150,77 @@ OPENHANDS_TOOLS = {
         "and must differ from it. Prefer several edits to one file in a single message.\n\n"
         "Your current working directory is: {workdir}\n"
         "When exploring project structure, start with this directory instead of the root filesystem.",
-        {"security_risk": _OH_RISK, "summary": _OH_SUMMARY,
-         "command": {"type": "string", "description": "The commands to run. Allowed options are: `view`, `create`, "
-                     "`str_replace`, `insert`, `undo_edit`.",
-                     "enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
-         "path": {"type": "string", "description": "Absolute path to file or directory."},
-         "file_text": {"type": "string", "description": "Required parameter of `create` command, with the content of "
-                       "the file to be created."},
-         "old_str": {"type": "string", "description": "Required parameter of `str_replace` command containing the "
-                     "string in `path` to replace."},
-         "new_str": {"type": "string", "description": "Optional parameter of `str_replace` command containing the new "
-                     "string (if not given, no string will be added). Required parameter of `insert` command containing "
-                     "the string to insert."},
-         "insert_line": {"type": "integer", "description": "Required parameter of `insert` command. The `new_str` will "
-                         "be inserted AFTER the line `insert_line` of `path`."},
-         "view_range": {"type": "array", "items": {"type": "integer"}, "description": "Optional parameter of `view` "
-                        "command when `path` points to a file. If none is given, the full file is shown. If provided, "
-                        "the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 "
-                        "and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` "
-                        "to the end of the file."}},
-        ["command", "path"]),
+        {
+            "security_risk": _OH_RISK,
+            "summary": _OH_SUMMARY,
+            "command": {
+                "type": "string",
+                "description": "The commands to run. Allowed options are: `view`, `create`, "
+                "`str_replace`, `insert`, `undo_edit`.",
+                "enum": ["view", "create", "str_replace", "insert", "undo_edit"],
+            },
+            "path": {"type": "string", "description": "Absolute path to file or directory."},
+            "file_text": {
+                "type": "string",
+                "description": "Required parameter of `create` command, with the content of the file to be created.",
+            },
+            "old_str": {
+                "type": "string",
+                "description": "Required parameter of `str_replace` command containing the "
+                "string in `path` to replace.",
+            },
+            "new_str": {
+                "type": "string",
+                "description": "Optional parameter of `str_replace` command containing the new "
+                "string (if not given, no string will be added). Required parameter of `insert` command containing "
+                "the string to insert.",
+            },
+            "insert_line": {
+                "type": "integer",
+                "description": "Required parameter of `insert` command. The `new_str` will "
+                "be inserted AFTER the line `insert_line` of `path`.",
+            },
+            "view_range": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Optional parameter of `view` "
+                "command when `path` points to a file. If none is given, the full file is shown. If provided, "
+                "the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 "
+                "and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` "
+                "to the end of the file.",
+            },
+        },
+        ["command", "path"],
+    ),
     "finish": fn(
         "finish",
         "Signals the completion of the current task or conversation: when the task is done, or when you cannot "
         "proceed. The message summarises what you did and the results, the next steps for the user, why you could not "
         "complete the task, or a follow-up question.",
         {"summary": _OH_SUMMARY, "message": {"type": "string", "description": "Final message to send to the user."}},
-        ["message"]),
+        ["message"],
+    ),
     "think": fn(
         "think",
         "Use the tool to think about something. It will not obtain new information or make any changes to the "
         "repository, but just log the thought. Use it when complex reasoning or brainstorming is needed (possible "
         "fixes for a bug, failing tests, refactoring approaches, design decisions, debugging hypotheses).",
         {"summary": _OH_SUMMARY, "thought": {"type": "string", "description": "The thought to log."}},
-        ["thought"]),
+        ["thought"],
+    ),
 }
 
 
-OH_ALIASES = {"bash": "terminal", "command": "terminal", "execute": "terminal", "execute_bash": "terminal",
-              "git": "terminal", "reset": "terminal", "str_replace": "file_editor", "str_replace_editor": "file_editor"}
+OH_ALIASES = {
+    "bash": "terminal",
+    "command": "terminal",
+    "execute": "terminal",
+    "execute_bash": "terminal",
+    "git": "terminal",
+    "reset": "terminal",
+    "str_replace": "file_editor",
+    "str_replace_editor": "file_editor",
+}
 
 
 def openhands_alias(name: str, args: dict, names: list[str]):
@@ -999,8 +1249,10 @@ def _oh_terminal(s, a):
             return OH_ERROR + "Cannot use reset=True with is_input=True"
         ops.reset_shell(s.ws)
         if not cmd.strip():
-            return "Terminal session has been reset. All previous environment variables and session state have been " \
-                   "cleared."
+            return (
+                "Terminal session has been reset. All previous environment variables and session state have been "
+                "cleared."
+            )
     if a.get("is_input"):  # no process is ever left running between calls here
         return OH_ERROR + "No previous running command to interact with."
     if not cmd.strip():
@@ -1011,8 +1263,11 @@ def _oh_terminal(s, a):
     s.last_exec = r
     out = r.output
     if r.timed_out:
-        suffix = (f"\n[The command timed out after {timeout:g} seconds. {OH_TIMEOUT_HELP}]" if hard else
-                  f"\n[The command has no new output after {OH_SOFT_TIMEOUT} seconds. {OH_TIMEOUT_HELP}]")
+        suffix = (
+            f"\n[The command timed out after {timeout:g} seconds. {OH_TIMEOUT_HELP}]"
+            if hard
+            else f"\n[The command has no new output after {OH_SOFT_TIMEOUT} seconds. {OH_TIMEOUT_HELP}]"
+        )
         text = out + suffix
     else:
         text = out.rstrip("\n") + f"\n[The command completed with exit code {r.exit_code}.]"
@@ -1044,18 +1299,21 @@ def _oh_param(name: str, value, reason: str) -> str:
 def _oh_file_editor(s, a):
     command, path = a.get("command"), str(a.get("path", ""))
     if command not in ("view", "create", "str_replace", "insert", "undo_edit"):
-        return _oh_param("command", command, "Allowed options are: `view`, `create`, `str_replace`, `insert`, "
-                                             "`undo_edit`.")
+        return _oh_param(
+            "command", command, "Allowed options are: `view`, `create`, `str_replace`, `insert`, `undo_edit`."
+        )
     if not path.startswith("/"):
         return _oh_param("path", path, "The path should be an absolute path.")
     k = s.ws.kind(path)
     if command == "create":
         if k == "file":
-            return _oh_param("path", path, f"File already exists at: {path}. Cannot overwrite files using command "
-                                           "`create`.")
+            return _oh_param(
+                "path", path, f"File already exists at: {path}. Cannot overwrite files using command `create`."
+            )
         if k == "dir":
-            return _oh_param("path", path, f"The path {path} is a directory and only the `view` command can be used "
-                                           "on directories.")
+            return _oh_param(
+                "path", path, f"The path {path} is a directory and only the `view` command can be used on directories."
+            )
         if a.get("file_text") is None:
             return _oh_param("file_text", None, "Parameter `file_text` is required for command: create.")
         ops.write(s.ws, path, str(a["file_text"]))
@@ -1063,21 +1321,29 @@ def _oh_file_editor(s, a):
     if k is None:
         return _oh_param("path", path, f"The path {path} does not exist. Please provide a valid path.")
     if k == "dir" and command != "view":
-        return _oh_param("path", path, f"The path {path} is a directory and only the `view` command can be used on "
-                                       "directories.")
+        return _oh_param(
+            "path", path, f"The path {path} is a directory and only the `view` command can be used on directories."
+        )
     if command == "view":
         if k == "dir":
             if a.get("view_range"):
-                return _oh_param("view_range", a["view_range"], "The `view_range` parameter is not allowed when "
-                                                                "`path` points to a directory.")
+                return _oh_param(
+                    "view_range",
+                    a["view_range"],
+                    "The `view_range` parameter is not allowed when `path` points to a directory.",
+                )
             entries, hidden = ops.list_dir(s.ws, path, 2)
             root = path.rstrip("/") or "/"
             listing = [root + "/"] + [posixpath.join(root, e) for e in entries]
-            msg = (f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n"
-                   + "\n".join(listing))
+            msg = (
+                f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n"
+                + "\n".join(listing)
+            )
             if hidden:
-                msg += (f"\n\n{hidden} hidden files/directories in this directory are excluded. You can use 'ls -la "
-                        f"{path}' to see them.")
+                msg += (
+                    f"\n\n{hidden} hidden files/directories in this directory are excluded. You can use 'ls -la "
+                    f"{path}' to see them."
+                )
             return ctx.middle_clip(msg, OH_EDITOR_MAX, OH_CLIP)
         lines = ops.lines_of(ops.read(s.ws, path))
         vr = a.get("view_range")
@@ -1088,13 +1354,19 @@ def _oh_file_editor(s, a):
         first, last = vr
         n = len(lines)
         if first < 1 or first > n:
-            return _oh_param("view_range", vr, f"Its first element `{first}` should be within the range of lines of "
-                                               f"the file: [1, {n}].")
+            return _oh_param(
+                "view_range",
+                vr,
+                f"Its first element `{first}` should be within the range of lines of the file: [1, {n}].",
+            )
         if last != -1 and last < first:
-            return _oh_param("view_range", vr, f"Its second element `{last}` should be greater than or equal to the "
-                                               f"first element `{first}`.")
+            return _oh_param(
+                "view_range",
+                vr,
+                f"Its second element `{last}` should be greater than or equal to the first element `{first}`.",
+            )
         end = n if last == -1 else min(last, n)
-        return _oh_cat_n(lines[first - 1:end], first, path)
+        return _oh_cat_n(lines[first - 1 : end], first, path)
     if command == "str_replace":
         if a.get("old_str") is None:
             return _oh_param("old_str", None, "Parameter `old_str` is required for command: str_replace.")
@@ -1103,16 +1375,21 @@ def _oh_file_editor(s, a):
             e = ops.replace(s.ws, path, old, new)
         except OpError as err:
             if err.kind == "identical":
-                return _oh_param("new_str", new, "No replacement was performed. `new_str` and `old_str` must be "
-                                                 "different.")
+                return _oh_param(
+                    "new_str", new, "No replacement was performed. `new_str` and `old_str` must be different."
+                )
             if err.kind == "multiple":
-                return (OH_ERROR + f"No replacement was performed. Multiple occurrences of old_str `{old}` in lines "
-                        f"{err.data['lines']}. Please ensure it is unique.")
+                return (
+                    OH_ERROR + f"No replacement was performed. Multiple occurrences of old_str `{old}` in lines "
+                    f"{err.data['lines']}. Please ensure it is unique."
+                )
             return OH_ERROR + f"No replacement was performed, old_str `{old}` did not appear verbatim in {path}."
         snip, start = _oh_snippet(e.after, e.line, new.count("\n") + 1)
-        return (f"The file {path} has been edited. "
-                + _oh_cat_n(snip, start, f"a snippet of {path}")
-                + "Review the changes and make sure they are as expected. Edit the file again if necessary.")
+        return (
+            f"The file {path} has been edited. "
+            + _oh_cat_n(snip, start, f"a snippet of {path}")
+            + "Review the changes and make sure they are as expected. Edit the file again if necessary."
+        )
     if command == "insert":
         line = a.get("insert_line")
         if line is None:
@@ -1125,10 +1402,12 @@ def _oh_file_editor(s, a):
             n = len(ops.lines_of(ops.read(s.ws, path)))
             return _oh_param("insert_line", line, f"It should be within the range of allowed values: [0, {n}]")
         snip, start = _oh_snippet(e.after, e.line, str(a["new_str"]).count("\n") + 1)
-        return (f"The file {path} has been edited. "
-                + _oh_cat_n(snip, start, "a snippet of the edited file")
-                + "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, "
-                  "etc). Edit the file again if necessary.")
+        return (
+            f"The file {path} has been edited. "
+            + _oh_cat_n(snip, start, "a snippet of the edited file")
+            + "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, "
+            "etc). Edit the file again if necessary."
+        )
     try:  # undo_edit
         e = ops.undo_edit(s.ws, path)
     except OpError:
@@ -1137,25 +1416,38 @@ def _oh_file_editor(s, a):
 
 
 def openhands_sdk() -> HarnessProfile:
-    binds = {"terminal": _oh_terminal, "file_editor": _oh_file_editor,
-             "finish": lambda s, a: str(a.get("message") or ""), "think": lambda s, a: "Your thought has been logged."}
+    binds = {
+        "terminal": _oh_terminal,
+        "file_editor": _oh_file_editor,
+        "finish": lambda s, a: str(a.get("message") or ""),
+        "think": lambda s, a: "Your thought has been logged.",
+    }
     return HarnessProfile(
-        name="openhands-sdk", version="1.55.1", system=OPENHANDS_SYSTEM,
+        name="openhands-sdk",
+        version="1.55.1",
+        system=OPENHANDS_SYSTEM,
         tools=[ToolSpec(OPENHANDS_TOOLS[n], binds[n]) for n in ("terminal", "file_editor", "finish", "think")],
-        stop=Finish("finish", "message", no_call_ends=True), answer=StopAnswer(LastText()),
+        stop=Finish("finish", "message", no_call_ends=True),
+        answer=StopAnswer(LastText()),
         exec_timeout=OH_SOFT_TIMEOUT,
         context=Context("compaction", emulated=False, note="LLMSummarizingCondenser (when configured)"),
         alias=openhands_alias,
         unknown_tool=lambda name, names, args: f"Tool '{name}' not found. Available: {list(names)}",
         emulates="openhands-sdk / openhands-tools 1.55.1 as Harbor 0.24's openhands_sdk_runner builds the agent "
-                 "(terminal, file_editor, task_tracker left out, finish, think; security analyzer on); schemas from "
-                 "Tool.to_openai_tool(add_security_risk_prediction=True)")
+        "(terminal, file_editor, task_tracker left out, finish, think; security analyzer on); schemas from "
+        "Tool.to_openai_tool(add_security_risk_prediction=True)",
+    )
 
 
-for _f, _n, _v in ((palingenesis_default, "palingenesis-default", "1"),
-                   (palingenesis_default_2, "palingenesis-default", "2"), (mini_swe_agent, "mini-swe-agent", "2.4.6"),
-                   (mini_swe_agent_text, "mini-swe-agent-text", "2.4.6"), (opencode, "opencode", "1.19.2"),
-                   (pi, "pi", "1.3.0"), (openhands_sdk, "openhands-sdk", "1.55.1")):
+for _f, _n, _v in (
+    (palingenesis_default, "palingenesis-default", "1"),
+    (palingenesis_default_2, "palingenesis-default", "2"),
+    (mini_swe_agent, "mini-swe-agent", "2.4.6"),
+    (mini_swe_agent_text, "mini-swe-agent-text", "2.4.6"),
+    (opencode, "opencode", "1.19.2"),
+    (pi, "pi", "1.3.0"),
+    (openhands_sdk, "openhands-sdk", "1.55.1"),
+):
     register(_n, _v, _f)
 
 from palingenesis.rl.envs.harness import profiles_more, terminus  # noqa: E402,F401 — phase 2 profiles

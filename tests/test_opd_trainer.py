@@ -345,7 +345,9 @@ def test_privileged_self_distillation_run(tmp_path, models):
         config.set("train.learning_rate", 1e-12, "test")  # measure the teachers, not training
         if privileged:
             config.set("sources.math.privileged_field", "solution", "test")
-            config.set("sources.math.privileged_template", "{content}\nReference (do not mention): {privileged}", "test")
+            config.set(
+                "sources.math.privileged_template", "{content}\nReference (do not mention): {privileged}", "test"
+            )
         trainer = OPDTrainer(config)
         requests = trainer._draw()
         logged = []
@@ -390,7 +392,11 @@ def test_sampling_mix_and_deployment_dev_metrics_run(tmp_path, models):
     from palingenesis.opd.trainer import OPDTrainer
 
     config = make_config(tmp_path, models)
-    config.set("sources.math.sampling_mix", [{"weight": 1, "temperature": 0.7, "top_p": 0.8, "top_k": 20}, {"weight": 1}], "test")
+    config.set(
+        "sources.math.sampling_mix",
+        [{"weight": 1, "temperature": 0.7, "top_p": 0.8, "top_k": 20}, {"weight": 1}],
+        "test",
+    )
     config.set("train.eval_sampling", {"temperature": 0.7, "top_p": 0.8, "top_k": 20}, "test")
     config.set("train.steps", 1, "test")
     trainer = OPDTrainer(config)

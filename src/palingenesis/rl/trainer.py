@@ -209,10 +209,15 @@ class RLTrainer:
             from palingenesis.rl.reference import ReferencePolicy
 
             ref_path = m.policy if config.loss.kl_ref == "start" else config.loss.kl_ref
-            self.reference = ReferencePolicy(ref_path, self.device, self.pad_id, t.micro_tokens,
-                                             temperature=config.rollout.temperature)
-            logger.info("KL reference: %s (kl_coef %g, reset every %d steps)", ref_path, config.loss.kl_coef,
-                        config.loss.kl_ref_reset)
+            self.reference = ReferencePolicy(
+                ref_path, self.device, self.pad_id, t.micro_tokens, temperature=config.rollout.temperature
+            )
+            logger.info(
+                "KL reference: %s (kl_coef %g, reset every %d steps)",
+                ref_path,
+                config.loss.kl_coef,
+                config.loss.kl_ref_reset,
+            )
 
         if r.backend == "hf":
             self.engine = HFRollout(self.model, self.stop_ids, self.pad_id, r.micro_seqs)
@@ -508,7 +513,9 @@ class RLTrainer:
                 seq = torch.zeros(len(sampled), dtype=torch.long, device=device)
                 seq_len = torch.tensor([float(len(sampled))], device=device)
                 forced = (
-                    torch.tensor([j in t.forced for j in sampled], dtype=torch.bool, device=device) if t.forced else None
+                    torch.tensor([j in t.forced for j in sampled], dtype=torch.bool, device=device)
+                    if t.forced
+                    else None
                 )
                 loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced)
                 if self.ref_lp:
@@ -816,7 +823,9 @@ class _LazySandbox:
         return getattr(self._trainer.sandbox, name)
 
 
-def _optimizer(params: list[torch.nn.Parameter], t: Any, device: str, names: list[str] | None = None) -> torch.optim.Optimizer:
+def _optimizer(
+    params: list[torch.nn.Parameter], t: Any, device: str, names: list[str] | None = None
+) -> torch.optim.Optimizer:
     """AdamW over the trained parameters (the fp32 masters on one GPU), with fp32 or 8-bit moments; or Muon on the
     hidden matrices with AdamW on the rest (`names` route the parameters, palingenesis.muon)."""
     eps = t.adam_eps or (1e-15 if t.optimizer in ("adamw", "muon") else 1e-8)
@@ -825,7 +834,11 @@ def _optimizer(params: list[torch.nn.Parameter], t: Any, device: str, names: lis
         from palingenesis.muon import build_muon
 
         params = list(params)
-        named = list(zip(names, params)) if names and len(names) == len(params) else [(str(i), p) for i, p in enumerate(params)]
+        named = (
+            list(zip(names, params))
+            if names and len(names) == len(params)
+            else [(str(i), p) for i, p in enumerate(params)]
+        )
         return build_muon(named, t.learning_rate, t.weight_decay, betas=kwargs["betas"], eps=eps, **t.muon_options())
     if t.optimizer == "adamw":
         return torch.optim.AdamW(params, fused=device.startswith("cuda") and not t.cpu_offload, **kwargs)

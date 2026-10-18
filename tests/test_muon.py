@@ -70,8 +70,11 @@ def test_routing_sends_only_hidden_matrices_to_muon():
     groups, counts = muon_param_groups(m, weight_decay=0.1, min_dim=32)
     names = {id(p): n for n, p in m.named_parameters()}
     muon = sorted(names[id(p)] for g in groups if g["use_muon"] for p in g["params"])
-    assert muon == ["model.layers.0.linear_attn.in_proj_qkv.weight", "model.layers.0.linear_attn.out_proj.weight",
-                    "model.layers.0.mlp.up_proj.weight"]
+    assert muon == [
+        "model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.layers.0.linear_attn.out_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+    ]
     no_decay = sorted(names[id(p)] for g in groups if not g["use_muon"] and g["weight_decay"] == 0 for p in g["params"])
     assert "model.layers.0.linear_attn.A_log" in no_decay and "model.layers.0.input_layernorm.weight" in no_decay
     assert counts["muon"] + counts["adamw"] == sum(p.numel() for p in m.parameters())
@@ -81,8 +84,9 @@ def test_moonlight_scale_matches_adamw_update_rms():
     torch.manual_seed(3)
     lin = nn.Linear(256, 1024, bias=False)
     w0 = lin.weight.detach().clone()
-    opt = MuonAdamW([{"params": [lin.weight], "use_muon": True}], lr=1e-3, weight_decay=0.0, momentum=0.0,
-                    nesterov=False)
+    opt = MuonAdamW(
+        [{"params": [lin.weight], "use_muon": True}], lr=1e-3, weight_decay=0.0, momentum=0.0, nesterov=False
+    )
     lin.weight.grad = torch.randn_like(lin.weight)
     opt.step()
     rms = ((lin.weight - w0) / 1e-3).pow(2).mean().sqrt()

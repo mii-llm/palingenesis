@@ -42,11 +42,15 @@ def test_episode_with_tools_and_verifier_reward():
             assert "[exit code 0]" in out and "hi" in out
             env.call_tool("write_file", {"path": "hello.txt", "content": "cia0\n"})
             assert env.get_reward()["reward"] == 0.0
-            assert (env.call_tool("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"})).startswith("Edited")
+            assert (env.call_tool("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"})).startswith(
+                "Edited"
+            )
             env.call_tool("submit", {})
             assert env.done
             assert env.get_reward()["reward"] == 1.0
-            assert "network" in (env.call_tool("bash", {"command": "getent hosts example.com || echo no network"})).lower()
+            assert (
+                "network" in (env.call_tool("bash", {"command": "getent hosts example.com || echo no network"})).lower()
+            )
         finally:
             env.close()
 
@@ -65,8 +69,13 @@ def test_setup_runs_and_verifier_is_isolated_from_the_agent(tmp_path):
         try:
             assert "seeded" in env.call_tool("bash", {"command": "cat seeded.txt"})
             # an agent that forges the reward from a background process must not reach the verifier
-            env.call_tool("bash", {"command": "nohup bash -c 'while true; do echo 1 > /logs/verifier/reward.txt; "
-                                                    "done' >/dev/null 2>&1 &"})
+            env.call_tool(
+                "bash",
+                {
+                    "command": "nohup bash -c 'while true; do echo 1 > /logs/verifier/reward.txt; "
+                    "done' >/dev/null 2>&1 &"
+                },
+            )
             assert env.get_reward()["reward"] == 0.0
         finally:
             env.close()
@@ -77,8 +86,11 @@ def test_setup_runs_and_verifier_is_isolated_from_the_agent(tmp_path):
 def test_task_workdir_and_verifier_network_settings(tmp_path):
     task = tmp_path / "task"
     shutil.copytree(FIXTURE, task)
-    toml = (task / "task.toml").read_text().replace("allow_internet = false",
-                                                     'allow_internet = false\nworkdir = "/work/ws"')
+    toml = (
+        (task / "task.toml")
+        .read_text()
+        .replace("allow_internet = false", 'allow_internet = false\nworkdir = "/work/ws"')
+    )
     (task / "task.toml").write_text(toml.replace("[verifier]\n", "[verifier]\nallow_internet = true\n"))
     t = HarborTask.load(task)
     assert t.workdir == "/work/ws" and t.verifier["allow_internet"] is True
@@ -92,13 +104,18 @@ def _variant(tmp_path, workdir=None, user=False, test_body=None):
     wd = workdir or "/workdir"
     if workdir:
         toml = (task / "task.toml").read_text()
-        (task / "task.toml").write_text(toml.replace("allow_internet = false", f'allow_internet = false\nworkdir = "{wd}"'))
+        (task / "task.toml").write_text(
+            toml.replace("allow_internet = false", f'allow_internet = false\nworkdir = "{wd}"')
+        )
     if user:
         (task / "environment" / "Dockerfile").write_text(
             f"FROM python:3.11-slim\nRUN useradd -m -u 1234 agent && mkdir -p {wd} /logs && chown agent {wd} /logs\n"
-            f"USER agent\nWORKDIR {wd}\n")
-    body = test_body or (f'if [ "$(cat {wd}/hello.txt 2>/dev/null | tr -d \'[:space:]\')" = "$EXPECTED" ]; '
-                         "then echo 1 > /logs/verifier/reward.txt; else echo 0 > /logs/verifier/reward.txt; fi")
+            f"USER agent\nWORKDIR {wd}\n"
+        )
+    body = test_body or (
+        f'if [ "$(cat {wd}/hello.txt 2>/dev/null | tr -d \'[:space:]\')" = "$EXPECTED" ]; '
+        "then echo 1 > /logs/verifier/reward.txt; else echo 0 > /logs/verifier/reward.txt; fi"
+    )
     (task / "tests" / "test.sh").write_text("#!/usr/bin/env bash\nmkdir -p /logs/verifier\n" + body + "\n")
     (task / "solution" / "solve.sh").write_text(f"echo ciao > {wd}/hello.txt\n")
     return task
@@ -137,8 +154,10 @@ def test_tool_writes_belong_to_an_unprivileged_image_user(tmp_path):
 
 @pytest.mark.skipif(not _docker_ok(), reason="docker unavailable")
 def test_final_message_reaches_the_verifier(tmp_path):
-    body = ('grep -q "fatto" /logs/agent/final_message.md 2>/dev/null && echo 1 > /logs/verifier/reward.txt '
-            "|| echo 0 > /logs/verifier/reward.txt")
+    body = (
+        'grep -q "fatto" /logs/agent/final_message.md 2>/dev/null && echo 1 > /logs/verifier/reward.txt '
+        "|| echo 0 > /logs/verifier/reward.txt"
+    )
     task = _variant(tmp_path, test_body=body)
     env = HarborEnv()
     env.reset(task_dir=str(task))
@@ -152,8 +171,10 @@ def test_final_message_reaches_the_verifier(tmp_path):
 
 @pytest.mark.skipif(not _docker_ok(), reason="docker unavailable")
 def test_verifier_network_is_its_own_setting(tmp_path):
-    body = ('if getent hosts example.com >/dev/null; then echo 1 > /logs/verifier/reward.txt; '
-            "else echo 0 > /logs/verifier/reward.txt; fi")
+    body = (
+        "if getent hosts example.com >/dev/null; then echo 1 > /logs/verifier/reward.txt; "
+        "else echo 0 > /logs/verifier/reward.txt; fi"
+    )
     task = _variant(tmp_path, test_body=body)
     toml = (task / "task.toml").read_text()
     (task / "task.toml").write_text(toml.replace("[verifier]\n", "[verifier]\nallow_internet = true\n"))
@@ -173,7 +194,9 @@ def test_containers_of_exited_runs_are_swept_and_failed_starts_leave_none(tmp_pa
     from palingenesis.rl.envs import harbor
 
     def ours():
-        r = subprocess.run(["docker", "ps", "-aq", "--filter", f"label={harbor._LABEL}"], capture_output=True, text=True)
+        r = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"label={harbor._LABEL}"], capture_output=True, text=True
+        )
         return set(r.stdout.split())
 
     before = ours()
@@ -231,7 +254,9 @@ def _capture_task(tmp_path, capture=True):
     shutil.copytree(FIXTURE, task)
     if capture:
         toml = (task / "task.toml").read_text()
-        (task / "task.toml").write_text(toml.replace("[verifier]\n", '[verifier]\ncapture = "python3 /opt/capture.py"\n'))
+        (task / "task.toml").write_text(
+            toml.replace("[verifier]\n", '[verifier]\ncapture = "python3 /opt/capture.py"\n')
+        )
     return task
 
 

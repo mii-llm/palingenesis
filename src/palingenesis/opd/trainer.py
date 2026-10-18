@@ -138,8 +138,11 @@ class OPDTrainer:
                 aligners[name] = SharedVocabAligner(bridge, self.stop_ids)
             self.kinds[name] = kind
             logger.info("teacher %s: %s (%s backend), loss %s", name, teacher.model, teacher.backend, kind)
-        self.sampling_mix = {name: _sampling_mix(src, config.rollout.temperature)
-                             for name, src in config.sources.items() if src.sampling_mix}
+        self.sampling_mix = {
+            name: _sampling_mix(src, config.rollout.temperature)
+            for name, src in config.sources.items()
+            if src.sampling_mix
+        }
         for name, mix in self.sampling_mix.items():
             routed = {config.teacher_of(name)} | set(config.sources[name].topic_teachers)
             off_policy = any(sp != Sampling(1.0) for _, sp in mix)
@@ -371,7 +374,10 @@ class OPDTrainer:
             if self.skipped_long in (1, 10, 100) or self.skipped_long % 1000 == 0:
                 logger.warning(
                     "Skipped %d prompt(s) longer than rollout.max_model_len=%d allows (last: %d tokens, source %s)",
-                    self.skipped_long, limit, longest, request.source,
+                    self.skipped_long,
+                    limit,
+                    longest,
+                    request.source,
                 )
             return False
         request.max_new_tokens = min(request.max_new_tokens, limit - longest)
@@ -680,20 +686,32 @@ class OPDTrainer:
         """(decoded text, finish reason, completion tokens) per conversation, sampled with `sampling`."""
         metas = metas or [{}] * len(messages_list)
         prompts = [
-            encode_prompt(self.tok, m, {**self.config.model.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
-                          meta.get("tools"))
+            encode_prompt(
+                self.tok,
+                m,
+                {**self.config.model.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
+                meta.get("tools"),
+            )
             for m, meta in zip(messages_list, metas)
         ]
         limit = self.config.rollout.max_model_len
         fits = [i for i, ids in enumerate(prompts) if len(ids) + MIN_COMPLETION <= limit]
         if len(fits) < len(prompts):
-            logger.warning("Dev generation: %d prompt(s) longer than rollout.max_model_len=%d skipped",
-                           len(prompts) - len(fits), limit)
-        rollouts, _ = self.pipeline.generate([prompts[i] for i in fits],
-                                             [min(max_new_tokens, limit - len(prompts[i])) for i in fits], sampling)
+            logger.warning(
+                "Dev generation: %d prompt(s) longer than rollout.max_model_len=%d skipped",
+                len(prompts) - len(fits),
+                limit,
+            )
+        rollouts, _ = self.pipeline.generate(
+            [prompts[i] for i in fits], [min(max_new_tokens, limit - len(prompts[i])) for i in fits], sampling
+        )
         out = [("", "skipped", 0)] * len(prompts)  # one entry per conversation, aligned with the caller's rows
         for i, r in zip(fits, rollouts):
-            out[i] = (self.tok.decode(r.completion_ids, skip_special_tokens=True), r.finish_reason, len(r.completion_ids))
+            out[i] = (
+                self.tok.decode(r.completion_ids, skip_special_tokens=True),
+                r.finish_reason,
+                len(r.completion_ids),
+            )
         return out
 
     @torch.no_grad()
@@ -705,7 +723,9 @@ class OPDTrainer:
         dev_kl is the sampled estimate sum(log p_S - log p_T) per student token, on one
         scale for every loss; dev_kl_full (full_rkl teachers) the exact per-token KL."""
         metas = metas or [{}] * len(messages_list)
-        requests = [self.pipeline.request(m, max_new_tokens, meta, source, teacher) for m, meta in zip(messages_list, metas)]
+        requests = [
+            self.pipeline.request(m, max_new_tokens, meta, source, teacher) for m, meta in zip(messages_list, metas)
+        ]
         requests = [r for r in requests if self._fit(r)]
         if not requests:
             return {"dev_kl": float("nan"), "dev_len": 0.0}
@@ -820,9 +840,13 @@ def resolve_resume(resume_from: str, output_dir: str) -> str | None:
 
 def _sampling_mix(source, temperature: float) -> list[tuple[float, Sampling]]:
     """sources.<name>.sampling_mix as (weight, Sampling) pairs."""
-    return [(float(e.get("weight", 1.0)),
-             Sampling(float(e.get("temperature", temperature)), float(e.get("top_p", 1.0)), int(e.get("top_k", 0))))
-            for e in source.sampling_mix]
+    return [
+        (
+            float(e.get("weight", 1.0)),
+            Sampling(float(e.get("temperature", temperature)), float(e.get("top_p", 1.0)), int(e.get("top_k", 0))),
+        )
+        for e in source.sampling_mix
+    ]
 
 
 class _SourceEngine:
@@ -845,7 +869,9 @@ class _SourceEngine:
         sampling = self.trainer.config.train.eval_sampling
         if not sampling:
             return None
-        sp = Sampling(float(sampling.get("temperature", 1.0)), float(sampling.get("top_p", 1.0)), int(sampling.get("top_k", 0)))
+        sp = Sampling(
+            float(sampling.get("temperature", 1.0)), float(sampling.get("top_p", 1.0)), int(sampling.get("top_k", 0))
+        )
         return self.trainer.sample_generate(messages_list, max_new_tokens, metas, sp)
 
 

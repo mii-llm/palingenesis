@@ -88,7 +88,7 @@ class Workspace:
         return self.rt.exec(command, timeout, workdir=workdir)
 
     def kind(self, path: str) -> str | None:
-        """"dir", "file" or None (missing)."""
+        """ "dir", "file" or None (missing)."""
         q = shlex.quote(path)
         r = self.sh(f"if [ -d {q} ]; then echo dir; elif [ -e {q} ]; then echo file; else echo none; fi")
         k = r.stdout.strip()
@@ -116,8 +116,9 @@ class Workspace:
         tmp = f"{self.scratch}/.pgs_put_{uuid.uuid4().hex[:12]}"
         self.rt.put_files({tmp: text}, "/", as_user=True)
         q, t = shlex.quote(path), shlex.quote(tmp)
-        r = self.sh(f"mkdir -p {shlex.quote(posixpath.dirname(path) or '/')} && cat {t} > {q}; rc=$?; rm -f {t}; "
-                    f"exit $rc")
+        r = self.sh(
+            f"mkdir -p {shlex.quote(posixpath.dirname(path) or '/')} && cat {t} > {q}; rc=$?; rm -f {t}; exit $rc"
+        )
         if r.exit_code != 0:
             raise OpError("write_failed", path=path, detail=(r.stderr or r.stdout).strip()[-300:])
 
@@ -125,22 +126,31 @@ class Workspace:
 # ------------------------------------------------------------------ shell
 
 
-def exec_(ws: Workspace, command: str, timeout: float = 60, workdir: str | None = None,
-          persistent: bool = False, shell: str = "bash", env: dict | None = None) -> ExecOut:
+def exec_(
+    ws: Workspace,
+    command: str,
+    timeout: float = 60,
+    workdir: str | None = None,
+    persistent: bool = False,
+    shell: str = "bash",
+    env: dict | None = None,
+) -> ExecOut:
     """Run a command; stdout and stderr merged. persistent: the shell's working directory and exported variables
     carry over from the previous persistent call (a background process does not: each call is a new process).
     shell "sh": the command runs under /bin/sh -c (subprocess shell=True: dash on Debian images) instead of bash."""
     cmd = shlex.quote(str(command))
     if persistent:
         st = shlex.quote(ws.state)
-        script = (f"exec 2>&1\n[ -f {st}.env ] && . {st}.env >/dev/null 2>&1\n"
-                  f"cd \"$(cat {st}.cwd 2>/dev/null || echo {shlex.quote(ws.workdir)})\" 2>/dev/null\n"
-                  f"__pgs_cmd={cmd}\neval \"$__pgs_cmd\"\n__pgs_rc=$?\n"
-                  f"pwd > {st}.cwd; export -p > {st}.env 2>/dev/null\n"
-                  f"printf '\\n__PGS_CWD__%s' \"$(pwd)\"\nexit $__pgs_rc")
+        script = (
+            f"exec 2>&1\n[ -f {st}.env ] && . {st}.env >/dev/null 2>&1\n"
+            f'cd "$(cat {st}.cwd 2>/dev/null || echo {shlex.quote(ws.workdir)})" 2>/dev/null\n'
+            f'__pgs_cmd={cmd}\neval "$__pgs_cmd"\n__pgs_rc=$?\n'
+            f"pwd > {st}.cwd; export -p > {st}.env 2>/dev/null\n"
+            f"printf '\\n__PGS_CWD__%s' \"$(pwd)\"\nexit $__pgs_rc"
+        )
     else:
         cd = f"cd {shlex.quote(workdir)} || exit 1\n" if workdir else ""
-        run = f"exec sh -c {cmd}" if shell == "sh" else f"__pgs_cmd={cmd}\neval \"$__pgs_cmd\""
+        run = f"exec sh -c {cmd}" if shell == "sh" else f'__pgs_cmd={cmd}\neval "$__pgs_cmd"'
         script = f"exec 2>&1\n{cd}{run}"
     r = ws.rt.exec(script, timeout, env=env, workdir=ws.workdir)
     out = r.stdout + (r.stderr if r.stderr and not r.timed_out else "")
@@ -174,9 +184,13 @@ class Tmux:
         return shlex.quote(self.name)
 
     def start(self) -> None:
-        r = self.ws.sh("command -v tmux >/dev/null 2>&1 || exit 127; export TERM=xterm-256color SHELL=/bin/bash; "
-                       f"tmux new-session -x {self.width} -y {self.height} -d -s {self._t()} 'bash --login' && "
-                       "tmux set-option -g history-limit 10000000 >/dev/null", timeout=30, workdir=self.ws.workdir)
+        r = self.ws.sh(
+            "command -v tmux >/dev/null 2>&1 || exit 127; export TERM=xterm-256color SHELL=/bin/bash; "
+            f"tmux new-session -x {self.width} -y {self.height} -d -s {self._t()} 'bash --login' && "
+            "tmux set-option -g history-limit 10000000 >/dev/null",
+            timeout=30,
+            workdir=self.ws.workdir,
+        )
         if r.exit_code == 127:
             raise OpError("no_tmux", detail="tmux is not installed in the task image")
         if r.exit_code != 0:
@@ -195,9 +209,11 @@ class Tmux:
         self.ws.sh(f"tmux send-keys -t {self._t()} -- {shlex.quote(keys)}")
 
     def _probe(self) -> tuple[bool, str]:
-        r = self.ws.sh(f"p=$(tmux display -p -t {self._t()} '#{{pane_pid}}'); "
-                       f"if pgrep -P \"$p\" >/dev/null 2>&1; then echo BUSY; else echo IDLE; fi; "
-                       f"tmux capture-pane -p -t {self._t()} | cksum")
+        r = self.ws.sh(
+            f"p=$(tmux display -p -t {self._t()} '#{{pane_pid}}'); "
+            f'if pgrep -P "$p" >/dev/null 2>&1; then echo BUSY; else echo IDLE; fi; '
+            f"tmux capture-pane -p -t {self._t()} | cksum"
+        )
         lines = r.stdout.splitlines()
         return (bool(lines) and lines[0] == "IDLE"), (lines[1] if len(lines) > 1 else "")
 
@@ -248,8 +264,10 @@ def keys(ws: Workspace, tmux: Tmux, keystrokes: str, duration: float = 1.0) -> N
 
 
 def apply_patch(ws: Workspace, patch_text: str) -> str:
-    raise NotImplementedError("ApplyPatch (the codex / opencode gpt-* apply_patch grammar) is not implemented: no "
-                              "built-in profile uses it yet")
+    raise NotImplementedError(
+        "ApplyPatch (the codex / opencode gpt-* apply_patch grammar) is not implemented: no "
+        "built-in profile uses it yet"
+    )
 
 
 # ------------------------------------------------------------------ files
@@ -271,8 +289,10 @@ def list_dir(ws: Workspace, path: str, max_depth: int = 1, hidden: bool = False)
     """(entries, hidden_count): paths under `path` to max_depth (directories end with "/"), sorted; hidden entries
     (a name starting with ".") left out unless hidden, and counted at the first level."""
     q = shlex.quote(path)
-    r = ws.sh(f"[ -d {q} ] || exit 3; cd {q} && find . -mindepth 1 -maxdepth {int(max_depth)} "
-              f"\\( -type d -exec printf '%s/\\n' {{}} \\; \\) -o -print")
+    r = ws.sh(
+        f"[ -d {q} ] || exit 3; cd {q} && find . -mindepth 1 -maxdepth {int(max_depth)} "
+        f"\\( -type d -exec printf '%s/\\n' {{}} \\; \\) -o -print"
+    )
     if r.exit_code == 3:
         raise OpError("not_dir", path=path)
     entries, n_hidden = [], 0
@@ -326,7 +346,7 @@ def replace(ws: Workspace, path: str, old: str, new: str, replace_all: bool = Fa
         raise OpError("no_match", path=path, old=old)
     if len(hits) > 1 and not replace_all:
         raise OpError("multiple", path=path, old=old, count=len(hits), lines=[_line_of(text, i) for i in hits])
-    after = text.replace(old, new) if replace_all else text[:hits[0]] + new + text[hits[0] + len(old):]
+    after = text.replace(old, new) if replace_all else text[: hits[0]] + new + text[hits[0] + len(old) :]
     ws.store(path, after)
     ws.history[path] = text
     return Edit(path, text, after, _line_of(text, hits[0]), len(hits) if replace_all else 1)
@@ -346,8 +366,15 @@ def multi_replace(ws: Workspace, path: str, edits: list[tuple[str, str]]) -> Edi
         if not hits:
             raise OpError("no_match", path=path, old=old, index=i, n=len(edits))
         if len(hits) > 1:
-            raise OpError("multiple", path=path, old=old, count=len(hits), index=i, n=len(edits),
-                          lines=[_line_of(text, h) for h in hits])
+            raise OpError(
+                "multiple",
+                path=path,
+                old=old,
+                count=len(hits),
+                index=i,
+                n=len(edits),
+                lines=[_line_of(text, h) for h in hits],
+            )
         spans.append((hits[0], hits[0] + len(old), new, i))
     spans.sort(key=lambda x: (x[0], x[3]))
     for a, b in zip(spans, spans[1:]):
@@ -401,7 +428,7 @@ def _expand_braces(pattern: str) -> list[str]:
     m = re.search(r"\{([^{}]*)\}", pattern)
     if not m:
         return [pattern]
-    return [x for alt in m.group(1).split(",") for x in _expand_braces(pattern[:m.start()] + alt + pattern[m.end():])]
+    return [x for alt in m.group(1).split(",") for x in _expand_braces(pattern[: m.start()] + alt + pattern[m.end() :])]
 
 
 def _glob_regex(pattern: str) -> re.Pattern:
@@ -427,7 +454,7 @@ def _glob_regex(pattern: str) -> re.Pattern:
                 out.append(re.escape(c))
                 i += 1
             else:
-                body = pattern[i + 1:j]
+                body = pattern[i + 1 : j]
                 out.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
                 i = j + 1
         else:
@@ -455,8 +482,11 @@ def glob(ws: Workspace, pattern: str, path: str | None = None, limit: int = 100)
     if k is None:
         raise OpError("not_found", path=root)
     q = shlex.quote(root)
-    r = ws.sh(f"cd {q} && (find . -name .git -prune -o -type f -printf '%T@ %p\\n' 2>/dev/null "
-              f"|| find . -name .git -prune -o -type f -print | sed 's/^/0 /')", timeout=60)
+    r = ws.sh(
+        f"cd {q} && (find . -name .git -prune -o -type f -printf '%T@ %p\\n' 2>/dev/null "
+        f"|| find . -name .git -prune -o -type f -print | sed 's/^/0 /')",
+        timeout=60,
+    )
     rows = []
     for line in r.stdout.splitlines():
         stamp, _, p = line.partition(" ")
@@ -471,16 +501,20 @@ def glob(ws: Workspace, pattern: str, path: str | None = None, limit: int = 100)
     return [posixpath.join(root, rel) for _, rel in rows[:limit]]
 
 
-def grep(ws: Workspace, pattern: str, path: str | None = None, include: str | None = None,
-         limit: int = 100) -> list[tuple[str, int, str]]:
+def grep(
+    ws: Workspace, pattern: str, path: str | None = None, include: str | None = None, limit: int = 100
+) -> list[tuple[str, int, str]]:
     """(file, line number, line) for each line under `path` matching the extended regular expression `pattern`
     (binary files and .git left out), at most `limit`."""
     root = ws.abspath(path or ws.workdir)
     if ws.kind(root) is None:
         raise OpError("not_found", path=root)
     inc = " ".join(f"--include={shlex.quote(p)}" for p in _expand_braces(include)) if include else ""
-    r = ws.sh(f"grep -rnHI -E --exclude-dir=.git {inc} -e {shlex.quote(pattern)} -- {shlex.quote(root)} "
-              f"2>/dev/null | head -n {int(limit)}", timeout=60)
+    r = ws.sh(
+        f"grep -rnHI -E --exclude-dir=.git {inc} -e {shlex.quote(pattern)} -- {shlex.quote(root)} "
+        f"2>/dev/null | head -n {int(limit)}",
+        timeout=60,
+    )
     out = []
     for line in r.stdout.splitlines():
         m = re.match(r"^(.*?):(\d+):(.*)$", line)

@@ -217,7 +217,9 @@ class ChatMessagesSource:
             meta["chat_template_kwargs"] = row["chat_template_kwargs"]
         field = self.config.privileged_field
         if field and row.get(field):
-            meta["teacher_messages"] = with_privileged(row["messages"], str(row[field]), self.config.privileged_template)
+            meta["teacher_messages"] = with_privileged(
+                row["messages"], str(row[field]), self.config.privileged_template
+            )
         return meta
 
     def sample(self):
@@ -228,7 +230,11 @@ class ChatMessagesSource:
         rows = self.dev_rows[: self.eval_samples]
         metrics = engine.dev_kl([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows])
         deploy = getattr(engine, "deploy_generate", None)
-        answers = deploy([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows]) if deploy else None
+        answers = (
+            deploy([r["messages"] for r in rows], self.config.max_new_tokens, [self.meta(r) for r in rows])
+            if deploy
+            else None
+        )
         answers = [a for a in answers or [] if a[1] != "skipped"]  # prompts too long for rollout.max_model_len
         if answers:
             metrics["dev_loop"] = sum(looped(text, finish) for text, finish, _ in answers) / len(answers)

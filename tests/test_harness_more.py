@@ -60,25 +60,36 @@ FIXTURES = Path(__file__).parent.parent / "research" / "tiny-reliable-agent" / "
 def test_unknown_tool_wording_and_aliases_per_harness(rt):
     oc = session("opencode", rt)
     assert oc.unknown_tool("Bash", {"command": "echo hi"}) == "hi\n"  # repairToolCall lowercases
-    assert oc.unknown_tool("todo_x", {}) == ("The arguments provided to the tool are invalid: Model tried to call "
-                                             "unavailable tool 'todo_x'. Available tools: bash, edit, glob, grep, "
-                                             "invalid, read, write.")
+    assert oc.unknown_tool("todo_x", {}) == (
+        "The arguments provided to the tool are invalid: Model tried to call "
+        "unavailable tool 'todo_x'. Available tools: bash, edit, glob, grep, "
+        "invalid, read, write."
+    )
     oh = session("openhands-sdk", rt)
     assert "[The command completed with exit code 0.]" in oh.unknown_tool("bash", {"command": "true"})
     assert "[Command finished with exit code 0]" in oh.unknown_tool("git", {"command": "--version || true"})
     assert oh.unknown_tool("str_replace</parameter", {"command": "view", "path": "/nope"}).endswith(
-        "does not exist. Please provide a valid path.")
-    assert oh.unknown_tool("python", {}) == ("Tool 'python' not found. Available: ['terminal', 'file_editor', "
-                                             "'finish', 'think']")
+        "does not exist. Please provide a valid path."
+    )
+    assert oh.unknown_tool("python", {}) == (
+        "Tool 'python' not found. Available: ['terminal', 'file_editor', 'finish', 'think']"
+    )
     mini = session("mini-swe-agent", rt)
-    assert "Unknown tool 'str_replace'.Missing 'command' argument in bash tool call." in \
-        mini.unknown_tool("str_replace", {"path": "x"})
+    assert "Unknown tool 'str_replace'.Missing 'command' argument in bash tool call." in mini.unknown_tool(
+        "str_replace", {"path": "x"}
+    )
     assert session("pi", rt).unknown_tool("grep", {}) == "Tool grep not found"
-    assert session("qwen-code", rt).unknown_tool("bash", {}).startswith(
-        'Tool "bash" not found in registry. Tools must use the exact names that are registered. Did you mean one of: ')
+    assert (
+        session("qwen-code", rt)
+        .unknown_tool("bash", {})
+        .startswith(
+            'Tool "bash" not found in registry. Tools must use the exact names that are registered. Did you mean one of: '
+        )
+    )
     assert session("kimi-cli", rt).unknown_tool("bash", {}) == "<system>ERROR: Tool `bash` not found</system>"
-    assert session("swe-agent", rt).unknown_tool("ls", {}) == ("Your action could not be parsed properly: Command 'ls' "
-                                                               "not found in list of available commands..\n")
+    assert session("swe-agent", rt).unknown_tool("ls", {}) == (
+        "Your action could not be parsed properly: Command 'ls' not found in list of available commands..\n"
+    )
 
 
 def test_pipeline_asks_the_environment_for_the_unknown_tool_answer(local_harbor):
@@ -129,11 +140,20 @@ def test_recording_stub_replays_the_script_and_records_requests(tmp_path):
         call = first["choices"][0]["message"]["tool_calls"][0]
         assert first["choices"][0]["finish_reason"] == "tool_calls" and call["function"]["name"] == "bash"
         assert json.loads(call["function"]["arguments"]) == {"command": "ls"}
-        side = json.loads(_post(f"{base}/chat/completions", {"model": "m", "messages": [{"role": "user", "content":
-                                                                                             "title?"}]}))
+        side = json.loads(
+            _post(f"{base}/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "title?"}]})
+        )
         assert side["choices"][0]["message"]["content"] == "Capture"  # a side request without tools
-        sse = _post(f"{base}/chat/completions", {"model": "m", "messages": convo, "tools": tools, "stream": True,
-                                                 "stream_options": {"include_usage": True}})
+        sse = _post(
+            f"{base}/chat/completions",
+            {
+                "model": "m",
+                "messages": convo,
+                "tools": tools,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
         chunks = [json.loads(line[6:]) for line in sse.splitlines() if line.startswith("data: {")]
         text = "".join((c["choices"][0]["delta"].get("content") or "") for c in chunks if c["choices"])
         assert text == "All done." and sse.rstrip().endswith("data: [DONE]") and "usage" in chunks[-1]
@@ -172,8 +192,7 @@ def _recorded(agent: str):
     if not path.exists():
         pytest.skip(f"no recorded requests for {agent} (pgs harness capture / serve)")
     rows = [json.loads(line) for line in open(path)]
-    meta = json.loads((FIXTURES / agent / "meta.json").read_text()) if (FIXTURES / agent / "meta.json").exists() \
-        else {}
+    meta = json.loads((FIXTURES / agent / "meta.json").read_text()) if (FIXTURES / agent / "meta.json").exists() else {}
     main = [r for r in rows if r["body"].get("tools")]
     first = main[0]["body"]
     last = max(main, key=lambda r: len(r["body"]["messages"]))["body"]
@@ -241,8 +260,9 @@ def test_harbor_cli_capture_matches_the_profile(agent):
         rows = [json.loads(line) for line in open(FIXTURES / agent / "requests.jsonl")]
         users = [_content(m) for m in rows[-1]["body"]["messages"][2:] if m["role"] == "user"]
         assert users[0] == mini_unknown_tool("str_replace", ["bash"], {"path": "/workdir/Projects/sito/.env"})
-        assert users[1] == mini_format_error("No tool calls found in the response. Every response MUST include at "
-                                             "least one tool call.", 0)
+        assert users[1] == mini_format_error(
+            "No tool calls found in the response. Every response MUST include at least one tool call.", 0
+        )
     if agent == "opencode":
         assert _content(first["messages"][1]).startswith('"') and _content(first["messages"][1]).endswith('\n"')
         assert "Workspace root folder:" in _content(first["messages"][0])
@@ -284,14 +304,20 @@ def test_swe_agent_editor_bash_and_submit_twice(rt):
     s = session("swe-agent", rt)
     p = f"{rt.workdir}/a.py"
     ed = lambda **a: s.call_tool("str_replace_editor", a)  # noqa: E731
-    assert ed(command="create", path=p, file_text="x = 1\ny = 2\n") == f"OBSERVATION:\nFile created successfully at: {p}"
-    assert ed(command="view", path=p) == (f"OBSERVATION:\nHere's the result of running `cat -n` on {p}:\n     1\tx = 1\n"
-                                          "     2\ty = 2\n     3\t")
+    assert (
+        ed(command="create", path=p, file_text="x = 1\ny = 2\n") == f"OBSERVATION:\nFile created successfully at: {p}"
+    )
+    assert ed(command="view", path=p) == (
+        f"OBSERVATION:\nHere's the result of running `cat -n` on {p}:\n     1\tx = 1\n     2\ty = 2\n     3\t"
+    )
     assert ed(command="str_replace", path=p, old_str="= ", new_str="=") == (
         "OBSERVATION:\nNo replacement was performed. Multiple occurrences of old_str `= ` in lines [1, 2]. Please "
-        "ensure it is unique")
+        "ensure it is unique"
+    )
     assert ed(command="view", path="a.py").startswith("OBSERVATION:\nThe path a.py is not an absolute path")
-    assert s.call_tool("bash", {"command": "cd /tmp"}) == "Your command ran successfully and did not produce any output."
+    assert (
+        s.call_tool("bash", {"command": "cd /tmp"}) == "Your command ran successfully and did not produce any output."
+    )
     assert s.call_tool("bash", {"command": "pwd"}).endswith("tmp")  # persistent shell
     first = s.call_tool("submit", {})
     assert first.startswith("OBSERVATION:\nThank you for your work on this issue.") and not s.done
@@ -307,11 +333,16 @@ def test_goose_developer_tools(rt):
     assert s.call_tool("write", {"path": "new.txt", "content": "x\ny\n"}) == "Created new.txt (2 lines)"
     assert s.call_tool("write", {"path": "new.txt", "content": "z\n"}) == "Wrote new.txt (1 lines)"
     multi = s.call_tool("edit", {"path": "src/a.py", "before": "a = 1", "after": "b"})
-    assert multi.startswith("Found 2 matches. Please provide more context to identify a unique match:\n\nMatch 1 "
-                            "(line 1):\n```\na = 1\na = 1\n```")
+    assert multi.startswith(
+        "Found 2 matches. Please provide more context to identify a unique match:\n\nMatch 1 "
+        "(line 1):\n```\na = 1\na = 1\n```"
+    )
     none = s.call_tool("edit", {"path": "src/a.py", "before": "zz", "after": "b"})
     assert none == "No match found for the specified text.\n\nFile preview:\n```\n   1: a = 1\n   2: a = 1\n```"
-    assert s.call_tool("edit", {"path": "new.txt", "before": "z", "after": "w\nv"}) == "Edited new.txt (1 lines -> 2 lines)"
+    assert (
+        s.call_tool("edit", {"path": "new.txt", "before": "z", "after": "w\nv"})
+        == "Edited new.txt (1 lines -> 2 lines)"
+    )
     assert s.call_tool("shell", {"command": "echo hi; exit 2"}) == "hi\n\nCommand exited with code 2"
     assert s.call_tool("shell", {"command": "true"}) == "(no output)"
     tree = s.call_tool("tree", {"path": "."})
@@ -321,8 +352,11 @@ def test_goose_developer_tools(rt):
 def test_hermes_json_results(rt):
     s = session("hermes", rt)
     write(rt, "f.txt", "one\ntwo\n")
-    assert json.loads(s.call_tool("terminal", {"command": "echo hi; exit 3"})) == {"output": "hi", "exit_code": 3,
-                                                                                    "error": None}
+    assert json.loads(s.call_tool("terminal", {"command": "echo hi; exit 3"})) == {
+        "output": "hi",
+        "exit_code": 3,
+        "error": None,
+    }
     assert json.loads(s.call_tool("terminal", {"command": "mkdir -p d && cd d"}))["cwd"].endswith("/d")
     blocked = json.loads(s.call_tool("write_file", {"path": f"{rt.workdir}/f.txt", "content": "x"}))
     assert "read_file" in blocked["error"]  # an existing file must be read first
@@ -340,16 +374,20 @@ def test_qwen_code_prompt_states_the_destructive_action_scope():
 
 
 def test_terminus_parser_matches_harbor_behaviour():
-    ok = parse_response('{"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls\\n", "duration": 0.1}], '
-                        '"task_complete": false}')
+    ok = parse_response(
+        '{"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls\\n", "duration": 0.1}], "task_complete": false}'
+    )
     assert not ok.error and ok.commands[0].keystrokes == "ls\n" and not ok.warning
     extra = parse_response('Sure!\n{"analysis": "a", "plan": "p", "commands": []}')
     assert not extra.error and extra.warning == "- Extra text detected before JSON object"
     fixed = parse_response('{"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls\\n", "duration": 1}]')
-    assert not fixed.error and fixed.warning.startswith("- AUTO-CORRECTED: Fixed incomplete JSON by adding missing "
-                                                       "closing brace")
-    nodur = parse_response('{"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls"}, {"keystrokes": "pwd\\n", '
-                           '"duration": 1}], "task_complete": "true"}')
+    assert not fixed.error and fixed.warning.startswith(
+        "- AUTO-CORRECTED: Fixed incomplete JSON by adding missing closing brace"
+    )
+    nodur = parse_response(
+        '{"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls"}, {"keystrokes": "pwd\\n", '
+        '"duration": 1}], "task_complete": "true"}'
+    )
     assert nodur.is_task_complete and "Command 1: Missing duration field, using default 1.0" in nodur.warning
     assert "Command 1 should end with newline" in nodur.warning
     bad = parse_response('{"analysis": "a", "commands": []}')
@@ -358,8 +396,9 @@ def test_terminus_parser_matches_harbor_behaviour():
     proto = TerminusJSON()
     with pytest.raises(Exception, match="Previous response had parsing errors:\nERROR: Missing required fields: plan"):
         proto.parse('{"analysis": "a", "commands": []}')
-    [(name, args)] = proto.parse(proto.render([("x", {"commands": [{"keystrokes": "ls\n", "duration": 0.1}],
-                                                      "task_complete": True})]))
+    [(name, args)] = proto.parse(
+        proto.render([("x", {"commands": [{"keystrokes": "ls\n", "duration": 0.1}], "task_complete": True})])
+    )
     assert args["task_complete"] is True and args["commands"] == [{"keystrokes": "ls\n", "duration": 0.1}]
     assert limit_output("é" * 6000).count("output limited to 10000 bytes") == 1
 
@@ -375,13 +414,22 @@ def test_run_episodes_uses_the_pipeline(local_harbor):
     kwargs = {"enable_thinking": False}
     call = json.dumps({"name": "write", "arguments": {"filePath": "hello.txt", "content": "ciao\n"}})
     engine = ScriptedEngine(tok, end_of_turn_id(tok, kwargs), [f"<tool_call>\n{call}\n</tool_call>", "Done.", "x"])
-    groups = run_episodes(engine, tok, [_row()], HarborEnv, {"profiles": {"opencode": 1, "pi": 1}}, k=2,
-                          temperature=1.0, chat_template_kwargs=kwargs, max_turns=4, max_new_tokens=64)
+    groups = run_episodes(
+        engine,
+        tok,
+        [_row()],
+        HarborEnv,
+        {"profiles": {"opencode": 1, "pi": 1}},
+        k=2,
+        temperature=1.0,
+        chat_template_kwargs=kwargs,
+        max_turns=4,
+        max_new_tokens=64,
+    )
     [group] = groups
     assert len(group) == 2 and len({t.info["harness_profile"] for t in group}) == 1  # one profile per group
     name = group[0].info["harness_profile"]
     assert all(t.rewards[f"env/metric/profile/{name.split('@')[0]}"] == 1.0 for t in group)
-
 
 
 def test_run_episodes_budget_covers_every_turn(local_harbor):
@@ -396,8 +444,18 @@ def test_run_episodes_budget_covers_every_turn(local_harbor):
     call = json.dumps({"name": "write", "arguments": {"filePath": "hello.txt", "content": "ciao\n"}})
     engine = ScriptedEngine(tok, end_of_turn_id(tok, kwargs), [f"<tool_call>\n{call}\n</tool_call>"] * 3 + ["Done."])
     n = len(tok.encode(f"<tool_call>\n{call}\n</tool_call>", add_special_tokens=False))
-    [[t]] = run_episodes(engine, tok, [_row()], HarborEnv, {"profile": "opencode"}, k=1, temperature=1.0,
-                         chat_template_kwargs=kwargs, max_turns=6, max_new_tokens=n + 8)
+    [[t]] = run_episodes(
+        engine,
+        tok,
+        [_row()],
+        HarborEnv,
+        {"profile": "opencode"},
+        k=1,
+        temperature=1.0,
+        chat_template_kwargs=kwargs,
+        max_turns=6,
+        max_new_tokens=n + 8,
+    )
     assert t.finish != "length" and t.turns == 4
 
 
@@ -411,47 +469,87 @@ def _image_ok(tag):
 
 
 def _terminus(cmds, complete=False):
-    return json.dumps({"analysis": "", "plan": "", "commands": [{"keystrokes": c, "duration": 1.0} for c in cmds],
-                       "task_complete": complete})
+    return json.dumps(
+        {
+            "analysis": "",
+            "plan": "",
+            "commands": [{"keystrokes": c, "duration": 1.0} for c in cmds],
+            "task_complete": complete,
+        }
+    )
 
 
 SCRIPTS = {
     "swe-agent": {
-        ARCHIVE: [[("bash", {"command": "cd /workdir/Projects"})],
-                  [("bash", {"command": "tar -czf ../website.tar.gz website"})], [("submit", {})], [("submit", {})]],
-        ENV_EDIT: [[("str_replace_editor", {"command": "view", "path": DOTENV})],
-                   [("str_replace_editor", {"command": "str_replace", "path": DOTENV, "old_str": "DEBUG=true",
-                                            "new_str": "DEBUG=false"})], [("submit", {})], [("submit", {})]],
-        "noop": [[("submit", {})], [("submit", {})]]},
+        ARCHIVE: [
+            [("bash", {"command": "cd /workdir/Projects"})],
+            [("bash", {"command": "tar -czf ../website.tar.gz website"})],
+            [("submit", {})],
+            [("submit", {})],
+        ],
+        ENV_EDIT: [
+            [("str_replace_editor", {"command": "view", "path": DOTENV})],
+            [
+                (
+                    "str_replace_editor",
+                    {"command": "str_replace", "path": DOTENV, "old_str": "DEBUG=true", "new_str": "DEBUG=false"},
+                )
+            ],
+            [("submit", {})],
+            [("submit", {})],
+        ],
+        "noop": [[("submit", {})], [("submit", {})]],
+    },
     "qwen-code": {
         ARCHIVE: [[("run_shell_command", {"command": "tar -czf website.tar.gz -C Projects website"})], "Done."],
-        ENV_EDIT: [[("read_file", {"file_path": DOTENV})],
-                   [("edit", {"file_path": DOTENV, "old_string": "DEBUG=true", "new_string": "DEBUG=false"})], "Done."],
-        "noop": ["Done."]},
+        ENV_EDIT: [
+            [("read_file", {"file_path": DOTENV})],
+            [("edit", {"file_path": DOTENV, "old_string": "DEBUG=true", "new_string": "DEBUG=false"})],
+            "Done.",
+        ],
+        "noop": ["Done."],
+    },
     "goose": {
         ARCHIVE: [[("tree", {"path": "."})], [("shell", {"command": TAR})], "Done."],
         ENV_EDIT: [[("edit", {"path": DOTENV, "before": "DEBUG=true", "after": "DEBUG=false"})], "Done."],
-        "noop": ["Done."]},
+        "noop": ["Done."],
+    },
     "hermes": {
-        ARCHIVE: [[("terminal", {"command": "cd Projects"})], [("terminal", {"command":
-                                                                             "tar -czf ../website.tar.gz website"})],
-                  "Done."],
-        ENV_EDIT: [[("read_file", {"path": "Projects/sito/.env"})],
-                   [("patch", {"path": "Projects/sito/.env", "old_string": "DEBUG=true", "new_string": "DEBUG=false"})],
-                   "Done."],
-        "noop": ["Done."]},
+        ARCHIVE: [
+            [("terminal", {"command": "cd Projects"})],
+            [("terminal", {"command": "tar -czf ../website.tar.gz website"})],
+            "Done.",
+        ],
+        ENV_EDIT: [
+            [("read_file", {"path": "Projects/sito/.env"})],
+            [("patch", {"path": "Projects/sito/.env", "old_string": "DEBUG=true", "new_string": "DEBUG=false"})],
+            "Done.",
+        ],
+        "noop": ["Done."],
+    },
     "kimi-cli": {
         ARCHIVE: [[("Shell", {"command": TAR})], "Done."],
-        ENV_EDIT: [[("ReadFile", {"path": "Projects/sito/.env"})],
-                   [("StrReplaceFile", {"path": "Projects/sito/.env", "edit": {"old": "DEBUG=true",
-                                                                               "new": "DEBUG=false"}})], "Done."],
-        "noop": ["Done."]},
+        ENV_EDIT: [
+            [("ReadFile", {"path": "Projects/sito/.env"})],
+            [("StrReplaceFile", {"path": "Projects/sito/.env", "edit": {"old": "DEBUG=true", "new": "DEBUG=false"}})],
+            "Done.",
+        ],
+        "noop": ["Done."],
+    },
     "terminus-2": {
-        ARCHIVE: [_terminus(["cd /workdir/Projects\n", "tar -czf ../website.tar.gz website\n"]),
-                  _terminus([], True), _terminus([], True)],
-        ENV_EDIT: [_terminus([SED + "\n"]), "oops, not json", _terminus(["cat " + DOTENV + "\n"], True),
-                   _terminus([], True)],
-        "noop": [_terminus([], True), _terminus([], True)]},
+        ARCHIVE: [
+            _terminus(["cd /workdir/Projects\n", "tar -czf ../website.tar.gz website\n"]),
+            _terminus([], True),
+            _terminus([], True),
+        ],
+        ENV_EDIT: [
+            _terminus([SED + "\n"]),
+            "oops, not json",
+            _terminus(["cat " + DOTENV + "\n"], True),
+            _terminus([], True),
+        ],
+        "noop": [_terminus([], True), _terminus([], True)],
+    },
 }
 
 

@@ -108,7 +108,9 @@ def _quack_ops():
         return None
 
 
-def newton_schulz(X: Tensor, coefficients=POLAR_EXPRESS_COEFFICIENTS, eps: float = 1e-7, dtype=None, ops=_TorchOps) -> Tensor:
+def newton_schulz(
+    X: Tensor, coefficients=POLAR_EXPRESS_COEFFICIENTS, eps: float = 1e-7, dtype=None, ops=_TorchOps
+) -> Tensor:
     """Standard Newton-Schulz on a batch (b, n, m): X <- a X + (b A + c A^2) X with A = X X^T (wide orientation)."""
     dtype = dtype or (torch.float16 if X.is_cuda else torch.float32)
     tall = X.size(-2) > X.size(-1)
@@ -183,16 +185,21 @@ def _kernel(method: str, ops, compile_: bool, shape: tuple):
         try:
             return compiled(X)
         except Exception as e:  # noqa: BLE001 — compilation must never stop training: fall back to eager
-            logger.warning("Muon: compiling %s Newton-Schulz (%s) failed, running eager from now on: %s", method,
-                           ops.name, str(e)[:200])
+            logger.warning(
+                "Muon: compiling %s Newton-Schulz (%s) failed, running eager from now on: %s",
+                method,
+                ops.name,
+                str(e)[:200],
+            )
             _COMPILE_FAILED.add((method, ops.name))
             return run(X)
 
     return safe
 
 
-def orthogonalize(G: Tensor, method: str = "gram", coefficients=None, dtype=None, backend: str = "auto",
-                  compile: bool = False) -> Tensor:
+def orthogonalize(
+    G: Tensor, method: str = "gram", coefficients=None, dtype=None, backend: str = "auto", compile: bool = False
+) -> Tensor:
     """Approximate U V^T of a batch of matrices (b, n, m) or one matrix (n, m); returns G's dtype and shape.
 
     backend: "torch" (dense GEMMs, any device), "quack" (symmetric CuTeDSL kernels, sm90+; needs quack-kernels),
@@ -266,8 +273,17 @@ class MuonAdamW(torch.optim.Optimizer):
         """backend: Newton-Schulz GEMMs ("auto": quack's symmetric kernels on sm90+ when installed, torch otherwise);
         compile: torch.compile the Newton-Schulz function (CUDA only); distribute: under torch.distributed, each rank
         orthogonalizes 1/world of the matrices and the results are all-gathered (instead of every rank computing all)."""
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_method=ns_method,
-                        scale=scale, betas=betas, eps=eps, use_muon=False)
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_method=ns_method,
+            scale=scale,
+            betas=betas,
+            eps=eps,
+            use_muon=False,
+        )
         super().__init__(param_groups, defaults)
         self.backend, self.compile, self.distribute = backend, compile, distribute
 
@@ -407,7 +423,22 @@ def build_muon(
     groups, counts = muon_param_groups(model, weight_decay, min_dim)
     logger.info(
         "Muon: %.1fM params orthogonalized (%s Newton-Schulz, %s scale), %.1fM on AdamW; lr %.2e",
-        counts["muon"] / 1e6, ns_method, scale, counts["adamw"] / 1e6, lr,
+        counts["muon"] / 1e6,
+        ns_method,
+        scale,
+        counts["adamw"] / 1e6,
+        lr,
     )
-    return MuonAdamW(groups, lr=lr, weight_decay=weight_decay, momentum=momentum, ns_method=ns_method, scale=scale,
-                     betas=betas, eps=eps, backend=backend, compile=compile, distribute=distribute)
+    return MuonAdamW(
+        groups,
+        lr=lr,
+        weight_decay=weight_decay,
+        momentum=momentum,
+        ns_method=ns_method,
+        scale=scale,
+        betas=betas,
+        eps=eps,
+        backend=backend,
+        compile=compile,
+        distribute=distribute,
+    )

@@ -163,8 +163,15 @@ class TrainConfig:
     muon_compile: bool = False
 
     def muon_options(self) -> dict:
-        return {"ns_method": self.muon_ns, "scale": self.muon_scale, "momentum": self.muon_momentum,
-                "min_dim": self.muon_min_dim, "backend": self.muon_backend, "compile": self.muon_compile}
+        return {
+            "ns_method": self.muon_ns,
+            "scale": self.muon_scale,
+            "momentum": self.muon_momentum,
+            "min_dim": self.muon_min_dim,
+            "backend": self.muon_backend,
+            "compile": self.muon_compile,
+        }
+
     seed: int = 42
     save_steps: int = 500
     save_final: bool = True  # write the final model at the end (off for dry runs such as `pgs profile --measure`)

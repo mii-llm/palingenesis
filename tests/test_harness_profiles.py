@@ -52,14 +52,19 @@ class LocalRuntime:
 
     def exec(self, command, timeout=60, env=None, workdir=None):
         try:
-            r = subprocess.run(["bash", "-c", command], cwd=workdir or self.workdir, capture_output=True,
-                               timeout=timeout, env={**os.environ, **(env or {})})
+            r = subprocess.run(
+                ["bash", "-c", command],
+                cwd=workdir or self.workdir,
+                capture_output=True,
+                timeout=timeout,
+                env={**os.environ, **(env or {})},
+            )
         except subprocess.TimeoutExpired:
             return ExecResult(124, "", f"timed out after {timeout:g} s", True)
         out, err = r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
         cut = self.max_output
         if len(out) > cut:
-            out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2:]
+            out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2 :]
         return ExecResult(r.returncode, out, err[-cut:])
 
     def put_files(self, files, dest="/", as_user=False):
@@ -147,8 +152,13 @@ def test_read_write_keep_mode_and_report_creation(ws, rt):
 
 def test_replace_variants_and_errors(ws, rt):
     p = write(rt, "f.txt", "alpha\nbeta\ngamma\nbeta\n")
-    for args, kind in (((p, "beta", "B"), "multiple"), ((p, "zzz", "B"), "no_match"), ((p, "beta", "beta"), "identical"),
-                       ((p, "", "B"), "empty_old"), ((rt.workdir, "a", "b"), "is_dir")):
+    for args, kind in (
+        ((p, "beta", "B"), "multiple"),
+        ((p, "zzz", "B"), "no_match"),
+        ((p, "beta", "beta"), "identical"),
+        ((p, "", "B"), "empty_old"),
+        ((rt.workdir, "a", "b"), "is_dir"),
+    ):
         with pytest.raises(OpError) as e:
             ops.replace(ws, *args)
         assert e.value.kind == kind
@@ -165,9 +175,13 @@ def test_multi_replace_matches_the_original_text(ws, rt):
     p = write(rt, "f.txt", "one two three\n")
     ed = ops.multi_replace(ws, p, [("three", "3"), ("one", "two")])  # "two" from edit 2 is not re-matched
     assert ops.read(ws, p) == "two two 3\n" and ed.count == 2
-    for edits, kind in (([("two", "x"), ("two two", "y")], "multiple"), ([("nope", "x")], "no_match"),
-                        ([("", "x")], "empty_old"), ([("two 3", "a"), ("3\n", "b")], "overlap"),
-                        ([("3", "3")], "identical")):
+    for edits, kind in (
+        ([("two", "x"), ("two two", "y")], "multiple"),
+        ([("nope", "x")], "no_match"),
+        ([("", "x")], "empty_old"),
+        ([("two 3", "a"), ("3\n", "b")], "overlap"),
+        ([("3", "3")], "identical"),
+    ):
         with pytest.raises(OpError) as e:
             ops.multi_replace(ws, p, edits)
         assert e.value.kind == kind
@@ -233,49 +247,64 @@ def test_openhands_file_editor_wording_matches_the_sdk(rt):
     assert fe(command="create", path=p, file_text="alpha\nbeta\ngamma\nbeta\n") == f"File created successfully at: {p}"
     assert fe(command="create", path=p, file_text="x") == (
         f"[An error occurred during execution.]\nInvalid `path` parameter: {p}. File already exists at: {p}. Cannot "
-        "overwrite files using command `create`.")
-    assert fe(command="view", path=p) == (f"Here's the result of running `cat -n` on {p}:\n     1\talpha\n     2\tbeta\n"
-                                          "     3\tgamma\n     4\tbeta\n")
-    assert fe(command="view", path=p, view_range=[2, 3]) == (f"Here's the result of running `cat -n` on {p}:\n"
-                                                             "     2\tbeta\n     3\tgamma\n")
-    assert fe(command="view", path=W) == (f"Here's the files and directories up to 2 levels deep in {W}, excluding "
-                                          f"hidden items:\n{W}/\n{W}/a.txt")
+        "overwrite files using command `create`."
+    )
+    assert fe(command="view", path=p) == (
+        f"Here's the result of running `cat -n` on {p}:\n     1\talpha\n     2\tbeta\n     3\tgamma\n     4\tbeta\n"
+    )
+    assert fe(command="view", path=p, view_range=[2, 3]) == (
+        f"Here's the result of running `cat -n` on {p}:\n     2\tbeta\n     3\tgamma\n"
+    )
+    assert fe(command="view", path=W) == (
+        f"Here's the files and directories up to 2 levels deep in {W}, excluding hidden items:\n{W}/\n{W}/a.txt"
+    )
     assert fe(command="str_replace", path=p, old_str="beta", new_str="B") == (
         "[An error occurred during execution.]\nNo replacement was performed. Multiple occurrences of old_str `beta` in "
-        "lines [2, 4]. Please ensure it is unique.")
+        "lines [2, 4]. Please ensure it is unique."
+    )
     assert fe(command="str_replace", path=p, old_str="zzz", new_str="B") == (
         f"[An error occurred during execution.]\nNo replacement was performed, old_str `zzz` did not appear verbatim "
-        f"in {p}.")
+        f"in {p}."
+    )
     assert fe(command="str_replace", path=p, old_str="alpha", new_str="ALPHA") == (
         f"The file {p} has been edited. Here's the result of running `cat -n` on a snippet of {p}:\n     1\tALPHA\n"
         "     2\tbeta\n     3\tgamma\n     4\tbeta\nReview the changes and make sure they are as expected. Edit the "
-        "file again if necessary.")
+        "file again if necessary."
+    )
     assert fe(command="insert", path=p, insert_line=1, new_str="ins") == (
         f"The file {p} has been edited. Here's the result of running `cat -n` on a snippet of the edited file:\n"
         "     1\tALPHA\n     2\tins\n     3\tbeta\n     4\tgamma\n     5\tbeta\nReview the changes and make sure they "
-        "are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary.")
-    assert fe(command="undo_edit", path=p) == (f"Last edit to {p} undone successfully. Here's the result of running "
-                                               f"`cat -n` on {p}:\n     1\tALPHA\n     2\tbeta\n     3\tgamma\n"
-                                               "     4\tbeta\n")
+        "are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary."
+    )
+    assert fe(command="undo_edit", path=p) == (
+        f"Last edit to {p} undone successfully. Here's the result of running "
+        f"`cat -n` on {p}:\n     1\tALPHA\n     2\tbeta\n     3\tgamma\n"
+        "     4\tbeta\n"
+    )
     assert fe(command="view", path=f"{W}/nope.txt") == (
         f"[An error occurred during execution.]\nInvalid `path` parameter: {W}/nope.txt. The path {W}/nope.txt does "
-        "not exist. Please provide a valid path.")
+        "not exist. Please provide a valid path."
+    )
     assert fe(command="str_replace", path=p, old_str="gamma", new_str="gamma") == (
         "[An error occurred during execution.]\nInvalid `new_str` parameter: gamma. No replacement was performed. "
-        "`new_str` and `old_str` must be different.")
+        "`new_str` and `old_str` must be different."
+    )
     assert fe(command="create", path="rel.txt", file_text="x") == (
-        "[An error occurred during execution.]\nInvalid `path` parameter: rel.txt. The path should be an absolute "
-        "path.")
+        "[An error occurred during execution.]\nInvalid `path` parameter: rel.txt. The path should be an absolute path."
+    )
 
 
 def test_openhands_terminal_is_persistent_and_reports_exit_and_cwd(rt):
     s = session("openhands-sdk", rt)
     out = s.call_tool("terminal", {"command": "mkdir -p d && cd d && echo hi"})
-    assert out == (f"hi\n[The command completed with exit code 0.]\n[Current working directory: {rt.workdir}/d]\n"
-                   "[Command finished with exit code 0]")
+    assert out == (
+        f"hi\n[The command completed with exit code 0.]\n[Current working directory: {rt.workdir}/d]\n"
+        "[Command finished with exit code 0]"
+    )
     assert s.call_tool("terminal", {"command": "pwd"}).startswith(f"{rt.workdir}/d\n")
-    assert s.call_tool("terminal", {"command": "", "is_input": True}).endswith("No previous running command to "
-                                                                               "interact with.")
+    assert s.call_tool("terminal", {"command": "", "is_input": True}).endswith(
+        "No previous running command to interact with."
+    )
     out = s.call_tool("terminal", {"command": "sleep 3", "timeout": 0.5})
     assert "[The command timed out after 0.5 seconds." in out and "finished with exit code" not in out
     assert s.call_tool("think", {"thought": "x"}) == "Your thought has been logged."
@@ -285,35 +314,48 @@ def test_opencode_wording(rt):
     s = session("opencode", rt)
     p = write(rt, "f.txt", "alpha\nbeta\nbeta\n")
     call = s.call_tool
-    assert call("read", {"filePath": p}) == (f"<path>{p}</path>\n<type>file</type>\n<content>\n1: alpha\n2: beta\n"
-                                             "3: beta\n\n(End of file - total 3 lines)\n</content>")
+    assert call("read", {"filePath": p}) == (
+        f"<path>{p}</path>\n<type>file</type>\n<content>\n1: alpha\n2: beta\n"
+        "3: beta\n\n(End of file - total 3 lines)\n</content>"
+    )
     assert call("read", {"filePath": p, "offset": 2, "limit": 1}).endswith(
-        "2: beta\n\n(Showing lines 2-2 of 3. Use offset=3 to continue.)\n</content>")
+        "2: beta\n\n(Showing lines 2-2 of 3. Use offset=3 to continue.)\n</content>"
+    )
     assert call("read", {"filePath": p, "offset": 9}) == "Offset 9 is out of range for this file (3 lines)"
-    assert call("read", {"filePath": f"{rt.workdir}/f.tx"}) == (f"File not found: {rt.workdir}/f.tx\n\nDid you mean "
-                                                                f"one of these?\n{rt.workdir}/f.txt")
+    assert call("read", {"filePath": f"{rt.workdir}/f.tx"}) == (
+        f"File not found: {rt.workdir}/f.tx\n\nDid you mean one of these?\n{rt.workdir}/f.txt"
+    )
     assert call("edit", {"filePath": p, "oldString": "beta", "newString": "B"}) == (
-        "Found multiple matches for oldString. Provide more surrounding context to make the match unique.")
+        "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
+    )
     assert call("edit", {"filePath": p, "oldString": "zz", "newString": "B"}).startswith("Could not find oldString")
     assert call("edit", {"filePath": p, "oldString": "beta", "newString": "beta"}) == (
-        "No changes to apply: oldString and newString are identical.")
+        "No changes to apply: oldString and newString are identical."
+    )
     assert call("edit", {"filePath": p, "oldString": "beta", "newString": "B", "replaceAll": True}) == (
-        "Edit applied successfully.")
+        "Edit applied successfully."
+    )
     assert Path(p).read_text() == "alpha\nB\nB\n"
     assert call("write", {"filePath": f"{rt.workdir}/n/x.txt", "content": "x"}) == "Wrote file successfully."
     assert call("bash", {"command": "true"}) == "(no output)"
     assert call("bash", {"command": "echo hi; exit 2"}) == "hi\n"  # opencode shows no exit code
-    assert "<shell_metadata>\nshell tool terminated command after exceeding timeout 300 ms" in \
-        call("bash", {"command": "sleep 3", "timeout": 300})
+    assert "<shell_metadata>\nshell tool terminated command after exceeding timeout 300 ms" in call(
+        "bash", {"command": "sleep 3", "timeout": 300}
+    )
     big = call("bash", {"command": "seq 1 3000"})
     assert big.startswith(f"...output truncated...\n\nFull output saved to: {rt.scratch}/opencode/tool-output/tool_")
     kept = big.split("\n\n", 2)[2]  # the last 2000 lines ("\n"-split, the trailing empty line included)
     assert kept.startswith("1002\n") and kept.endswith("\n3000\n")
-    assert sorted(call("glob", {"pattern": "**/*.txt"}).splitlines()) == [f"{rt.workdir}/f.txt", f"{rt.workdir}/n/x.txt"]
+    assert sorted(call("glob", {"pattern": "**/*.txt"}).splitlines()) == [
+        f"{rt.workdir}/f.txt",
+        f"{rt.workdir}/n/x.txt",
+    ]
     assert call("grep", {"pattern": "alpha"}) == f"Found 1 matches\n{p}:\n  Line 1: alpha\n"
     assert call("grep", {"pattern": "nothing-here"}) == "No files found"
-    assert call("todowrite", {}) == ("The arguments provided to the tool are invalid: Model tried to call unavailable "
-                                     "tool 'todowrite'. Available tools: bash, edit, glob, grep, invalid, read, write.")
+    assert call("todowrite", {}) == (
+        "The arguments provided to the tool are invalid: Model tried to call unavailable "
+        "tool 'todowrite'. Available tools: bash, edit, glob, grep, invalid, read, write."
+    )
 
 
 def test_pi_wording(rt):
@@ -324,18 +366,25 @@ def test_pi_wording(rt):
     assert call("read", {"path": "f.txt", "limit": 1}) == "one\n\n[3 more lines in file. Use offset=2 to continue.]"
     assert call("read", {"path": "nope"}) == f"ENOENT: no such file or directory, access '{rt.workdir}/nope'"
     edit = lambda *e: call("edit", {"path": "f.txt", "edits": [{"oldText": o, "newText": n} for o, n in e]})  # noqa
-    assert edit(("two", "2")) == ("Found 2 occurrences of the text in f.txt. The text must be unique. Please provide "
-                                  "more context to make it unique.")
-    assert edit(("one", "1"), ("two", "2")) == ("Found 2 occurrences of edits[1] in f.txt. Each oldText must be "
-                                                "unique. Please provide more context to make it unique.")
-    assert edit(("zz", "2")) == ("Could not find the exact text in f.txt. The old text must match exactly including "
-                                 "all whitespace and newlines.")
-    assert edit(("one", "1"), ("on", "2")) == ("edits[0] and edits[1] overlap in f.txt. Merge them into one edit or "
-                                               "target disjoint regions.")
+    assert edit(("two", "2")) == (
+        "Found 2 occurrences of the text in f.txt. The text must be unique. Please provide "
+        "more context to make it unique."
+    )
+    assert edit(("one", "1"), ("two", "2")) == (
+        "Found 2 occurrences of edits[1] in f.txt. Each oldText must be "
+        "unique. Please provide more context to make it unique."
+    )
+    assert edit(("zz", "2")) == (
+        "Could not find the exact text in f.txt. The old text must match exactly including all whitespace and newlines."
+    )
+    assert edit(("one", "1"), ("on", "2")) == (
+        "edits[0] and edits[1] overlap in f.txt. Merge them into one edit or target disjoint regions."
+    )
     assert edit(("one\n", "1\n"), ("two\ntwo", "2\n2")) == "Successfully replaced 2 block(s) in f.txt."
     assert (Path(rt.workdir) / "f.txt").read_text() == "1\n2\n2\n"
     assert call("edit", {"path": "nope", "edits": [{"oldText": "a", "newText": "b"}]}) == (
-        "Could not edit file: nope. Error code: ENOENT.")
+        "Could not edit file: nope. Error code: ENOENT."
+    )
     assert call("write", {"path": "w/x.txt", "content": "x"}) == "Successfully wrote to w/x.txt"
     assert call("bash", {"command": "true"}) == "(no output)"
     assert call("bash", {"command": "echo hi; exit 4"}) == "hi\n\n\nCommand exited with code 4"
@@ -344,26 +393,34 @@ def test_pi_wording(rt):
 
 def test_mini_observations_match_the_upstream_jinja_templates(rt):
     jinja2 = pytest.importorskip("jinja2")
-    fc = ('{%- if output.output | length < 10000 -%}\n{\n  "returncode": {{ output.returncode }},\n  "output": '
-          '{{ output.output | tojson }}\n  {%- if output.exception_info %}, "exception_info": {{ output.exception_info '
-          '| tojson }}{% endif %}\n}\n{%- else -%}\n{\n  "returncode": {{ output.returncode }},\n  "output_head": '
-          '{{ output.output[:5000] | tojson }},\n  "output_tail": {{ output.output[-5000:] | tojson }},\n  '
-          '"elided_chars": {{ output.output | length - 10000 }},\n  "warning": "Output too long."\n  {%- if '
-          'output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}\n}\n'
-          '{%- endif -%}\n')
-    text = ("{% if output.exception_info -%}\n<exception>{{output.exception_info}}</exception>\n{% endif -%}\n"
-            "<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n"
-            "{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\n"
-            "Please try a different command that produces less output.\nIf you're looking at a file you can try use "
-            "head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it "
-            "produced too much output, you can use a more selective search pattern.\nIf you really need to see "
-            "something from the full command's output, you can redirect output to a file and then search in that "
-            "file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n"
-            "{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n"
-            "</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n")
+    fc = (
+        '{%- if output.output | length < 10000 -%}\n{\n  "returncode": {{ output.returncode }},\n  "output": '
+        '{{ output.output | tojson }}\n  {%- if output.exception_info %}, "exception_info": {{ output.exception_info '
+        '| tojson }}{% endif %}\n}\n{%- else -%}\n{\n  "returncode": {{ output.returncode }},\n  "output_head": '
+        '{{ output.output[:5000] | tojson }},\n  "output_tail": {{ output.output[-5000:] | tojson }},\n  '
+        '"elided_chars": {{ output.output | length - 10000 }},\n  "warning": "Output too long."\n  {%- if '
+        'output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}\n}\n'
+        "{%- endif -%}\n"
+    )
+    text = (
+        "{% if output.exception_info -%}\n<exception>{{output.exception_info}}</exception>\n{% endif -%}\n"
+        "<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n"
+        "{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\n"
+        "Please try a different command that produces less output.\nIf you're looking at a file you can try use "
+        "head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it "
+        "produced too much output, you can use a more selective search pattern.\nIf you really need to see "
+        "something from the full command's output, you can redirect output to a file and then search in that "
+        "file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n"
+        "{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n"
+        "</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n"
+    )
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
-    for out, rc, exc in (("hi <b> & 'q' è\n", 0, ""), ("", -1, "An error occurred: timed out"), ("x" * 12000, 1, ""),
-                         ("y" * 10500, 2, "boom")):
+    for out, rc, exc in (
+        ("hi <b> & 'q' è\n", 0, ""),
+        ("", -1, "An error occurred: timed out"),
+        ("x" * 12000, 1, ""),
+        ("y" * 10500, 2, "boom"),
+    ):
         o = {"output": out, "returncode": rc, "exception_info": exc}
         assert mini_observation(out, rc, exc) == env.from_string(fc).render(output=o)
         assert mini_text_observation(out, rc, exc) == env.from_string(text).render(output=o)
@@ -390,8 +447,9 @@ def _template():
             def apply_chat_template(self, messages, tools=None, tokenize=False, add_generation_prompt=True, **kw):
                 return jinja2.Template(
                     "{% if tools %}<tools>{% for t in tools %}{{ t | tojson }}\n{% endfor %}</tools>{% endif %}"
-                    "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}\n{% endfor %}").render(
-                        messages=messages, tools=tools)
+                    "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}\n{% endfor %}"
+                ).render(messages=messages, tools=tools)
+
         return Stub()
 
 
@@ -430,9 +488,18 @@ def test_tool_contracts_are_exact():
     assert list(oh["terminal"]["properties"]) == ["security_risk", "summary", "command", "is_input", "timeout", "reset"]
     assert oh["finish"]["required"] == ["message"] and oh["file_editor"]["required"] == ["command", "path"]
     mini = get_profile("mini-swe-agent").tools[0].schema
-    assert mini == {"type": "function", "function": {"name": "bash", "description": "Execute a bash command",
-                    "parameters": {"type": "object", "properties": {"command": {
-                        "type": "string", "description": "The bash command to execute"}}, "required": ["command"]}}}
+    assert mini == {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a bash command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "The bash command to execute"}},
+                "required": ["command"],
+            },
+        },
+    }
     for key in available():
         p = get_profile(key)
         assert p.id == key and p.version and (p.emulates or p.legacy)
@@ -443,7 +510,7 @@ def test_tool_contracts_are_exact():
 
 @pytest.mark.parametrize("proto", [XmlTool(), JsonBlock(), Tags(["bash", "read"])])
 def test_text_protocols_round_trip(proto):
-    calls = [("bash", {"command": "ls -la \"x y\""}), ("read", {"path": "a.txt", "n": 2})]
+    calls = [("bash", {"command": 'ls -la "x y"'}), ("read", {"path": "a.txt", "n": 2})]
     assert proto.parse("Let me look.\n" + proto.render(calls) + "\nthen answer") == calls
     assert proto.parse("no action here") == []
     assert proto.observation([("bash", "out")])
@@ -549,9 +616,13 @@ def test_default_profile_is_byte_identical_to_harbor_env(local_harbor):
     assert base.reset(**row) is None and prof.reset(**row) is None
     assert json.dumps(base.tool_schemas()) == json.dumps(prof.tool_schemas())
     assert base.text_actions("done") is None and prof.text_actions("done") is None
-    for name, args in (("bash", {"command": "echo hi; echo err >&2"}), ("write_file", {"path": "hello.txt",
-                       "content": "cia0\n"}), ("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"}),
-                       ("read_file", {"path": "hello.txt"}), ("submit", {})):
+    for name, args in (
+        ("bash", {"command": "echo hi; echo err >&2"}),
+        ("write_file", {"path": "hello.txt", "content": "cia0\n"}),
+        ("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"}),
+        ("read_file", {"path": "hello.txt"}),
+        ("submit", {}),
+    ):
         a, b = base.call_tool(name, args), prof.call_tool(name, args)
         assert a.replace(base.rt.workdir, "W") == b.replace(prof.rt.workdir, "W")
     assert base.done and prof.done
@@ -607,13 +678,27 @@ def _pipeline_episode(profile, script, env_args=None, kwargs=None):
     kwargs = kwargs or {"enable_thinking": False}
     eot = end_of_turn_id(tok, kwargs)
     config = RLConfig()
-    for key, value in {"model.policy": "x", "model.chat_template_kwargs": kwargs, "env.max_turns": 6,
-                       "rollout.max_new_tokens": 128, "rollout.max_model_len": 16384}.items():
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 6,
+        "rollout.max_new_tokens": 128,
+        "rollout.max_model_len": 16384,
+    }.items():
         config.set(key, value)
     rows = [_row()]
-    pipeline = RLPipeline(tok, ChatFormat(tok, eot, kwargs), ScriptedEngine(tok, eot, script),
-                          PublishedWeights(torch.nn.Linear(1, 1)), config, PromptSampler(rows), [],
-                          EnvPool(HarborEnv, {"profile": profile, **(env_args or {})}), None, (eot,))
+    pipeline = RLPipeline(
+        tok,
+        ChatFormat(tok, eot, kwargs),
+        ScriptedEngine(tok, eot, script),
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        PromptSampler(rows),
+        [],
+        EnvPool(HarborEnv, {"profile": profile, **(env_args or {})}),
+        None,
+        (eot,),
+    )
     try:
         (group,) = pipeline._await(pipeline._eval(rows, 1.0))
     finally:
@@ -622,10 +707,15 @@ def _pipeline_episode(profile, script, env_args=None, kwargs=None):
 
 
 def test_trainer_rollout_with_a_text_profile(local_harbor):
-    t = _pipeline_episode("mini-swe-agent-text", [
-        "THOUGHT: write it.\n\n```mswea_bash_command\necho ciao > hello.txt\n```",
-        "I am done.",  # no block: mini answers with its format error
-        "THOUGHT: submit.\n\n```mswea_bash_command\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n```", "never"])
+    t = _pipeline_episode(
+        "mini-swe-agent-text",
+        [
+            "THOUGHT: write it.\n\n```mswea_bash_command\necho ciao > hello.txt\n```",
+            "I am done.",  # no block: mini answers with its format error
+            "THOUGHT: submit.\n\n```mswea_bash_command\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n```",
+            "never",
+        ],
+    )
     assert t.finish == "env_done" and t.reward == 1.0 and t.info["harness_profile"] == "mini-swe-agent-text@2.4.6"
     assert t.info["prompt"][0]["content"].startswith("You are a helpful assistant that can interact with a computer.")
     users = [m["content"] for m in t.messages if m["role"] == "user"]
@@ -666,45 +756,83 @@ def _fenced(cmd):
 SCRIPTS = {
     "palingenesis-default": {
         ARCHIVE: [[("bash", {"cmd": TAR})], "Created website.tar.gz."],
-        ENV_EDIT: [[("glob", {"pat": "**/.env*"})], [("read", {"path": "Projects/sito/.env"})],
-                   [("edit", {"path": "Projects/sito/.env", "old": "DEBUG=true", "new": "DEBUG=false"})], "Done."],
-        "noop": ["Done."]},
+        ENV_EDIT: [
+            [("glob", {"pat": "**/.env*"})],
+            [("read", {"path": "Projects/sito/.env"})],
+            [("edit", {"path": "Projects/sito/.env", "old": "DEBUG=true", "new": "DEBUG=false"})],
+            "Done.",
+        ],
+        "noop": ["Done."],
+    },
     "palingenesis-default@1": {
         ARCHIVE: [[("bash", {"command": TAR})], [("submit", {})]],
-        ENV_EDIT: [[("read_file", {"path": "Projects/sito/.env"})],
-                   [("str_replace", {"path": "Projects/sito/.env", "old": "DEBUG=true", "new": "DEBUG=false"})],
-                   [("submit", {})]],
-        "noop": [[("submit", {})]]},
+        ENV_EDIT: [
+            [("read_file", {"path": "Projects/sito/.env"})],
+            [("str_replace", {"path": "Projects/sito/.env", "old": "DEBUG=true", "new": "DEBUG=false"})],
+            [("submit", {})],
+        ],
+        "noop": [[("submit", {})]],
+    },
     "mini-swe-agent": {
         ARCHIVE: [[("bash", {"command": TAR})], [("bash", {"command": SENTINEL})]],
-        ENV_EDIT: [[("bash", {"command": f"nl -ba {DOTENV}"})], [("bash", {"command": SED})],
-                   [("bash", {"command": SENTINEL})]],
-        "noop": [[("bash", {"command": SENTINEL})]]},
+        ENV_EDIT: [
+            [("bash", {"command": f"nl -ba {DOTENV}"})],
+            [("bash", {"command": SED})],
+            [("bash", {"command": SENTINEL})],
+        ],
+        "noop": [[("bash", {"command": SENTINEL})]],
+    },
     "mini-swe-agent-text": {
         ARCHIVE: [_fenced(TAR), _fenced(SENTINEL)],
         ENV_EDIT: [_fenced(f"cat {DOTENV}"), _fenced(SED), _fenced(SENTINEL)],
-        "noop": [_fenced(SENTINEL)]},
+        "noop": [_fenced(SENTINEL)],
+    },
     "opencode": {
-        ARCHIVE: [[("bash", {"command": "tar -czf website.tar.gz -C Projects website", "workdir": "/workdir"})],
-                  "Created website.tar.gz."],
-        ENV_EDIT: [[("glob", {"pattern": "**/.env"})], [("read", {"filePath": DOTENV})],
-                   [("edit", {"filePath": DOTENV, "oldString": "DEBUG=true", "newString": "DEBUG=false"})], "Done."],
-        "noop": ["Done."]},
+        ARCHIVE: [
+            [("bash", {"command": "tar -czf website.tar.gz -C Projects website", "workdir": "/workdir"})],
+            "Created website.tar.gz.",
+        ],
+        ENV_EDIT: [
+            [("glob", {"pattern": "**/.env"})],
+            [("read", {"filePath": DOTENV})],
+            [("edit", {"filePath": DOTENV, "oldString": "DEBUG=true", "newString": "DEBUG=false"})],
+            "Done.",
+        ],
+        "noop": ["Done."],
+    },
     "pi": {
         ARCHIVE: [[("bash", {"command": TAR})], "Created website.tar.gz."],
-        ENV_EDIT: [[("read", {"path": "Projects/sito/.env"})],
-                   [("edit", {"path": "Projects/sito/.env", "edits": [{"oldText": "DEBUG=true",
-                                                                         "newText": "DEBUG=false"}]})], "Done."],
-        "noop": ["Done."]},
+        ENV_EDIT: [
+            [("read", {"path": "Projects/sito/.env"})],
+            [("edit", {"path": "Projects/sito/.env", "edits": [{"oldText": "DEBUG=true", "newText": "DEBUG=false"}]})],
+            "Done.",
+        ],
+        "noop": ["Done."],
+    },
     "openhands-sdk": {
-        ARCHIVE: [[("terminal", {"command": "cd /workdir/Projects", "summary": "enter", "security_risk": "LOW"})],
-                  [("terminal", {"command": "tar -czf ../website.tar.gz website", "security_risk": "LOW"})],
-                  [("finish", {"message": "Created website.tar.gz."})]],
-        ENV_EDIT: [[("file_editor", {"command": "view", "path": "/workdir/Projects/sito"})],
-                   [("file_editor", {"command": "str_replace", "path": DOTENV, "old_str": "DEBUG=true",
-                                     "new_str": "DEBUG=false", "security_risk": "MEDIUM"})],
-                   [("finish", {"message": "DEBUG is now false."})]],
-        "noop": [[("finish", {"message": "Done."})]]},
+        ARCHIVE: [
+            [("terminal", {"command": "cd /workdir/Projects", "summary": "enter", "security_risk": "LOW"})],
+            [("terminal", {"command": "tar -czf ../website.tar.gz website", "security_risk": "LOW"})],
+            [("finish", {"message": "Created website.tar.gz."})],
+        ],
+        ENV_EDIT: [
+            [("file_editor", {"command": "view", "path": "/workdir/Projects/sito"})],
+            [
+                (
+                    "file_editor",
+                    {
+                        "command": "str_replace",
+                        "path": DOTENV,
+                        "old_str": "DEBUG=true",
+                        "new_str": "DEBUG=false",
+                        "security_risk": "MEDIUM",
+                    },
+                )
+            ],
+            [("finish", {"message": "DEBUG is now false."})],
+        ],
+        "noop": [[("finish", {"message": "Done."})]],
+    },
 }
 
 
@@ -722,8 +850,9 @@ def play(env: HarborEnv, turns) -> tuple[list[dict], list[str]]:
             messages.append({"role": "user", "content": obs})
             seen.append(obs)
         else:
-            messages.append({"role": "assistant", "content": "", "tool_calls": [{"name": n, "arguments": a}
-                                                                                  for n, a in turn]})
+            messages.append(
+                {"role": "assistant", "content": "", "tool_calls": [{"name": n, "arguments": a} for n, a in turn]}
+            )
             for n, a in turn:
                 out = env.call_tool(n, a)
                 messages.append({"role": "tool", "name": n, "content": out})
@@ -760,15 +889,23 @@ def test_nanocode_default_schemas_prompt_and_stop(rt):
     assert p.id == "palingenesis-default@2" and get_profile("palingenesis-default@1").legacy
     tools = {t.name: t.schema["function"] for t in p.tools}
     assert list(tools) == ["read", "write", "edit", "glob", "grep", "bash"]
-    assert tools["read"]["parameters"] == {"type": "object", "properties": {
-        "path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}
+    assert tools["read"]["parameters"] == {
+        "type": "object",
+        "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}},
+        "required": ["path"],
+    }
     assert tools["edit"]["parameters"]["required"] == ["path", "old", "new"]
     assert tools["edit"]["parameters"]["properties"]["all"] == {"type": "boolean"}
-    assert tools["bash"] == {"name": "bash", "description": "Run shell command", "parameters": {
-        "type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}
+    assert tools["bash"] == {
+        "name": "bash",
+        "description": "Run shell command",
+        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]},
+    }
     s = Session(p, rt)
-    assert s.conversation("ciao") == [{"role": "system", "content": f"Concise coding assistant. cwd: {rt.workdir}"},
-                                      {"role": "user", "content": "ciao"}]
+    assert s.conversation("ciao") == [
+        {"role": "system", "content": f"Concise coding assistant. cwd: {rt.workdir}"},
+        {"role": "user", "content": "ciao"},
+    ]
     assert s.text_actions("Fatto.") is None
 
 
@@ -781,8 +918,10 @@ def test_nanocode_default_tools_word_results_like_nanocode(rt):
     assert call("read", {"path": "nope.txt"}) == "error: [Errno 2] No such file or directory: 'nope.txt'"
     assert call("read", {}) == "error: 'path'"
     assert call("edit", {"path": "a.txt", "old": "tre", "new": "x"}) == "error: old_string not found"
-    assert call("edit", {"path": "a.txt", "old": "due", "new": "x"}) == \
-        "error: old_string appears 2 times, must be unique (use all=true)"
+    assert (
+        call("edit", {"path": "a.txt", "old": "due", "new": "x"})
+        == "error: old_string appears 2 times, must be unique (use all=true)"
+    )
     assert call("edit", {"path": "a.txt", "old": "due", "new": "tre", "all": True}) == "ok"
     assert (Path(rt.workdir) / "a.txt").read_text() == "uno\ntre\ntre\n"
     assert call("write", {"path": "sub/b.py", "content": "x"}).startswith("error: [Errno 2] No such file")

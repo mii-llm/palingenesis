@@ -250,8 +250,15 @@ class RLTrainConfig:
     muon_compile: bool = False
 
     def muon_options(self) -> dict:
-        return {"ns_method": self.muon_ns, "scale": self.muon_scale, "momentum": self.muon_momentum,
-                "min_dim": self.muon_min_dim, "backend": self.muon_backend, "compile": self.muon_compile}
+        return {
+            "ns_method": self.muon_ns,
+            "scale": self.muon_scale,
+            "momentum": self.muon_momentum,
+            "min_dim": self.muon_min_dim,
+            "backend": self.muon_backend,
+            "compile": self.muon_compile,
+        }
+
     weight_decay: float = 0.0
     micro_tokens: int = 16384  # padded tokens per forward/backward micro-batch
     # FSDP2: shard the policy over data-parallel ranks (always under torchrun with > 1 process;
@@ -566,7 +573,9 @@ class RLConfig:
             errors.append("rollout.backend hf generates with the sharded trainer model: max_staleness must be 0.")
         if t.optimizer not in ("adamw", "muon", "adamw8bit", "paged_adamw8bit"):
             errors.append(f"train.optimizer must be adamw, muon, adamw8bit or paged_adamw8bit, got {t.optimizer!r}.")
-        elif t.optimizer not in ("adamw", "muon") and (t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"):
+        elif t.optimizer not in ("adamw", "muon") and (
+            t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"
+        ):
             errors.append(
                 f"train.optimizer {t.optimizer} (bitsandbytes) steps local tensors: not with FSDP or cpu_offload."
             )

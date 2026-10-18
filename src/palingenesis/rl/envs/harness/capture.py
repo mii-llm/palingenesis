@@ -65,9 +65,14 @@ class Stub:
 
 
 def _message(turn: dict) -> tuple[dict, str]:
-    calls = [{"id": f"call_{uuid.uuid4().hex[:16]}", "type": "function",
-              "function": {"name": c["name"], "arguments": json.dumps(c.get("arguments") or {}, ensure_ascii=False)}}
-             for c in turn.get("tool_calls") or []]
+    calls = [
+        {
+            "id": f"call_{uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {"name": c["name"], "arguments": json.dumps(c.get("arguments") or {}, ensure_ascii=False)},
+        }
+        for c in turn.get("tool_calls") or []
+    ]
     msg = {"role": "assistant", "content": turn.get("content") or ("" if calls else "Done.")}
     if calls:
         msg["tool_calls"] = calls
@@ -91,8 +96,13 @@ def make_handler(stub: Stub):
 
         def do_GET(self):  # noqa: N802
             if self.path.rstrip("/").endswith("/models"):
-                return self._json(200, {"object": "list", "data": [{"id": stub.model, "object": "model",
-                                                                     "owned_by": "pgs-harness-capture"}]})
+                return self._json(
+                    200,
+                    {
+                        "object": "list",
+                        "data": [{"id": stub.model, "object": "model", "owned_by": "pgs-harness-capture"}],
+                    },
+                )
             return self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):  # noqa: N802
@@ -108,10 +118,17 @@ def make_handler(stub: Stub):
             rid, created = f"chatcmpl-{uuid.uuid4().hex[:12]}", int(time.time())
             usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
             if not body.get("stream"):
-                return self._json(200, {"id": rid, "object": "chat.completion", "created": created,
-                                        "model": body.get("model", stub.model),
-                                        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                                        "usage": usage})
+                return self._json(
+                    200,
+                    {
+                        "id": rid,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": body.get("model", stub.model),
+                        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+                        "usage": usage,
+                    },
+                )
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -119,21 +136,38 @@ def make_handler(stub: Stub):
             self.end_headers()
 
             def chunk(delta: dict, finish_reason=None, **extra):
-                obj = {"id": rid, "object": "chat.completion.chunk", "created": created,
-                       "model": body.get("model", stub.model),
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+                obj = {
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": body.get("model", stub.model),
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                    **extra,
+                }
                 self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
 
             chunk({"role": "assistant", "content": ""})
             if msg["content"]:
                 chunk({"content": msg["content"]})
             for i, c in enumerate(msg.get("tool_calls") or []):
-                chunk({"tool_calls": [{"index": i, "id": c["id"], "type": "function",
-                                       "function": {"name": c["function"]["name"], "arguments": ""}}]})
+                chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": i,
+                                "id": c["id"],
+                                "type": "function",
+                                "function": {"name": c["function"]["name"], "arguments": ""},
+                            }
+                        ]
+                    }
+                )
                 chunk({"tool_calls": [{"index": i, "function": {"arguments": c["function"]["arguments"]}}]})
             chunk({}, finish)
             if (body.get("stream_options") or {}).get("include_usage"):
-                self.wfile.write(f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': body.get('model', stub.model), 'choices': [], 'usage': usage})}\n\n".encode())  # noqa: E501
+                self.wfile.write(
+                    f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': body.get('model', stub.model), 'choices': [], 'usage': usage})}\n\n".encode()
+                )  # noqa: E501
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             self.close_connection = True
@@ -150,14 +184,22 @@ def serve(stub: Stub, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPSe
 
 # ------------------------------------------------------------------ Harbor CLI capture
 
+
 def harbor_agent_args(agent: str, model: str, base_url: str) -> tuple[list[str], dict[str, str]]:
     """(harbor run arguments, agent environment) that point a Harbor 0.24 agent at the stub (REPORT §1)."""
     key = "pgs-capture"
     env = {"OPENAI_API_KEY": key, "OPENAI_BASE_URL": base_url, "OPENAI_API_BASE": base_url}
     if agent == "opencode":
-        config = {"provider": {"vllm": {"npm": "@ai-sdk/openai-compatible", "name": "vllm",
-                                        "options": {"baseURL": base_url, "apiKey": key},
-                                        "models": {model: {"name": model}}}}}
+        config = {
+            "provider": {
+                "vllm": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "vllm",
+                    "options": {"baseURL": base_url, "apiKey": key},
+                    "models": {model: {"name": model}},
+                }
+            }
+        }
         return ["-m", f"vllm/{model}", "--ak", f"opencode_config={json.dumps(config)}"], env
     if agent == "pi":
         return ["-m", f"openai/{model}", "--ak", "model_api=openai-completions"], env
@@ -167,9 +209,18 @@ def harbor_agent_args(agent: str, model: str, base_url: str) -> tuple[list[str],
     return ["-m", f"openai/{model}"], env  # mini-swe-agent, qwen-coder, goose, kimi-cli (with base_url), ...
 
 
-def capture(agent: str, task: str, script: list[dict], out: str | Path, model: str = "qwen3.5-0.8b",
-            harbor: str = "0.24.0", host_ip: str | None = None, extra_ak: list[str] = (), extra_ae: list[str] = (),
-            timeout: float = 1800) -> Path:
+def capture(
+    agent: str,
+    task: str,
+    script: list[dict],
+    out: str | Path,
+    model: str = "qwen3.5-0.8b",
+    harbor: str = "0.24.0",
+    host_ip: str | None = None,
+    extra_ak: list[str] = (),
+    extra_ae: list[str] = (),
+    timeout: float = 1800,
+) -> Path:
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     log = out / "requests.jsonl"
@@ -184,14 +235,36 @@ def capture(agent: str, task: str, script: list[dict], out: str | Path, model: s
     for kv in extra_ae:
         k, _, v = kv.partition("=")
         env[k] = v
-    cmd = ["uv", "run", "--with", f"harbor=={harbor}", "harbor", "run", "-p", str(task), "-a", agent, *args,
-           *[x for kv in extra_ak for x in ("--ak", kv)], *[x for k, v in env.items() for x in ("--ae", f"{k}={v}")],
-           "--allow-agent-host", ip, "-n", "1", "-o", str(out / "jobs"), "-y", "--job-name", f"capture_{agent}_{time.strftime('%Y%m%d_%H%M%S')}"]
+    cmd = [
+        "uv",
+        "run",
+        "--with",
+        f"harbor=={harbor}",
+        "harbor",
+        "run",
+        "-p",
+        str(task),
+        "-a",
+        agent,
+        *args,
+        *[x for kv in extra_ak for x in ("--ak", kv)],
+        *[x for k, v in env.items() for x in ("--ae", f"{k}={v}")],
+        "--allow-agent-host",
+        ip,
+        "-n",
+        "1",
+        "-o",
+        str(out / "jobs"),
+        "-y",
+        "--job-name",
+        f"capture_{agent}_{time.strftime('%Y%m%d_%H%M%S')}",
+    ]
     (out / "command.json").write_text(json.dumps({"cmd": cmd, "base_url": base}, indent=1))
     try:
         with open(out / "harbor.log", "w") as f:
-            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, timeout=timeout, env={**os.environ, **env},
-                           check=False)
+            subprocess.run(
+                cmd, stdout=f, stderr=subprocess.STDOUT, timeout=timeout, env={**os.environ, **env}, check=False
+            )
     finally:
         server.shutdown()
     return log

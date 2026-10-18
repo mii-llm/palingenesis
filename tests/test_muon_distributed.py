@@ -34,8 +34,10 @@ def _step(model):
 
 
 def _full_params(model):
-    return {n: (p.full_tensor() if hasattr(p, "full_tensor") else p).detach().flatten().tolist()
-            for n, p in model.named_parameters()}
+    return {
+        n: (p.full_tensor() if hasattr(p, "full_tensor") else p).detach().flatten().tolist()
+        for n, p in model.named_parameters()
+    }
 
 
 def _worker(rank, world, mode, out, port):

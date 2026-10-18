@@ -42,8 +42,14 @@ SINGLE = "model.safetensors"
 # non-weight files copied from the template (training-only files are left out)
 COPY_SUFFIXES = {".json", ".jinja", ".txt", ".model", ".tiktoken", ".py"}
 SKIP_FILES = {INDEX, "merge_config.json", "training_meta.json", "rl_config.json", "tracker_run_id.json"}
-DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp16": torch.float16, "float16": torch.float16,
-          "fp32": torch.float32, "float32": torch.float32}
+DTYPES = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+}
 
 
 class MergeError(ValueError):
@@ -56,8 +62,11 @@ def _resolve(path: str | Path) -> Path:
         return p
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(str(path), allow_patterns=["*.safetensors", "*.json", "*.jinja", "*.txt", "*.model",
-                                                             "*.tiktoken"]))
+    return Path(
+        snapshot_download(
+            str(path), allow_patterns=["*.safetensors", "*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken"]
+        )
+    )
 
 
 class Checkpoint:
@@ -148,8 +157,18 @@ def _copy_files(template: Checkpoint, out: Path) -> None:
             shutil.copy(f, out / f.name)
 
 
-def _combine(method: str, terms: list[tuple[Checkpoint, float]], out: str | Path, *, base: Checkpoint | None,
-             template: Checkpoint, missing: str, dtype, overwrite: bool, extra: str) -> MergeReport:
+def _combine(
+    method: str,
+    terms: list[tuple[Checkpoint, float]],
+    out: str | Path,
+    *,
+    base: Checkpoint | None,
+    template: Checkpoint,
+    missing: str,
+    dtype,
+    overwrite: bool,
+    extra: str,
+) -> MergeReport:
     """out = base + sum_i c_i (W_i - base) when base is given, else sum_i c_i W_i; tensor set and layout = template's."""
     if missing not in ("error", "template"):
         raise MergeError(f"missing must be 'error' or 'template', not {missing!r}")
@@ -160,8 +179,10 @@ def _combine(method: str, terms: list[tuple[Checkpoint, float]], out: str | Path
     others = set().union(*(set(c.keys()) for c, _ in terms)) | (set(base.keys()) if base is not None else set())
     extra_names = sorted(others - names)
     if extra_names and extra == "error":
-        raise MergeError(f"{len(extra_names)} tensors are not in the template (e.g. {extra_names[:3]}); "
-                         "extra='drop' to leave them out")
+        raise MergeError(
+            f"{len(extra_names)} tensors are not in the template (e.g. {extra_names[:3]}); "
+            "extra='drop' to leave them out"
+        )
     out = _prepare_out(out, overwrite)
     from_template, written = 0, 0
     total_size = 0
@@ -175,14 +196,19 @@ def _combine(method: str, terms: list[tuple[Checkpoint, float]], out: str | Path
             if not complete:
                 if missing == "error":
                     lacking = [c.source for c, _ in terms if name not in c] + (
-                        [base.source] if base is not None and name not in base else [])
-                    raise MergeError(f"tensor {name!r} is missing from {lacking} (missing='template' copies the template's)")
+                        [base.source] if base is not None and name not in base else []
+                    )
+                    raise MergeError(
+                        f"tensor {name!r} is missing from {lacking} (missing='template' copies the template's)"
+                    )
                 t = template.tensor(name)
                 from_template += 1
             else:
                 for c in holders:
                     if c.shape(name) != ref_shape:
-                        raise MergeError(f"tensor {name!r}: shape {c.shape(name)} in {c.source} vs {ref_shape} in the template")
+                        raise MergeError(
+                            f"tensor {name!r}: shape {c.shape(name)} in {c.source} vs {ref_shape} in the template"
+                        )
                 ref = template.tensor(name)
                 if not ref.is_floating_point():  # integer buffers are copied, and must agree across the sources
                     for c in holders:
@@ -212,9 +238,18 @@ def _combine(method: str, terms: list[tuple[Checkpoint, float]], out: str | Path
     if (template.dir / INDEX).exists() or len(template.shards()) > 1:
         (out / INDEX).write_text(json.dumps({"metadata": {"total_size": total_size}, "weight_map": index}, indent=2))
     _copy_files(template, out)
-    report = MergeReport(str(out), method, [{"model": c.source, "coef": coef} for c, coef in terms],
-                         base.source if base is not None else None, template.source, written, from_template,
-                         str(out_dtype).replace("torch.", "") if out_dtype is not None else None, missing, extra_names)
+    report = MergeReport(
+        str(out),
+        method,
+        [{"model": c.source, "coef": coef} for c, coef in terms],
+        base.source if base is not None else None,
+        template.source,
+        written,
+        from_template,
+        str(out_dtype).replace("torch.", "") if out_dtype is not None else None,
+        missing,
+        extra_names,
+    )
     try:
         from palingenesis import __version__
     except ImportError:  # pragma: no cover
@@ -227,9 +262,18 @@ def _checkpoints(models: Iterable[str | Path]) -> list[Checkpoint]:
     return [m if isinstance(m, Checkpoint) else Checkpoint(m) for m in models]
 
 
-def linear(models: list[str | Path], weights: list[float], out: str | Path, *, template: str | Path | None = None,
-           missing: str = "error", dtype=None, unnormalized: bool = False, overwrite: bool = False,
-           extra: str = "error") -> MergeReport:
+def linear(
+    models: list[str | Path],
+    weights: list[float],
+    out: str | Path,
+    *,
+    template: str | Path | None = None,
+    missing: str = "error",
+    dtype=None,
+    unnormalized: bool = False,
+    overwrite: bool = False,
+    extra: str = "error",
+) -> MergeReport:
     """w = sum_i weights[i] * models[i]. Weights must sum to 1 (a convex or affine combination) unless unnormalized=True.
     template: whose tensor set, shard layout, dtype and files the output takes (default: the first model)."""
     if len(models) != len(weights) or not models:
@@ -238,8 +282,17 @@ def linear(models: list[str | Path], weights: list[float], out: str | Path, *, t
         raise MergeError(f"weights sum to {sum(weights):g}, not 1 (unnormalized=True to allow it)")
     cks = _checkpoints(models)
     tpl = Checkpoint(template) if template is not None else cks[0]
-    return _combine("linear", list(zip(cks, map(float, weights))), out, base=None, template=tpl, missing=missing,
-                    dtype=dtype, overwrite=overwrite, extra=extra)
+    return _combine(
+        "linear",
+        list(zip(cks, map(float, weights))),
+        out,
+        base=None,
+        template=tpl,
+        missing=missing,
+        dtype=dtype,
+        overwrite=overwrite,
+        extra=extra,
+    )
 
 
 def interpolate(start: str | Path, end: str | Path, lam: float, out: str | Path, **kwargs) -> MergeReport:
@@ -259,9 +312,18 @@ def soup(models: list[str | Path], out: str | Path, **kwargs) -> MergeReport:
     return _relabel(report, "soup")
 
 
-def task_arithmetic(base: str | Path, models: list[str | Path], weights: list[float], out: str | Path, *,
-                    template: str | Path | None = None, missing: str = "error", dtype=None, overwrite: bool = False,
-                    extra: str = "error") -> MergeReport:
+def task_arithmetic(
+    base: str | Path,
+    models: list[str | Path],
+    weights: list[float],
+    out: str | Path,
+    *,
+    template: str | Path | None = None,
+    missing: str = "error",
+    dtype=None,
+    overwrite: bool = False,
+    extra: str = "error",
+) -> MergeReport:
     """w = base + sum_i weights[i] * (models[i] - base): each model's change from the shared base, scaled and added.
     With weights [1, lam], A keeps all of its own training and gains lam of B's (a linear merge would also pull A back
     toward the base). Template: the first model (pass template= to change)."""
@@ -270,12 +332,22 @@ def task_arithmetic(base: str | Path, models: list[str | Path], weights: list[fl
     cks = _checkpoints(models)
     b = base if isinstance(base, Checkpoint) else Checkpoint(base)
     tpl = Checkpoint(template) if template is not None else cks[0]
-    return _combine("task_arithmetic", list(zip(cks, map(float, weights))), out, base=b, template=tpl, missing=missing,
-                    dtype=dtype, overwrite=overwrite, extra=extra)
+    return _combine(
+        "task_arithmetic",
+        list(zip(cks, map(float, weights))),
+        out,
+        base=b,
+        template=tpl,
+        missing=missing,
+        dtype=dtype,
+        overwrite=overwrite,
+        extra=extra,
+    )
 
 
-def materialize(checkpoint: str | Path, template: str | Path, out: str | Path, *, dtype=None,
-                overwrite: bool = False) -> MergeReport:
+def materialize(
+    checkpoint: str | Path, template: str | Path, out: str | Path, *, dtype=None, overwrite: bool = False
+) -> MergeReport:
     """A partial checkpoint (e.g. a text-only training save of a multimodal model) completed into a loadable model: its
     tensors, cast to the template's dtype, plus the template's other tensors and files."""
     report = linear([checkpoint], [1.0], out, template=template, missing="template", dtype=dtype, overwrite=overwrite)
@@ -313,16 +385,26 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     import sys
 
-    ap = argparse.ArgumentParser(prog="pgs merge", description="weight-space merging of checkpoints (palingenesis.merge)")
+    ap = argparse.ArgumentParser(
+        prog="pgs merge", description="weight-space merging of checkpoints (palingenesis.merge)"
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p, template=True):
         p.add_argument("-o", "--out", required=True, help="output directory")
         if template:
-            p.add_argument("--template", default=None, help="model whose tensor set, layout, dtype and files the output takes")
-            p.add_argument("--missing", choices=("error", "template"), default="error",
-                           help="a tensor some source lacks: error, or copy the template's")
-        p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default=None, help="output dtype (default: the template's)")
+            p.add_argument(
+                "--template", default=None, help="model whose tensor set, layout, dtype and files the output takes"
+            )
+            p.add_argument(
+                "--missing",
+                choices=("error", "template"),
+                default="error",
+                help="a tensor some source lacks: error, or copy the template's",
+            )
+        p.add_argument(
+            "--dtype", choices=("bf16", "fp16", "fp32"), default=None, help="output dtype (default: the template's)"
+        )
         p.add_argument("--overwrite", action="store_true")
 
     p = sub.add_parser("interpolate", help="start + lam (end - start)")

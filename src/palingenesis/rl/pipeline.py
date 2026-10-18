@@ -233,8 +233,11 @@ class RLPipeline:
         finished environment (a Harbor container, a remote session) until the slowest episode of its group ends; only
         when no reward function asks for the live environment (env / envs)."""
         pool = self.env_pool
-        return pool is not None and pool.has_reward and not any(
-            r.accepts_all or {"env", "envs"} & r.accepts for r in self.rewards)
+        return (
+            pool is not None
+            and pool.has_reward
+            and not any(r.accepts_all or {"env", "envs"} & r.accepts for r in self.rewards)
+        )
 
     async def _episode(
         self, row: dict, gid: int, temperature: float, training: bool, skip: bool = False
@@ -277,7 +280,9 @@ class RLPipeline:
             by_name = {s["function"]["name"]: s for s in schemas or []}
             # a row may carry its own template kwargs (thinking or not) and generation budgets
             # (the environment's episode kwargs, e.g. a harness profile's enable_thinking, under the row's own)
-            episode = (getattr(env, "episode_info", None) or {}).get("chat_template_kwargs") if env is not None else None
+            episode = (
+                (getattr(env, "episode_info", None) or {}).get("chat_template_kwargs") if env is not None else None
+            )
             chat = self.chat.with_kwargs({**(episode or {}), **(row.get("chat_template_kwargs") or {})})
             trajectory.prompt_ids = encode_prompt(self.tok, messages, schemas, chat.kwargs)
             budget = int(row.get("max_completion_tokens") or config.completion_budget)
@@ -322,7 +327,9 @@ class RLPipeline:
                 text_protocol = False
                 if env is not None and not (parsed.calls or parsed.errors) and hasattr(env, "text_actions"):
                     actions = await call_sync_or_async(env.text_actions, parsed.content) or []
-                    parsed.calls = [ToolCall(name, dict(args or {}), f"call_{turn}_{k}") for k, (name, args) in enumerate(actions)]
+                    parsed.calls = [
+                        ToolCall(name, dict(args or {}), f"call_{turn}_{k}") for k, (name, args) in enumerate(actions)
+                    ]
                     text_protocol = bool(parsed.calls)
                 if env is None or not (parsed.calls or parsed.errors):
                     trajectory.finish = "stop"
@@ -332,8 +339,10 @@ class RLPipeline:
                     break
                 t_tools = clock()
                 results = await asyncio.gather(  # text-protocol actions are validated by the environment itself
-                    *(run_tool(env, c.name, c.arguments, e.tool_timeout, None if text_protocol else set(by_name))
-                      for c in parsed.calls)
+                    *(
+                        run_tool(env, c.name, c.arguments, e.tool_timeout, None if text_protocol else set(by_name))
+                        for c in parsed.calls
+                    )
                 )
                 turn_timing["tools_s"] = clock() - t_tools
                 observations = [
@@ -348,8 +357,11 @@ class RLPipeline:
                 observations += [{"role": "tool", "content": error} for error in parsed.errors]
                 if text_protocol:  # one user turn with the results, in the environment's own format
                     render = getattr(env, "observation_text", None)
-                    body = render([(c.name, out_text) for c, (out_text, _) in zip(parsed.calls, results)]) if render \
+                    body = (
+                        render([(c.name, out_text) for c, (out_text, _) in zip(parsed.calls, results)])
+                        if render
                         else "\n\n".join(out_text for out_text, _ in results)
+                    )
                     observations = [{"role": "user", "content": body}]
                 for o in observations:
                     o["content"] = self.chat.truncate(self.chat.sanitize(o["content"]), e.max_tool_output_tokens)
@@ -428,10 +440,15 @@ class RLPipeline:
         for reward in self.rewards:
             scores[reward.name] = await reward.score(samples)
         if self.env_pool is not None and self.env_pool.has_reward:
-            scores["env"] = list(await asyncio.gather(*(self._env_reward(envs[i], group[i]) for i in live
-                                                          if "_env_reward" not in group[i].info)))
-            scores["env"] = [group[i].info.pop("_env_reward") if "_env_reward" in group[i].info else scores["env"].pop(0)
-                             for i in live]
+            scores["env"] = list(
+                await asyncio.gather(
+                    *(self._env_reward(envs[i], group[i]) for i in live if "_env_reward" not in group[i].info)
+                )
+            )
+            scores["env"] = [
+                group[i].info.pop("_env_reward") if "_env_reward" in group[i].info else scores["env"].pop(0)
+                for i in live
+            ]
         weights = {r.name: r.weight for r in self.rewards}
         loss = self.config.loss
         budget = self.config.completion_budget
@@ -565,7 +582,8 @@ class RLPipeline:
             return {
                 "reward_all": sum(t.reward for t in ts) / len(ts),
                 "pass@1": sum(t.reward >= threshold for t in ts) / len(ts),
-                f"pass@{self.config.rollout.group_size}": sum(any(t.reward >= threshold for t in g) for g in gs) / len(gs),
+                f"pass@{self.config.rollout.group_size}": sum(any(t.reward >= threshold for t in g) for g in gs)
+                / len(gs),
                 "surprisal": -sum(sampled) / max(1, len(sampled)),
                 "completion_len": sum(t.sampled_tokens for t in ts) / len(ts),
                 "groups": float(len(gs)),

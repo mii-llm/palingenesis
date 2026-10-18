@@ -18,11 +18,26 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
-def run_episodes(engine, tokenizer, rows: list[dict], env: Callable[..., Any], env_args: dict | None = None, *,
-                 k: int = 1, temperature=1.0, chat_template_kwargs: dict | None = None, model: str | None = None,
-                 max_turns: int = 16, max_new_tokens: int = 1024, max_completion_tokens: int | None = None,
-                 max_model_len: int = 16384, max_concurrent: int = 0, tool_timeout: float = 600.0,
-                 max_tool_output_tokens: int = 1536, tool_parser: str = "auto") -> list[list[Any]]:
+def run_episodes(
+    engine,
+    tokenizer,
+    rows: list[dict],
+    env: Callable[..., Any],
+    env_args: dict | None = None,
+    *,
+    k: int = 1,
+    temperature=1.0,
+    chat_template_kwargs: dict | None = None,
+    model: str | None = None,
+    max_turns: int = 16,
+    max_new_tokens: int = 1024,
+    max_completion_tokens: int | None = None,
+    max_model_len: int = 16384,
+    max_concurrent: int = 0,
+    tool_timeout: float = 600.0,
+    max_tool_output_tokens: int = 1536,
+    tool_parser: str = "auto",
+) -> list[list[Any]]:
     import torch
 
     from palingenesis.opd.orchestrator import PublishedWeights
@@ -40,11 +55,17 @@ def run_episodes(engine, tokenizer, rows: list[dict], env: Callable[..., Any], e
     eot = end_of_turn_id(tokenizer, kwargs)
     stop_ids = student_stop_ids(tokenizer, model, [], kwargs) if model else (eot,)
     config = RLConfig()
-    for key, value in {"model.policy": model or "episodes", "model.chat_template_kwargs": kwargs,
-                       "env.max_turns": max_turns, "env.tool_timeout": tool_timeout,
-                       "env.max_tool_output_tokens": max_tool_output_tokens, "env.tool_parser": tool_parser,
-                       "rollout.max_new_tokens": max_new_tokens, "rollout.max_completion_tokens": max_completion_tokens,
-                       "rollout.max_model_len": max_model_len}.items():
+    for key, value in {
+        "model.policy": model or "episodes",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": max_turns,
+        "env.tool_timeout": tool_timeout,
+        "env.max_tool_output_tokens": max_tool_output_tokens,
+        "env.tool_parser": tool_parser,
+        "rollout.max_new_tokens": max_new_tokens,
+        "rollout.max_completion_tokens": max_completion_tokens,
+        "rollout.max_model_len": max_model_len,
+    }.items():
         config.set(key, value)
     try:
         from palingenesis.rl.trainer import _think_tags
@@ -52,8 +73,18 @@ def run_episodes(engine, tokenizer, rows: list[dict], env: Callable[..., Any], e
         chat = ChatFormat(tokenizer, eot, kwargs, _think_tags(tokenizer, kwargs))
     except Exception:  # noqa: BLE001 — a template without think tags
         chat = ChatFormat(tokenizer, eot, kwargs)
-    pipeline = RLPipeline(tokenizer, chat, engine, PublishedWeights(torch.nn.Linear(1, 1)), config,
-                          PromptSampler(rows), [], EnvPool(env, env_args or {}, max_concurrent), None, stop_ids)
+    pipeline = RLPipeline(
+        tokenizer,
+        chat,
+        engine,
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        PromptSampler(rows),
+        [],
+        EnvPool(env, env_args or {}, max_concurrent),
+        None,
+        stop_ids,
+    )
     try:
         return pipeline._await(pipeline._eval(rows, temperature, k))
     finally:

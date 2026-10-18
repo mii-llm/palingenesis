@@ -774,9 +774,15 @@ def test_messages_source_rows_carry_template_kwargs_and_may_end_on_tool_results(
     from palingenesis.opd.orchestrator import Pipeline
     from palingenesis.opd.sources import ChatMessagesSource
 
-    state = [{"role": "user", "content": "Luci?"},
-             {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}]},
-             {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'}]
+    state = [
+        {"role": "user", "content": "Luci?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}],
+        },
+        {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'},
+    ]
     rows = [{"messages": state, "chat_template_kwargs": {"enable_thinking": True}} for _ in range(3)]
     rows += [{"messages": [{"role": "user", "content": f"Ciao {i}"}]} for i in range(3)]
     rows += [{"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]}]  # skipped
@@ -817,20 +823,33 @@ def test_privileged_context_reaches_the_teacher_only(tmp_path):
     from palingenesis.opd.orchestrator import Pipeline
     from palingenesis.opd.sources import ChatMessagesSource
 
-    state = [{"role": "user", "content": "Luci?"},
-             {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}]},
-             {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'}]
+    state = [
+        {"role": "user", "content": "Luci?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "get_lights", "arguments": {}}}],
+        },
+        {"role": "tool", "name": "get_lights", "content": '{"status": "ok"}'},
+    ]
     teacher_view = with_privileged(state, "Expected: lights are on.", "{content}\n[ref] {privileged}")
     assert teacher_view[0]["content"] == "Luci?\n[ref] Expected: lights are on." and teacher_view[2] == state[2]
     assert state[0]["content"] == "Luci?"  # the student's copy is untouched
     with pytest.raises(ValueError, match="user turn"):
         with_privileged([{"role": "system", "content": "s"}], "p", "{content}{privileged}")
 
-    rows = [{"messages": [{"role": "user", "content": f"2+{i}?"}], "solution": f"= {2 + i}",
-             "chat_template_kwargs": {"enable_thinking": True}} for i in range(4)]
+    rows = [
+        {
+            "messages": [{"role": "user", "content": f"2+{i}?"}],
+            "solution": f"= {2 + i}",
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+        for i in range(4)
+    ]
     rows += [{"messages": [{"role": "user", "content": "plain"}]}]
-    config = SourceConfig(path=write_chat(tmp_path / "p.jsonl", rows), dev_size=2, max_new_tokens=16,
-                          privileged_field="solution")
+    config = SourceConfig(
+        path=write_chat(tmp_path / "p.jsonl", rows), dev_size=2, max_new_tokens=16, privileged_field="solution"
+    )
     source = ChatMessagesSource(config, eval_samples=2, seed=0, rng=random.Random(0))
     metas = {json.dumps(m, sort_keys=True) for m in (source.meta(r) for r in source.train_rows + source.dev_rows)}
     assert json.dumps({}, sort_keys=True) in metas  # the row without the field
@@ -917,7 +936,7 @@ def test_samplings_truncation_and_loop_detector():
     assert not looped("<think>" + "loop " * 400 + "</think>Risposta breve.", "stop")  # thinking is not judged
 
     def call(device):
-        return f'<tool_call>\n<function=set_device>\n<parameter=device_id>\n{device}\n</parameter>\n<parameter=state>\noff\n</parameter>\n</function>\n</tool_call>\n'
+        return f"<tool_call>\n<function=set_device>\n<parameter=device_id>\n{device}\n</parameter>\n<parameter=state>\noff\n</parameter>\n</function>\n</tool_call>\n"
 
     # 15 parallel calls to one function with different arguments share their markup: not a loop
     assert not looped("".join(call(f"luce_{i}") for i in range(15)), "stop")

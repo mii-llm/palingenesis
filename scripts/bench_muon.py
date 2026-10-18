@@ -70,8 +70,10 @@ def main():
     dev = torch.cuda.get_device_name()
     cap = torch.cuda.get_device_capability()
     shapes = model_shapes(a.model, a.min_dim)
-    print(f"{dev} (sm{cap[0]}{cap[1]}), {a.model}: {sum(shapes.values())} Muon matrices in {len(shapes)} shapes "
-          f"{dict(shapes)}")
+    print(
+        f"{dev} (sm{cap[0]}{cap[1]}), {a.model}: {sum(shapes.values())} Muon matrices in {len(shapes)} shapes "
+        f"{dict(shapes)}"
+    )
     backends = ["torch"] + (["quack"] if _quack_ops() is not None else [])
     rows = []
     for backend in backends:
@@ -81,16 +83,26 @@ def main():
                     rows.append(bench(shapes, method, backend, compile_, a.iters))
                 except Exception as e:  # noqa: BLE001 — report and keep going
                     rows.append({"method": method, "backend": backend, "compiled": compile_, "error": str(e)[:200]})
-    base = next((r["ms"] for r in rows if r.get("ms") and r["method"] == "standard" and r["backend"] == "torch"
-                 and not r["compiled"]), None)
+    base = next(
+        (
+            r["ms"]
+            for r in rows
+            if r.get("ms") and r["method"] == "standard" and r["backend"] == "torch" and not r["compiled"]
+        ),
+        None,
+    )
     for r in rows:
         r.update(device=dev, capability=f"sm{cap[0]}{cap[1]}", model=a.model, torch=torch.__version__)
         if "ms" in r:
             worst = min(v["cos"] for v in r["accuracy"].values())
-            print(f"  {r['method']:9s} {r['backend']:6s} {'compiled' if r['compiled'] else 'eager':8s} "
-                  f"{r['ms']:8.2f} ms  x{base / r['ms']:.2f}  min cos {worst:.4f}")
+            print(
+                f"  {r['method']:9s} {r['backend']:6s} {'compiled' if r['compiled'] else 'eager':8s} "
+                f"{r['ms']:8.2f} ms  x{base / r['ms']:.2f}  min cos {worst:.4f}"
+            )
         else:
-            print(f"  {r['method']:9s} {r['backend']:6s} {'compiled' if r['compiled'] else 'eager':8s} ERROR {r['error']}")
+            print(
+                f"  {r['method']:9s} {r['backend']:6s} {'compiled' if r['compiled'] else 'eager':8s} ERROR {r['error']}"
+            )
     if a.json:
         with open(a.json, "a") as f:
             f.writelines(json.dumps(r) + "\n" for r in rows)

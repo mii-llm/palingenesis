@@ -222,7 +222,6 @@ def _resolve_total_steps(config: Config, world_size: int, make_dataloader, devic
     return total_steps
 
 
-
 def eval_reader(config, tokenizer, eval_ds):
     """The held-out set's reader, matching training: raw text with all-token loss when every data source is
     `mode: pretrain` (a CPT run; a chat reader would find no messages and silently disable validation), otherwise
@@ -234,7 +233,9 @@ def eval_reader(config, tokenizer, eval_ds):
 
     sources = config.data.sources or []
     if sources and all((src or {}).get("mode", "sft") == "pretrain" for src in sources):
-        return PretrainDataset(eval_ds, tokenizer, config.data.max_seq_length, text_field=sources[0].get("text_field", "text"))
+        return PretrainDataset(
+            eval_ds, tokenizer, config.data.max_seq_length, text_field=sources[0].get("text_field", "text")
+        )
     return ChatDataset(
         eval_ds,
         tokenizer,
@@ -247,6 +248,7 @@ def eval_reader(config, tokenizer, eval_ds):
         last_turn_only=config.data.last_turn_only,
         tools_field=config.data.tools_field,
     )
+
 
 def train(config: Config):
     # ── CUDA allocator: expandable segments ───────────────────────────────

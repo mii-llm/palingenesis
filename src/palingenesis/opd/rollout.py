@@ -344,7 +344,9 @@ class VLLMColocateRollout:
         request with n samples: the prompt is prefilled once and its KV cache forked, instead
         of relying on the prefix cache to find it n times."""
         unique: dict[tuple, list[int]] = {}
-        for i, (prompt, budget, sampling) in enumerate(zip(prompts, max_new_tokens, samplings(temperature, len(prompts)))):
+        for i, (prompt, budget, sampling) in enumerate(
+            zip(prompts, max_new_tokens, samplings(temperature, len(prompts)))
+        ):
             unique.setdefault((tuple(prompt), budget, sampling), []).append(i)
         requests = list(unique.items())
         params = [self._params(len(indices), budget, sampling) for (_, budget, sampling), indices in requests]

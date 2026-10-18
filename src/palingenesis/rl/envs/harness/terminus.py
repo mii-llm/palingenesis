@@ -54,7 +54,8 @@ TERMINUS_USER = (
     "JSON generates warnings but is tolerated; the JSON must be valid (escape quotes and special characters); the "
     "commands array may be empty to wait without acting.\n\n"
     "Task Description:\n{instruction}\n\n"
-    "Current terminal state:\n{terminal_state}")
+    "Current terminal state:\n{terminal_state}"
+)
 
 
 @dataclass
@@ -135,8 +136,9 @@ def _try_parse(response: str) -> ParseResult:
         expected = [f for f in ("analysis", "plan", "commands") if f in positions]
         actual = sorted(positions, key=positions.get)
         if actual != expected:
-            warnings.append(f"Fields appear in wrong order. Found: {' → '.join(actual)}, expected: "
-                            f"{' → '.join(expected)}")
+            warnings.append(
+                f"Fields appear in wrong order. Found: {' → '.join(actual)}, expected: {' → '.join(expected)}"
+            )
     tc = data.get("task_complete")
     if tc is not None and not isinstance(tc, (bool, str)):
         warnings.append("Field 'task_complete' should be a boolean or string")
@@ -167,8 +169,10 @@ def _try_parse(response: str) -> ParseResult:
         if unknown:
             warnings.append(f"Command {i + 1}: Unknown fields: {', '.join(sorted(unknown))}")
         if i < len(commands) - 1 and keys and not keys.endswith("\n"):
-            warnings.append(f"Command {i + 1} should end with newline when followed by another command. Otherwise "
-                            "the two commands will be concatenated together on the same line.")
+            warnings.append(
+                f"Command {i + 1} should end with newline when followed by another command. Otherwise "
+                "the two commands will be concatenated together on the same line."
+            )
         parsed.append(ParsedCommand(keys, float(duration)))
     if error:
         if complete:  # with task_complete, command errors are only warnings
@@ -223,16 +227,32 @@ class TerminusJSON(Protocol):
         result = parse_response(content or "")
         if result.error:
             feedback = f"ERROR: {result.error}" + (f"\nWARNINGS: {result.warning}" if result.warning else "")
-            raise FormatError(f"Previous response had parsing errors:\n{feedback}\n\nPlease fix these issues and "
-                              "provide a proper JSON response.")
-        return [(ACTION, {"commands": [{"keystrokes": c.keystrokes, "duration": c.duration} for c in result.commands],
-                          "task_complete": result.is_task_complete, "warning": result.warning})]
+            raise FormatError(
+                f"Previous response had parsing errors:\n{feedback}\n\nPlease fix these issues and "
+                "provide a proper JSON response."
+            )
+        return [
+            (
+                ACTION,
+                {
+                    "commands": [{"keystrokes": c.keystrokes, "duration": c.duration} for c in result.commands],
+                    "task_complete": result.is_task_complete,
+                    "warning": result.warning,
+                },
+            )
+        ]
 
     def render(self, calls):
         name, args = calls[0]
-        return json.dumps({"analysis": args.get("analysis", ""), "plan": args.get("plan", ""),
-                           "commands": args.get("commands", []), "task_complete": bool(args.get("task_complete"))},
-                          indent=2)
+        return json.dumps(
+            {
+                "analysis": args.get("analysis", ""),
+                "plan": args.get("plan", ""),
+                "commands": args.get("commands", []),
+                "task_complete": bool(args.get("task_complete")),
+            },
+            indent=2,
+        )
 
     def observation(self, results):
         return "\n\n".join(out for _, out in results)
@@ -255,9 +275,11 @@ def _terminus_batch(s, a):
             s.finish(None)
             return terminal
         s.flags["pending_completion"] = True
-        return (f"Current terminal state:\n{terminal}\n\nAre you sure you want to mark the task as complete? This will "
-                "trigger your solution to be graded and you won't be able to make any further corrections. If so, "
-                'include "task_complete": true in your JSON response again.')
+        return (
+            f"Current terminal state:\n{terminal}\n\nAre you sure you want to mark the task as complete? This will "
+            "trigger your solution to be graded and you won't be able to make any further corrections. If so, "
+            'include "task_complete": true in your JSON response again.'
+        )
     s.flags["pending_completion"] = False
     if a.get("warning"):
         return f"Previous response had warnings:\nWARNINGS: {a['warning']}\n\n{terminal}"
@@ -269,9 +291,11 @@ def _terminus_start(s) -> dict[str, str]:
     try:
         tmux.start()
     except OpError as e:
-        raise RuntimeError("terminus-2 needs tmux in the task image (build harbor3-base:3 from "
-                           "research/tiny-reliable-agent/harness/Dockerfile.tmux and pass HarborEnv(images="
-                           "{'harbor3-base:1': 'harbor3-base:3'})): " + str(e.data.get("detail", ""))) from None
+        raise RuntimeError(
+            "terminus-2 needs tmux in the task image (build harbor3-base:3 from "
+            "research/tiny-reliable-agent/harness/Dockerfile.tmux and pass HarborEnv(images="
+            "{'harbor3-base:1': 'harbor3-base:3'})): " + str(e.data.get("detail", ""))
+        ) from None
     tmux.wait(0.5)
     s.flags["tmux"] = tmux
     return {"terminal_state": limit_output(tmux.incremental())}
@@ -283,14 +307,21 @@ def terminus_format_error(reason: str, n: int) -> str:
 
 def terminus_2() -> HarnessProfile:
     return HarnessProfile(
-        name="terminus-2", version="harbor-0.24.0", system=None, user=TERMINUS_USER,
+        name="terminus-2",
+        version="harbor-0.24.0",
+        system=None,
+        user=TERMINUS_USER,
         tools=[ToolSpec(fn_schema(ACTION, "a terminus-2 response (internal)", {}, []), _terminus_batch)],
-        protocol=TerminusJSON(), stop=TaskComplete(), answer=StopAnswer(None), start=_terminus_start,
+        protocol=TerminusJSON(),
+        stop=TaskComplete(),
+        answer=StopAnswer(None),
+        start=_terminus_start,
         format_error=terminus_format_error,
         context=Context("compaction", emulated=False, note="unwind + 3-subagent summarisation near the limit"),
         emulates="Harbor 0.24.0 agents/terminus_2 (terminus-json-plain.txt, terminus_json_plain_parser.py, "
-                 "tmux_session.py; parser json, pane 160x40, 10 KB output cap, task_complete twice); summarisation "
-                 "off as for RL capture")
+        "tmux_session.py; parser json, pane 160x40, 10 KB output cap, task_complete twice); summarisation "
+        "off as for RL capture",
+    )
 
 
 register("terminus-2", "harbor-0.24.0", terminus_2)

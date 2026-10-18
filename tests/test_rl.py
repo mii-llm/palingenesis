@@ -555,8 +555,15 @@ def test_kl_term_is_the_same_with_prompt_sharing():
             group = []
             for _ in range(4):
                 n = rng.randint(3, 25)
-                t = Trajectory({}, g, prompt, [], tokens=[rng.randrange(1, 90) for _ in range(n)],
-                               mask=[True] * n, logprobs=[-rng.random() * 3 for _ in range(n)])
+                t = Trajectory(
+                    {},
+                    g,
+                    prompt,
+                    [],
+                    tokens=[rng.randrange(1, 90) for _ in range(n)],
+                    mask=[True] * n,
+                    logprobs=[-rng.random() * 3 for _ in range(n)],
+                )
                 t.reward = rng.random()
                 group.append(t)
             out.append(group)
@@ -770,12 +777,23 @@ def test_outcome_stats_cover_every_group_and_family():
     from palingenesis.rl.pipeline import RLPipeline
 
     def traj(family, reward):
-        return Trajectory(row={"task": family}, group=0, prompt_ids=[1], messages=[], tokens=[5, 6], mask=[True, True],
-                          logprobs=[-0.5, -1.5], reward=reward)
+        return Trajectory(
+            row={"task": family},
+            group=0,
+            prompt_ids=[1],
+            messages=[],
+            tokens=[5, 6],
+            mask=[True, True],
+            logprobs=[-0.5, -1.5],
+            reward=reward,
+        )
 
     groups = [[traj("a", 1.0), traj("a", 1.0)], [traj("a", 0.0), traj("a", 0.0)], [traj("b", 1.0), traj("b", 0.0)]]
-    fake = SimpleNamespace(config=SimpleNamespace(data=SimpleNamespace(success_threshold=0.5, metrics_key=["task"]),
-                                                  rollout=SimpleNamespace(group_size=2)))
+    fake = SimpleNamespace(
+        config=SimpleNamespace(
+            data=SimpleNamespace(success_threshold=0.5, metrics_key=["task"]), rollout=SimpleNamespace(group_size=2)
+        )
+    )
     out = RLPipeline._outcome_stats(fake, groups)
     assert out["outcome/pass@1"] == 0.5 and out["outcome/pass@2"] == 2 / 3 and out["outcome/surprisal"] == 1.0
     assert out["family/a/pass@1"] == 0.5 and out["family/a/pass@2"] == 0.5 and out["family/b/pass@2"] == 1.0
@@ -784,7 +802,10 @@ def test_outcome_stats_cover_every_group_and_family():
 def test_trainer_logs_kl_to_reference_and_families(tmp_path):
     from palingenesis.rl.trainer import RLTrainer
 
-    rows = [{"prompt": f"What is {i} plus {i + 1}?", "answer": str(2 * i + 1), "kind": "odd" if i % 2 else "even"} for i in range(20)]
+    rows = [
+        {"prompt": f"What is {i} plus {i + 1}?", "answer": str(2 * i + 1), "kind": "odd" if i % 2 else "even"}
+        for i in range(20)
+    ]
     (tmp_path / "data.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     config = RLConfig()
     for key, value in {
@@ -909,11 +930,20 @@ def test_group_shaping_hook_sees_the_scored_group_before_the_overlong_penalty(tm
         config.set("rollout.max_new_tokens", 8)
         pipe = RLPipeline.__new__(RLPipeline)
         pipe.config, pipe.rewards, pipe.env_pool, pipe.sandbox = config, [Exact()], None, None
-        pipe.group_shaping = __import__("palingenesis.rl.rewards", fromlist=["x"]).load_object(config.loss.group_shaping)
+        pipe.group_shaping = __import__("palingenesis.rl.rewards", fromlist=["x"]).load_object(
+            config.loss.group_shaping
+        )
         group = []
         for text, n in [("4", 2), ("4, since 2+2", 7), ("5", 2), ("skip", 2)]:
-            t = Trajectory({"prompt": "2+2?"}, 0, [1], [{"role": "assistant", "content": text}], tokens=[1] * n,
-                           mask=[True] * n, finish="stop")
+            t = Trajectory(
+                {"prompt": "2+2?"},
+                0,
+                [1],
+                [{"role": "assistant", "content": text}],
+                tokens=[1] * n,
+                mask=[True] * n,
+                finish="stop",
+            )
             t.info["prompt"] = "2+2?"
             group.append(t)
         asyncio.run(pipe._score(group, [None] * len(group)))

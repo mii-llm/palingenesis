@@ -222,8 +222,15 @@ class OPDTrainConfig:
     muon_compile: bool = False
 
     def muon_options(self) -> dict:
-        return {"ns_method": self.muon_ns, "scale": self.muon_scale, "momentum": self.muon_momentum,
-                "min_dim": self.muon_min_dim, "backend": self.muon_backend, "compile": self.muon_compile}
+        return {
+            "ns_method": self.muon_ns,
+            "scale": self.muon_scale,
+            "momentum": self.muon_momentum,
+            "min_dim": self.muon_min_dim,
+            "backend": self.muon_backend,
+            "compile": self.muon_compile,
+        }
+
     warmup_steps: int = 20
     lr_scheduler: str = "cosine"  # "cosine" or "constant"
     max_grad_norm: float = 1.0
@@ -432,7 +439,9 @@ class OPDConfig:
                     )
             for entry in source.sampling_mix:
                 if not isinstance(entry, dict) or set(entry) - {"weight", "temperature", "top_p", "top_k"}:
-                    errors.append(f"{where}.sampling_mix entries are {{weight, temperature, top_p, top_k}}, got {entry!r}.")
+                    errors.append(
+                        f"{where}.sampling_mix entries are {{weight, temperature, top_p, top_k}}, got {entry!r}."
+                    )
                     continue
                 if entry.get("weight", 1.0) < 0 or entry.get("temperature", 1.0) <= 0:
                     errors.append(f"{where}.sampling_mix: weight must be >= 0 and temperature > 0, got {entry!r}.")
@@ -443,9 +452,16 @@ class OPDConfig:
                     errors.append(f"{where}.sampling_mix applies to format 'messages' only.")
                 if sum(e.get("weight", 1.0) for e in source.sampling_mix if isinstance(e, dict)) <= 0:
                     errors.append(f"{where}.sampling_mix needs a positive total weight.")
-                not_student = [e for e in source.sampling_mix if isinstance(e, dict)
-                               and (e.get("temperature", self.rollout.temperature) != 1.0
-                                    or e.get("top_p", 1.0) < 1.0 or e.get("top_k", 0) > 0)]
+                not_student = [
+                    e
+                    for e in source.sampling_mix
+                    if isinstance(e, dict)
+                    and (
+                        e.get("temperature", self.rollout.temperature) != 1.0
+                        or e.get("top_p", 1.0) < 1.0
+                        or e.get("top_k", 0) > 0
+                    )
+                ]
                 teachers = {source.teacher or next(iter(self.teachers), "")} | set(source.topic_teachers)
                 for name in teachers:
                     teacher = self.teachers.get(name)
@@ -527,9 +543,15 @@ class OPDConfig:
                 "and xtok weight by importance ratios against the scaled sampler (ratios far from 1 get clipped)."
             )
         sampling = self.train.eval_sampling
-        if sampling and (set(sampling) - {"temperature", "top_p", "top_k"} or sampling.get("temperature", 1.0) <= 0
-                         or not 0 < sampling.get("top_p", 1.0) <= 1 or sampling.get("top_k", 0) < 0):
-            errors.append(f"train.eval_sampling must be {{temperature > 0, top_p in (0, 1], top_k >= 0}}, got {sampling!r}.")
+        if sampling and (
+            set(sampling) - {"temperature", "top_p", "top_k"}
+            or sampling.get("temperature", 1.0) <= 0
+            or not 0 < sampling.get("top_p", 1.0) <= 1
+            or sampling.get("top_k", 0) < 0
+        ):
+            errors.append(
+                f"train.eval_sampling must be {{temperature > 0, top_p in (0, 1], top_k >= 0}}, got {sampling!r}."
+            )
         if not 0.0 <= loss.beta <= 1.0:
             errors.append(f"loss.beta must be in [0, 1], got {loss.beta}.")
         if loss.xtok_spread not in ("chunk", "proportional"):

@@ -91,8 +91,11 @@ class HarborTask:
     def load(cls, root: str | Path) -> "HarborTask":
         root = Path(root)
         config = tomllib.loads((root / "task.toml").read_text()) if (root / "task.toml").exists() else {}
-        instruction = (root / "instruction.md").read_text() if (root / "instruction.md").exists() else \
-            config.get("task", {}).get("description", "")
+        instruction = (
+            (root / "instruction.md").read_text()
+            if (root / "instruction.md").exists()
+            else config.get("task", {}).get("description", "")
+        )
         name = config.get("task", {}).get("name") or root.name
         return cls(root, name, instruction.strip(), config)
 
@@ -135,8 +138,10 @@ class HarborTask:
         return explicit or f"{IMAGE_PREFIX}:{self.context_hash()}"
 
 
-SYSTEM = ("You work in a Linux container through tools; the working directory is /workdir and there is no internet. "
-          "Inspect before you change things, check your result, then call submit and tell the user briefly what you did.")
+SYSTEM = (
+    "You work in a Linux container through tools; the working directory is /workdir and there is no internet. "
+    "Inspect before you change things, check your result, then call submit and tell the user briefly what you did."
+)
 
 
 def harbor_rows(tasks_dir: str | Path, system: str | None = SYSTEM) -> list[dict]:
@@ -154,7 +159,9 @@ def harbor_rows(tasks_dir: str | Path, system: str | None = SYSTEM) -> list[dict
 # ------------------------------------------------------------------ docker
 
 
-def _docker(*args: str, input: bytes | None = None, timeout: float | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def _docker(
+    *args: str, input: bytes | None = None, timeout: float | None = None, check: bool = True
+) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], input=input, capture_output=True, timeout=timeout, check=check)
 
 
@@ -191,8 +198,16 @@ def _pid_alive(pid: int) -> bool:
 def sweep_orphans() -> int:
     """Remove episode containers whose owning process on this host has exited; returns how many."""
     try:
-        r = _docker("ps", "-a", "--filter", f"label={_LABEL}", "--format", f'{{{{.Names}}}} {{{{.Label "{_LABEL}"}}}}',
-                    check=False, timeout=60)
+        r = _docker(
+            "ps",
+            "-a",
+            "--filter",
+            f"label={_LABEL}",
+            "--format",
+            f'{{{{.Names}}}} {{{{.Label "{_LABEL}"}}}}',
+            check=False,
+            timeout=60,
+        )
     except (subprocess.TimeoutExpired, OSError):
         return 0
     dead = []
@@ -202,7 +217,7 @@ def sweep_orphans() -> int:
         if host == _HOST and pid.isdigit() and not _pid_alive(int(pid)):
             dead.append(name)
     for i in range(0, len(dead), 100):
-        _remove(dead[i:i + 100], timeout=300)
+        _remove(dead[i : i + 100], timeout=300)
     if dead:
         logger.warning("removed %d Harbor containers left behind by exited runs", len(dead))
     return len(dead)
@@ -223,7 +238,7 @@ def _remove_live() -> None:
         names = sorted(_live)
         _live.clear()
     for i in range(0, len(names), 100):
-        _remove(names[i:i + 100], timeout=300)
+        _remove(names[i : i + 100], timeout=300)
 
 
 def build_image(task: HarborTask, timeout: float | None = None) -> str:
@@ -268,9 +283,21 @@ class DockerRuntime:
         env = self.task.environment
         image = build_image(self.task)
         _sweep_once()
-        args = ["run", "-d", "--name", self.name, "--init", "--label", f"{_LABEL}={_HOST}:{os.getpid()}",
-                "--cpus", str(env.get("cpus", 1)), "--memory", f"{int(env.get('memory_mb', 2048))}m",
-                "--pids-limit", str(env.get("pids_limit", 512))]
+        args = [
+            "run",
+            "-d",
+            "--name",
+            self.name,
+            "--init",
+            "--label",
+            f"{_LABEL}={_HOST}:{os.getpid()}",
+            "--cpus",
+            str(env.get("cpus", 1)),
+            "--memory",
+            f"{int(env.get('memory_mb', 2048))}m",
+            "--pids-limit",
+            str(env.get("pids_limit", 512)),
+        ]
         if not (env.get("allow_internet", False) if allow_internet is None else allow_internet):
             args += ["--network", "none"]
         for k, v in (env.get("env") or {}).items():
@@ -310,7 +337,9 @@ class DockerRuntime:
             else:
                 raise RuntimeError(f"healthcheck failed for {self.task.name}")
 
-    def exec(self, command: str, timeout: float = 60, env: dict | None = None, workdir: str | None = None) -> ExecResult:
+    def exec(
+        self, command: str, timeout: float = 60, env: dict | None = None, workdir: str | None = None
+    ) -> ExecResult:
         args = ["exec"]
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
@@ -323,7 +352,7 @@ class DockerRuntime:
         cut = self.max_output
         out, err = r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
         if len(out) > cut:
-            out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2:]
+            out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2 :]
         return ExecResult(r.returncode, out, err[-cut:])
 
     def owner(self) -> tuple[int, int]:
@@ -350,7 +379,9 @@ class DockerRuntime:
         _docker(*cp, "-", f"{self.name}:{dest}", input=buf.getvalue(), timeout=60)
 
     def put_dir(self, local: Path, dest: str) -> None:
-        files = {str(Path(dest.lstrip("/")) / p.relative_to(local)): p.read_bytes() for p in local.rglob("*") if p.is_file()}
+        files = {
+            str(Path(dest.lstrip("/")) / p.relative_to(local)): p.read_bytes() for p in local.rglob("*") if p.is_file()
+        }
         if files:
             self.put_files(files, "/")
 
@@ -368,14 +399,26 @@ class DockerRuntime:
         agent's container, so a policy that can rewrite its tools (ps, python) could bias the capture: use absolute paths
         to binaries the task does not let the agent modify, and treat captured state as evidence, not ground truth."""
         cmd = self.task.verifier["capture"]
-        r = _docker("exec", "-u", "0", "-w", "/", self.name, "bash", "-c", cmd, check=False,
-                    timeout=float(self.task.verifier.get("capture_timeout_sec", 60)))
+        r = _docker(
+            "exec",
+            "-u",
+            "0",
+            "-w",
+            "/",
+            self.name,
+            "bash",
+            "-c",
+            cmd,
+            check=False,
+            timeout=float(self.task.verifier.get("capture_timeout_sec", 60)),
+        )
         if r.returncode != 0:
             raise RuntimeError(f"capture failed for {self.task.name} (exit {r.returncode}): {r.stderr.decode()[-300:]}")
         return r.stdout
 
-    def verify(self, isolated: bool = True, final_message: str | None = None,
-               capture: bytes | None = None) -> dict[str, float]:
+    def verify(
+        self, isolated: bool = True, final_message: str | None = None, capture: bytes | None = None
+    ) -> dict[str, float]:
         """Run the task's tests and read the reward. isolated (default): the working directory is copied into a fresh
         container from the pristine image and tested there, so nothing the agent left behind (a background process
         rewriting the reward, a patched package, a pytest.py shadowing pytest) can reach the verifier. That container
@@ -397,15 +440,20 @@ class DockerRuntime:
                 return clean.verify(isolated=False, final_message=final_message, capture=capture)
             finally:
                 clean.stop()
-        self.exec("rm -rf /tests /logs/verifier /logs/agent && mkdir -p /tests /logs/verifier /logs/agent", timeout=30,
-                  workdir="/")
+        self.exec(
+            "rm -rf /tests /logs/verifier /logs/agent && mkdir -p /tests /logs/verifier /logs/agent",
+            timeout=30,
+            workdir="/",
+        )
         if final_message is not None:
             self.put_files({"/logs/agent/final_message.md": final_message}, "/")
         if capture is not None:
             self.put_files({"/logs/agent/capture.json": capture}, "/")
         self.put_dir(tests, "/tests")
         venv = {k: os.path.expandvars(str(v)) for k, v in (self.task.verifier.get("env") or {}).items()}
-        r = self.exec("bash /tests/test.sh", timeout=float(self.task.verifier.get("timeout_sec", 120)), env=venv, workdir="/")
+        r = self.exec(
+            "bash /tests/test.sh", timeout=float(self.task.verifier.get("timeout_sec", 120)), env=venv, workdir="/"
+        )
         raw_json = self.read_file("/logs/verifier/reward.json")
         if raw_json:
             try:
@@ -438,18 +486,36 @@ class DockerRuntime:
 
 
 def _fn(name, desc, props, req):
-    return {"type": "function", "function": {"name": name, "description": desc,
-                                             "parameters": {"type": "object", "properties": props, "required": req}}}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": desc,
+            "parameters": {"type": "object", "properties": props, "required": req},
+        },
+    }
 
 
 TOOL_SCHEMAS = {
-    "bash": _fn("bash", "Run a shell command in the task's container (working directory /workdir) and return its output.",
-                {"command": {"type": "string"}, "timeout": {"type": "integer", "description": "Seconds (default 60)."}}, ["command"]),
+    "bash": _fn(
+        "bash",
+        "Run a shell command in the task's container (working directory /workdir) and return its output.",
+        {"command": {"type": "string"}, "timeout": {"type": "integer", "description": "Seconds (default 60)."}},
+        ["command"],
+    ),
     "read_file": _fn("read_file", "Read a text file.", {"path": {"type": "string"}}, ["path"]),
-    "write_file": _fn("write_file", "Create or overwrite a text file.", {"path": {"type": "string"}, "content": {"type": "string"}},
-                      ["path", "content"]),
-    "str_replace": _fn("str_replace", "Replace an exact piece of text in a file (it must occur exactly once).",
-                       {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, ["path", "old", "new"]),
+    "write_file": _fn(
+        "write_file",
+        "Create or overwrite a text file.",
+        {"path": {"type": "string"}, "content": {"type": "string"}},
+        ["path", "content"],
+    ),
+    "str_replace": _fn(
+        "str_replace",
+        "Replace an exact piece of text in a file (it must occur exactly once).",
+        {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
+        ["path", "old", "new"],
+    ),
     "submit": _fn("submit", "Finish the task (call it when the work is done).", {}, []),
 }
 
@@ -465,10 +531,18 @@ class HarborEnv:
 
     episode_group = None  # the trainer sets the GRPO group id here before reset (harness profiles: one per group)
 
-    def __init__(self, tools: list[str] | None = None, reward_key: str = "reward", workdir: str | None = None,
-                 max_output: int = 16000, profile: str | None = None, profiles: dict[str, float] | None = None,
-                 profile_seed: int = 0, profile_chat_kwargs: dict[str, dict] | None = None,
-                 images: dict[str, str] | None = None):
+    def __init__(
+        self,
+        tools: list[str] | None = None,
+        reward_key: str = "reward",
+        workdir: str | None = None,
+        max_output: int = 16000,
+        profile: str | None = None,
+        profiles: dict[str, float] | None = None,
+        profile_seed: int = 0,
+        profile_chat_kwargs: dict[str, dict] | None = None,
+        images: dict[str, str] | None = None,
+    ):
         self.tool_names = list(tools or TOOL_SCHEMAS)
         self.reward_key = reward_key
         self.workdir = workdir
@@ -503,8 +577,9 @@ class HarborEnv:
         from palingenesis.rl.envs.harness import Session
 
         self.session = Session(drawn, self.rt)
-        kwargs = self.profile_chat_kwargs.get(drawn.name, self.profile_chat_kwargs.get(drawn.id,
-                                                                                         drawn.chat_template_kwargs))
+        kwargs = self.profile_chat_kwargs.get(
+            drawn.name, self.profile_chat_kwargs.get(drawn.id, drawn.chat_template_kwargs)
+        )
         self.episode_info = {"harness_profile": drawn.id, **({"chat_template_kwargs": dict(kwargs)} if kwargs else {})}
         user = next((m.get("content") for m in reversed(row.get("messages") or []) if m.get("role") == "user"), None)
         return self.session.conversation(user if isinstance(user, str) and user else self.task.instruction)
@@ -584,8 +659,10 @@ class HarborEnv:
             logger.warning("verifier failed for %s: %s", self.task.name, e)
             comps = {"reward": 0.0, "metric/verifier_failed": 1.0}
         main = comps.get(self.reward_key, next(iter(comps.values()), 0.0))
-        out = {"reward": float(main), **{(k if k.startswith("metric/") else f"metric/{k}"): v for k, v in comps.items()
-                                          if k != self.reward_key}}
+        out = {
+            "reward": float(main),
+            **{(k if k.startswith("metric/") else f"metric/{k}"): v for k, v in comps.items() if k != self.reward_key},
+        }
         if self.session is not None:  # harness profiles hook: the mix's share and reward per profile
             name = self.session.profile.name
             out.update({f"metric/profile/{n}": float(n == name) for n in set(self.harness.names) | {name}})
@@ -662,8 +739,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(results, indent=1))
     else:
         for res in results:
-            print(f"{'ok ' if res['valid'] else 'BAD'}  oracle={res.get('oracle')} nop={res.get('nop')}  {res['task']}"
-                  + (f"  {res.get('oracle_error') or res.get('nop_error')}" if not res["valid"] else ""))
+            print(
+                f"{'ok ' if res['valid'] else 'BAD'}  oracle={res.get('oracle')} nop={res.get('nop')}  {res['task']}"
+                + (f"  {res.get('oracle_error') or res.get('nop_error')}" if not res["valid"] else "")
+            )
         print(f"{sum(x['valid'] for x in results)}/{len(results)} valid")
     return 0 if all(x["valid"] for x in results) else 1
 

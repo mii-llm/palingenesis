@@ -91,8 +91,10 @@ class Finish(StopRule):
 @dataclass
 class Flag(StopRule):
     confirm: bool = True
-    confirm_message: str = ("Are you sure you want to mark the task as complete? If so, set the completion flag "
-                            "again in your next response.")
+    confirm_message: str = (
+        "Are you sure you want to mark the task as complete? If so, set the completion flag "
+        "again in your next response."
+    )
     requires_action: bool = True
 
     def on_tool(self, session, name, args, output):

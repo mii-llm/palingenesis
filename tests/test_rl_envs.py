@@ -227,7 +227,6 @@ def test_dynamic_tools_and_environment_ended_episode():
     assert "submit" in tok.decode(t.prompt_ids)  # the dynamic schema reached the prompt
 
 
-
 class _Tracked(Submission):
     """Records when each instance is scored and closed relative to the others."""
 
@@ -270,15 +269,29 @@ def test_environments_are_scored_and_released_when_their_episode_ends():
     eot = end_of_turn_id(tok, kwargs)
     call = '<tool_call>\n{"name": "submit", "arguments": {"answer": "5"}}\n</tool_call>'
     config = RLConfig()
-    for key, value in {"model.policy": "x", "model.chat_template_kwargs": kwargs, "env.max_turns": 4,
-                       "rollout.max_new_tokens": 64, "rollout.max_model_len": 4096}.items():
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 4,
+        "rollout.max_new_tokens": 64,
+        "rollout.max_model_len": 4096,
+    }.items():
         config.set(key, value)
     rows = [{"prompt": "What is 2 + 3? Submit it."}]
     for rewards, early in (([], True), ([Reward("peek", lambda env, **_: 0.0)], False)):
         _Tracked.events, _Tracked.made = [], 0
-        pipeline = RLPipeline(tok, ChatFormat(tok, eot, kwargs), ScriptedEngine(tok, eot, [call, "never"]),
-                              PublishedWeights(torch.nn.Linear(1, 1)), config, PromptSampler(rows), rewards,
-                              EnvPool(_Tracked), None, (eot,))
+        pipeline = RLPipeline(
+            tok,
+            ChatFormat(tok, eot, kwargs),
+            ScriptedEngine(tok, eot, [call, "never"]),
+            PublishedWeights(torch.nn.Linear(1, 1)),
+            config,
+            PromptSampler(rows),
+            rewards,
+            EnvPool(_Tracked),
+            None,
+            (eot,),
+        )
         try:
             assert pipeline._early_release is early
             (group,) = pipeline._await(pipeline._eval(rows, 1.0, 3))
@@ -570,12 +583,27 @@ def test_text_protocol_environment_runs_actions_from_text():
     eot = end_of_turn_id(tok, kwargs)
     engine = ScriptedEngine(tok, eot, ["<lookup>capital</lookup>", "The capital is Rome.", "never"])
     config = RLConfig()
-    for key, value in {"model.policy": "x", "model.chat_template_kwargs": kwargs, "env.max_turns": 4,
-                       "rollout.max_new_tokens": 64, "rollout.max_model_len": 4096}.items():
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 4,
+        "rollout.max_new_tokens": 64,
+        "rollout.max_model_len": 4096,
+    }.items():
         config.set(key, value)
     rows = [{"prompt": "Use <lookup>key</lookup> to look things up. What is the capital?"}]
-    pipeline = RLPipeline(tok, ChatFormat(tok, eot, kwargs), engine, PublishedWeights(torch.nn.Linear(1, 1)), config,
-                          PromptSampler(rows), [], EnvPool(_TagProtocol), None, (eot,))
+    pipeline = RLPipeline(
+        tok,
+        ChatFormat(tok, eot, kwargs),
+        engine,
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        PromptSampler(rows),
+        [],
+        EnvPool(_TagProtocol),
+        None,
+        (eot,),
+    )
     try:
         (group,) = pipeline._await(pipeline._eval(rows, 1.0))
     finally:

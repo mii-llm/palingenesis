@@ -11,8 +11,13 @@ import torch
 
 # Gated-DeltaNet fast paths. Where causal-conv1d / fla are installed (the GPU box), HF builds the linear-attention
 # layers on their CUDA/Triton kernels whatever the tensors' device and dtype, and those reject fp64 CPU tensors.
-_KERNELS = ("causal_conv1d_fn", "causal_conv1d_update", "chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule",
-            "FusedRMSNormGated")
+_KERNELS = (
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+    "FusedRMSNormGated",
+)
 
 
 @contextlib.contextmanager
@@ -35,6 +40,7 @@ def torch_kernels(model_type: str):
     finally:
         for k, v in saved.items():
             setattr(module, k, v)
+
 
 VOCAB = 97
 COMMON = dict(

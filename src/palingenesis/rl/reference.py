@@ -49,9 +49,13 @@ class ReferencePolicy:
                 positions[row, [len(t.prompt_ids) + j - 1 for j in sampled]] = True
                 targets += [t.tokens[j] for j in sampled]
                 counts.append(len(sampled))
-            with torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16, enabled=self.device.startswith("cuda")):
+            with torch.autocast(
+                self.device.split(":")[0], dtype=torch.bfloat16, enabled=self.device.startswith("cuda")
+            ):
                 hidden = final_hidden_states(self.model, ids, None)[positions.to(self.device)]
-            lp, _ = target_logprobs(hidden.float() * self.inv_temperature, self.head, torch.tensor(targets, device=self.device))
+            lp, _ = target_logprobs(
+                hidden.float() * self.inv_temperature, self.head, torch.tensor(targets, device=self.device)
+            )
             for t, piece in zip(micro, torch.split(lp.detach(), counts)):
                 out[id(t)] = piece
         return out
@@ -62,8 +66,10 @@ class ReferencePolicy:
         state = {k: v.detach().to(torch.bfloat16) for k, v in model.state_dict().items()}
         result = self.model.load_state_dict(state, strict=False)
         if result.missing_keys or result.unexpected_keys:  # a partial reset would leave a stale anchor, silently
-            raise RuntimeError(f"reference reset: parameter names differ from the policy's "
-                               f"(missing {result.missing_keys[:3]}, unexpected {result.unexpected_keys[:3]})")
+            raise RuntimeError(
+                f"reference reset: parameter names differ from the policy's "
+                f"(missing {result.missing_keys[:3]}, unexpected {result.unexpected_keys[:3]})"
+            )
 
 
 def kl_k3(policy_lp: torch.Tensor, reference_lp: torch.Tensor) -> torch.Tensor:

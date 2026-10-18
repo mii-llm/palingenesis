@@ -31,9 +31,14 @@ FORMAT_ERROR = "__format_error__"  # the synthetic action that answers a turn br
 
 def fn_schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
     """An OpenAI function tool schema."""
-    return {"type": "function", "function": {"name": name, "description": description,
-                                             "parameters": {"type": "object", "properties": properties,
-                                                            "required": required}}}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties, "required": required},
+        },
+    }
 
 
 @dataclass
@@ -100,13 +105,25 @@ class HarnessProfile:
         return [t.schema for t in self.tools]
 
     def messages(self, instruction: str, **values: str) -> list[dict]:
-        vals = {"workdir": "/workdir", "date": "", "model": "", "system_information": "Linux", "git_repo": "no", "git_root": "/",
-                **self.values, **values}
+        vals = {
+            "workdir": "/workdir",
+            "date": "",
+            "model": "",
+            "system_information": "Linux",
+            "git_repo": "no",
+            "git_root": "/",
+            **self.values,
+            **values,
+        }
         vals["tools"] = "" if self.protocol.native else self.protocol.instructions(self.schemas())
         vals["instruction"] = instruction
         out = [{"role": "system", "content": render(self.system, vals)}] if self.system else []
-        out.append({"role": "user", "content": render(self.user.replace("{instruction}", "\0"), vals)
-                    .replace("\0", instruction)})
+        out.append(
+            {
+                "role": "user",
+                "content": render(self.user.replace("{instruction}", "\0"), vals).replace("\0", instruction),
+            }
+        )
         return out
 
 
@@ -135,7 +152,9 @@ class Session:
             r = self.ws.sh("uname -srvm", timeout=30)
             values["system_information"] = r.stdout.strip() if r.exit_code == 0 else "Linux"
         if self.ws is not None and "{git_repo}" in templates:
-            r = self.ws.sh(f"git -C {shlex.quote(self.workdir)} rev-parse --is-inside-work-tree 2>/dev/null", timeout=30)
+            r = self.ws.sh(
+                f"git -C {shlex.quote(self.workdir)} rev-parse --is-inside-work-tree 2>/dev/null", timeout=30
+            )
             values["git_repo"] = "yes" if r.stdout.strip() == "true" else "no"
         if self.ws is not None and "{git_root}" in templates:
             r = self.ws.sh(f"git -C {shlex.quote(self.workdir)} rev-parse --show-toplevel 2>/dev/null", timeout=30)
@@ -176,8 +195,11 @@ class Session:
         if actions:
             return actions
         if p.stop.requires_action:
-            reason = "No tool calls found in the response. Every response MUST include at least one tool call." \
-                if p.protocol.native else "Expected exactly 1 action, found 0."
+            reason = (
+                "No tool calls found in the response. Every response MUST include at least one tool call."
+                if p.protocol.native
+                else "Expected exactly 1 action, found 0."
+            )
             return [(FORMAT_ERROR, {"message": p.format_error(reason, 0)})]
         return None
 
@@ -274,9 +296,15 @@ class HarnessMix:
         keys = list(self.weights)
         if len(keys) == 1:
             return get_profile(keys[0])
-        anchor = group if group is not None else hashlib.sha256(
-            json.dumps({k: v for k, v in row.items() if k != "harness_profile"}, sort_keys=True, default=str)
-            .encode()).hexdigest()
+        anchor = (
+            group
+            if group is not None
+            else hashlib.sha256(
+                json.dumps(
+                    {k: v for k, v in row.items() if k != "harness_profile"}, sort_keys=True, default=str
+                ).encode()
+            ).hexdigest()
+        )
         u = _unit(f"{self.seed}|{anchor}|{row.get('task_dir', '')}") * sum(self.weights.values())
         acc = 0.0
         for k in keys:

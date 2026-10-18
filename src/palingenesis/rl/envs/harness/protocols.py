@@ -78,8 +78,9 @@ class FencedCommand(Protocol):
 
     name = "fenced"
 
-    def __init__(self, lang: str = "mswea_bash_command", tool: str = "bash", arg: str = "command",
-                 exactly_one: bool = True):
+    def __init__(
+        self, lang: str = "mswea_bash_command", tool: str = "bash", arg: str = "command", exactly_one: bool = True
+    ):
         self.lang, self.tool, self.arg, self.exactly_one = lang, tool, arg, exactly_one
         self.regex = re.compile(rf"```{re.escape(lang)}\s*\n(.*?)\n```", re.DOTALL)
 
@@ -98,9 +99,10 @@ class XmlTool(Protocol):
     pattern = re.compile(r'<tool\s+name="([^"]+)"\s*>(.*?)</tool>', re.DOTALL)
 
     def instructions(self, schemas):
-        return ('Write each action as <tool name="NAME">{"argument": value}</tool>; several actions in one message '
-                "if they are independent. When you are done, answer in plain text with no action.\n\n"
-                + tool_lines(schemas))
+        return (
+            'Write each action as <tool name="NAME">{"argument": value}</tool>; several actions in one message '
+            "if they are independent. When you are done, answer in plain text with no action.\n\n" + tool_lines(schemas)
+        )
 
     def parse(self, content):
         out = []
@@ -123,8 +125,10 @@ class ReAct(Protocol):
     pattern = re.compile(r"Action:\s*([\w.-]+)\s*\nAction Input:\s*(\{.*?\}|\S*)\s*(?=\n\S|\Z)", re.DOTALL)
 
     def instructions(self, schemas):
-        return ("Write one action per message as\nAction: NAME\nAction Input: {\"argument\": value}\n"
-                "When you are done, answer in plain text with no action.\n\n" + tool_lines(schemas))
+        return (
+            'Write one action per message as\nAction: NAME\nAction Input: {"argument": value}\n'
+            "When you are done, answer in plain text with no action.\n\n" + tool_lines(schemas)
+        )
 
     def parse(self, content):
         found = self.pattern.findall(content or "")
@@ -150,8 +154,10 @@ class JsonBlock(Protocol):
     pattern = re.compile(r"```json\s*\n?(.*?)```", re.DOTALL)
 
     def instructions(self, schemas):
-        return ('Write each action as a ```json {"action": "NAME", "args": {...}} ``` block; several blocks if they '
-                "are independent. When you are done, answer in plain text with no action.\n\n" + tool_lines(schemas))
+        return (
+            'Write each action as a ```json {"action": "NAME", "args": {...}} ``` block; several blocks if they '
+            "are independent. When you are done, answer in plain text with no action.\n\n" + tool_lines(schemas)
+        )
 
     def parse(self, content):
         out = []
@@ -166,8 +172,9 @@ class JsonBlock(Protocol):
         return out
 
     def render(self, calls):
-        return "\n".join("```json\n" + json.dumps({"action": n, "args": a}, ensure_ascii=False) + "\n```"
-                         for n, a in calls)
+        return "\n".join(
+            "```json\n" + json.dumps({"action": n, "args": a}, ensure_ascii=False) + "\n```" for n, a in calls
+        )
 
     def observation(self, results):
         return "\n\n".join(f"Result ({n}):\n{o}" for n, o in results)
@@ -181,9 +188,10 @@ class Tags(Protocol):
 
     def instructions(self, schemas):
         self.names = [s.get("function", s)["name"] for s in schemas]
-        return ('Write each action as <TOOL_NAME>{"argument": value}</TOOL_NAME>, one tag per action; several tags '
-                "if they are independent. When you are done, answer in plain text with no action.\n\n"
-                + tool_lines(schemas))
+        return (
+            'Write each action as <TOOL_NAME>{"argument": value}</TOOL_NAME>, one tag per action; several tags '
+            "if they are independent. When you are done, answer in plain text with no action.\n\n" + tool_lines(schemas)
+        )
 
     def parse(self, content):
         out = []
