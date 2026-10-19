@@ -166,3 +166,85 @@ def test_cli(tmp_path, capsys):
         wl["model.embed.weight"],
         (0.25 * wa["model.embed.weight"].float() + 0.75 * wb["model.embed.weight"].float()).to(torch.bfloat16),
     )
+
+
+def test_model_stock_ratio_math():
+    base = torch.zeros(4, 4)
+    d = torch.randn(4, 4)
+    # identical task vectors: c = 1 -> t = 1 (the average); orthogonal: c = 0 -> t = 0 (the base)
+    assert torch.isclose(M.stock_ratio(base, [base + d, base + d]), torch.tensor([1.0])).all()
+    e = torch.zeros(4, 4)
+    e[0, 0] = 1.0
+    f = torch.zeros(4, 4)
+    f[1, 1] = 1.0
+    assert torch.isclose(M.stock_ratio(base, [e, f]), torch.tensor([0.0])).all()
+    # opposite task vectors (c = -1) are clamped to the base, not extrapolated
+    assert M.stock_ratio(base, [base + d, base - d]).item() == 0.0
+    # k = 3, c = 0.5 -> t = 3 * .5 / (1 + 2 * .5) = .75 ; built from unit vectors with pairwise cosine .5
+    v = [
+        torch.tensor([1.0, 0, 0]),
+        torch.tensor([0.5, 0.75**0.5, 0]),
+        torch.tensor([0.5, 0.75**0.5 / 3, (2 / 3) ** 0.5]),
+    ]
+    t = M.stock_ratio(torch.zeros(3), v)
+    assert torch.isclose(t, torch.tensor([0.75]), atol=1e-5).all()
+    # filter_wise: one t per output row
+    assert M.stock_ratio(base, [base + d, base + 2 * d], filter_wise=True).shape == (4,)
+    with pytest.raises(M.MergeError):
+        M.stock_ratio(base, [d])
+
+
+def test_model_stock_merge_and_config(tmp_path):
+    base = make(tmp_path / "base", 0, dtype=torch.float32)
+    wb = weights(base)
+    paths = []
+    for i in range(3):  # fine-tunes = base + shared update + private noise
+        g = torch.Generator().manual_seed(100 + i)
+        shared = {n: torch.ones(SHAPES[n]) for n in NAMES}
+        p = tmp_path / f"m{i}"
+        p.mkdir()
+        save_file(
+            {n: wb[n] + shared[n] + 0.5 * torch.randn(SHAPES[n], generator=g) for n in NAMES},
+            str(p / "model.safetensors"),
+        )
+        (p / "config.json").write_text("{}")
+        paths.append(p)
+    M.model_stock(base, paths, tmp_path / "out")
+    wo, ws = weights(tmp_path / "out"), [weights(p) for p in paths]
+    cfg = json.loads((tmp_path / "out" / "merge_config.json").read_text())
+    assert cfg["method"] == "model_stock" and set(cfg["t"]) == set(NAMES)
+    for n in NAMES:
+        t = M.stock_ratio(wb[n], [w[n] for w in ws])
+        expect = wb[n] + t * (torch.stack([w[n] for w in ws]).mean(0) - wb[n])
+        assert torch.allclose(wo[n], expect, atol=1e-6)
+        assert 0.0 < cfg["t"][n] < 1.0  # partial agreement: between the base and the average
+    assert M.main(["model-stock", "--base", str(base), *map(str, paths), "-o", str(tmp_path / "cli")]) == 0
+
+
+def test_ram_unique_kept_shared_averaged(tmp_path):
+    base = make(tmp_path / "base", 0, dtype=torch.float32)
+    wb = weights(base)
+    deltas = []
+    for i, p in enumerate((tmp_path / "a", tmp_path / "b")):
+        p.mkdir()
+        d = {n: torch.zeros(SHAPES[n]) for n in NAMES}
+        for n in NAMES:
+            d[n][0, 0] = 1.0 + i  # shared: both change element (0, 0)
+            d[n][1 + i, 1] = 3.0  # unique: a changes (1, 1), b changes (2, 1)
+        save_file({n: wb[n] + d[n] for n in NAMES}, str(p / "model.safetensors"))
+        (p / "config.json").write_text("{}")
+        deltas.append(d)
+    M.ram(base, [tmp_path / "a", tmp_path / "b"], tmp_path / "out")
+    wo = weights(tmp_path / "out")
+    for n in NAMES:
+        got = wo[n] - wb[n]
+        assert torch.isclose(got[0, 0], torch.tensor(1.5))  # shared: mean of 1 and 2
+        assert torch.isclose(got[1, 1], torch.tensor(3.0)) and torch.isclose(
+            got[2, 1], torch.tensor(3.0)
+        )  # unique: whole
+        assert got.abs().sum() == got[0, 0].abs() + got[1, 1].abs() + got[2, 1].abs()  # inactive: base
+    cfg = json.loads((tmp_path / "out" / "merge_config.json").read_text())
+    assert cfg["method"] == "ram" and cfg["unique_share"] > 0 and cfg["shared_share"] > 0
+    assert (
+        M.main(["ram", "--base", str(base), str(tmp_path / "a"), str(tmp_path / "b"), "-o", str(tmp_path / "c")]) == 0
+    )

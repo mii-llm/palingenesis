@@ -7,6 +7,12 @@ interpolation back, soups), task arithmetic, and materializing partial checkpoin
     soup(models, out)                            w = mean_i W_i
     task_arithmetic(base, models, weights, out)  w = base + sum_i l_i (W_i - base) (add what each model learned on top of a
                                                                                     shared base; [1, l] = A + l (B - base))
+    model_stock(base, models, out)               w = base + t (mean_i W_i - base), t per tensor from the mean pairwise
+                                                 cosine c of the task vectors W_i - base: t = k c / (1 + (k - 1) c)
+                                                 (Model Stock, Jang et al. 2024, arXiv 2403.19522; mergekit model_stock)
+    ram(base, models, out)                       per element: a change made by one model only is kept whole, a change made
+                                                 by several is averaged over them (|W_i - base| > eps counts as a change)
+                                                 (RAM, Yuan et al. 2026, arXiv 2601.13572: RL task vectors are sparse)
     materialize(checkpoint, template, out)       a partial checkpoint (e.g. a text-only training save) completed with the
                                                  template's other tensors and files, so it loads like the template
 
@@ -21,6 +27,8 @@ output records the method, sources, coefficients and counts. Sources are local d
     pgs merge linear A:0.7 B:0.3 -o out/
     pgs merge soup A B C -o out/
     pgs merge task-arithmetic --base Qwen/Qwen3.5-0.8B agent:1 expert:0.3 -o out/
+    pgs merge model-stock --base runs/start runs/a runs/b runs/c -o out/
+    pgs merge ram --base runs/start runs/agent runs/web -o out/
     pgs merge materialize runs/x/step-200/model --template runs/x/final -o out/
 """
 
@@ -168,8 +176,10 @@ def _combine(
     dtype,
     overwrite: bool,
     extra: str,
+    per_tensor=None,
 ) -> MergeReport:
-    """out = base + sum_i c_i (W_i - base) when base is given, else sum_i c_i W_i; tensor set and layout = template's."""
+    """out = base + sum_i c_i (W_i - base) when base is given, else sum_i c_i W_i; tensor set and layout = template's.
+    per_tensor(name, base, [W_i]) -> merged float32 tensor replaces the fixed-coefficient sum (base required)."""
     if missing not in ("error", "template"):
         raise MergeError(f"missing must be 'error' or 'template', not {missing!r}")
     if extra not in ("error", "drop"):
@@ -219,11 +229,14 @@ def _combine(
                     total_size += ref.numel() * ref.element_size()
                     written += 1
                     continue
-                acc = base.tensor(name).float() if base is not None else torch.zeros(ref.shape, dtype=torch.float32)
-                b = acc.clone() if base is not None else None
-                for c, coef in terms:
-                    w = c.tensor(name).float()
-                    acc += coef * (w - b) if b is not None else coef * w
+                if per_tensor is not None:
+                    acc = per_tensor(name, base.tensor(name).float(), [c.tensor(name).float() for c, _ in terms])
+                else:
+                    acc = base.tensor(name).float() if base is not None else torch.zeros(ref.shape, dtype=torch.float32)
+                    b = acc.clone() if base is not None else None
+                    for c, coef in terms:
+                        w = c.tensor(name).float()
+                        acc += coef * (w - b) if b is not None else coef * w
                 if not torch.isfinite(acc).all():
                     raise MergeError(f"tensor {name!r}: non-finite values after merging")
                 t = acc.to(out_dtype or ref.dtype)
@@ -345,6 +358,128 @@ def task_arithmetic(
     )
 
 
+def stock_ratio(base: torch.Tensor, models: list[torch.Tensor], filter_wise: bool = False) -> torch.Tensor:
+    """Model Stock interpolation ratio t for one tensor: c = mean pairwise cosine of the task vectors W_i - base (whole
+    tensor, or per output row with filter_wise), t = k c / (1 + (k - 1) c), clamped to [0, 1] (a negative c, i.e.
+    disagreeing models, keeps the base; mergekit leaves t unclamped). Returns a scalar, or one value per row."""
+    k = len(models)
+    if k < 2:
+        raise MergeError("model_stock needs at least two models besides the base")
+    if filter_wise and base.dim() >= 2:
+        d = [(w - base).reshape(base.shape[0], -1) for w in models]
+    else:
+        d = [(w - base).reshape(1, -1) for w in models]
+    cos = []
+    for i in range(k):
+        for j in range(i + 1, k):
+            cos.append(torch.nn.functional.cosine_similarity(d[i], d[j], dim=1, eps=1e-12))
+    c = torch.stack(cos).mean(0)
+    den = 1 + (k - 1) * c
+    t = torch.where(den.abs() < 1e-6, torch.zeros_like(c), k * c / den)
+    return t.clamp(0.0, 1.0)
+
+
+def model_stock(
+    base: str | Path,
+    models: list[str | Path],
+    out: str | Path,
+    *,
+    filter_wise: bool = False,
+    template: str | Path | None = None,
+    missing: str = "error",
+    dtype=None,
+    overwrite: bool = False,
+    extra: str = "error",
+) -> MergeReport:
+    """Model Stock (Jang et al. 2024): w = base + t (mean_i W_i - base) per tensor, t from how much the fine-tunes agree
+    (mean pairwise cosine of their task vectors): agreeing models (c -> 1) give their average, disagreeing ones (c -> 0)
+    stay near the base, so shared improvements are kept and run-specific noise is averaged out. Needs >= 2 fine-tunes
+    of the same base. merge_config.json records the per-tensor t. Template: the first model."""
+    cks = _checkpoints(models)
+    b = base if isinstance(base, Checkpoint) else Checkpoint(base)
+    tpl = Checkpoint(template) if template is not None else cks[0]
+    ratios: dict[str, float] = {}
+
+    def fn(name, w0, ws):
+        t = stock_ratio(w0, ws, filter_wise)
+        ratios[name] = round(float(t.mean()), 5)
+        avg = torch.stack(ws).mean(0)
+        if t.numel() > 1:
+            t = t.reshape(-1, *([1] * (w0.dim() - 1)))
+        return w0 + t * (avg - w0)
+
+    report = _combine(
+        "model_stock",
+        [(c, 1.0 / len(cks)) for c in cks],
+        out,
+        base=b,
+        template=tpl,
+        missing=missing,
+        dtype=dtype,
+        overwrite=overwrite,
+        extra=extra,
+        per_tensor=fn,
+    )
+    vals = list(ratios.values())
+    summary = {
+        "filter_wise": filter_wise,
+        "t_mean": round(sum(vals) / max(len(vals), 1), 4),
+        "t_min": min(vals, default=None),
+        "t_max": max(vals, default=None),
+        "t": ratios,
+    }
+    return _relabel(report, "model_stock", summary)
+
+
+def ram(
+    base: str | Path,
+    models: list[str | Path],
+    out: str | Path,
+    *,
+    eps: float = 1e-5,
+    template: str | Path | None = None,
+    missing: str = "error",
+    dtype=None,
+    overwrite: bool = False,
+    extra: str = "error",
+) -> MergeReport:
+    """RAM (Yuan et al. 2026, "Behavior Knowledge Merge in Reinforced Agentic Models"; mergekit `ram`): on-policy RL
+    changes a sparse, model-specific subset of the weights, so averaging task vectors dilutes each model's unique
+    changes by 1/k. Per element, with active_i = |W_i - base| > eps: w = base + sum_i active_i (W_i - base) / n_active
+    (n_active >= 1), i.e. a change only one model made is kept whole and changes several made are averaged. Template:
+    the first model. merge_config.json records the share of unique / shared / inactive elements."""
+    if len(models) < 2:
+        raise MergeError("ram needs at least two models besides the base")
+    cks = _checkpoints(models)
+    b = base if isinstance(base, Checkpoint) else Checkpoint(base)
+    tpl = Checkpoint(template) if template is not None else cks[0]
+    counts = {"unique": 0, "shared": 0, "inactive": 0}
+
+    def fn(name, w0, ws):
+        tv = torch.stack([w - w0 for w in ws])
+        act = tv.abs() > eps
+        n = act.sum(0)
+        counts["unique"] += int((n == 1).sum())
+        counts["shared"] += int((n > 1).sum())
+        counts["inactive"] += int((n == 0).sum())
+        return w0 + (tv * act).sum(0) / n.clamp(min=1)
+
+    report = _combine(
+        "ram",
+        [(c, 1.0) for c in cks],
+        out,
+        base=b,
+        template=tpl,
+        missing=missing,
+        dtype=dtype,
+        overwrite=overwrite,
+        extra=extra,
+        per_tensor=fn,
+    )
+    total = max(sum(counts.values()), 1)
+    return _relabel(report, "ram", {"eps": eps, **{f"{k}_share": round(v / total, 4) for k, v in counts.items()}})
+
+
 def materialize(
     checkpoint: str | Path, template: str | Path, out: str | Path, *, dtype=None, overwrite: bool = False
 ) -> MergeReport:
@@ -423,6 +558,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base", required=True)
     p.add_argument("models", nargs="+", metavar="MODEL:WEIGHT")
     common(p)
+    p = sub.add_parser("model-stock", help="base + t (mean_i W_i - base), t per tensor from task-vector agreement")
+    p.add_argument("--base", required=True)
+    p.add_argument("models", nargs="+")
+    p.add_argument("--filter-wise", action="store_true", help="one t per output row instead of per tensor")
+    common(p)
+    p = sub.add_parser("ram", help="per element: one model's change kept whole, several models' changes averaged")
+    p.add_argument("--base", required=True)
+    p.add_argument("models", nargs="+")
+    p.add_argument("--eps", type=float, default=1e-5, help="|W_i - base| above this counts as a change")
+    common(p)
     p = sub.add_parser("materialize", help="complete a partial checkpoint from a full export")
     p.add_argument("checkpoint")
     p.add_argument("--template", required=True)
@@ -444,6 +589,10 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "task-arithmetic":
             models, weights = _model_weights(a.models)
             report = task_arithmetic(a.base, models, weights, a.out, **kw)
+        elif a.cmd == "ram":
+            report = ram(a.base, a.models, a.out, eps=a.eps, **kw)
+        elif a.cmd == "model-stock":
+            report = model_stock(a.base, a.models, a.out, filter_wise=a.filter_wise, **kw)
         else:
             report = materialize(a.checkpoint, a.template, a.out, **kw)
     except MergeError as e:

@@ -31,7 +31,7 @@ Commands:
   rl          Reinforcement learning: rollouts scored by rewards (math, code, tools, your own)
   harbor      Harbor task directories (Docker envs with tests): check oracle/nop, export RL rows
   harness     Harness profiles for Harbor tasks: list, record a real harness's requests (capture)
-  merge       Weight-space merging: interpolate, linear, soup, task-arithmetic, materialize
+  merge       Weight-space merging: interpolate, linear, soup, task-arithmetic, model-stock, ram, materialize
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
   prepare     Score and filter data by difficulty (offline, uses model inference)
   prepare-multi  Prepare multiple sources with per-source scoring + MSFT allocation

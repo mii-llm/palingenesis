@@ -76,6 +76,8 @@ pgs merge interpolate START END --lam 0.3 -o OUT          # START + lam (END - S
 pgs merge linear A:0.7 B:0.3 -o OUT                       # weights sum to 1 (--unnormalized to allow others)
 pgs merge soup A B C -o OUT                               # mean
 pgs merge task-arithmetic --base BASE A:1 B:0.3 -o OUT    # BASE + sum l_i (W_i - BASE)
+pgs merge model-stock --base BASE A B C -o OUT            # BASE + t (mean - BASE), t per tensor from agreement
+pgs merge ram --base BASE A B -o OUT                      # unique changes kept whole, shared ones averaged
 pgs merge materialize CKPT --template EXPORT -o OUT       # complete a partial checkpoint
 ```
 

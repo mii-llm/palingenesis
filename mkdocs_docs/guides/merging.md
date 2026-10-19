@@ -31,10 +31,29 @@ print(report)            # soup: 488 tensors -> runs/soup
 | `linear(models, weights)` | `W = sum_i a_i * W_i`, `sum_i a_i = 1` | weighted mixes of siblings (`unnormalized=True` allows other sums) |
 | `soup(models)` | `W = mean_i W_i` | averaging same-origin runs (seeds, sibling stages) |
 | `task_arithmetic(base, models, weights)` | `W = base + sum_i l_i * (W_i - base)` | add each model's change from a shared base; with weights `[1, lam]`, model A keeps all of its own training and gains lam of B's |
+| `model_stock(base, models)` | `W = base + t * (mean_i W_i - base)`, per tensor `t = k c / (1 + (k - 1) c)`, `c` = mean pairwise cosine of the task vectors `W_i - base` (clamped to [0, 1]) | several fine-tunes of one base: keeps what they agree on and shrinks toward the base where they disagree ([Model Stock](https://arxiv.org/abs/2403.19522)); `filter_wise=True` gives one `t` per output row |
+| `ram(base, models, eps)` | per element: a change (`|W_i - base| > eps`) made by one model is kept whole; changes made by several are averaged | combining RL-trained experts, whose task vectors are sparse and nearly orthogonal ([RAM](https://arxiv.org/abs/2601.13572)): averaging would dilute each one's unique changes by `1/k` |
 | `materialize(checkpoint, template)` | the checkpoint's tensors + the template's other tensors and files | intermediate training saves that hold only the trained (text) weights and a training config |
 
 Why task arithmetic for adding an expert rather than a linear merge: `a * A + (1 - a) * B` also pulls A back toward the base
 by `1 - a`, undoing part of A's training. `A + lam * (B - base)` adds only what B learned.
+
+### Which method for which situation
+
+Measure the task vectors before choosing. Two numbers decide: how many weights each model changed, and how aligned the
+changes are. On our 0.8B RL runs from one base (LR 1e-6, 100–250 steps):
+
+- **Sparsity.** 19–37% of weights changed by more than 1e-5, so the task vectors are sparse.
+- **Separate experts are nearly orthogonal.** Pairwise cosine is .01–.13. Where two experts both changed a weight, their
+  signs agree only 51–60% of the time.
+- **Checkpoints of one run share a path.** Step 100 against step 250 has cosine .66 and 98% sign agreement.
+
+| Situation | Suited | Not suited, and why |
+|---|---|---|
+| A run overshot (general skills drifted) | `interpolate` toward the start (WiSE-FT); `soup` or `model_stock` of its checkpoints (Model Stock reduces to a mild shrink of the checkpoint average, `t` ≈ .9) | `ram` and TIES: checkpoints share signs, so there is nothing to disentangle |
+| Combining experts trained separately from one base | `task_arithmetic` (keeps each whole; interference is low when the vectors are orthogonal); `ram` (also averages the overlapping elements) | `linear`, `soup`, `model_stock`: they divide each expert by about `k` (Model Stock gave `t` = .20 for three experts). TIES sign election at ~50% agreement is a coin flip. DARE's random drop + rescale adds noise to already sparse vectors |
+
+A merge cannot remove a regression that an expert already has: check each expert alone before merging.
 
 ## Guarantees
 
