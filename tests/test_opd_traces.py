@@ -163,6 +163,25 @@ def test_prompt_rows_become_one_turn_traces(tok, tmp_path):
         msgs[:-1], tools=TOOLS, add_generation_prompt=True, tokenize=False, enable_thinking=False
     )
     assert tok.decode(plan.branches[0].context) == want and "(regenerated)" not in want
+    # tool-call arguments stored as JSON strings (wire format) are parsed, as for recorded traces
+    wire = {
+        "messages": [
+            {"role": "user", "content": "Weather in Rome?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": "shell", "arguments": json.dumps({"command": "date"})}}
+                ],
+            },
+            {"role": "tool", "content": "Mon"},
+        ],
+        "tools": TOOLS,
+    }
+    path.write_text(json.dumps(wire) + "\n")
+    row = load_prompt_rows_as_traces(str(path), chat_template_kwargs={"enable_thinking": False})[0]
+    assert isinstance(row["messages"][1]["tool_calls"][0]["function"]["arguments"], dict)
+    assert p.plan(row["messages"], TOOLS, random.Random(0)) is not None
     # a row whose own template arguments disagree with the source's is refused
     path.write_text(json.dumps({**rows[0], "chat_template_kwargs": {"enable_thinking": True}}) + "\n")
     with pytest.raises(ValueError, match="different sources"):

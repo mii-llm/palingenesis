@@ -284,9 +284,8 @@ def load_prompt_rows_as_traces(
             if not line.strip():
                 continue
             record = json.loads(line)
-            messages = record.get(messages_field)
-            if isinstance(messages, str):
-                messages = json.loads(messages)
+            # the same normalization as recorded traces: JSON-string conversations / arguments parsed, None keys dropped
+            messages = normalize_messages(record, messages_field)
             if not messages or messages[-1].get("role") not in ("user", "tool"):
                 skipped += 1
                 continue
@@ -309,7 +308,7 @@ def load_prompt_rows_as_traces(
                         for k, v in record.items()
                         if k not in (messages_field, tools_field, "chat_template_kwargs")
                     },
-                    "messages": [dict(m) for m in messages] + [{"role": "assistant", "content": "(regenerated)"}],
+                    "messages": messages + [{"role": "assistant", "content": "(regenerated)"}],
                     "tools": normalize_tools(tools) if tools else None,
                 }
             )
