@@ -230,6 +230,35 @@ def test_traces_mixed_with_prompt_source(tmp_path, models):
     assert "dev_kl_full/chat" in evals[-1] and "dev_kl_full/traces" in evals[-1]
 
 
+def test_stop_at_chunks_follow_one_schedule(tmp_path, models):
+    """steps 4 with stop_at 2 then a resume: the LR follows the 4-step schedule across the chunks, step_2 is
+    resumable, final only at the end (a chunked run equals one run)."""
+    from palingenesis.opd.trace_trainer import TraceTrainer
+
+    base = {
+        "train.steps": 4,
+        "train.warmup_steps": 1,
+        "train.save_steps": 2,
+        "train.eval_every": 2,
+        "train.resume_from": "auto",
+        "loss.trace_kd_weight": 0.0,
+    }
+    lrs = {}
+
+    def run(**extra):
+        t = TraceTrainer(make_config(tmp_path, models, **{**base, **extra}))
+        t._log = lambda kind, m, step: lrs.__setitem__(step, m["lr"]) if kind == "step" else None
+        t.train()
+
+    run(**{"train.stop_at": 2})
+    out = tmp_path / "run"
+    assert (out / "step_2" / "trainer_state.pt").exists() and not (out / "final").exists()
+    run()
+    assert (out / "final" / "config.json").exists()
+    ref = TraceTrainer(make_config(tmp_path, models, **base))
+    assert lrs == {k + 1: pytest.approx(ref._lr_at(k)) for k in range(4)}  # one cosine over 4 steps, no restart
+
+
 def test_trace_config_validation(tmp_path, models):
     from palingenesis.opd.config import OPDConfigError
 

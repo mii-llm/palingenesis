@@ -579,14 +579,16 @@ class OPDTrainer:
 
     def train(self) -> None:
         config = self.config
-        if self.start_step >= config.train.steps:
-            logger.warning("the checkpoint is at step %d of %d: nothing to train", self.start_step, config.train.steps)
+        stop_at = config.train.stop_at
+        end = stop_at if 0 < stop_at < config.train.steps else config.train.steps
+        if self.start_step >= end:
+            logger.warning("the checkpoint is at step %d, the run stops at %d: nothing to train", self.start_step, end)
         self.orchestrator.start()
         try:
             if config.train.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)
             start_time = time.time()
-            for step in range(self.start_step, config.train.steps):
+            for step in range(self.start_step, end):
                 t0 = time.perf_counter()
                 batch = self.orchestrator.next(self.weights.version)
                 waited = time.perf_counter() - t0
@@ -632,9 +634,16 @@ class OPDTrainer:
                     self._log("eval", self.evaluate(), step + 1)
                 if config.train.save_steps and (step + 1) % config.train.save_steps == 0:
                     self.save(f"step_{step + 1}", step + 1)
-            if config.train.eval_every:
-                self._log("eval", self.evaluate(), config.train.steps)
-            self.save("final")
+            if end < config.train.steps:  # a chunk of a longer schedule: evaluate and save the stop step, resumable
+                if config.train.eval_every and end % config.train.eval_every and end > self.start_step:
+                    self._log("eval", self.evaluate(), end)
+                if not (config.train.save_steps and end % config.train.save_steps == 0) and end > self.start_step:
+                    self.save(f"step_{end}", end)
+                logger.info("stop_at %d reached (schedule of %d steps); resume to continue", end, config.train.steps)
+            else:
+                if config.train.eval_every:
+                    self._log("eval", self.evaluate(), config.train.steps)
+                self.save("final")
         finally:
             self.orchestrator.stop()
             for server in self.servers:

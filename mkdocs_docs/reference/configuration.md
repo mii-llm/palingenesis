@@ -101,6 +101,7 @@
 |-----------|------|---------|-------------|
 | `output_dir` | str | `./checkpoints` | Where to save checkpoints and final model. Must be shared filesystem for multi-node. |
 | `resume_from` | str\|null | `null` | Checkpoint path to resume from. `"auto"` finds the latest valid checkpoint in `output_dir`. |
+| `stop_at` | int | `0` | Stop after this step (0 = run to `steps`). The LR schedule stays the one of `steps`, so a run can be done in chunks (`stop_at: 50`, then `resume_from: auto` with `stop_at: 100`, …) and follow one schedule; the stop step is evaluated and saved as a resumable `step_<stop_at>`, and `final` is written only at `steps`. |
 | `epochs` | int | `1` | Number of training epochs. |
 | `max_steps` | int | `-1` | Maximum optimizer steps. Overrides epochs if positive. When unset, the LR-schedule horizon (warmup + decay) is **estimated** from the data's row counts and a sample of rows through the pipeline (a few seconds, typically ±1–2%; streaming included), so training starts at once; see the data guide's "Run length and streaming". A Hub stream without published sizes, or a `ga_ramp`, needs `max_steps`. |
 | `exact_steps` | bool | `false` | Scan the whole assembled pipeline once to count the steps exactly instead of estimating them (an extra pass over the data before training; not possible when streaming). |

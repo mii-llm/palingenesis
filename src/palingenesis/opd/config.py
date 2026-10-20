@@ -254,6 +254,10 @@ class OPDTrainConfig:
     tree_branch_tokens: int = 8192  # agent_traces: padded tokens per batched forward of regenerated turns
     tree_min_gap: int = 1024  # agent_traces: trunk tokens between cuts at turns (fewer, larger passes)
     resume_from: str = ""  # a step_* checkpoint dir, or "auto": the newest in output_dir
+    # Stop after this step (0 = run to `steps`): the LR schedule stays the one of `steps`, so a run can be done in
+    # chunks (stop_at 50, then resume_from auto with stop_at 100, ...) and still follow one schedule. The stop step is
+    # evaluated and saved as step_<stop_at> (resumable); `final` is written only at `steps`.
+    stop_at: int = 0
 
 
 @dataclass(slots=True)
