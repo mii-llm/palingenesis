@@ -349,14 +349,20 @@ class VLLMColocateRollout:
         ):
             unique.setdefault((tuple(prompt), budget, sampling), []).append(i)
         requests = list(unique.items())
-        params = [self._params(len(indices), budget, sampling) for (_, budget, sampling), indices in requests]
+        # greedy decoding is deterministic and vLLM refuses n > 1 without sampling: one sample, shared by the duplicates
+        greedy = [samplings(sampling, 1)[0].temperature <= 0 for (_, _, sampling), _ in requests]
+        params = [
+            self._params(1 if g else len(indices), budget, sampling)
+            for g, ((_, budget, sampling), indices) in zip(greedy, requests)
+        ]
         outputs = self.llm.generate(
             [{"prompt_token_ids": list(prompt)} for (prompt, _, _), _ in requests], params, use_tqdm=False
         )
         rollouts: list[Rollout | None] = [None] * len(prompts)
-        for (_, indices), out in zip(requests, outputs):
-            for i, rollout in zip(indices, self._rollouts(out)):
-                rollouts[i] = rollout
+        for g, (_, indices), out in zip(greedy, requests, outputs):
+            got = self._rollouts(out)
+            for k, i in enumerate(indices):
+                rollouts[i] = got[0] if g else got[k]
         return rollouts
 
     def _params(self, n: int, budget: int, sampling, final_only: bool = False):

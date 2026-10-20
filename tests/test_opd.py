@@ -973,3 +973,44 @@ def test_sampling_mix_options_are_validated():
     assert "positive total weight" in errors(sampling_mix=[{"weight": 0}])
     assert "train.eval_sampling" in errors(eval_sampling={"temperature": 0})
     assert errors(eval_sampling=deploy) == ""
+
+
+def test_vllm_greedy_duplicates_share_one_sample():
+    """Identical greedy requests (e.g. the same trace trunk drawn twice for prefix caching) are sent as one n=1
+    request and the sample is shared; vLLM refuses n > 1 without sampling."""
+    from types import SimpleNamespace
+
+    from palingenesis.opd.rollout import VLLMColocateRollout
+
+    sent = []
+
+    class FakeLLM:
+        def generate(self, prompts, params, use_tqdm=False):
+            sent.extend(params)
+            outs = []
+            for p, sp in zip(prompts, params):
+                if sp.temperature <= 0:
+                    assert sp.n == 1  # what vLLM enforces
+                tok = p["prompt_token_ids"][-1]
+                outs.append(
+                    SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(token_ids=[tok, k], logprobs=None, finish_reason="stop")
+                            for k in range(sp.n)
+                        ]
+                    )
+                )
+            return outs
+
+    eng = object.__new__(VLLMColocateRollout)
+    eng.llm, eng.version = FakeLLM(), 0
+    eng.SamplingParams = lambda **kw: SimpleNamespace(**kw)
+    eng.stop_ids = (0,)
+    eng._params = lambda n, budget, sampling, final_only=False: SimpleNamespace(
+        n=n, max_tokens=budget, temperature=getattr(sampling, "temperature", sampling)
+    )
+    out = eng.generate([[1, 2], [1, 2], [3]], [1, 1, 1], 0.0)
+    assert [r.completion_ids for r in out] == [[2, 0], [2, 0], [3, 0]] and len(sent) == 2
+    sent.clear()
+    out = eng.generate([[1, 2], [1, 2]], [4, 4], 1.0)  # sampling: one request with n=2, two different samples
+    assert len(sent) == 1 and sent[0].n == 2 and out[0].completion_ids != out[1].completion_ids
