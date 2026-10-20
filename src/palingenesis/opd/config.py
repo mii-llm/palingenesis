@@ -515,6 +515,12 @@ class OPDConfig:
                         f"sources.{name}: in an agent_traces run, messages sources are distilled as one-turn traces "
                         "at rollout.temperature, without sampling_mix or privileged context."
                     )
+            if self.model.gradient_checkpointing:
+                errors.append(
+                    "model.gradient_checkpointing: agent_traces runs train through the shared-prefix tree, which needs "
+                    "the KV cache that HF gradient checkpointing disables; leave it off (train.tree_chunk_size bounds "
+                    "the activation memory)."
+                )
             for name, teacher in self.teachers.items():
                 if teacher.backend != "hf" or teacher.loss not in ("", "full_rkl"):
                     errors.append(

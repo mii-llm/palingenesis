@@ -242,6 +242,7 @@ def test_trace_config_validation(tmp_path, models):
     invalid("needs topic_field", **{"sources.traces.topic_field": ""})
     invalid("full_rkl from an hf teacher", **{"teachers.coder.loss": "sampled_rkl"})
     invalid("branches_per_trace", **{"sources.traces.branches_per_trace": -1})
+    invalid("tree_chunk_size bounds", **{"model.gradient_checkpointing": True})
     invalid("mcqa sources need a plain OPD run", **{"sources.pool.format": "mcqa", "sources.pool.path": "x.jsonl"})
     invalid(
         "without sampling_mix",
