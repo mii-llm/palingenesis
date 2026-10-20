@@ -100,6 +100,11 @@ class SourceConfig:
     # exact; sampled_rkl and xtok need the sampling to be the student's own (their behaviour log-probs).
     # Empty = rollout.temperature, untruncated.
     sampling_mix: list = field(default_factory=list)
+    # Chat-template arguments for this source, over model.chat_template_kwargs (e.g. {enable_thinking: true}
+    # for one thinking source next to non-thinking ones). messages rows: a row's own kwargs win over these.
+    # agent_traces runs: every row of the source renders with them (split thinking / non-thinking rows into
+    # two sources; a messages row whose own kwargs disagree is an error there).
+    chat_template_kwargs: dict = field(default_factory=dict)
     # ---- agent_traces ----
     messages_field: str = "messages"
     tools_field: str = "tools"
@@ -499,8 +504,17 @@ class OPDConfig:
             errors.append("the source weights must not all be 0.")
         formats = {s.format for s in self.sources.values()}
         if "agent_traces" in formats:
-            if formats != {"agent_traces"}:
-                errors.append("agent_traces sources cannot be mixed with other formats in one run.")
+            if not formats <= {"agent_traces", "messages"}:
+                errors.append(
+                    "agent_traces runs take agent_traces and messages sources only (a messages prompt becomes a "
+                    "one-turn trace); mcqa sources need a plain OPD run."
+                )
+            for name, source in self.sources.items():
+                if source.format == "messages" and (source.sampling_mix or source.privileged_field):
+                    errors.append(
+                        f"sources.{name}: in an agent_traces run, messages sources are distilled as one-turn traces "
+                        "at rollout.temperature, without sampling_mix or privileged context."
+                    )
             for name, teacher in self.teachers.items():
                 if teacher.backend != "hf" or teacher.loss not in ("", "full_rkl"):
                     errors.append(

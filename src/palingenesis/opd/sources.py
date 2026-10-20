@@ -213,8 +213,9 @@ class ChatMessagesSource:
         """A row's rollout meta: its tools, its template kwargs and, with privileged context, the
         teacher's copy of the conversation."""
         meta = {"tools": row["tools"]} if row.get("tools") else {}
-        if row.get("chat_template_kwargs"):
-            meta["chat_template_kwargs"] = row["chat_template_kwargs"]
+        kwargs = {**self.config.chat_template_kwargs, **(row.get("chat_template_kwargs") or {})}
+        if kwargs:
+            meta["chat_template_kwargs"] = kwargs
         field = self.config.privileged_field
         if field and row.get(field):
             meta["teacher_messages"] = with_privileged(

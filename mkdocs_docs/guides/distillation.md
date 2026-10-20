@@ -212,6 +212,24 @@ rollout: {backend: vllm, prefix_caching: true, max_model_len: 36864}
 loss: {trace_kd_weight: 0.5}            # also distill the recorded turns (off-policy)
 ```
 
+**Thinking and non-thinking traces, and plain prompts, in one run.** Each source can set its own
+`chat_template_kwargs` over the model's, so thinking traces and non-thinking traces go in two sources of the same run.
+`messages` sources can join an `agent_traces` run: each prompt becomes a one-turn trace (the student writes the
+answer, its teacher scores it, as in plain OPD). Use this to anchor single-turn skills while distilling agent traces:
+
+```yaml
+sources:
+  agent: {format: agent_traces, path: data/traces.jsonl, teacher: agentic, weight: 0.5}
+  agent_think: {format: agent_traces, path: data/traces_think.jsonl, teacher: agentic, weight: 0.2,
+                chat_template_kwargs: {enable_thinking: true}}
+  tool_calls: {format: messages, path: data/calls.jsonl, teacher: tools, weight: 0.3,
+               chat_template_kwargs: {enable_thinking: false}}
+```
+
+In an `agent_traces` run, every row of a source renders with that source's arguments. A `messages` row whose own
+`chat_template_kwargs` disagree with its source's is an error: split such rows into two sources. `mcqa` sources, and
+`messages` sources with `sampling_mix` or privileged context, need a plain OPD run.
+
 `configs/distill_agent_traces.yaml` is the full example (openbmb/UltraData-SFT-Agent-2609: code, search, office and tool-use agents; contexts of 5k–120k tokens, 2–95 assistant turns per trace).
 
 **Each context is the student's own rendering.** Contexts are rendered with the student's chat template exactly as at inference, tools included, and the student generates from those token ids; the teacher (same tokenizer) scores the same ids. Set the template options the traces were made with: with Qwen3.5 small models, `enable_thinking: true` (their template defaults to non-thinking, which would render every recorded turn's reasoning as a history the model never sees at inference).

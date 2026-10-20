@@ -312,12 +312,13 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `format` | str | `messages` | `messages` (chat JSONL `{"messages": [...], "answer"?: ...}`: held-out reverse KL, plus greedy accuracy for rows with an answer), `mcqa` (pool-row JSONL: letter accuracy) or `agent_traces` (recorded agent conversations, JSONL or parquet: the student regenerates their assistant turns; see the distillation guide). |
+| `format` | str | `messages` | `messages` (chat JSONL `{"messages": [...], "answer"?: ...}`: held-out reverse KL, plus greedy accuracy for rows with an answer), `mcqa` (pool-row JSONL: letter accuracy) or `agent_traces` (recorded agent conversations, JSONL or parquet: the student regenerates their assistant turns; see the distillation guide). An `agent_traces` run also takes `messages` sources, as one-turn traces. |
 | `path` | str | — | Prompt file. |
 | `weight` | float | `1.0` | Sampling weight among the sources. |
 | `teacher` | str | `""` | Teacher of this source's prompts (empty = the first teacher). |
 | `topic_field` | str | `""` | Row field holding a topic (e.g. `domain`), for `topic_teachers`. |
 | `topic_teachers` | dict | `{}` | `{teacher: [topics]}`: rows whose topic is listed go to that teacher, the others to `teacher`. A topic may be listed under one teacher only. |
+| `chat_template_kwargs` | dict | `{}` | Chat-template arguments for this source over `model.chat_template_kwargs` (e.g. `{enable_thinking: true}`). `messages` rows: a row's own kwargs win. `agent_traces` runs: every row of the source renders with them; a `messages` row that disagrees is an error. |
 | `messages_field` / `tools_field` | str | `messages` / `tools` | agent_traces: the columns holding the conversation and the tool schemas (lists or JSON strings). |
 | `branches_per_trace` | int | `8` | agent_traces: assistant turns regenerated per sampled trace (0 = all). |
 | `max_context` | int | `32768` | agent_traces: longest context (tokens) a regenerated turn may have; later turns are not sampled. |

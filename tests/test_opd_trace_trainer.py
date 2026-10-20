@@ -194,6 +194,42 @@ def test_trace_loss_equals_every_turn_as_its_own_sequence(tmp_path, models, monk
     )
 
 
+def test_traces_mixed_with_prompt_source(tmp_path, models):
+    """A messages source joins an agent_traces run as one-turn traces, with its own template arguments."""
+    from palingenesis.opd.trace_trainer import TraceTrainer
+
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text(
+        "".join(
+            json.dumps({"messages": [{"role": "user", "content": f"Count to {i}."}], "tools": TOOLS if i % 2 else None})
+            + "\n"
+            for i in range(10)
+        )
+    )
+    trainer = TraceTrainer(
+        make_config(
+            tmp_path,
+            models,
+            **{
+                "sources.chat.format": "messages",
+                "sources.chat.path": str(prompts),
+                "sources.chat.dev_size": 2,
+                "sources.chat.max_new_tokens": 6,
+                "sources.chat.teacher": "coder",
+                "sources.chat.weight": 1.0,
+                "sources.chat.chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    )
+    assert trainer.planners["chat"].kwargs["enable_thinking"] is False
+    assert trainer.planners["traces"].kwargs["enable_thinking"] is True
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append((kind, step, metrics))
+    trainer.train()
+    evals = [m for kind, _, m in logged if kind == "eval"]
+    assert "dev_kl_full/chat" in evals[-1] and "dev_kl_full/traces" in evals[-1]
+
+
 def test_trace_config_validation(tmp_path, models):
     from palingenesis.opd.config import OPDConfigError
 
@@ -206,3 +242,12 @@ def test_trace_config_validation(tmp_path, models):
     invalid("needs topic_field", **{"sources.traces.topic_field": ""})
     invalid("full_rkl from an hf teacher", **{"teachers.coder.loss": "sampled_rkl"})
     invalid("branches_per_trace", **{"sources.traces.branches_per_trace": -1})
+    invalid("mcqa sources need a plain OPD run", **{"sources.pool.format": "mcqa", "sources.pool.path": "x.jsonl"})
+    invalid(
+        "without sampling_mix",
+        **{
+            "sources.chat.format": "messages",
+            "sources.chat.path": "x.jsonl",
+            "sources.chat.sampling_mix": [{"weight": 1}],
+        },
+    )

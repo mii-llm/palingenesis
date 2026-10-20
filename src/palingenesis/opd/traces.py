@@ -269,6 +269,57 @@ def load_trace_rows(
     return rows
 
 
+def load_prompt_rows_as_traces(
+    path: str, messages_field: str = "messages", tools_field: str = "tools", chat_template_kwargs: dict | None = None
+) -> list[dict]:
+    """Chat prompts ({"messages": [...] ending with a user turn or a tool result, "tools"?: [...]}) as one-turn
+    traces, so plain prompts can join agent traces in one run: a placeholder assistant turn marks the turn the
+    student regenerates. Its content never reaches a model: a branch context renders messages[:turn] with the
+    generation prompt, and recorded-turn distillation only covers turns before the trunk's. A row's own
+    chat_template_kwargs must agree with the source's (trace planners render a whole source one way)."""
+    want = dict(chat_template_kwargs or {})
+    rows, skipped = [], 0
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            messages = record.get(messages_field)
+            if isinstance(messages, str):
+                messages = json.loads(messages)
+            if not messages or messages[-1].get("role") not in ("user", "tool"):
+                skipped += 1
+                continue
+            own = record.get("chat_template_kwargs") or {}
+            clash = {k: v for k, v in own.items() if k in want and want[k] != v} or {
+                k: v for k, v in own.items() if k not in want
+            }
+            if clash:
+                raise ValueError(
+                    f"{path}: a row's chat_template_kwargs {own} disagree with the source's {want}; in an agent_traces "
+                    "run, put rows with different template arguments in different sources"
+                )
+            tools = record.get(tools_field)
+            if isinstance(tools, str):
+                tools = json.loads(tools) if tools.strip() else None
+            rows.append(
+                {
+                    **{
+                        k: v
+                        for k, v in record.items()
+                        if k not in (messages_field, tools_field, "chat_template_kwargs")
+                    },
+                    "messages": [dict(m) for m in messages] + [{"role": "assistant", "content": "(regenerated)"}],
+                    "tools": normalize_tools(tools) if tools else None,
+                }
+            )
+    if skipped:
+        logger.warning("%s: skipped %d rows whose last message is not a user turn or tool result", path, skipped)
+    if not rows:
+        raise ValueError(f"{path}: no usable prompts")
+    return rows
+
+
 @dataclass
 class TraceSample:
     """One trace's rollouts, ready for the teacher and the student."""

@@ -35,6 +35,7 @@ from palingenesis.opd.traces import (
     TraceSample,
     branch_inputs,
     completion_rows,
+    load_prompt_rows_as_traces,
     load_trace_rows,
     select,
     topic_teacher,
@@ -71,9 +72,21 @@ class TraceSources:
         self.names, self.weights, self.train, self.dev = [], [], {}, {}
         for name, source in config.sources.items():
             tags = tuple(source.think_tags) if source.think_tags else (think_tags or {}).get(name)
-            rows = load_trace_rows(source.path, source.messages_field, source.tools_field, tags)
+            if source.format == "messages":  # plain prompts: one-turn traces
+
+                def load(path, source=source):
+                    return load_prompt_rows_as_traces(
+                        path, source.messages_field, source.tools_field, source.chat_template_kwargs
+                    )
+
+            else:
+
+                def load(path, source=source, tags=tags):
+                    return load_trace_rows(path, source.messages_field, source.tools_field, tags)
+
+            rows = load(source.path)
             if source.dev_path:
-                train, dev = rows, load_trace_rows(source.dev_path, source.messages_field, source.tools_field, tags)
+                train, dev = rows, load(source.dev_path)
             else:
 
                 def key(row):
@@ -253,7 +266,7 @@ class TraceTrainer(OPDTrainer):
         self.planners = {
             name: TracePlanner(
                 self.tok,
-                config.model.chat_template_kwargs,
+                {**config.model.chat_template_kwargs, **source.chat_template_kwargs},
                 self.stop_ids,
                 source.max_context,
                 # recorded turns only: every turn that fits, so the trunk holds as many as can be
@@ -266,7 +279,7 @@ class TraceTrainer(OPDTrainer):
         self.eval_planners = {
             name: TracePlanner(
                 self.tok,
-                config.model.chat_template_kwargs,
+                {**config.model.chat_template_kwargs, **source.chat_template_kwargs},
                 self.stop_ids,
                 source.max_context,
                 source.branches_per_trace,

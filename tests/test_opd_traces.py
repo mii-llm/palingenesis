@@ -136,3 +136,47 @@ def test_topic_teacher():
     assert topic_teacher({"domain": "Search_Agent-en"}, "domain", mapping, "general") == "searcher"
     assert topic_teacher({"domain": "Other"}, "domain", mapping, "general") == "general"
     assert topic_teacher({"domain": "Tool_Use"}, "", mapping, "general") == "general"
+
+
+def test_prompt_rows_become_one_turn_traces(tok, tmp_path):
+    import json
+
+    from palingenesis.opd.traces import load_prompt_rows_as_traces
+
+    rows = [
+        {"messages": [{"role": "user", "content": "Weather in Rome?"}], "tools": TOOLS, "id": "a"},
+        {"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]},  # nothing to do
+    ]
+    path = tmp_path / "p.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    out = load_prompt_rows_as_traces(str(path), chat_template_kwargs={"enable_thinking": False})
+    assert len(out) == 1 and out[0]["id"] == "a" and out[0]["tools"]
+    msgs = out[0]["messages"]
+    assert msgs[-1]["role"] == "assistant" and is_trainable_turn(msgs[-1])
+    # the regenerated turn's context is the prompt with the generation prompt, exactly as plain OPD renders it;
+    # the placeholder content never appears in any context
+    stop = (tok.convert_tokens_to_ids("<|im_end|>"),)
+    p = TracePlanner(tok, {"enable_thinking": False}, stop, max_context=100_000, branches_per_trace=0, recorded_kd=True)
+    plan = p.plan(msgs, out[0]["tools"], random.Random(0))
+    assert len(plan.branches) == 1 and not plan.kd_spans
+    want = tok.apply_chat_template(
+        msgs[:-1], tools=TOOLS, add_generation_prompt=True, tokenize=False, enable_thinking=False
+    )
+    assert tok.decode(plan.branches[0].context) == want and "(regenerated)" not in want
+    # a row whose own template arguments disagree with the source's is refused
+    path.write_text(json.dumps({**rows[0], "chat_template_kwargs": {"enable_thinking": True}}) + "\n")
+    with pytest.raises(ValueError, match="different sources"):
+        load_prompt_rows_as_traces(str(path), chat_template_kwargs={"enable_thinking": False})
+
+
+def test_source_kwargs_change_the_rendering(tok):
+    stop = (tok.convert_tokens_to_ids("<|im_end|>"),)
+    msgs = [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}]
+    think = TracePlanner(
+        tok, {"enable_thinking": True}, stop, max_context=1000, branches_per_trace=0, recorded_kd=False
+    )
+    plain = TracePlanner(
+        tok, {"enable_thinking": False}, stop, max_context=1000, branches_per_trace=0, recorded_kd=False
+    )
+    a, b = (tok.decode(x.plan(msgs, None, random.Random(0)).branches[0].context) for x in (think, plain))
+    assert a != b and b.rstrip().endswith("</think>")  # non-thinking opens with an empty think block
