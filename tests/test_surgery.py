@@ -384,3 +384,25 @@ def test_cli_run_margins_span(setup, tmp_path, capsys):
     res = json.loads(capsys.readouterr().out)
     cov = res["coverage"]
     assert set(cov) == {"1", "2", "4"} and 0.5 < cov["1"] <= cov["2"] + 1e-9 <= cov["4"] + 2e-9 <= 1.0 + 1e-6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA: device -> host copies are synchronous on CPU")
+def test_cpu_master_applies_full_step_on_cuda():
+    """A CPU (pinned) master must receive the whole step from the device (regression: non_blocking D2H + add_)."""
+    from palingenesis.surgery import _Editor
+
+    p = torch.nn.Parameter(torch.zeros(1 << 20, device="cuda"))
+    ed = _Editor(
+        ["w"],
+        [p],
+        [torch.zeros(1 << 20)],
+        device="cuda",
+        master="cpu",
+        work_dtype=torch.bfloat16,
+        save_dtype=torch.float32,
+        rounding="nearest",
+        seed=0,
+    )
+    step = [torch.full((1 << 20,), 0.5, device="cuda")]
+    ed.apply(step, 1.0)
+    assert torch.allclose(ed.master[0], torch.full((1 << 20,), 0.5))

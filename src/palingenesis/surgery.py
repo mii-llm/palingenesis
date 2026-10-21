@@ -922,7 +922,9 @@ class _Editor:
     @torch.no_grad()
     def apply(self, step: list[torch.Tensor], scale: float) -> None:
         for i, m in enumerate(self.master):
-            m.add_(step[i].to(m.device, non_blocking=True), alpha=scale)
+            # device -> host must be blocking: a non_blocking copy into a fresh host tensor can still be in flight when
+            # add_ reads it (the CPU master then received partial steps; found on GPU in validation 561)
+            m.add_(step[i].to(m.device, non_blocking=m.device.type != "cpu"), alpha=scale)
         self.refresh()
 
     def freeze(self) -> None:
