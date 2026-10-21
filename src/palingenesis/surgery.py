@@ -1317,6 +1317,12 @@ def run_surgery(config: SurgeryConfig) -> dict:
         )
     timings["doses"] = time.time() - t0
     timings["total"] = time.time() - t_start
+    if torch.device(device).type == "cuda":  # measured peak next to choose_gram_mode's estimate
+        memory = dict(
+            memory,
+            peak_allocated_gib=round(torch.cuda.max_memory_allocated(device) / 2**30, 2),
+            peak_reserved_gib=round(torch.cuda.max_memory_reserved(device) / 2**30, 2),
+        )
 
     report = {
         "config": config.to_dict(),

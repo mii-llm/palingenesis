@@ -2,8 +2,7 @@
 
 `palingenesis.surgery` repairs a decision whose overall level a training stage shifted, without training. It computes a
 minimal-norm weight edit that moves the decision's margins on a few groups of prompts back to target values, then
-writes the edit at one or more doses. It is experimental: two applications on a 0.8B agent model, one confirmed on
-held-out tests, one that restored the margins but not the behaviour (see [Limits](#limits)). Single device.
+writes the edit at one or more doses. It is experimental and single-device; read [Limits](#limits) before relying on it.
 
 ```bash
 pgs surgery margins --model runs/before --model runs/after --twins data/cont_dev.jsonl --decision "<|im_end|>"
@@ -19,35 +18,19 @@ print(report["stop_reason"], report["edit"]["rel_reference"], report["doses"][0]
 
 ## What it fixes
 
-Training stages move decisions along one axis. After an agentic distillation stage, our model ended its turn after
-one tool call on prompts that needed several parallel calls: the log-odds of `<|im_end|>` right after `</tool_call>`
-rose by about 5 nats on twins and 9 on BFCL prompts. Its ability to tell one-call requests from multi-call requests
-survived. This is a **common-mode** shift: the level of the decision moved, its discrimination did not.
+Training stages can move a decision along one axis. A typical case: after an agentic training stage a model ends
+its turn after one tool call on requests that need several parallel calls. The log-odds of `<|im_end|>` right after
+`</tool_call>` rises, while the model can still tell one-call requests from multi-call requests. This is a
+**common-mode** shift: the level of the decision moved, its discrimination did not.
 
 Surgery fixes the level. You give it prompts at the decision position, grouped, and a target per group: usually the
 margins of a same-lineage reference model from before the shift. It solves for the smallest edit, inside the span of
-the groups' margin gradients, that closes the gaps.
+the groups' margin gradients, that closes the gaps. Such edits can be very small (around 1% of the distance between
+the shifted model and its reference), because the shift itself is low-dimensional.
 
-**Measured example (0.8B, end-of-turn after a call):**
-
-- 16 groups of 8 grounded multi-call twins, target = the reference's margins. One Newton step, 3 of 16
-  eigen-directions kept, gap −5.15 → −0.74 nats. The edit is 0.71% of ‖θ0 − θ_ref‖.
-- Doses θ0 + α·Δ, with α chosen on half of BFCL parallel and reported on the other half:
-
-  | α | edit / ‖θ0 − θ_ref‖ | half B parallel | one-call stops |
-  |---|---|---|---|
-  | 0 (shifted model) | 0 | .417 | .505 |
-  | 1 | .007 | .587 | .252 |
-  | 2 | .015 | .660 | .146 |
-  | 3 | .022 | **.709** | .097 |
-  | reference | | .709 | .092 |
-
-- Held-out confirmation of α = 3 against the shifted model (paired): Harbor tasks .380 vs .378, real-use tasks .637
-  vs .632, When2Call decision quality .783 vs .783 and hallucinated calls .235 vs .235, IFEval .695 vs .684, GSM8K
-  .747 vs .740. Sequential agent turns, where ending after one call is right, kept margins above +10 nats.
-
-Twin margins at α = 1 were back within 1 nat of the reference, but the behaviour recovered only 2/3: the twins
-under-measured the deployment shift by about 2×. **The dose has to be chosen on a behavioural set.**
+Matching the reference's margins on the groups fixes the **direction** of the edit, not its amount: in validation, an
+edit that brought the group margins back within a nat recovered only part of the behaviour, and a larger dose was
+needed. **The dose has to be chosen on a behavioural set** (see [Choosing the dose](#choosing-the-dose)).
 
 ## When to use it, and when not
 
@@ -75,8 +58,8 @@ pgs surgery span --model runs/shifted --groups data/twins.jsonl --targets data/b
 ```
 
 `span` prints the fraction ‖P_K t‖ / ‖t‖ of the target set's margin gradient t inside the span of the first K group
-gradients. In our example it was .90 at K = 1 and .956 at K = 16 for BFCL parallel prompts, and .08–.16 for an
-unrelated decision: the groups represented the decision, and only it.
+gradients. A useful pattern: high coverage for prompts of the decision you edit (rising with K), low coverage for an unrelated
+decision. That says the groups represent the decision, and only it.
 
 ## Configuration
 
@@ -152,7 +135,7 @@ groups on negative twins (calls must not become more likely than the reference's
 ## The solve
 
 With g_i = ∇θ m̄_i for the active rows, A = G Gᵀ and gap = target − m̄, the minimal-norm step that closes the linearised
-gaps is Δ = Gᵀ A⁺ gap. The group gradients of one decision are nearly collinear (cosine .9–.99 in our example), so A has
+gaps is Δ = Gᵀ A⁺ gap. The group gradients of one decision are often nearly collinear (cosines of .9 and above are common), so A has
 a few large eigenvalues and many tiny ones that are group noise: eigenvalues below `cutoff`·λmax are dropped
 (c = V_k diag(1/λ_k) V_kᵀ gap, Δ = Gᵀc). The step is scaled to the trust radius and the cumulative cap, the margins are
 re-measured, and the loop stops when |mean gap| < max(`min_gap`, `stop_se`·SE of the mean gap) over the equality rows
@@ -167,8 +150,8 @@ The twin target fixes the direction, not the amount. Write several doses and cho
 3. Take the smallest dose within 1 SE of the best passing one; report it on half B; then run held-out tests once.
 
 Always run the null baseline: a constant logit bias on the decision token, chosen on half A with the same rule. If the
-bias does as well, the weight edit adds nothing for this decision. In our example the edit was context-selective: at
-α = 1 the BFCL end-of-turn log-odds fell by 5.5 nats while sequential agent turns moved by 0.1.
+bias does as well, the weight edit adds nothing for this decision. Also check contexts where the decision must not
+move (for an end-of-turn edit: turns where ending after one call is right) with `pgs surgery margins`.
 
 ## Precision
 
@@ -244,20 +227,18 @@ Lower-level pieces for research scripts: `load_sides`, `make_groups`, `group_mar
 
 ## Limits
 
-- **Twins must represent the target distribution's positives and hard negatives.** In the second application
-  (restoring a tool-shy model's first-token `<tool_call>` propensity; positive groups to the reference, negative groups
-  hinged), the twin margins were restored exactly: positives back at the reference's level, negatives stricter than
-  the reference. On When2Call the model only moved along the old axis: calls when needed .52 → .68, hallucinated calls
-  .07 → .21, decision quality .725 → .732 (no gain). The twins' negatives were easy (irrelevant tool sets); When2Call's
-  hard negatives are related tools with missing information. Build twins whose negatives look like the hard cases, and
-  always check discrimination, not only the level, on a held-out behavioural set.
+- **Twins must represent the target distribution's positives and hard negatives.** An edit can restore the group
+  margins exactly and still move the behaviour only along the old axis: in one validation, restoring a tool-call
+  propensity with twins whose negatives were easy (irrelevant tool sets) raised needed and unneeded calls together on a
+  benchmark whose hard negatives are related tools with missing information. Build twins whose negatives look like the
+  hard cases, and always check discrimination, not only the level, on a held-out behavioural set.
 - **The dose is a free parameter.** Twin targets are a proxy; choose α on a behavioural split and confirm once.
 - **Run the logit-bias baseline** before crediting the weight edit.
 - **Thinking-mode decisions are unsupported**, and steering-like edits are known to break under chain of thought.
 - **Calibrated int4 (GPTQ / AWQ) survival is unmeasured.**
 - **Chained surgeries** accumulate edit norm; edit several decisions in one system (hold rows for the earlier ones)
   rather than one after another.
-- **Status:** experimental; validated on one model size. The ingredients (minimal-norm Gauss–Newton steps on a few
+- **Status:** experimental; validated on one small model size so far. The ingredients (minimal-norm Gauss–Newton steps on a few
   outputs, gradient-span edits, stochastic rounding) are known; the combination with decision margins at templated
   positions, hinges and dose selection on a behavioural split is, as far as we know, new.
 
