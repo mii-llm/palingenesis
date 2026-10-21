@@ -79,25 +79,7 @@ class CMRConfig:
         return errors
 
 
-def load_twins(path: str) -> list[dict]:
-    rows = []
-    with open(path) as f:
-        for line in f:
-            if line.strip():
-                r = json.loads(line)
-                if not (r.get("pos", {}).get("messages") and r.get("neg", {}).get("messages")):
-                    raise ValueError(f"{path}: twin rows need pos.messages and neg.messages")
-                rows.append(r)
-    if not rows:
-        raise ValueError(f"{path}: no twins")
-    return rows
-
-
-def decision_token_id(tok, token: str) -> int:
-    ids = tok.encode(token, add_special_tokens=False)
-    if len(ids) != 1:
-        raise ValueError(f"cmr.decision_token {token!r} is {len(ids)} tokens for this tokenizer; it must be one")
-    return ids[0]
+from palingenesis.margins import MarginReader, decision_token_id, load_twins  # noqa: E402,F401  (re-exported)
 
 
 class CommonModeRejection:
@@ -115,6 +97,7 @@ class CommonModeRejection:
             f: decision_token_id(tok, config.decision_tokens.get(f, config.decision_token)) for f in config.families
         }
         self.twins = {f: load_twins(p) for f, p in config.families.items()}
+        self._reader = MarginReader(model, tok, config.chat_template_kwargs, device)
         self.rng = random.Random(config.seed)
         self.dirs: dict[str, list[torch.Tensor]] = {}  # family -> unit direction (per-parameter fp32 chunks)
         self.norms: dict[str, float] = {}
@@ -126,53 +109,12 @@ class CommonModeRejection:
     # ------------------------------------------------------------------ margins
 
     def _prompt_ids(self, side: dict) -> list[int]:
-        """The prompt up to the decision position. With "prefix_calls" ([{name, arguments}]), an assistant turn holding
-        those calls (and the text "prefix_content" before them, default none) is rendered and cut right after its last
-        "</tool_call>": the next token decides between ending the turn and making another call."""
-        kw = dict(tools=side.get("tools") or None, tokenize=False, **self.config.chat_template_kwargs)
-        calls = side.get("prefix_calls")
-        if not calls:
-            text = self.tok.apply_chat_template(side["messages"], add_generation_prompt=True, **kw)
-        else:
-            turn = {
-                "role": "assistant",
-                "content": side.get("prefix_content") or "",
-                "tool_calls": [
-                    {"type": "function", "function": {"name": c["name"], "arguments": c.get("arguments") or {}}}
-                    for c in calls
-                ],
-            }
-            full = self.tok.apply_chat_template(list(side["messages"]) + [turn], add_generation_prompt=False, **kw)
-            cut = full.rfind("</tool_call>")
-            if cut < 0:
-                raise ValueError("cmr: the chat template rendered no </tool_call> for prefix_calls")
-            text = full[: cut + len("</tool_call>")]
-        return self.tok(text, add_special_tokens=False)["input_ids"]
+        """The prompt up to the decision position (palingenesis.margins.MarginReader.prompt_ids)."""
+        return self._reader.prompt_ids(side)
 
     def margins(self, sides: list[dict], token_id: int | None = None) -> torch.Tensor:
-        """Decision margin at the first assistant token for each prompt. One forward with RIGHT padding, read at each
-        row's last real position: causal attention and recurrent (Gated DeltaNet) layers never see the padding there,
-        which left padding could not guarantee for linear-attention state."""
-        ids = [self._prompt_ids(s) for s in sides]
-        width = max(len(x) for x in ids)
-        pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
-        input_ids = torch.full((len(ids), width), pad, dtype=torch.long)
-        mask = torch.zeros((len(ids), width), dtype=torch.long)
-        for i, x in enumerate(ids):
-            input_ids[i, : len(x)] = torch.tensor(x)
-            mask[i, : len(x)] = 1
-        from palingenesis.logits import final_hidden_states, output_head
-
-        hidden = final_hidden_states(self.model, input_ids.to(self.device), mask.to(self.device))  # [B, T, H]
-        last = torch.tensor([len(x) - 1 for x in ids], device=hidden.device)
-        h = hidden[torch.arange(len(ids), device=hidden.device), last]  # head only on the B last real positions
-        logits = output_head(self.model)(h).float()
-        tid = self.token_id if token_id is None else token_id
-        # exact log-odds log p(d) - log(1 - p(d)) = logit_d - logsumexp(other logits): no clamp, so a saturated side
-        # (p near 0 or 1) keeps its gradient
-        others = logits.clone()
-        others[:, tid] = float("-inf")
-        return logits[:, tid] - torch.logsumexp(others, dim=-1)
+        """Exact decision log-odds at each side's decision position (palingenesis.margins)."""
+        return self._reader.margins(sides, self.token_id if token_id is None else token_id)
 
     @torch.no_grad()
     def evaluate(self, rows: list[dict], family: str | None = None) -> dict[str, float]:
