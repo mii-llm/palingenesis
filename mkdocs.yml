@@ -104,6 +104,7 @@ nav:
     - Harness Profiles: guides/harness-profiles.md
     - Model Merging: guides/merging.md
     - Common-Mode Rejection (CMR): guides/cmr.md
+    - Margin Surgery: guides/surgery.md
     - SFT → RL Transition: guides/sft-to-rl.md
   - Reference:
     - Configuration: reference/configuration.md
