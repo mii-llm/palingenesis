@@ -85,6 +85,21 @@ Common options: `--template` (tensor set, layout, dtype and files of the output)
 `--dtype {bf16,fp16,fp32}`, `--rounding {nearest,stochastic}` and `--seed` (stochastic rounding keeps edits below
 one bf16 ulp; see [Precision of small edits](../guides/merging.md#precision-of-small-edits)), `--overwrite`.
 
+### surgery
+
+Margin surgery: a minimal-norm weight edit that moves a decision's margins back to target values. See
+[Margin Surgery](../guides/surgery.md).
+
+```bash
+pgs surgery run --config surgery.yaml [--set trust=0.2 --set families.cont.groups=8] [--overwrite]
+pgs surgery margins --model REF --model CUR --twins TWINS.jsonl --decision "<tool_call>" [--prefix-side pos|neg|both]
+pgs surgery span --model CUR --groups TWINS.jsonl --targets TARGET.jsonl --decision "<|im_end|>" --k 1,4,16
+```
+
+`margins` prints mean / SE / greedy share per model (common and differential with `both`); `span` prints the fraction
+of the target set's margin gradient inside the span of K group gradients. Common options: `--micro-batch`,
+`--max-side-tokens`, `--dtype`, `--device`, `--limit`, `--json`.
+
 ### autopilot
 
 Zero-config autonomous training. Profiles hardware, sweeps LR, trains to completion.
