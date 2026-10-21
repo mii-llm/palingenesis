@@ -82,7 +82,8 @@ pgs merge materialize CKPT --template EXPORT -o OUT       # complete a partial c
 ```
 
 Common options: `--template` (tensor set, layout, dtype and files of the output), `--missing {error,template}`,
-`--dtype {bf16,fp16,fp32}`, `--overwrite`.
+`--dtype {bf16,fp16,fp32}`, `--rounding {nearest,stochastic}` and `--seed` (stochastic rounding keeps edits below
+one bf16 ulp; see [Precision of small edits](../guides/merging.md#precision-of-small-edits)), `--overwrite`.
 
 ### autopilot
 

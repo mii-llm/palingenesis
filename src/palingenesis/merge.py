@@ -23,6 +23,13 @@ processor configs). Shapes must match; non-finite results are an error. A tensor
 default; missing="template" copies the template's tensor unchanged (and reports how many). `merge_config.json` in the
 output records the method, sources, coefficients and counts. Sources are local directories or Hugging Face model ids.
 
+Precision: a tiny interpolation of bf16 checkpoints (an edit far below one bf16 ulp) is erased by round-to-nearest, since
+the sources already sit on the bf16 grid. rounding="stochastic" (`--rounding stochastic --seed N`) casts the float32
+result with unbiased stochastic rounding (palingenesis.precision), which keeps the edit in expectation. Every merge
+measures the edit's survival against the first model (precision.edit_survival, streamed per tensor alongside the merge:
+one extra float64 pass over each tensor, small next to the I/O) and records it in merge_config.json; with nearest
+rounding to a 16-bit dtype a projection below 0.5 is logged as a warning.
+
     pgs merge interpolate <start> <end> --lam 0.3 -o out/
     pgs merge linear A:0.7 B:0.3 -o out/
     pgs merge soup A B C -o out/
@@ -35,6 +42,7 @@ output records the method, sources, coefficients and counts. Sources are local d
 from __future__ import annotations
 
 import json
+import logging
 import math
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -44,6 +52,10 @@ from typing import Iterable
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+from palingenesis.precision import ROUNDINGS, SR_DTYPES, SurvivalMeter, cast_tensor
+
+logger = logging.getLogger(__name__)
 
 INDEX = "model.safetensors.index.json"
 SINGLE = "model.safetensors"
@@ -135,6 +147,9 @@ class MergeReport:
     dtype: str | None = None
     missing: str = "error"
     extra_dropped: list[str] = field(default_factory=list)
+    rounding: str = "nearest"
+    seed: int = 0
+    edit_survival: dict | None = None  # vs the first model (precision.edit_survival over the merged float tensors)
 
     def __str__(self) -> str:
         extra = f", {self.from_template} copied from the template" if self.from_template else ""
@@ -177,9 +192,15 @@ def _combine(
     overwrite: bool,
     extra: str,
     per_tensor=None,
+    rounding: str = "nearest",
+    seed: int = 0,
 ) -> MergeReport:
     """out = base + sum_i c_i (W_i - base) when base is given, else sum_i c_i W_i; tensor set and layout = template's.
-    per_tensor(name, base, [W_i]) -> merged float32 tensor replaces the fixed-coefficient sum (base required)."""
+    per_tensor(name, base, [W_i]) -> merged float32 tensor replaces the fixed-coefficient sum (base required).
+    rounding: how the float32 result is cast to the output dtype ("nearest" or "stochastic", per-tensor seed from
+    `seed` and the name); template copies are cast the same way."""
+    if rounding not in ROUNDINGS:
+        raise MergeError(f"rounding must be one of {ROUNDINGS}, not {rounding!r}")
     if missing not in ("error", "template"):
         raise MergeError(f"missing must be 'error' or 'template', not {missing!r}")
     if extra not in ("error", "drop"):
@@ -195,6 +216,8 @@ def _combine(
         )
     out = _prepare_out(out, overwrite)
     from_template, written = 0, 0
+    meter = SurvivalMeter()
+    narrow_nearest = rounding == "nearest"
     total_size = 0
     index: dict[str, str] = {}
     for shard, shard_names in template.shards().items():
@@ -239,9 +262,11 @@ def _combine(
                         acc += coef * (w - b) if b is not None else coef * w
                 if not torch.isfinite(acc).all():
                     raise MergeError(f"tensor {name!r}: non-finite values after merging")
-                t = acc.to(out_dtype or ref.dtype)
+                t = cast_tensor(acc, out_dtype or ref.dtype, rounding, seed, name)
+                meter.update(terms[0][0].tensor(name), acc, t)
+                narrow_nearest = narrow_nearest and t.dtype in SR_DTYPES
             if out_dtype is not None and t.dtype != out_dtype and t.is_floating_point():  # template copies too
-                t = t.to(out_dtype)
+                t = cast_tensor(t, out_dtype, rounding, seed, name)
             tensors[name] = t.contiguous()
             index[name] = shard
             total_size += t.numel() * t.element_size()
@@ -251,6 +276,17 @@ def _combine(
     if (template.dir / INDEX).exists() or len(template.shards()) > 1:
         (out / INDEX).write_text(json.dumps({"metadata": {"total_size": total_size}, "weight_map": index}, indent=2))
     _copy_files(template, out)
+    survival = meter.result() if meter.n else None
+    if survival is not None and narrow_nearest and survival["projection"] < 0.5:
+        logger.warning(
+            "only %.0f%% of the edit vs %s survives round-to-nearest to 16 bits (projection %.3f, %.1f%% of "
+            "elements changed); the edit is below the grid of the stored weights: rounding='stochastic' keeps it in "
+            "expectation",
+            100 * max(survival["projection"], 0.0),
+            terms[0][0].source,
+            survival["projection"],
+            100 * survival["changed_frac"],
+        )
     report = MergeReport(
         str(out),
         method,
@@ -262,6 +298,9 @@ def _combine(
         str(out_dtype).replace("torch.", "") if out_dtype is not None else None,
         missing,
         extra_names,
+        rounding,
+        seed,
+        {k: round(v, 6) if math.isfinite(v) else None for k, v in survival.items()} if survival else None,
     )
     try:
         from palingenesis import __version__
@@ -286,9 +325,12 @@ def linear(
     unnormalized: bool = False,
     overwrite: bool = False,
     extra: str = "error",
+    rounding: str = "nearest",
+    seed: int = 0,
 ) -> MergeReport:
     """w = sum_i weights[i] * models[i]. Weights must sum to 1 (a convex or affine combination) unless unnormalized=True.
-    template: whose tensor set, shard layout, dtype and files the output takes (default: the first model)."""
+    template: whose tensor set, shard layout, dtype and files the output takes (default: the first model).
+    rounding / seed: the cast of the float32 result ("stochastic" keeps sub-ulp edits in expectation; module doc)."""
     if len(models) != len(weights) or not models:
         raise MergeError("linear needs one weight per model")
     if not unnormalized and not math.isclose(sum(weights), 1.0, abs_tol=1e-6):
@@ -305,6 +347,8 @@ def linear(
         dtype=dtype,
         overwrite=overwrite,
         extra=extra,
+        rounding=rounding,
+        seed=seed,
     )
 
 
@@ -336,6 +380,8 @@ def task_arithmetic(
     dtype=None,
     overwrite: bool = False,
     extra: str = "error",
+    rounding: str = "nearest",
+    seed: int = 0,
 ) -> MergeReport:
     """w = base + sum_i weights[i] * (models[i] - base): each model's change from the shared base, scaled and added.
     With weights [1, lam], A keeps all of its own training and gains lam of B's (a linear merge would also pull A back
@@ -355,6 +401,8 @@ def task_arithmetic(
         dtype=dtype,
         overwrite=overwrite,
         extra=extra,
+        rounding=rounding,
+        seed=seed,
     )
 
 
@@ -390,6 +438,8 @@ def model_stock(
     dtype=None,
     overwrite: bool = False,
     extra: str = "error",
+    rounding: str = "nearest",
+    seed: int = 0,
 ) -> MergeReport:
     """Model Stock (Jang et al. 2024): w = base + t (mean_i W_i - base) per tensor, t from how much the fine-tunes agree
     (mean pairwise cosine of their task vectors): agreeing models (c -> 1) give their average, disagreeing ones (c -> 0)
@@ -419,6 +469,8 @@ def model_stock(
         overwrite=overwrite,
         extra=extra,
         per_tensor=fn,
+        rounding=rounding,
+        seed=seed,
     )
     vals = list(ratios.values())
     summary = {
@@ -442,6 +494,8 @@ def ram(
     dtype=None,
     overwrite: bool = False,
     extra: str = "error",
+    rounding: str = "nearest",
+    seed: int = 0,
 ) -> MergeReport:
     """RAM (Yuan et al. 2026, "Behavior Knowledge Merge in Reinforced Agentic Models"; mergekit `ram`): on-policy RL
     changes a sparse, model-specific subset of the weights, so averaging task vectors dilutes each model's unique
@@ -475,17 +529,36 @@ def ram(
         overwrite=overwrite,
         extra=extra,
         per_tensor=fn,
+        rounding=rounding,
+        seed=seed,
     )
     total = max(sum(counts.values()), 1)
     return _relabel(report, "ram", {"eps": eps, **{f"{k}_share": round(v / total, 4) for k, v in counts.items()}})
 
 
 def materialize(
-    checkpoint: str | Path, template: str | Path, out: str | Path, *, dtype=None, overwrite: bool = False
+    checkpoint: str | Path,
+    template: str | Path,
+    out: str | Path,
+    *,
+    dtype=None,
+    overwrite: bool = False,
+    rounding: str = "nearest",
+    seed: int = 0,
 ) -> MergeReport:
     """A partial checkpoint (e.g. a text-only training save of a multimodal model) completed into a loadable model: its
     tensors, cast to the template's dtype, plus the template's other tensors and files."""
-    report = linear([checkpoint], [1.0], out, template=template, missing="template", dtype=dtype, overwrite=overwrite)
+    report = linear(
+        [checkpoint],
+        [1.0],
+        out,
+        template=template,
+        missing="template",
+        dtype=dtype,
+        overwrite=overwrite,
+        rounding=rounding,
+        seed=seed,
+    )
     return _relabel(report, "materialize")
 
 
@@ -540,6 +613,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--dtype", choices=("bf16", "fp16", "fp32"), default=None, help="output dtype (default: the template's)"
         )
+        p.add_argument(
+            "--rounding",
+            choices=ROUNDINGS,
+            default="nearest",
+            help="cast of the float32 result: stochastic keeps edits below one ulp of bf16 sources in expectation",
+        )
+        p.add_argument("--seed", type=int, default=0, help="seed of stochastic rounding (per tensor: seed + name)")
         p.add_argument("--overwrite", action="store_true")
 
     p = sub.add_parser("interpolate", help="start + lam (end - start)")
@@ -573,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--template", required=True)
     common(p, template=False)
     a = ap.parse_args(argv if argv is not None else sys.argv[1:])
-    kw = {"dtype": a.dtype, "overwrite": a.overwrite}
+    kw = {"dtype": a.dtype, "overwrite": a.overwrite, "rounding": a.rounding, "seed": a.seed}
     if a.cmd != "materialize":
         kw.update(template=a.template, missing=a.missing)
     try:

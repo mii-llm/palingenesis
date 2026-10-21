@@ -44,12 +44,28 @@ def hf_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def save_hf_model(
-    model, tokenizer, path: Path, state: dict[str, torch.Tensor] | None = None, source_layout: bool = False
+    model,
+    tokenizer,
+    path: Path,
+    state: dict[str, torch.Tensor] | None = None,
+    source_layout: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+    rounding: str = "nearest",
+    seed: int = 0,
 ) -> None:
     """Save in Hugging Face format under the architecture's parameter names.
 
     `state` is an already gathered full state dict (FSDP); by default the model's own.
     The live model is never modified.
+
+    dtype: save the float weights in this dtype (default: as they are, the model's own).
+    rounding="stochastic" casts with unbiased stochastic rounding (precision.cast_state_dict,
+    per-tensor seeds from `seed` and the name): a small edit made in fp32 on top of bf16
+    weights survives a bf16 save in expectation, where round-to-nearest returns the
+    original weight for almost every element. config.json then records the saved dtype.
+    In the source layout only the model's weights are cast; tensors copied from the
+    source checkpoint (the vision tower) keep their stored dtype.
 
     source_layout: for a model loaded as a causal LM from a checkpoint of another
     architecture (Qwen3.5's checkpoints are multimodal; transformers loads their
@@ -61,13 +77,40 @@ def save_hf_model(
     """
     path.mkdir(parents=True, exist_ok=True)
     state = hf_state_dict(state if state is not None else model.state_dict())
+    if dtype is not None:
+        from palingenesis.precision import cast_state_dict
+
+        state = cast_state_dict(state, dtype, rounding, seed)  # aliases (tied weights) stay one tensor
     source = _source_checkpoint(model) if source_layout else None
     if source is None:
         model.save_pretrained(path, state_dict=state, safe_serialization=True, max_shard_size=MAX_SHARD_SIZE)
     else:
         _save_in_source_layout(model, state, path, *source)
+    if dtype is not None:  # save_pretrained records the live model's dtype, the source layout the source's
+        _set_config_dtype(path / "config.json", dtype)
     if tokenizer is not None:
         tokenizer.save_pretrained(path)
+
+
+def _set_config_dtype(config_file: Path, dtype: torch.dtype) -> None:
+    """Record `dtype` in a saved config.json: the top-level dtype (transformers 5 "dtype", older
+    "torch_dtype") and the same keys of nested sub-configs that have them (text_config of a
+    multimodal checkpoint)."""
+    if not config_file.exists():
+        return
+    name = str(dtype).replace("torch.", "")
+    config = json.loads(config_file.read_text())
+
+    def fix(d: dict, top: bool) -> None:
+        for k in ("dtype", "torch_dtype"):
+            if k in d or (top and k == "dtype"):
+                d[k] = name
+        for v in d.values():
+            if isinstance(v, dict) and ("dtype" in v or "torch_dtype" in v):
+                fix(v, False)
+
+    fix(config, True)
+    config_file.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
 def _source_checkpoint(model):

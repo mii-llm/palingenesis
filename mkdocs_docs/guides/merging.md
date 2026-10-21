@@ -68,11 +68,53 @@ A merge cannot remove a regression that an expert already has: check each expert
 - **Extra tensors:** tensors present in a source but not in the template are an error by default; `extra="drop"` leaves
   them out.
 - **Integer buffers** are copied, and must be equal across sources. Non-finite merged values are an error.
-- **Provenance:** `merge_config.json` in the output records the method, sources, coefficients, base, template, dtype and
-  counts.
+- **Provenance:** `merge_config.json` in the output records the method, sources, coefficients, base, template, dtype,
+  rounding, seed, edit survival and counts.
 - **Sources** can be local directories or Hugging Face model ids.
 
 `pgs merge` refuses to write into a non-empty directory unless you pass `--overwrite`.
+
+## Precision of small edits
+
+Public checkpoints are stored in bf16, so their weights already sit on the bf16 grid. bf16 keeps 8 significant bits:
+one ulp is 2^-7 to 2^-8 of a weight's magnitude. An edit far smaller than that, such as a merge with a small `lam`
+between close siblings or a margin-surgery step (‖Δ‖ around 1e-3 to 1e-5 of ‖W‖), is computed correctly in float32. Saving it
+with round-to-nearest then sends almost every element back to its original value, so the edit vanishes: in simulation
+1–6% of it survives.
+
+**Stochastic rounding** (SR) rounds each element up with probability equal to the fraction of an ulp it has moved, so the
+saved value is unbiased: `E[SR(w + d)] = w + d`. A few elements move by a whole ulp and the rest stay. Summed over
+millions of elements, the saved change points along the intended edit and has its size (projection ≈ 1). It is
+noisier element by element (`norm_ratio` > 1). Edits computed from fp32 weights that are off the grid survive
+round-to-nearest only on average. With bf16 sources nothing dithers them.
+
+```bash
+pgs merge interpolate runs/a/final runs/b/final --lam 0.05 --dtype bf16 --rounding stochastic --seed 0 -o runs/ab_0.05
+```
+
+```python
+from palingenesis.checkpoint import save_hf_model
+save_hf_model(model, tok, out, source_layout=True, dtype=torch.bfloat16, rounding="stochastic", seed=0)
+```
+
+- `--rounding {nearest,stochastic}` (default `nearest`) and `--seed` (default 0) exist on every `pgs merge` command, and
+  `rounding=` / `seed=` on every merge function. Each tensor's noise is seeded from `(seed, name)`, so the output is
+  reproducible and does not depend on tensor order or sharding. SR applies when the output dtype is bf16 or fp16.
+  Casts to fp32 are exact anyway.
+- **Measured survival:** every merge records `edit_survival` against the first model in `merge_config.json`:
+  `projection` = ⟨saved − W₀, Δ⟩/‖Δ‖², `norm_ratio` and `changed_frac`. It is computed per tensor while merging, which
+  adds one float64 pass per tensor. With nearest rounding to a 16-bit dtype, a projection below 0.5 logs a warning. Use
+  `--rounding stochastic` then.
+- `save_hf_model(..., dtype=, rounding=, seed=)` casts the saved state the same way (`palingenesis.precision.cast_state_dict`).
+  Tied weights stay tied, and `config.json` records the saved dtype. In the source layout (Qwen3.5 multimodal exports),
+  only the trained weights are cast. Tensors copied from the source checkpoint (the vision tower) keep their stored
+  dtype.
+- **Serving formats:** `palingenesis.precision.simulate_cast(W, fmt)` rounds to `bf16`, `fp16`, `fp8_e4m3` or
+  `fp8_e5m2`, using a per-tensor amax scale for fp8 as common fp8 serving does. Check whether an edit survives serving with
+  `q = simulate_cast(W, fmt); edit_survival(q, q + delta, simulate_cast(W + delta, fmt))`. fp8 steps are 16–32× coarser
+  than bf16. A sub-ulp edit survives fp8 serving of off-grid (fp32 or bf16) weights only on average, through the weights'
+  own offsets on the fp8 grid, so check large enough tensors. GPTQ / AWQ int4 are not simulated: their rounding depends on
+  calibration data and error feedback.
 
 ## Choosing lam and adopting a merge
 
