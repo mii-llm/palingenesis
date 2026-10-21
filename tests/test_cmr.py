@@ -75,7 +75,6 @@ def test_margin_matches_manual(setup):
 def test_margin_is_exact_log_odds_without_saturation():
     """m = logit_d - logsumexp(others): finite with a gradient even when p(d) is ~1 (the old clamp zeroed it)."""
 
-
     logits = torch.tensor([[30.0, 0.0, -1.0]], requires_grad=True)  # p(d=0) ~ 1 - 1e-13
     others = logits.clone()
     others[:, 0] = float("-inf")
@@ -200,3 +199,18 @@ def test_prefix_calls_decision_position(setup):
     assert cmr.token_ids["cont"] == tok.convert_tokens_to_ids("<|im_end|>")
     cmr.refresh()
     assert "cont" in cmr.dirs
+
+
+def test_pos_only_and_residual(setup):
+    """pos_only: the direction ignores the neg side; the logged residual along u is ~0 after the correction."""
+    tmp, path, tok = setup
+    model = fresh(path)
+    cmr = make(model, tok, {"a": twins(tmp / "p.jsonl")}, pos_only=["a"])
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    cmr.pre_step()
+    loss = -cmr.margins([r["pos"] for r in cmr.twins["a"]]).mean()
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    out = cmr.post_step()
+    assert abs(out["cmr/residual/a"]) <= 0.1 * abs(out["cmr/component/a"]) + 1e-9

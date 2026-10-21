@@ -47,6 +47,9 @@ class CMRConfig:
     decision_token: str = "<tool_call>"  # must be a single token of the student's tokenizer
     # per-family override, e.g. {"cont": "<|im_end|>"} for the end-vs-continue decision after a prefix of calls
     decision_tokens: dict = field(default_factory=dict)
+    # families held on the pos margin only (u = grad m+, the neg side is monitored but free): for twins that are not
+    # minimal pairs, where holding m+ + m- would let m+ and m- drift in opposite directions
+    pos_only: list = field(default_factory=list)
     pairs_per_refresh: int = 16  # twins per family used to estimate u_f
     micro_pairs: int = 4  # twins per forward / backward inside a refresh (activation memory)
     refresh_every: int = 1  # optimizer steps between direction refreshes
@@ -65,6 +68,8 @@ class CMRConfig:
             errors.append(f"cmr.mode must be 'hold' or 'target', not {self.mode!r}")
         if self.mode == "target" and set(self.target) - set(self.families):
             errors.append("cmr.target names families that are not in cmr.families")
+        if set(self.pos_only) - set(self.families):
+            errors.append("cmr.pos_only names families that are not in cmr.families")
         if set(self.decision_tokens) - set(self.families):
             errors.append("cmr.decision_tokens names families that are not in cmr.families")
         if self.chat_template_kwargs.get("enable_thinking"):
@@ -213,8 +218,9 @@ class CommonModeRejection:
                 chunk = batch[i : i + micro]
                 with cast:
                     tid = self.token_ids[f]
-                    mp, mn = self.margins([r["pos"] for r in chunk], tid), self.margins([r["neg"] for r in chunk], tid)
-                part = (mp + mn).sum() / len(batch)
+                    mp = self.margins([r["pos"] for r in chunk], tid)
+                    mn = None if f in self.config.pos_only else self.margins([r["neg"] for r in chunk], tid)
+                part = (mp if mn is None else mp + mn).sum() / len(batch)
                 part.backward()
                 total += float(part.detach())
             raw[f] = self._grads()
@@ -263,4 +269,6 @@ class CommonModeRejection:
                 p.sub_(corr * x.to(p.dtype))
             out[f"cmr/component/{f}"] = c
             out[f"cmr/correction/{f}"] = corr
+            # what is left along u_f after the correction (should be ~delta; fp32 rounding of tiny per-element steps)
+            out[f"cmr/residual/{f}"] = self._dot(d) - self.before[f] - delta
         return out
