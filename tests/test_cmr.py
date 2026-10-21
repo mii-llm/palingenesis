@@ -199,6 +199,11 @@ def test_prefix_calls_decision_position(setup):
     assert cmr.token_ids["cont"] == tok.convert_tokens_to_ids("<|im_end|>")
     cmr.refresh()
     assert "cont" in cmr.dirs
+    # prefix_content: text the assistant wrote before its calls is rendered in the same turn, before the call
+    side = dict(rows[0]["pos"], prefix_content="Checking both cities.")
+    text = tok.decode(cmr._prompt_ids(side))
+    assert text.endswith("</tool_call>") and "Checking both cities." in text
+    assert text.index("Checking both cities.") < text.rindex("<tool_call>")
 
 
 def test_pos_only_and_residual(setup):

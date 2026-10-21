@@ -127,8 +127,8 @@ class CommonModeRejection:
 
     def _prompt_ids(self, side: dict) -> list[int]:
         """The prompt up to the decision position. With "prefix_calls" ([{name, arguments}]), an assistant turn holding
-        those calls is rendered and cut right after its last "</tool_call>": the next token decides between ending the
-        turn and making another call."""
+        those calls (and the text "prefix_content" before them, default none) is rendered and cut right after its last
+        "</tool_call>": the next token decides between ending the turn and making another call."""
         kw = dict(tools=side.get("tools") or None, tokenize=False, **self.config.chat_template_kwargs)
         calls = side.get("prefix_calls")
         if not calls:
@@ -136,7 +136,7 @@ class CommonModeRejection:
         else:
             turn = {
                 "role": "assistant",
-                "content": "",
+                "content": side.get("prefix_content") or "",
                 "tool_calls": [
                     {"type": "function", "function": {"name": c["name"], "arguments": c.get("arguments") or {}}}
                     for c in calls

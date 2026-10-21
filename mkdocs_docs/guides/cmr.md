@@ -33,6 +33,14 @@ while the differential margins and everything else train freely.
 
 With `mode: target`, the common margin is steered toward a value of your choice instead of held.
 
+### Decisions after a call
+
+A side can carry `prefix_calls`, a list of `{name, arguments}`. CMR then renders an assistant turn holding those calls
+and reads the margin right after the last `</tool_call>`, so the decision is whether to end the turn or make another
+call. Set that family's decision token to `<|im_end|>` with `decision_tokens: {cont: "<|im_end|>"}`. `prefix_content`
+adds the text the assistant wrote before its calls. `pos_only: [family]` holds only the positive side's margin, which
+fits when the negative side is saturated or not a minimal pair.
+
 ## Configuration
 
 ```yaml
