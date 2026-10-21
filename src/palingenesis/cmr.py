@@ -146,10 +146,11 @@ class CommonModeRejection:
 
     def refresh(self) -> None:
         """Estimate u_f for every family, orthonormalise. Backward in micro-batches of `micro_pairs` (exact: the mean is
-        linear) under bf16 autocast on CUDA, so activation memory stays bounded."""
+        linear) under bf16 autocast on CUDA, so activation memory stays bounded. Each family's gradient is orthonormalised
+        against the kept directions (in place) right after its backward, so at most one raw gradient is alive at a time:
+        the peak is the kept directions plus one gradient, not every family's raw gradient at once."""
         self._zero()
         self.dirs, self.norms = {}, {}  # free the previous directions before building the new ones
-        raw: dict[str, list[torch.Tensor]] = {}
         micro = max(1, self.config.micro_pairs)
         cast = torch.autocast("cuda", dtype=torch.bfloat16) if str(self.device).startswith("cuda") else _nullcontext()
         for f, rows in self.twins.items():
@@ -164,23 +165,25 @@ class CommonModeRejection:
                 part = (mp if mn is None else mp + mn).sum() / len(batch)
                 part.backward()
                 total += float(part.detach())
-            raw[f] = self._grads()
+            g = self._grads()
             self.common[f] = total
             self._zero()
-        for f, g in raw.items():
             norm0 = math.sqrt(sum(float(torch.sum(x * x, dtype=torch.float64)) for x in g))
-            for d in self.dirs.values():  # Gram-Schmidt against the kept families
+            for d in self.dirs.values():  # Gram-Schmidt against the kept families, in place
                 dot = sum(float(torch.sum(x * y, dtype=torch.float64)) for x, y in zip(g, d))
-                g = [x - dot * y for x, y in zip(g, d)]
+                for x, y in zip(g, d):
+                    x.sub_(y, alpha=dot)
             norm = math.sqrt(sum(float(torch.sum(x * x, dtype=torch.float64)) for x in g))
             if norm0 == 0 or norm < self.config.min_residual * norm0:
                 logger.warning("cmr: family %s dropped this refresh (residual %.3g of %.3g)", f, norm, norm0)
+                del g
                 continue
-            self.dirs[f] = [x / norm for x in g]
+            for x in g:
+                x.div_(norm)
+            self.dirs[f] = g
             self.norms[f] = norm0
             self.stats[f"cmr/u_norm/{f}"] = norm0
             self.stats[f"cmr/common/{f}"] = self.common[f]
-        del raw
 
     # ------------------------------------------------------------------ the correction
 
