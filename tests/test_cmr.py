@@ -72,6 +72,18 @@ def test_margin_matches_manual(setup):
     assert torch.isclose(m.detach(), torch.log(p) - torch.log1p(-p), atol=1e-4)
 
 
+def test_margin_is_exact_log_odds_without_saturation():
+    """m = logit_d - logsumexp(others): finite with a gradient even when p(d) is ~1 (the old clamp zeroed it)."""
+
+
+    logits = torch.tensor([[30.0, 0.0, -1.0]], requires_grad=True)  # p(d=0) ~ 1 - 1e-13
+    others = logits.clone()
+    others[:, 0] = float("-inf")
+    m = logits[:, 0] - torch.logsumexp(others, dim=-1)
+    m.sum().backward()
+    assert torch.isfinite(m).all() and m.item() > 25 and logits.grad.abs().sum() > 0
+
+
 def test_batched_margins_equal_single_rows(setup):
     """Right padding: a batch of prompts of different lengths gives each row's own unpadded margin."""
     tmp, path, tok = setup

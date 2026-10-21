@@ -162,8 +162,12 @@ class CommonModeRejection:
         last = torch.tensor([len(x) - 1 for x in ids], device=hidden.device)
         h = hidden[torch.arange(len(ids), device=hidden.device), last]  # head only on the B last real positions
         logits = output_head(self.model)(h).float()
-        logp = torch.log_softmax(logits, dim=-1)[:, self.token_id if token_id is None else token_id]
-        return logp - torch.log1p(-logp.exp().clamp(max=1 - 1e-6))
+        tid = self.token_id if token_id is None else token_id
+        # exact log-odds log p(d) - log(1 - p(d)) = logit_d - logsumexp(other logits): no clamp, so a saturated side
+        # (p near 0 or 1) keeps its gradient
+        others = logits.clone()
+        others[:, tid] = float("-inf")
+        return logits[:, tid] - torch.logsumexp(others, dim=-1)
 
     @torch.no_grad()
     def evaluate(self, rows: list[dict], family: str | None = None) -> dict[str, float]:
