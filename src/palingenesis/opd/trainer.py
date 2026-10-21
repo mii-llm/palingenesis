@@ -278,6 +278,17 @@ class OPDTrainer:
 
             cls = bnb.optim.PagedAdamW8bit if config.train.optimizer == "paged_adamw8bit" else bnb.optim.AdamW8bit
             self.opt = cls(self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0)
+        self.cmr = None
+        if config.cmr.enabled:  # common-mode rejection: hold the twins' common decision margin (palingenesis.cmr)
+            from palingenesis.cmr import CommonModeRejection
+
+            self.cmr = CommonModeRejection(
+                config.cmr,
+                self.student,
+                self.tok,
+                [p for p in self.student.parameters() if p.requires_grad],
+                self.device,
+            )
         self.start_step, wandb_id = 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
@@ -601,10 +612,13 @@ class OPDTrainer:
                     group["lr"] = lr
                 t1 = time.perf_counter()
                 self.student.train()
+                if self.cmr is not None:  # its own forward / backward on the twins; grads cleared before the task's
+                    self.cmr.pre_step()
                 stats = self._scores(batch, train=True)
                 with self.weights.lock:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), config.train.max_grad_norm)
                     self.opt.step()
+                    cmr_stats = self.cmr.post_step() if self.cmr is not None else {}
                     self.opt.zero_grad(set_to_none=True)
                     if self.device == "cuda":
                         torch.cuda.synchronize()
@@ -612,6 +626,7 @@ class OPDTrainer:
                 staleness = self.weights.version - batch.version
                 self.weights.publish()
                 metrics = self._summarize(stats, batch)
+                metrics.update(cmr_stats)
                 metrics.update(
                     {
                         "lr": lr,

@@ -445,6 +445,68 @@ def test_trainer_end_to_end_and_resume(tmp_path, fsdp, monkeypatch):
     resumed.train()
 
 
+def test_trainer_with_cmr_logs_and_corrects(tmp_path):
+    """cmr.enabled in an RL run: the correction runs every step and the twins' common margin is held."""
+    from palingenesis.cmr import CMRConfig, CommonModeRejection
+    from palingenesis.rl.trainer import RLTrainer
+
+    rows = [{"prompt": f"What is {i} plus {i + 1}?", "answer": str(2 * i + 1)} for i in range(30)]
+    (tmp_path / "data.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "add",
+            "description": "Add two numbers",
+            "parameters": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}},
+        },
+    }
+    twins = [
+        {
+            "pos": {"messages": [{"role": "user", "content": f"Add {i} and {i}."}], "tools": [tool]},
+            "neg": {"messages": [{"role": "user", "content": f"Add {i} and {i}."}], "tools": []},
+        }
+        for i in range(6)
+    ]
+    (tmp_path / "twins.jsonl").write_text("".join(json.dumps(r) + "\n" for r in twins))
+    config = RLConfig()
+    for key, value in {
+        "model.policy": tiny_policy(tmp_path),
+        "model.use_liger_kernel": False,
+        "model.chat_template_kwargs": {"enable_thinking": False},
+        "data.dataset": str(tmp_path / "data.jsonl"),
+        "data.eval_size": 3,
+        "rollout.backend": "hf",
+        "rollout.batch_prompts": 3,
+        "rollout.group_size": 3,
+        "rollout.max_new_tokens": 8,
+        "train.output_dir": str(tmp_path / "run"),
+        "train.steps": 2,
+        "train.learning_rate": 1e-3,
+        "train.warmup_steps": 1,
+        "train.eval_every": 0,
+        "model.gradient_checkpointing": "none",
+        "cmr.enabled": True,
+        "cmr.families": {"t": str(tmp_path / "twins.jsonl")},
+        "cmr.pairs_per_refresh": 6,
+    }.items():
+        config.set(key, value)
+    trainer = RLTrainer(config, rewards=[lambda completion: len(completion) / 40])
+    probe = CommonModeRejection(
+        CMRConfig(enabled=True, families={"t": str(tmp_path / "twins.jsonl")}),
+        trainer.model,
+        trainer.tok,
+        list(trainer._trainable()),
+        trainer.device,
+    )
+    before = probe.evaluate(probe.twins["t"])["common"]
+    logged = []
+    trainer._log = lambda kind, m, step: logged.append((kind, m))
+    trainer.train()
+    steps = [m for kind, m in logged if kind == "step"]
+    assert steps and all("cmr/component/t" in m for m in steps)
+    assert abs(probe.evaluate(probe.twins["t"])["common"] - before) < 0.05
+
+
 @pytest.mark.parametrize("multiplier,softcap", [(1.0, None), (0.5, 3.0)])
 def test_fused_linear_logprobs_match_autograd(multiplier, softcap):
     from palingenesis.logits import PostProcessedHead

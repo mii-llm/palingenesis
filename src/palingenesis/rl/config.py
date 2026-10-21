@@ -15,6 +15,8 @@ from pathlib import Path
 
 import yaml
 
+from palingenesis.cmr import CMRConfig
+
 LOSSES = ("masked_is", "cispo", "icepop", "gspo")
 ADVANTAGE_STD = ("batch", "group", "none")
 AGGREGATIONS = ("prompt", "token", "constant")
@@ -304,6 +306,7 @@ class RLConfig:
     loss: RLLossConfig = field(default_factory=RLLossConfig)
     train: RLTrainConfig = field(default_factory=RLTrainConfig)
     logging: RLLoggingConfig = field(default_factory=RLLoggingConfig)
+    cmr: CMRConfig = field(default_factory=CMRConfig)  # common-mode rejection (palingenesis.cmr); off by default
 
     # ------------------------------------------------------------------ loading
 
@@ -588,6 +591,10 @@ class RLConfig:
             errors.append("train.adam_eps must be >= 0 (0 = auto).")
         if t.steps < 1 or t.micro_tokens < 1:
             errors.append("train.steps and train.micro_tokens must be >= 1.")
+        if self.cmr.enabled:
+            errors += self.cmr.validate()
+            if self.train.fsdp:
+                errors.append("cmr is single-GPU only (the update correction needs the full parameters); turn off fsdp")
         if t.learning_rate > 1e-5:
             warnings.append(f"train.learning_rate {t.learning_rate}: RL recipes use 5e-7 to 2e-6.")
 

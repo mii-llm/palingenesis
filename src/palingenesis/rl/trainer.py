@@ -258,6 +258,11 @@ class RLTrainer:
         )
         self.orchestrator = Orchestrator(self.pipeline, lambda: self.batch_prompts, r.temperature, r.max_staleness)
         self.opt = _optimizer(self._trainable(), t, self.device, self._trainable_names())
+        self.cmr = None
+        if config.cmr.enabled:  # common-mode rejection on the parameters the optimizer steps (fp32 masters)
+            from palingenesis.cmr import CommonModeRejection
+
+            self.cmr = CommonModeRejection(config.cmr, self.model, self.tok, list(self._trainable()), self.device)
         self.start_step, self.stale_groups, wandb_id = 0, 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
@@ -571,6 +576,8 @@ class RLTrainer:
                 for group in self.opt.param_groups:
                     group["lr"] = lr
                 t1 = time.perf_counter()
+                if self.cmr is not None:  # its own forward / backward on the twins; grads cleared before the task's
+                    self.cmr.pre_step()
                 metrics = self._train_step(groups)
                 trained = self.parallel.sum([metrics.get("trained_sequences", 0.0)])[0]
                 with self.weights.lock:
@@ -578,6 +585,8 @@ class RLTrainer:
                     grad_norm = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
                     if trained:  # every rank steps (or none does): the parameters are sharded
                         self.opt.step()
+                        if self.cmr is not None:  # correct the masters before they are published
+                            metrics.update(self.cmr.post_step())
                         if self.master is not None:
                             self.master.publish()
                     self.opt.zero_grad(set_to_none=True)

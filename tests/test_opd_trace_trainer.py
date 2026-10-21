@@ -259,6 +259,43 @@ def test_stop_at_chunks_follow_one_schedule(tmp_path, models):
     assert lrs == {k + 1: pytest.approx(ref._lr_at(k)) for k in range(4)}  # one cosine over 4 steps, no restart
 
 
+def test_cmr_holds_the_common_margin_in_a_trace_run(tmp_path, models):
+    """cmr.enabled in an agent_traces run: metrics logged, and the twins' common margin moves far less than without."""
+    from palingenesis.opd.trace_trainer import TraceTrainer
+
+    tw = tmp_path / "twins.jsonl"
+    rows = []
+    for i in range(6):
+        q = [{"role": "user", "content": f"Run the command number {i}."}]
+        rows.append({"pos": {"messages": q, "tools": TOOLS}, "neg": {"messages": q, "tools": []}})
+    tw.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    common = {}
+    for arm, on in (("off", False), ("on", True)):
+        extra = {
+            "train.output_dir": str(tmp_path / arm),
+            "train.steps": 3,
+            "train.eval_every": 0,
+            "loss.trace_kd_weight": 0.0,
+            "train.learning_rate": 3e-3,
+        }
+        if on:
+            extra.update({"cmr.enabled": True, "cmr.families": {"t": str(tw)}, "cmr.pairs_per_refresh": 6})
+        t = TraceTrainer(make_config(tmp_path, models, **extra))
+        from palingenesis.cmr import CMRConfig, CommonModeRejection
+
+        probe = CommonModeRejection(
+            CMRConfig(enabled=True, families={"t": str(tw)}), t.student, t.tok, list(t.student.parameters()), t.device
+        )
+        before = probe.evaluate(probe.twins["t"])["common"]
+        logged = []
+        t._log = lambda kind, m, step: logged.append((kind, m))
+        t.train()
+        common[arm] = abs(probe.evaluate(probe.twins["t"])["common"] - before)
+        steps = [m for kind, m in logged if kind == "step"]
+        assert any("cmr/component/t" in m for m in steps) == on
+    assert common["on"] < 0.5 * common["off"] + 1e-4
+
+
 def test_trace_config_validation(tmp_path, models):
     from palingenesis.opd.config import OPDConfigError
 
@@ -272,6 +309,7 @@ def test_trace_config_validation(tmp_path, models):
     invalid("full_rkl from an hf teacher", **{"teachers.coder.loss": "sampled_rkl"})
     invalid("branches_per_trace", **{"sources.traces.branches_per_trace": -1})
     invalid("tree_chunk_size bounds", **{"model.gradient_checkpointing": True})
+    invalid("cmr.families", **{"cmr.enabled": True})
     invalid("mcqa sources need a plain OPD run", **{"sources.pool.format": "mcqa", "sources.pool.path": "x.jsonl"})
     invalid(
         "without sampling_mix",

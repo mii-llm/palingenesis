@@ -14,6 +14,7 @@ from pathlib import Path
 
 import yaml
 
+from palingenesis.cmr import CMRConfig
 from palingenesis.validate_data import valid_think_tags
 
 LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok", "rs_kd")
@@ -290,6 +291,7 @@ class OPDConfig:
     loss: OPDLossConfig = field(default_factory=OPDLossConfig)
     train: OPDTrainConfig = field(default_factory=OPDTrainConfig)
     logging: OPDLoggingConfig = field(default_factory=OPDLoggingConfig)
+    cmr: CMRConfig = field(default_factory=CMRConfig)  # common-mode rejection (palingenesis.cmr); off by default
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "OPDConfig":
@@ -506,6 +508,8 @@ class OPDConfig:
                 )
         if self.sources and sum(s.weight for s in self.sources.values()) <= 0:
             errors.append("the source weights must not all be 0.")
+        if self.cmr.enabled:
+            errors += self.cmr.validate()
         formats = {s.format for s in self.sources.values()}
         if "agent_traces" in formats:
             if not formats <= {"agent_traces", "messages"}:
