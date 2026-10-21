@@ -120,23 +120,24 @@ class CommonModeRejection:
         return self.tok(text, add_special_tokens=False)["input_ids"]
 
     def margins(self, sides: list[dict]) -> torch.Tensor:
-        """Decision margin at the first assistant token for each prompt (one forward, left padding, last position)."""
+        """Decision margin at the first assistant token for each prompt. One forward with RIGHT padding, read at each
+        row's last real position: causal attention and recurrent (Gated DeltaNet) layers never see the padding there,
+        which left padding could not guarantee for linear-attention state."""
         ids = [self._prompt_ids(s) for s in sides]
         width = max(len(x) for x in ids)
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
         input_ids = torch.full((len(ids), width), pad, dtype=torch.long)
         mask = torch.zeros((len(ids), width), dtype=torch.long)
         for i, x in enumerate(ids):
-            input_ids[i, width - len(x) :] = torch.tensor(x)
-            mask[i, width - len(x) :] = 1
-        position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
-        out = self.model(
-            input_ids=input_ids.to(self.device),
-            attention_mask=mask.to(self.device),
-            position_ids=position_ids.to(self.device),
-            logits_to_keep=1,
-        )
-        logp = torch.log_softmax(out.logits[:, -1].float(), dim=-1)[:, self.token_id]
+            input_ids[i, : len(x)] = torch.tensor(x)
+            mask[i, : len(x)] = 1
+        from palingenesis.logits import final_hidden_states, output_head
+
+        hidden = final_hidden_states(self.model, input_ids.to(self.device), mask.to(self.device))  # [B, T, H]
+        last = torch.tensor([len(x) - 1 for x in ids], device=hidden.device)
+        h = hidden[torch.arange(len(ids), device=hidden.device), last]  # head only on the B last real positions
+        logits = output_head(self.model)(h).float()
+        logp = torch.log_softmax(logits, dim=-1)[:, self.token_id]
         return logp - torch.log1p(-logp.exp().clamp(max=1 - 1e-6))
 
     @torch.no_grad()

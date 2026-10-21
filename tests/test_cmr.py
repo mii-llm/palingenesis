@@ -72,6 +72,18 @@ def test_margin_matches_manual(setup):
     assert torch.isclose(m.detach(), torch.log(p) - torch.log1p(-p), atol=1e-4)
 
 
+def test_batched_margins_equal_single_rows(setup):
+    """Right padding: a batch of prompts of different lengths gives each row's own unpadded margin."""
+    tmp, path, tok = setup
+    model = fresh(path)
+    cmr = make(model, tok, {"a": twins(tmp / "b.jsonl")})
+    sides = [cmr.twins["a"][0]["pos"], {"messages": [{"role": "user", "content": "hi"}], "tools": [TOOL, OTHER]}]
+    with torch.no_grad():
+        batch = cmr.margins(sides)
+        single = torch.stack([cmr.margins([s])[0] for s in sides])
+    assert torch.allclose(batch, single, atol=1e-4)
+
+
 def _step(model, cmr=None, seed=0):
     """One AdamW step on a loss that pushes the decision token up on every twin (a pure common-mode push plus noise)."""
     torch.manual_seed(seed)
