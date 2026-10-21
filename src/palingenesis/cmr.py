@@ -25,6 +25,7 @@ freely. The parameters corrected are the ones the optimizer updates (the fp32 ma
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -32,6 +33,8 @@ import random
 from dataclasses import dataclass, field
 
 import torch
+
+_nullcontext = contextlib.nullcontext
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,7 @@ class CMRConfig:
     families: dict = field(default_factory=dict)
     decision_token: str = "<tool_call>"  # must be a single token of the student's tokenizer
     pairs_per_refresh: int = 16  # twins per family used to estimate u_f
+    micro_pairs: int = 4  # twins per forward / backward inside a refresh (activation memory)
     refresh_every: int = 1  # optimizer steps between direction refreshes
     mode: str = "hold"  # "hold": common-mode change 0; "target": steer the mean common margin toward `target`
     target: dict = field(default_factory=dict)  # mode "target": {family: mean common margin to reach}
@@ -169,24 +173,32 @@ class CommonModeRejection:
             p.grad = None
 
     def refresh(self) -> None:
-        """Estimate u_f for every family (one forward / backward per family, last position only), orthonormalise."""
+        """Estimate u_f for every family, orthonormalise. Backward in micro-batches of `micro_pairs` (exact: the mean is
+        linear) under bf16 autocast on CUDA, so activation memory stays bounded."""
         self._zero()
+        self.dirs, self.norms = {}, {}  # free the previous directions before building the new ones
         raw: dict[str, list[torch.Tensor]] = {}
+        micro = max(1, self.config.micro_pairs)
+        cast = torch.autocast("cuda", dtype=torch.bfloat16) if str(self.device).startswith("cuda") else _nullcontext()
         for f, rows in self.twins.items():
             batch = self.rng.sample(rows, min(self.config.pairs_per_refresh, len(rows)))
-            mp, mn = self.margins([r["pos"] for r in batch]), self.margins([r["neg"] for r in batch])
-            common = (mp + mn).mean()
-            common.backward()
+            total = 0.0
+            for i in range(0, len(batch), micro):
+                chunk = batch[i : i + micro]
+                with cast:
+                    mp, mn = self.margins([r["pos"] for r in chunk]), self.margins([r["neg"] for r in chunk])
+                part = (mp + mn).sum() / len(batch)
+                part.backward()
+                total += float(part.detach())
             raw[f] = self._grads()
-            self.common[f] = float(common.detach())
+            self.common[f] = total
             self._zero()
-        self.dirs, self.norms = {}, {}
         for f, g in raw.items():
-            norm0 = math.sqrt(sum(float((x.double() ** 2).sum()) for x in g))
+            norm0 = math.sqrt(sum(float(torch.sum(x * x, dtype=torch.float64)) for x in g))
             for d in self.dirs.values():  # Gram-Schmidt against the kept families
-                dot = sum(float((x.double() * y.double()).sum()) for x, y in zip(g, d))
+                dot = sum(float(torch.sum(x * y, dtype=torch.float64)) for x, y in zip(g, d))
                 g = [x - dot * y for x, y in zip(g, d)]
-            norm = math.sqrt(sum(float((x.double() ** 2).sum()) for x in g))
+            norm = math.sqrt(sum(float(torch.sum(x * x, dtype=torch.float64)) for x in g))
             if norm0 == 0 or norm < self.config.min_residual * norm0:
                 logger.warning("cmr: family %s dropped this refresh (residual %.3g of %.3g)", f, norm, norm0)
                 continue
@@ -194,12 +206,13 @@ class CommonModeRejection:
             self.norms[f] = norm0
             self.stats[f"cmr/u_norm/{f}"] = norm0
             self.stats[f"cmr/common/{f}"] = self.common[f]
+        del raw
 
     # ------------------------------------------------------------------ the correction
 
     @torch.no_grad()
     def _dot(self, d: list[torch.Tensor]) -> float:
-        return sum(float((x.double() * p.detach().double()).sum()) for x, p in zip(d, self.params))
+        return sum(float(torch.sum(x * p.detach().float(), dtype=torch.float64)) for x, p in zip(d, self.params))
 
     def pre_step(self) -> None:
         """Before optimizer.step(): refresh the directions when due and record u_f . theta."""
