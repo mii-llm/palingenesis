@@ -45,6 +45,8 @@ class CMRConfig:
     # {family: path to JSONL of {"pos": {"messages", "tools"?}, "neg": {"messages", "tools"?}}}
     families: dict = field(default_factory=dict)
     decision_token: str = "<tool_call>"  # must be a single token of the student's tokenizer
+    # per-family override, e.g. {"cont": "<|im_end|>"} for the end-vs-continue decision after a prefix of calls
+    decision_tokens: dict = field(default_factory=dict)
     pairs_per_refresh: int = 16  # twins per family used to estimate u_f
     micro_pairs: int = 4  # twins per forward / backward inside a refresh (activation memory)
     refresh_every: int = 1  # optimizer steps between direction refreshes
@@ -63,6 +65,8 @@ class CMRConfig:
             errors.append(f"cmr.mode must be 'hold' or 'target', not {self.mode!r}")
         if self.mode == "target" and set(self.target) - set(self.families):
             errors.append("cmr.target names families that are not in cmr.families")
+        if set(self.decision_tokens) - set(self.families):
+            errors.append("cmr.decision_tokens names families that are not in cmr.families")
         if self.chat_template_kwargs.get("enable_thinking"):
             errors.append("cmr: thinking twins are not supported (the first assistant token is inside the think block)")
         if self.pairs_per_refresh < 1 or self.refresh_every < 1:
@@ -102,6 +106,9 @@ class CommonModeRejection:
             raise ValueError("; ".join(errors))
         self.config, self.model, self.tok, self.params, self.device = config, model, tok, params, device
         self.token_id = decision_token_id(tok, config.decision_token)
+        self.token_ids = {
+            f: decision_token_id(tok, config.decision_tokens.get(f, config.decision_token)) for f in config.families
+        }
         self.twins = {f: load_twins(p) for f, p in config.families.items()}
         self.rng = random.Random(config.seed)
         self.dirs: dict[str, list[torch.Tensor]] = {}  # family -> unit direction (per-parameter fp32 chunks)
@@ -114,16 +121,30 @@ class CommonModeRejection:
     # ------------------------------------------------------------------ margins
 
     def _prompt_ids(self, side: dict) -> list[int]:
-        text = self.tok.apply_chat_template(
-            side["messages"],
-            tools=side.get("tools") or None,
-            add_generation_prompt=True,
-            tokenize=False,
-            **self.config.chat_template_kwargs,
-        )
+        """The prompt up to the decision position. With "prefix_calls" ([{name, arguments}]), an assistant turn holding
+        those calls is rendered and cut right after its last "</tool_call>": the next token decides between ending the
+        turn and making another call."""
+        kw = dict(tools=side.get("tools") or None, tokenize=False, **self.config.chat_template_kwargs)
+        calls = side.get("prefix_calls")
+        if not calls:
+            text = self.tok.apply_chat_template(side["messages"], add_generation_prompt=True, **kw)
+        else:
+            turn = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": c["name"], "arguments": c.get("arguments") or {}}}
+                    for c in calls
+                ],
+            }
+            full = self.tok.apply_chat_template(list(side["messages"]) + [turn], add_generation_prompt=False, **kw)
+            cut = full.rfind("</tool_call>")
+            if cut < 0:
+                raise ValueError("cmr: the chat template rendered no </tool_call> for prefix_calls")
+            text = full[: cut + len("</tool_call>")]
         return self.tok(text, add_special_tokens=False)["input_ids"]
 
-    def margins(self, sides: list[dict]) -> torch.Tensor:
+    def margins(self, sides: list[dict], token_id: int | None = None) -> torch.Tensor:
         """Decision margin at the first assistant token for each prompt. One forward with RIGHT padding, read at each
         row's last real position: causal attention and recurrent (Gated DeltaNet) layers never see the padding there,
         which left padding could not guarantee for linear-attention state."""
@@ -141,15 +162,16 @@ class CommonModeRejection:
         last = torch.tensor([len(x) - 1 for x in ids], device=hidden.device)
         h = hidden[torch.arange(len(ids), device=hidden.device), last]  # head only on the B last real positions
         logits = output_head(self.model)(h).float()
-        logp = torch.log_softmax(logits, dim=-1)[:, self.token_id]
+        logp = torch.log_softmax(logits, dim=-1)[:, self.token_id if token_id is None else token_id]
         return logp - torch.log1p(-logp.exp().clamp(max=1 - 1e-6))
 
     @torch.no_grad()
-    def evaluate(self, rows: list[dict]) -> dict[str, float]:
+    def evaluate(self, rows: list[dict], family: str | None = None) -> dict[str, float]:
         """Mean common / differential margin and decision rates on twins (e.g. held-out dev twins)."""
         was = self.model.training
         self.model.eval()
-        mp, mn = self.margins([r["pos"] for r in rows]), self.margins([r["neg"] for r in rows])
+        tid = self.token_ids.get(family) if family else None
+        mp, mn = self.margins([r["pos"] for r in rows], tid), self.margins([r["neg"] for r in rows], tid)
         self.model.train(was)
         return {
             "common": float((mp + mn).mean()),
@@ -186,7 +208,8 @@ class CommonModeRejection:
             for i in range(0, len(batch), micro):
                 chunk = batch[i : i + micro]
                 with cast:
-                    mp, mn = self.margins([r["pos"] for r in chunk]), self.margins([r["neg"] for r in chunk])
+                    tid = self.token_ids[f]
+                    mp, mn = self.margins([r["pos"] for r in chunk], tid), self.margins([r["neg"] for r in chunk], tid)
                 part = (mp + mn).sum() / len(batch)
                 part.backward()
                 total += float(part.detach())

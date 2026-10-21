@@ -159,3 +159,32 @@ def test_config_validation(setup):
     assert CMRConfig(enabled=True, families={"a": "x"}, chat_template_kwargs={"enable_thinking": True}).validate()
     with pytest.raises(ValueError, match="one"):
         make(fresh(path), tok, {"a": twins(tmp / "v.jsonl")}, decision_token="call the tool")
+
+
+def test_prefix_calls_decision_position(setup):
+    """prefix_calls: the prompt ends right after the last </tool_call> of the rendered assistant turn, and a per-family
+    decision token (end of turn) is used."""
+    tmp, path, tok = setup
+    model = fresh(path)
+    rows = [
+        {
+            "pos": {
+                "messages": [{"role": "user", "content": "Weather in Rome and Paris?"}],
+                "tools": [TOOL],
+                "prefix_calls": [{"name": "get_weather", "arguments": {"city": "Rome"}}],
+            },
+            "neg": {
+                "messages": [{"role": "user", "content": "Weather in Rome?"}],
+                "tools": [TOOL],
+                "prefix_calls": [{"name": "get_weather", "arguments": {"city": "Rome"}}],
+            },
+        }
+    ] * 4
+    f = tmp / "cont.jsonl"
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    cmr = make(model, tok, {"cont": str(f)}, decision_tokens={"cont": "<|im_end|>"})
+    ids = cmr._prompt_ids(rows[0]["pos"])
+    assert tok.decode(ids).endswith("</tool_call>")
+    assert cmr.token_ids["cont"] == tok.convert_tokens_to_ids("<|im_end|>")
+    cmr.refresh()
+    assert "cont" in cmr.dirs
