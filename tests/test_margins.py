@@ -45,8 +45,12 @@ def test_reader_matches_full_forward_and_batches(setup):
     sides = [
         {"messages": [{"role": "user", "content": "Weather in Rome?"}], "tools": [TOOL]},
         {"messages": [{"role": "user", "content": "Tell me a much longer story about the weather in Rome today"}]},
-        {"messages": [{"role": "user", "content": "Rome and Paris?"}], "tools": [TOOL],
-         "prefix_calls": [{"name": "get_weather", "arguments": {"city": "Rome"}}], "prefix_content": "Checking."},
+        {
+            "messages": [{"role": "user", "content": "Rome and Paris?"}],
+            "tools": [TOOL],
+            "prefix_calls": [{"name": "get_weather", "arguments": {"city": "Rome"}}],
+            "prefix_content": "Checking.",
+        },
     ]
     with torch.no_grad():
         batch = reader.margins(sides, tid)

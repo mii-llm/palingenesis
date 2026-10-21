@@ -62,7 +62,9 @@ class MarginReader:
 
     def __init__(self, model, tok, chat_template_kwargs: dict | None = None, device: str | torch.device | None = None):
         self.model, self.tok = model, tok
-        self.chat_template_kwargs = dict(chat_template_kwargs if chat_template_kwargs is not None else {"enable_thinking": False})
+        self.chat_template_kwargs = dict(
+            chat_template_kwargs if chat_template_kwargs is not None else {"enable_thinking": False}
+        )
         if device is None:
             device = next(model.parameters()).device
         self.device = device
