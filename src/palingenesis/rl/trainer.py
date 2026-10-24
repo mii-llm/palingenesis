@@ -121,7 +121,9 @@ class RLTrainer:
         eval_rows = _eval_subset(eval_rows, t.eval_samples, config.data.seed)
         # every rank owns a disjoint shard of the prompts (a group never spans ranks)
         self.eval_rows = eval_rows[rank::world]
-        self.sampler = PromptSampler(train_rows[rank::world], config.data.seed + rank, config.data.retire_above)
+        d = config.data
+        self.sampler = PromptSampler(train_rows[rank::world], d.seed + rank, d.retire_above, d.revisit_after, d.revisit_max,
+                                     None if d.revisit_partial_after < 0 else d.revisit_partial_after)
         self.batch_prompts = r.batch_prompts // world
         self.sandbox = make_sandbox(config.sandbox) if self._needs_sandbox() else None
         logger.info(

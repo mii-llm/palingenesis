@@ -1109,3 +1109,38 @@ def test_eval_subset_is_a_fixed_sample_covering_the_whole_file():
     assert a == b and len(a) == 50 and [r["i"] for r in a] == sorted(r["i"] for r in a)
     assert any(r["source"] == "new" for r in a)  # a head slice would drop the appended family
     assert _eval_subset(rows, 0, 0) == rows and _eval_subset(rows, 200, 0) == rows
+
+
+def test_prompt_sampler_retry_queue():
+    import pickle
+
+    from palingenesis.rl.data import PromptSampler
+
+    rows = [{"prompt": f"p{i}"} for i in range(10)]
+    a, b = PromptSampler(rows, seed=1), PromptSampler(rows, seed=1, revisit_after=0)
+    for _ in range(25):  # with the queue off, observe(..., solved) changes nothing in the draw order
+        ia, ib = a.draw()[0], b.draw()[0]
+        assert ia == ib
+        a.observe(ia, 0.0)
+        b.observe(ib, 0.0, 0.0)
+    assert not b.pending
+
+    s = PromptSampler(rows, seed=1, revisit_after=5, revisit_max=2, revisit_partial_after=2)
+    i0, _ = s.draw()
+    s.observe(i0, 0.0, 0.0)  # nothing solved: due again 5 draws later
+    seen = [s.draw()[0] for _ in range(5)]
+    assert seen[-1] == i0 and i0 not in seen[:-1]
+    s.observe(i0, 0.5, 0.25)  # partly solved now: solved after a failure, back after 2 draws
+    assert i0 in s.solved_after_fail and s.first_solved[i0] == s.draws
+    assert [s.draw()[0] for _ in range(2)][-1] == i0
+    s.observe(i0, 0.0, 0.0)  # third observation: the revisit cap (2) is reached, nothing scheduled
+    assert all(index != i0 for due, index in s.pending)
+    j, _ = s.draw()
+    s.observe(j, 1.0, 1.0)  # fully solved: not queued
+    assert all(index != j for due, index in s.pending)
+    m = s.metrics()
+    assert m["sampler/rows_solved_after_fail"] == 1.0 and m["sampler/rows_failed_once"] == 1.0
+    t = PromptSampler(rows, seed=1, revisit_after=5)
+    t.load_state(pickle.loads(pickle.dumps(s.state())))
+    assert (t.draws, t.pending, t.first_solved, t.solved_after_fail) == (s.draws, s.pending, s.first_solved, s.solved_after_fail)
+    assert [t.draw()[0] for _ in range(6)] == [s.draw()[0] for _ in range(6)]

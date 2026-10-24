@@ -7,6 +7,7 @@ in `data.prompt_field` or the first of messages, prompt, question, problem.
 
 import hashlib
 import json
+import heapq
 import random
 from pathlib import Path
 from typing import Any
@@ -71,9 +72,18 @@ def split_rows(rows: list[dict], eval_size: int) -> tuple[list[dict], list[dict]
 
 class PromptSampler:
     """Training rows in shuffled epochs. With `retire_above`, a row whose group's mean reward
-    reaches it is not drawn again (it no longer teaches anything)."""
+    reaches it is not drawn again (it no longer teaches anything).
 
-    def __init__(self, rows: list[dict[str, Any]], seed: int = 0, retire_above: float = 0.0):
+    With `revisit_after` > 0 (a retry queue, off by default), a row is brought back on a schedule instead of waiting for
+    the next epoch: a group where no rollout succeeded (solved share 0) returns after `revisit_after` draws, up to
+    `revisit_max` times, so a task the policy cannot solve yet is tried again once the policy has moved; a partly solved
+    group (0 < share < 1: the rows that give gradient) returns after `revisit_partial_after` draws (default half the
+    delay), also up to `revisit_max` times. Due revisits are served before the epoch order. Per row the sampler keeps
+    attempts, the draw of its first success and whether it was solved only after a group that failed completely, so a
+    run can report how many tasks went from "tried, not solved" to "solved" (`metrics()`, `state()`)."""
+
+    def __init__(self, rows: list[dict[str, Any]], seed: int = 0, retire_above: float = 0.0, revisit_after: int = 0,
+                 revisit_max: int = 3, revisit_partial_after: int | None = None):
         if not rows:
             raise ValueError("no training rows")
         self.rows = rows
@@ -82,8 +92,24 @@ class PromptSampler:
         self.retired: set[int] = set()
         self.order: list[int] = []
         self.epoch = 0
+        self.revisit_after = int(revisit_after)
+        self.revisit_max = int(revisit_max)
+        self.revisit_partial_after = (int(revisit_partial_after) if revisit_partial_after is not None
+                                      else max(1, self.revisit_after // 2))
+        self.draws = 0
+        self.pending: list[tuple[int, int]] = []  # (due draw, row index), a heap
+        self.attempts: dict[int, int] = {}
+        self.revisits: dict[int, int] = {}
+        self.first_solved: dict[int, int] = {}  # row index -> draw count when a group first had a success
+        self.failed: set[int] = set()  # rows with at least one group where nothing succeeded
+        self.solved_after_fail: set[int] = set()
 
     def draw(self) -> tuple[int, dict[str, Any]]:
+        self.draws += 1
+        while self.pending and self.pending[0][0] <= self.draws:
+            _, index = heapq.heappop(self.pending)
+            if index not in self.retired:
+                return index, self.rows[index]
         while True:
             if not self.order:
                 live = [i for i in range(len(self.rows)) if i not in self.retired]
@@ -98,9 +124,37 @@ class PromptSampler:
             if index not in self.retired:
                 return index, self.rows[index]
 
-    def observe(self, index: int, mean_reward: float) -> None:
+    def observe(self, index: int, mean_reward: float, solved: float | None = None) -> None:
+        """A group's outcome: mean reward (for retire_above) and, for the retry queue, the share of its rollouts that
+        succeeded (reward >= data.success_threshold)."""
         if self.retire_above and mean_reward >= self.retire_above:
             self.retired.add(index)
+        if solved is None:
+            return
+        self.attempts[index] = self.attempts.get(index, 0) + 1
+        if solved > 0:
+            self.first_solved.setdefault(index, self.draws)
+            if index in self.failed:
+                self.solved_after_fail.add(index)
+        else:
+            self.failed.add(index)
+        if self.revisit_after <= 0 or index in self.retired or solved >= 1:
+            return
+        if self.revisits.get(index, 0) >= self.revisit_max:
+            return
+        self.revisits[index] = self.revisits.get(index, 0) + 1
+        delay = self.revisit_after if solved <= 0 else self.revisit_partial_after
+        heapq.heappush(self.pending, (self.draws + delay, index))
+
+    def metrics(self) -> dict[str, float]:
+        """Counters for the training log (cumulative)."""
+        if not self.attempts:
+            return {}
+        return {"sampler/rows_tried": float(len(self.attempts)),
+                "sampler/rows_ever_solved": float(len(self.first_solved)),
+                "sampler/rows_failed_once": float(len(self.failed)),
+                "sampler/rows_solved_after_fail": float(len(self.solved_after_fail)),
+                "sampler/revisits_pending": float(len(self.pending))}
 
     def state(self) -> dict:
         return {
@@ -108,6 +162,13 @@ class PromptSampler:
             "retired": sorted(self.retired),
             "order": self.order,
             "epoch": self.epoch,
+            "draws": self.draws,
+            "pending": sorted(self.pending),
+            "attempts": {str(k): v for k, v in self.attempts.items()},
+            "revisits": {str(k): v for k, v in self.revisits.items()},
+            "first_solved": {str(k): v for k, v in self.first_solved.items()},
+            "failed": sorted(self.failed),
+            "solved_after_fail": sorted(self.solved_after_fail),
         }
 
     def load_state(self, state: dict) -> None:
@@ -117,3 +178,11 @@ class PromptSampler:
             list(state["order"]),
             state["epoch"],
         )
+        self.draws = int(state.get("draws", 0))
+        self.pending = [tuple(x) for x in state.get("pending", [])]
+        heapq.heapify(self.pending)
+        self.attempts = {int(k): v for k, v in state.get("attempts", {}).items()}
+        self.revisits = {int(k): v for k, v in state.get("revisits", {}).items()}
+        self.first_solved = {int(k): v for k, v in state.get("first_solved", {}).items()}
+        self.failed = set(state.get("failed", []))
+        self.solved_after_fail = set(state.get("solved_after_fail", []))

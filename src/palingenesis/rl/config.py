@@ -70,6 +70,11 @@ class RLDataConfig:
     # Retire a prompt once its running mean reward reaches this (0 = never). With a 0/1
     # reward, 0.9 retires prompts the policy has learned (ScaleRL's no-positive-resampling).
     retire_above: float = 0.0
+    # retry queue (0 = off): a training group with no success brings its row back after `revisit_after` draws, a partly
+    # solved one after `revisit_partial_after` (-1 = half the delay), each up to `revisit_max` times (PromptSampler)
+    revisit_after: int = 0
+    revisit_max: int = 3
+    revisit_partial_after: int = -1
     # Rollout outcome metrics (pipeline._outcome_stats): a rollout counts as a success at or above this reward
     # (pass@1 / pass@G), and metrics_key (dotted row paths, first present wins, e.g. ["vtask.vtype", "task"]) splits
     # them per family as family/<name>/... (empty: global only).
@@ -469,6 +474,8 @@ class RLConfig:
             errors.append(f"data.format must be one of {FORMATS}, got {d.format!r}.")
         if d.eval_size < 0 or t.eval_samples < 0:
             errors.append("data.eval_size and train.eval_samples must be >= 0.")
+        if d.revisit_after < 0 or d.revisit_max < 0:
+            errors.append("data.revisit_after and data.revisit_max must be >= 0 (revisit_after 0 = no retry queue).")
         if d.retire_above < 0:
             errors.append("data.retire_above must be >= 0 (0 = never retire prompts).")
 

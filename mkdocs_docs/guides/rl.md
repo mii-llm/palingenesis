@@ -26,6 +26,9 @@ A JSONL, JSON or parquet file, or a Hugging Face dataset id. The prompt is the f
 | `data.eval_dataset` / `data.eval_size` | | Held-out rows (a file, or rows split off by content hash) |
 | `data.system_prompt` | | Prepended when a row has no system message |
 | `data.retire_above` | `0` | Stop drawing a prompt once its group's mean reward reaches this (0.9 with a 0/1 reward) |
+| `data.revisit_after` | `0` | Retry queue (0 = off): a prompt whose group had no success comes back after this many draws instead of waiting for the next epoch, so tasks the policy cannot solve yet are retried once it has moved |
+| `data.revisit_partial_after` | `-1` | Delay for partly solved groups (the ones that give gradient); -1 = half of `revisit_after` |
+| `data.revisit_max` | `3` | Revisits per prompt; the log counts `sampler/rows_solved_after_fail` (tried and failed, later solved) |
 | `data.format` | `auto` | `chat` (palingenesis rows) or `nemo_gym` (NVIDIA NeMo Gym / Nemotron-RL rows, prompt in `responses_create_params`), detected |
 | `data.tools_field` | `tools` | A column of per-row tool schemas (OpenAI or Responses-API form), used when the environment has none |
 

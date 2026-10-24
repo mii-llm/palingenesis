@@ -203,6 +203,8 @@ class RLPipeline:
                 "_dropped_tokens": dropped_tokens,
             }
         )
+        if hasattr(self.sampler, "metrics"):
+            stats.update(self.sampler.metrics())  # the retry queue's cumulative counters
         return kept, stats
 
     # ------------------------------------------------------------------ groups
@@ -224,7 +226,8 @@ class RLPipeline:
         if training:
             scored = [t.reward for t in group if t.scored]
             if scored:
-                self.sampler.observe(index, sum(scored) / len(scored))
+                solved = sum(r >= self.config.data.success_threshold for r in scored) / len(scored)
+                self.sampler.observe(index, sum(scored) / len(scored), solved)
         return group
 
     @property
