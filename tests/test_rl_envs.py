@@ -227,6 +227,60 @@ def test_dynamic_tools_and_environment_ended_episode():
     assert "submit" in tok.decode(t.prompt_ids)  # the dynamic schema reached the prompt
 
 
+class _Endless(Submission):
+    """Never ends its episode: every submit is answered and the episode goes on."""
+
+    def call_tool(self, name, arguments):
+        self.answer = arguments["answer"]
+        return "noted"
+
+
+def test_row_max_turns_overrides_the_env_limit():
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from tests.test_rl import ScriptedEngine, tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    eot = end_of_turn_id(tok, kwargs)
+    engine = ScriptedEngine(tok, eot, ['<tool_call>\n{"name": "submit", "arguments": {"answer": "5"}}\n</tool_call>'])
+    config = RLConfig()
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 4,
+        "rollout.max_new_tokens": 64,
+        "rollout.max_model_len": 4096,
+    }.items():
+        config.set(key, value)
+    rows = [{"prompt": "Submit 5.", "max_turns": 2}, {"prompt": "Submit 5 again."}]
+    pipeline = RLPipeline(
+        tok,
+        ChatFormat(tok, eot, kwargs),
+        engine,
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        PromptSampler(rows),
+        [],
+        EnvPool(_Endless),
+        None,
+        (eot,),
+    )
+    try:
+        groups = pipeline._await(pipeline._eval(rows, 1.0))
+    finally:
+        pipeline.close()
+    turns = {g[0].row["prompt"]: (g[0].turns, g[0].finish) for g in groups}
+    assert turns == {"Submit 5.": (2, "turns"), "Submit 5 again.": (4, "turns")}
+
+
 class _Tracked(Submission):
     """Records when each instance is scored and closed relative to the others."""
 

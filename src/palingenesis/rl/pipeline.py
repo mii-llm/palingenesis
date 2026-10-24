@@ -288,7 +288,9 @@ class RLPipeline:
             budget = int(row.get("max_completion_tokens") or config.completion_budget)
             row_new_tokens = int(row.get("max_new_tokens") or r.max_new_tokens)
             trajectory.info["budget"] = budget
-            max_turns = 1 if env is None else e.max_turns
+            # a row may raise or lower its own turn limit (long agentic tasks next to short ones in one mix)
+            max_turns = 1 if env is None else max(1, int(row.get("max_turns") or e.max_turns))
+            trajectory.info["max_turns"] = max_turns
             forced: list[int] = []
             if skip and chat.thinking and chat.opens_think:
                 forced = self.tok.encode(r.think_skip_prefix, add_special_tokens=False)

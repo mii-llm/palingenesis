@@ -131,7 +131,7 @@ class RLEnvConfig:
     type: str = "single_turn"
     # For type "tools": "module:function" or "file.py:function" names.
     tools: list = field(default_factory=list)
-    max_turns: int = 8  # assistant turns per trajectory (tools/custom envs)
+    max_turns: int = 8  # assistant turns per trajectory (tools/custom envs); a row's own "max_turns" overrides it
     tool_parser: str = "auto"  # "hermes" (JSON), "xml" (Qwen3-Coder/Qwen3.5), or auto
     max_tool_output_tokens: int = 512  # longer tool results keep their head and tail
     tool_timeout: float = 30.0  # seconds per tool call

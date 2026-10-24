@@ -30,7 +30,7 @@ data:
   prompt_field: messages
 env:
   type: palingenesis.rl.envs.harbor:HarborEnv
-  max_turns: 16
+  max_turns: 16                       # default; a row's own "max_turns" overrides it (long tasks next to short ones)
   max_concurrent: 64                  # containers alive at once
   max_tool_output_tokens: 1024
   tool_timeout: 120                   # a bash command may run tests or a build
