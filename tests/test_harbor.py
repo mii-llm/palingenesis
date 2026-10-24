@@ -308,3 +308,70 @@ def test_a_failed_capture_scores_zero(tmp_path, monkeypatch):
     env.rt.started = True
     r = env.get_reward([{"role": "assistant", "content": "fatto"}])
     assert r["reward"] == 0.0 and r["metric/verifier_failed"] == 1.0
+
+
+class _FakeRuntime:
+    """DockerRuntime stand-in for check_task: records exec / verify; the tests grade the final message."""
+
+    runs: list = []
+    passes_empty = False
+
+    def __init__(self, task, workdir=None):
+        self.task, self.execs, self.final = task, [], "unset"
+        _FakeRuntime.runs.append(self)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def put_dir(self, src, dst):
+        pass
+
+    def exec(self, cmd, timeout=None):
+        from types import SimpleNamespace
+
+        self.execs.append(cmd)
+        return SimpleNamespace(exit_code=0, output="")
+
+    def verify(self, final_message=None):
+        self.final = final_message
+        ok = final_message is not None and ("è fatto" in final_message or (self.passes_empty and final_message == ""))
+        return {"reward": float(ok)}
+
+
+def _reply_task(tmp_path, solve=False):
+    task = tmp_path / "reply_task"
+    shutil.copytree(FIXTURE, task)
+    if not solve:
+        (task / "solution" / "solve.sh").unlink()
+    (task / "solution" / "final_message.md").write_bytes("Ecco: è fatto.\n".encode("utf-8"))
+    return task
+
+
+def test_check_task_reply_only_oracle_and_empty_reply_nop(tmp_path, monkeypatch):
+    from palingenesis.rl.envs import harbor
+
+    monkeypatch.setattr(harbor, "DockerRuntime", _FakeRuntime)
+    _FakeRuntime.runs, _FakeRuntime.passes_empty = [], False
+    r = check_task(_reply_task(tmp_path))
+    assert r["oracle"] == 1.0 and r["nop"] == 0.0 and r["nop_reply"] == 0.0 and r["valid"], r
+    nop, nop_reply, oracle = _FakeRuntime.runs
+    assert nop.final is None and nop_reply.final == "" and oracle.final == "Ecco: è fatto." and not oracle.execs
+    assert "oracle_exit" not in r  # no solve.sh: the oracle is the reply alone
+
+    _FakeRuntime.passes_empty = True  # tests that accept an empty reply: invalid
+    assert not check_task(_reply_task(tmp_path / "b"))["valid"]
+
+
+def test_check_task_runs_solve_and_reply_together_and_plain_tasks_unchanged(tmp_path, monkeypatch):
+    from palingenesis.rl.envs import harbor
+
+    monkeypatch.setattr(harbor, "DockerRuntime", _FakeRuntime)
+    _FakeRuntime.runs, _FakeRuntime.passes_empty = [], False
+    r = check_task(_reply_task(tmp_path, solve=True))
+    assert r["valid"] and r["oracle_exit"] == 0 and _FakeRuntime.runs[-1].execs == ["bash /solution/solve.sh"]
+    _FakeRuntime.runs = []
+    r = check_task(FIXTURE)  # no reply: nop and oracle only (the fake tests need a reply, so the oracle scores 0)
+    assert "nop_reply" not in r and len(_FakeRuntime.runs) == 2 and r["oracle"] == 0.0 and not r["valid"]

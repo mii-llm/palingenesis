@@ -29,7 +29,7 @@ from palingenesis.opd.orchestrator import PublishedWeights
 from palingenesis.opd.rollout import RolloutEngine
 from palingenesis.rl.chat import ChatFormat, ToolCall, encode_prompt, parse_assistant
 from palingenesis.rl.config import RLConfig
-from palingenesis.rl.data import PromptSampler, prompt_messages
+from palingenesis.rl.data import PromptSampler, prompt_messages, row_limit
 from palingenesis.rl.env import EnvPool, call_sync_or_async, row_tools, run_tool
 from palingenesis.rl.generation import GenerationClient
 from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample, load_object
@@ -161,6 +161,8 @@ class RLPipeline:
             nonlocal dropped_tokens
             counts["groups"] += 1
             finished.append(group)
+            if any(t.rewards.get("env/metric/verifier_failed") for t in group):
+                counts["verifier_failed"] += 1  # a broken verifier, not a failure of the policy (the queue skips it)
             if group_is_informative(group):
                 return True
             counts["zero_variance"] += 1
@@ -174,8 +176,11 @@ class RLPipeline:
             if missing > 0:
                 missing = math.ceil(missing / (1.0 - min(self.drop_rate, 0.8)))
             for _ in range(max(0, min(missing, budget - launched))):
-                index, row = self.sampler.draw()
-                in_flight.add(asyncio.create_task(self._group(index, row, temperature, r.group_size, True)))
+                # the policy version is the retry queue's clock (delays and the cooldown count training steps)
+                index, row = self.sampler.draw(self.weights.version)
+                revisit = bool(getattr(self.sampler, "last_revisit", False))
+                counts["revisits"] += revisit
+                in_flight.add(asyncio.create_task(self._group(index, row, temperature, r.group_size, True, revisit)))
                 launched += 1
             if not in_flight:
                 break  # refill budget spent
@@ -203,13 +208,19 @@ class RLPipeline:
                 "_dropped_tokens": dropped_tokens,
             }
         )
+        if self.env_pool is not None:
+            stats["groups/verifier_failed"] = counts["verifier_failed"]
         if hasattr(self.sampler, "metrics"):
-            stats.update(self.sampler.metrics())  # the retry queue's cumulative counters
+            stats.update(self.sampler.metrics())  # the sampler's cumulative counters
+        if getattr(self.sampler, "queue_on", False):
+            stats["sampler/revisit_share_drawn"] = counts["revisits"] / max(launched, 1)
         return kept, stats
 
     # ------------------------------------------------------------------ groups
 
-    async def _group(self, index: int, row: dict, temperature: float, size: int, training: bool) -> list[Trajectory]:
+    async def _group(
+        self, index: int, row: dict, temperature: float, size: int, training: bool, revisit: bool = False
+    ) -> list[Trajectory]:
         gid = next(self.group_ids)
         # think-skip: a fixed share of each training group starts with a closed think (the row's view decides if it applies)
         n_skip = round(self.config.rollout.think_skip * size) if training else 0
@@ -218,16 +229,31 @@ class RLPipeline:
         )
         group = [t for t, _ in results]
         envs = [env for _, env in results]
+        if revisit:  # served from the retry queue: outcome/*_fresh and *_revisit keep the two mixes apart
+            for t in group:
+                t.info["revisit"] = True
         try:
             await self._score(group, envs)
         finally:
             if self.env_pool is not None:
                 await asyncio.gather(*(self.env_pool.release(env) for env in envs if env is not None))
         if training:
-            scored = [t.reward for t in group if t.scored]
+            scored = [t for t in group if t.scored]
             if scored:
-                solved = sum(r >= self.config.data.success_threshold for r in scored) / len(scored)
-                self.sampler.observe(index, sum(scored) / len(scored), solved)
+                # The queue and the sampler's counters judge the raw task outcome (the weighted reward before group
+                # shaping and the overlong penalty: a correct episode in the overlong buffer is still a success), over
+                # the rollouts whose verifier worked: a broken task (env metric verifier_failed) is not a failure to
+                # retry, and a group where the verifier failed on more than half of the scored rollouts is not judged
+                # at all (solved None: it still counts for retire_above, on the rewards it trains on).
+                judged = [t for t in scored if not t.rewards.get("env/metric/verifier_failed")]
+                solved = None
+                if judged and 2 * len(judged) >= len(scored):
+                    threshold = self.config.data.success_threshold
+                    solved = sum(t.info.get("raw_reward", t.reward) >= threshold for t in judged) / len(judged)
+                mean = sum(t.reward for t in scored) / len(scored)
+                self.sampler.observe(index, mean, solved, self.weights.version)
+            elif hasattr(self.sampler, "release"):
+                self.sampler.release(index)  # every rollout errored: the row is no longer in flight
         return group
 
     @property
@@ -288,11 +314,13 @@ class RLPipeline:
             )
             chat = self.chat.with_kwargs({**(episode or {}), **(row.get("chat_template_kwargs") or {})})
             trajectory.prompt_ids = encode_prompt(self.tok, messages, schemas, chat.kwargs)
-            budget = int(row.get("max_completion_tokens") or config.completion_budget)
-            row_new_tokens = int(row.get("max_new_tokens") or r.max_new_tokens)
+            # a row's own limits: positive integers (row_limit raises on anything else; the trainer checks at load)
+            budget = row_limit(row, "max_completion_tokens") or config.completion_budget
+            row_new_tokens = row_limit(row, "max_new_tokens") or r.max_new_tokens
             trajectory.info["budget"] = budget
-            # a row may raise or lower its own turn limit (long agentic tasks next to short ones in one mix)
-            max_turns = 1 if env is None else max(1, int(row.get("max_turns") or e.max_turns))
+            # a row may raise or lower its own turn limit (long agentic tasks next to short ones in one mix); give it
+            # max_completion_tokens too, or its turns share the default episode budget (check_row_limits warns)
+            max_turns = 1 if env is None else (row_limit(row, "max_turns") or e.max_turns)
             trajectory.info["max_turns"] = max_turns
             forced: list[int] = []
             if skip and chat.thinking and chat.opens_think:
@@ -476,6 +504,7 @@ class RLPipeline:
                 t.scored = t.trained = False
                 continue
             t.reward = sum(w * v for w, v in applicable)
+            t.info["raw_reward"] = t.reward  # before group shaping and the overlong penalty (task success)
         if self.group_shaping is not None:
             scored = [group[i] for i in live if group[i].scored]
             if scored:
@@ -573,7 +602,8 @@ class RLPipeline:
         whose mix shifts as groups saturate): reward_all, pass@1 (share of rollouts at or above
         data.success_threshold), pass@G (share of groups with at least one such rollout: falling pass@G under rising
         pass@1 is the sharpening signature) and surprisal (mean -log p of sampled tokens, an entropy proxy). With
-        data.metrics_key, the same per family as family/<name>/<metric>."""
+        data.metrics_key, the same per family as family/<name>/<metric>. With the retry queue, also pass@1_fresh and
+        pass@1_revisit (rows drawn from the epoch order / from the queue)."""
         groups = [[t for t in g if t.scored] for g in groups]
         groups = [g for g in groups if g]
         if not groups:
@@ -595,6 +625,13 @@ class RLPipeline:
             }
 
         out = {f"outcome/{k}": v for k, v in summarize(groups).items() if k != "completion_len"}
+        if getattr(self.sampler, "queue_on", False):
+            # the retry queue changes the prompt mix (hard and partly solved rows come back), so pass@1 above moves with
+            # the mix as well as with the policy: fresh draws alone are comparable with a run without the queue
+            for name, revisit in (("fresh", False), ("revisit", True)):
+                ts = [t for g in groups if bool(g[0].info.get("revisit")) == revisit for t in g]
+                if ts:
+                    out[f"outcome/pass@1_{name}"] = sum(t.reward >= threshold for t in ts) / len(ts)
         if d.metrics_key:
             by: dict[str, list[list[Trajectory]]] = defaultdict(list)
             for g in groups:

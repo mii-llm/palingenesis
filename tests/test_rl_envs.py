@@ -281,6 +281,135 @@ def test_row_max_turns_overrides_the_env_limit():
     assert turns == {"Submit 5.": (2, "turns"), "Submit 5 again.": (4, "turns")}
 
 
+def _submit_pipeline(env, rows, sampler, settings=None):
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from tests.test_rl import ScriptedEngine, tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    eot = end_of_turn_id(tok, kwargs)
+    engine = ScriptedEngine(tok, eot, ['<tool_call>\n{"name": "submit", "arguments": {"answer": "5"}}\n</tool_call>'])
+    config = RLConfig()
+    for key, value in {
+        "model.policy": "x",
+        "model.chat_template_kwargs": kwargs,
+        "env.max_turns": 4,
+        "rollout.max_new_tokens": 64,
+        "rollout.max_model_len": 4096,
+        **(settings or {}),
+    }.items():
+        config.set(key, value)
+    return RLPipeline(
+        tok, ChatFormat(tok, eot, kwargs), engine, PublishedWeights(torch.nn.Linear(1, 1)), config, sampler, [],
+        EnvPool(env), None, (eot,),
+    )
+
+
+def test_row_max_turns_raises_the_limit_and_bad_values_fail_clearly(caplog):
+    from palingenesis.rl.data import PromptSampler, check_row_limits
+
+    rows = [{"prompt": "Submit 5.", "max_turns": 6}, {"prompt": "Submit 5 badly.", "max_turns": "abc"}]
+    pipeline = _submit_pipeline(_Endless, rows, PromptSampler(rows), {"rollout.max_completion_tokens": 1024})
+    try:
+        good, bad = pipeline._await(pipeline._eval(rows, 1.0))
+    finally:
+        pipeline.close()
+    assert (good[0].turns, good[0].finish) == (6, "turns")  # above env.max_turns 4
+    assert bad[0].finish == "error" and "max_turns must be a positive integer" in bad[0].info["error"]
+
+    check_row_limits([{"max_turns": 3}, {"max_turns": float("nan")}, {"max_turns": 4.0}, {}], "ok.jsonl", 6144)
+    for value in (0, -2, "abc", "3", 2.5, True):
+        with pytest.raises(ValueError, match=r"tasks\.jsonl, row 1 .*max_turns must be a positive integer"):
+            check_row_limits([{"max_turns": 2}, {"max_turns": value}], "tasks.jsonl", 6144)
+    with pytest.raises(ValueError, match="max_completion_tokens"):
+        check_row_limits([{"max_completion_tokens": 0}], "tasks.jsonl")
+    caplog.clear()
+    with caplog.at_level("WARNING"):  # 30 turns cannot each get 256 of 6144 tokens: one warning for both rows
+        check_row_limits(
+            [{"max_turns": 30}, {"max_turns": 40}, {"max_turns": 30, "max_completion_tokens": 30000}], "swe", 6144
+        )
+    warnings = [r for r in caplog.records if "max_turns" in r.getMessage()]
+    assert len(warnings) == 1 and "2 row(s)" in warnings[0].getMessage()
+
+
+def _centre(trajectories, row):
+    """group_shaping: zero-mean rewards (a correct group ends at 0 everywhere)."""
+    mean = sum(t.reward for t in trajectories) / len(trajectories)
+    for t in trajectories:
+        t.reward -= mean
+
+
+class _BrokenVerifier(Submission):
+    def get_reward(self):
+        return {"reward": 0.0, "metric/verifier_failed": 1.0}
+
+
+class _Recorder:
+    """Wraps a PromptSampler and records every observe() call."""
+
+    def __init__(self, sampler):
+        self.sampler, self.seen = sampler, []
+
+    def observe(self, index, mean_reward, solved=None, version=None):
+        self.seen.append((index, mean_reward, solved, version))
+        self.sampler.observe(index, mean_reward, solved, version)
+
+    def __getattr__(self, name):
+        return getattr(self.sampler, name)
+
+
+def test_queue_judges_the_raw_outcome_skips_broken_verifiers_and_tags_revisits():
+    from palingenesis.rl.data import PromptSampler
+
+    rows = [{"prompt": "Submit 5."}, {"prompt": "Submit 5 again."}]
+    sampler = _Recorder(PromptSampler(rows, seed=0, revisit_after_steps=1))
+    sampler.sampler.observe(0, 0.0, 0.0, 0)  # row 0 failed at version 0: due at version 1
+    settings = {"rollout.group_size": 2, "rollout.max_refill": 1.0, "loss.group_shaping": "tests.test_rl_envs:_centre"}
+    pipeline = _submit_pipeline(Submission, rows, sampler, settings)
+    pipeline.weights.version = 1
+    try:
+        groups, stats = pipeline._await(pipeline._collect(1, 1.0))
+    finally:
+        pipeline.close()
+    assert not groups  # every group zero-variance after shaping
+    assert sampler.seen and all(solved == 1.0 and version == 1 for _, _, solved, version in sampler.seen)
+    assert sampler.served_revisits == 1 and stats["sampler/revisit_share_drawn"] == 1 / stats["groups/launched"]
+    # the revisit group is tagged and logged apart (pass@1 is on the shaped rewards, as outcome/pass@1)
+    assert stats["outcome/pass@1_revisit"] == 0.0 and "outcome/pass@1_fresh" in stats
+    assert stats["groups/verifier_failed"] == 0 and stats["sampler/rows_solved_after_fail"] == 1.0
+
+    broken = _Recorder(PromptSampler(rows, seed=0, revisit_after_steps=1))
+    pipeline = _submit_pipeline(_BrokenVerifier, rows, broken, {"rollout.group_size": 2})
+    try:
+        _, stats = pipeline._await(pipeline._collect(1, 1.0))
+    finally:
+        pipeline.close()
+    assert broken.seen and all(solved is None for _, _, solved, _ in broken.seen)  # not judged: nothing queued
+    assert not broken.pending and not broken.attempts and stats["groups/verifier_failed"] == len(broken.seen)
+
+
+def test_trajectory_records_the_raw_reward_before_shaping_and_the_overlong_penalty():
+    from palingenesis.rl.data import PromptSampler
+
+    rows = [{"prompt": "Submit 5."}]
+    sampler = _Recorder(PromptSampler(rows))
+    settings = {"rollout.group_size": 2, "loss.overlong_buffer": 63, "loss.overlong_penalty": 4.0}
+    pipeline = _submit_pipeline(Submission, rows, sampler, settings)  # budget 64: every rollout is in the buffer
+    try:
+        group = pipeline._await(pipeline._group(0, rows[0], 1.0, 2, True))
+    finally:
+        pipeline.close()
+    assert all(t.info["raw_reward"] == 1.0 and t.reward < 0.5 for t in group)
+    assert sampler.seen == [(0, group[0].reward, 1.0, 0)]  # a success for the queue, not a failure
+
+
 class _Tracked(Submission):
     """Records when each instance is scored and closed relative to the others."""
 

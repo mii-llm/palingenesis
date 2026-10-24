@@ -48,7 +48,7 @@ from palingenesis.opd.teachers import end_of_turn_id, load_causal_lm, right_pad
 from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, student_stop_ids
 from palingenesis.rl.chat import ChatFormat
 from palingenesis.rl.config import RLConfig, RLConfigError, max_num_seqs
-from palingenesis.rl.data import PromptSampler, load_rows, prompt_messages, split_rows
+from palingenesis.rl.data import PromptSampler, check_row_limits, load_rows, prompt_messages, split_rows
 from palingenesis.rl.env import EnvPool, ToolEnv, row_tools
 from palingenesis.rl.formats import convert
 from palingenesis.rl.losses import LowPrecisionWeight, assign_advantages, policy_loss, target_logprobs, token_weights
@@ -70,7 +70,16 @@ _SUMMED = {
     "groups/launched",
     "groups/kept",
     "groups/carried",
+    "groups/verifier_failed",
     "prompts_retired",
+    # the prompt sampler's cumulative counters: each rank's shard is disjoint, so the run's totals are sums
+    "sampler/rows_tried",
+    "sampler/rows_ever_solved",
+    "sampler/rows_failed_once",
+    "sampler/rows_solved_after_fail",
+    "sampler/revisits_pending",
+    "sampler/revisits_served",
+    "sampler/cooldown_overrides",
 }
 
 
@@ -122,8 +131,17 @@ class RLTrainer:
         # every rank owns a disjoint shard of the prompts (a group never spans ranks)
         self.eval_rows = eval_rows[rank::world]
         d = config.data
-        self.sampler = PromptSampler(train_rows[rank::world], d.seed + rank, d.retire_above, d.revisit_after, d.revisit_max,
-                                     None if d.revisit_partial_after < 0 else d.revisit_partial_after, d.revisit_share)
+        self.sampler = PromptSampler(
+            train_rows[rank::world],
+            d.seed + rank,
+            d.retire_above,
+            revisit_after_steps=d.revisit_after_steps,
+            revisit_max_failed=d.revisit_max_failed,
+            revisit_partial_after_steps=None if d.revisit_partial_after_steps < 0 else d.revisit_partial_after_steps,
+            revisit_share=d.revisit_share,
+            revisit_max_partial=d.revisit_max_partial,
+            revisit_partial_max_share=d.revisit_partial_max_share,
+        )
         self.batch_prompts = r.batch_prompts // world
         self.sandbox = make_sandbox(config.sandbox) if self._needs_sandbox() else None
         logger.info(
@@ -319,6 +337,12 @@ class RLTrainer:
             train, held = rows, convert(load_rows(d.eval_dataset, d.eval_split), d.format)
         else:
             train, held = split_rows(rows, d.eval_size)
+        try:  # a row's own max_turns / budgets: a bad value fails here, naming the row, not as rollout errors later
+            check_row_limits(rows, d.dataset or "dataset", self.config.completion_budget)
+            if held and (eval_dataset is not None or d.eval_dataset):
+                check_row_limits(held, d.eval_dataset or "eval_dataset", self.config.completion_budget)
+        except ValueError as e:
+            raise RLConfigError(str(e)) from None
         limit = d.max_prompt_tokens or (self.config.rollout.max_model_len - self.config.rollout.max_new_tokens)
         dynamic = self.env_pool is not None and (self.env_pool.reusable or self.env_pool.dynamic)
         if not dynamic:  # reset() or tool_schemas() may change the prompt: rollouts check the room instead

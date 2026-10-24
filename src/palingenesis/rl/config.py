@@ -70,11 +70,17 @@ class RLDataConfig:
     # Retire a prompt once its running mean reward reaches this (0 = never). With a 0/1
     # reward, 0.9 retires prompts the policy has learned (ScaleRL's no-positive-resampling).
     retire_above: float = 0.0
-    # retry queue (0 = off): a training group with no success brings its row back after `revisit_after` draws, a partly
-    # solved one after `revisit_partial_after` (-1 = half the delay), each up to `revisit_max` times (PromptSampler)
-    revisit_after: int = 0
-    revisit_max: int = 3
-    revisit_partial_after: int = -1
+    # Retry queue (0 = off; PromptSampler). Delays count policy versions (training steps), not draws: a training group
+    # with no success brings its row back `revisit_after_steps` versions later, up to `revisit_max_failed` times over the
+    # run; a partly solved one after `revisit_partial_after_steps` (-1 = half the delay, at least 1), up to
+    # `revisit_max_partial` times; a share >= `revisit_partial_max_share` (7/8) or a solved group is not queued. Success
+    # is the raw task reward (before group shaping and the overlong penalty) >= success_threshold; groups whose verifier
+    # failed are not judged. A row is never served twice at the same version (the cooldown, both paths).
+    revisit_after_steps: int = 0
+    revisit_partial_after_steps: int = -1
+    revisit_max_failed: int = 1
+    revisit_max_partial: int = 3
+    revisit_partial_max_share: float = 0.875
     revisit_share: float = 0.5  # at most this share of draws are revisits (fresh rows keep flowing)
     # Rollout outcome metrics (pipeline._outcome_stats): a rollout counts as a success at or above this reward
     # (pass@1 / pass@G), and metrics_key (dotted row paths, first present wins, e.g. ["vtask.vtype", "task"]) splits
@@ -475,8 +481,18 @@ class RLConfig:
             errors.append(f"data.format must be one of {FORMATS}, got {d.format!r}.")
         if d.eval_size < 0 or t.eval_samples < 0:
             errors.append("data.eval_size and train.eval_samples must be >= 0.")
-        if d.revisit_after < 0 or d.revisit_max < 0:
-            errors.append("data.revisit_after and data.revisit_max must be >= 0 (revisit_after 0 = no retry queue).")
+        if d.revisit_after_steps < 0 or d.revisit_max_failed < 0 or d.revisit_max_partial < 0:
+            errors.append(
+                "data.revisit_after_steps, data.revisit_max_failed and data.revisit_max_partial must be >= 0 "
+                "(revisit_after_steps 0 = no retry queue)."
+            )
+        if d.revisit_after_steps > 0 and d.revisit_partial_after_steps != -1 and d.revisit_partial_after_steps < 1:
+            errors.append(
+                "data.revisit_partial_after_steps must be >= 1 or -1 (half of revisit_after_steps): delays count "
+                "policy versions, and a row is never served twice at one version."
+            )
+        if not 0.0 < d.revisit_share <= 1.0 or not 0.0 < d.revisit_partial_max_share <= 1.0:
+            errors.append("data.revisit_share and data.revisit_partial_max_share must be in (0, 1].")
         if d.retire_above < 0:
             errors.append("data.retire_above must be >= 0 (0 = never retire prompts).")
 

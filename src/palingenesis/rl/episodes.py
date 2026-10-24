@@ -45,12 +45,13 @@ def run_episodes(
     from palingenesis.opd.trainer import student_stop_ids
     from palingenesis.rl.chat import ChatFormat
     from palingenesis.rl.config import RLConfig
-    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.data import PromptSampler, check_row_limits
     from palingenesis.rl.env import EnvPool
     from palingenesis.rl.pipeline import RLPipeline
 
     if max_completion_tokens is None:  # the whole episode's generated tokens; the pipeline's 0 means one turn's
         max_completion_tokens = max_new_tokens * max_turns  # worth, which cuts multi-turn episodes short
+    check_row_limits(rows, "run_episodes rows", max_completion_tokens)  # a row's own max_turns / budgets
     kwargs = dict(chat_template_kwargs or {})
     eot = end_of_turn_id(tokenizer, kwargs)
     stop_ids = student_stop_ids(tokenizer, model, [], kwargs) if model else (eot,)

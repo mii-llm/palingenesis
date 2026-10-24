@@ -854,10 +854,14 @@ def test_outcome_stats_cover_every_group_and_family():
     fake = SimpleNamespace(
         config=SimpleNamespace(
             data=SimpleNamespace(success_threshold=0.5, metrics_key=["task"]), rollout=SimpleNamespace(group_size=2)
-        )
+        ),
+        sampler=SimpleNamespace(queue_on=True),
     )
+    for t in groups[1]:
+        t.info["revisit"] = True  # served from the retry queue
     out = RLPipeline._outcome_stats(fake, groups)
     assert out["outcome/pass@1"] == 0.5 and out["outcome/pass@2"] == 2 / 3 and out["outcome/surprisal"] == 1.0
+    assert out["outcome/pass@1_fresh"] == 0.75 and out["outcome/pass@1_revisit"] == 0.0
     assert out["family/a/pass@1"] == 0.5 and out["family/a/pass@2"] == 0.5 and out["family/b/pass@2"] == 1.0
 
 
@@ -1117,37 +1121,125 @@ def test_prompt_sampler_retry_queue():
     from palingenesis.rl.data import PromptSampler
 
     rows = [{"prompt": f"p{i}"} for i in range(10)]
-    a, b = PromptSampler(rows, seed=1), PromptSampler(rows, seed=1, revisit_after=0)
-    for _ in range(25):  # with the queue off, observe(..., solved) changes nothing in the draw order
-        ia, ib = a.draw()[0], b.draw()[0]
+    a, b = PromptSampler(rows, seed=1), PromptSampler(rows, seed=1, revisit_after_steps=0)
+    for step in range(25):  # with the queue off, observe(..., solved) changes nothing in the draw order
+        ia, ib = a.draw()[0], b.draw(step // 4)[0]
         assert ia == ib
         a.observe(ia, 0.0)
-        b.observe(ib, 0.0, 0.0)
-    assert not b.pending
+        b.observe(ib, 0.0, 0.0, step // 4)
+    assert not b.pending and not b.in_flight
 
-    s = PromptSampler(rows, seed=1, revisit_after=5, revisit_max=2, revisit_partial_after=2)
-    i0, _ = s.draw()
-    s.observe(i0, 0.0, 0.0)  # nothing solved: due again 5 draws later
-    seen = [s.draw()[0] for _ in range(5)]
-    assert seen[-1] == i0 and i0 not in seen[:-1]
-    s.observe(i0, 0.5, 0.25)  # partly solved now: solved after a failure, back after 2 draws
-    assert i0 in s.solved_after_fail and s.first_solved[i0] == s.draws
-    assert [s.draw()[0] for _ in range(2)][-1] == i0
-    s.observe(i0, 0.0, 0.0)  # third observation: the revisit cap (2) is reached, nothing scheduled
-    assert all(index != i0 for due, index in s.pending)
-    j, _ = s.draw()
-    s.observe(j, 1.0, 1.0)  # fully solved: not queued
-    assert all(index != j for due, index in s.pending)
+    # delays count policy versions: a failed row is due 3 versions after it was observed, however many draws pass
+    s = PromptSampler(rows, seed=1, revisit_after_steps=3, revisit_max_failed=2, revisit_partial_after_steps=1)
+    i0, _ = s.draw(0)
+    s.observe(i0, 0.0, 0.0, 0)  # nothing solved: due at version 3
+    assert s.pending[0][0] == 3 and not s.last_revisit
+    early = [s.draw(v)[0] for v in (0, 0, 1, 1, 2, 2)]  # observed at once (draws do not move the clock)
+    for i in early:
+        s.observe(i, 1.0, 1.0)
+    assert i0 not in early
+    assert s.draw(3)[0] == i0 and s.last_revisit  # due at version 3
+    s.observe(i0, 0.5, 0.25, 3)  # partly solved now: solved after a failure, back 1 version later
+    assert i0 in s.solved_after_fail and s.first_solved[i0] == 3 and s.history[i0] == [(0, 0.0), (3, 0.25)]
+    assert s.draw(3)[0] != i0  # not at the version it was served at
+    assert s.draw(4)[0] == i0
+    s.observe(i0, 0.0, 0.0, 4)  # failed again: the failed cap (2) still has room
+    assert s.queued[i0][0] == 7
+    j, _ = s.draw(4)
+    s.observe(j, 1.0, 1.0, 4)  # fully solved: not queued
+    k, _ = s.draw(4)
+    s.observe(k, 0.9, 0.875, 4)  # near-solved (7/8): not queued either
+    assert j not in s.queued and k not in s.queued
     m = s.metrics()
     assert m["sampler/rows_solved_after_fail"] == 1.0 and m["sampler/rows_failed_once"] == 1.0
-    t = PromptSampler(rows, seed=1, revisit_after=5)
+    assert m["sampler/revisits_pending"] == 1.0 and m["sampler/revisits_served"] == 2.0
+    t = PromptSampler(rows, seed=1, revisit_after_steps=3)
     t.load_state(pickle.loads(pickle.dumps(s.state())))
-    assert (t.draws, t.pending, t.first_solved, t.solved_after_fail) == (s.draws, s.pending, s.first_solved, s.solved_after_fail)
-    assert [t.draw()[0] for _ in range(6)] == [s.draw()[0] for _ in range(6)]
+    assert (t.version, t.draws, t.pending, t.first_solved, t.solved_after_fail, t.history) == (
+        s.version, s.draws, s.pending, s.first_solved, s.solved_after_fail, s.history
+    )
+    s.in_flight.clear()  # the resumed sampler has no groups in flight
+    assert [t.draw(v)[0] for v in (5, 6, 7, 7, 8, 8)] == [s.draw(v)[0] for v in (5, 6, 7, 7, 8, 8)]
 
-    capped = PromptSampler(rows, seed=2, revisit_after=1, revisit_max=5, revisit_share=0.25)
-    served = 0
-    for _ in range(40):  # every row fails every time: revisits stay within a quarter of the draws
-        i, _ = capped.draw()
-        capped.observe(i, 0.0, 0.0)
-    assert capped.served_revisits <= 0.25 * capped.draws + 1
+    # separate caps: a failed row is retried revisit_max_failed times, a partly solved one revisit_max_partial times
+    c = PromptSampler(rows, seed=3, revisit_after_steps=1, revisit_max_failed=1, revisit_max_partial=2)
+    for v in range(4):
+        c.observe(0, 0.0, 0.0, v)
+        c.observe(1, 0.5, 0.5, v)
+    assert (c.revisits_failed[0], c.revisits_partial[1]) == (1, 2)
+    with pytest.raises(ValueError):
+        PromptSampler(rows, revisit_after_steps=2, revisit_partial_after_steps=0)
+    for share in (0.0, 1.5):
+        with pytest.raises(ValueError):
+            PromptSampler(rows, revisit_share=share)
+
+    capped = PromptSampler(rows, seed=2, revisit_after_steps=1, revisit_max_failed=50, revisit_share=0.25)
+    for step in range(40):  # every row fails every time, 4 draws a step: revisits take about a quarter of the draws
+        drawn = [capped.draw(step)[0] for _ in range(4)]
+        for i in drawn:
+            capped.observe(i, 0.0, 0.0, step)
+    assert 0.2 * capped.draws <= capped.served_revisits <= 0.25 * capped.draws + 1
+
+
+def test_prompt_sampler_cooldown_never_repeats_a_row_at_one_version():
+    from palingenesis.rl.data import PromptSampler
+
+    rows = [{"prompt": f"p{i}"} for i in range(12)]
+    s = PromptSampler(rows, seed=4, revisit_after_steps=1, revisit_partial_after_steps=1, revisit_max_failed=99,
+                      revisit_max_partial=99, revisit_share=1.0)
+    for version in range(60):  # 5 draws a step, the epoch rolls over mid-step, every group is partly solved
+        drawn = [s.draw(version)[0] for _ in range(5)]
+        assert len(set(drawn)) == 5, (version, drawn)  # neither the queue nor a new epoch repeats a row in a step
+        for i in drawn:
+            s.observe(i, 0.5, 0.5, version)
+    assert s.served_revisits > 0 and s.cooldown_overrides == 0
+    # a row still generating (drawn, not observed) is not served again at later versions either
+    i, _ = s.draw(60)
+    assert all(s.draw(61 + v)[0] != i for v in range(11))
+    s.release(i)
+    # fewer live rows than draws in a step: served anyway, counted
+    tiny = PromptSampler(rows[:2], seed=0, revisit_after_steps=1)
+    assert sorted(tiny.draw(0)[0] for _ in range(3)) in ([0, 0, 1], [0, 1, 1]) and tiny.cooldown_overrides == 1
+
+
+def test_prompt_sampler_loads_old_states_and_skips_retired_revisits():
+    from palingenesis.rl.data import PromptSampler
+
+    rows = [{"prompt": f"p{i}"} for i in range(6)]
+    old = PromptSampler(rows, seed=5)
+    old.draw()
+    legacy = {k: v for k, v in old.state().items() if k in ("rng", "retired", "order", "epoch")}  # before the queue
+    s = PromptSampler(rows, seed=5, revisit_after_steps=2)
+    s.load_state(legacy)
+    assert s.order == old.order and not s.pending and not s.attempts and s.version == 0
+    assert [s.draw(v)[0] for v in range(5)] == [old.draw()[0] for _ in range(5)]
+    # the first queue's states (delays in draws, one revisit counter): entries are due at once, the counter covers both
+    day_one = {**legacy, "draws": 9, "pending": [(12, 4)], "revisits": {"4": 1}, "attempts": {"4": 1}, "failed": [4]}
+    s = PromptSampler(rows, seed=5, revisit_after_steps=2)
+    s.load_state(day_one)
+    assert s.revisits_failed == {4: 1} == s.revisits_partial and s.draw(0) == (4, rows[4])
+
+    # retire_above with pending entries: a retired row is skipped at pop and never served again
+    r = PromptSampler(rows, seed=6, retire_above=0.9, revisit_after_steps=1, revisit_max_failed=5)
+    r.observe(2, 0.0, 0.0, 0)
+    r.observe(3, 0.0, 0.0, 0)
+    assert {i for _, _, i in r.pending} == {2, 3}
+    r.observe(2, 1.0, None, 0)  # retired (e.g. a group without a judged share)
+    served = [r.draw(1 + v // 5)[0] for v in range(30)]
+    assert 2 not in served and 3 in served and r.metrics()["sampler/revisits_pending"] == 0.0
+
+
+def test_sampler_counters_are_summed_over_ranks():
+    from types import SimpleNamespace
+
+    from palingenesis.rl.trainer import RLTrainer
+
+    ranks = [
+        {"sampler/rows_tried": 10.0, "sampler/rows_solved_after_fail": 2.0, "groups/verifier_failed": 1, "reward": 0.2},
+        {"sampler/rows_tried": 30.0, "sampler/rows_solved_after_fail": 4.0, "groups/verifier_failed": 0, "reward": 0.4},
+    ]
+    trainer = RLTrainer.__new__(RLTrainer)
+    trainer.parallel = SimpleNamespace(world=2, gather=lambda metrics: ranks)
+    out = trainer._combine(ranks[0])
+    assert out["sampler/rows_tried"] == 40.0 and out["sampler/rows_solved_after_fail"] == 6.0
+    assert out["groups/verifier_failed"] == 1 and out["reward"] == pytest.approx(0.3)

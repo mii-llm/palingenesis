@@ -90,9 +90,11 @@ class HarborTask:
     @classmethod
     def load(cls, root: str | Path) -> "HarborTask":
         root = Path(root)
-        config = tomllib.loads((root / "task.toml").read_text()) if (root / "task.toml").exists() else {}
+        config = (
+            tomllib.loads((root / "task.toml").read_text(encoding="utf-8")) if (root / "task.toml").exists() else {}
+        )
         instruction = (
-            (root / "instruction.md").read_text()
+            (root / "instruction.md").read_text(encoding="utf-8")
             if (root / "instruction.md").exists()
             else config.get("task", {}).get("description", "")
         )
@@ -683,32 +685,44 @@ class HarborEnv:
 
 def check_task(task_dir: str | Path, workdir: str | None = None) -> dict:
     """Harbor's oracle / nop check: the oracle solution (solution/solve.sh) must pass, doing nothing must not. A
-    reply-graded task's oracle reply is solution/final_message.md (given to the tests as /logs/agent/final_message.md).
+    reply-graded task's oracle reply is solution/final_message.md (given to the tests as /logs/agent/final_message.md,
+    read as UTF-8, surrounding whitespace stripped like a model's reply); such a task may ship no solve.sh at all (the
+    oracle is then the reply alone). A reply-graded task also runs nop with an empty final message ("nop_reply"),
+    since training always writes the file: tests that pass on an empty reply must score 0 there.
     workdir: overrides the task's working directory ([environment] workdir, else /workdir)."""
     task = HarborTask.load(task_dir)
     out = {"task": task.name}
-    for mode in ("nop", "oracle"):
+    sol = task.root / "solution"
+    reply = sol / "final_message.md"
+    graded_reply = reply.exists()
+    modes = ("nop", "nop_reply", "oracle") if graded_reply else ("nop", "oracle")
+    for mode in modes:
+        if mode == "oracle" and not (sol / "solve.sh").exists() and not graded_reply:
+            out["oracle"] = None  # nothing to check the tests against
+            continue
         rt = DockerRuntime(task, workdir)
         try:
             rt.start()
-            final = None
+            final = "" if mode == "nop_reply" else None
             if mode == "oracle":
-                sol = task.root / "solution"
-                if not (sol / "solve.sh").exists():
-                    out["oracle"] = None
-                    continue
-                rt.put_dir(sol, "/solution")
-                r = rt.exec("bash /solution/solve.sh", timeout=task.agent_timeout)
-                out["oracle_exit"] = r.exit_code
-                if (sol / "final_message.md").exists():  # reply-graded tasks: the oracle's reply
-                    final = (sol / "final_message.md").read_text()
+                if (sol / "solve.sh").exists():
+                    rt.put_dir(sol, "/solution")
+                    r = rt.exec("bash /solution/solve.sh", timeout=task.agent_timeout)
+                    out["oracle_exit"] = r.exit_code
+                if graded_reply:  # reply-graded tasks: the oracle's reply
+                    final = reply.read_text(encoding="utf-8").strip()
             out[mode] = rt.verify(final_message=final).get("reward", 0.0)
         except Exception as e:  # noqa: BLE001
             out[mode] = None
             out[f"{mode}_error"] = f"{type(e).__name__}: {e}"[:300]
         finally:
             rt.stop()
-    out["valid"] = out.get("oracle") == 1.0 and out.get("nop") is not None and out.get("nop", 1.0) < 1.0
+    out["valid"] = (
+        out.get("oracle") == 1.0
+        and out.get("nop") is not None
+        and out["nop"] < 1.0
+        and (not graded_reply or out.get("nop_reply") == 0.0)
+    )
     return out
 
 
@@ -745,7 +759,12 @@ def main(argv: list[str] | None = None) -> int:
         for res in results:
             print(
                 f"{'ok ' if res['valid'] else 'BAD'}  oracle={res.get('oracle')} nop={res.get('nop')}  {res['task']}"
-                + (f"  {res.get('oracle_error') or res.get('nop_error')}" if not res["valid"] else "")
+                + (f"  nop_reply={res.get('nop_reply')}" if "nop_reply" in res else "")
+                + (
+                    f"  {res.get('oracle_error') or res.get('nop_error') or res.get('nop_reply_error') or ''}"
+                    if not res["valid"]
+                    else ""
+                )
             )
         print(f"{sum(x['valid'] for x in results)}/{len(results)} valid")
     return 0 if all(x["valid"] for x in results) else 1
