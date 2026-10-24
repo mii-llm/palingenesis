@@ -682,7 +682,8 @@ class HarborEnv:
 
 
 def check_task(task_dir: str | Path, workdir: str | None = None) -> dict:
-    """Harbor's oracle / nop check: the oracle solution (solution/solve.sh) must pass, doing nothing must not.
+    """Harbor's oracle / nop check: the oracle solution (solution/solve.sh) must pass, doing nothing must not. A
+    reply-graded task's oracle reply is solution/final_message.md (given to the tests as /logs/agent/final_message.md).
     workdir: overrides the task's working directory ([environment] workdir, else /workdir)."""
     task = HarborTask.load(task_dir)
     out = {"task": task.name}
@@ -690,6 +691,7 @@ def check_task(task_dir: str | Path, workdir: str | None = None) -> dict:
         rt = DockerRuntime(task, workdir)
         try:
             rt.start()
+            final = None
             if mode == "oracle":
                 sol = task.root / "solution"
                 if not (sol / "solve.sh").exists():
@@ -698,7 +700,9 @@ def check_task(task_dir: str | Path, workdir: str | None = None) -> dict:
                 rt.put_dir(sol, "/solution")
                 r = rt.exec("bash /solution/solve.sh", timeout=task.agent_timeout)
                 out["oracle_exit"] = r.exit_code
-            out[mode] = rt.verify().get("reward", 0.0)
+                if (sol / "final_message.md").exists():  # reply-graded tasks: the oracle's reply
+                    final = (sol / "final_message.md").read_text()
+            out[mode] = rt.verify(final_message=final).get("reward", 0.0)
         except Exception as e:  # noqa: BLE001
             out[mode] = None
             out[f"{mode}_error"] = f"{type(e).__name__}: {e}"[:300]
