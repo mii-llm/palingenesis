@@ -123,7 +123,7 @@ class RLTrainer:
         self.eval_rows = eval_rows[rank::world]
         d = config.data
         self.sampler = PromptSampler(train_rows[rank::world], d.seed + rank, d.retire_above, d.revisit_after, d.revisit_max,
-                                     None if d.revisit_partial_after < 0 else d.revisit_partial_after)
+                                     None if d.revisit_partial_after < 0 else d.revisit_partial_after, d.revisit_share)
         self.batch_prompts = r.batch_prompts // world
         self.sandbox = make_sandbox(config.sandbox) if self._needs_sandbox() else None
         logger.info(

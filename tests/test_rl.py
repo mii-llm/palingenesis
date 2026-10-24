@@ -1144,3 +1144,10 @@ def test_prompt_sampler_retry_queue():
     t.load_state(pickle.loads(pickle.dumps(s.state())))
     assert (t.draws, t.pending, t.first_solved, t.solved_after_fail) == (s.draws, s.pending, s.first_solved, s.solved_after_fail)
     assert [t.draw()[0] for _ in range(6)] == [s.draw()[0] for _ in range(6)]
+
+    capped = PromptSampler(rows, seed=2, revisit_after=1, revisit_max=5, revisit_share=0.25)
+    served = 0
+    for _ in range(40):  # every row fails every time: revisits stay within a quarter of the draws
+        i, _ = capped.draw()
+        capped.observe(i, 0.0, 0.0)
+    assert capped.served_revisits <= 0.25 * capped.draws + 1

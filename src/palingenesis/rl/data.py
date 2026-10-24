@@ -78,12 +78,13 @@ class PromptSampler:
     the next epoch: a group where no rollout succeeded (solved share 0) returns after `revisit_after` draws, up to
     `revisit_max` times, so a task the policy cannot solve yet is tried again once the policy has moved; a partly solved
     group (0 < share < 1: the rows that give gradient) returns after `revisit_partial_after` draws (default half the
-    delay), also up to `revisit_max` times. Due revisits are served before the epoch order. Per row the sampler keeps
+    delay), also up to `revisit_max` times. Due revisits are served before the epoch order, capped at `revisit_share` of all
+    draws. Per row the sampler keeps
     attempts, the draw of its first success and whether it was solved only after a group that failed completely, so a
     run can report how many tasks went from "tried, not solved" to "solved" (`metrics()`, `state()`)."""
 
     def __init__(self, rows: list[dict[str, Any]], seed: int = 0, retire_above: float = 0.0, revisit_after: int = 0,
-                 revisit_max: int = 3, revisit_partial_after: int | None = None):
+                 revisit_max: int = 3, revisit_partial_after: int | None = None, revisit_share: float = 1.0):
         if not rows:
             raise ValueError("no training rows")
         self.rows = rows
@@ -96,6 +97,8 @@ class PromptSampler:
         self.revisit_max = int(revisit_max)
         self.revisit_partial_after = (int(revisit_partial_after) if revisit_partial_after is not None
                                       else max(1, self.revisit_after // 2))
+        self.revisit_share = float(revisit_share)
+        self.served_revisits = 0
         self.draws = 0
         self.pending: list[tuple[int, int]] = []  # (due draw, row index), a heap
         self.attempts: dict[int, int] = {}
@@ -106,9 +109,12 @@ class PromptSampler:
 
     def draw(self) -> tuple[int, dict[str, Any]]:
         self.draws += 1
-        while self.pending and self.pending[0][0] <= self.draws:
+        # due revisits first, but at most `revisit_share` of all draws, so rows never tried keep flowing
+        while (self.pending and self.pending[0][0] <= self.draws
+               and self.served_revisits < self.revisit_share * self.draws):
             _, index = heapq.heappop(self.pending)
             if index not in self.retired:
+                self.served_revisits += 1
                 return index, self.rows[index]
         while True:
             if not self.order:
@@ -163,6 +169,7 @@ class PromptSampler:
             "order": self.order,
             "epoch": self.epoch,
             "draws": self.draws,
+            "served_revisits": self.served_revisits,
             "pending": sorted(self.pending),
             "attempts": {str(k): v for k, v in self.attempts.items()},
             "revisits": {str(k): v for k, v in self.revisits.items()},
@@ -179,6 +186,7 @@ class PromptSampler:
             state["epoch"],
         )
         self.draws = int(state.get("draws", 0))
+        self.served_revisits = int(state.get("served_revisits", 0))
         self.pending = [tuple(x) for x in state.get("pending", [])]
         heapq.heapify(self.pending)
         self.attempts = {int(k): v for k, v in state.get("attempts", {}).items()}

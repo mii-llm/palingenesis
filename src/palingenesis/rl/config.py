@@ -75,6 +75,7 @@ class RLDataConfig:
     revisit_after: int = 0
     revisit_max: int = 3
     revisit_partial_after: int = -1
+    revisit_share: float = 0.5  # at most this share of draws are revisits (fresh rows keep flowing)
     # Rollout outcome metrics (pipeline._outcome_stats): a rollout counts as a success at or above this reward
     # (pass@1 / pass@G), and metrics_key (dotted row paths, first present wins, e.g. ["vtask.vtype", "task"]) splits
     # them per family as family/<name>/... (empty: global only).
