@@ -139,8 +139,10 @@ class Parallel:
         return out
 
     def barrier(self) -> None:
-        if dist.is_initialized():
-            dist.barrier()
+        """Nothing on one process (see distributed.barrier)."""
+        from palingenesis.distributed import barrier
+
+        barrier()
 
     def close(self) -> None:
         if dist.is_initialized():

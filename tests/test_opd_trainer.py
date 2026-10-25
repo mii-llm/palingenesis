@@ -409,3 +409,30 @@ def test_sampling_mix_and_deployment_dev_metrics_run(tmp_path, models):
     evals = [m for kind, m in logged if kind == "eval"]
     assert {"dev_loop/math", "dev_len_deploy/math", "dev_loop/chat"} <= set(evals[0])
     assert 0.0 <= evals[0]["dev_loop/math"] <= 1.0 and evals[0]["dev_len_deploy/math"] > 0
+
+
+def test_pruning_keeps_complete_checkpoints_past_an_interrupted_save(tmp_path):
+    """keep_checkpoints counts complete checkpoints only: an interrupted save (no trainer_state.pt)
+    never prunes the last complete one, and goes once a later complete save passes it."""
+    from pathlib import Path
+
+    from palingenesis.opd.trainer import TRAINER_STATE_FILE, prunable_checkpoints
+
+    def add(step, complete=True):
+        (tmp_path / f"step_{step}").mkdir()
+        if complete:
+            (tmp_path / f"step_{step}" / TRAINER_STATE_FILE).write_bytes(b"")
+
+    def prune(keep=2):
+        for p in prunable_checkpoints(str(tmp_path), keep):
+            (Path(p) / TRAINER_STATE_FILE).unlink(missing_ok=True)
+            Path(p).rmdir()
+        return sorted(int(d.name[5:]) for d in tmp_path.iterdir())
+
+    add(60), add(80), add(100, complete=False)
+    assert prune() == [60, 80, 100]  # the old rule ([:-keep] over all dirs) deleted step_60 here
+    add(120)
+    assert prune() == [80, 100, 120]
+    add(140)
+    assert prune() == [120, 140]  # the interrupted step_100 is now older than every kept one
+    assert prunable_checkpoints(str(tmp_path), 0) == []  # 0 = keep all

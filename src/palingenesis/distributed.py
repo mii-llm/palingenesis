@@ -1,5 +1,6 @@
 """Distributed training: FSDP2, Context Parallel, process group management."""
 
+import gc
 import os
 
 import torch
@@ -57,6 +58,30 @@ def cleanup_distributed():
 
 def is_main() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def barrier() -> None:
+    """dist.barrier() over the default group; nothing without a process group or with a group of one.
+
+    One process has nobody to wait for, and NCCL allocates on the GPU for every barrier: right after
+    a checkpoint save, with a rollout engine awake on the same GPU, that allocation can fail and kill
+    a run whose files are already written. Under NCCL the barrier runs on the current device, named
+    explicitly (otherwise NCCL guesses it from the global rank and warns)."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+    if torch.cuda.is_available() and dist.get_backend() == "nccl":
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
+def release_cuda_memory() -> None:
+    """Return the caching allocator's free blocks to the device (after a save's transient copies and
+    gathers, before a collective or another process needs the memory). Local to the rank: no
+    collective, so every rank still reaches the next barrier."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def build_mesh(world_size: int, config: ParallelConfig) -> DeviceMesh | None:

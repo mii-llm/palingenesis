@@ -801,10 +801,8 @@ class OPDTrainer:
             }
             torch.save(state, path / (TRAINER_STATE_FILE + ".tmp"))
             os.replace(path / (TRAINER_STATE_FILE + ".tmp"), path / TRAINER_STATE_FILE)
-        keep = self.config.train.keep_checkpoints
-        if keep > 0:
-            for old in checkpoint_steps(self.config.train.output_dir, complete=False)[:-keep]:
-                shutil.rmtree(old, ignore_errors=True)
+        for old in prunable_checkpoints(self.config.train.output_dir, self.config.train.keep_checkpoints):
+            shutil.rmtree(old, ignore_errors=True)
 
     def _load_state(self, path: str) -> str | None:
         """Restore the optimizer, the policy version and the random states; the wandb run id.
@@ -839,6 +837,20 @@ def checkpoint_steps(output_dir: str, complete: bool = True) -> list[str]:
             if not complete or os.path.exists(os.path.join(path, TRAINER_STATE_FILE)):
                 found.append((int(d[5:]), path))
     return [path for _, path in sorted(found)]
+
+
+def prunable_checkpoints(output_dir: str, keep: int) -> list[str]:
+    """The step_* dirs to delete so the newest `keep` complete checkpoints remain.
+
+    Only complete checkpoints count toward `keep`: an interrupted save (no trainer_state.pt)
+    never pushes the last complete one out. Incomplete dirs older than the oldest kept one
+    go with it; a newer incomplete one stays until a later complete save passes it (its
+    weights are written, the user may still want them)."""
+    complete = checkpoint_steps(output_dir)
+    if keep <= 0 or len(complete) < keep:
+        return []
+    oldest_kept = int(os.path.basename(complete[-keep])[5:])
+    return [p for p in checkpoint_steps(output_dir, complete=False) if int(os.path.basename(p)[5:]) < oldest_kept]
 
 
 def resolve_resume(resume_from: str, output_dir: str) -> str | None:

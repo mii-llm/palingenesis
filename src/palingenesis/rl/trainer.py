@@ -45,7 +45,7 @@ from palingenesis.opd.rollout import (
     checkpoint_named_parameters,
 )
 from palingenesis.opd.teachers import end_of_turn_id, load_causal_lm, right_pad
-from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, student_stop_ids
+from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, prunable_checkpoints, student_stop_ids
 from palingenesis.rl.chat import ChatFormat
 from palingenesis.rl.config import RLConfig, RLConfigError, max_num_seqs
 from palingenesis.rl.data import PromptSampler, check_row_limits, load_rows, prompt_messages, split_rows
@@ -732,8 +732,14 @@ class RLTrainer:
     def save(self, name: str, step: int | None = None) -> None:
         """The policy in Hugging Face format; with `step`, also the state to resume from: the
         optimizer (sharded DCP under FSDP), each rank's prompt sampler and random states.
-        trainer_state.pt is written last, so a checkpoint with it is complete."""
+        trainer_state.pt is written last, so a checkpoint with it is complete.
+
+        The save's transient GPU memory (gathered tensors, state-dict copies) goes back to the
+        device before each barrier: an awake rollout engine (rollout.max_staleness > 0) may hold
+        the rest of the GPU, and NCCL allocates for a barrier. On one process there is no
+        barrier at all, so trainer_state.pt follows rank0.pt directly."""
         from palingenesis.checkpoint import _save_gathered_or_local
+        from palingenesis.distributed import release_cuda_memory
 
         path = Path(self.config.train.output_dir) / name
         if self.parallel.main:
@@ -759,7 +765,9 @@ class RLTrainer:
             if not self.parallel.fsdp:
                 local["optimizer"] = self.opt.state_dict()
             torch.save(local, path / f"rank{self.parallel.rank}.pt")
-            self.parallel.barrier()
+            del local
+            release_cuda_memory()  # on every rank, before the barrier: no collective in it
+            self.parallel.barrier()  # every rank's files written before rank 0 marks the checkpoint complete
         if self.parallel.main:
             with open(path / "rl_config.json", "w") as f:
                 json.dump(self.config.to_dict(), f, indent=2)
@@ -772,10 +780,8 @@ class RLTrainer:
                 }
                 torch.save(state, path / (TRAINER_STATE_FILE + ".tmp"))
                 os.replace(path / (TRAINER_STATE_FILE + ".tmp"), path / TRAINER_STATE_FILE)
-            keep = self.config.train.keep_checkpoints
-            if keep > 0:
-                for old in checkpoint_steps(self.config.train.output_dir, complete=False)[:-keep]:
-                    shutil.rmtree(old, ignore_errors=True)
+            for old in prunable_checkpoints(self.config.train.output_dir, self.config.train.keep_checkpoints):
+                shutil.rmtree(old, ignore_errors=True)
         self.parallel.barrier()
 
     def _load_state(self, path: str) -> str | None:

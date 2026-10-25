@@ -1243,3 +1243,81 @@ def test_sampler_counters_are_summed_over_ranks():
     out = trainer._combine(ranks[0])
     assert out["sampler/rows_tried"] == 40.0 and out["sampler/rows_solved_after_fail"] == 6.0
     assert out["groups/verifier_failed"] == 1 and out["reward"] == pytest.approx(0.3)
+
+
+# ------------------------------------------------- checkpoint save: memory, barriers
+
+
+def _fake_dist(monkeypatch, world, calls, backend="gloo"):
+    """torch.distributed as a process group of `world` would answer; barrier() and empty_cache()
+    only record the call."""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: world)
+    monkeypatch.setattr(dist, "get_backend", lambda group=None: backend)
+    monkeypatch.setattr(dist, "barrier", lambda *a, **k: calls.append(("barrier", k)))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(("empty_cache", {})))
+
+
+def test_barrier_is_skipped_on_one_process_and_names_the_device(monkeypatch):
+    from palingenesis.distributed import barrier, release_cuda_memory
+
+    calls = []
+    _fake_dist(monkeypatch, 1, calls, backend="nccl")
+    barrier()  # a group of one: no NCCL allocation at all
+    assert calls == []
+    _fake_dist(monkeypatch, 2, calls, backend="nccl")
+    barrier()
+    assert calls == [("barrier", {"device_ids": [3]})]  # the current device, not guessed from the rank
+    calls.clear()
+    _fake_dist(monkeypatch, 2, calls, backend="gloo")
+    barrier()
+    assert calls == [("barrier", {})]
+    calls.clear()
+    release_cuda_memory()
+    assert calls == [("empty_cache", {})]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    release_cuda_memory()
+    assert calls == [("empty_cache", {})]  # no CUDA: no call
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_save_frees_gpu_memory_before_any_barrier_and_marks_the_checkpoint(tmp_path, monkeypatch, world):
+    """RLTrainer.save on rank 0: the save's cached GPU blocks are released before the first barrier
+    (several ranks), and on one process no barrier runs at all, so trainer_state.pt follows rank0.pt
+    without a collective in between that could fail."""
+    import random
+    import threading
+
+    import palingenesis.checkpoint as ckpt
+    from palingenesis.rl.parallel import Parallel
+    from palingenesis.rl.trainer import TRAINER_STATE_FILE, RLTrainer
+
+    parallel = Parallel(fsdp=False)  # before CUDA is faked
+    parallel.world, parallel.rank = world, 0
+    calls = []
+    _fake_dist(monkeypatch, world, calls)
+    monkeypatch.setattr(ckpt, "_save_gathered_or_local", lambda model, tok, path, fsdp: path.mkdir(parents=True))
+    trainer = object.__new__(RLTrainer)
+    trainer.config = RLConfig()
+    trainer.config.set("train.output_dir", str(tmp_path))
+    trainer.parallel = parallel
+    trainer.device = "cpu"
+    trainer.pipeline, trainer.weights = SimpleNamespace(lock=threading.Lock()), SimpleNamespace(lock=threading.Lock())
+    trainer.model, trainer.tok, trainer.master = torch.nn.Linear(2, 2), None, None
+    trainer.opt = torch.optim.AdamW(trainer.model.parameters())
+    trainer.sampler = SimpleNamespace(state=lambda: {})
+    trainer.rng = random.Random(0)
+    trainer.stale_groups, trainer.wandb_id = 0, None
+
+    trainer.save("step_4", step=4)
+    assert (tmp_path / "step_4" / "rank0.pt").exists() and (tmp_path / "step_4" / TRAINER_STATE_FILE).exists()
+    names = [name for name, _ in calls]
+    assert "empty_cache" in names
+    if world == 1:
+        assert "barrier" not in names
+    else:
+        assert names.index("empty_cache") < names.index("barrier")

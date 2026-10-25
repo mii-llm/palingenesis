@@ -21,6 +21,8 @@ import torch.distributed as dist
 from safetensors.torch import load_file as safetensors_load
 from safetensors.torch import save_file as safetensors_save
 
+from palingenesis.distributed import barrier, release_cuda_memory
+
 logger = logging.getLogger(__name__)
 
 TRAINING_META_FILE = "training_meta.json"
@@ -176,7 +178,7 @@ def _save_in_source_layout(model, state: dict, path: Path, config, name: str) ->
                 if key not in weights:  # a module the causal LM does not have (vision)
                     weights[key] = f.get_tensor(key)
                     copied += 1
-    weights = {k: v.detach().contiguous().cpu() for k, v in weights.items()}
+    weights = {k: v.detach().cpu().contiguous() for k, v in weights.items()}  # to the CPU first: no GPU copy
     split = split_torch_state_dict_into_shards(weights, max_shard_size=MAX_SHARD_SIZE)
     for filename, keys in split.filename_to_tensors.items():
         safetensors_save({k: weights[k] for k in keys}, str(path / filename), metadata={"format": "pt"})
@@ -287,7 +289,9 @@ def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, 
         _save_meta(scheduler, step, epoch, micro_step, path)
         _save_rng(path)
 
-    dist.barrier()
+    del state
+    release_cuda_memory()
+    barrier()
 
 
 def _save_optimizer_sharded(optimizer, path: Path):
@@ -561,7 +565,7 @@ def _load_fsdp(model, optimizer, path):
     set_optimizer_state_dict(model, optimizer, optim_state, options=opts)
 
     logger.info("Loaded FSDP distributed checkpoint (sharded)")
-    dist.barrier()
+    barrier()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -591,13 +595,14 @@ def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool) -> None
     if is_fsdp and dist.is_initialized():  # also one rank: FSDP2 with CPU offload on a single GPU
         from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-        dist.barrier()  # every rank has finished its step before the gather
+        barrier()  # every rank has finished its step before the gather
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         state = get_model_state_dict(model, options=opts)
         if dist.get_rank() == 0:
             save_hf_model(model, tokenizer, path, state=state, source_layout=True)
         del state
-        dist.barrier()
+        release_cuda_memory()  # the gather's GPU blocks, before the barrier's NCCL allocation
+        barrier()
     else:
         save_hf_model(model, tokenizer, path, source_layout=True)
 
