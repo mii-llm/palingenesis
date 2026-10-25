@@ -1321,3 +1321,61 @@ def test_save_frees_gpu_memory_before_any_barrier_and_marks_the_checkpoint(tmp_p
         assert "barrier" not in names
     else:
         assert names.index("empty_cache") < names.index("barrier")
+
+
+class _FakeWandbRun:
+    """Records wandb calls without a network: log() rows with their kwargs, define_metric() calls."""
+
+    def __init__(self):
+        self.logs, self.defined = [], []
+
+    def log(self, row, **kwargs):
+        self.logs.append((dict(row), kwargs))
+
+    def define_metric(self, name, **kwargs):
+        self.defined.append((name, kwargs))
+
+
+@pytest.mark.parametrize("trainer_kind", ["rl", "opd"])
+def test_wandb_logging_survives_a_resume_that_redoes_steps(trainer_kind):
+    """A run that crashed after logging step 5 resumes from a step 2 checkpoint into the SAME
+    wandb run and redoes steps 3..6. wandb drops every row logged with an explicit step= below
+    its history step, so no call may pass step=: the training step rides in each row
+    (train/global_step, as in palingenesis.logging.Tracker) and define_metric makes it the x-axis."""
+    from palingenesis.logging import WANDB_STEP_METRIC, wandb_define_step_axis
+
+    if trainer_kind == "rl":
+        from palingenesis.rl.parallel import Parallel
+        from palingenesis.rl.trainer import RLTrainer
+
+        trainer = object.__new__(RLTrainer)
+        trainer.parallel = Parallel(fsdp=False)
+    else:
+        from palingenesis.opd.trainer import OPDTrainer
+
+        trainer = object.__new__(OPDTrainer)
+
+    run = _FakeWandbRun()
+    wandb_define_step_axis(run)  # what both trainers call right after wandb.init (resume or not)
+    assert ("*", {"step_metric": WANDB_STEP_METRIC}) in run.defined
+    assert ("eval/*", {"step_metric": WANDB_STEP_METRIC}) in run.defined
+    assert (WANDB_STEP_METRIC, {}) in run.defined
+    assert WANDB_STEP_METRIC == "train/global_step"
+
+    trainer.wandb = run
+    for step in range(1, 6):  # the first life: steps 1..5, an eval at step 4
+        trainer._log("step", {"loss": 1.0 / step}, step)
+        if step == 4:
+            trainer._log("eval", {"reward": 0.5}, step)
+    for step in range(3, 7):  # the resumed life redoes 3..5 and goes on to 6
+        trainer._log("step", {"loss": 0.5 / step}, step)
+    trainer._log("eval", {"reward": 0.7}, 6)
+
+    assert trainer.wandb is run, "a log call failed and disabled wandb"
+    assert all(kwargs == {} for _, kwargs in run.logs), "wandb.log must never get step="
+    assert all(WANDB_STEP_METRIC in row for row, _ in run.logs)
+    steps = [row[WANDB_STEP_METRIC] for row, _ in run.logs if "loss" in row]
+    assert steps == [1, 2, 3, 4, 5, 3, 4, 5, 6]  # every redone step is logged, none dropped
+    evals = [(row[WANDB_STEP_METRIC], row["eval/reward"]) for row, _ in run.logs if "eval/reward" in row]
+    assert evals == [(4, 0.5), (6, 0.7)]
+    assert not any("reward" in row for row, _ in run.logs), "eval metrics keep their eval/ prefix"

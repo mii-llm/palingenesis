@@ -31,6 +31,7 @@ from torch import Tensor
 from transformers import AutoTokenizer
 
 from palingenesis.kernels import apply_liger_kernel, model_type_of
+from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.opd import fused_rkl, losses
 from palingenesis.opd.align import ByteChunkAligner, SharedVocabAligner
@@ -305,6 +306,7 @@ class OPDTrainer:
                     id=wandb_id,
                     resume="allow" if wandb_id else None,
                 )
+                wandb_define_step_axis(run)  # x-axis = the training step, a resumed run included
                 self.wandb_id = run.id
                 self.wandb = wandb
             except Exception as e:  # noqa: BLE001 — a metrics backend must never kill a training run
@@ -770,7 +772,10 @@ class OPDTrainer:
         logger.info("%s %d | %s", kind, step, " ".join(f"{k}={v:.4g}" for k, v in sorted(metrics.items())))
         if self.wandb:
             try:
-                self.wandb.log({(f"eval/{k}" if kind == "eval" else k): v for k, v in metrics.items()}, step=step)
+                # No step=: wandb drops rows below its history step, i.e. every step a resume
+                # from an older checkpoint redoes. The training step rides in the row instead.
+                row = {(f"eval/{k}" if kind == "eval" else k): v for k, v in metrics.items()}
+                self.wandb.log(wandb_row(row, step))
             except Exception as e:  # noqa: BLE001 — a metrics backend must never kill training
                 logger.warning("wandb.log failed (%s); disabling wandb", e)
                 self.wandb = None

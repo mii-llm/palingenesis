@@ -12,6 +12,31 @@ logger = logging.getLogger(__name__)
 
 _RUN_ID_FILE = "tracker_run_id.json"
 
+# The x-axis of every wandb chart, logged as a metric in each row (never as wandb's step=).
+WANDB_STEP_METRIC = "train/global_step"
+
+
+def wandb_define_step_axis(run) -> None:
+    """Plot every metric (train, eval/*, health/*) against WANDB_STEP_METRIC.
+
+    Called after every wandb.init, a resumed run included: the definitions belong to the
+    process, and they are what keeps a resumed run's redone steps on the right x.
+    """
+    run.define_metric(WANDB_STEP_METRIC)
+    run.define_metric("*", step_metric=WANDB_STEP_METRIC)
+    run.define_metric("eval/*", step_metric=WANDB_STEP_METRIC)
+
+
+def wandb_row(metrics: dict[str, Any], step: int) -> dict[str, Any]:
+    """The row to pass to wandb's log() WITHOUT step=: the metrics plus the training step.
+
+    wandb DROPS any row whose explicit step is below the run's history step, so a run that
+    resumes from an older checkpoint than its last logged step (a crash after logging step
+    100 with the last checkpoint at 80) would lose every redone step. Without step=, wandb
+    numbers the rows itself and the charts use WANDB_STEP_METRIC as their x-axis.
+    """
+    return {**metrics, WANDB_STEP_METRIC: step}
+
 
 class Tracker:
     """Dual backend tracker: wandb + trackio.
@@ -58,8 +83,7 @@ class Tracker:
                 )
                 # Use the training step as x-axis for ALL metrics so train/*,
                 # eval/* and health/* line up on the same axis across resumes.
-                self._wandb.define_metric("train/global_step")
-                self._wandb.define_metric("*", step_metric="train/global_step")
+                wandb_define_step_axis(self._wandb)
             except Exception as e:
                 logger.warning(f"wandb init failed: {e}")
                 self._wandb = None
@@ -82,8 +106,8 @@ class Tracker:
 
     def log(self, metrics: dict[str, Any], step: int | None = None):
         # Include the step as a metric so wandb's define_metric x-axis works
-        if step is not None and "train/global_step" not in metrics:
-            metrics = {**metrics, "train/global_step": step}
+        if step is not None and WANDB_STEP_METRIC not in metrics:
+            metrics = wandb_row(metrics, step)
 
         if self._wandb:
             try:
