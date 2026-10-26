@@ -33,6 +33,7 @@ from transformers import AutoTokenizer
 from palingenesis.kernels import apply_liger_kernel, model_type_of
 from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
+from palingenesis.memory import trim_host_memory
 from palingenesis.opd import fused_rkl, losses
 from palingenesis.opd.align import ByteChunkAligner, SharedVocabAligner
 from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig, rollout_max_num_seqs
@@ -639,6 +640,7 @@ class OPDTrainer:
                         "time/wait_batch": waited,
                         "time/step": time.perf_counter() - t0,
                         "elapsed": time.time() - start_time,
+                        **trim_host_memory(),  # after the step: frees what the batch held, then reads the RSS
                     }
                 )
                 if step % config.logging.log_every == 0:

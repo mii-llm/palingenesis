@@ -251,6 +251,38 @@ def test_combined_memory_savings():
     print("✓ test_combined_memory_savings PASSED\n")
 
 
+def test_trim_host_memory_reads_rss_and_never_fails(tmp_path, monkeypatch):
+    """malloc_trim after each RL / OPD step: the host RSS as a metric; a missing or failing allocator hook is
+    skipped, never raised."""
+    from palingenesis import memory
+
+    status = tmp_path / "status"
+    status.write_text("Name:\tpython\nVmHWM:\t 9000000 kB\nVmRSS:\t 3145728 kB\nThreads:\t140\n")
+    assert memory.host_rss_gb(str(status)) == 3.0
+    assert memory.host_rss_gb(str(tmp_path / "missing")) is None
+    monkeypatch.setattr(memory, "host_rss_gb", lambda: 3.0)
+
+    class Libc:
+        calls = []
+
+        def malloc_trim(self, pad):
+            self.calls.append(pad)
+            if len(self.calls) > 1:
+                raise OSError("boom")
+
+    libc = Libc()
+    monkeypatch.setattr(memory, "_libc", libc)
+    assert memory.trim_host_memory() == {"memory/host_rss_gb": 3.0} and libc.calls == [0]
+    assert memory.trim_host_memory() == {"memory/host_rss_gb": 3.0}  # the failure disables the trim
+    assert memory._libc is False and memory.trim_host_memory() == {"memory/host_rss_gb": 3.0}
+    assert libc.calls == [0, 0]
+    monkeypatch.setattr(memory, "_libc", None)  # the real allocator (a no-op off Linux)
+    monkeypatch.setattr(memory, "host_rss_gb", lambda: None)
+    assert memory.trim_host_memory() == {}
+    if not sys.platform.startswith("linux"):
+        assert memory._libc is False
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("MEMORY OPTIMIZATION TESTS")

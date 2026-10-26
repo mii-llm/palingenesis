@@ -86,7 +86,8 @@ class HarnessProfile:
     start: Callable[["Session"], dict[str, str]] | None = None  # per-episode setup (e.g. a tmux session) returning
     # extra template values for the first turn (e.g. {terminal_state})
     exec_timeout: float = 60  # default shell timeout (seconds) when the call sets none
-    runtime_max_output: int = 8_000_000  # the episode runtime's own output cap (the profile truncates first)
+    runtime_max_output: int = 8_000_000  # the episode runtime's own output cap (the profile truncates first; the
+    # raw capture still stops at harbor.EXEC_LIMIT, 4 MiB per stream)
     chat_template_kwargs: dict | None = None  # applied to the episode's chat template (e.g. enable_thinking); None:
     # the model's default, as a harness that sends no chat_template_kwargs to vLLM gets
     emulates: str = ""  # what was read to write the profile

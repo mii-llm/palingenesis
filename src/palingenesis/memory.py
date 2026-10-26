@@ -24,9 +24,12 @@ Combined effect for hybrid model training (Qwen3.5-4B, freeze_non_attention=true
    - Gradient release: eliminates gradient buffer for trainable params (~2 GB)
    - Selective diff: eliminates activation storage for 75% of layers (~6 GB)
    - Total saving: ~8 GB → model that needed 28 GB now needs ~20 GB
+
+3. HOST MEMORY: trim_host_memory (glibc malloc_trim after each step) and the host RSS as a metric.
 """
 
 import logging
+import sys
 from typing import Any
 
 import torch
@@ -379,3 +382,50 @@ def apply_selective_diff_v2(model: nn.Module) -> int:
 
     logger.info(f"SelectiveDiff v2: {modified} frozen linear layers, zero input activation stored")
     return modified
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. HOST MEMORY: RETURN FREED HEAP TO THE OS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_libc: Any = None  # glibc once loaded; False where malloc_trim is not available (not Linux, musl) or failed
+
+
+def host_rss_gb(status: str = "/proc/self/status") -> float | None:
+    """This process's resident set size (VmRSS in /proc/self/status) in GiB; None where it cannot be read."""
+    try:
+        with open(status) as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 2**20  # kB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def trim_host_memory() -> dict[str, float]:
+    """glibc malloc_trim(0), then the host RSS as a step metric ({"memory/host_rss_gb": ...}, empty where unknown).
+
+    glibc keeps the heap pages of large transient allocations (multi-MB tool outputs, a step's trajectories) made
+    on many threads, one arena per thread up to 8 per CPU, so an RL trainer's RSS ratchets up at each new peak; the
+    trim gives the free pages back. Linux with glibc only; it never fails the run."""
+    global _libc
+    if _libc is None:
+        _libc = False
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes
+
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim.argtypes, libc.malloc_trim.restype = [ctypes.c_size_t], ctypes.c_int
+                _libc = libc
+            except (OSError, AttributeError):  # no glibc (musl has no malloc_trim)
+                pass
+    if _libc:
+        try:
+            _libc.malloc_trim(0)
+        except Exception as e:  # noqa: BLE001 (an allocator hint must never kill a training run)
+            logger.warning("malloc_trim failed (%s); not trimming again", e)
+            _libc = False
+    rss = host_rss_gb()
+    return {} if rss is None else {"memory/host_rss_gb": rss}

@@ -221,7 +221,7 @@ The pieces:
 | `answer` | `LastText()`, `StopAnswer(fallback)` (what the stop rule captured: a finish message, a sentinel submission) |
 | `format_error`, `unknown_tool`, `alias` | The harness's wording for a malformed turn and an unknown tool, and its own name repair |
 | `start` | Per-episode setup (e.g. a tmux session) returning extra template values for the first turn |
-| `exec_timeout`, `runtime_max_output` | Default shell timeout; the runtime's own output cap (the profile truncates first) |
+| `exec_timeout`, `runtime_max_output` | Default shell timeout; the runtime's own output cap (the profile truncates first; the runtime reads at most 4 MiB per stream, so a file read over about 3 MiB is refused as too large) |
 | `chat_template_kwargs` | Thinking on or off for this harness |
 | `context` | The harness's compaction policy, recorded (not emulated: rollouts are token-exact) |
 

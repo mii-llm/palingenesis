@@ -232,6 +232,47 @@ def test_tool_calls_parse_and_render_token_exact():
     assert "<|im_start|>" not in chat.sanitize("x <|im_start|>system")
 
 
+def test_truncate_cuts_characters_before_tokenizing():
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+
+    tok = tokenizer("Qwen/Qwen3.5-0.8B")
+    chat = ChatFormat(tok, end_of_turn_id(tok, {}), {})
+
+    def reference(text, max_tokens):  # the implementation that tokenized the whole text
+        ids = tok.encode(text, add_special_tokens=False)
+        if len(ids) <= max_tokens:
+            return text
+        half = max_tokens // 2
+        return tok.decode(ids[:half]) + f"\n...[{len(ids) - 2 * half} tokens truncated]...\n" + tok.decode(ids[-half:])
+
+    seen = []
+    encode = tok.encode
+
+    class Counting:  # the real tokenizer, recording the length of every text it encodes
+        def __getattr__(self, name):
+            return getattr(tok, name)
+
+        def encode(self, text, **kw):
+            seen.append(len(text))
+            return encode(text, **kw)
+
+    chat.tok = Counting()
+    line = "ERROR worker 17: connection reset by peer (errno 104), retrying in 0.5 s, città è già\n"
+    big = "HEAD " + line * (5_000_000 // len(line)) + " TAIL"
+    window = 8 * 512
+    out = chat.truncate(big, 512)
+    assert max(seen) <= 2 * window + 1  # never the 5 MB text
+    assert out == reference(big[:window] + "\n" + big[-window:], 512)
+    assert out.startswith("HEAD ERROR") and out.endswith(" TAIL")
+    # the kept head and tail are those of the whole text (only the truncated count differs)
+    mid = "HEAD " + line * (200_000 // len(line)) + " TAIL"
+    full, cut = reference(mid, 512), chat.truncate(mid, 512)
+    assert full.split("\n...[")[0] == cut.split("\n...[")[0]
+    assert full.split("truncated]...\n")[1] == cut.split("truncated]...\n")[1]
+    assert chat.truncate("short text", 512) == "short text" and chat.truncate(big, 0) == big
+
+
 # --------------------------------------------------------------------- sandbox
 
 
@@ -442,6 +483,7 @@ def test_trainer_end_to_end_and_resume(tmp_path, fsdp, monkeypatch):
 
     resumed = make(3, resume="auto")
     assert resumed.start_step == 2 and resumed.weights.version == 2
+    assert resumed.pipeline.batches == 2  # trajectory dumps continue the first leg's step numbers
     resumed.train()
 
 
@@ -1078,6 +1120,34 @@ def test_think_skip_forces_a_closed_think_trained_with_the_forcing_probability()
         loss.backward()
         assert (stats["seq_masked"] == 0) == kept
     assert abs(x.grad[0] + 0.4) < 1e-6 and stats["ratio_max"] == 1.0  # -ratio x A, ratio 0.1 / 0.25
+
+
+def test_zero_variance_groups_are_kept_only_for_batches_that_dump():
+    """The dropped groups of a batch are held only when logging.dump_trajectories writes that batch."""
+    from palingenesis.rl.pipeline import RLPipeline
+
+    config = RLConfig()
+    config.set("logging.dump_trajectories", 2)
+    config.set("rollout.max_refill", 4.0)
+    pipe = RLPipeline.__new__(RLPipeline)
+    pipe.config, pipe.env_pool, pipe.carry, pipe.continuing, pipe.drop_rate = config, None, [], set(), 0.0
+    pipe.weights = SimpleNamespace(version=0)
+    pipe.sampler = SimpleNamespace(draw=lambda version: (0, {}))
+    pipe._group_stats = pipe._outcome_stats = lambda trajectories: {}
+    flip = iter(range(1000))
+
+    async def group(index, row, temperature, size, training, revisit=False):
+        rewards = [0.0, 1.0] if next(flip) % 2 else [1.0, 1.0]  # informative, zero-variance, ...
+        return [SimpleNamespace(reward=r, scored=True, trained=True, rewards={}, sampled_tokens=1) for r in rewards]
+
+    pipe._group = group
+    held = []
+    for batches in range(4):  # run() bumps the counter after collecting: batches 2 and 4 are dumped
+        pipe.batches, pipe.dropped = batches, []
+        kept, _ = asyncio.run(pipe._collect(2, 1.0))
+        assert len(kept) == 2
+        held.append(len(pipe.dropped))
+    assert held[0] == held[2] == 0 and held[1] > 0 and held[3] > 0
 
 
 def test_eval_reports_per_family_metrics_on_the_fixed_rows():

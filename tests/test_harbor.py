@@ -248,6 +248,18 @@ class _FakeDocker:
                         self.copied["/" + m.name] = tar.extractfile(m).read()
         return subprocess.CompletedProcess(args, 0, out, b"")
 
+    def pipe(self, src, dst, limit, timeout, what="the stream"):  # harbor._pipe_capped of two docker commands
+        out = self(*src[1:]).stdout
+        if len(out) > limit:
+            raise RuntimeError(f"{what} is over {limit >> 20} MiB")
+        self(*dst[1:], input=out)
+        return len(out)
+
+    def install(self, monkeypatch, harbor):
+        monkeypatch.setattr(harbor, "_docker", self)
+        monkeypatch.setattr(harbor, "_pipe_capped", self.pipe)
+        return self
+
 
 def _capture_task(tmp_path, capture=True):
     task = tmp_path / "task"
@@ -263,8 +275,7 @@ def _capture_task(tmp_path, capture=True):
 def test_verifier_capture_runs_as_root_in_the_agent_container_and_reaches_the_tests(tmp_path, monkeypatch):
     from palingenesis.rl.envs import harbor
 
-    fake = _FakeDocker()
-    monkeypatch.setattr(harbor, "_docker", fake)
+    fake = _FakeDocker().install(monkeypatch, harbor)
     monkeypatch.setattr(harbor, "_swept", True)
     rt = harbor.DockerRuntime(HarborTask.load(_capture_task(tmp_path)))
     rt.started = True
@@ -281,8 +292,7 @@ def test_verifier_capture_runs_as_root_in_the_agent_container_and_reaches_the_te
 def test_no_capture_keeps_the_default_verification(tmp_path, monkeypatch):
     from palingenesis.rl.envs import harbor
 
-    fake = _FakeDocker()
-    monkeypatch.setattr(harbor, "_docker", fake)
+    fake = _FakeDocker().install(monkeypatch, harbor)
     monkeypatch.setattr(harbor, "_swept", True)
     rt = harbor.DockerRuntime(HarborTask.load(_capture_task(tmp_path, capture=False)))
     rt.started = True
@@ -300,7 +310,7 @@ def test_a_failed_capture_scores_zero(tmp_path, monkeypatch):
                 return subprocess.CompletedProcess(args, 137, b"", b"container not running")
             return super().__call__(*args, **kw)
 
-    monkeypatch.setattr(harbor, "_docker", Dead())
+    Dead().install(monkeypatch, harbor)
     monkeypatch.setattr(harbor, "_swept", True)
     env = HarborEnv()
     env.task = HarborTask.load(_capture_task(tmp_path))
@@ -395,3 +405,53 @@ def test_run_capped_keeps_head_and_tail_with_bounded_memory():
         _run_capped(["bash", "-c", "yes"], None, 1, False, 1000)
     with pytest.raises(subprocess.CalledProcessError):
         _run_capped(["false"], None, 10, True, 1000)
+
+
+def test_exec_capture_is_capped_whatever_the_runtime_max_output(tmp_path, monkeypatch):
+    """Harness profiles allow 8M characters (32 MB per stream); the raw capture stops at EXEC_LIMIT, with the same
+    character-cut marker (the file ops read through base64 and refuse an output carrying it)."""
+    from palingenesis.rl.envs import harbor
+    from palingenesis.rl.envs.harness.ops import CUT_MARK
+
+    script = {"cmd": ""}
+    limits = []
+
+    def docker(*args, input=None, timeout=None, check=True, limit=None):
+        limits.append(limit)
+        return harbor._run_capped(["bash", "-c", script["cmd"]], input, timeout, check, limit)
+
+    monkeypatch.setattr(harbor, "_docker", docker)
+    rt = harbor.DockerRuntime(HarborTask.load(FIXTURE), max_output=8_000_000)
+    script["cmd"] = "printf HEAD; head -c 20000000 /dev/zero | tr '\\0' x; printf TAIL"
+    r = rt.exec("ignored")
+    assert limits[-1] == harbor.EXEC_LIMIT
+    assert r.stdout.startswith("HEADxx") and r.stdout.endswith("xxTAIL") and CUT_MARK in r.stdout
+    assert len(r.stdout) < harbor.EXEC_LIMIT + 100
+    n = int(r.stdout.split("... [")[1].split(" characters")[0])
+    assert n + len(r.stdout.split("\n... [")[0]) + len(r.stdout.split("cut] ...\n")[1]) == 20_000_008
+    script["cmd"] = "printf '%s' 0123456789abcdefghij"  # under the cap: the character cut as before
+    small = harbor.DockerRuntime(HarborTask.load(FIXTURE), max_output=10).exec("ignored")
+    assert limits[-1] == 4 * 10 + 4096 and small.stdout == "01234\n... [10 characters cut] ...\nfghij"
+
+
+def test_pipe_capped_streams_counts_and_aborts_over_the_limit(tmp_path):
+    """The verifier's working-directory copy is streamed between two docker cp, never held in memory."""
+    import subprocess
+
+    from palingenesis.rl.envs.harbor import _pipe_capped
+
+    out = tmp_path / "out"
+    src = ["bash", "-c", "head -c 3000000 /dev/zero | tr '\\0' y"]
+    assert _pipe_capped(src, ["bash", "-c", f"cat > {out}"], 4 << 20, 30) == 3_000_000
+    assert out.read_bytes() == b"y" * 3_000_000
+    with pytest.raises(RuntimeError, match="wd is over 1 MiB"):
+        _pipe_capped(src, ["bash", "-c", "cat > /dev/null"], 1 << 20, 30, "wd")
+    with pytest.raises(RuntimeError, match="over 1 MiB"):  # a source that never ends
+        _pipe_capped(["yes"], ["bash", "-c", "cat > /dev/null"], 1 << 20, 30)
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        _pipe_capped(src, ["bash", "-c", "echo no space >&2; exit 2"], 4 << 20, 30)
+    assert e.value.returncode == 2 and b"no space" in e.value.stderr
+    with pytest.raises(subprocess.CalledProcessError):
+        _pipe_capped(["bash", "-c", "exit 1"], ["bash", "-c", "cat > /dev/null"], 4 << 20, 30)
+    with pytest.raises(subprocess.TimeoutExpired):
+        _pipe_capped(["sleep", "30"], ["bash", "-c", "cat > /dev/null"], 4 << 20, 1)

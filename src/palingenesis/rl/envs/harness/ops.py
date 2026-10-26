@@ -23,7 +23,8 @@ Runtime contract (DockerRuntime, or a test double): .workdir, .exec(command, tim
 ExecResult(exit_code, stdout, stderr, timed_out), .put_files({path: data}, "/", as_user=True), optionally .scratch
 (the temporary directory, default /tmp: the persistent shell's state and staged writes live there). Files are read
 through base64 in the shell, so the runtime's max_output must exceed the largest file read (the episode's runtime
-for a profile is created with HarnessProfile.runtime_max_output).
+for a profile is created with HarnessProfile.runtime_max_output; DockerRuntime also reads at most harbor.EXEC_LIMIT,
+4 MiB, of an output, so a file over about 3 MiB is too_large).
 """
 
 from __future__ import annotations

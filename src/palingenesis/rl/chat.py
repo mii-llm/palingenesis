@@ -122,6 +122,13 @@ class ChatFormat:
         """`text` cut to about `max_tokens` tokens, keeping its head and tail."""
         if max_tokens <= 0:
             return text
+        # Cut by characters first: encoding a whole multi-MB tool output (a 423k-token one was seen) only to keep
+        # 512 tokens costs ~100 MB of transient memory, which glibc keeps. Each side keeps 8 chars per token limit,
+        # far more than the max_tokens // 2 tokens it needs, so the kept head and tail are the same as on the whole
+        # text (only the truncated count no longer includes the characters cut here).
+        window = 8 * max_tokens
+        if len(text) > 2 * window:
+            text = text[:window] + "\n" + text[-window:]
         ids = self.tok.encode(text, add_special_tokens=False)
         if len(ids) <= max_tokens:
             return text

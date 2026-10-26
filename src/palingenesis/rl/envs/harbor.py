@@ -237,7 +237,67 @@ def _run_capped(
     out, err = joined(res[0]), joined(res[1])
     if check and p.returncode:
         raise subprocess.CalledProcessError(p.returncode, cmd, out, err)
-    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    done = subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    done.stdout_parts = tuple(res[0]) or (b"", b"", 0)  # (head, tail, bytes dropped) of stdout
+    return done
+
+
+def _pipe_capped(src: list[str], dst: list[str], limit: int, timeout: float | None, what: str = "the stream") -> int:
+    """`src | dst` through a 64 KiB buffer, counting the bytes: a working directory goes from one container to another
+    without being held in memory (buffered, a tar of up to GET_DIR_LIMIT was held 3 times per verifying episode).
+    Returns the bytes copied; raises RuntimeError above limit bytes (dst is killed mid-stream and must not be used),
+    subprocess.TimeoutExpired after timeout seconds and CalledProcessError when either command fails."""
+    a = subprocess.Popen(src, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    b = subprocess.Popen(dst, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    errs: list[list] = [[], []]
+    readers = [threading.Thread(target=_drain, args=(p.stderr, 8192, r), daemon=True) for p, r in zip((a, b), errs)]
+    for t in readers:
+        t.start()
+    expired = threading.Event()
+
+    def kill() -> None:
+        expired.set()
+        a.kill()
+        b.kill()
+
+    timer = threading.Timer(timeout, kill) if timeout is not None else None
+    if timer:
+        timer.start()
+    total, over, broken = 0, False, False
+    try:
+        for chunk in iter(lambda: a.stdout.read(65536), b""):
+            total += len(chunk)
+            if total > limit:
+                over = True
+                break
+            b.stdin.write(chunk)
+    except (BrokenPipeError, OSError):  # dst exited early: its exit code says why; src must not block on a full pipe
+        broken = True
+        a.kill()
+    finally:
+        if timer:
+            timer.cancel()
+        if over:
+            b.kill()  # before its stdin closes: a cut tar is never extracted to the end
+            a.kill()
+        try:
+            b.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        a.wait()
+        b.wait()
+        a.stdout.close()
+        for t in readers:
+            t.join(5)
+    if expired.is_set():
+        raise subprocess.TimeoutExpired(src, timeout)
+    if over:
+        raise RuntimeError(f"{what} is over {limit >> 20} MiB")
+    order = ((b, dst, errs[1]), (a, src, errs[0])) if broken else ((a, src, errs[0]), (b, dst, errs[1]))
+    for p, cmd, r in order:  # the first failure is the cause (dst fails on the empty stream of a failed src)
+        if p.returncode:
+            raise subprocess.CalledProcessError(p.returncode, cmd, b"", r[0] + r[1] if r else b"")
+    return total
 
 
 # Episode containers carry the owning process in a label, so containers a dead run left behind (killed by a signal,
@@ -247,7 +307,10 @@ _LABEL = "palingenesis.harbor.owner"
 _HOST = os.uname().nodename
 _live: set[str] = set()
 CAPTURE_LIMIT = 16 << 20  # [verifier] capture stdout kept (bytes)
-GET_DIR_LIMIT = 2 << 30  # working directory tar stream copied to the verifier container (bytes)
+EXEC_LIMIT = 4 << 20  # tool command output read per stream (bytes), whatever the runtime's max_output: harness
+# profiles allow 8M characters (32 MB at 4 bytes each), and 128 episodes holding such buffers at once grow the
+# trainer's heap for good (glibc keeps what it allocated)
+GET_DIR_LIMIT = 2 << 30  # working directory tar stream copied to the verifier container (bytes; verify streams it)
 _live_lock = threading.Lock()
 _swept = False
 
@@ -422,13 +485,20 @@ class DockerRuntime:
             args += ["-e", f"{k}={v}"]
         args += ["-w", workdir or self.workdir, self.name, "bash", "-lc", command]
         try:
-            r = _docker(*args, timeout=timeout, check=False, limit=4 * self.max_output + 4096)  # chars <= 4 bytes
+            limit = min(4 * self.max_output + 4096, EXEC_LIMIT)  # chars <= 4 bytes
+            r = _docker(*args, timeout=timeout, check=False, limit=limit)
         except subprocess.TimeoutExpired:
             _docker("exec", self.name, "bash", "-lc", "pkill -f -- 'bash -lc' || true", check=False, timeout=10)
             return ExecResult(124, "", f"timed out after {timeout:g} s", True)
         cut = self.max_output
         out, err = r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
-        if len(out) > cut:
+        head, tail, dropped = getattr(r, "stdout_parts", (b"", b"", 0))
+        if dropped:  # over EXEC_LIMIT: only its head and tail were read; cut as below, with the same marker
+            h, t = head.decode(errors="replace"), tail.decode(errors="replace")
+            kept_h, kept_t = h[: cut // 2], t[-(cut // 2) :] if cut // 2 else ""
+            n = dropped + len(h) - len(kept_h) + len(t) - len(kept_t)  # dropped bytes counted as characters
+            out = kept_h + f"\n... [{n} characters cut] ...\n" + kept_t
+        elif len(out) > cut:
             out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2 :]
         return ExecResult(r.returncode, out, err[-cut:])
 
@@ -473,6 +543,18 @@ class DockerRuntime:
             raise RuntimeError(f"{self.task.name}: {path} is over {GET_DIR_LIMIT >> 20} MiB")
         return out
 
+    def copy_dir(self, path: str, dest: "DockerRuntime", dest_dir: str, timeout: float = 240) -> int:
+        """Copy a directory of this container into dest_dir of another, streamed (`docker cp a:path - | docker cp -
+        b:dest_dir`, never in memory); returns the tar's size. Over GET_DIR_LIMIT raises RuntimeError: the episode
+        fails to verify and scores 0."""
+        return _pipe_capped(
+            ["docker", "cp", f"{self.name}:{path}", "-"],
+            ["docker", "cp", "-", f"{dest.name}:{dest_dir}"],
+            GET_DIR_LIMIT,
+            timeout,
+            f"{self.task.name}: {path}",
+        )
+
     def capture(self) -> bytes:
         """[verifier] capture: the command's stdout, run as root in this container (not cut like tool output). A
         container the agent stopped (kill -9 -1) cannot be captured and raises, which scores 0. The command runs in the
@@ -512,12 +594,11 @@ class DockerRuntime:
         if capture is None and self.task.verifier.get("capture"):
             capture = self.capture()  # in the agent's container, before anything is copied or removed
         if isolated:
-            archive = self.get_dir(self.workdir)
             clean = DockerRuntime(self.task, self.workdir, self.max_output)
             try:
                 clean.start(provision=False, allow_internet=self.task.verifier.get("allow_internet"))
                 clean.exec(f"rm -rf {shlex.quote(self.workdir)}", timeout=30, workdir="/")
-                _docker("cp", "-", f"{clean.name}:{str(Path(self.workdir).parent)}", input=archive, timeout=120)
+                self.copy_dir(self.workdir, clean, str(Path(self.workdir).parent))
                 return clean.verify(isolated=False, final_message=final_message, capture=capture)
             finally:
                 clean.stop()

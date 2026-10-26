@@ -114,7 +114,7 @@ A verifier that writes nothing scores 0 and is logged as `env/metric/verifier_fa
 
 ## Isolation: what the verifier can trust
 
-Each episode gets a fresh container from the task image, started with `--init`, the task's CPU, memory and PID limits, and `--network none` unless the task allows internet. The tests do **not** run in the agent's container. By default `verify` copies only the working directory into a new container from the pristine image and runs the tests there. Nothing the agent left outside the working directory reaches the verifier: no background process rewriting the reward, no patched package, no `pytest.py` shadowing pytest.
+Each episode gets a fresh container from the task image, started with `--init`, the task's CPU, memory and PID limits, and `--network none` unless the task allows internet. The tests do **not** run in the agent's container. By default `verify` copies only the working directory into a new container from the pristine image (streamed from one `docker cp` to the other, up to 2 GiB; a larger directory scores 0) and runs the tests there. Nothing the agent left outside the working directory reaches the verifier: no background process rewriting the reward, no patched package, no `pytest.py` shadowing pytest.
 
 ### Live-state capture
 

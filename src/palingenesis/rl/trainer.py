@@ -37,6 +37,7 @@ from transformers import AutoTokenizer
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel, model_type_of
 from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
+from palingenesis.memory import trim_host_memory
 from palingenesis.opd.orchestrator import Orchestrator, PublishedWeights
 from palingenesis.opd.rollout import (
     HFRollout,
@@ -642,6 +643,7 @@ class RLTrainer:
                         "epoch": self.sampler.epoch,
                         "elapsed": time.time() - start_time,
                         **self._memory(),
+                        **trim_host_memory(),  # after the step: frees what the batch held, then reads the RSS
                     }
                 )
                 metrics = self._combine(metrics)
@@ -814,6 +816,7 @@ class RLTrainer:
         if local["cuda_rng"] is not None and self.device.startswith("cuda"):
             torch.cuda.set_rng_state_all(local["cuda_rng"])
         self.start_step = state["step"]
+        self.pipeline.batches = state["step"]  # trajectory dumps continue the first leg's step numbers
         self.weights.version = state["step"]  # the engine holds older weights: the first rollout (or push) syncs
         self.stale_groups = state["stale_groups"]
         logger.info("Resumed from %s at step %d", path, self.start_step)

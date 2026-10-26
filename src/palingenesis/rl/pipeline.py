@@ -77,7 +77,7 @@ class RLPipeline:
         self.continuing: set[asyncio.Task] = set()  # groups still generating at the last batch's end
         self.drop_rate = 0.0  # expected fraction of zero-variance groups (running, per batch)
         self.reported_errors = 0
-        self.batches = 0  # batches collected (the dump's step numbers)
+        self.batches = 0  # batches collected (the dump's step numbers; the trainer sets the resumed step)
         self.rollout_start = 0.0  # loop time the current batch's collection started
         self.dropped: list[list[Trajectory]] = []  # zero-variance groups of the batch (dumps)
         self.loop = asyncio.new_event_loop()
@@ -153,7 +153,8 @@ class RLPipeline:
         continued = len(in_flight)
         launched = 0
         self.rollout_start = asyncio.get_running_loop().time()
-        dumping = bool(self.config.logging.dump_trajectories)
+        every = self.config.logging.dump_trajectories
+        dumping = bool(every) and (self.batches + 1) % every == 0  # zero-variance groups are kept for dumps only
 
         finished: list[list[Trajectory]] = []  # every finished group (kept or not): unbiased pass@k / family stats
 
