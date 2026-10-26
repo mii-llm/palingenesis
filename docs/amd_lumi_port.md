@@ -129,7 +129,7 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 3. **[Track A] ROCm install path** in `pyproject.toml` (`rocm` extra, documented pip flow); CUDA-only extras gated. ✅ *done — CUDA pins untouched.*
 4. **[Track A] Single-device SFT MVP** — bf16, `sdpa`, `adamw`; no FP8/bnb/causal-conv1d. Core loop + loss + checkpoint. ✅ *done — validated on a LUMI MI250X GCD (loss → ~0, HF checkpoint saved). `configs/rocm_smoke.yaml` + `scripts/lumi/sft_single_gcd.sh`.*
 5. **[Track B] LUMI bring-up** — prove step 4 inside the LUMI container on one GCD (`scripts/lumi/`).
-6. **[Track A] Multi-GCD / multi-node** — FSDP over RCCL (generic), validated on LUMI Slingshot via Track B env.
+6. **[Track A] Multi-GCD / multi-node** — FSDP over RCCL (generic), validated on LUMI Slingshot via Track B env. ✅ *done — 2-GCD (`train_multi_gcd.sh`) and 2-node×2-GCD (`train_multi_node.sbatch`, with `singularity-AI-bindings` for Slingshot) both train & checkpoint. OFI/CXI fast-path vs socket fallback not yet confirmed (needs NCCL_DEBUG=INFO) — perf follow-up.*
 7. **[Track A] Triton kernels** (liger, flash-linear-attention) — validate, keep fallbacks.
 8. **[Track A] Rollout backend → generic ROCm vLLM** for distill/RL; validated against LUMI's vLLM.
 9. *(optional)* bitsandbytes 8-bit optimizers; causal-conv1d HIP build for Qwen3.5 packing.
@@ -150,4 +150,5 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 *Status: **Milestone 1 reached** — Track A steps 1–4 done (accelerator detection, capability
 gates, ROCm install path, single-device SFT) and validated on a LUMI MI250X GCD: SFT loop
 runs in bf16/SDPA/AdamW, loss converges, HF checkpoint saved. Next: step 6 — multi-GCD /
-multi-node FSDP over RCCL (step 5 LUMI bring-up folded in via scripts/lumi/).*
+multi-node FSDP over RCCL — DONE (2-GCD and 2-node validated on LUMI). Next: step 7 —
+Triton kernels on ROCm (liger / flash-linear-attention / CCE), keeping the torch fallback.*
