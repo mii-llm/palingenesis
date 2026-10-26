@@ -229,7 +229,7 @@ class _FakeDocker:
     def __init__(self):
         self.calls, self.copied = [], {}
 
-    def __call__(self, *args, input=None, timeout=None, check=True):
+    def __call__(self, *args, input=None, timeout=None, check=True, limit=None):
         import io
         import tarfile
 
@@ -375,3 +375,23 @@ def test_check_task_runs_solve_and_reply_together_and_plain_tasks_unchanged(tmp_
     _FakeRuntime.runs = []
     r = check_task(FIXTURE)  # no reply: nop and oracle only (the fake tests need a reply, so the oracle scores 0)
     assert "nop_reply" not in r and len(_FakeRuntime.runs) == 2 and r["oracle"] == 0.0 and not r["valid"]
+
+
+def test_run_capped_keeps_head_and_tail_with_bounded_memory():
+    """A command printing without end must not be buffered whole (an agent's `yes` OOM-killed a trainer)."""
+    import subprocess
+
+    from palingenesis.rl.envs.harbor import _run_capped
+
+    r = _run_capped(
+        ["bash", "-c", "printf 'HEAD'; head -c 50000000 /dev/zero | tr '\\0' x; printf 'TAIL'"], None, 60, False, 1000
+    )
+    assert r.stdout.startswith(b"HEAD") and r.stdout.endswith(b"TAIL") and b"bytes cut" in r.stdout
+    assert len(r.stdout) < 1100
+    small = _run_capped(["bash", "-c", "echo out; echo err >&2; exit 3"], None, 10, False, 1000)
+    assert (small.returncode, small.stdout, small.stderr) == (3, b"out\n", b"err\n")
+    assert _run_capped(["cat"], b"abc", 10, False, 1000).stdout == b"abc"
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_capped(["bash", "-c", "yes"], None, 1, False, 1000)
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_capped(["false"], None, 10, True, 1000)

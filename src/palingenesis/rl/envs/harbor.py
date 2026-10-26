@@ -162,9 +162,82 @@ def harbor_rows(tasks_dir: str | Path, system: str | None = SYSTEM) -> list[dict
 
 
 def _docker(
-    *args: str, input: bytes | None = None, timeout: float | None = None, check: bool = True
+    *args: str, input: bytes | None = None, timeout: float | None = None, check: bool = True, limit: int | None = None
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(["docker", *args], input=input, capture_output=True, timeout=timeout, check=check)
+    """limit: keep at most about this many bytes of each stream (see _run_capped); None buffers everything."""
+    if limit is None:
+        return subprocess.run(["docker", *args], input=input, capture_output=True, timeout=timeout, check=check)
+    return _run_capped(["docker", *args], input, timeout, check, limit)
+
+
+def _drain(stream, limit: int, out: list) -> None:
+    """Read a pipe to the end keeping its first and last limit // 2 bytes; out = [head, tail, bytes dropped]."""
+    half = max(limit // 2, 1)
+    head, tail, dropped = bytearray(), bytearray(), 0
+    for chunk in iter(lambda: stream.read(65536), b""):
+        if len(head) < half:
+            take = half - len(head)
+            head += chunk[:take]
+            chunk = chunk[take:]
+        tail += chunk
+        if len(tail) > 2 * half:
+            dropped += len(tail) - half
+            del tail[:-half]
+    if len(tail) > half:
+        dropped += len(tail) - half
+        del tail[:-half]
+    out[:] = [bytes(head), bytes(tail), dropped]
+
+
+def _run_capped(
+    cmd: list[str], input: bytes | None, timeout: float | None, check: bool, limit: int
+) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True) with bounded memory. A command the agent runs can print without end for the
+    whole tool timeout (`yes`, a print loop under a test that never finishes); subprocess.run buffers all of it before
+    the output is cut, and 128 such episodes at once took the trainer to 89 GB of host RAM and the kernel OOM killer.
+    Here each stream keeps its head and tail (limit // 2 bytes each) while it is read, with the dropped byte count
+    marked in the middle; the timeout and check behave as in subprocess.run."""
+    p = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    res: list[list] = [[], []]
+    readers = [
+        threading.Thread(target=_drain, args=(s, limit, r), daemon=True) for s, r in zip((p.stdout, p.stderr), res)
+    ]
+    for t in readers:
+        t.start()
+    if input is not None:
+
+        def feed() -> None:
+            try:
+                p.stdin.write(input)
+                p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        threading.Thread(target=feed, daemon=True).start()
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        for t in readers:
+            t.join(5)
+        raise
+    for t in readers:
+        t.join()
+
+    def joined(r: list) -> bytes:
+        head, tail, dropped = r or (b"", b"", 0)
+        return head + (f"\n... [{dropped} bytes cut] ...\n".encode() if dropped else b"") + tail
+
+    out, err = joined(res[0]), joined(res[1])
+    if check and p.returncode:
+        raise subprocess.CalledProcessError(p.returncode, cmd, out, err)
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
 # Episode containers carry the owning process in a label, so containers a dead run left behind (killed by a signal,
@@ -173,6 +246,8 @@ def _docker(
 _LABEL = "palingenesis.harbor.owner"
 _HOST = os.uname().nodename
 _live: set[str] = set()
+CAPTURE_LIMIT = 16 << 20  # [verifier] capture stdout kept (bytes)
+GET_DIR_LIMIT = 2 << 30  # working directory tar stream copied to the verifier container (bytes)
 _live_lock = threading.Lock()
 _swept = False
 
@@ -347,7 +422,7 @@ class DockerRuntime:
             args += ["-e", f"{k}={v}"]
         args += ["-w", workdir or self.workdir, self.name, "bash", "-lc", command]
         try:
-            r = _docker(*args, timeout=timeout, check=False)
+            r = _docker(*args, timeout=timeout, check=False, limit=4 * self.max_output + 4096)  # chars <= 4 bytes
         except subprocess.TimeoutExpired:
             _docker("exec", self.name, "bash", "-lc", "pkill -f -- 'bash -lc' || true", check=False, timeout=10)
             return ExecResult(124, "", f"timed out after {timeout:g} s", True)
@@ -393,7 +468,10 @@ class DockerRuntime:
 
     def get_dir(self, path: str) -> bytes:
         """The tar stream of a directory in the container."""
-        return _docker("cp", f"{self.name}:{path}", "-", timeout=120).stdout
+        out = _docker("cp", f"{self.name}:{path}", "-", timeout=120, limit=GET_DIR_LIMIT).stdout
+        if len(out) > GET_DIR_LIMIT:  # cut in the middle: not a valid tar; the episode fails to verify and scores 0
+            raise RuntimeError(f"{self.task.name}: {path} is over {GET_DIR_LIMIT >> 20} MiB")
+        return out
 
     def capture(self) -> bytes:
         """[verifier] capture: the command's stdout, run as root in this container (not cut like tool output). A
@@ -413,6 +491,7 @@ class DockerRuntime:
             cmd,
             check=False,
             timeout=float(self.task.verifier.get("capture_timeout_sec", 60)),
+            limit=CAPTURE_LIMIT,
         )
         if r.returncode != 0:
             raise RuntimeError(f"capture failed for {self.task.name} (exit {r.returncode}): {r.stderr.decode()[-300:]}")
