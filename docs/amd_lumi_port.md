@@ -57,13 +57,25 @@ This is the primitive the guards below consume.
 | `muon.py` (quack) | `get_device_capability()[0] < 9` | quack is NVIDIA CuTeDSL; must **not** activate on ROCm | guard with `is_cuda()` before the sm check |
 | `kernels.py` (selective AC) | matches `aten._flash_attention_forward` op names | ROCm SDPA may dispatch to different ops → save-list silently misses | verify op names resolve on ROCm; widen if needed |
 
-### 2.3 Dependency stack (`pyproject.toml`) — the big one
-Today Linux forces the **CUDA 12.9** torch/vLLM indexes. AMD-agnostic approach:
-- Make the CUDA index **not unconditional** — add a ROCm install path (a `rocm` extra and/or
-  a documented "install ROCm torch first" flow, mirroring the existing pip fallback).
-- Gate CUDA-only extras so a ROCm install doesn't try to pull them: `torchao` (float8 — N/A),
-  and treat `bitsandbytes`, `causal-conv1d`, Triton kernels as **opt-in / validate-per-kernel**.
-- Keep macOS/Windows on PyPI as today.
+### 2.3 Dependency stack (`pyproject.toml`) — DONE (feature 3)
+uv has no marker to tell ROCm from CUDA on Linux, so the ROCm path is **explicit** rather
+than auto-detected — and the CUDA pins are left **exactly as they were** (zero NVIDIA
+regression):
+- Added a **`rocm` extra** = ROCm-safe, pure-Python deps only (`logging, optim, prepare,
+  rl, mcp`). It deliberately excludes the CUDA-only extras (float8/torchao, hybrid/
+  causal-conv1d, vllm) and the bitsandbytes/Triton pieces in `train` (validate later).
+- ROCm install = **plain pip** after a ROCm torch is present: `pip install -e ".[rocm]"`.
+  Plain pip ignores `[tool.uv.sources]`, so the cu129 pins never bite; the ROCm torch is kept.
+- Documented in `mkdocs_docs/getting-started/install.md` (AMD / ROCm section). macOS/Windows
+  unchanged.
+
+**transformers 5.10 vs ≥5.12 (resolved):** floor **kept at `>=5.12`** (it is a real need:
+cache classes for SeCO/DPO, and Qwen3.5). Verified on LUMI: palingenesis's core modules
+(`train`, `data`, `seco`, `dpo`) **import fine under the container's 5.10.1**, so basic SFT
+is not blocked. For the 5.12-only features, overlay a newer transformers via
+`pip install --target=<scratch> "transformers>=5.12,<6"` + `PYTHONPATH` (its deps bump
+numpy/hub, which can clash with vLLM — fine for SFT, revisit for rollouts), or rebuild the
+container. `--user` does **not** work (the container python is a venv).
 
 ### 2.4 Per-dependency verdict
 | Dependency | Extra | AMD / ROCm status |
@@ -114,7 +126,7 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 
 1. **[Track A] Accelerator detection** (`accelerator.py` + tests) — the foundation. ← *starting here*
 2. **[Track A] Fix capability gates** — float8 & profile refuse FP8 on ROCm; quack guarded by `is_cuda()`.
-3. **[Track A] ROCm install path** in `pyproject.toml` (ROCm extra / documented flow); CUDA-only extras gated.
+3. **[Track A] ROCm install path** in `pyproject.toml` (`rocm` extra, documented pip flow); CUDA-only extras gated. ✅ *done — CUDA pins untouched.*
 4. **[Track A] Single-device SFT MVP** — bf16, `sdpa`, `adamw`; no FP8/bnb/causal-conv1d. Core loop + loss + checkpoint.
 5. **[Track B] LUMI bring-up** — prove step 4 inside the LUMI container on one GCD (`scripts/lumi/`).
 6. **[Track A] Multi-GCD / multi-node** — FSDP over RCCL (generic), validated on LUMI Slingshot via Track B env.
@@ -135,4 +147,5 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 
 ---
 
-*Status: Track A step 1 (accelerator detection) in progress on this branch.*
+*Status: Track A steps 1–3 done (accelerator detection, capability gates, ROCm install
+path) and validated on a LUMI MI250X GCD. Next: step 4 — single-device SFT MVP.*

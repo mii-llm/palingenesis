@@ -83,6 +83,58 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 
 ---
 
+## AMD / ROCm (experimental)
+
+Palingenesis runs on AMD GPUs through PyTorch's ROCm build. The device layer is
+backend-agnostic — ROCm masquerades as CUDA (`torch.cuda.*`, `device="cuda"`) and the
+`"nccl"` backend maps to RCCL — so most of the framework works unchanged. This path is
+experimental, validated so far on **MI250X (gfx90a)**; see `docs/amd_lumi_port.md` for
+status and the feature-by-feature plan.
+
+CDNA2 (MI250X) has **no FP8**, so float8 training is refused automatically on ROCm
+regardless of config — train in bf16.
+
+1. Install a **ROCm build of torch first** — a ROCm container that ships torch, or a wheel
+   matching your ROCm version:
+
+    ```bash
+    pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+    ```
+
+2. Install palingenesis with the **`rocm` extra** — ROCm-safe deps only (it excludes the
+   CUDA-only extras: float8/torchao, hybrid/causal-conv1d, vllm, and the bitsandbytes /
+   Triton pieces in `train` that aren't validated on ROCm yet):
+
+    ```bash
+    pip install -e ".[rocm]"   # plain pip ignores the CUDA index pins in pyproject.toml,
+                               # so it keeps the ROCm torch you installed in step 1
+    ```
+
+    Do **not** use `uv sync`, `.[train]` or `.[all]` on ROCm: those force the CUDA 12.9
+    torch index and CUDA-only packages. With uv, pre-install ROCm torch and pass
+    `--no-deps` for it.
+
+Verify:
+
+```bash
+python -c "from palingenesis import accelerator; print(accelerator.describe())"
+# accelerator: rocm (1x AMD Instinct MI250X, arch=gfx90a, fp8=no)
+```
+
+!!! note "transformers version on older containers"
+    Palingenesis requires `transformers>=5.12` (cache classes for SeCO/DPO, and Qwen3.5).
+    Core modules import fine under older 5.10.x — so basic SFT works — but SeCO/DPO/Qwen3.5
+    need 5.12+. If a ROCm container pins an older transformers, overlay a newer one into a
+    writable dir and prepend it to the path (its transitive deps may bump numpy/hub, which
+    can clash with vLLM — fine for SFT, revisit for the rollout path):
+
+    ```bash
+    pip install --target=/scratch/you/tf "transformers>=5.12,<6"
+    PYTHONPATH=/scratch/you/tf:src python -m palingenesis ...
+    ```
+
+---
+
 ## Verify
 
 ```bash
