@@ -245,9 +245,10 @@ class Session:
 _REGISTRY: dict[str, Callable[[], HarnessProfile]] = {}
 
 
-def register(name: str, version: str, factory: Callable[[], HarnessProfile]) -> None:
-    """Register a profile factory under "name" and "name@version"."""
-    _REGISTRY[name] = factory
+def register(name: str, version: str, factory: Callable[[], HarnessProfile], default: bool = True) -> None:
+    """Register a profile factory under "name@version" and, when default, under the bare "name" too."""
+    if default:
+        _REGISTRY[name] = factory
     _REGISTRY[f"{name}@{version}"] = factory
 
 

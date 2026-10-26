@@ -8,6 +8,8 @@ originals (summarised in research/tiny-reliable-agent/harness/profiles/), never 
     palingenesis-default@2   nanocode's dialect (what "palingenesis-default" names): read(path, offset, limit) with
                              "   1| " line numbers, write, edit(path, old, new, all), glob(pat, path), grep(pat, path),
                              bash(cmd); "ok" / "error: ..." / "none" / "(empty)"; stops at a turn without a tool call
+    palingenesis-default@3   @2 except that an edit or write leaving the file unchanged is an error, not "ok" (ours,
+                             not nanocode's); opt-in by id: the bare name stays @2, so results stay comparable
     mini-swe-agent@2.4.6     native bash(command) only, JSON {returncode, output} observations (head/tail over 10k
                              characters), /bin/sh per command, sentinel submit, no answer channel (the submission is
                              the output after the sentinel line)
@@ -21,9 +23,10 @@ originals (summarised in research/tiny-reliable-agent/harness/profiles/), never 
                              message, else the last text
 
 Known gaps (phase 1): opencode/pi compaction and OpenHands' condenser are not emulated (rollouts are token-exact);
-opencode's fuzzy edit fallbacks and pi's whitespace-normalised matching are exact-match here; OpenHands' undo is single
-level and its terminal cannot keep a process running between calls (is_input answers that nothing is running);
-OpenHands' task_tracker is left out; opencode's skill, task, todowrite and webfetch tools are left out (Harbor does not
+opencode's fuzzy edit fallbacks and pi's whitespace-normalised matching are exact-match here; pi's schema validation
+(typebox, "Validation failed for tool ...") is not emulated (edit arguments it rejects get edit.js's own message);
+OpenHands' undo is single level and its terminal cannot keep a process running between calls (is_input answers that
+nothing is running); OpenHands' task_tracker is left out; opencode's skill, task, todowrite and webfetch tools are left out (Harbor does not
 disable them). opencode's parameter schemas are the ones recorded with `pgs harness capture opencode` (Harbor 0.24 CLI);
 tests/test_harness_more.py diffs the profiles against the recorded requests.
 """
@@ -115,7 +118,7 @@ def _nano_schema(name: str, description: str, params: dict) -> dict:
 
 NANO_TOOLS = {n: _nano_schema(n, d, p) for n, d, p in _NANO_SPEC}
 
-_NANO_PY = r"""
+_NANO_FUNCS = r"""
 import glob as globlib, json, os, re, sys
 def read(args):
     lines = open(args["path"]).readlines()
@@ -155,6 +158,8 @@ def grep(args):
         except Exception:
             pass
     return "\n".join(hits[:50]) or "none"
+"""
+_NANO_MAIN = r"""
 TOOLS = {"read": read, "write": write, "edit": edit, "glob": glob, "grep": grep}
 path = sys.argv[1]
 with open(path) as f:
@@ -166,14 +171,45 @@ except Exception as err:
     out = f"error: {err}"
 sys.stdout.write(out)
 """
+_NANO_PY = _NANO_FUNCS + _NANO_MAIN
+# palingenesis-default@3: nanocode with two answers changed, a no-op edit or write is an error instead of "ok" (a
+# small agent repeats an identical edit while the harness keeps saying ok); everything else is @2's
+_NANO3_FUNCS = r"""
+def write(args):
+    try:
+        with open(args["path"], newline="") as f:
+            same = f.read() == args["content"]
+    except Exception:
+        same = False
+    if same:
+        return "error: content identical to the current file, nothing changed"
+    with open(args["path"], "w") as f:
+        f.write(args["content"])
+    return "ok"
+def edit(args):
+    text = open(args["path"]).read()
+    old, new = args["old"], args["new"]
+    if old not in text:
+        return "error: old_string not found"
+    count = text.count(old)
+    if not args.get("all") and count > 1:
+        return f"error: old_string appears {count} times, must be unique (use all=true)"
+    replacement = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
+    if replacement == text:
+        return "error: old and new are identical, nothing changed"
+    with open(args["path"], "w") as f:
+        f.write(replacement)
+    return "ok"
+"""
+_NANO3_PY = _NANO_FUNCS + _NANO3_FUNCS + _NANO_MAIN
 
 
-def _nano_py(s, name: str, a: dict) -> str:
+def _nano_py(s, name: str, a: dict, script: str = _NANO_PY) -> str:
     """nanocode's run_tool for a file tool, run with the container's python3 in the working directory (arguments
     staged as a file: an argv entry is capped at 128 KiB)."""
     tmp = f"{s.ws.scratch}/.pgs_nano_{uuid.uuid4().hex[:12]}.json"
     s.ws.rt.put_files({tmp: json.dumps([name, a])}, "/", as_user=True)
-    r = s.ws.rt.exec(f"python3 -c {shlex.quote(_NANO_PY)} {shlex.quote(tmp)}", 60, workdir=s.workdir)
+    r = s.ws.rt.exec(f"python3 -c {shlex.quote(script)} {shlex.quote(tmp)}", 60, workdir=s.workdir)
     if r.exit_code == 127:
         return "error: python3 is not installed in the container"
     if r.exit_code != 0 or r.timed_out:  # the interpreter itself failed (run_tool's own errors exit 0)
@@ -191,24 +227,40 @@ def _nano_bash(s, a):
     return out.strip() or "(empty)"
 
 
-def palingenesis_default_2() -> HarnessProfile:
+def _nano_profile(version: str, script: str, emulates: str) -> HarnessProfile:
     tools = [
-        ToolSpec(NANO_TOOLS[n], _nano_bash if n == "bash" else (lambda s, a, n=n: _nano_py(s, n, a)))
+        ToolSpec(NANO_TOOLS[n], _nano_bash if n == "bash" else (lambda s, a, n=n: _nano_py(s, n, a, script)))
         for n, _, _ in _NANO_SPEC
     ]
     return HarnessProfile(
         name="palingenesis-default",
-        version="2",
+        version=version,
         system=NANO_SYSTEM,
         tools=tools,
         stop=NoCall(),
         answer=LastText(),
         exec_timeout=NANO_TIMEOUT,
         unknown_tool=lambda name, names, args: f"error: {name!r}",  # TOOLS[name] KeyError
-        emulates="nanocode (minimal Claude Code alternative): system prompt, TOOLS and make_schema, run_tool's "
-        "'error: {err}' wording, the agentic loop's stop at a reply without tool calls; bash under /bin/sh "
-        "with stderr merged, a 30 s timeout (the partial output of a timed-out command is not kept), no "
-        "output cap of its own",
+        emulates=emulates,
+    )
+
+
+_NANO_EMULATES = (
+    "nanocode (minimal Claude Code alternative): system prompt, TOOLS and make_schema, run_tool's 'error: {err}' "
+    "wording, the agentic loop's stop at a reply without tool calls; bash under /bin/sh with stderr merged, a 30 s "
+    "timeout (the partial output of a timed-out command is not kept), no output cap of its own"
+)
+
+
+def palingenesis_default_2() -> HarnessProfile:
+    return _nano_profile("2", _NANO_PY, _NANO_EMULATES)
+
+
+def palingenesis_default_3() -> HarnessProfile:
+    return _nano_profile(
+        "3",
+        _NANO3_PY,
+        _NANO_EMULATES + "; changed on purpose: an edit or write that leaves the file unchanged is an error",
     )
 
 
@@ -980,8 +1032,26 @@ def _pi_edit(s, a):
     shown = str(a.get("path", ""))
     path = s.ws.abspath(shown)
     edits = a.get("edits")
+    # prepareEditArguments (dist/core/tools/edit.js:43-73) repairs the arguments before validation: edits sent as a
+    # JSON string is parsed (an array, or one {oldText, newText} object), a single object becomes a one-element list,
+    # and top-level oldText/newText (the legacy shape) is appended to edits
+    if isinstance(edits, str):
+        try:
+            parsed = json.loads(edits)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            edits = parsed
+        elif (
+            isinstance(parsed, dict)
+            and isinstance(parsed.get("oldText"), str)
+            and isinstance(parsed.get("newText"), str)
+        ):
+            edits = [parsed]
     if isinstance(edits, dict):
         edits = [edits]
+    if isinstance(a.get("oldText"), str) and isinstance(a.get("newText"), str):
+        edits = [*(edits if isinstance(edits, list) else []), {"oldText": a["oldText"], "newText": a["newText"]}]
     if not isinstance(edits, list) or not edits:
         return "Edit tool input is invalid. edits must contain at least one replacement."
     if s.ws.kind(path) is None:
@@ -1449,5 +1519,6 @@ for _f, _n, _v in (
     (openhands_sdk, "openhands-sdk", "1.55.1"),
 ):
     register(_n, _v, _f)
+register("palingenesis-default", "3", palingenesis_default_3, default=False)  # the bare name stays @2
 
 from palingenesis.rl.envs.harness import profiles_more, terminus  # noqa: E402,F401 — phase 2 profiles

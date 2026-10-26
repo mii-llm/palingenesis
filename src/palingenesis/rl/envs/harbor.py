@@ -811,7 +811,10 @@ class HarborEnv:
             n = text.count(old)
             if n != 1:
                 return f"Error: the text occurs {n} times in {p}; it must occur exactly once"
-            rt.put_files({p: text.replace(old, str(arguments.get("new", "")))}, "/", as_user=True)
+            new_text = text.replace(old, str(arguments.get("new", "")))
+            if new_text == text:  # a no-op edit answered "Edited" feeds edit loops
+                return f"Error: old and new are identical; nothing changed in {p}"
+            rt.put_files({p: new_text}, "/", as_user=True)
             return f"Edited {p}."
         return f"Error: unknown tool {name!r}"
 

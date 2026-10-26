@@ -146,7 +146,10 @@ def test_tool_writes_belong_to_an_unprivileged_image_user(tmp_path):
         assert "agent" in env.call_tool("bash", {"command": "stat -c %U hello.txt"})
         # the agent's own shell can still change a file the tools wrote
         assert "[exit code 0]" in env.call_tool("bash", {"command": "echo ciao > hello.txt"})
-        assert env.call_tool("str_replace", {"path": "hello.txt", "old": "ciao", "new": "ciao"}).startswith("Edited")
+        assert env.call_tool("str_replace", {"path": "hello.txt", "old": "ciao", "new": "cia0"}).startswith("Edited")
+        assert env.call_tool("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"}).startswith("Edited")
+        # a no-op edit is an error and writes nothing
+        assert env.call_tool("str_replace", {"path": "hello.txt", "old": "ciao", "new": "ciao"}).startswith("Error:")
         assert env.get_reward()["reward"] == 1.0
     finally:
         env.close()

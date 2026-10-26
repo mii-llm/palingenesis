@@ -391,6 +391,34 @@ def test_pi_wording(rt):
     assert call("bash", {"command": "sleep 3", "timeout": 0.5}) == "Command timed out after 0.5 seconds"
 
 
+def test_pi_edit_repairs_arguments_like_prepare_edit_arguments(rt):
+    s = session("pi", rt)
+    write(rt, "f.txt", "one\ntwo\n")
+    call = s.call_tool
+    # edits as a JSON string: an array, or a single object
+    assert call("edit", {"path": "f.txt", "edits": json.dumps([{"oldText": "one", "newText": "1"}])}) == (
+        "Successfully replaced 1 block(s) in f.txt."
+    )
+    assert call("edit", {"path": "f.txt", "edits": json.dumps({"oldText": "two", "newText": "2"})}) == (
+        "Successfully replaced 1 block(s) in f.txt."
+    )
+    assert (Path(rt.workdir) / "f.txt").read_text() == "1\n2\n"
+    # the legacy top-level oldText/newText is appended to edits
+    assert call("edit", {"path": "f.txt", "oldText": "1", "newText": "uno"}) == (
+        "Successfully replaced 1 block(s) in f.txt."
+    )
+    assert call(
+        "edit", {"path": "f.txt", "edits": [{"oldText": "2", "newText": "due"}], "oldText": "uno", "newText": "one"}
+    ) == ("Successfully replaced 2 block(s) in f.txt.")
+    assert (Path(rt.workdir) / "f.txt").read_text() == "one\ndue\n"
+    # what is not repaired stays invalid, and nothing is written
+    for bad in ("not json", "[]", json.dumps({"oldText": "one"})):
+        assert call("edit", {"path": "f.txt", "edits": bad}) == (
+            "Edit tool input is invalid. edits must contain at least one replacement."
+        )
+    assert (Path(rt.workdir) / "f.txt").read_text() == "one\ndue\n"
+
+
 def test_mini_observations_match_the_upstream_jinja_templates(rt):
     jinja2 = pytest.importorskip("jinja2")
     fc = (
@@ -620,6 +648,7 @@ def test_default_profile_is_byte_identical_to_harbor_env(local_harbor):
         ("bash", {"command": "echo hi; echo err >&2"}),
         ("write_file", {"path": "hello.txt", "content": "cia0\n"}),
         ("str_replace", {"path": "hello.txt", "old": "cia0", "new": "ciao"}),
+        ("str_replace", {"path": "hello.txt", "old": "ciao", "new": "ciao"}),
         ("read_file", {"path": "hello.txt"}),
         ("submit", {}),
     ):
@@ -936,3 +965,44 @@ def test_nanocode_default_tools_word_results_like_nanocode(rt):
     assert call("bash", {}) == "error: 'cmd'"
     assert call("str_replace", {"path": "a.txt"}) == "error: 'str_replace'"
     assert not s.done
+
+
+def test_nanocode_default_2_accepts_no_op_edits_and_3_rejects_them(rt):
+    p2, p3 = get_profile("palingenesis-default@2"), get_profile("palingenesis-default@3")
+    assert get_profile("palingenesis-default").id == p2.id  # the bare name stays @2
+    assert p3.name == p2.name and json.dumps(p3.schemas()) == json.dumps(p2.schemas()) and p3.system == p2.system
+    write(rt, "a.txt", "uno\r\ndue\n")
+    s2, s3 = Session(p2, rt), Session(p3, rt)
+    # @2 is nanocode as it is: a no-op edit or write answers "ok"
+    assert s2.call_tool("edit", {"path": "a.txt", "old": "uno", "new": "uno"}) == "ok"
+    assert s2.call_tool("write", {"path": "a.txt", "content": "uno\r\ndue\n"}) == "ok"
+    # @3: the same calls are errors and leave the file as it was
+    before = (Path(rt.workdir) / "a.txt").stat().st_mtime_ns
+    assert s3.call_tool("edit", {"path": "a.txt", "old": "uno", "new": "uno"}) == (
+        "error: old and new are identical, nothing changed"
+    )
+    assert s3.call_tool("edit", {"path": "a.txt", "old": "due", "new": "due", "all": True}) == (
+        "error: old and new are identical, nothing changed"
+    )
+    assert s3.call_tool("write", {"path": "a.txt", "content": "uno\r\ndue\n"}) == (
+        "error: content identical to the current file, nothing changed"
+    )
+    assert (Path(rt.workdir) / "a.txt").stat().st_mtime_ns == before
+    # the other answers are @2's
+    assert s3.call_tool("edit", {"path": "a.txt", "old": "tre", "new": "tre"}) == "error: old_string not found"
+    assert s3.call_tool("write", {"path": "a.txt", "content": "uno\ndue\n"}) == "ok"  # CRLF -> LF is a change
+    assert s3.call_tool("edit", {"path": "a.txt", "old": "due", "new": "tre"}) == "ok"
+    assert s3.call_tool("write", {"path": "b.txt", "content": ""}) == "ok"
+    assert (Path(rt.workdir) / "a.txt").read_bytes() == b"uno\ntre\n"
+
+
+def test_legacy_str_replace_rejects_a_no_op_edit(local_harbor):
+    env = HarborEnv()
+    env.reset(**_row())
+    p = f"{env.rt.workdir}/hello.txt"
+    assert env.call_tool("write_file", {"path": "hello.txt", "content": "ciao\n"}) == f"Wrote {p}."
+    assert env.call_tool("str_replace", {"path": "hello.txt", "old": "ciao", "new": "ciao"}) == (
+        f"Error: old and new are identical; nothing changed in {p}"
+    )
+    assert env.call_tool("str_replace", {"path": "hello.txt", "old": "ciao", "new": "ciao!"}) == f"Edited {p}."
+    assert Path(p).read_text() == "ciao!\n"

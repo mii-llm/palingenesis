@@ -46,6 +46,7 @@ Profile names are validated when the environment is built, not mid-run.
 | Profile | Protocol | Tools the policy sees | Episode ends | Answer |
 |---|---|---|---|---|
 | `palingenesis-default@2` | native | read(path, offset, limit), write, edit(path, old, new, all), glob(pat, path), grep(pat, path), bash(cmd) | turn without a tool call | last text |
+| `palingenesis-default@3` | native | same as `@2`; a no-op edit or write is an error | turn without a tool call | last text |
 | `palingenesis-default@1` | native | bash, read_file, write_file, str_replace, submit | submit | last text |
 | `mini-swe-agent@2.4.6` | native | bash(command), `/bin/sh` per call, 30 s | `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` | output after the sentinel |
 | `mini-swe-agent-text@2.4.6` | ```` ```mswea_bash_command ```` block, exactly one per turn | same | same | same |
@@ -59,7 +60,7 @@ Profile names are validated when the environment is built, not mid-run.
 | `kimi-cli@1.52.0` | native | Shell, ReadFile, Glob, Grep, WriteFile, StrReplaceFile; `<system>` status tags | turn without a tool call | last text |
 | `terminus-2@harbor-0.24.0` | text: one JSON object {analysis, plan, commands[{keystrokes, duration}], task_complete} | keystrokes to a persistent tmux pane | task_complete twice in a row | none |
 
-A bare name selects the registered default version (`palingenesis-default` is `@2`). `name@version` pins one.
+A bare name selects the registered default version (`palingenesis-default` is `@2`, and stays `@2` so that runs and evaluations remain comparable). `name@version` pins one. Versions of one harness share a name, so a mix of `palingenesis-default@2` and `@3` logs both under `metric/profile/palingenesis-default`.
 
 **What is exact and what is paraphrased.** Parameter schemas, tool names and order, result strings and error strings are exact wherever a recording or the source code shows them. System prompts and long tool descriptions are concise paraphrases, never the long upstream text. Real harnesses send much more, e.g. qwen-code about 11k tokens, OpenHands about 5k, kimi-cli about 4k. The profiles' first prompts are 0.5–2.7k tokens with the Qwen3.5 template. Strings seen in neither a recording nor the source are marked `approx.` in the code.
 
@@ -86,10 +87,19 @@ The default dialect: the smallest harness that works, modelled on nanocode, a mi
 - **Ending:** the episode ends at a reply without tool calls, and that reply is the answer. There is no submit tool, so the answer and the end of the episode are the same act.
 - **Requirements and gaps:** the task image needs `python3`; without it the file tools answer `error: python3 is not installed in the container`. The partial output of a timed-out command is not kept. There is no output cap of its own (the trainer's `env.max_tool_output_tokens` applies).
 
+### palingenesis-default@3 (nanocode, no-op edits rejected)
+
+`@2` with two answers changed. A small agent that sends an edit whose old and new text are the same, and hears `ok`, tends to send it again; `@3` names the mistake instead. This is our change, not nanocode's, so it is opt-in by id: `palingenesis-default` alone still selects `@2`.
+
+- `edit` whose replacement leaves the file unchanged (old equal to new, with or without `all`): `error: old and new are identical, nothing changed`. A missing or non-unique `old` keeps `@2`'s errors, which are checked first.
+- `write` whose content is byte-identical to the current file: `error: content identical to the current file, nothing changed`. A new file, or any change (a CRLF file rewritten with LF included), is `ok`.
+- Neither writes the file. Everything else (prompt, schemas, results, ending) is `@2`'s.
+
 ### Per-harness notes
 
 - **mini-swe-agent** answers a turn without a command as a format error. Upstream drops the rejected turn from its history; here it stays, because rollouts are token-exact. The submission is the command output after the sentinel line, and there is no separate answer channel.
 - **opencode:** Harbor's adapter passes the instruction quoted (`"<instruction>\n"`, as recorded). Tool names are lowercased before lookup (`Bash` runs `bash`), and unknown tools go through its `invalid` tool. The recorded schemas, including a `$schema` key and opencode's own bounds, are sent as they are. Its skill, task, todowrite and webfetch tools are left out.
+- **pi** repairs `edit` arguments before validating them, as its `prepareEditArguments` does: `edits` sent as a JSON string is parsed (an array, or one `{oldText, newText}` object), a single object becomes a one-element list, and top-level `oldText`/`newText` is appended to `edits`. Arguments still invalid after that get `Edit tool input is invalid. edits must contain at least one replacement.`; real pi answers some of them (an unparseable string) with its schema validator's `Validation failed for tool "edit": ...` instead.
 - **OpenHands:** legacy and malformed names are repaired as in `normalize_tool_call` (bash → terminal, str_replace_editor → file_editor). Undo is single level, and the terminal cannot keep a process running between calls. task_tracker is left out.
 - **SWE-agent** expects one call per turn and drops rejected turns; here every call runs. Its submit runs `git add -A && git diff --cached` and asks for confirmation once (the review step).
 - **qwen-code and destructive actions:** its prompt asks for confirmation before destructive or hard-to-reverse actions *when the current interaction mode can receive it; otherwise stop and report the blocker*. It also says authorisation *stands for the scope specified*. Under Harbor the task instruction is the user's request, so a destructive action the task explicitly asks for (delete these files, stop that process) is in scope and is scored normally. Destructive actions beyond the request are what the verifiers' collateral checks penalise.

@@ -151,7 +151,7 @@ Without `profile`/`profiles`, the policy gets HarborEnv's own dialect (`palingen
 | `bash(command, timeout=60)` | `bash -lc` in the working directory; returns `[exit code N]`, stdout, then `[stderr]` and stderr if any |
 | `read_file(path)` | The file's text (up to 200 kB), or `Error: cannot read '<path>'` |
 | `write_file(path, content)` | Creates parent directories; `Wrote <path>.` |
-| `str_replace(path, old, new)` | Exact text, must occur exactly once; `Edited <path>.` or `Error: the text occurs N times in <path>; it must occur exactly once` |
+| `str_replace(path, old, new)` | Exact text, must occur exactly once; `Edited <path>.`, `Error: the text occurs N times in <path>; it must occur exactly once`, or `Error: old and new are identical; nothing changed in <path>` (nothing is written) |
 | `submit()` | Ends the episode |
 
 System prompt (`harbor_rows` puts it in each row; `--no-system` leaves it out): *"You work in a Linux container through tools; the working directory is /workdir and there is no internet. Inspect before you change things, check your result, then call submit and tell the user briefly what you did."*
