@@ -310,6 +310,8 @@ CAPTURE_LIMIT = 16 << 20  # [verifier] capture stdout kept (bytes)
 EXEC_LIMIT = 4 << 20  # tool command output read per stream (bytes), whatever the runtime's max_output: harness
 # profiles allow 8M characters (32 MB at 4 bytes each), and 128 episodes holding such buffers at once grow the
 # trainer's heap for good (glibc keeps what it allocated)
+FILE_LIMIT_KB = 2 << 20  # largest file a command may write (ulimit -f, KiB): an agent's `yes > out` under a 300 s tool
+# timeout wrote tens of GB per container, and 128 containers filled the host disk mid-run
 GET_DIR_LIMIT = 2 << 30  # working directory tar stream copied to the verifier container (bytes; verify streams it)
 _live_lock = threading.Lock()
 _swept = False
@@ -483,7 +485,14 @@ class DockerRuntime:
         args = ["exec"]
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
-        args += ["-w", workdir or self.workdir, self.name, "bash", "-lc", command]
+        args += [
+            "-w",
+            workdir or self.workdir,
+            self.name,
+            "bash",
+            "-lc",
+            f"ulimit -f {FILE_LIMIT_KB} 2>/dev/null; {command}",
+        ]
         try:
             limit = min(4 * self.max_output + 4096, EXEC_LIMIT)  # chars <= 4 bytes
             r = _docker(*args, timeout=timeout, check=False, limit=limit)

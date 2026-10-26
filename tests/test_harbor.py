@@ -455,3 +455,19 @@ def test_pipe_capped_streams_counts_and_aborts_over_the_limit(tmp_path):
         _pipe_capped(["bash", "-c", "exit 1"], ["bash", "-c", "cat > /dev/null"], 4 << 20, 30)
     with pytest.raises(subprocess.TimeoutExpired):
         _pipe_capped(["sleep", "30"], ["bash", "-c", "cat > /dev/null"], 4 << 20, 1)
+
+
+def test_exec_caps_the_size_of_files_a_command_writes(tmp_path, monkeypatch):
+    """Every command runs under ulimit -f: an agent's runaway `yes > out` must not fill the host disk."""
+    from palingenesis.rl.envs import harbor
+
+    fake = _FakeDocker().install(monkeypatch, harbor)
+    rt = harbor.DockerRuntime(harbor.HarborTask.load(_capture_task(tmp_path, capture=False)))
+    rt.name = "pgs-test"
+    rt.exec("echo hi")
+    cmd = [c for c in fake.calls if c[0] == "exec"][-1][-1]
+    assert cmd.startswith(f"ulimit -f {harbor.FILE_LIMIT_KB} ") and cmd.endswith("; echo hi")
+    # the prefix works in a real bash: a write past the limit is stopped (SIGXFSZ / EFBIG), the file stays at the cap
+    out = tmp_path / "big"
+    subprocess.run(["bash", "-lc", f"ulimit -f 4 2>/dev/null; head -c 100000 /dev/zero > {out}"], check=False)
+    assert out.stat().st_size == 4096
