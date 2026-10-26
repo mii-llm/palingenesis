@@ -1,0 +1,58 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROCm single-device SFT smoke test — the AMD/ROCm port MVP (milestone 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+# A minimal, backend-agnostic SFT run that exercises the real training loop on one
+# GPU with only ROCm-safe settings: bf16, SDPA attention, plain AdamW, chunked CE.
+# Everything that depends on CUDA-only or not-yet-validated-on-ROCm kernels is OFF
+# (float8, bitsandbytes, liger/Triton, torch.compile/inductor, causal-conv1d).
+#
+# It overfits a tiny arithmetic dataset so the loss visibly drops in ~30 steps —
+# the point is "the loop runs correctly on this device", not model quality.
+# Run on LUMI with scripts/lumi/sft_single_gcd.sh; on any ROCm box:
+#   python -m palingenesis train --config configs/rocm_smoke.yaml
+# ═══════════════════════════════════════════════════════════════════════════════
+
+model:
+  name_or_path: Qwen/Qwen3-0.6B   # small standard transformer (no linear-attention)
+  torch_dtype: bfloat16
+  attn_implementation: sdpa       # ROCm-supported; flash_attention_2 needs an AMD build
+  use_liger_kernel: false         # Triton kernels — not validated on ROCm yet
+  compile: false                  # inductor/Triton — off on ROCm for the MVP
+
+data:
+  dataset: configs/rocm_smoke.data.jsonl   # tiny local JSONL (chat messages)
+  messages_field: messages
+  max_seq_length: 256
+  streaming: false
+  num_workers: 1
+  packing: false
+
+train:
+  output_dir: ./outputs/rocm_smoke
+  max_steps: 30
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4           # high on purpose: visible drop on a tiny set
+  warmup_ratio: 0.1
+  lr_scheduler: cosine
+  optimizer: adamw
+  max_grad_norm: 1.0
+  gradient_checkpointing: false   # 0.6B — not needed
+  logging_steps: 1
+  save_steps: 1000                # skip mid-run saves; a final save still happens
+  bf16: true
+  seed: 42
+
+parallel:
+  fsdp: false
+  context_parallel: false
+  cpu_offload: false
+
+memory:
+  chunked_loss: true              # pure-torch chunking (not CCE); ROCm-safe
+  loss_num_chunks: 2
+  float8_training: false
+
+logging:
+  use_wandb: false
+  use_trackio: false

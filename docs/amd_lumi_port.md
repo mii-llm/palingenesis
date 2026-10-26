@@ -127,7 +127,7 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 1. **[Track A] Accelerator detection** (`accelerator.py` + tests) — the foundation. ← *starting here*
 2. **[Track A] Fix capability gates** — float8 & profile refuse FP8 on ROCm; quack guarded by `is_cuda()`.
 3. **[Track A] ROCm install path** in `pyproject.toml` (`rocm` extra, documented pip flow); CUDA-only extras gated. ✅ *done — CUDA pins untouched.*
-4. **[Track A] Single-device SFT MVP** — bf16, `sdpa`, `adamw`; no FP8/bnb/causal-conv1d. Core loop + loss + checkpoint.
+4. **[Track A] Single-device SFT MVP** — bf16, `sdpa`, `adamw`; no FP8/bnb/causal-conv1d. Core loop + loss + checkpoint. ✅ *done — validated on a LUMI MI250X GCD (loss → ~0, HF checkpoint saved). `configs/rocm_smoke.yaml` + `scripts/lumi/sft_single_gcd.sh`.*
 5. **[Track B] LUMI bring-up** — prove step 4 inside the LUMI container on one GCD (`scripts/lumi/`).
 6. **[Track A] Multi-GCD / multi-node** — FSDP over RCCL (generic), validated on LUMI Slingshot via Track B env.
 7. **[Track A] Triton kernels** (liger, flash-linear-attention) — validate, keep fallbacks.
@@ -147,5 +147,7 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 
 ---
 
-*Status: Track A steps 1–3 done (accelerator detection, capability gates, ROCm install
-path) and validated on a LUMI MI250X GCD. Next: step 4 — single-device SFT MVP.*
+*Status: **Milestone 1 reached** — Track A steps 1–4 done (accelerator detection, capability
+gates, ROCm install path, single-device SFT) and validated on a LUMI MI250X GCD: SFT loop
+runs in bf16/SDPA/AdamW, loss converges, HF checkpoint saved. Next: step 6 — multi-GCD /
+multi-node FSDP over RCCL (step 5 LUMI bring-up folded in via scripts/lumi/).*
