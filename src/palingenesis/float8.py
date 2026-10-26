@@ -38,15 +38,17 @@ def apply_float8_training(model: nn.Module) -> bool:
         )
         return False
 
-    # Check hardware capability
-    if not torch.cuda.is_available():
-        logger.warning("Float8 training requires CUDA. Skipping.")
-        return False
+    # Check hardware capability. supports_fp8() is False on ROCm (AMD has no FP8 path we
+    # target) and on pre-SM89 CUDA — a raw get_device_capability() check would wrongly
+    # pass on ROCm, where the numbers are gfx-derived (gfx90a -> (9, 0)), not CUDA SM.
+    from . import accelerator
 
-    capability = torch.cuda.get_device_capability()
-    if capability < (8, 9):
+    if not accelerator.supports_fp8():
         logger.warning(
-            f"Float8 training requires SM89+ (H100/B200). Current device is SM{capability[0]}{capability[1]}. Skipping."
+            "Float8 training requires an NVIDIA SM89+ GPU (H100/L40S/B200); "
+            "unavailable on %s (arch=%s). Skipping, continuing in bf16.",
+            accelerator.backend(),
+            accelerator.gpu_arch(),
         )
         return False
 

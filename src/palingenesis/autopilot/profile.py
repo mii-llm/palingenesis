@@ -22,7 +22,9 @@ def profile_hardware() -> dict:
     Returns:
         Dict with gpu_name, memory_gb, compute_capability, etc.
     """
-    if not torch.cuda.is_available():
+    from .. import accelerator
+
+    if not accelerator.is_available():
         return {"gpu_name": "cpu", "memory_gb": 0, "compute_capability": (0, 0)}
 
     props = torch.cuda.get_device_properties(0)
@@ -31,8 +33,12 @@ def profile_hardware() -> dict:
         "memory_gb": props.total_memory / 2**30,
         "compute_capability": (props.major, props.minor),
         "num_gpus": torch.cuda.device_count(),
+        "backend": accelerator.backend(),  # "cuda" or "rocm"
+        "gpu_arch": accelerator.gpu_arch(),
         "supports_bf16": props.major >= 8,
-        "supports_float8": (props.major, props.minor) >= (8, 9),  # Ada, Hopper, Blackwell
+        # FP8 only where the training path actually exists (NVIDIA SM89+); False on ROCm,
+        # where (props.major, props.minor) is gfx-derived and would wrongly pass (8, 9).
+        "supports_float8": accelerator.supports_fp8(),
     }
 
 
