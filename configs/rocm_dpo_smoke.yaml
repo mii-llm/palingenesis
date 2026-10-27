@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROCm DPO smoke test — preference optimisation on one GPU (AMD port, feature 12)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Exercises the DPO path on ROCm: a frozen reference model + chunked log-prob margins,
+# all ROCm-safe torch ops (bf16, SDPA, AdamW, no FP8/Triton/compile). Overfits a tiny
+# preference set (correct vs wrong arithmetic) so the chosen−rejected margin and reward
+# accuracy move in ~30 steps. Point is DPO correctness on the device, not model quality.
+#
+#   python -m palingenesis train --config configs/rocm_dpo_smoke.yaml
+#   # on LUMI: PGS_CONFIG=configs/rocm_dpo_smoke.yaml bash scripts/lumi/sft_single_gcd.sh
+
+model:
+  name_or_path: Qwen/Qwen3-0.6B
+  torch_dtype: float32      # DPO: fp32 master weights (compute still bf16 via train.bf16);
+                            # bf16 weights round DPO's ~1e-6 updates to zero.
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  compile: false
+
+data:
+  dataset: configs/rocm_dpo_smoke.data.jsonl
+  max_seq_length: 256
+  streaming: false
+  num_workers: 1
+
+dpo:
+  enabled: true
+  loss_type: sigmoid        # standard DPO
+  beta: 0.1
+  reference_model: ""        # frozen copy of the policy base
+  sft_weight: 0.0
+
+train:
+  output_dir: ./outputs/rocm_dpo_smoke
+  max_steps: 30
+  per_device_batch_size: 2   # pairs per step
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.1
+  lr_scheduler: cosine
+  optimizer: adamw
+  max_grad_norm: 1.0
+  gradient_checkpointing: false
+  logging_steps: 1
+  save_steps: 1000
+  bf16: true
+  seed: 42
+
+parallel:
+  fsdp: false
+
+logging:
+  use_wandb: false
+  use_trackio: false

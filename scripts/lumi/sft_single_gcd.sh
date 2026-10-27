@@ -19,6 +19,8 @@ SIF="${PGS_SIF:-/appl/local/laifs/containers/lumi-multitorch-latest.sif}"
 SCRATCH="/scratch/project_${PROJECT}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODEL="${PGS_MODEL:-Qwen/Qwen3-0.6B}"
+CONFIG="${PGS_CONFIG:-configs/rocm_smoke.yaml}"   # any single-GCD config (SFT, DPO, ...)
+OUT="${PGS_OUT:-${SCRATCH}/outputs/$(basename "${CONFIG%.yaml}")}"
 
 # Everything under scratch (LUMI policy): HF cache and training outputs.
 export HF_HOME="${SCRATCH}/hf_cache"
@@ -37,4 +39,4 @@ srun --account="$ACCOUNT" --partition="$PARTITION" \
   singularity exec $BIND \
     --env HF_HOME="$HF_HOME" --env HF_HUB_OFFLINE=1 --env PYTHONPATH="${REPO}/src" \
     "$SIF" \
-    bash -c "cd '${REPO}' && python -m palingenesis train --config configs/rocm_smoke.yaml --train.output_dir '${SCRATCH}/outputs/rocm_smoke'"
+    bash -c "cd '${REPO}' && python -m palingenesis train --config '${CONFIG}' --train.output_dir '${OUT}'"

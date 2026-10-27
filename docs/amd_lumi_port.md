@@ -166,7 +166,11 @@ multi-node FSDP over RCCL+Slingshot, liger kernels (work) and CCE (gated to NVID
 bitsandbytes 8-bit (work), flash_attention_2 (works on the container's ROCm flash-attn;
 falls back to sdpa otherwise). **Real-model SFT validated**: Qwen3-4B full fine-tune on one
 64 GB GCD (adamw8bit fits 4B, ~1750 tok/s, stable grad norms, HF checkpoint) — `configs/
-rocm_qwen3_4b.yaml` + `scripts/lumi/sft_qwen3_4b.sh`. Step 8
+rocm_qwen3_4b.yaml` + `scripts/lumi/sft_qwen3_4b.sh`. **DPO validated** on gfx90a
+(`configs/rocm_dpo_smoke.yaml`): frozen reference + chunked-logprob margins, all
+device-agnostic torch — reward accuracy 0→100%, chosen−rejected margin 0→~1.8, loss
+0.69→0.15; config uses `torch_dtype: float32` (fp32 master) per the framework's DPO
+guidance (bf16 weights round DPO's ~1e-6 updates to zero). Step 8
 partial — off-policy / frozen-teacher vLLM over HTTP works on ROCm; on-policy CUDA-IPC weight
 sync guarded to NVIDIA. Remaining: on-policy ROCm vLLM weight-sync (non-IPC), flash-linear-
 attention (needs Qwen3.5), and validating the in-process `vllm` colocate backend on ROCm.*
