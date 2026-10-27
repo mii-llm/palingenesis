@@ -56,6 +56,7 @@ This is the primitive the guards below consume.
 | `autopilot/profile.py` | same `(8,9)` check for `supports_float8` | same false-positive | same |
 | `muon.py` (quack) | `get_device_capability()[0] < 9` | quack is NVIDIA CuTeDSL; must **not** activate on ROCm | guard with `is_cuda()` before the sm check |
 | `kernels.py` (selective AC) | matches `aten._flash_attention_forward` op names | ROCm SDPA may dispatch to different ops → save-list silently misses | verify op names resolve on ROCm; widen if needed |
+| `train.py` (attn load) | `attn_implementation=flash_attention_2` crashed at load without a flash-attn build | ✅ done: load now retries with `sdpa` on an FA2 failure (warns). FA2 itself **works on the LUMI container's ROCm flash-attn** (validated on gfx90a); the fallback covers ROCm boxes without it. `sdpa` stays the default. |
 
 ### 2.3 Dependency stack (`pyproject.toml`) — DONE (feature 3)
 uv has no marker to tell ROCm from CUDA on Linux, so the ROCm path is **explicit** rather
@@ -161,7 +162,9 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 
 *Status (all validated on a LUMI MI250X / gfx90a): steps 1–7 done — accelerator detection,
 FP8/quack guards, ROCm install path, single-device SFT (bf16/SDPA/AdamW), multi-GCD &
-multi-node FSDP over RCCL+Slingshot, liger kernels (work) and CCE (gated to NVIDIA). Step 8
+multi-node FSDP over RCCL+Slingshot, liger kernels (work) and CCE (gated to NVIDIA),
+bitsandbytes 8-bit (work), flash_attention_2 (works on the container's ROCm flash-attn;
+falls back to sdpa otherwise). Step 8
 partial — off-policy / frozen-teacher vLLM over HTTP works on ROCm; on-policy CUDA-IPC weight
 sync guarded to NVIDIA. Remaining: on-policy ROCm vLLM weight-sync (non-IPC), flash-linear-
 attention (needs Qwen3.5), and validating the in-process `vllm` colocate backend on ROCm.*

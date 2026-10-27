@@ -312,13 +312,33 @@ def train(config: Config):
     compute_dtype = torch.bfloat16 if model_dtype == torch.float32 else model_dtype
 
     logger.info(f"Loading model: {config.model.name_or_path}")
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model.name_or_path,
-        torch_dtype=model_dtype,
-        attn_implementation=config.model.attn_implementation,
-        trust_remote_code=config.model.trust_remote_code,
-        low_cpu_mem_usage=True,  # Load shard-by-shard, no 2x RAM spike
-    )
+
+    def _load_lm(path):
+        return AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=model_dtype,
+            attn_implementation=config.model.attn_implementation,
+            trust_remote_code=config.model.trust_remote_code,
+            low_cpu_mem_usage=True,  # Load shard-by-shard, no 2x RAM spike
+        )
+
+    try:
+        model = _load_lm(config.model.name_or_path)
+    except (ImportError, ValueError, RuntimeError) as e:
+        # flash_attention_2 needs a flash-attn build for this device; on ROCm/AMD there may
+        # be none. sdpa is the portable, always-available fused path, so fall back to it
+        # (and reuse it for the ref model below) rather than crash. NVIDIA with flash-attn
+        # installed is unaffected; a non-FA2 failure is re-raised unchanged.
+        if config.model.attn_implementation != "flash_attention_2":
+            raise
+        logger.warning(
+            "attn_implementation=flash_attention_2 is unavailable on %s (%s); falling back to sdpa. "
+            "On AMD, flash_attention_2 needs a ROCm flash-attn build.",
+            accelerator.backend(),
+            type(e).__name__,
+        )
+        config.model.attn_implementation = "sdpa"
+        model = _load_lm(config.model.name_or_path)
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
     if has_linear_attention(model) and (missing := missing_linear_attention_kernels()):
@@ -334,13 +354,7 @@ def train(config: Config):
     if dpo is not None:
         ref_path = dpo.reference_model or config.model.name_or_path
         logger.info(f"DPO: loading frozen reference model: {ref_path}")
-        ref_model = AutoModelForCausalLM.from_pretrained(
-            ref_path,
-            torch_dtype=model_dtype,
-            attn_implementation=config.model.attn_implementation,
-            trust_remote_code=config.model.trust_remote_code,
-            low_cpu_mem_usage=True,
-        )
+        ref_model = _load_lm(ref_path)  # reuses the resolved attn_implementation
         if hasattr(ref_model, "config") and hasattr(ref_model.config, "use_cache"):
             ref_model.config.use_cache = False
         ref_model.requires_grad_(False)
