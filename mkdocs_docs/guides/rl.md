@@ -55,7 +55,7 @@ async def judged(prompt, completion, **row):   # async works too
     ...
 ```
 
-Per sample it can ask for `completion` (the final answer, reasoning removed), `reasoning`, `prompt`, `messages` (the whole conversation, tool calls included), `completion_ids`, `finish_reason`, `env`, `sandbox`, and any dataset column. Batched functions get the plural names and every column as a list.
+Per sample it can ask for `completion` (the final answer, reasoning removed), `reasoning`, `prompt`, `messages` (the whole conversation, tool calls included), `completion_ids`, `raw_contents` (every assistant turn's content as sampled, before any strip), `finish_reason`, `env`, `sandbox`, and any dataset column. Batched functions get the plural names and every column as a list.
 
 Return `None` when a reward does not apply to a sample: it is left out of the weighted sum. Raise `palingenesis.rl.SkipSample` when a sample cannot be scored for reasons that are not the policy's fault (a sandbox or judge outage): the rollout is kept out of the loss instead of teaching the policy that a right answer was wrong.
 
@@ -76,6 +76,16 @@ rewards:
 | `code` | The last fenced Python block against the row's hidden tests (see below) |
 | `judge` | A 0–10 quality score from an LLM judge behind any OpenAI-compatible endpoint (`url`, `model`, `template`) |
 | `equivalence` | A YES/NO judge: is the final answer equivalent to the reference? (free-form answers no rule can check) |
+| `whitespace` | -1 when a reply starts with one space or has a line indented by exactly one space, else 0 (reads `raw_contents`) |
+
+Add `whitespace` to every RL run, at weight 0.2:
+
+```yaml
+rewards:
+  whitespace: {fn: whitespace, weight: 0.2}
+```
+
+The parser, the graders and the chat template all strip the text, so no other reward sees a reply that starts with a space (`" Hello!"`) or a stray space at a line start (`"\n def"`, which breaks pasted code). On a small model such a habit can drift in during RL and spread to every task and to thinking-mode answers; a 0.8B policy went from 0% to over 90% of its replies. The share of rollouts with a defect is logged on every run as `format/whitespace`; keep it under 0.02.
 
 ## Code and the sandbox
 

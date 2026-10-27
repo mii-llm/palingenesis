@@ -1449,3 +1449,51 @@ def test_wandb_logging_survives_a_resume_that_redoes_steps(trainer_kind):
     evals = [(row[WANDB_STEP_METRIC], row["eval/reward"]) for row, _ in run.logs if "eval/reward" in row]
     assert evals == [(4, 0.5), (6, 0.7)]
     assert not any("reward" in row for row, _ in run.logs), "eval metrics keep their eval/ prefix"
+
+
+# ------------------------------------------------------- whitespace (leading space after RL)
+
+
+def test_plain_prompt_boundary_is_token_stable_and_raw_whitespace_is_kept():
+    """The plain-mode prompt ends with "</think>\\n\\n" (one token); an answer's first word is one token with or
+    without a leading space, so the sampled ids survive a text round trip and no boundary merge changes what is
+    trained. The space is visible only before the strips (parser, graders, chat template): raw_contents keeps it
+    and the whitespace reward sees it."""
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat, encode_prompt, parse_assistant
+    from palingenesis.rl.rewards import resolve_rewards, whitespace_defects
+
+    tok = tokenizer("Qwen/Qwen3.5-0.8B")
+    kwargs = {"enable_thinking": False}
+    messages = [{"role": "user", "content": "hello"}]
+    prompt = encode_prompt(tok, messages, None, kwargs)
+    assert tok.decode(prompt).endswith("</think>\n\n") and tok.decode(prompt[-1:]) == "\n\n"
+    for answer in ("Hello! How can I help?", " Hello! How can I help?"):
+        joint = tok.encode(tok.decode(prompt) + answer, add_special_tokens=False)
+        alone = tok.encode(answer, add_special_tokens=False)
+        assert joint == prompt + alone  # no merge across the prompt / completion boundary
+        assert tok.encode(tok.decode(alone), add_special_tokens=False) == alone  # stable round trip
+    assert len(tok.encode(" Hello", add_special_tokens=False)) == len(tok.encode("Hello", add_special_tokens=False)) == 1
+
+    plain = ChatFormat(tok, end_of_turn_id(tok, kwargs), kwargs)
+    turn = parse_assistant(" Hello! How can I help?", plain)
+    assert turn.content == "Hello! How can I help?" and turn.raw_content == " Hello! How can I help?"
+    # the template trims too: rendered history (and every SFT target) can never show the space
+    rendered = tok.apply_chat_template(messages + [turn.message()], tokenize=False, **kwargs)
+    assert "\n\nHello!" in rendered
+
+    thinking = plain.with_kwargs({"enable_thinking": True})
+    turn = parse_assistant("reason\n</think>\n\n Mars has two moons.", thinking)
+    assert turn.content == "Mars has two moons." and turn.raw_content == "\n\n Mars has two moons."
+    assert parse_assistant("still thinking", thinking).raw_content == ""
+    call = parse_assistant(" Running it.\n\n<tool_call>\n<function=f>\n</function>\n</tool_call>", plain)
+    assert call.raw_content == " Running it.\n\n"
+
+    assert whitespace_defects(["\n\n Mars has two moons."]) == ["leading_space"]
+    assert whitespace_defects(["```python\ndef f():\n    return 1\n```"]) == []
+    assert whitespace_defects(["Here:\n```python\n def f():\n```"]) == ["single_space_line"]
+    assert whitespace_defects(["", "Done."]) == []  # a tool-call-only turn has no reply to check
+    configured = {"fmt": SimpleNamespace(fn="whitespace", weight=0.2, args={})}
+    (reward,) = resolve_rewards(configured, [])
+    samples = [{"raw_contents": [" Hello!"], "prompt": []}, {"raw_contents": ["Hello!"], "prompt": []}]
+    assert asyncio.run(reward.score(samples)) == [-1.0, 0.0] and reward.weight == 0.2

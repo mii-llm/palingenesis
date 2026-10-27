@@ -32,7 +32,7 @@ from palingenesis.rl.config import RLConfig
 from palingenesis.rl.data import PromptSampler, prompt_messages, row_limit
 from palingenesis.rl.env import EnvPool, call_sync_or_async, row_tools, run_tool
 from palingenesis.rl.generation import GenerationClient
-from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample, load_object
+from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample, load_object, whitespace_defects
 from palingenesis.rl.trajectory import Trajectory, group_is_informative
 
 logger = logging.getLogger(__name__)
@@ -353,6 +353,7 @@ class RLPipeline:
                 )
                 parsed = parse_assistant(text, chat, e.tool_parser, by_name, f"call_{turn}")
                 trajectory.messages.append(parsed.message())
+                trajectory.info.setdefault("raw_contents", []).append(parsed.raw_content)
                 if out.finish == "length":
                     trajectory.finish = "length"
                     break
@@ -554,6 +555,7 @@ class RLPipeline:
             "prompt": t.info["prompt"],
             "messages": t.messages,
             "completion_ids": [tok for tok, m in zip(t.tokens, t.mask) if m],
+            "raw_contents": list(t.info.get("raw_contents", [])),
             "finish_reason": t.finish,
             "env": env,
             "sandbox": self.sandbox,
@@ -571,6 +573,10 @@ class RLPipeline:
             "truncated": sum(t.finish == "length" for t in trajectories) / n,
             "skipped": sum(not t.scored for t in trajectories) / n,
             "rollout_errors": sum(t.finish == "error" for t in trajectories) / n,
+            # rollouts with a whitespace defect in a reply (leading space, single-space line start): no grader sees
+            # it (everything strips), so it is logged on every run
+            "format/whitespace": sum(bool(whitespace_defects(t.info.get("raw_contents", []))) for t in trajectories)
+            / n,
         }
         if self.env_pool is not None:
             stats.update(

@@ -193,6 +193,9 @@ class AssistantTurn:
     content: str
     calls: list[ToolCall] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)  # malformed calls, reported back to the policy
+    # the content as sampled, before any strip (the chat template, the parser and graders all trim, so a leading
+    # space or a stray one after a newline is invisible everywhere else; whitespace_reward reads this)
+    raw_content: str = ""
 
     def message(self) -> dict[str, Any]:
         msg: dict[str, Any] = {"role": "assistant", "content": self.content}
@@ -219,7 +222,9 @@ def parse_assistant(
     reasoning, rest = chat.split_reasoning(text)
     first = rest.find("<tool_call>")
     content = (rest if first < 0 else rest[:first]).strip()
-    turn = AssistantTurn(reasoning, content)
+    raw = _raw_rest(text, chat)
+    raw_first = raw.find("<tool_call>")
+    turn = AssistantTurn(reasoning, content, raw_content=raw if raw_first < 0 else raw[:raw_first])
     for k, block in enumerate(_TOOL_CALL.findall(rest if first >= 0 else "")):
         block = block.strip()
         try:
@@ -233,6 +238,15 @@ def parse_assistant(
         call.id = f"{call_prefix}_{k}"
         turn.calls.append(call)
     return turn
+
+
+def _raw_rest(text: str, chat: ChatFormat) -> str:
+    """The text after the reasoning, unstripped: everything when thinking is off (the prompt closed the think
+    block), else what follows the closing tag (nothing when it never closes)."""
+    if not chat.thinking:
+        return text
+    close_tag = chat.think_tags[1]
+    return text.split(close_tag, 1)[1] if close_tag in text else ""
 
 
 def _parse_hermes(block: str) -> ToolCall:

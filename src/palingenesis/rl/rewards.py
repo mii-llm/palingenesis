@@ -15,6 +15,7 @@ rollouts. A function receives only the keyword arguments it declares (all of the
   prompt          the conversation the rollout started from
   messages        the whole conversation, tool calls and results included
   completion_ids  the tokens the policy sampled
+  raw_contents    every assistant turn's content as sampled, before any strip (one string per turn)
   finish_reason   stop | length | turns
   env             the environment instance (custom environments)
   sandbox         the code sandbox (see palingenesis.rl.sandbox)
@@ -67,6 +68,7 @@ _BATCHED = {
     "prompt": "prompts",
     "messages": "messages",
     "completion_ids": "completion_ids",
+    "raw_contents": "raw_contents",
     "finish_reason": "finish_reasons",
     "env": "envs",
 }
@@ -401,6 +403,31 @@ def qa_match_reward(completion: str, field: str = "answer", metric: str = "em", 
     return best
 
 
+_SINGLE_SPACE_LINE = re.compile(r"\n [^ \n]")
+
+
+def whitespace_defects(raw_contents: list[str]) -> list[str]:
+    """Whitespace defects in replies as sampled: a reply that starts with one space (after the newlines the
+    template or the think block put before it), or a line indented by exactly one space ("\n def", "\n ```").
+    Every grader and the chat template strip the text, so nothing else sees these."""
+    defects = []
+    for raw in raw_contents:
+        body = raw.lstrip("\n")
+        if not body.strip():
+            continue  # a turn that is only a tool call
+        if body[0] in " \t" and body[:2] != "  ":
+            defects.append("leading_space")
+        elif _SINGLE_SPACE_LINE.search(body):
+            defects.append("single_space_line")
+    return defects
+
+
+def whitespace_reward(raw_contents: list[str] | None = None, **row) -> float:
+    """-1 when any assistant reply has a whitespace defect (whitespace_defects), else 0: a format term for RL,
+    weighted in the config (rewards.whitespace.weight, e.g. 0.2)."""
+    return -1.0 if whitespace_defects(raw_contents or []) else 0.0
+
+
 BUILTINS: dict[str, Callable] = {
     "math": math_reward,
     "exact": exact_reward,
@@ -411,4 +438,5 @@ BUILTINS: dict[str, Callable] = {
     "code": code_reward,
     "judge": judge_reward,
     "equivalence": equivalence_reward,
+    "whitespace": whitespace_reward,
 }
