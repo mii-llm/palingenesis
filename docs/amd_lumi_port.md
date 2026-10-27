@@ -164,7 +164,9 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 FP8/quack guards, ROCm install path, single-device SFT (bf16/SDPA/AdamW), multi-GCD &
 multi-node FSDP over RCCL+Slingshot, liger kernels (work) and CCE (gated to NVIDIA),
 bitsandbytes 8-bit (work), flash_attention_2 (works on the container's ROCm flash-attn;
-falls back to sdpa otherwise). Step 8
+falls back to sdpa otherwise). **Real-model SFT validated**: Qwen3-4B full fine-tune on one
+64 GB GCD (adamw8bit fits 4B, ~1750 tok/s, stable grad norms, HF checkpoint) — `configs/
+rocm_qwen3_4b.yaml` + `scripts/lumi/sft_qwen3_4b.sh`. Step 8
 partial — off-policy / frozen-teacher vLLM over HTTP works on ROCm; on-policy CUDA-IPC weight
 sync guarded to NVIDIA. Remaining: on-policy ROCm vLLM weight-sync (non-IPC), flash-linear-
 attention (needs Qwen3.5), and validating the in-process `vllm` colocate backend on ROCm.*

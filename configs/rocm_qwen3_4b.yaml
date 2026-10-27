@@ -1,0 +1,58 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROCm SFT — Qwen3-4B on one GPU (real-model quality check for the AMD port)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Target-scale SFT with ROCm-validated settings: bf16 + SDPA + Liger fused kernels +
+# chunked CE, and 8-bit AdamW so a 4B full fine-tune fits on one 64 GB GCD. This is the
+# "does a real model actually train well on AMD" run, not a toy smoke.
+#
+# Generic (any ROCm box with internet): streams a public chat set.
+#   python -m palingenesis train --config configs/rocm_qwen3_4b.yaml
+# On LUMI (offline compute nodes) use scripts/lumi/sft_qwen3_4b.sh, which pre-stages the
+# model and a data slice to scratch and overrides data.dataset to that local file.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+model:
+  name_or_path: Qwen/Qwen3-4B
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: true    # fused RMSNorm/SwiGLU/RoPE — validated on gfx90a
+  compile: false            # inductor/Triton compile not validated on ROCm yet
+
+data:
+  dataset: HuggingFaceH4/ultrachat_200k
+  dataset_split: train_sft
+  streaming: true
+  max_seq_length: 2048
+  messages_field: messages
+  num_workers: 2
+  packing: false
+
+train:
+  output_dir: ./outputs/rocm_qwen3_4b
+  max_steps: 120
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8     # effective batch = 8
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  warmup_ratio: 0.03
+  lr_scheduler: cosine
+  optimizer: adamw8bit               # bitsandbytes 8-bit — validated on ROCm; fits 4B on 64 GB
+  max_grad_norm: 1.0
+  gradient_checkpointing: selective
+  logging_steps: 10
+  save_steps: 1000
+  bf16: true
+  seed: 42
+
+parallel:
+  fsdp: false
+  context_parallel: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+  float8_training: false
+
+logging:
+  use_wandb: false
+  use_trackio: false
