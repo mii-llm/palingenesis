@@ -538,6 +538,19 @@ class VLLMServerRollout:
     """
 
     def __init__(self, server: VLLMServer, stop_ids: tuple[int, ...]):
+        # On-policy weight sync here goes over CUDA IPC (reduce_tensor handles), which is
+        # NVIDIA-only. ROCm has no equivalent in this path, so fail fast with the ROCm
+        # alternatives rather than crash later inside update_weights. The HTTP generation
+        # path and a frozen vLLM teacher work on ROCm; only the IPC weight push does not.
+        from palingenesis import accelerator
+
+        if not accelerator.is_cuda():
+            raise RuntimeError(
+                "rollout.backend='vllm_server' syncs the student's weights into vLLM over CUDA IPC, "
+                f"which is NVIDIA-only; unavailable on {accelerator.backend()}. On ROCm use "
+                "rollout.backend='hf' for on-policy rollouts, or serve a frozen model with a ROCm "
+                "vLLM and use it as a teacher / for off-policy generation (HTTP, no weight sync)."
+            )
         self.server = server
         self.stop_ids = stop_ids
         self.version = 0

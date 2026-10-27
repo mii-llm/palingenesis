@@ -90,11 +90,23 @@ container. `--user` does **not** work (the container python is a venv).
 | vLLM | vllm | ✅ **ROCm vLLM works** (proven on LUMI). Target generic ROCm vLLM; see 2.5. |
 | quack-kernels | — | ❌ NVIDIA-only; must stay inactive on ROCm (already falls back). |
 
-### 2.5 Rollout backend for distill / RL
-`opd/rollout.py`, `opd/teachers.py`, `rl/` talk to vLLM. ROCm vLLM is a solved problem
-(validated on LUMI), so this is **integration, not a porting epic**: ensure palingenesis's
-rollout backend speaks to a generic ROCm vLLM over its normal interface, with **no LUMI
-assumptions** in the code. We *test* against LUMI's instance; we don't depend on it.
+### 2.5 Rollout backend for distill / RL — partially done
+`opd/rollout.py`, `opd/teachers.py`, `rl/` talk to vLLM. Three backends: `hf` (generate with
+the training model — ROCm-OK, no vLLM), `vllm` (in-process colocate), `vllm_server` (separate
+server). The split that matters on ROCm:
+- **Generation / frozen-teacher scoring over HTTP** (`VLLMServer.complete` → `/v1/completions`,
+  `VLLMTeacher.score` via `prompt_logprobs`): backend-agnostic, **works on ROCm** —
+  ✅ validated by driving palingenesis's own `VLLMServer` client against a ROCm vLLM serving
+  Qwen3-0.6B on a LUMI GCD (generation + prompt_logprobs round-trip). This is the path that
+  reuses LUMI's working vLLM for teachers / off-policy.
+- **On-policy student weight sync into vLLM** (`VLLMServerRollout.update_weights`): pushes
+  weights over **CUDA IPC** (`reduce_tensor` handles) — NVIDIA-only. Now **guarded on
+  `is_cuda()`**: on ROCm it raises a clear error pointing to `rollout.backend='hf'` for
+  on-policy, or a frozen external server for off-policy/teacher. A non-IPC ROCm weight-sync
+  (e.g. RCCL broadcast / `collective_rpc`) is the remaining follow-up. The in-process `vllm`
+  colocate backend (sleep/wake, `apply_model` weight load) is **not yet validated on ROCm**.
+
+No LUMI assumptions live in this code — we test against LUMI's instance, we don't depend on it.
 
 ### 2.6 Hardware reality for the guards
 - **No FP8** on CDNA2 (gfx90a / MI250X). bf16 is the ceiling there. `supports_fp8()` returns
@@ -131,7 +143,7 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 5. **[Track B] LUMI bring-up** — prove step 4 inside the LUMI container on one GCD (`scripts/lumi/`).
 6. **[Track A] Multi-GCD / multi-node** — FSDP over RCCL (generic), validated on LUMI Slingshot via Track B env. ✅ *done — 2-GCD (`train_multi_gcd.sh`) and 2-node×2-GCD (`train_multi_node.sbatch`, with `singularity-AI-bindings` for Slingshot) both train & checkpoint. OFI/CXI fast-path vs socket fallback not yet confirmed (needs NCCL_DEBUG=INFO) — perf follow-up.*
 7. **[Track A] Triton kernels** (liger, flash-linear-attention, CCE) — validate, keep fallbacks. ✅ *done for liger (works on gfx90a) and CCE (crashed on ROCm — tf32 Triton kernel; now gated on `is_cuda()` → falls back to chunked CE, validated). flash-linear-attention pending (needs a Qwen3.5 model + transformers≥5.12; transformers uses a pure-torch fallback when absent).*
-8. **[Track A] Rollout backend → generic ROCm vLLM** for distill/RL; validated against LUMI's vLLM.
+8. **[Track A] Rollout backend → generic ROCm vLLM** for distill/RL; validated against LUMI's vLLM. ◑ *off-policy / frozen-teacher HTTP path done + validated on gfx90a; on-policy CUDA-IPC weight sync guarded to NVIDIA (ROCm → use `hf`). Remaining: a non-IPC ROCm weight-sync for on-policy vLLM, and validating the in-process `vllm` colocate backend on ROCm.*
 9. *(optional)* bitsandbytes 8-bit optimizers; causal-conv1d HIP build for Qwen3.5 packing.
 
 **Milestone 1:** steps 1–4 = "SFT trains correctly on a single ROCm device, NVIDIA path unchanged."
@@ -147,10 +159,9 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 
 ---
 
-*Status: **Milestone 1 reached** — Track A steps 1–4 done (accelerator detection, capability
-gates, ROCm install path, single-device SFT) and validated on a LUMI MI250X GCD: SFT loop
-runs in bf16/SDPA/AdamW, loss converges, HF checkpoint saved. Next: step 6 — multi-GCD /
-multi-node FSDP over RCCL — DONE (2-GCD and 2-node validated on LUMI). Next: step 7 —
-Triton kernels — liger validated on ROCm, CCE now gated to NVIDIA (falls back to chunked
-CE on AMD), flash-linear-attention still pending. Next: step 8 — rollout backend → generic
-ROCm vLLM for distill/RL (validate against LUMI's working vLLM).*
+*Status (all validated on a LUMI MI250X / gfx90a): steps 1–7 done — accelerator detection,
+FP8/quack guards, ROCm install path, single-device SFT (bf16/SDPA/AdamW), multi-GCD &
+multi-node FSDP over RCCL+Slingshot, liger kernels (work) and CCE (gated to NVIDIA). Step 8
+partial — off-policy / frozen-teacher vLLM over HTTP works on ROCm; on-policy CUDA-IPC weight
+sync guarded to NVIDIA. Remaining: on-policy ROCm vLLM weight-sync (non-IPC), flash-linear-
+attention (needs Qwen3.5), and validating the in-process `vllm` colocate backend on ROCm.*
