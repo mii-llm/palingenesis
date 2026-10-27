@@ -95,7 +95,11 @@ def _build_bnb_optimizer(
     try:
         import bitsandbytes as bnb
     except ImportError:
-        raise ImportError("bitsandbytes not installed. pip install bitsandbytes")
+        raise ImportError(
+            "bitsandbytes not installed. pip install bitsandbytes (on ROCm/AMD you need a "
+            "ROCm-capable build, e.g. bitsandbytes>=0.49; validated working on gfx90a). "
+            "Or set train.optimizer: adamw."
+        )
 
     decay_params = []
     no_decay_params = []

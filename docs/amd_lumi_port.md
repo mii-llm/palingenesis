@@ -82,7 +82,7 @@ container. `--user` does **not** work (the container python is a venv).
 |---|---|---|
 | torch | core | ✅ ROCm wheels / ROCm container torch. |
 | transformers / datasets / accelerate | core | ✅ pure Python. |
-| bitsandbytes | train | ⚠️ ROCm backend less mature → optional; default `adamw`/`muon`. |
+| bitsandbytes | train | ✅ validated on gfx90a (0.50.2): `adamw8bit`, `lion8bit`, `paged_adamw8bit` all step correctly (params update, finite loss). ROCm needs a ROCm-capable build; absent → clear error, use `adamw`. |
 | liger-kernel | train | ✅ validated on gfx90a (qwen3): RMSNorm/SwiGLU/RoPE fused kernels compile on Triton 3.6.0 and train; its CuteDSL/Ascend RoPE backends fail to import but Liger falls back internally (benign). |
 | flash-linear-attention | train | ⚠️ Triton; fallback is 6–20× slower but correct. |
 | causal-conv1d | hybrid | ❌ CUDA build; needs HIP build/fork. Only gates Qwen3.5 *packing*. |
@@ -144,7 +144,7 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 6. **[Track A] Multi-GCD / multi-node** — FSDP over RCCL (generic), validated on LUMI Slingshot via Track B env. ✅ *done — 2-GCD (`train_multi_gcd.sh`) and 2-node×2-GCD (`train_multi_node.sbatch`, with `singularity-AI-bindings` for Slingshot) both train & checkpoint. OFI/CXI fast-path vs socket fallback not yet confirmed (needs NCCL_DEBUG=INFO) — perf follow-up.*
 7. **[Track A] Triton kernels** (liger, flash-linear-attention, CCE) — validate, keep fallbacks. ✅ *done for liger (works on gfx90a) and CCE (crashed on ROCm — tf32 Triton kernel; now gated on `is_cuda()` → falls back to chunked CE, validated). flash-linear-attention pending (needs a Qwen3.5 model + transformers≥5.12; transformers uses a pure-torch fallback when absent).*
 8. **[Track A] Rollout backend → generic ROCm vLLM** for distill/RL; validated against LUMI's vLLM. ◑ *off-policy / frozen-teacher HTTP path done + validated on gfx90a; on-policy CUDA-IPC weight sync guarded to NVIDIA (ROCm → use `hf`). Remaining: a non-IPC ROCm weight-sync for on-policy vLLM, and validating the in-process `vllm` colocate backend on ROCm.*
-9. *(optional)* bitsandbytes 8-bit optimizers; causal-conv1d HIP build for Qwen3.5 packing.
+9. *(optional)* bitsandbytes 8-bit optimizers — ✅ *validated on gfx90a (all three step correctly)*; causal-conv1d HIP build for Qwen3.5 packing — pending.
 
 **Milestone 1:** steps 1–4 = "SFT trains correctly on a single ROCm device, NVIDIA path unchanged."
 
