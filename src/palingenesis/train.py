@@ -34,6 +34,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from palingenesis import accelerator
 from palingenesis.checkpoint import (
     BestModelTracker,
     find_latest_checkpoint,
@@ -691,12 +692,31 @@ def train(config: Config):
         if lm_head is None:
             logger.warning("Could not find lm_head, falling back to standard loss")
             use_chunked_loss = False
-        elif cce_available() and not _needs_logits and not isinstance(lm_head, PostProcessedHead):
-            # CCE: zero-memory CE, replaces chunked when no plugin needs full logits
+        elif (
+            cce_available()
+            and accelerator.is_cuda()
+            and not _needs_logits
+            and not isinstance(lm_head, PostProcessedHead)
+        ):
+            # CCE: zero-memory CE, replaces chunked when no plugin needs full logits.
+            # NVIDIA only: CCE's Triton kernel passes input_precision="tf32" to tl.dot,
+            # which ROCm's Triton rejects — on AMD it crashes with no fallback, so we gate
+            # on is_cuda() and use chunked CE there instead.
             use_cce = True
             use_chunked_loss = False
             logger.info("Using Cut Cross-Entropy (Apple): zero logit materialization")
         else:
+            if (
+                cce_available()
+                and not accelerator.is_cuda()
+                and not _needs_logits
+                and not isinstance(lm_head, PostProcessedHead)
+            ):
+                logger.warning(
+                    "Cut Cross-Entropy is installed but its Triton kernel uses tf32 (NVIDIA-only), "
+                    "unsupported on %s — using chunked CE instead.",
+                    accelerator.backend(),
+                )
             # Chunk count is computed PER BATCH from actual tokens (see
             # _dynamic_num_chunks). A static count sized for max_seq_length
             # ran 64 sequential tiny lm_head fwd+bwd passes even on short

@@ -83,7 +83,7 @@ container. `--user` does **not** work (the container python is a venv).
 | torch | core | ✅ ROCm wheels / ROCm container torch. |
 | transformers / datasets / accelerate | core | ✅ pure Python. |
 | bitsandbytes | train | ⚠️ ROCm backend less mature → optional; default `adamw`/`muon`. |
-| liger-kernel | train | ⚠️ Triton-on-ROCm; validate per kernel, pure-torch fallback exists. |
+| liger-kernel | train | ✅ validated on gfx90a (qwen3): RMSNorm/SwiGLU/RoPE fused kernels compile on Triton 3.6.0 and train; its CuteDSL/Ascend RoPE backends fail to import but Liger falls back internally (benign). |
 | flash-linear-attention | train | ⚠️ Triton; fallback is 6–20× slower but correct. |
 | causal-conv1d | hybrid | ❌ CUDA build; needs HIP build/fork. Only gates Qwen3.5 *packing*. |
 | torchao (float8) | float8 | ❌ N/A on ROCm (no FP8 path we target). Keep gated off. |
@@ -130,7 +130,7 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 4. **[Track A] Single-device SFT MVP** — bf16, `sdpa`, `adamw`; no FP8/bnb/causal-conv1d. Core loop + loss + checkpoint. ✅ *done — validated on a LUMI MI250X GCD (loss → ~0, HF checkpoint saved). `configs/rocm_smoke.yaml` + `scripts/lumi/sft_single_gcd.sh`.*
 5. **[Track B] LUMI bring-up** — prove step 4 inside the LUMI container on one GCD (`scripts/lumi/`).
 6. **[Track A] Multi-GCD / multi-node** — FSDP over RCCL (generic), validated on LUMI Slingshot via Track B env. ✅ *done — 2-GCD (`train_multi_gcd.sh`) and 2-node×2-GCD (`train_multi_node.sbatch`, with `singularity-AI-bindings` for Slingshot) both train & checkpoint. OFI/CXI fast-path vs socket fallback not yet confirmed (needs NCCL_DEBUG=INFO) — perf follow-up.*
-7. **[Track A] Triton kernels** (liger, flash-linear-attention) — validate, keep fallbacks.
+7. **[Track A] Triton kernels** (liger, flash-linear-attention, CCE) — validate, keep fallbacks. ✅ *done for liger (works on gfx90a) and CCE (crashed on ROCm — tf32 Triton kernel; now gated on `is_cuda()` → falls back to chunked CE, validated). flash-linear-attention pending (needs a Qwen3.5 model + transformers≥5.12; transformers uses a pure-torch fallback when absent).*
 8. **[Track A] Rollout backend → generic ROCm vLLM** for distill/RL; validated against LUMI's vLLM.
 9. *(optional)* bitsandbytes 8-bit optimizers; causal-conv1d HIP build for Qwen3.5 packing.
 
@@ -151,4 +151,6 @@ Each step is an independent commit; NVIDIA behaviour stays intact throughout.
 gates, ROCm install path, single-device SFT) and validated on a LUMI MI250X GCD: SFT loop
 runs in bf16/SDPA/AdamW, loss converges, HF checkpoint saved. Next: step 6 — multi-GCD /
 multi-node FSDP over RCCL — DONE (2-GCD and 2-node validated on LUMI). Next: step 7 —
-Triton kernels on ROCm (liger / flash-linear-attention / CCE), keeping the torch fallback.*
+Triton kernels — liger validated on ROCm, CCE now gated to NVIDIA (falls back to chunked
+CE on AMD), flash-linear-attention still pending. Next: step 8 — rollout backend → generic
+ROCm vLLM for distill/RL (validate against LUMI's working vLLM).*
