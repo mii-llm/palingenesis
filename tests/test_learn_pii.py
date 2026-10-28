@@ -132,3 +132,57 @@ def test_promotion_rechecks_pii_at_the_shared_level(learner):
     queue_id = learner.promote(USER, stored.note_id, "org:acme")
     learner.approve("org:acme", [queue_id])
     assert learner.store.scope("org:acme").active_notes()[0].text == "The Orion escalation contact is [EMAIL]"
+
+
+@pytest.mark.parametrize(
+    "text, kind",
+    [
+        ("P.IVA 01114601006", "partita_iva"),
+        ("partita IVA IT01114601006", "partita_iva"),
+        ("chiamami allo 02 1234 5678", "phone"),
+        ("ufficio di Roma 06-1234-5678", "phone"),
+        ("tel. 02 12 34 56 78", "phone"),
+        ("+39 02 1234 5678", "phone"),
+        ("abito in via Roma 12, Milano", "address"),
+        ("Piazza della Repubblica, 3/A", "address"),
+        ("Corso Buenos Aires 33", "address"),
+        ("221 Baker Street", "address"),
+    ],
+)
+def test_detects_italian_ids_landlines_and_addresses(text, kind):
+    assert kind in kinds(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "VAT 12345678901",  # fails the partita IVA check digit
+        "11111111111",  # a run of one digit
+        "costa 1 000 000 euro",
+        "350 000 000 abitanti",
+        "il budget è di 350.000.000",
+        "€ 350 000 000",
+        "ISBN 978-88-04-66823-7",
+        "ISBN 0306406152",
+        "ISBN 9788804668237",
+        "il 03 12 2024",
+        "send it via Slack, 2 times",
+        "via email entro 3 giorni",
+        "il corso di Python 2",
+    ],
+)
+def test_amounts_isbns_dates_are_not_phones_or_addresses(text):
+    assert kinds(text) == []
+
+
+def test_partita_iva_checksum():
+    from palingenesis.learn.pii import isbn_ok, partita_iva_ok
+
+    assert partita_iva_ok("01114601006") and not partita_iva_ok("01114601007") and not partita_iva_ok("00000000000")
+    assert isbn_ok("0306406152") and isbn_ok("9788804668237") and not isbn_ok("9788804668238")
+
+
+def test_addresses_redacted_at_shared_scopes():
+    pii = PIIFilter()
+    result = pii.check("The Milan office is in via Roma 12, tel 02 1234 5678.", shared=True)
+    assert result.action == "redact" and result.text == "The Milan office is in [ADDRESS], tel [PHONE]."

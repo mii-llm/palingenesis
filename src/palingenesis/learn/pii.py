@@ -5,8 +5,9 @@ Two categories, with a policy per scope level:
     category   examples                                          user scope           team / org scope
     secret     API keys, private keys, passwords, card numbers   rejected             rejected
                (Luhn), IBANs (mod-97 checksum)
-    personal   emails, phone numbers, Italian codice fiscale,    allow (default)      redact (default)
-               US social security numbers
+    personal   emails, phone numbers, Italian codice fiscale     allow (default)      redact (default)
+               and partita IVA (checksums), US social security
+               numbers, street addresses (a basic pattern)
 
 `allow` stores the text as is (a user's own memory; `forget` removes it), `redact` replaces each match
 with a placeholder such as [EMAIL], `block` holds the note in the inbox for review. Detectors are
@@ -26,7 +27,7 @@ SECRET, PERSONAL = "secret", "personal"
 @dataclass(frozen=True)
 class Finding:
     category: str  # secret | personal
-    kind: str  # email, phone, ssn, iban, codice_fiscale, credit_card, api_key, private_key, password
+    kind: str  # email, phone, ssn, address, iban, codice_fiscale, partita_iva, credit_card, api_key, private_key, password
     start: int
     end: int
 
@@ -43,6 +44,23 @@ def luhn_ok(digits: str) -> bool:
             d = d * 2 - 9 if d > 4 else d * 2
         total += d
     return total % 10 == 0
+
+
+def partita_iva_ok(code: str) -> bool:
+    """The check digit of an Italian partita IVA (11 digits, the Luhn scheme), not a run of one digit."""
+    digits = re.sub(r"\D", "", code)
+    return len(digits) == 11 and len(set(digits)) > 1 and luhn_ok(digits)
+
+
+def isbn_ok(digits: str) -> bool:
+    """ISBN-10 (mod 11, X allowed last) or ISBN-13 (978 / 979, weights 1 and 3) checksum."""
+    digits = digits.upper()
+    if len(digits) == 10 and digits[:9].isdigit() and (digits[9].isdigit() or digits[9] == "X"):
+        total = sum((10 - i) * (10 if ch == "X" else int(ch)) for i, ch in enumerate(digits))
+        return total % 11 == 0
+    if len(digits) == 13 and digits.isdigit() and digits[:3] in ("978", "979"):
+        return sum((3 if i % 2 else 1) * int(ch) for i, ch in enumerate(digits)) % 10 == 0
+    return False
 
 
 def iban_ok(iban: str) -> bool:
@@ -88,12 +106,20 @@ _PATTERNS = [
     (PERSONAL, "email", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b")),
     (PERSONAL, "codice_fiscale", re.compile(rf"\b[A-Za-z]{{6}}{_D}{{2}}[A-Za-z]{_D}{{2}}[A-Za-z]{_D}{{3}}[A-Za-z]\b")),
     (SECRET, "iban", re.compile(r"(?i)\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b")),
+    # Partita IVA: 11 digits with a Luhn check digit, optionally prefixed with IT.
+    (PERSONAL, "partita_iva", re.compile(r"(?i)(?<![\w.,-])(?:IT[ ]?)?\d{11}(?![\w.,-])")),
     (PERSONAL, "ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
     (SECRET, "credit_card", re.compile(r"\b\d(?:[ -]?\d){12,18}\b")),
     # International numbers (+39 ..., 0039 ...), Italian mobile (3xx) and landline (0x) numbers, and the
     # (555) 123-4567 form. Bare digit runs are not phones: dates, versions and amounts must survive.
     (PERSONAL, "phone", re.compile(r"(?<![\w+])(?:\+|00)[1-9]\d{0,2}(?:[ .-]?\(?\d{1,4}\)?){2,5}(?!\w)")),
     (PERSONAL, "phone", re.compile(r"(?<![\w.-])(?:3\d{2}[ .-]?\d{3}[ .-]?\d{3,4}|0\d{1,3}[ .-]?\d{5,8})(?![\w.-])")),
+    # Spaced Italian landlines: 02 1234 5678, 06-1234-5678, 02 12 34 56 78 (area codes start with 0[1-9]).
+    (
+        PERSONAL,
+        "phone",
+        re.compile(r"(?<![\w.,-])(?<!\d )0[1-9]\d{0,2}(?:[ .-]\d{2,4}){2,4}(?![\w-])(?!\.\d)"),
+    ),
     (PERSONAL, "phone", re.compile(r"\(\d{3}\)[ ]?\d{3}-\d{4}\b")),
     (PERSONAL, "phone", re.compile(r"(?<![\w.-])\d{3}([.-])\d{3}\1\d{4}(?![\w.-])")),  # 415-555-0123
     (
@@ -105,6 +131,18 @@ _PATTERNS = [
         ),
     ),
     (SECRET, "private_key", re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")),
+    # Street addresses, a basic pattern: "via Roma 12", "Piazza della Repubblica, 3/A", "221 Baker Street".
+    (
+        PERSONAL,
+        "address",
+        re.compile(
+            r"\b(?:[Vv]ia|[Vv]iale|[Pp]iazza|[Pp]iazzale|[Vv]icolo|Corso|Largo|Strada|Contrada|Borgo)"
+            r"\s+(?:(?:d[ei]l?(?:l[aoe'])?|d[ae]i|degli|delle|di|San|Santa)\s*)?[A-ZÀ-Ý][\w'’.-]*"
+            r"(?:\s+(?:d[ei]l?(?:l[aoe'])?|d[ae]i|degli|delle|di|[A-ZÀ-Ý][\w'’.-]*)){0,4},?\s*\d{1,4}(?:\s*/\s*[A-Za-z]|[A-Za-z])?\b"
+            r"(?!\s*(?:%|giorni|days?|volte|times|ore|hours|minut))"
+            r"|\b\d{1,5}\s+(?:[A-Z][a-z]+\s+){1,3}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Place|Pl)\b\.?"
+        ),
+    ),
     # A credential after "password:" / "password is" / "la password è": a token of 4+ characters with a digit
     # or a symbol, so "Password: at least 12 characters" (a policy in a document) is not a secret.
     (
@@ -118,8 +156,28 @@ _PATTERNS = [
 ]
 
 
+_DATE = re.compile(r"(?:0?[1-9]|[12]\d|3[01])([ .-])(?:0?[1-9]|1[0-2])\1(?:19|20)\d\d")
+_CURRENCY = re.compile(r"(?i)(?:[€$£]|\b(?:eur|euro|euros|usd|dollars?|gbp|chf)\b)")
+
+
+def _phone_like(text: str, start: int, end: int, value: str, digits: str) -> bool:
+    """False for what only looks like a phone number: an amount (a currency sign or word next to it, or
+    thousands grouping such as 350 000 000 / 350.000.000), or an ISBN."""
+    before, after = text[max(0, start - 12) : start], text[end : end + 12]
+    if _CURRENCY.search(before[-5:]) or _CURRENCY.match(after.lstrip()):
+        return False
+    groups = re.split(r"[ .,-]", value.lstrip("+"))
+    if not value.startswith(("0", "+")) and len(groups) > 2 and all(len(g) == 3 for g in groups[1:]):
+        if len({sep for sep in re.findall(r"[ .,-]", value)}) == 1:
+            return False  # thousands grouping
+    if "isbn" in before.lower() and isbn_ok(digits):
+        return False
+    return not _DATE.fullmatch(value)
+
+
 class RegexDetector:
-    """Regex baseline with checksums: emails, phone numbers, codice fiscale, IBAN, card numbers, keys."""
+    """Regex baseline with checksums: emails, phone numbers, codice fiscale, partita IVA, IBAN, card numbers,
+    keys, street addresses."""
 
     def find(self, text: str) -> list[Finding]:
         found: list[Finding] = []
@@ -137,7 +195,11 @@ class RegexDetector:
                     continue
                 if kind == "codice_fiscale" and not codice_fiscale_ok(value):
                     continue
-                if kind == "phone" and not 8 <= len(digits) <= 15:
+                if kind == "credit_card" and isbn_ok(digits) and digits[:3] in ("978", "979"):
+                    continue  # an ISBN-13 that happens to pass Luhn
+                if kind == "partita_iva" and not partita_iva_ok(value):
+                    continue
+                if kind == "phone" and not (8 <= len(digits) <= 15 and _phone_like(text, start, end, value, digits)):
                     continue
                 found.append(Finding(category, kind, start, end))
                 taken.append((start, end))
