@@ -8,6 +8,7 @@ a raw ``>= (8, 9)`` FP8 gate wrongly pass. These tests pin that behaviour down.
 import types
 
 import pytest
+
 from palingenesis import accelerator
 
 

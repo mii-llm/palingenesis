@@ -6,15 +6,14 @@
 # dependency), and GRPO updates the policy. Tiny arithmetic task; the point is the loop
 # runs on the device, not the score.
 #
-#   python -m palingenesis.cli rl --config configs/rocm_rl_smoke.yaml
-#   # on LUMI: bash scripts/lumi/rl_single_gcd.sh
+#   python -m palingenesis.cli rl --config configs/rl_rocm_smoke.yaml
 
 model:
   policy: Qwen/Qwen3-0.6B
   chat_template_kwargs: {enable_thinking: false}
 
 data:
-  dataset: configs/rocm_rl_smoke.data.jsonl
+  dataset: configs/rl_rocm_smoke.data.jsonl
 
 rollout:
   backend: vllm                 # in-process colocate engine (validated on gfx90a)

@@ -7,8 +7,7 @@
 # engine (apply_model, no CUDA IPC). Qwen3-1.7B -> Qwen3-0.6B: both use the Qwen3
 # tokenizer, so the loss is the exact full-vocabulary reverse KL (teacher backend hf).
 #
-#   python -m palingenesis.cli distill --config configs/rocm_opd_smoke.yaml
-#   # on LUMI: bash scripts/lumi/opd_single_gcd.sh
+#   python -m palingenesis.cli distill --config configs/distill_rocm_smoke.yaml
 
 model:
   student: Qwen/Qwen3-0.6B
@@ -24,7 +23,7 @@ teachers:
 sources:
   chat:
     format: messages
-    path: configs/rocm_opd_smoke.data.jsonl
+    path: configs/distill_rocm_smoke.data.jsonl
     dev_size: 8
     max_new_tokens: 64
 
