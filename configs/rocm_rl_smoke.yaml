@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROCm RL smoke test — GRPO on one GPU (AMD port, feature 19)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Exercises the full RL loop on ROCm: the policy samples groups via the in-process vLLM
+# colocate engine (validated on gfx90a), a pure-Python reward scores them (no math-verify
+# dependency), and GRPO updates the policy. Tiny arithmetic task; the point is the loop
+# runs on the device, not the score.
+#
+#   python -m palingenesis.cli rl --config configs/rocm_rl_smoke.yaml
+#   # on LUMI: bash scripts/lumi/rl_single_gcd.sh
+
+model:
+  policy: Qwen/Qwen3-0.6B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: configs/rocm_rl_smoke.data.jsonl
+
+rollout:
+  backend: vllm                 # in-process colocate engine (validated on gfx90a)
+  batch_prompts: 4              # groups per step
+  group_size: 4                 # rollouts per prompt (variance for GRPO advantages)
+  max_new_tokens: 32
+  max_model_len: 512
+  gpu_memory_utilization: 0.3
+  enforce_eager: true
+  sleep: true
+
+rewards:
+  # `math` extracts the completion's final number and checks it against the row's answer;
+  # it degrades to plain equality without math-verify. A weak 0.6B gets the arithmetic
+  # right only sometimes, so rollouts in a group disagree — the intra-group variance GRPO
+  # needs for a real gradient. The point is the RL update path runs on ROCm.
+  correct: {fn: math, args: {field: answer}}
+
+train:
+  output_dir: ./outputs/rocm_rl_smoke
+  steps: 10
+  learning_rate: 1.0e-6
+  eval_every: 1000
+  save_steps: 1000
+
+logging:
+  log_every: 1
+  use_wandb: false

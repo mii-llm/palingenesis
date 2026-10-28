@@ -192,5 +192,11 @@ container's transformers 5.10.1 already registers `qwen3_5`, and it trains via t
 as warned). **flash-linear-attention acceleration is deferred**: a simple overlay install of
 `flash-linear-attention` 0.6.0 came up incomplete and a *broken* fla makes Qwen3.5 loading
 hard-fail (fla *absent* falls back cleanly) — it needs a known-good ROCm fla build / matching
-version, a follow-up. Remaining: surgery/CMR/RL envs; CI; a known-good ROCm fla build.
-(Non-IPC server-topology weight sync is optional, not a blocker.)*
+version, a follow-up. **RL (GRPO) validated** on gfx90a (`configs/rocm_rl_smoke.yaml`): the
+full loop runs — colocate vLLM rollouts (~1000 tok/s) + pure-Python reward + GRPO advantages
++ clipped policy update (informative groups give grad_norm up to ~300) + per-step sleep/wake
++ checkpoint. **Margin surgery core validated**: `pgs surgery margins` computes decision-token
+margins on gfx90a (the `margins.py` forward machinery that **CMR** also rests on; full
+CMR-in-OPD and `surgery run` weight-edit reuse that validated core + device-agnostic torch —
+a light follow-up, they need curated tool-calling twins). Remaining: CI wiring; a known-good
+ROCm fla build. (Non-IPC server-topology weight sync is optional, not a blocker.)*
