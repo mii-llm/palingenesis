@@ -91,7 +91,7 @@ container. `--user` does **not** work (the container python is a venv).
 | vLLM | vllm | ✅ **ROCm vLLM works** (proven on LUMI). Target generic ROCm vLLM; see 2.5. |
 | quack-kernels | — | ❌ NVIDIA-only; must stay inactive on ROCm (already falls back). |
 
-### 2.5 Rollout backend for distill / RL — partially done
+### 2.5 Rollout backend for distill / RL — on-policy works on ROCm (colocate)
 `opd/rollout.py`, `opd/teachers.py`, `rl/` talk to vLLM. Three backends: `hf` (generate with
 the training model — ROCm-OK, no vLLM), `vllm` (in-process colocate), `vllm_server` (separate
 server). The split that matters on ROCm:
@@ -100,12 +100,15 @@ server). The split that matters on ROCm:
   ✅ validated by driving palingenesis's own `VLLMServer` client against a ROCm vLLM serving
   Qwen3-0.6B on a LUMI GCD (generation + prompt_logprobs round-trip). This is the path that
   reuses LUMI's working vLLM for teachers / off-policy.
-- **On-policy student weight sync into vLLM** (`VLLMServerRollout.update_weights`): pushes
-  weights over **CUDA IPC** (`reduce_tensor` handles) — NVIDIA-only. Now **guarded on
-  `is_cuda()`**: on ROCm it raises a clear error pointing to `rollout.backend='hf'` for
-  on-policy, or a frozen external server for off-policy/teacher. A non-IPC ROCm weight-sync
-  (e.g. RCCL broadcast / `collective_rpc`) is the remaining follow-up. The in-process `vllm`
-  colocate backend (sleep/wake, `apply_model` weight load) is **not yet validated on ROCm**.
+- **On-policy via the in-process `vllm` colocate backend** (`VLLMColocateRollout`): ✅
+  **validated on gfx90a** — generate, vLLM sleep/wake (the CuMemAllocator freed ~25 GiB and
+  woke in 0.08 s), and the on-policy weight update (`apply_model` → `model.load_weights`, 226
+  tensors) all work **in-process, with no CUDA IPC**. So **on-policy OPD/RL runs on ROCm via
+  the colocate backend** (`rollout.backend='vllm'`), no code change.
+- **On-policy via a separate server** (`VLLMServerRollout.update_weights`): pushes weights
+  over **CUDA IPC** (`reduce_tensor` handles) — NVIDIA-only. **Guarded on `is_cuda()`** (clear
+  ROCm error). A non-IPC ROCm weight-sync for this *server* topology (RCCL broadcast /
+  `collective_rpc`) is now **optional** — colocate already covers on-policy on AMD.
 
 No LUMI assumptions live in this code — we test against LUMI's instance, we don't depend on it.
 
@@ -174,7 +177,10 @@ guidance (bf16 weights round DPO's ~1e-6 updates to zero). **SeCO validated** on
 (`configs/rocm_seco_smoke.yaml`): chunk-by-chunk forward matches the full forward to
 relative diff 7.9e-6 (< 1e-4 fp32 tol), then trains and checkpoints — SeCO's varlen flash
 op (`aten._flash_attention_forward`) already runs on ROCm (used by every SFT run). fp32
-weights + single-process, as the framework requires. Step 8
-partial — off-policy / frozen-teacher vLLM over HTTP works on ROCm; on-policy CUDA-IPC weight
-sync guarded to NVIDIA. Remaining: on-policy ROCm vLLM weight-sync (non-IPC), flash-linear-
-attention (needs Qwen3.5), and validating the in-process `vllm` colocate backend on ROCm.*
+weights + single-process, as the framework requires. **vLLM rollouts on ROCm**: off-policy /
+frozen-teacher over HTTP works; the in-process colocate backend (`rollout.backend='vllm'`)
+works end-to-end on gfx90a — generate, sleep/wake (CuMemAllocator), and on-policy weight
+update (`apply_model`/`load_weights`, no IPC) — so **on-policy OPD/RL runs on AMD** via
+colocate. The separate-server CUDA-IPC weight sync stays guarded to NVIDIA. Remaining:
+end-to-end OPD distill run on LUMI; flash-linear-attention (needs Qwen3.5); surgery/CMR/RL
+envs; CI. (Non-IPC server-topology weight sync is now optional, not a blocker.)*
