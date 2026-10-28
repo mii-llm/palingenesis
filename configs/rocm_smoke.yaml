@@ -8,7 +8,7 @@
 #
 # It overfits a tiny arithmetic dataset so the loss visibly drops in ~30 steps —
 # the point is "the loop runs correctly on this device", not model quality.
-# Run on LUMI with scripts/lumi/sft_single_gcd.sh; on any ROCm box:
+# Run on any ROCm box:
 #   python -m palingenesis train --config configs/rocm_smoke.yaml
 # ═══════════════════════════════════════════════════════════════════════════════
 

@@ -7,7 +7,6 @@
 # accuracy move in ~30 steps. Point is DPO correctness on the device, not model quality.
 #
 #   python -m palingenesis train --config configs/rocm_dpo_smoke.yaml
-#   # on LUMI: PGS_CONFIG=configs/rocm_dpo_smoke.yaml bash scripts/lumi/sft_single_gcd.sh
 
 model:
   name_or_path: Qwen/Qwen3-0.6B

@@ -8,8 +8,6 @@
 # (packing Qwen3.5 needs causal-conv1d, a CUDA build not available on ROCm).
 #
 #   python -m palingenesis train --config configs/rocm_qwen35_08b.yaml
-#   # on LUMI: PGS_MODEL=Qwen/Qwen3.5-0.8B PGS_CONFIG=configs/rocm_qwen35_08b.yaml \
-#   #          bash scripts/lumi/sft_single_gcd.sh
 
 model:
   name_or_path: Qwen/Qwen3.5-0.8B

@@ -35,3 +35,6 @@ projects/*/prepared/
 # Research notebooks and papers (kept out of the library repo; preserved on the HF org)
 research/
 post-training/
+
+# Local AMD/ROCm test harness & notes (kept out of the repo for now)
+/.lumi/

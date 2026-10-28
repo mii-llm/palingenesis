@@ -7,8 +7,8 @@
 #
 # Generic (any ROCm box with internet): streams a public chat set.
 #   python -m palingenesis train --config configs/rocm_qwen3_4b.yaml
-# On LUMI (offline compute nodes) use scripts/lumi/sft_qwen3_4b.sh, which pre-stages the
-# model and a data slice to scratch and overrides data.dataset to that local file.
+# On an offline cluster, pre-stage the model and a data slice to local storage and
+# override data.dataset to that local file.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 model:

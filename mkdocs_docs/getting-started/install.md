@@ -88,8 +88,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 Palingenesis runs on AMD GPUs through PyTorch's ROCm build. The device layer is
 backend-agnostic — ROCm masquerades as CUDA (`torch.cuda.*`, `device="cuda"`) and the
 `"nccl"` backend maps to RCCL — so most of the framework works unchanged. This path is
-experimental, validated so far on **MI250X (gfx90a)**; see `docs/amd_lumi_port.md` for
-status and the feature-by-feature plan.
+experimental, validated so far on **AMD MI250X (gfx90a)**.
 
 CDNA2 (MI250X) has **no FP8**, so float8 training is refused automatically on ROCm
 regardless of config — train in bf16.

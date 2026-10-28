@@ -8,7 +8,6 @@
 # explicit chunked-loss mode. Single process only (no FSDP), fp32 weights, no compile.
 #
 #   python -m palingenesis train --config configs/rocm_seco_smoke.yaml
-#   # on LUMI: PGS_CONFIG=configs/rocm_seco_smoke.yaml bash scripts/lumi/sft_single_gcd.sh
 
 model:
   name_or_path: Qwen/Qwen3-0.6B
