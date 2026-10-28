@@ -3293,6 +3293,9 @@ float8 = [
 hybrid = [
     { name = "causal-conv1d", marker = "sys_platform == 'linux'" },
 ]
+learn = [
+    { name = "peft" },
+]
 logging = [
     { name = "trackio" },
     { name = "wandb" },
@@ -3352,6 +3355,7 @@ requires-dist = [
     { name = "palingenesis", extras = ["all"], marker = "extra == 'dev'" },
     { name = "palingenesis", extras = ["train", "float8", "logging", "loss", "optim", "prepare", "rl", "mcp"], marker = "extra == 'all'" },
     { name = "palingenesis", extras = ["vllm"], marker = "extra == 'vllm-server'" },
+    { name = "peft", marker = "extra == 'learn'", specifier = ">=0.15" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ray", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = ">=2.40" },
@@ -3370,7 +3374,7 @@ requires-dist = [
     { name = "vllm", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = "==0.26.0", index = "https://wheels.vllm.ai/0.26.0/cu129" },
     { name = "wandb", marker = "extra == 'logging'", specifier = ">=0.19.0" },
 ]
-provides-extras = ["train", "hybrid", "float8", "vllm", "rl", "agent-sandbox", "mcp", "vllm-server", "logging", "loss", "optim", "prepare", "all", "dev"]
+provides-extras = ["train", "hybrid", "float8", "vllm", "rl", "agent-sandbox", "mcp", "vllm-server", "learn", "logging", "loss", "optim", "prepare", "all", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3447,6 +3451,30 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/6a/6d/eed37d7ebc1e0bcd27b831c0cf1fe94881934316187c4b30d23f29ea0bd4/partial_json_parser-0.2.1.1.post7.tar.gz", hash = "sha256:86590e1ba6bcb6739a2dfc17d2323f028cb5884f4c6ce23db376999132c9a922", size = 10296, upload-time = "2025-11-17T07:27:41.202Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/42/32/658973117bf0fd82a24abbfb94fe73a5e86216e49342985e10acce54775a/partial_json_parser-0.2.1.1.post7-py3-none-any.whl", hash = "sha256:145119e5eabcf80cbb13844a6b50a85c68bf99d376f8ed771e2a3c3b03e653ae", size = 10877, upload-time = "2025-11-17T07:27:40.457Z" },
+]
+
+[[package]]
+name = "peft"
+version = "0.21.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "huggingface-hub" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.12' and sys_platform != 'linux') or (python_full_version >= '3.13' and sys_platform == 'linux')" },
+    { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and sys_platform != 'linux'" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch", version = "2.11.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
+    { name = "torch", version = "2.14.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "tqdm" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/80/af/2e08abf1cd3b8792a02f5116808f2398c2f77ecdff801ced2ce16007a6f9/peft-0.21.2.tar.gz", hash = "sha256:b803ccfb3f3f316004d850284306687833a2235ea278fb56abc856203456142e", size = 983614, upload-time = "2026-10-01T10:26:36.129Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/70/0b/59441cdbfdd342ed03c08af90a2fe16173f0cd48ab219f523b39ca059a79/peft-0.21.2-py3-none-any.whl", hash = "sha256:106ab6077ff72c54d21577f9af5970e34bac7582cb14209f7b2b511e322a4eae", size = 835427, upload-time = "2026-10-01T10:26:34.085Z" },
 ]
 
 [[package]]
