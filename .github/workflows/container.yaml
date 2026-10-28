@@ -41,7 +41,10 @@ jobs:
         # Debian packages receive security updates instead of fixed version pins.
         run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < Dockerfile
       - name: Validate deployment contracts and configuration
-        run: pytest -q tests/test_container_contract.py tests/test_config_validation.py
+        # test_accelerator / test_muon_rocm cover the AMD/ROCm guards (CUDA-vs-ROCm
+        # detection, FP8 refusal, quack). They monkeypatch torch's probes, so they run
+        # on the CPU wheel here with no GPU.
+        run: pytest -q tests/test_container_contract.py tests/test_config_validation.py tests/test_accelerator.py tests/test_muon_rocm.py
 
   container:
     needs: quality

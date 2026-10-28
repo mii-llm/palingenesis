@@ -198,5 +198,9 @@ full loop runs — colocate vLLM rollouts (~1000 tok/s) + pure-Python reward + G
 + checkpoint. **Margin surgery core validated**: `pgs surgery margins` computes decision-token
 margins on gfx90a (the `margins.py` forward machinery that **CMR** also rests on; full
 CMR-in-OPD and `surgery run` weight-edit reuse that validated core + device-agnostic torch —
-a light follow-up, they need curated tool-calling twins). Remaining: CI wiring; a known-good
-ROCm fla build. (Non-IPC server-topology weight sync is optional, not a blocker.)*
+a light follow-up, they need curated tool-calling twins). **CI wired**: the ROCm guard unit
+tests (`test_accelerator`, `test_muon_rocm`) now run in GitHub CI on the CPU wheel
+(monkeypatched, no GPU), and `scripts/lumi/acceptance.sh` is the one-command on-hardware
+smoke (unit tests + probe + SFT) — both green. **Follow-ups** (not blockers): a known-good
+ROCm fla build; causal-conv1d HIP build; full CMR/`surgery run` on curated twins; non-IPC
+server-topology weight sync. The port is ready for review → PR to `main`.*
