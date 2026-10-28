@@ -16,12 +16,15 @@ Modules:
   recipe    the rows of a session and their teachers
   adapter   MLP-only LoRA via PEFT, the frozen ancestor stack, exact stacking and export
   trainer   one training session of a scope
+  evaluate  metrics of a version paired against the live one, the exclusive matcher, the detectors
+  gates     publishing gates over the metrics (uncalibrated defaults until null-session calibration)
+  report    report.json, report.md and diagnostics.jsonl per session
   forget    purge a note from every file, prune the versions that held it, verify
   learner   Learner, the Python API
   cli       pgs learn
 
-Experimental: the recipe defaults are hypotheses until benchmarked, and evaluation gates, publishing and
-serving are not implemented yet.
+Experimental: the recipe defaults and the gate thresholds are hypotheses until benchmarked and calibrated,
+and serving (publishing to an inference server) is not implemented yet.
 """
 
 import warnings
@@ -32,8 +35,8 @@ class ExperimentalWarning(UserWarning):
 
 
 warnings.warn(
-    "palingenesis.learn is experimental: interfaces and defaults may change, and no evaluation gate checks a "
-    "trained adapter yet.",
+    "palingenesis.learn is experimental: interfaces and defaults may change, and the evaluation gates use "
+    "uncalibrated thresholds.",
     ExperimentalWarning,
     stacklevel=2,
 )

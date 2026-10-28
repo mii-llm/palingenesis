@@ -7,10 +7,14 @@
     pgs learn approve  STORE --scope S ID... [--reject | --as supersede|both|reject]
     pgs learn promote  STORE --scope S NOTE --to team:acme/support
     pgs learn forget   STORE --scope S ID...
-    pgs learn run      STORE --scope S [--live] [--section.option value ...]
+    pgs learn plan     STORE [--scope S] [--json]
+    pgs learn run      STORE --scope S [--live [--force]] [--no-eval] [--section.option value ...]
+    pgs learn eval     STORE --scope S [--version V] [--live [--force]] [--json] [--section.option value ...]
+    pgs learn status   STORE [--scope S] [--json]
 
 Scopes are org:<org>, team:<org>/<team>, user:<org>/<team>/<user>. Every command that changes the store
-takes its lock. Exit code 0 on success, 1 on an error or an unclean forget.
+takes its lock. Exit codes: 0 on success, 1 on an error, an unclean forget, failed gates (eval, or run
+--live) or an unhealthy status (a pending rebuild, a forced or ungated live version).
 """
 
 from __future__ import annotations
@@ -71,10 +75,93 @@ def build_parser() -> argparse.ArgumentParser:
     store_arg(p)
     p.add_argument("ids", nargs="+")
 
-    p = sub.add_parser("run", help="train the scope's adapter on its unconsolidated notes")
+    p = sub.add_parser("plan", help="what the next run would train and evaluate, and its estimated cost")
+    store_arg(p, scope=False)
+    p.add_argument("--scope", default=None, help="one scope (default: every scope, parents first)")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("run", help="train the scope's adapter on its unconsolidated notes, then evaluate it")
     store_arg(p)
-    p.add_argument("--live", action="store_true", help="make the new version live (ungated until evaluation lands)")
+    p.add_argument("--live", action="store_true", help="make the new version live if its gates pass")
+    p.add_argument("--force", action="store_true", help="with --live: make it live even if a gate fails (recorded)")
+    p.add_argument("--no-eval", dest="evaluate", action="store_false", help="train only (the version cannot go live)")
+
+    p = sub.add_parser("eval", help="evaluate a version against the scope's live version; exit 1 if a gate fails")
+    store_arg(p)
+    p.add_argument("--version", default=None, help="adapter version (default: the newest)")
+    p.add_argument("--live", action="store_true", help="make it live if its gates pass")
+    p.add_argument("--force", action="store_true", help="with --live: make it live even if a gate fails (recorded)")
+    p.add_argument("--json", action="store_true", help="print report.json")
+
+    p = sub.add_parser("status", help="scope tree, live versions, inbox and queue counts; exit 1 on issues")
+    store_arg(p, scope=False)
+    p.add_argument("--scope", default=None, help="a scope and its descendants (default: every scope)")
+    p.add_argument("--json", action="store_true")
     return ap
+
+
+def _publish(learner, scope: str, version: str, passed: bool, force: bool) -> int:
+    """--live after an evaluation: 0 when the version went live."""
+    from palingenesis.learn import StoreError
+
+    try:
+        learner.set_live(scope, version, force=force)
+    except StoreError as e:
+        print(f"not live: {e}", file=sys.stderr)
+        return 1
+    print(f"{scope}: {version} is live" + ("" if passed else " (FORCED past failed gates; recorded in the manifest)"))
+    return 0
+
+
+def _plan_text(plans: list[dict]) -> str:
+    lines = []
+    for p in plans:
+        if not p["steps"]:
+            lines.append(f"{p['scope']}: nothing to train")
+            continue
+        cost = (
+            f"about {p['minutes']} min (times measured by {p['measured_on']})"
+            if p["minutes"] is not None
+            else "unknown until a session has run on this store"
+        )
+        lines += [
+            f"{p['scope']}: {p['new_facts']} new facts from {p['new_notes']} notes, {p['active_facts']} active",
+            f"  rows per pass: {p['questions']} questions + {p['nearmiss_per_pass']} near-miss + "
+            f"{p['anchor_per_pass']} anchors; {p['replay_rows']} replay rows over {p['replay_facts']} facts; "
+            f"{p['passes']} passes = {p['rows']} rows, {p['steps']} steps",
+            f"  eval: about {p['eval_answers']} generated answers; served rank {p['served_rank']} "
+            f"({' + '.join(map(str, p['chain_ranks']))}); cost {cost}",
+        ]
+        lines += [f"  warning: {w}" for w in p["warnings"]]
+    return "\n".join(lines)
+
+
+def _status_text(status: dict) -> str:
+    lines = [f"store for org {status['org']} on {status['base']}"]
+    for e in status["scopes"]:
+        depth = {"org": 0, "team": 1, "user": 2}[e["scope"].split(":")[0]]
+        if e["scope"].startswith("user:") and e["scope"].count("/") == 1:
+            depth = 1
+        live = f"live {e['live']} ({e['live_state']})" if e["live"] else "no live version"
+        latest = ""
+        if e["latest"] and e["latest"] != e["live"]:
+            ev = e["latest_evaluation"]
+            verdict = (
+                "not evaluated"
+                if ev is None
+                else "gates passed"
+                if ev["passed"]
+                else f"failed {', '.join(ev['failed'])}"
+            )
+            latest = f"; newest {e['latest']} {verdict}"
+        lines.append(
+            f"{'  ' * depth}{e['scope']}: {live}{latest}; {e['notes']} notes, {e['facts']} facts "
+            f"({e['unconsolidated']} unconsolidated); inbox {e['inbox']}, admin queue {e['admin_queue']}"
+            + ("; REBUILD pending" if e["rebuild"] else "")
+        )
+    lines += [f"issue: {i}" for i in status["issues"]]
+    lines.append("healthy" if status["healthy"] else f"{len(status['issues'])} issue(s)")
+    return "\n".join(lines)
 
 
 def _rows(path: str) -> list[dict]:
@@ -86,7 +173,7 @@ def _rows(path: str) -> list[dict]:
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     args, extra = build_parser().parse_known_args(argv)
-    if extra and args.cmd != "run":
+    if extra and args.cmd not in ("run", "eval"):
         print(f"pgs learn {args.cmd}: unexpected arguments {extra}", file=sys.stderr)
         return 1
     print("pgs learn is experimental: interfaces and defaults may change.", file=sys.stderr)
@@ -157,17 +244,42 @@ def main(argv: list[str] | None = None) -> int:
             for path in report.leftovers:
                 print(f"  still holds forgotten text: {path}")
             return 0 if report.ok else 1
+        if args.cmd == "plan":
+            plans = learner.plan(args.scope)
+            print(json.dumps(plans, indent=2) if args.json else _plan_text(plans))
+            return 0
+        if args.cmd == "status":
+            status = learner.status(args.scope)
+            print(json.dumps(status, indent=2, ensure_ascii=False) if args.json else _status_text(status))
+            return 0 if status["healthy"] else 1
         if args.cmd == "run":
             learner.config.apply_overrides(extra)
             learner.config.validate()
-            result = learner.run(args.scope)
+            if args.live and not args.evaluate and not args.force:
+                raise ValueError("--live needs the evaluation (drop --no-eval, or add --force)")
+            result = learner.run(args.scope, evaluate=args.evaluate)
             print(result.summary())
             for w in result.warnings:
                 print(f"  warning: {w}")
+            evaluation = result.evaluation
+            if evaluation is not None:
+                print(evaluation.summary())
+                print(f"  report: {evaluation.session_dir / 'report.md'}")
             if args.live:
-                learner.set_live(args.scope, result.version)
-                print(f"{args.scope}: {result.version} is live (ungated)")
+                return _publish(learner, args.scope, result.version, bool(evaluation and evaluation.passed), args.force)
             return 0
+        if args.cmd == "eval":
+            learner.config.apply_overrides(extra)
+            learner.config.validate()
+            evaluation = learner.evaluate(args.scope, args.version)
+            if args.json:
+                print(json.dumps(evaluation.report, indent=2, ensure_ascii=False))
+            else:
+                print(evaluation.summary())
+                print(f"  report: {evaluation.session_dir / 'report.md'}")
+            if args.live:
+                return _publish(learner, args.scope, evaluation.report["version"], evaluation.passed, args.force)
+            return 0 if evaluation.passed else 1
     except (StoreError, LearnConfigError, KeyError, ValueError, ImportError) as e:
         print(f"pgs learn {args.cmd}: {e}", file=sys.stderr)
         return 1

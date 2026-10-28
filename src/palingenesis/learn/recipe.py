@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import math
 import random
-import re
 from dataclasses import dataclass, field
 
 from palingenesis.learn.config import LearnConfig
-from palingenesis.learn.generate import Generator, Question, decontaminate
+from palingenesis.learn.evaluate import META_REFERENCE  # noqa: F401 - the trainer's teacher-sample filter
+from palingenesis.learn.generate import Generator, Question, StubGenerator, decontaminate
 from palingenesis.learn.ingest import resolve_fact
 from palingenesis.learn.render import BM25, with_notes
 from palingenesis.learn.store import Fact, Note, ScopeStore
@@ -56,14 +56,6 @@ BUILTIN_ANCHORS = [
     "Give a one-paragraph definition of machine learning.",
 ]
 
-META_REFERENCE = re.compile(
-    r"\b(?:according to|based on|as (?:stated|mentioned|written) in|from) (?:the |my |your )?"
-    r"(?:notes?|context|reference notes|provided (?:notes|information|context))\b"
-    r"|\b(?:secondo|in base a|dalle|nelle|come (?:indicato|scritto) nelle) (?:le |alle )?note\b"
-    r"|\b(?:the|these|your|my) notes (?:say|state|mention)\b",
-    re.I,
-)
-
 
 @dataclass
 class Row:
@@ -84,6 +76,7 @@ class SessionPlan:
     steps: int
     replay_rows: int = 0
     warnings: list = field(default_factory=list)
+    abstain: list[Question] = field(default_factory=list)  # eval only: questions the notes do not answer
 
     @property
     def empty(self) -> bool:
@@ -140,6 +133,76 @@ def anchor_prompts(config: LearnConfig) -> list[str | list[dict]]:
     for row in read_jsonl(config.recipe.anchors_path):
         out.append(row["messages"] if "messages" in row else row["prompt"])
     return out
+
+
+def row_counts(n_questions: int, has_nearmiss: bool, n_replay: int, has_anchors: bool, recipe) -> tuple[int, int, int]:
+    """(near-miss rows per pass, anchor rows per pass, passes) for a session with these inputs."""
+    mix = recipe.mix
+    n_near = round(n_questions * mix.get("nearmiss", 0) / mix["new"]) if has_nearmiss else 0
+    n_anchor = min(recipe.max_anchor_rows, round(n_questions * mix.get("anchor", 0) / mix["new"])) if has_anchors else 0
+    if not n_questions and n_replay and has_anchors:
+        n_anchor = min(recipe.max_anchor_rows, round(n_replay * mix.get("anchor", 0) / max(mix.get("replay", 0), 1e-9)))
+    return n_near, n_anchor, recipe.passes if n_questions else 1
+
+
+def _replay_prompts(index: NotesIndex, pool: list[dict]) -> dict[str, list[dict]]:
+    """Stored prompts per active fact (a prompt of a superseded fact counts for its successor)."""
+    prompts_of: dict[str, list[dict]] = {}
+    for entry in pool:
+        for fact in index.resolve(entry.get("fact_ids", [])):
+            prompts_of.setdefault(fact.id, []).append(entry)
+    return prompts_of
+
+
+def _steps(n_rows: int, recipe) -> tuple[int, list[str]]:
+    steps = recipe.steps or math.ceil(n_rows / recipe.rows_per_step)
+    if steps > recipe.max_steps_per_session:
+        warning = (
+            f"{steps} steps exceed recipe.max_steps_per_session ({recipe.max_steps_per_session}): the session is cut, "
+            "so later rows get fewer passes; split a large first ingestion into several sessions instead."
+        )
+        return recipe.max_steps_per_session, [warning]
+    return steps, []
+
+
+def estimate_session(ss: ScopeStore, config: LearnConfig) -> dict:
+    """What plan_session would build, counted without calling the generator (pgs learn plan)."""
+    recipe, gen = config.recipe, config.generate
+    index = NotesIndex(ss)
+    active = [f for f in index.facts.values() if f.status == "active" and f.note_id in index.by_id]
+    new_facts = [f for f in active if f.consolidated_in is None]
+    new_ids = {f.id for f in new_facts}
+    corrections = sum(
+        1 for n in index.notes if n.kind == "correction" and n.prompt and any(f.note_id == n.id for f in new_facts)
+    )
+    questions = len(new_facts) * gen.questions_per_fact + corrections
+    per_fact_near = gen.nearmiss_per_fact
+    train_near = max(1, per_fact_near // 2) if per_fact_near > 1 else per_fact_near
+    pool = [r for r in ss.pool() if r.get("active", True)]
+    replay = sum(min(len(v), config.replay.visits_per_fact) for v in _replay_prompts(index, pool).values())
+    n_near, n_anchor, passes = row_counts(
+        questions, bool(new_facts) and train_near > 0, replay, bool(anchor_prompts(config)), recipe
+    )
+    rows = passes * (questions + n_near + n_anchor) + replay
+    steps, warnings = _steps(rows, recipe)
+    return {
+        "scope": str(ss.scope),
+        "new_facts": len(new_facts),
+        "new_notes": len({f.note_id for f in new_facts}),
+        "active_facts": len(active),
+        "consolidated_facts": len([f for f in active if f.id not in new_ids]),
+        "questions": questions,
+        "probes": len(new_facts) * gen.probes_per_fact,
+        "nearmiss_per_pass": n_near,
+        "anchor_per_pass": n_anchor,
+        "replay_rows": replay,
+        "replay_facts": len(_replay_prompts(index, pool)),
+        "passes": passes,
+        "rows": rows if questions or replay else 0,
+        "steps": steps if questions or replay else 0,
+        "sampled_tokens": (steps * recipe.rows_per_step * recipe.max_new_tokens) if questions or replay else 0,
+        "warnings": warnings,
+    }
 
 
 def plan_session(
@@ -206,10 +269,7 @@ def plan_session(
     # Replay: about visits_per_fact rows per fact with stored prompts, drawn from the pool. A prompt of a
     # superseded fact counts for its successor (and is answered from the successor's note).
     replay: list[Row] = []
-    prompts_of: dict[str, list[dict]] = {}
-    for entry in pool:
-        for fact in index.resolve(entry.get("fact_ids", [])):
-            prompts_of.setdefault(fact.id, []).append(entry)
+    prompts_of = _replay_prompts(index, pool)
     for fact_id in sorted(prompts_of):
         entries = prompts_of[fact_id]
         for entry in rng.sample(entries, min(len(entries), config.replay.visits_per_fact)):
@@ -217,15 +277,8 @@ def plan_session(
 
     rows: list[Row] = []
     anchors = anchor_prompts(config)
-    mix = recipe.mix
-    per_pass_new = len(questions)
-    n_near = round(per_pass_new * mix.get("nearmiss", 0) / mix["new"]) if nearmiss else 0
-    n_anchor = min(recipe.max_anchor_rows, round(per_pass_new * mix.get("anchor", 0) / mix["new"])) if anchors else 0
-    if not questions and replay:
-        n_anchor = min(
-            recipe.max_anchor_rows, round(len(replay) * mix.get("anchor", 0) / max(mix.get("replay", 0), 1e-9))
-        )
-    for _ in range(recipe.passes if questions else 1):
+    n_near, n_anchor, passes = row_counts(len(questions), bool(nearmiss), len(replay), bool(anchors), recipe)
+    for _ in range(passes):
         block = [new_row(q) for q in questions]
         block += [general_row("nearmiss", nearmiss[i % len(nearmiss)].text) for i in range(n_near)]
         block += [general_row("anchor", anchors[rng.randrange(len(anchors))]) for _ in range(n_anchor)]
@@ -242,12 +295,17 @@ def plan_session(
             merged.append(row)
         rows = merged + replay[r:]
 
-    warnings = []
-    steps = recipe.steps or math.ceil(len(rows) / recipe.rows_per_step)
-    if steps > recipe.max_steps_per_session:
-        warnings.append(
-            f"{steps} steps exceed recipe.max_steps_per_session ({recipe.max_steps_per_session}): the session is cut, "
-            "so later rows get fewer passes; split a large first ingestion into several sessions instead."
-        )
-        steps = recipe.max_steps_per_session
-    return SessionPlan(new_facts, questions, probes, nearmiss, rows, steps if rows else 0, len(replay), warnings)
+    # Questions the notes do not answer (confabulation probes), spread over the new facts.
+    abstain: list[Question] = []
+    if gen.abstain_per_session and new_facts:
+        ask = getattr(generator, "abstain", None) or StubGenerator().abstain
+        per_fact = max(1, math.ceil(gen.abstain_per_session / len(new_facts)))
+        known = list(active)
+        for fact in new_facts:
+            abstain += ask(fact, known, per_fact)
+        abstain = abstain[: gen.abstain_per_session]
+
+    steps, warnings = _steps(len(rows), recipe)
+    return SessionPlan(
+        new_facts, questions, probes, nearmiss, rows, steps if rows else 0, len(replay), warnings, abstain
+    )

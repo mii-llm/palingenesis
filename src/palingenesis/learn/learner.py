@@ -4,8 +4,9 @@
     org = learner.scope("org:acme")
     org.add_documents("acme-docs/**/*.md", approve=True)        # diffed against the stored source
     learner.remember("user:acme/support/ana", "my project is Orion")
-    result = learner.run("org:acme")                            # trains a new adapter version
-    learner.set_live("org:acme", result.version)                # ungated until evaluation lands
+    result = learner.run("org:acme")                            # trains and evaluates a new adapter version
+    print(result.evaluation.summary())                          # paired against the live version
+    learner.set_live("org:acme", result.version)                # refused when a gate failed (force=True)
     messages = learner.render_notes("user:acme/support/ana", messages)   # notes not yet consolidated
     learner.forget("user:acme/support/ana", ["n_..."])
 
@@ -375,24 +376,79 @@ class Learner:
     def forget(self, scope, ids: list[str]) -> ForgetReport:
         return forget(self.store, scope, ids)
 
-    def run(self, scope, model=None, tokenizer=None, sampler=None):
-        """Train the scope's adapter on its unconsolidated facts (plus replay and anchors): a new version."""
+    def run(self, scope, model=None, tokenizer=None, sampler=None, evaluate: bool = True):
+        """Train the scope's adapter on its unconsolidated facts (plus replay and anchors): a new version,
+        evaluated against the live one unless evaluate=False (result.evaluation)."""
         from palingenesis.learn.trainer import SessionRunner
 
         scope = self.scope(scope).id
-        return SessionRunner(self, scope, self.generator, model=model, tokenizer=tokenizer, sampler=sampler).run()
+        runner = SessionRunner(self, scope, self.generator, model=model, tokenizer=tokenizer, sampler=sampler)
+        return runner.run(evaluate=evaluate)
 
-    def set_live(self, scope, version: str, forced: bool = False) -> None:
+    def evaluate(self, scope, version: str | None = None, model=None, tokenizer=None, sampler=None, decline=None):
+        """Evaluate `version` (default: the newest) against the scope's live version; writes the session's
+        report.json / report.md / diagnostics.jsonl and the manifest's evaluation entry."""
+        from palingenesis.learn.evaluate import Evaluator
+        from palingenesis.learn.trainer import SessionRunner
+
+        scope = self.scope(scope).id
+        ss = self.store.scope(scope)
+        versions = [v for v in ss.versions() if not ss.manifest(v).get("pruned")]
+        version = version or (versions[-1] if versions else None)
+        if version is None or version not in ss.versions():
+            raise StoreError(f"{scope}: no adapter version {version or ''} to evaluate".replace("  ", " "))
+        with self.store.lock():
+            runner = SessionRunner(self, scope, None, model=model, tokenizer=tokenizer, sampler=sampler)
+            runner._load()
+            try:
+                runner.load_version(version)
+                return Evaluator(runner, decline=decline).run(version)
+            finally:
+                runner.release()
+
+    def gate_check(self, scope, version: str) -> list[str]:
+        """Why `version` may not go live: not evaluated, a failed gate, or an evaluation against a chain that
+        is no longer live. Empty when it may."""
+        from palingenesis.learn.evaluate import chain_versions, load_report
+
+        scope = ScopeId.parse(scope)
+        ss = self.store.scope(scope)
+        report = load_report(ss, version)
+        if report is None:
+            return [f"{version} was not evaluated (pgs learn eval)"]
+        reasons = []
+        failed = [g["name"] for g in report["gates"] if not g["passed"]]
+        if failed:
+            reasons.append(f"gates failed: {', '.join(failed)}")
+        if report["live_chain"] != chain_versions(self.store, scope):
+            reasons.append(
+                f"evaluated against {report['live_chain']}, but the live chain is now "
+                f"{chain_versions(self.store, scope)}: evaluate it again"
+            )
+        return reasons
+
+    def set_live(self, scope, version: str, force: bool = False) -> None:
         """Make `version` the scope's live adapter: its facts count as consolidated, its train questions join
-        the replay pool. Until the evaluation milestone this is ungated and recorded as such."""
+        the replay pool. Refused unless its evaluation against the current live chain passed every gate;
+        force=True overrides, and the manifest records the forced publish and why."""
         ss, _ = self._stores(scope)
+        scope = ss.scope
         with self.store.lock():
             manifest = ss.manifest(version)
             if manifest.get("pruned"):
                 raise StoreError(f"{version} was pruned ({manifest['pruned']['reason']}); train a new version.")
-            manifest["forced"] = forced or manifest.get("forced", False)
+            reasons = self.gate_check(scope, version)
+            if reasons and not force:
+                raise StoreError(f"{scope} {version} cannot go live: {'; '.join(reasons)} (force to override).")
+            manifest["gated"] = not reasons
+            manifest["forced"] = bool(reasons)
+            manifest["forced_reasons"] = reasons
             manifest["live_at"] = now()
             ss.write_manifest(version, manifest)
+            rebuild = self.store.state.get("rebuild") or []
+            if str(scope) in rebuild:
+                self.store.state["rebuild"] = [s for s in rebuild if s != str(scope)]
+                self.store.save_state()
             notes, facts = ss.notes(), ss.facts()
             note_ids, fact_ids = set(manifest["note_ids"]), set(manifest["fact_ids"])
             for n in notes:
@@ -419,6 +475,162 @@ class Learner:
                     known.add(row["q"])
             ss.write_pool(_cap_pool(pool, self.config.replay.max_prompts_per_fact))
             ss.set_live(version)
+
+    # ------------------------------------------------------------------ plan and status
+    def _timing(self) -> dict:
+        """Seconds per training row and per evaluation answer, measured by the newest session of this store."""
+        newest_train, newest_eval = None, None
+        for s in self.store.scopes():
+            ss = self.store.scope(s)
+            for session in ss.session_dirs():
+                train, report = session / "train.json", session / "report.json"
+                if train.exists() and (newest_train is None or train.stat().st_mtime > newest_train.stat().st_mtime):
+                    newest_train = train
+                if report.exists() and (newest_eval is None or report.stat().st_mtime > newest_eval.stat().st_mtime):
+                    newest_eval = report
+        out = {"seconds_per_row": None, "seconds_per_answer": None, "measured": None}
+        if newest_train is not None:
+            data = json.loads(newest_train.read_text())
+            rows = data.get("rows_processed") or len(data.get("losses", [])) * self.config.recipe.rows_per_step
+            if rows and data.get("seconds"):
+                out["seconds_per_row"] = data["seconds"] / rows
+                out["measured"] = str(newest_train.parent.relative_to(self.store.root))
+        if newest_eval is not None:
+            data = json.loads(newest_eval.read_text())
+            if data.get("generated_answers") and data.get("seconds"):
+                out["seconds_per_answer"] = data["seconds"] / data["generated_answers"]
+        return out
+
+    def _chain_ranks(self, scope: ScopeId) -> list[int]:
+        ranks = []
+        for s in scope.chain():
+            ss = self.store.scope(s)
+            if s != scope and ss.exists and ss.live is not None:
+                ranks.append(ss.manifest(ss.live)["rank"])
+            elif s == scope:
+                ranks.append(self.config.scopes.ranks[s.level])
+        return ranks
+
+    def plan(self, scope=None) -> list[dict]:
+        """What the next run of each scope (or of `scope`) would train and evaluate, and an estimated cost from
+        the times measured on this store. Nothing is generated or written."""
+        from palingenesis.learn.config import LearnConfigError
+        from palingenesis.learn.evaluate import load_drift_prompts, load_general_qa
+        from palingenesis.learn.recipe import estimate_session
+
+        scopes = [ScopeId.parse(scope)] if scope else self.store.scopes()
+        timing = self._timing()
+        cfg, ev = self.config, self.config.eval
+        out = []
+        for s in scopes:
+            ss = self.store.scope(s)
+            est = estimate_session(ss, cfg)
+            ranks = self._chain_ranks(s)
+            est["chain_ranks"] = ranks
+            try:
+                est["served_rank"] = served_rank(ranks)
+            except LearnConfigError as e:
+                est["served_rank"] = None
+                est["warnings"].append(str(e))
+            held_out_near = max(0, cfg.generate.nearmiss_per_fact - max(1, cfg.generate.nearmiss_per_fact // 2))
+            ancestors = sum(
+                len([f for f in self.store.scope(a).active_facts() if f.consolidated_in])
+                for a in s.chain()[:-1]
+                if self.store.scope(a).exists
+            )
+            probes = min(est["probes"], ev.max_probes_per_session)
+            closed = (
+                probes
+                + min(est["consolidated_facts"] * cfg.generate.probes_per_fact, ev.max_retention_probes)
+                + min(ancestors * cfg.generate.probes_per_fact, ev.max_ancestor_probes)
+                + len(load_general_qa(ev.general_qa_path))
+                + est["new_facts"] * held_out_near
+                + min(cfg.generate.abstain_per_session, 2 * est["new_facts"])
+            )
+            drift = min(len(load_drift_prompts(ev.drift_path)), ev.max_drift_prompts)
+            est["eval_answers"] = 2 * closed + probes + drift if est["steps"] else 0
+            minutes = None
+            if timing["seconds_per_row"] is not None:
+                seconds = est["steps"] * cfg.recipe.rows_per_step * timing["seconds_per_row"]
+                seconds += est["eval_answers"] * (timing["seconds_per_answer"] or 0.0)
+                minutes = round(seconds / 60, 1)
+            est["minutes"] = minutes
+            est["measured_on"] = timing["measured"]
+            out.append(est)
+        return out
+
+    def status(self, scope=None) -> dict:
+        """The scope tree with live versions, gate states, inbox / queue counts and pending rebuilds;
+        `issues` lists what needs a person (a pending rebuild, a forced or ungated live version)."""
+        from palingenesis.learn.config import LearnConfigError
+
+        root = ScopeId.parse(scope) if scope else None
+        queue = self.store.admin_queue()
+        rebuild = list(self.store.state.get("rebuild") or [])
+        entries, issues = [], []
+        for s in self.store.scopes():
+            if root is not None and root not in s.chain():
+                continue
+            ss = self.store.scope(s)
+            facts = ss.facts()
+            versions = ss.versions()
+            live = ss.live
+            entry = {
+                "scope": str(s),
+                "parent": str(s.parent) if s.parent else None,
+                "live": live,
+                "live_state": None,
+                "notes": len(ss.active_notes()),
+                "facts": sum(1 for f in facts if f.status == "active"),
+                "unconsolidated": sum(1 for f in facts if f.status == "active" and f.consolidated_in is None),
+                "inbox": len(ss.inbox()),
+                "admin_queue": sum(1 for r in queue if r.get("to_scope") == str(s)),
+                "versions": len(versions),
+                "latest": versions[-1] if versions else None,
+                "latest_evaluation": None,
+                "rebuild": str(s) in rebuild,
+                "served_rank": None,
+                "retention_trend": [],
+            }
+            if live is not None:
+                manifest = ss.manifest(live)
+                entry["live_state"] = (
+                    "forced" if manifest.get("forced") else "gated" if manifest.get("gated") else "ungated"
+                )
+                if manifest.get("forced"):
+                    issues.append(
+                        f"{s}: live {live} was forced past: {'; '.join(manifest.get('forced_reasons') or [])}"
+                    )
+                elif not manifest.get("gated"):
+                    issues.append(f"{s}: live {live} went live without passing gates")
+            if versions:
+                evaluation = ss.manifest(versions[-1]).get("evaluation")
+                if evaluation:
+                    entry["latest_evaluation"] = {"passed": evaluation["passed"], "failed": evaluation["failed"]}
+            for session in ss.session_dirs():
+                path = session / "report.json"
+                if path.exists():
+                    paired = json.loads(path.read_text())["metrics"]["retention"]["paired"]
+                    if paired["n"]:
+                        entry["retention_trend"].append([session.name, paired["net_loss"]])
+            try:
+                entry["served_rank"] = served_rank(self._chain_ranks(s))
+            except LearnConfigError as e:
+                issues.append(f"{s}: {e}")
+            if entry["rebuild"]:
+                issues.append(
+                    f"{s}: rebuild pending (forget pruned its adapter or the parent version it was trained on)"
+                )
+            entries.append(entry)
+        return {
+            "org": self.store.org,
+            "base": self.store.state["base"],
+            "scopes": entries,
+            "admin_queue": len(queue),
+            "rebuild": rebuild,
+            "issues": issues,
+            "healthy": not issues,
+        }
 
     def stack(self, scope, out: str | Path | None = None, pad: bool = True) -> Path:
         """The scope chain's live adapters stacked into one PEFT adapter (exact; padded to a vLLM rank)."""

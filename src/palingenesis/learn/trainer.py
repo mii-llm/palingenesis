@@ -12,8 +12,10 @@
                    sft mode trains cross-entropy on teacher samples. Teacher samples that mention the notes
                    ("according to the notes") are dropped
     5. save        adapters/vNNNN/ (PEFT format) + manifest.json, the session renamed to sNNNN
+    6. evaluate    (optional, default on) the new version against the live one on the same probes
+                   (evaluate.Evaluator, with the model already loaded): report.json / report.md
 
-A version goes live only through Learner.set_live (with gates, from the evaluation milestone on).
+A version goes live only through Learner.set_live, which requires its gates to pass (or force=True).
 
 Sampling is pluggable: HFSampler (the trained model's generate) now; VLLMColocateSampler is the interface
 for an in-process vLLM engine that receives the merged MLP weights W + s B A after every step.
@@ -106,6 +108,7 @@ class SessionResult:
     rows: int = 0
     dropped_probes: int = 0
     warnings: list = field(default_factory=list)
+    evaluation: object = None  # evaluate.EvalResult when the session was evaluated
 
     def summary(self) -> str:
         first = f"{self.losses[0]:.4f}" if self.losses else "-"
@@ -144,7 +147,8 @@ def write_session_files(path: Path, plan: SessionPlan, config) -> None:
         path / "questions.jsonl", [{"q": q.text, "kind": q.kind, "fact_ids": q.fact_ids} for q in plan.questions]
     )
     write_jsonl(path / "probes.jsonl", [{"q": q.text, "kind": q.kind, "fact_ids": q.fact_ids} for q in plan.probes])
-    write_jsonl(path / "nearmiss.jsonl", [{"q": q.text, "kind": q.kind} for q in plan.nearmiss])
+    write_jsonl(path / "nearmiss.jsonl", [{"q": q.text, "kind": q.kind, "fact_ids": q.fact_ids} for q in plan.nearmiss])
+    write_jsonl(path / "abstain.jsonl", [{"q": q.text, "kind": q.kind, "fact_ids": q.fact_ids} for q in plan.abstain])
     (path / "config.yaml").write_text(yaml.safe_dump(config.to_dict(), sort_keys=False, allow_unicode=True))
 
 
@@ -163,7 +167,13 @@ class SessionRunner:
     notebooks); the model is wrapped by PEFT in place."""
 
     def __init__(
-        self, learner, scope, generator: Generator, model=None, tokenizer=None, sampler: Sampler | None = None
+        self,
+        learner,
+        scope,
+        generator: Generator | None,
+        model=None,
+        tokenizer=None,
+        sampler: Sampler | None = None,
     ):
         self.learner = learner
         self.store = learner.store
@@ -343,7 +353,7 @@ class SessionRunner:
         return [(row, s, t, c) for (row, s, t), c in zip(encoded, completions) if c]
 
     # ------------------------------------------------------------------ run
-    def run(self) -> SessionResult:
+    def run(self, evaluate: bool = True) -> SessionResult:
         config, ss = self.config, self.ss
         with self.store.lock():
             discard_leftovers(ss)
@@ -369,8 +379,30 @@ class SessionRunner:
                 result.dropped_probes = dropped
             except BaseException:
                 remove_tree(tmp)
+                self.release()
                 raise
+            # The version is saved: an evaluation failure leaves it for `pgs learn eval`.
+            try:
+                if evaluate:
+                    from palingenesis.learn.evaluate import Evaluator
+
+                    result.evaluation = Evaluator(self).run(version)
+            finally:
+                self.release()
         return result
+
+    def load_version(self, version: str) -> None:
+        """Put `version`'s weights in the trained LoRA (role student) after _load (role previous = live)."""
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        set_peft_model_state_dict(self.peft, load_file(str(self.ss.version_dir(version) / adapters.ADAPTER_WEIGHTS)))
+
+    def release(self) -> None:
+        """Take the frozen ancestor hooks off the model (the PEFT wrapping stays)."""
+        if getattr(self, "frozen", None) is not None:
+            self.frozen.remove()
+            self.frozen = None
 
     def _train(self, plan: SessionPlan, rng: random.Random, session: str, version: str, tmp: Path) -> SessionResult:
         config, ss, recipe = self.config, self.ss, self.config.recipe
@@ -425,14 +457,19 @@ class SessionRunner:
             "pruned": None,
         }
         (tmp / "train.json").write_text(
-            json.dumps({"losses": losses, "seconds": round(time.time() - started, 1)}) + "\n"
+            json.dumps(
+                {
+                    "losses": losses,
+                    "seconds": round(time.time() - started, 1),
+                    "rows_processed": plan.steps * recipe.rows_per_step,
+                }
+            )
+            + "\n"
         )
         tmp.rename(ss.dir / "sessions" / session)
         # The manifest last: until it exists the weights are not a version (a killed run leaves them for
         # discard_leftovers and forget to delete).
         ss.write_manifest(version, manifest)
-        if self.frozen is not None:
-            self.frozen.remove()
         return SessionResult(
             str(ss.scope),
             session,

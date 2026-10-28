@@ -54,7 +54,7 @@ def fake_session(learner, scope, parents=None):
         "pruned": None,
     }
     ss.write_manifest(version, manifest)
-    learner.set_live(scope, version)
+    learner.set_live(scope, version, force=True)
     return version
 
 
@@ -199,3 +199,77 @@ def test_forget_at_a_parent_scrubs_descendant_conflicts_and_stale_values(learner
     assert all(b"25 euros" not in p.read_bytes() for p in store_files(learner))
     assert learner.inbox(USER)[0].payload["conflicts"] == []
     assert learner.approve(USER, [held.inbox_id], "both")[0].status == "stored"
+
+
+def test_scan_finds_short_pieces_as_whole_words(learner):
+    """A value or name under 12 characters left anywhere is a trace; trivial and still-stated ones are not."""
+    learner.remember(USER, "The codename of Nightjar is Kestrel.")
+    learner.remember(USER, "The seat limit of Orion Pro is 5.")
+    learner.remember(USER, "The mascot of Orion is a Kestrel.")  # kept: states the same word
+    learner.remember(USER, "The office of Nightjar is Lisbon.")
+    ss = learner.store.scope(USER)
+    by_text = {n.text: n.id for n in ss.active_notes()}
+    (learner.store.root / "stray.txt").write_text("someone wrote Lisbon here\n")
+    (learner.store.root / "word.txt").write_text("Lisboner is another word\n")
+    (learner.store.root / "seats.txt").write_text("5 seats, 5 euros\n")
+    report = learner.forget(
+        USER, [by_text["The office of Nightjar is Lisbon."], by_text["The seat limit of Orion Pro is 5."]]
+    )
+    # "Lisbon" (6 characters) is found; "Lisboner" is another word; "5" is trivial.
+    assert report.leftovers == ["stray.txt"]
+    # "Kestrel" is still stated by a kept note: not evidence of the forgotten one.
+    report = learner.forget(USER, [by_text["The codename of Nightjar is Kestrel."]])
+    assert report.ok and learner.store.scope(USER).active_notes()[0].text == "The mascot of Orion is a Kestrel."
+
+
+def test_forget_purges_nearmiss_abstain_answers_and_diagnostics(learner):
+    from palingenesis.learn import report as reporting
+    from palingenesis.learn.evaluate import Answers, compute_metrics, kl_increment
+
+    gone = learner.remember(USER, "The codename of Nightjar is Kestrel.").note_id
+    learner.remember(USER, KEEP)
+    version = fake_session(learner, USER)
+    ss = learner.store.scope(USER)
+    session = ss.dir / "sessions" / ss.manifest(version)["session"]
+    nightjar = [f.id for f in ss.facts() if f.subject == "Nightjar"]
+    # Near-miss and abstain rows carry the fact they were derived from.
+    nearmiss = [r for r in read_rows(session / "nearmiss.jsonl") if r["fact_ids"] == nightjar]
+    abstain = [r for r in read_rows(session / "abstain.jsonl") if r["fact_ids"] == nightjar]
+    assert nearmiss and abstain
+    # An evaluation's cached answers and diagnostics, one of them a leak with no fact id of its own.
+    rows = [
+        {"key": "a", "q": "Capital of France?", "fact_ids": [], "answer": "Kestrel, probably"},
+        {"key": "b", "q": "Capital of Italy?", "fact_ids": [], "answer": "Rome"},
+    ]
+    (session / "answers.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    metrics, _ = compute_metrics([], Answers([], [], []), [])
+    metrics["drift"] = kl_increment(None, None, 0, 0)
+    report = {"scope": USER, "version": version, "session": session.name, "created": "t", "live_chain": []}
+    report.update({"calibrated": False, "passed": True, "gates": [], "warnings": [], "metrics": metrics})
+    diagnostics = [
+        {
+            "metric": "acquisition",
+            "q": "Codename of Nightjar?",
+            "answer": "?",
+            "expected": "Kestrel",
+            "fact_ids": nightjar,
+            "note_ids": [gone],
+            "notes": ["The codename of Nightjar is Kestrel."],
+        }
+    ]
+    reporting.write(session, report, diagnostics)
+    assert "Kestrel" in (session / "report.md").read_text()
+    result = learner.forget(USER, [gone])
+    assert result.ok, result.leftovers
+    assert not [r for r in read_rows(session / "nearmiss.jsonl") if r["fact_ids"] == nightjar]
+    assert all(r["fact_ids"] != nightjar for r in read_rows(session / "abstain.jsonl"))
+    assert [r["key"] for r in read_rows(session / "answers.jsonl")] == ["b"]
+    assert "Kestrel" not in (session / "report.md").read_text()
+    for path in store_files(learner):
+        assert b"Kestrel" not in path.read_bytes(), path
+
+
+def read_rows(path):
+    from palingenesis.learn.store import read_jsonl
+
+    return read_jsonl(path)

@@ -2,8 +2,9 @@
 
 !!! warning "Experimental"
     `pgs learn` lives on a feature branch. Its interfaces and defaults may change, and every recipe default
-    is a hypothesis until a benchmark settles it. Evaluation gates, publishing and serving are not
-    implemented yet: a trained adapter is not checked before you make it live.
+    is a hypothesis until a benchmark settles it. Each trained version is evaluated and gated before it can
+    go live, but the gate thresholds are **uncalibrated** defaults until a calibration on null sessions sets
+    them. Serving integration (publishing to an inference server) is not implemented yet.
 
 `palingenesis.learn` keeps what a deployed model must know per **scope** (an organization, a team, a person)
 and consolidates it into one small LoRA adapter per scope.
@@ -12,7 +13,9 @@ and consolidates it into one small LoRA adapter per scope.
 pip install 'palingenesis[learn]'
 pgs learn init stores/acme --base Qwen/Qwen3.5-4B --org acme
 pgs learn add stores/acme --scope org:acme --documents "docs/**/*.md" --approve
-pgs learn run stores/acme --scope org:acme --live
+pgs learn plan stores/acme                      # what the next run trains, and its estimated cost
+pgs learn run stores/acme --scope org:acme --live   # train, evaluate, go live if the gates pass
+pgs learn status stores/acme
 ```
 
 ## Why this matters
@@ -92,11 +95,13 @@ Every note passes a PII filter before anything is written, the inbox included.
 | category | examples | user scope | team / org scope |
 |---|---|---|---|
 | secret | API keys, private keys, passwords, card numbers (Luhn), IBANs (checksum) | rejected | rejected |
-| personal | emails, phone numbers, Italian codice fiscale, US social security numbers | kept (default) | redacted (default) |
+| personal | emails, phone numbers, Italian codice fiscale and partita IVA, US social security numbers, street addresses | kept (default) | redacted (default) |
 
 `pii.user_scope_personal` and `pii.shared_scope_personal` take `allow`, `redact` or `block` (held for review).
-The regex detectors are a baseline (no postal addresses, no national ids beyond the codice fiscale and US
-SSN): pass your own detectors (any object with `find(text)`) to `PIIFilter`.
+The regex detectors are a baseline: emails; international, Italian mobile and landline numbers (spaced
+forms included; amounts, dates and ISBNs are not taken for phones); the codice fiscale and partita IVA
+(with their check characters); US SSNs; a basic street-address pattern (`via Roma 12`, `221 Baker Street`).
+Pass your own detectors (any object with `find(text)`, such as a wrapper around Presidio) to `PIIFilter`.
 
 ## Quickstart
 
@@ -112,9 +117,17 @@ pgs learn add stores/acme --scope user:acme/support/ana --note "My project is Or
 pgs learn inbox stores/acme --scope user:acme/support/ana
 pgs learn approve stores/acme --scope user:acme/support/ana i_3f2a...
 
-# Train the scope's adapter on its new facts; --live makes the version live
+# What the next run would train and evaluate, and its cost (measured on this store once a session ran)
+pgs learn plan stores/acme
+
+# Train the scope's adapter on its new facts and evaluate it against the live version;
+# --live makes it live only if every gate passes
 pgs learn run stores/acme --scope org:acme --live
 pgs learn run stores/acme --scope user:acme/support/ana --live --recipe.passes 2
+
+# Evaluate again (exit 1 if a gate fails); --live --force publishes past a failed gate, recorded
+pgs learn eval stores/acme --scope org:acme --version v0003
+pgs learn status stores/acme                  # exit 1 on a pending rebuild or a forced live version
 
 # Next week: refreshed documents supersede the changed chunks only
 pgs learn add stores/acme --scope org:acme --documents "**/*.md" --root acme-docs --approve
@@ -132,8 +145,9 @@ from palingenesis.learn import Learner
 learner = Learner.init("stores/acme", base="Qwen/Qwen3.5-4B", org="acme")
 learner.scope("org:acme").add_documents("**/*.md", root="acme-docs", approve=True)
 learner.intake("user:acme/support/ana", [{"role": "user", "content": "ricorda che preferisco risposte brevi"}])
-result = learner.run("org:acme")
-learner.set_live("org:acme", result.version)
+result = learner.run("org:acme")               # trains, then evaluates against the live version
+print(result.evaluation.summary())
+learner.set_live("org:acme", result.version)   # StoreError if a gate failed (force=True overrides)
 composite = learner.stack("user:acme/support/ana")   # org + team + user as one PEFT adapter
 messages = learner.render_notes("user:acme/support/ana", messages)   # notes not consolidated yet
 report = learner.forget("user:acme/support/ana", ["n_8c1d..."])
@@ -173,13 +187,79 @@ student is P plus the scope's adapter, warm-started from its live version.
   largely stored in mid-layer MLPs (ROME, arXiv 2202.05262; MEMIT, arXiv 2210.07229; Geva et al., arXiv
   2012.14913). Whether multi-hop or document-level facts need attention targets is an open question.
 
-Each session writes `sessions/sNNNN/` (questions, probes, near-miss prompts, config, losses) and
-`adapters/vNNNN/` (a PEFT adapter and a manifest listing the notes active during training and the parent
-versions it was trained on). A failed session leaves no files behind.
+Each session writes `sessions/sNNNN/` (questions, probes, near-miss and abstain prompts, config, losses,
+and the evaluation's report) and `adapters/vNNNN/` (a PEFT adapter and a manifest listing the notes active
+during training, the parent versions it was trained on, and its evaluation). A failed session leaves no
+files behind.
 
 !!! note "What the CPU tests show"
     The test suite runs the whole loop on tiny random models. It checks mechanics (rows, teachers, frozen
     ancestors, stacking, crash safety), not that facts are learned.
+
+## Reports and gates
+
+Every metric compares two chains on the same probes, greedy, with the deployment system prompt: the
+**candidate** (the ancestors' live adapters plus the new version) and the **live** chain (the ancestors'
+live adapters plus the scope's live version, or none yet). The in-context ceiling is the parent stack with
+the notes in the prompt and no adapter of the scope.
+
+| metric | probes | measure |
+|---|---|---|
+| acquisition | held-out probes of the session's new facts | answered closed-book, among the probes the in-context ceiling answers |
+| update | probes of facts that superseded an older value | the new value, same measure |
+| stale | probes of every superseded fact of the scope | answers stating an old value |
+| retention | probes of the scope's earlier, consolidated facts | paired counts vs live: lost, gained, net loss |
+| ancestor retention | probes of the ancestors' facts, asked of the whole chain | paired counts vs live |
+| general QA | a short multilingual set (`eval.general_qa_path` to replace it) | paired counts vs live |
+| leak | near-miss probes (the same question about a real entity) and general QA | answers that changed vs live, are wrong, and name an entity of the scope that the live answer did not |
+| confabulation | questions the notes do not answer: an unstated attribute, an invented sibling (`Orion Ultra`) | answered instead of declined, paired vs live |
+| meta-reference | every closed-book answer, and the reasoning of a thinking model | mentions of "my notes", "the context", "secondo le mie note" |
+| drift | fixed general prompts | KL(target ‖ model) per token, target = the anchor teacher (the parent stack plus relevant and instruction notes); the increment vs live and the absolute value |
+
+- Answers are scored with an **exclusive matcher**: the answer states the expected value and none of its
+  competitors (the fact's stale values, the values other entities have for the same attribute, and for
+  general QA the scope's own entities). "25 or 30 euros" is wrong.
+- The decline detector covers English, Italian, Spanish, French and German; pass `decline=` to
+  `Learner.evaluate` to use a judge instead.
+- Rates are shown with Wilson 95% intervals; the gates use the counts. Paired counts come with an exact
+  McNemar p-value, for reading only.
+- The live chain's answers are cached in the session's `answers.jsonl`, so they are reused from the
+  evaluation that made the live version a candidate, and only new probes are asked of both.
+
+Each evaluation writes `report.json` (counts, rates, gates; no note text), `report.md` (a summary with the
+failed probes, their answers and the note text, so a note can be fixed) and `diagnostics.jsonl` (every
+failed probe). The manifest of the version records the outcome.
+
+| gate | default | passes when |
+|---|---|---|
+| `acquisition_min` | 0.80 | acquisition (relative to the in-context ceiling) is at least this |
+| `update_min` | 0.80 | update is at least this |
+| `stale_max` | 0.05 | stale is at most this |
+| `retention_max_net_loss` | 3 | lost minus gained earlier facts vs live |
+| `ancestor_retention_max_net_loss` | 3 | same, on the ancestors' facts |
+| `general_qa_max_net_loss` | 5 | same, on general QA |
+| `leak_max_net` | 2 | leaking answers |
+| `confab_max_net` | 2 | newly confabulated minus newly declined |
+| `meta_reference_max` | 0.02 | share of answers mentioning notes |
+| `drift_increment_max` | 0.03 | KL increment vs live, nats per token |
+| `drift_cap` | 0.15 | KL to the target, nats per token |
+
+A gate with nothing to measure (no superseded fact, no earlier fact) is skipped. A failed gate blocks
+`set_live` / `--live`, and the notes stay in the prompt (`render_notes`); `--force` publishes anyway and
+the manifest records it with the reasons, which `status` reports as an issue. A version evaluated against
+a live chain that has changed since must be evaluated again.
+
+!!! warning "Uncalibrated thresholds"
+    The defaults above are not calibrated (`gates.calibrated: false`, shown in every report). They will be
+    set from null sessions (the same session rerun with another seed, notes already known, replay and
+    anchors only) to a per-gate false-fail rate, with the family-wise rate published. Until then, read a
+    failed gate together with its counts, and expect some false fails, especially on small scopes.
+
+`pgs learn plan` counts what the next run of each scope would train (new facts, questions, near-miss,
+anchor and replay rows, steps) and evaluate, checks the stacked rank against vLLM's accepted ranks, and
+estimates the time from the last session measured on the same store. `pgs learn status` prints the scope
+tree with live versions, gate states, unconsolidated facts, inbox and admin-queue counts, pending rebuilds
+and the retention trend per session (`--json` for scripts; exit 1 when something needs a person).
 
 ## Forget
 
@@ -193,7 +273,13 @@ versions it was trained on). A failed session leaves no files behind.
    loses its weights, and every stacked composite built from such a version is deleted. The scope, and descendants trained on a pruned parent, are
    marked for rebuild: run `pgs learn run` again.
 3. **Verify**: every file of the store is searched for the note's text and its facts' sentences (pieces of 12
-   characters or more). The command exits with 1 and lists the files if any still hold one.
+   characters or more), and every text file for its facts' subjects and values of any length as whole words
+   ("Kestrel", "42 kg"). Trivial pieces (under 3 characters, common words, numbers of fewer than 4 digits)
+   and pieces that a kept note, fact or inbox item still states are not searched. The command exits with 1
+   and lists the files if any still hold one.
+
+Session rows derived from the note (questions, probes, near-miss and abstain prompts, cached evaluation
+answers, diagnostics), in the scope and in its descendants, are purged too, and `report.md` is rendered again.
 
 ## Store layout
 
@@ -204,7 +290,8 @@ stores/acme/
   admin_queue.jsonl         promotions waiting for an admin
   scopes/org/acme/
     sources.jsonl notes.jsonl facts.jsonl inbox.jsonl tombstones.jsonl
-    sessions/sNNNN/         questions, probes, near-miss prompts, config, losses
+    sessions/sNNNN/         questions, probes, near-miss and abstain prompts, config, losses,
+                            report.json, report.md, diagnostics.jsonl, answers.jsonl
     pool/replay.jsonl       replay prompts only (no answers)
     adapters/vNNNN/         PEFT adapter + manifest.json
     LIVE
@@ -243,6 +330,7 @@ generate:
   questions_per_fact: 4
   probes_per_fact: 2
   nearmiss_per_fact: 2
+  abstain_per_session: 20            # questions the notes do not answer (confabulation probes)
 recipe:
   mode: distill                      # distill | sft
   divergence: fkl                    # fkl | rkl | jsd
@@ -257,12 +345,34 @@ recipe:
 replay:
   visits_per_fact: 1
   max_prompts_per_fact: 4
+eval:
+  max_probes_per_session: 200        # acquisition and update probes
+  max_retention_probes: 200
+  max_ancestor_probes: 100
+  general_qa_path: ""                # JSONL of {"q", "answers": [...]}; empty = built-in multilingual set
+  drift_path: ""                     # JSONL of {"prompt"} or {"messages"}; empty = built-in prompts
+  max_drift_prompts: 32
+  max_new_tokens: 64
+gates:
+  calibrated: false                  # the defaults below are uncalibrated
+  acquisition_min: 0.80
+  update_min: 0.80
+  stale_max: 0.05
+  retention_max_net_loss: 3
+  ancestor_retention_max_net_loss: 3
+  general_qa_max_net_loss: 5
+  leak_max_net: 2
+  confab_max_net: 2
+  meta_reference_max: 0.02
+  drift_increment_max: 0.03
+  drift_cap: 0.15
 ```
 
 ## Limits
 
-- Experimental; defaults are untested hypotheses at scale.
-- No evaluation gates, reports, publishing or serving integration yet; `--live` is ungated.
+- Experimental; recipe defaults are untested hypotheses at scale, and the gate thresholds are uncalibrated.
+- The CPU tests check the evaluation's mechanics on tiny random models, not that its thresholds are right.
+- No publishing to inference servers, parity canary or proxy yet; `--live` sets the store's live version.
 - On-policy sampling uses HF `generate` (slow); the colocated vLLM sampler is an interface only.
 - MLP-only LoRA; no MoE expert adapters.
 - Not a replacement for retrieval over large corpora.

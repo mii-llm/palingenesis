@@ -11,7 +11,15 @@
                 trained on top of a pruned version are marked for rebuild, and their inbox conflicts and
                 stale values that name a forgotten fact lose them
     3. verify   every file under the store is searched (bytes) for the note's text and its facts'
-                sentences; the report lists any file that still holds one and holds no text itself
+                sentences (pieces of 12 characters or more), and every text file for its facts' subjects
+                and values of any length as whole words; the report lists any file that still holds one
+                and holds no text itself
+
+Short pieces (a name, a value: "Kestrel", "42 kg") are searched as whole words, except trivial ones that
+would match anything (under 3 characters, common words, numbers of fewer than 4 digits) and ones that
+legitimately remain: stated by a note, fact or inbox item that is kept, or in the store's state and
+manifests. Session rows (questions, probes, answers, diagnostics) that state such a piece are purged
+with the note, and report.md is rendered again without them.
 
 Rebuilding the scope's adapter from its remaining notes is a training run (`pgs learn run`); servers
 unload pruned names when serving lands.
@@ -21,13 +29,33 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from palingenesis.learn.store import ScopeId, Store, now, read_jsonl, remove_tree, sha256_text, write_jsonl
+from palingenesis.learn.evaluate import trivial
+from palingenesis.learn.report import render_again
+from palingenesis.learn.store import (
+    STATE_FILE,
+    ScopeId,
+    Store,
+    normalize,
+    now,
+    read_jsonl,
+    remove_tree,
+    sha256_text,
+    write_jsonl,
+)
 
-SESSION_FILES = ("questions.jsonl", "probes.jsonl", "nearmiss.jsonl")
-MIN_NEEDLE = 12  # shorter strings (a bare value, a name) are too common to search for
+SESSION_FILES = (
+    "questions.jsonl",
+    "probes.jsonl",
+    "nearmiss.jsonl",
+    "abstain.jsonl",
+    "answers.jsonl",
+    "diagnostics.jsonl",
+)
+MIN_NEEDLE = 12  # texts are searched as substrings from this length; shorter pieces as whole words
 
 
 @dataclass
@@ -73,18 +101,81 @@ def _needles(texts: list[str]) -> list[bytes]:
     return [n.encode() for n in out]
 
 
-def scan(root: Path, texts: list[str]) -> list[str]:
-    """Files under `root` whose bytes contain any of `texts` (or a line of one)."""
+def _word_pattern(pieces: list[str]) -> re.Pattern | None:
+    """Whole-word matcher of `pieces` as written, inside JSON (escaped) or plain text."""
+    forms = set()
+    for piece in pieces:
+        forms |= {piece, json.dumps(piece)[1:-1], json.dumps(piece, ensure_ascii=False)[1:-1]}
+    if not forms:
+        return None
+    alternatives = "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
+    return re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.I)
+
+
+def short_pieces(values: list[str], kept: str) -> list[str]:
+    """The values worth a whole-word search: not trivial, and not stated by what the store keeps (`kept`)."""
+    kept = f" {normalize(kept)} "
+    out = []
+    for value in values:
+        value = str(value).strip()
+        if value and not trivial(value) and f" {normalize(value)} " not in kept and value not in out:
+            out.append(value)
+    return out
+
+
+def scan(root: Path, texts: list[str], pieces: list[str] | None = None) -> list[str]:
+    """Files under `root` whose bytes contain any of `texts` (or a line of one), or whose text states one of
+    `pieces` as a whole word (already screened by short_pieces; binary files are not searched for them)."""
     needles = _needles(texts)
-    if not needles:
+    words = _word_pattern(pieces or [])
+    if not needles and words is None:
         return []
     hits = []
     for path in sorted(Path(root).rglob("*")):
-        if path.is_file():
-            data = path.read_bytes()
-            if any(n in data for n in needles):
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        if any(n in data for n in needles):
+            hits.append(str(path.relative_to(root)))
+            continue
+        if words is not None:
+            try:
+                text = data.decode()
+            except UnicodeDecodeError:
+                continue  # adapter weights: a short string matches random bytes
+            if words.search(text):
                 hits.append(str(path.relative_to(root)))
     return hits
+
+
+def _kept_text(store: Store) -> str:
+    """What legitimately stays after a forget: every scope's notes, facts, inbox and pool, the admin queue,
+    the store state and the version manifests."""
+    parts = [(store.root / STATE_FILE).read_text()]
+    parts.append(json.dumps(store.admin_queue(), ensure_ascii=False))
+    for s in store.scopes():
+        ss = store.scope(s)
+        parts += [n.text for n in ss.notes()]
+        parts += [
+            f"{f.subject} | {f.attribute} | {f.value} | {f.sentence} | {' | '.join(f.stale_values)}" for f in ss.facts()
+        ]
+        parts += [json.dumps(i.payload, ensure_ascii=False) for i in ss.inbox()]
+        parts += [(ss.version_dir(v) / "manifest.json").read_text() for v in ss.versions()]
+    return "\n".join(parts)
+
+
+def _purge_sessions(cs, derived, report: ForgetReport) -> None:
+    for session in cs.session_dirs():
+        changed = False
+        for name in SESSION_FILES:
+            rows = read_jsonl(session / name)
+            kept = [r for r in rows if not derived(r)]
+            if len(kept) != len(rows):
+                report.session_rows += len(rows) - len(kept)
+                write_jsonl(session / name, kept)
+                changed = True
+        if changed:
+            render_again(session)
 
 
 def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
@@ -109,6 +200,8 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
         gone_facts = {f.id for f in facts if f.note_id in gone_notes}
         texts += [f.sentence for f in facts if f.id in gone_facts and f.sentence]
         gone_values = {f.value for f in facts if f.id in gone_facts}
+        # Short pieces: the values (old ones included) and subjects of the forgotten facts.
+        values = [v for f in facts if f.id in gone_facts for v in (f.value, f.subject, *f.stale_values)]
         kept_inbox = []
         for item in inbox:
             payload = json.dumps(item.payload, ensure_ascii=False)
@@ -116,6 +209,9 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
             if item.id in wanted:
                 texts.append(note.get("text", ""))
                 texts += [d.get("sentence", "") for d in item.payload.get("drafts", [])]
+                values += [
+                    v for d in item.payload.get("drafts", []) for v in (d.get("value", ""), d.get("subject", ""))
+                ]
                 texts += [c.get("text", "") for c in item.payload.get("chunks", [])]  # a pending document
                 report.inbox += 1
             elif note.get("id") in gone_notes or any(n in payload for n in gone_notes | gone_facts):
@@ -167,25 +263,6 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
             report.inbox += len(queue) - len(kept_queue)
             store.write_admin_queue(kept_queue)
 
-        def derived(row: dict) -> bool:
-            if set(row.get("fact_ids", [])) & gone_facts or set(row.get("note_ids", [])) & gone_notes:
-                return True
-            blob = json.dumps(row, ensure_ascii=False)
-            return any(t in blob or json.dumps(t)[1:-1] in blob for t in texts if len(t) >= MIN_NEEDLE)
-
-        pool = ss.pool()
-        kept_pool = [r for r in pool if not derived(r)]
-        report.replay_rows = len(pool) - len(kept_pool)
-        if report.replay_rows:
-            ss.write_pool(kept_pool)
-        for session in ss.session_dirs():
-            for name in SESSION_FILES:
-                rows = read_jsonl(session / name)
-                kept = [r for r in rows if not derived(r)]
-                if len(kept) != len(rows):
-                    report.session_rows += len(rows) - len(kept)
-                    write_jsonl(session / name, kept)
-
         # Descendants keep no copy of the note, but a conflict with one of its facts (held in a child's inbox)
         # and a child's fact that superseded it (stale values) still name its value.
         for child in store.children(scope):
@@ -208,6 +285,27 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
                         item.reason = item.reason or "the conflicting note was forgotten: settle as both or reject"
             if changed:
                 cs.write_inbox(child_inbox)
+
+        # A piece also stated by what the store keeps (another note, the config) is not evidence of the note.
+        pieces = short_pieces(values, _kept_text(store))
+        words = _word_pattern(pieces)
+
+        def derived(row: dict) -> bool:
+            if set(row.get("fact_ids", [])) & gone_facts or set(row.get("note_ids", [])) & gone_notes:
+                return True
+            blob = json.dumps(row, ensure_ascii=False)
+            if any(t in blob or json.dumps(t)[1:-1] in blob for t in texts if len(t) >= MIN_NEEDLE):
+                return True
+            return words is not None and bool(words.search(blob))
+
+        # The scope's files, and its descendants': their evaluations ask the ancestors' probes of the chain.
+        for cs in [ss] + [store.scope(c) for c in store.children(scope)]:
+            pool = cs.pool()
+            kept_pool = [r for r in pool if not derived(r)]
+            if len(kept_pool) != len(pool):
+                report.replay_rows += len(pool) - len(kept_pool)
+                cs.write_pool(kept_pool)
+            _purge_sessions(cs, derived, report)
 
         # 2. prune adapter versions and composites that contain the note. A version warm-started from a pruned
         # one inherits its weights, so it is pruned too, even when the note was no longer active.
@@ -263,5 +361,5 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
         store.save_state()
 
         # 3. verify
-        report.leftovers = scan(store.root, texts)
+        report.leftovers = scan(store.root, texts, pieces)
     return report

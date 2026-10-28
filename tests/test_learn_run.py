@@ -66,6 +66,25 @@ class FixedSampler:
         return [list(self.ids) for _ in prompts]
 
 
+class KeySampler:
+    """Answers from a {subject: value} table per role (student = candidate, previous = live, parent = P with
+    or without notes): the value of the subject the user turn names, else "I don't know." Records calls."""
+
+    def __init__(self, tok, knows: dict[str, dict[str, str]]):
+        self.tok, self.knows, self.calls = tok, knows, []
+        self.end = tok.convert_tokens_to_ids("<|im_end|>")
+
+    def generate(self, prompts, max_new_tokens, temperature, role):
+        out = []
+        for p in prompts:
+            user = self.tok.decode(p).split("<|im_start|>user")[-1]
+            self.calls.append((role, user))
+            table = self.knows.get(role, {})
+            answer = next((f"It is {v}." for s, v in table.items() if s.lower() in user.lower()), "I don't know.")
+            out.append(self.tok.encode(answer, add_special_tokens=False) + [self.end])
+        return out
+
+
 def make_learner(tmp_path, base, **recipe):
     config = LearnConfig()
     config.generate.generator = "stub"
@@ -76,6 +95,9 @@ def make_learner(tmp_path, base, **recipe):
     config.recipe.max_new_tokens = 8
     config.recipe.rows_per_step = 8
     config.recipe.passes = 2
+    config.eval.max_new_tokens = 8
+    config.eval.drift_max_new_tokens = 4
+    config.eval.max_drift_prompts = 3
     for key, value in recipe.items():
         setattr(config.recipe, key, value)
     return Learner.init(tmp_path / "store", base, "acme", config)
@@ -98,7 +120,7 @@ def test_run_lowers_the_loss_and_records_the_version(tmp_path, base):
     assert (session / "questions.jsonl").exists() and json.loads((session / "train.json").read_text())["losses"]
     assert not list((ss.dir / "sessions").glob("*.tmp"))
     assert ss.live is None  # a version goes live only when asked
-    learner.set_live("org:acme", result.version)
+    learner.set_live("org:acme", result.version, force=True)
     assert ss.live == result.version and all(f.consolidated_in == result.version for f in ss.active_facts())
     assert len(ss.pool()) == len((session / "questions.jsonl").read_text().splitlines())
     # The saved adapter is a PEFT LoRA on the MLP projections only.
@@ -120,12 +142,12 @@ def test_hf_sampler_ancestors_and_stacking(tmp_path, base):
     learner = make_learner(tmp_path, path, steps=2, max_new_tokens=4)
     learner.add_notes("org:acme", ["The price of Orion Pro is 25 euros."], approve=True)
     org = learner.run("org:acme")  # HF generate, on-policy and teacher samples
-    learner.set_live("org:acme", org.version)
+    learner.set_live("org:acme", org.version, force=True)
     learner.remember(USER, "my project is Orion")
     user = learner.run(USER)
     manifest = learner.store.scope(USER).manifest(user.version)
     assert manifest["parent_versions"] == {"org:acme": org.version} and manifest["rank"] == 2
-    learner.set_live(USER, user.version)
+    learner.set_live(USER, user.version, force=True)
     composite = learner.stack(USER)
     stacked = json.loads((composite / "manifest.json").read_text())
     assert stacked["chain"] == [["org:acme", org.version], [USER, user.version]]
@@ -144,7 +166,7 @@ def test_warm_start_and_replay(tmp_path, base):
     learner = make_learner(tmp_path, path, steps=2)
     learner.add_notes("org:acme", ["The price of Orion Pro is 25 euros."], approve=True)
     first = learner.run("org:acme", sampler=FixedSampler(tok))
-    learner.set_live("org:acme", first.version)
+    learner.set_live("org:acme", first.version, force=True)
     learner.add_notes("org:acme", ["The colour of Orion Team is blue."], approve=True)
     second = learner.run("org:acme", sampler=FixedSampler(tok))
     manifest = learner.store.scope("org:acme").manifest(second.version)
@@ -157,7 +179,7 @@ def test_previous_model_teacher_arms_train(tmp_path, base, arm):
     path, tok = base
     learner = make_learner(tmp_path, path, steps=2, onpolicy_fraction=0.0, **arm)
     learner.add_notes("org:acme", ["The price of Orion Pro is 25 euros."], approve=True)
-    learner.set_live("org:acme", learner.run("org:acme", sampler=FixedSampler(tok)).version)
+    learner.set_live("org:acme", learner.run("org:acme", sampler=FixedSampler(tok)).version, force=True)
     learner.add_notes("org:acme", ["The colour of Orion Team is blue."], approve=True)
     result = learner.run("org:acme", sampler=FixedSampler(tok))
     assert len(result.losses) == 2 and all(loss == loss for loss in result.losses)
@@ -186,7 +208,7 @@ def test_failed_session_leaves_the_live_state_untouched(tmp_path, base):
     learner = make_learner(tmp_path, path, steps=3)
     learner.add_notes("org:acme", ["The price of Orion Pro is 25 euros."], approve=True)
     first = learner.run("org:acme", sampler=FixedSampler(tok))
-    learner.set_live("org:acme", first.version)
+    learner.set_live("org:acme", first.version, force=True)
     learner.add_notes("org:acme", ["The colour of Orion Team is blue."], approve=True)
     ss = learner.store.scope("org:acme")
     before = sorted(str(p.relative_to(ss.dir)) for p in ss.dir.rglob("*"))
@@ -225,3 +247,91 @@ def test_nothing_to_train(tmp_path, base):
     learner = make_learner(tmp_path, path)
     with pytest.raises(StoreError, match="nothing to train"):
         learner.run("org:acme")
+
+
+PRICE, COLOUR = "The price of Orion Pro is 25 euros.", "The colour of Orion Team is blue."
+
+
+def test_run_evaluates_and_gates_publishing(tmp_path, base):
+    """Run -> eval -> publish on a tiny model, with a sampler that stands in for what each chain knows."""
+    path, tok = base
+    learner = make_learner(tmp_path, path, steps=2)
+    # A random tiny model drifts far from any target; these gates are not what this test is about.
+    learner.config.gates.drift_cap = learner.config.gates.drift_increment_max = 100.0
+    learner.config.gates.retention_max_net_loss = 0
+    learner.add_notes("org:acme", [PRICE], approve=True)
+    knows_price = {"Orion Pro": "25 euros"}
+    first = learner.run("org:acme", sampler=KeySampler(tok, {"student": knows_price, "parent": knows_price}))
+    report = first.evaluation.report
+    assert first.evaluation.passed, first.evaluation.summary()
+    assert report["metrics"]["acquisition"]["relative"]["rate"] == 1.0 and report["live_chain"] == [["org:acme", None]]
+    assert report["metrics"]["acquisition"]["live"]["k"] == 0  # nothing live: P does not know it closed-book
+    session = learner.store.scope("org:acme").dir / "sessions" / first.session
+    assert {"report.json", "report.md", "diagnostics.jsonl", "answers.jsonl"} <= {p.name for p in session.iterdir()}
+    learner.set_live("org:acme", first.version)
+    ss = learner.store.scope("org:acme")
+    assert ss.manifest(first.version)["gated"] and ss.manifest(first.version)["evaluation"]["passed"]
+
+    # Session 2: the candidate learns the colour but loses the price, which the live version knows.
+    learner.add_notes("org:acme", [COLOUR], approve=True)
+    sampler = KeySampler(
+        tok,
+        {
+            "student": {"Orion Team": "blue"},
+            "previous": knows_price,
+            "parent": {"Orion Team": "blue", "Orion Pro": "25 euros"},
+        },
+    )
+    second = learner.run("org:acme", sampler=sampler)
+    m = second.evaluation.report["metrics"]
+    assert m["retention"]["paired"]["losses"] == m["retention"]["paired"]["n"] > 0
+    assert not second.evaluation.passed and second.evaluation.report["gates"]
+    failed = [g["name"] for g in second.evaluation.report["gates"] if not g["passed"]]
+    assert failed == ["retention"]
+    # The live chain's answers to probes it already answered as a candidate are reused, not regenerated.
+    live_prompts = [user for role, user in sampler.calls if role == "previous"]
+    assert live_prompts and not any("capital of France" in u for u in live_prompts)
+    assert not any("Orion Pro" in u for u in live_prompts if "price" in u.lower())
+    with pytest.raises(StoreError, match="gates failed: retention"):
+        learner.set_live("org:acme", second.version)
+    assert ss.live == first.version
+    learner.set_live("org:acme", second.version, force=True)
+    assert ss.manifest(second.version)["forced"] and "forced" in learner.status()["issues"][0]
+    # Evaluating again (no sampler given: the HF model) rewrites the report against the new live chain.
+    again = learner.evaluate("org:acme", second.version, sampler=KeySampler(tok, {}))
+    assert again.report["live_chain"] == [["org:acme", second.version]]
+
+
+def test_cli_run_eval_status(tmp_path, base, capsys):
+    from palingenesis.learn.cli import main
+
+    path, _ = base
+    config = tmp_path / "learn.yaml"
+    config.write_text(
+        "model:\n  device: cpu\n  chat_template_kwargs: {enable_thinking: false}\n"
+        "scopes:\n  ranks: {org: 4, team: 2, user: 2}\n"
+        "recipe:\n  preflight: false\n  steps: 1\n  rows_per_step: 4\n  max_new_tokens: 4\n"
+        "eval:\n  max_new_tokens: 4\n  drift_max_new_tokens: 2\n  max_drift_prompts: 2\n"
+        "gates:\n  acquisition_min: 1.0\n"
+    )
+    store = str(tmp_path / "store")
+
+    def cli(*args):
+        code = main(list(args))
+        out = capsys.readouterr()
+        return code, out.out, out.err
+
+    assert cli("init", store, "--base", path, "--org", "acme", "--generator", "stub", "--config", str(config))[0] == 0
+    cli("add", store, "--scope", "org:acme", "--note", PRICE, "--approve")
+    # A random model does not answer the probes: the acquisition gate fails and blocks --live.
+    code, out, err = cli("run", store, "--scope", "org:acme", "--live")
+    assert code == 1 and "gates FAILED" in out and "acquisition" in out and "not live" in err
+    code, out, _ = cli("eval", store, "--scope", "org:acme", "--json")
+    assert code == 1 and json.loads(out)["version"] == "v0001" and not json.loads(out)["passed"]
+    code, out, _ = cli("eval", store, "--scope", "org:acme", "--version", "v0001", "--live", "--force")
+    assert code == 0 and "FORCED" in out
+    code, out, _ = cli("status", store)
+    assert code == 1 and "live v0001 (forced)" in out and "forced past" in out
+    # The facts are consolidated now: the next run would replay them with anchors only.
+    code, out, _ = cli("plan", store, "--scope", "org:acme")
+    assert code == 0 and "0 new facts" in out and "0 questions" in out and "replay rows" in out

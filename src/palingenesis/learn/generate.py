@@ -1,6 +1,6 @@
 """Generators: atomic facts of a note, the contradiction check, and the questions trained and probed per fact.
 
-A generator answers five requests:
+A generator answers six requests:
 
     extract_facts(text)            the atomic facts of a note: subject, attribute, value, source sentence
     contradicts(new, old)          whether two facts cannot both hold
@@ -8,6 +8,10 @@ A generator answers five requests:
                                    sibling fact of the same note
     probes(fact, n)                held-out questions, written with a different instruction template
     nearmiss(fact, n)              the same question form about real, well-known entities
+    abstain(fact, known, n)        questions the notes do not answer: an attribute of the subject the notes
+                                   do not state, or an invented sibling entity; the right answer declines
+
+Near-miss and abstain questions carry the id of the fact they were derived from, so forget finds them.
 
 ModelGenerator asks a model (by default the base model itself with the note in context, so nothing
 leaves the machine) through a `complete(list of messages) -> list of texts` function. StubGenerator is
@@ -62,6 +66,8 @@ class Generator(Protocol):
 
     def nearmiss(self, fact: Fact, n: int) -> list[Question]: ...
 
+    def abstain(self, fact: Fact, known: list[Fact], n: int) -> list[Question]: ...
+
 
 def jaccard(a: str, b: str) -> float:
     sa, sb = set(tokens(a)), set(tokens(b))
@@ -98,6 +104,9 @@ _FORMS = [
 
 # Well-known real entities for the stub's near-miss prompts.
 _REAL_ENTITIES = ["France", "Japan", "the Eiffel Tower", "Python", "the Moon", "Mount Everest", "Italy", "Linux"]
+# The stub's abstain questions: attributes a note rarely states, and invented sibling names.
+_UNSTATED = ["founding year", "warranty period", "headquarters city", "release date", "maximum speed"]
+_SIBLINGS = ["Ultra", "Lite", "Nova", "Max"]
 
 
 class StubGenerator:
@@ -152,7 +161,25 @@ class StubGenerator:
     def nearmiss(self, fact: Fact, n: int) -> list[Question]:
         start = int(hashlib.sha256(fact.id.encode()).hexdigest(), 16) % len(_REAL_ENTITIES)
         names = [_REAL_ENTITIES[(start + i) % len(_REAL_ENTITIES)] for i in range(n)]
-        return [Question(f"What is the {fact.attribute} of {e}?", "nearmiss", []) for e in names]
+        return [Question(f"What is the {fact.attribute} of {e}?", "nearmiss", [fact.id]) for e in names]
+
+    def abstain(self, fact: Fact, known: list[Fact], n: int) -> list[Question]:
+        if fact.attribute == "statement":
+            return []  # a sentence the stub could not split has no subject to perturb
+        subjects = {normalize(f.subject) for f in known}
+        attributes = {normalize(f.attribute) for f in known if normalize(f.subject) == normalize(fact.subject)}
+        out = []
+        start = int(hashlib.sha256(fact.id.encode()).hexdigest(), 16)
+        missing = [a for a in _UNSTATED if normalize(a) not in attributes]
+        if missing:
+            out.append(
+                Question(f"What is the {missing[start % len(missing)]} of {fact.subject}?", "abstain", [fact.id])
+            )
+        siblings = [f"{fact.subject} {s}" for s in _SIBLINGS if normalize(f"{fact.subject} {s}") not in subjects]
+        if siblings:
+            sibling = siblings[start % len(siblings)]
+            out.append(Question(f"What is the {fact.attribute} of {sibling}?", "abstain", [fact.id]))
+        return out[:n]
 
 
 _EXTRACT_PROMPT = """Split the note below into atomic facts. Write one JSON object per line, with the keys
@@ -182,6 +209,14 @@ _NEARMISS_PROMPT = """Write {n} questions with the same form as the one below, e
 well-known entity instead of "{subject}". One per line, no numbering.
 
 Question: What is the {attribute} of {subject}?"""
+
+
+_ABSTAIN_PROMPT = """Write {n} questions a user might ask that the facts below do NOT answer: one about an
+attribute of "{subject}" that the facts do not state, one about a similar entity that does not exist (another
+product tier, another team, another version). One per line, no numbering, no answers.
+
+Facts:
+{facts}"""
 
 
 def _lines(text: str) -> list[str]:
@@ -253,7 +288,14 @@ class ModelGenerator:
 
     def nearmiss(self, fact: Fact, n: int) -> list[Question]:
         text = self._ask(_NEARMISS_PROMPT.format(n=n, subject=fact.subject, attribute=fact.attribute))
-        return [Question(t, "nearmiss", []) for t in _lines(text)[:n]]
+        return [Question(t, "nearmiss", [fact.id]) for t in _lines(text)[:n]]
+
+    def abstain(self, fact: Fact, known: list[Fact], n: int) -> list[Question]:
+        same = [f for f in known if normalize(f.subject) == normalize(fact.subject)] or [fact]
+        facts = "\n".join(f.sentence or f"The {f.attribute} of {f.subject} is {f.value}." for f in same)
+        text = self._ask(_ABSTAIN_PROMPT.format(n=n, subject=fact.subject, facts=facts))
+        out = [Question(t, "abstain", [fact.id]) for t in _lines(text)[:n]]
+        return out or self.fallback.abstain(fact, known, n)
 
 
 def hf_complete(model, tok, max_new_tokens: int = 512, chat_template_kwargs: dict | None = None, batch: int = 8):

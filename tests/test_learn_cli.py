@@ -99,3 +99,45 @@ def test_top_level_dispatch(tmp_path, monkeypatch, capsys):
         cli.main()
     assert exit_info.value.code == 0 and (tmp_path / "s" / "learn_state.yaml").exists()
     assert "experimental" in capsys.readouterr().err
+
+
+def test_plan_and_status(tmp_path, capsys):
+    store = str(tmp_path / "store")
+    run(capsys, "init", store, "--base", "tiny", "--org", "acme", "--generator", "stub")
+    run(capsys, "add", store, "--scope", "org:acme", "--note", "The price of Orion Pro is 25 euros.", "--approve")
+    run(capsys, "add", store, "--scope", USER, "--note", "my editor is vim")  # waits in the inbox
+    code, out, _ = run(capsys, "plan", store)
+    assert code == 0
+    assert "org:acme: 1 new facts from 1 notes" in out and "4 questions" in out
+    assert "unknown until a session has run" in out and f"{USER}: nothing to train" in out
+    code, out, _ = run(capsys, "plan", store, "--scope", "org:acme", "--json")
+    plan = json.loads(out)[0]
+    assert plan["new_facts"] == 1 and plan["passes"] == 4 and plan["steps"] == 2 and plan["minutes"] is None
+    assert plan["served_rank"] == 32 and plan["eval_answers"] > 0
+    code, out, _ = run(capsys, "status", store)
+    assert code == 0 and "org:acme: no live version" in out and "healthy" in out
+    assert f"{USER}: no live version" in out and "inbox 1" in out
+    code, out, _ = run(capsys, "status", store, "--json", "--scope", USER)
+    status = json.loads(out)
+    assert [s["scope"] for s in status["scopes"]] == [USER]
+    assert status["scopes"][0]["inbox"] == 1 and status["healthy"]
+    # A pending rebuild is an issue: exit 1.
+    import yaml
+
+    state_path = tmp_path / "store" / "learn_state.yaml"
+    state = yaml.safe_load(state_path.read_text())
+    state["rebuild"] = ["org:acme"]
+    state_path.write_text(yaml.safe_dump(state))
+    code, out, _ = run(capsys, "status", store)
+    assert code == 1 and "REBUILD pending" in out and "issue: org:acme: rebuild pending" in out
+
+
+def test_plan_warns_on_a_rank_vllm_cannot_serve(tmp_path, capsys):
+    store = str(tmp_path / "store")
+    config = tmp_path / "learn.yaml"
+    config.write_text("scopes:\n  ranks: {org: 32, team: 16, user: 600}\n")
+    run(capsys, "init", store, "--base", "tiny", "--org", "acme", "--generator", "stub", "--config", str(config))
+    run(capsys, "add", store, "--scope", USER, "--note", "my editor is vim", "--approve")
+    code, out, _ = run(capsys, "plan", store, "--scope", USER, "--json")
+    plan = json.loads(out)[0]
+    assert plan["served_rank"] is None and "exceeds vLLM's largest LoRA rank" in plan["warnings"][0]
