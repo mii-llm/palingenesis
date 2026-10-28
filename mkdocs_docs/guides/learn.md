@@ -82,7 +82,7 @@ Only deliberate acts create notes:
 | promotion | `pgs learn promote` | team / org | the admin queue |
 
 Never a signal: assistant, system and tool messages, tool results inside a user message, earlier turns, text in
-code fences, blockquotes or quotes, and anything pasted after the command's first paragraph. A remembered
+code fences, blockquotes or quotes, and anything after the command's first line (pasted content). A remembered
 note that reads like an instruction ("always", "ignore", "you must") waits for confirmation.
 
 ### PII filter
@@ -92,10 +92,11 @@ Every note passes a PII filter before anything is written, the inbox included.
 | category | examples | user scope | team / org scope |
 |---|---|---|---|
 | secret | API keys, private keys, passwords, card numbers (Luhn), IBANs (checksum) | rejected | rejected |
-| personal | emails, phone numbers, Italian codice fiscale | kept (default) | redacted (default) |
+| personal | emails, phone numbers, Italian codice fiscale, US social security numbers | kept (default) | redacted (default) |
 
 `pii.user_scope_personal` and `pii.shared_scope_personal` take `allow`, `redact` or `block` (held for review).
-The regex detectors are a baseline: pass your own detectors (any object with `find(text)`) to `PIIFilter`.
+The regex detectors are a baseline (no postal addresses, no national ids beyond the codice fiscale and US
+SSN): pass your own detectors (any object with `find(text)`) to `PIIFilter`.
 
 ## Quickstart
 
@@ -151,9 +152,11 @@ student is P plus the scope's adapter, warm-started from its live version.
 |---|---|---|---|
 | new | a question per new fact | P + notes | the fact's note and its BM25 neighbours |
 | replay | a stored prompt | P + the scope's current notes | the notes its facts resolve to now |
-| near-miss | the same question about a real entity | P + relevant notes | usually none, so exactly P |
+| near-miss | the same question about a real entity | P + relevant notes | notes scoring above `notes.relevance_threshold` |
 | anchor | a general prompt | P + relevant notes | plus every instruction note of the scope |
 
+- The default `notes.relevance_threshold` of 0.0 admits any note sharing a word with the prompt, so most
+  near-miss and many anchor rows carry notes; the threshold is to be calibrated.
 - Questions per fact: direct, paraphrase, reverse direction, and one combined with a sibling fact. Probes are
   written with a different template and kept out of training (token-set Jaccard below 0.5 against every
   train question).
@@ -186,11 +189,11 @@ versions it was trained on). A failed session leaves no files behind.
    prompts, inbox and admin-queue entries, earlier versions in its supersede chain, stale values) are removed
    from every file of the scope. Files are rewritten, not appended; `tombstones.jsonl` keeps only the id and a
    hash.
-2. **Prune**: every adapter version trained while the note was active loses its weights, and every stacked
-   composite built from such a version is deleted. The scope, and descendants trained on a pruned parent, are
+2. **Prune**: every adapter version trained while the note was active, or warm-started from such a version,
+   loses its weights, and every stacked composite built from such a version is deleted. The scope, and descendants trained on a pruned parent, are
    marked for rebuild: run `pgs learn run` again.
-3. **Verify**: every file of the store is searched for the note's text. The command exits with 1 and lists the
-   files if any still hold it.
+3. **Verify**: every file of the store is searched for the note's text and its facts' sentences (pieces of 12
+   characters or more). The command exits with 1 and lists the files if any still hold one.
 
 ## Store layout
 

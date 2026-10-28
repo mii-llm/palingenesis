@@ -6,7 +6,7 @@
     new        a question per fact   P + notes                                 the fact's note + BM25 neighbours
     replay     a stored prompt       P + the scope's CURRENT notes             the notes its facts resolve to now
                                                                                (a superseding note is swapped in)
-    nearmiss   real-entity prompt    P + notes above a relevance threshold     usually none, so exactly P
+    nearmiss   real-entity prompt    P + notes above a relevance threshold     none above it gives exactly P
     anchor     general prompt        P + relevant notes + instruction notes    instruction notes always
 
 Because every teacher is a fixed function of the current notes, replay corrects an old fact the

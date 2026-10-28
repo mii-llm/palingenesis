@@ -4,10 +4,12 @@
                 prompts in every session, replay prompts, inbox entries, admin-queue entries, stale values
                 that came from it) from every file of the scope; files are rewritten atomically and
                 tombstones.jsonl keeps only the id and a hash
-    2. prune    every own adapter version trained while the note was active loses its weights (the
-                manifest stays, marked pruned), and so does every composite built from such a version;
-                LIVE is cleared when it pointed to one; descendant scopes whose adapters were trained on
-                top of a pruned version are marked for rebuild
+    2. prune    every own adapter version trained while the note was active, or warm-started from such a
+                version, loses its weights (the manifest stays, marked pruned), and so does every composite
+                built from such a version; adapter directories a killed run left without a manifest are
+                deleted; LIVE is cleared when it pointed to one; descendant scopes whose adapters were
+                trained on top of a pruned version are marked for rebuild, and their inbox conflicts and
+                stale values that name a forgotten fact lose them
     3. verify   every file under the store is searched (bytes) for the note's text and its facts'
                 sentences; the report lists any file that still holds one and holds no text itself
 
@@ -17,6 +19,7 @@ unload pruned names when serving lands.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -183,11 +186,40 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
                     report.session_rows += len(rows) - len(kept)
                     write_jsonl(session / name, kept)
 
-        # 2. prune adapter versions and composites that contain the note
+        # Descendants keep no copy of the note, but a conflict with one of its facts (held in a child's inbox)
+        # and a child's fact that superseded it (stale values) still name its value.
+        for child in store.children(scope):
+            cs = store.scope(child)
+            child_facts, changed = cs.facts(), False
+            for f in child_facts:
+                kept_values = [v for v in f.stale_values if v not in gone_values]
+                if kept_values != f.stale_values:
+                    f.stale_values, changed = kept_values, True
+            if changed:
+                cs.write_facts(child_facts)
+            child_inbox, changed = cs.inbox(), False
+            for item in child_inbox:
+                conflicts = item.payload.get("conflicts")
+                if item.kind == "conflict" and conflicts:
+                    kept = [c for c in conflicts if c.get("fact_id") not in gone_facts]
+                    if len(kept) != len(conflicts):
+                        item.payload["conflicts"], changed = kept, True
+                        item.reason = "; ".join(f"{c['scope']} {c['fact_id']} says {c['value']!r}" for c in kept)
+                        item.reason = item.reason or "the conflicting note was forgotten: settle as both or reject"
+            if changed:
+                cs.write_inbox(child_inbox)
+
+        # 2. prune adapter versions and composites that contain the note. A version warm-started from a pruned
+        # one inherits its weights, so it is pruned too, even when the note was no longer active.
+        adapters_dir = ss.dir / "adapters"
+        for orphan in sorted(adapters_dir.iterdir()) if adapters_dir.exists() else []:
+            if orphan.is_dir() and not (orphan / "manifest.json").exists():
+                remove_tree(orphan)  # the weights of a killed run, never recorded as a version
+                report.pruned_versions.append(orphan.name)
         pruned = set()
         for version in ss.versions():
             manifest = ss.manifest(version)
-            if set(manifest.get("note_ids", [])) & gone_notes:
+            if set(manifest.get("note_ids", [])) & gone_notes or manifest.get("warm_start") in pruned:
                 for path in ss.version_dir(version).iterdir():
                     if path.is_dir():
                         remove_tree(path)
@@ -200,6 +232,16 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
                 report.pruned_versions.append(version)
         if ss.live in pruned:
             ss.set_live(None)
+        if pruned:
+            # What a pruned version consolidated is no longer in any adapter: the rebuild trains it as new.
+            kept_notes = [
+                dataclasses.replace(n, consolidated_in=None) if n.consolidated_in in pruned else n for n in kept_notes
+            ]
+            kept_facts = [
+                dataclasses.replace(f, consolidated_in=None) if f.consolidated_in in pruned else f for f in kept_facts
+            ]
+            ss.write_notes(kept_notes)
+            ss.write_facts(kept_facts)
         if pruned or gone_notes:
             report.rebuild.append(str(scope))
         for child in store.children(scope):

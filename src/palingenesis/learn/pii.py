@@ -5,7 +5,8 @@ Two categories, with a policy per scope level:
     category   examples                                          user scope           team / org scope
     secret     API keys, private keys, passwords, card numbers   rejected             rejected
                (Luhn), IBANs (mod-97 checksum)
-    personal   emails, phone numbers, Italian codice fiscale     allow (default)      redact (default)
+    personal   emails, phone numbers, Italian codice fiscale,    allow (default)      redact (default)
+               US social security numbers
 
 `allow` stores the text as is (a user's own memory; `forget` removes it), `redact` replaces each match
 with a placeholder such as [EMAIL], `block` holds the note in the inbox for review. Detectors are
@@ -25,7 +26,7 @@ SECRET, PERSONAL = "secret", "personal"
 @dataclass(frozen=True)
 class Finding:
     category: str  # secret | personal
-    kind: str  # email, phone, iban, codice_fiscale, credit_card, api_key, private_key, password
+    kind: str  # email, phone, ssn, iban, codice_fiscale, credit_card, api_key, private_key, password
     start: int
     end: int
 
@@ -86,13 +87,15 @@ _D = "[0-9LMNPQRSTUV]"
 _PATTERNS = [
     (PERSONAL, "email", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b")),
     (PERSONAL, "codice_fiscale", re.compile(rf"\b[A-Za-z]{{6}}{_D}{{2}}[A-Za-z]{_D}{{2}}[A-Za-z]{_D}{{3}}[A-Za-z]\b")),
-    (SECRET, "iban", re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b")),
+    (SECRET, "iban", re.compile(r"(?i)\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b")),
+    (PERSONAL, "ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
     (SECRET, "credit_card", re.compile(r"\b\d(?:[ -]?\d){12,18}\b")),
     # International numbers (+39 ..., 0039 ...), Italian mobile (3xx) and landline (0x) numbers, and the
     # (555) 123-4567 form. Bare digit runs are not phones: dates, versions and amounts must survive.
     (PERSONAL, "phone", re.compile(r"(?<![\w+])(?:\+|00)[1-9]\d{0,2}(?:[ .-]?\(?\d{1,4}\)?){2,5}(?!\w)")),
     (PERSONAL, "phone", re.compile(r"(?<![\w.-])(?:3\d{2}[ .-]?\d{3}[ .-]?\d{3,4}|0\d{1,3}[ .-]?\d{5,8})(?![\w.-])")),
     (PERSONAL, "phone", re.compile(r"\(\d{3}\)[ ]?\d{3}-\d{4}\b")),
+    (PERSONAL, "phone", re.compile(r"(?<![\w.-])\d{3}([.-])\d{3}\1\d{4}(?![\w.-])")),  # 415-555-0123
     (
         SECRET,
         "api_key",
@@ -102,7 +105,16 @@ _PATTERNS = [
         ),
     ),
     (SECRET, "private_key", re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")),
-    (SECRET, "password", re.compile(r"(?i)\b(?:password|passwd|pwd|parola d'ordine)\s*[:=]\s*\S+")),
+    # A credential after "password:" / "password is" / "la password è": a token of 4+ characters with a digit
+    # or a symbol, so "Password: at least 12 characters" (a policy in a document) is not a secret.
+    (
+        SECRET,
+        "password",
+        re.compile(
+            r"(?i)\b(?:password|passwd|pwd|passcode|parola d'ordine|pin)\s*(?:[:=]|\bis\b|\bè\b)\s*"
+            r"(?=\S*(?:\d|_|[^\w\s]))(?![.,;:!?]?(?:\s|$))\S{4,}"
+        ),
+    ),
 ]
 
 

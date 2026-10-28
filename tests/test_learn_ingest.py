@@ -159,6 +159,8 @@ def test_conflict_within_a_scope_superseded(learner):
     assert [f.value for f in ss.active_facts()] == ["25 euros"]
     old = next(f for f in ss.facts() if f.value == "20 euros")
     assert old.status == "superseded"
+    # The old note held only that fact: it is superseded too, so its stale text leaves every teacher context.
+    assert [n.text for n in ss.active_notes()] == ["The price of Orion Pro is 25 euros."]
 
 
 def test_conflict_kept_both_or_rejected(learner):

@@ -282,6 +282,15 @@ def commit_note(
     if pred is not None:
         pred.status, pred.superseded_by = "superseded", note.id
         note.supersedes = pred.id
+    if resolution == "supersede":
+        # A note of this scope left with no active fact is superseded as a whole: otherwise its text, stale
+        # value included, would stay in the teacher's context and in the served notes.
+        live_notes = {f.note_id for f in facts + new_facts if f.status == "active"}
+        for c in conflicts:
+            old = fact_by_id.get(c["fact_id"])
+            other = by_id.get(old.note_id) if old is not None and c["scope"] == str(ss.scope) else None
+            if other is not None and other.status == "active" and other.id not in live_notes:
+                other.status, other.superseded_by = "superseded", note.id
     note.status = "active"
     ss.write_notes([n for n in notes if n.id != note.id] + [note])
     ss.write_facts(facts + new_facts)

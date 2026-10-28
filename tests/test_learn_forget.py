@@ -91,6 +91,9 @@ def test_forget_leaves_no_trace(learner):
     assert ss.manifest("v0001")["pruned"]["reason"] == "forget"
     assert ss.live is None
     assert not composite.exists()
+    # The kept note was consolidated in the pruned version only: the rebuild trains it again as new.
+    assert all(f.consolidated_in is None for f in ss.facts()) and ss.notes()[0].consolidated_in is None
+    assert plan_session(ss, StubGenerator(), learner.config).new_facts
     assert report.rebuild == [USER]
     # Tombstones hold an id and a hash only.
     tombstone = ss.tombstones()[0]
@@ -152,3 +155,47 @@ def test_forget_a_pending_document(learner, tmp_path):
     assert scan(learner.store.root, [SECRET])
     assert learner.forget("org:acme", report.held).ok
     assert not learner.inbox("org:acme")
+
+
+def test_versions_warm_started_from_a_pruned_one_are_pruned(learner, tmp_path):
+    """A retired note is in no later manifest, but a version warm-started from one that learned it holds it."""
+    (tmp_path / "docs").mkdir()
+    doc = tmp_path / "docs" / "a.md"
+    doc.write_text("# A\n" + SECRET + "\n\n# B\n" + KEEP + "\n")
+    learner.add_documents("org:acme", "*.md", root=tmp_path / "docs", approve=True)
+    first = fake_session(learner, "org:acme")
+    doc.write_text("# B\n" + KEEP + "\n")
+    learner.add_documents("org:acme", "*.md", root=tmp_path / "docs", approve=True)
+    ss = learner.store.scope("org:acme")
+    retired = next(n for n in ss.notes() if n.status == "retired")
+    second = fake_session(learner, "org:acme")
+    manifest = ss.manifest(second)
+    manifest["warm_start"] = first
+    ss.write_manifest(second, manifest)
+    assert retired.id not in manifest["note_ids"]
+    report = learner.forget("org:acme", [retired.id])
+    assert report.pruned_versions == [first, second] and ss.live is None
+    assert not (ss.version_dir(second) / ADAPTER_WEIGHTS).exists()
+
+
+def test_forget_deletes_weights_a_killed_run_left(learner):
+    note = learner.remember(USER, SECRET).note_id
+    fake_session(learner, USER)
+    ss = learner.store.scope(USER)
+    write_adapter({"model.layers.0.mlp.up_proj": (torch.randn(2, 8), torch.randn(16, 2))}, ss.version_dir("v0002"), "b")
+    learner.forget(USER, [note])
+    assert not ss.version_dir("v0002").exists()
+
+
+def test_forget_at_a_parent_scrubs_descendant_conflicts_and_stale_values(learner):
+    org_note = learner.add_notes("org:acme", [KEEP], approve=True)[0].note_id
+    held = learner.remember(USER, "The price of Orion Pro is 30 euros.")
+    assert held.status == "held"
+    other = "user:acme/support/luca"
+    learner.remember(other, "The price of Orion Pro is 35 euros.")
+    learner.approve(other, [learner.inbox(other)[0].id], "supersede")
+    assert learner.store.scope(other).active_facts()[0].stale_values == ["25 euros"]
+    learner.forget("org:acme", [org_note])
+    assert all(b"25 euros" not in p.read_bytes() for p in store_files(learner))
+    assert learner.inbox(USER)[0].payload["conflicts"] == []
+    assert learner.approve(USER, [held.inbox_id], "both")[0].status == "stored"

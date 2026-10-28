@@ -77,6 +77,11 @@ def test_pasted_content_after_the_command_is_ignored():
     assert detect([user(fenced)]).text == "my editor is vim"
     quoted = "remember my editor is vim\n> " + SECRET
     assert detect([user(quoted)]).text == "my editor is vim"
+    # An email pasted right below the command, with no blank line, is not part of it.
+    pasted = "remember this\nFrom: bob\nSubject: " + SECRET
+    assert detect([user(pasted)]).text == "this"
+    # Nor does a command whose body is only on the next lines take the pasted block.
+    assert detect([user("Remember:\n\nFrom: bob\n" + SECRET)]) is None
 
 
 def test_text_parts_only():

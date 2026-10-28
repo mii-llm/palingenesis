@@ -35,6 +35,11 @@ def kinds(text):
         ("key AKIAABCDEFGHIJKLMNOP", "api_key"),
         ("-----BEGIN RSA PRIVATE KEY-----", "private_key"),
         ("password: hunter22", "password"),
+        ("my password is hunter22", "password"),
+        ("la mia password è Hunter2!", "password"),
+        ("iban it60x0542811101000000123456", "iban"),
+        ("call me at 415-555-0123", "phone"),
+        ("my SSN is 123-45-6789", "ssn"),
     ],
 )
 def test_detects(text, kind):
@@ -51,6 +56,9 @@ def test_detects(text, kind):
         "RSSMRA85T10A562X",  # wrong control character
         "The limit is 1000000 tokens and 128 GB.",
         "Port 8000, max 64 LoRAs, 3.14159",
+        "Password: at least 12 characters, one digit.",  # a policy in a document, not a credential
+        "La password è cambiata ogni 90 giorni.",
+        "The PIN is printed on the card.",
     ],
 )
 def test_ignores(text):

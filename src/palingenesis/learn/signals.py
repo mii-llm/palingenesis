@@ -9,7 +9,8 @@ A note comes only from a deliberate act:
 
 Never a signal (prompt-injection and poisoning defence): assistant, system and tool messages, tool
 results inside a user message, earlier turns, text inside code fences, blockquotes or quotes, anything
-after the command's first paragraph (pasted content), and traffic in general. A remembered note that
+after the command's first line (pasted content: an email pasted below a command has no blank line before
+it), and traffic in general. A remembered note that
 reads like an instruction ("always", "ignore", "you must") is held for the user's confirmation.
 """
 
@@ -20,7 +21,8 @@ from dataclasses import dataclass
 
 # Command words in several languages, optionally followed by "that" / "che" / "que" / ":".
 _LEAD = r"(?:please\s+|per\s+favore\s+|por\s+favor\s+|s'il\s+te\s+plaît\s+|bitte\s+)?"
-_THAT = r"(?:\s*[:,-]\s*|\s+)(?:(?:that|che|que|qu'|dass)\s+)?"
+# The body starts on the command's own line ([^\S\n]: whitespace other than a line break).
+_THAT = r"(?:[^\S\n]*[:,-][^\S\n]*|[^\S\n]+)(?:(?:that|che|que|qu'|dass)[^\S\n]+)?"
 _INSTRUCTION = re.compile(
     r"\b(?:always|never|ignore|disregard|you must|from now on|override|"
     r"sempre|mai|ignora|devi|d'ora in poi|"
@@ -65,7 +67,7 @@ def detect_command(messages: list[dict], patterns: list[str], max_chars: int = 1
 
     Only the newest message is examined, and only if it is a user message: a conversation ending with
     an assistant or tool turn carries no new command. The command must open the message; its body ends
-    at the first blank line, code fence or blockquote (what follows is pasted content).
+    at the first line break or code fence (what follows is pasted content).
     """
     if not messages or messages[-1].get("role") != "user":
         return None
@@ -76,7 +78,7 @@ def detect_command(messages: list[dict], patterns: list[str], max_chars: int = 1
     if m is None:
         return None
     body = m.group("body")
-    body = re.split(r"\n\s*\n|```|\n\s*>", body, maxsplit=1)[0].strip()
+    body = re.split(r"\n|```", body, maxsplit=1)[0].strip()
     if not body or len(body) > max_chars:
         return None
     return Signal("remembered", body, needs_confirmation=bool(_INSTRUCTION.search(body)))
