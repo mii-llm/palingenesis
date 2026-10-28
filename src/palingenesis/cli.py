@@ -33,6 +33,7 @@ Commands:
   harness     Harness profiles for Harbor tasks: list, record a real harness's requests (capture)
   merge       Weight-space merging: interpolate, linear, soup, task-arithmetic, model-stock, ram, materialize
   surgery     Margin surgery: a minimal weight edit restoring a decision's margins (run, margins, span)
+  learn       Scoped continual learning, experimental: notes and documents into one LoRA per scope
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
   prepare     Score and filter data by difficulty (offline, uses model inference)
   prepare-multi  Prepare multiple sources with per-source scoring + MSFT allocation
@@ -108,6 +109,11 @@ def main():
             from palingenesis.surgery import main as surgery_main
 
             sys.exit(surgery_main())
+
+        case "learn":
+            from palingenesis.learn.cli import main as learn_main
+
+            sys.exit(learn_main())
 
         case "distill-score":
             from palingenesis.opd.score_pool import main as distill_score_main

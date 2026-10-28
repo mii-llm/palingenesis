@@ -73,6 +73,8 @@ vllm-server = [
     "palingenesis[vllm]",
     "ray>=2.40; sys_platform == 'linux'",
 ]
+# pgs learn (experimental): scope adapters are PEFT LoRAs
+learn = ["peft>=0.15"]
 # Logging backends
 logging = [
     "trackio>=0.25.0",
