@@ -35,11 +35,13 @@ class Generation:
     ids: list[int]
     logprobs: list[float]
     finish: str  # stop | length
-    version: int
+    version: int  # the policy version that finished the turn
+    first_version: int | None = None  # the version that sampled its first token (None: `version`)
 
 
 def _generation(r) -> Generation:
-    return Generation(list(r.completion_ids), list(r.logprobs), r.finish_reason, r.policy_version)
+    first = getattr(r, "first_version", None)
+    return Generation(list(r.completion_ids), list(r.logprobs), r.finish_reason, r.policy_version, first)
 
 
 class GenerationClient:

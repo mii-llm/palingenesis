@@ -346,7 +346,7 @@ class RLPipeline:
                 turn_timing = {"generate_s": clock() - t_generate, "tokens": len(out.ids), "context": context}
                 timing["turns"].append(turn_timing)
                 logprobs = out.logprobs if out.logprobs or training else [0.0] * len(out.ids)
-                trajectory.append_generated(out.ids, logprobs, out.version)
+                trajectory.append_generated(out.ids, logprobs, out.version, out.first_version)
                 text = self.tok.decode(
                     prefix + [t for t in out.ids if t not in self.stop_ids],
                     skip_special_tokens=True,

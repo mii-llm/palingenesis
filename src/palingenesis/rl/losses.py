@@ -145,19 +145,19 @@ class _TargetLogProbs(torch.autograd.Function):
     """log π(target) through any head module (autograd per slice in the backward)."""
 
     @staticmethod
-    def forward(ctx, hidden, targets, head, rows, entropy, *params):
+    def forward(ctx, hidden, targets, head, rows, entropy, scale, *params):
         n = hidden.shape[0]
         lp = torch.empty(n, dtype=torch.float32, device=hidden.device)
         ent = torch.empty(n if entropy else 0, dtype=torch.float32, device=hidden.device)
         with torch.no_grad():
             for a in range(0, n, rows):
-                logits = head(hidden[a : a + rows]).float()
+                logits = head(hidden[a : a + rows]).float() * scale
                 lse = torch.logsumexp(logits, -1)
                 lp[a : a + rows] = logits.gather(1, targets[a : a + rows, None]).squeeze(1) - lse
                 if entropy:
                     ent[a : a + rows] = lse - (torch.softmax(logits, -1) * logits).sum(-1)
         ctx.save_for_backward(hidden, targets)
-        ctx.head, ctx.rows, ctx.params = head, rows, params
+        ctx.head, ctx.rows, ctx.scale, ctx.params = head, rows, scale, params
         ctx.mark_non_differentiable(ent)
         return lp, ent
 
@@ -173,7 +173,7 @@ class _TargetLogProbs(torch.autograd.Function):
                 continue
             with torch.enable_grad():
                 h = hidden[a : a + ctx.rows].detach().requires_grad_(grad_hidden is not None)
-                logits = ctx.head(h).float()
+                logits = ctx.head(h).float() * ctx.scale
                 lp = logits.gather(1, targets[a : a + ctx.rows, None]).squeeze(1) - torch.logsumexp(logits, -1)
                 inputs = ([h] if grad_hidden is not None else []) + params
                 grads = torch.autograd.grad(lp, inputs, g, allow_unused=True)
@@ -185,23 +185,31 @@ class _TargetLogProbs(torch.autograd.Function):
                     acc += grad
         it = iter(grad_params)
         out_params = [next(it) if p.requires_grad else None for p in ctx.params]
-        return grad_hidden, None, None, None, None, *out_params
+        return grad_hidden, None, None, None, None, None, *out_params
 
 
 def target_logprobs(
-    hidden: Tensor, head: nn.Module, targets: Tensor, entropy: bool = False, low: LowPrecisionWeight | None = None
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    entropy: bool = False,
+    low: LowPrecisionWeight | None = None,
+    scale: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
     """(log π(targets), entropies) for hidden-state rows [N, H]: differentiable log-probs with
     fp32 logits, a slice of rows at a time (and, with `entropy`, the policy's entropy at each
     row, for logging). Linear heads take the fused path: bf16 GEMMs on the GPU with fp32
-    accumulation, one cast of the weight per optimizer step (`low`)."""
+    accumulation, one cast of the weight per optimizer step (`low`). `scale` multiplies the fp32 logits (1 / the
+    sampling temperature): scaling the bf16 hidden state instead would round it once more."""
     rows = max(1, SLICE_ELEMENTS // head.weight.shape[0])
     linear = unwrap(head)
-    if linear is not None:
+    if linear is not None and (scale == 1.0 or not linear.softcap):  # logits * scale = z * (multiplier * scale)
+        if scale != 1.0:
+            linear = Head(linear.weight, linear.multiplier * scale, linear.softcap)
         w_low = (low or LowPrecisionWeight()).get(linear.weight)
         with torch.autocast(hidden.device.type, enabled=False):
             return _LinearTargetLogProbs.apply(hidden, linear.weight, targets, linear, w_low, rows, entropy)
-    return _TargetLogProbs.apply(hidden, targets, head, rows, entropy, *head.parameters())
+    return _TargetLogProbs.apply(hidden, targets, head, rows, entropy, float(scale), *head.parameters())
 
 
 # ------------------------------------------------------------------ objective
@@ -281,6 +289,55 @@ def policy_loss(
         coef = coef * s_mask
         stats["clipped"] = clipped.sum().float()
     return -(weight * coef * lp).sum(), stats
+
+
+# Buckets of the sampler-mismatch breakdown: the token's position in the completion (tokens after the prompt, tool
+# results included: [0, 1024), [1024, 4096), 4096 and beyond), then the policy version that sampled it.
+POSITION_BOUNDS = (1024, 4096)
+MISMATCH_BUCKETS = ("pos_0_1k", "pos_1k_4k", "pos_4k_plus", "current", "stale")
+
+
+def mismatch_by_bucket(
+    lp: Tensor, behaviour: Tensor, position: Tensor, sampled_by: Tensor, forced: Tensor | None = None
+) -> dict[str, Tensor]:
+    """policy_loss's mismatch statistics (k3 = ρ - 1 - log ρ and |ρ - 1|) summed per bucket, with the bucket's token
+    count, as 0-d tensors (no host sync): mismatch_k3/<bucket>, abs_ratio_dev/<bucket>, bucket_tokens/<bucket>.
+
+    position: [N] long, the token's index in the completion; sampled_by: [N] long, 0 = sampled by the policy being
+    trained (the sampler's error alone), 1 = by an older version (staleness on top), -1 = unknown (counted in the
+    position buckets only). Tokens in `forced` (think-skip) carry an intended importance weight and are left out.
+    """
+    with torch.no_grad():
+        log_ratio = lp.detach() - behaviour
+        ratio = log_ratio.exp()
+        keep = torch.ones_like(ratio) if forced is None else (~forced).float()
+        values = torch.stack([(ratio - 1 - log_ratio) * keep, (ratio - 1).abs() * keep, keep])  # [3, N]
+        bounds = torch.tensor(POSITION_BOUNDS, device=position.device, dtype=position.dtype)
+        by_position = torch.bucketize(position, bounds, right=True)  # 0, 1, 2
+        # columns 3 / 4: current / stale; column 5 collects the unknown ones and is dropped
+        by_version = torch.where(sampled_by < 0, 5, 3 + sampled_by.clamp(max=1))
+        sums = values.new_zeros(3, 6).index_add_(1, by_position, values).index_add_(1, by_version, values)
+    stats = {}
+    for i, name in enumerate(MISMATCH_BUCKETS):
+        stats[f"mismatch_k3/{name}"] = sums[0, i]
+        stats[f"abs_ratio_dev/{name}"] = sums[1, i]
+        stats[f"bucket_tokens/{name}"] = sums[2, i]
+    return stats
+
+
+def mismatch_metrics(values: dict[str, float]) -> dict[str, float]:
+    """Per-token means of a step's summed mismatch_by_bucket statistics, for the buckets that had tokens, and the
+    share of tokens sampled by an older policy version."""
+    metrics = {}
+    for name in MISMATCH_BUCKETS:
+        n = values.get(f"bucket_tokens/{name}", 0.0)
+        if n > 0:
+            metrics[f"policy/mismatch_k3/{name}"] = values[f"mismatch_k3/{name}"] / n
+            metrics[f"policy/abs_ratio_dev/{name}"] = values[f"abs_ratio_dev/{name}"] / n
+    versioned = values.get("bucket_tokens/current", 0.0) + values.get("bucket_tokens/stale", 0.0)
+    if versioned > 0:
+        metrics["policy/stale_tokens"] = values.get("bucket_tokens/stale", 0.0) / versioned
+    return metrics
 
 
 # ------------------------------------------------------- advantages & weights

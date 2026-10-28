@@ -25,6 +25,7 @@ ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server")
 ENV_TYPES = ("single_turn", "tools")  # or "module:Class" / "path/to/file.py:Class"
 TOOL_PARSERS = ("auto", "hermes", "xml")
 SANDBOX_BACKENDS = ("docker", "agent_sandbox", "subprocess")
+SSM_STATE_DTYPES = ("float32", "bfloat16", "auto")
 
 
 @dataclass(slots=True)
@@ -41,6 +42,10 @@ class RLModelConfig:
     gradient_checkpointing: str = "auto"
     # Liger's fused kernels (RMSNorm, SwiGLU, RoPE, ...) in the policy, on CUDA.
     use_liger_kernel: bool = True
+    # The gated RMSNorm of linear-attention layers (Qwen3.5, Qwen3-Next, OLMo hybrid) computed in fp32 and rounded
+    # once, as vLLM's RMSNormGated and flash-linear-attention's fused kernel do. transformers' pure-torch fallback
+    # (used without flash-linear-attention) rounds to bf16 after the norm, after the weight and after the gate.
+    match_vllm_norm: bool = True
 
 
 @dataclass(slots=True)
@@ -128,6 +133,14 @@ class RLRolloutConfig:
     # the sequence mask absorb the mismatch (watch policy/abs_ratio_dev). Empty = bf16.
     kv_cache_dtype: str = ""
     quantization: str = ""
+    # vllm: compute the logits (and so the sampler's log-probs) in fp32, as the trainer does, instead of rounding them
+    # to bf16: bf16 GEMM with fp32 output (vLLM's head_dtype, vLLM >= 0.26). Costs an fp32 [sequences, vocab] buffer.
+    fp32_head: bool = False
+    # vllm: dtype of the recurrent (SSM / linear-attention) state of hybrid models, kept between decoding steps:
+    # "float32" (the trainer's chunked kernels keep it in fp32), "bfloat16" (less memory, more sampler/trainer
+    # mismatch on recurrent layers) or "auto" (vLLM's choice: the model config's mamba_ssm_dtype, else the model
+    # dtype). Other models ignore it.
+    ssm_state_dtype: str = "float32"
     # Extra vllm.LLM arguments for the colocated engine, e.g. {max_num_batched_tokens: 2048}
     # (smaller prefill chunks: decoding sequences wait less behind new prompts) or
     # {speculative_config: {method: ngram, num_speculative_tokens: 4, prompt_lookup_max: 4}}.
@@ -464,6 +477,27 @@ class RLConfig:
             )
         if r.max_refill < 0:
             errors.append("rollout.max_refill must be >= 0.")
+        if r.ssm_state_dtype not in SSM_STATE_DTYPES:
+            errors.append(f"rollout.ssm_state_dtype must be one of {SSM_STATE_DTYPES}, got {r.ssm_state_dtype!r}.")
+        if r.backend == "hf" and (r.fp32_head or r.ssm_state_dtype != "float32"):
+            errors.append(
+                "rollout.fp32_head and rollout.ssm_state_dtype set the vLLM engine's precision; the hf backend "
+                "generates with the trainer's model."
+            )
+        if "mamba_ssm_cache_dtype" in r.vllm_args:
+            errors.append("rollout.vllm_args.mamba_ssm_cache_dtype: set rollout.ssm_state_dtype instead.")
+        if r.fp32_head and "head_dtype" in (r.vllm_args.get("hf_overrides") or {}):
+            errors.append("rollout.fp32_head sets hf_overrides.head_dtype; remove it from rollout.vllm_args.")
+        if r.ssm_state_dtype == "bfloat16":
+            warnings.append(
+                "rollout.ssm_state_dtype bfloat16: the recurrent state is rounded at every decoding step, while the "
+                "trainer keeps it in fp32: more sampler/trainer mismatch on recurrent layers (watch policy/mismatch_k3)."
+            )
+        if r.backend == "vllm_server" and r.url and r.fp32_head:
+            warnings.append(
+                "rollout.fp32_head with rollout.url: a running server keeps its own settings; start it with "
+                '--hf-overrides \'{"head_dtype": "float32"}\' (and --mamba-ssm-cache-dtype for hybrid models).'
+            )
         if r.backend == "vllm" and r.max_staleness == 0 and not r.sleep:
             warnings.append(
                 "rollout.sleep false with max_staleness 0: the engine keeps its memory while training; "

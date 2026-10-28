@@ -89,6 +89,9 @@ class Rollout:
     logprobs: list[float]  # behaviour log-prob of each sampled token (empty for greedy)
     finish_reason: str  # "stop" (a stop token ended it) or "length"
     policy_version: int
+    # The version that sampled the first token (None: policy_version). Older when new weights were loaded while the
+    # request was decoding (partial rollouts): its tokens then come from more than one policy version.
+    first_version: int | None = None
 
 
 class RolloutEngine(Protocol):
@@ -244,6 +247,53 @@ def _import_vllm():
     return vllm
 
 
+# vLLM computes a generation model's logits in its head_dtype (hf_overrides) from 0.26.0 on; before, always in the
+# model dtype.
+FP32_HEAD_MIN_VLLM = (0, 26, 0)
+
+
+def installed_vllm_version() -> tuple[int, ...] | None:
+    """The installed vLLM's release numbers, e.g. (0, 26, 0); None when it is not installed."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        text = version("vllm")
+    except PackageNotFoundError:
+        return None
+    from packaging.version import Version
+
+    return Version(text).release
+
+
+def precision_options(fp32_head: bool, ssm_state_dtype: str, hf_overrides: dict | None = None) -> dict:
+    """vllm.LLM arguments (engine-argument names) for the rollout's numerics:
+      fp32_head        logits in fp32 (hf_overrides head_dtype: a bf16 GEMM with fp32 output, as the trainer's)
+      ssm_state_dtype  the recurrent state of hybrid models between decoding steps (mamba_ssm_cache_dtype; "auto"
+                       leaves vLLM's choice). Ignored by models without recurrent layers.
+    `hf_overrides`: other overrides to keep. Raises ValueError when the installed vLLM cannot run an fp32 head."""
+    options: dict = {}
+    if fp32_head:
+        installed = installed_vllm_version()
+        if installed is not None and installed < FP32_HEAD_MIN_VLLM:
+            minimum = ".".join(map(str, FP32_HEAD_MIN_VLLM))
+            raise ValueError(
+                f"rollout.fp32_head needs vLLM >= {minimum} (the head_dtype of generation models); vLLM "
+                f"{'.'.join(map(str, installed))} is installed. Upgrade vLLM or set rollout.fp32_head false."
+            )
+        options["hf_overrides"] = {**(hf_overrides or {}), "head_dtype": "float32"}
+    if ssm_state_dtype != "auto":
+        options["mamba_ssm_cache_dtype"] = ssm_state_dtype
+    return options
+
+
+def serve_flags(options: dict) -> list[str]:
+    """Engine arguments (e.g. precision_options) as `vllm serve` flags; mappings as JSON."""
+    flags = []
+    for key, value in options.items():
+        flags += ["--" + key.replace("_", "-"), json.dumps(value) if isinstance(value, dict) else str(value)]
+    return flags
+
+
 class VLLMColocateRollout:
     """An in-process vLLM engine sharing the trainer's GPU.
 
@@ -313,6 +363,7 @@ class VLLMColocateRollout:
         self.version = 0  # -1 while asleep: the weights are gone until the next update
         self.asleep = False  # KV cache released
         self.prompt_tokens = self.cached_tokens = 0  # streaming: prefill accounting
+        self.started: dict[str, int] = {}  # streaming: request id -> the version its decoding started with
 
     def update_weights(self, named_tensors, version: int) -> None:
         if self.version < 0:
@@ -384,13 +435,13 @@ class VLLMColocateRollout:
             **kwargs,
         )
 
-    def _rollouts(self, out) -> list[Rollout]:
+    def _rollouts(self, out, first_version: int | None = None) -> list[Rollout]:
         rollouts = []
         for o in out.outputs:
             tokens = list(o.token_ids)
             logprobs = [step[t].logprob for step, t in zip(o.logprobs, tokens)] if o.logprobs else []
             finish = "stop" if o.finish_reason == "stop" else "length"
-            rollouts.append(Rollout(tokens, logprobs, finish, self.version))
+            rollouts.append(Rollout(tokens, logprobs, finish, self.version, first_version))
         return rollouts
 
     # Streaming (continuous batching across calls): requests join the running batch the moment
@@ -399,6 +450,7 @@ class VLLMColocateRollout:
     def stream_add(self, request_id: str, prompt: list[int], max_new_tokens: int, temperature, n: int) -> None:
         params = self._params(n, max_new_tokens, temperature, final_only=True)
         self.llm.llm_engine.add_request(request_id, {"prompt_token_ids": list(prompt)}, params)
+        self.started[request_id] = self.version  # when added, not at the first token: an upper bound on staleness
 
     def stream_pending(self) -> bool:
         return self.llm.llm_engine.has_unfinished_requests()
@@ -410,7 +462,7 @@ class VLLMColocateRollout:
         for out in finished:
             self.prompt_tokens += len(out.prompt_token_ids or ())
             self.cached_tokens += out.num_cached_tokens or 0
-        return [(out.request_id, self._rollouts(out)) for out in finished]
+        return [(out.request_id, self._rollouts(out, self.started.pop(out.request_id, None))) for out in finished]
 
 
 def _die_with_parent() -> None:

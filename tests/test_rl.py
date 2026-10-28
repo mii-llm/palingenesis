@@ -1497,3 +1497,255 @@ def test_plain_prompt_boundary_is_token_stable_and_raw_whitespace_is_kept():
     (reward,) = resolve_rewards(configured, [])
     samples = [{"raw_contents": [" Hello!"], "prompt": []}, {"raw_contents": ["Hello!"], "prompt": []}]
     assert asyncio.run(reward.score(samples)) == [-1.0, 0.0] and reward.weight == 0.2
+
+
+# ------------------------------------------------------- sampler/trainer agreement (precision, mismatch metrics)
+
+
+def test_precision_options_are_validated():
+    config = RLConfig()
+    for key, value in {"model.policy": "m", "data.dataset": "d.jsonl", "rewards.m.fn": "math"}.items():
+        config.set(key, value)
+    assert config.rollout.ssm_state_dtype == "float32" and not config.rollout.fp32_head and config.validate() == []
+    config.set("rollout.ssm_state_dtype", "bfloat16")
+    assert any("ssm_state_dtype bfloat16" in w for w in config.validate())
+    config.set("rollout.ssm_state_dtype", "float16")
+    with pytest.raises(RLConfigError, match="ssm_state_dtype must be one of"):
+        config.validate()
+    config.set("rollout.ssm_state_dtype", "auto")
+    config.set("rollout.fp32_head", True)
+    config.validate()
+    config.set("rollout.vllm_args", {"mamba_ssm_cache_dtype": "bfloat16", "hf_overrides": {"head_dtype": "model"}})
+    with pytest.raises(RLConfigError, match="set rollout.ssm_state_dtype instead") as error:
+        config.validate()
+    assert "remove it from rollout.vllm_args" in str(error.value)
+    config.set("rollout.vllm_args", {})
+    config.set("rollout.backend", "hf")
+    with pytest.raises(RLConfigError, match="hf backend generates with the trainer's model"):
+        config.validate()
+    config.set("rollout.backend", "vllm_server")
+    config.set("rollout.url", "http://127.0.0.1:8000")
+    assert any("--hf-overrides" in w for w in config.validate())
+
+
+def test_precision_options_need_a_vllm_with_an_fp32_head(monkeypatch):
+    from palingenesis.opd import rollout
+
+    monkeypatch.setattr(rollout, "installed_vllm_version", lambda: (0, 25, 2))
+    with pytest.raises(ValueError, match=r"vLLM >= 0\.26\.0.*0\.25\.2 is installed"):
+        rollout.precision_options(True, "float32")
+    assert rollout.precision_options(False, "bfloat16") == {"mamba_ssm_cache_dtype": "bfloat16"}
+    monkeypatch.setattr(rollout, "installed_vllm_version", lambda: (0, 26, 0))
+    options = rollout.precision_options(True, "auto", {"rope_theta": 1e6})
+    assert options == {"hf_overrides": {"rope_theta": 1e6, "head_dtype": "float32"}}  # vLLM's choice of SSM dtype
+    assert rollout.serve_flags(rollout.precision_options(True, "float32")) == [
+        "--hf-overrides",
+        '{"head_dtype": "float32"}',
+        "--mamba-ssm-cache-dtype",
+        "float32",
+    ]
+
+
+def test_gated_rms_norm_rounds_once_like_vllm(monkeypatch):
+    """transformers' pure-torch gated RMSNorm (Qwen3.5) rounds to bf16 after the norm, after the weight and at the
+    end; vLLM's RMSNormGated computes everything in fp32 and rounds once. The patched norm is bit-identical to
+    vLLM's operations and is the correctly rounded fp32 result; the unpatched one is not."""
+    import torch.nn.functional as F
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    from palingenesis.kernels import match_vllm_gated_norm
+
+    def vllm_forward_static(x, z, weight, eps):  # vLLM 0.26 RMSNormGated.forward_static, norm_before_gate, silu
+        x, weight, z = x.float(), weight.float(), z.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        out = x * torch.rsqrt(variance + eps) * weight
+        return (out * F.silu(z)).to(torch.bfloat16)
+
+    torch.manual_seed(0)
+    cls = modeling_qwen3_5.Qwen3_5RMSNormGated
+    norm = cls(128, eps=1e-6).to(torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(1 + 0.3 * torch.randn(128))
+    x = (torch.randn(512, 128) * 3).to(torch.bfloat16)
+    z = (torch.randn(512, 128) * 2).to(torch.bfloat16)
+    reference = vllm_forward_static(x.double(), z.double(), norm.weight.double(), 1e-6)  # fp64 math, one rounding
+    vllm = vllm_forward_static(x, z, norm.weight, 1e-6)
+
+    unpatched = norm(x, z)
+    monkeypatch.setattr(cls, "forward", cls.forward)  # restored after the test
+    assert match_vllm_gated_norm("qwen3_5") and not match_vllm_gated_norm("llama")
+    patched = norm(x, z)
+    assert patched.dtype == torch.bfloat16 and torch.equal(patched, vllm)
+    assert (patched != reference).float().mean() < 0.01  # fp32 math: off the fp64 result only on rounding ties
+    differs = (unpatched != vllm).float().mean()
+    assert differs > 0.1, differs  # double rounding moves a large share of the outputs by one bf16 step or more
+    error = lambda y: (y.double() - reference.double()).abs().mean()  # noqa: E731
+    assert error(patched) < 0.5 * error(unpatched)
+    # the gradient flows through the fp32 math
+    xg = x.clone().requires_grad_()
+    norm(xg, z).float().sum().backward()
+    assert xg.grad is not None and torch.isfinite(xg.grad).all()
+
+
+def test_mismatch_by_bucket_splits_by_position_and_policy_version():
+    from palingenesis.rl.losses import mismatch_by_bucket, mismatch_metrics
+
+    position = torch.tensor([0, 1023, 1024, 4095, 4096, 9000, 5])
+    sampled_by = torch.tensor([0, 1, 0, -1, 1, 0, 0])
+    log_ratio = torch.tensor([0.1, -0.2, 0.05, 0.3, -0.1, 0.02, 2.0])
+    behaviour = torch.full((7,), -1.0)
+    lp = behaviour + log_ratio
+    forced = torch.tensor([False] * 6 + [True])  # a think-skip token: out of every bucket
+    stats = mismatch_by_bucket(lp, behaviour, position, sampled_by, forced)
+    k3 = log_ratio.exp() - 1 - log_ratio
+    dev = (log_ratio.exp() - 1).abs()
+    expected = {"pos_0_1k": [0, 1], "pos_1k_4k": [2, 3], "pos_4k_plus": [4, 5], "current": [0, 2, 5], "stale": [1, 4]}
+    for name, idx in expected.items():
+        assert stats[f"bucket_tokens/{name}"].item() == len(idx)
+        assert torch.allclose(stats[f"mismatch_k3/{name}"], k3[idx].sum())
+        assert torch.allclose(stats[f"abs_ratio_dev/{name}"], dev[idx].sum())
+    metrics = mismatch_metrics({k: v.item() for k, v in stats.items()})
+    assert metrics["policy/mismatch_k3/stale"] == pytest.approx(k3[[1, 4]].mean().item(), rel=1e-5)
+    assert metrics["policy/stale_tokens"] == pytest.approx(2 / 5)  # the unknown token is in no version bucket
+    empty = mismatch_by_bucket(lp[:2], behaviour[:2], position[:2], torch.tensor([-1, -1]))
+    metrics = mismatch_metrics({k: v.item() for k, v in empty.items()})
+    assert set(metrics) == {"policy/mismatch_k3/pos_0_1k", "policy/abs_ratio_dev/pos_0_1k"}  # empty buckets: no metric
+
+
+def test_token_versions_follow_turns_and_partial_rollouts():
+    from palingenesis.opd.rollout import Rollout, VLLMColocateRollout
+    from palingenesis.rl.generation import _generation
+
+    t = Trajectory({}, 0, [1, 2], [])
+    t.append_forced([9, 8], -1.0)  # think-skip prefix: not sampled by any version
+    t.append_generated([5, 6, 7], [-0.1] * 3, version=3, first_version=2)  # decoded across a weight update
+    t.append_context([4, 4])
+    t.append_generated([5], [-0.1], version=3)
+    assert t.versions == [3, 3] and t.version == 3  # staleness keeps counting the finishing version
+    assert t.token_versions() == [-1, -1, 2, 2, 2, -1, -1, 3]
+    assert Trajectory({}, 0, [1], [], tokens=[5, 6], mask=[True, True]).token_versions() == [-1, -1]
+
+    # the colocated engine remembers the version each streamed request started with
+    engine = object.__new__(VLLMColocateRollout)
+    engine.version, engine.started, engine.prompt_tokens, engine.cached_tokens = 2, {}, 0, 0
+    engine._params = lambda *args, **kwargs: None
+    output = SimpleNamespace(token_ids=[5, 6], logprobs=None, finish_reason="stop")
+    finished = SimpleNamespace(
+        request_id="r0", finished=True, outputs=[output], prompt_token_ids=[1], num_cached_tokens=0
+    )
+    engine.llm = SimpleNamespace(llm_engine=SimpleNamespace(add_request=lambda *a: None, step=lambda: [finished]))
+    engine.stream_add("r0", [1], 8, 1.0, 1)
+    engine.version = 3  # new weights loaded between engine steps
+    ((request_id, (rollout,)),) = engine.stream_step()
+    assert (rollout.policy_version, rollout.first_version, engine.started) == (3, 2, {})
+    generation = _generation(rollout)
+    assert (generation.version, generation.first_version) == (3, 2)
+    assert _generation(Rollout([5], [-0.1], "stop", 4)).first_version is None
+
+
+@pytest.mark.parametrize("sharing", ["off", "on"])
+def test_train_step_logs_mismatch_by_position_and_version(sharing):
+    """Turns sampled by the policy being trained (version 1) are scored against their own log-probs: their
+    mismatch is the numerics alone (exactly 0 here); turns of version 0 carry a deliberate offset. Both training
+    paths log the same breakdown."""
+    import random as _random
+
+    from test_seco import MODELS
+
+    from palingenesis.logits import final_hidden_states, output_head
+    from palingenesis.rl.losses import LowPrecisionWeight
+    from palingenesis.rl.parallel import Parallel
+    from palingenesis.rl.trainer import RLTrainer
+
+    torch.manual_seed(0)
+    model = MODELS["gpt2"]()
+    head = output_head(model)
+
+    def logprobs(ids, n):
+        with torch.no_grad():
+            logits = head(final_hidden_states(model, torch.tensor([ids[:-1]]), None))[0, -n:]
+            return torch.log_softmax(logits.double(), -1).gather(1, torch.tensor(ids[-n:])[:, None]).squeeze(1).tolist()
+
+    rng = _random.Random(0)
+    groups = []
+    for g in range(2):
+        prompt = [rng.randrange(1, 90) for _ in range(8)]
+        group = []
+        for k in range(3):
+            t = Trajectory({}, g, prompt, [])
+            first = [rng.randrange(1, 90) for _ in range(5)]
+            stale = k == 0
+            lps = logprobs(prompt + first, 5)
+            t.append_generated(
+                first, [lp - 0.3 if stale else lp for lp in lps], version=1, first_version=0 if stale else 1
+            )
+            t.append_context([rng.randrange(1, 90) for _ in range(3)])
+            second = [rng.randrange(1, 90) for _ in range(4)]
+            t.append_generated(second, logprobs(prompt + t.tokens + second, 4), version=1)
+            t.reward = rng.random()
+            group.append(t)
+        groups.append(group)
+
+    trainer = object.__new__(RLTrainer)
+    trainer.config = RLConfig()
+    trainer.config.set("train.prompt_sharing", sharing)
+    trainer.parallel, trainer.device, trainer.pad_id = Parallel(fsdp=False), "cpu", 0
+    trainer.model, trainer.head, trainer.head_weight = model, head, LowPrecisionWeight()
+    trainer.weights = SimpleNamespace(version=1)
+    metrics = trainer._train_step(groups)
+    assert metrics["policy/mismatch_k3/current"] < 1e-9 and metrics["policy/abs_ratio_dev/current"] < 1e-5
+    k3 = math.exp(0.3) - 1 - 0.3  # the stale turns' log-ratio is exactly +0.3
+    assert metrics["policy/mismatch_k3/stale"] == pytest.approx(k3, rel=1e-4)
+    assert metrics["policy/stale_tokens"] == pytest.approx(10 / 54)  # 2 stale turns of 5 tokens, 6 x 9 trained
+    assert metrics["policy/mismatch_k3/pos_0_1k"] == pytest.approx(metrics["policy/mismatch_k3"], rel=1e-6)
+    assert "policy/mismatch_k3/pos_1k_4k" not in metrics
+
+
+def test_step0_parity_check_logs_and_warns(caplog):
+    from palingenesis.rl.parallel import Parallel
+    from palingenesis.rl.trainer import MISMATCH_K3_STEP0_WARN, RLTrainer
+
+    trainer = object.__new__(RLTrainer)
+    trainer.parallel = Parallel(fsdp=False)
+    metrics = {"policy/mismatch_k3": 1e-4}
+    with caplog.at_level("WARNING"):
+        trainer._parity_check(metrics)
+    assert metrics["policy/mismatch_k3_step0"] == 1e-4 and not caplog.records
+    metrics = {"policy/mismatch_k3": 10 * MISMATCH_K3_STEP0_WARN}
+    with caplog.at_level("WARNING"):
+        trainer._parity_check(metrics)
+    assert metrics["policy/mismatch_k3_step0"] == 10 * MISMATCH_K3_STEP0_WARN and "before any update" in caplog.text
+    trainer._parity_check({})  # a step with nothing trained logs nothing
+
+
+@pytest.mark.parametrize("softcap", [None, 3.0])
+def test_temperature_scales_the_fp32_logits_not_the_bf16_hidden_state(softcap):
+    """The sampler divides fp32 logits by T. target_logprobs' scale does the same (fused linear path: folded into the
+    head's multiplier; soft-capped heads: the generic path, after the cap); scaling the bf16 hidden state by 1 / T, as
+    the trainer did, rounds it once more. Gradients match autograd of the exact math."""
+    from palingenesis.logits import PostProcessedHead
+
+    torch.manual_seed(3)
+    linear = torch.nn.Linear(64, 300, bias=False).to(torch.bfloat16)
+    head = PostProcessedHead(linear, 1.0, softcap) if softcap else linear
+    hidden = (torch.randn(200, 64) * 2).to(torch.bfloat16).requires_grad_()
+    targets = torch.randint(0, 300, (200,))
+    inv_t = 1 / 0.7
+    g = torch.randn(200)
+
+    def exact(h):  # fp64: head(h) / T (the generic path takes the soft-capped head's own bf16 logits)
+        y = head(h).double() if softcap else h.double() @ linear.weight.double().T
+        return torch.log_softmax(y * inv_t, -1).gather(1, targets[:, None]).squeeze(1)
+
+    reference = exact(hidden.detach())
+    lp, _ = target_logprobs(hidden, head, targets, scale=inv_t)
+    (lp * g).sum().backward()
+    grad = hidden.grad.clone()
+    hidden.grad = None
+    (exact(hidden) * g.double()).sum().backward()
+    assert (lp.double() - reference).abs().max() < 1e-4
+    assert torch.allclose(grad.double(), hidden.grad.double(), rtol=2e-2, atol=1e-3)
+    if not softcap:  # the old way: (h / T) rounded to bf16 before the head
+        with torch.no_grad():
+            old, _ = target_logprobs(hidden * inv_t, head, targets)
+        assert (old.double() - reference).abs().mean() > 10 * (lp.double() - reference).abs().mean()

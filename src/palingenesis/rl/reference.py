@@ -54,7 +54,7 @@ class ReferencePolicy:
             ):
                 hidden = final_hidden_states(self.model, ids, None)[positions.to(self.device)]
             lp, _ = target_logprobs(
-                hidden.float() * self.inv_temperature, self.head, torch.tensor(targets, device=self.device)
+                hidden, self.head, torch.tensor(targets, device=self.device), scale=self.inv_temperature
             )
             for t, piece in zip(micro, torch.split(lp.detach(), counts)):
                 out[id(t)] = piece

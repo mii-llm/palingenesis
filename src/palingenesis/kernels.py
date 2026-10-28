@@ -43,6 +43,58 @@ def apply_liger_kernel(model_type: str | None) -> bool:
     return True
 
 
+# ─── Gated RMSNorm with one rounding ─────────────────────────────────────────
+
+# model_type -> (transformers module, its pure-torch gated RMSNorm: rms_norm(x) * weight * silu(gate), norm first)
+_GATED_NORMS = {
+    "qwen3_5": ("qwen3_5", "Qwen3_5RMSNormGated"),
+    "qwen3_5_text": ("qwen3_5", "Qwen3_5RMSNormGated"),
+    "qwen3_5_moe": ("qwen3_5_moe", "Qwen3_5MoeRMSNormGated"),
+    "qwen3_5_moe_text": ("qwen3_5_moe", "Qwen3_5MoeRMSNormGated"),
+    "qwen3_next": ("qwen3_next", "Qwen3NextRMSNormGated"),
+    "olmo_hybrid": ("olmo_hybrid", "OlmoHybridRMSNormGated"),
+}
+
+
+def gated_rms_norm_one_rounding(self, hidden_states: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
+    """rms_norm(x) * weight * silu(gate) in fp32, rounded once to the input dtype: the operations, in order, of
+    vLLM's RMSNormGated (forward_static, norm before gate) and the math of flash-linear-attention's
+    FusedRMSNormGated kernel. transformers' fallback rounds to the input dtype after the norm and again after the
+    weight (for bf16 weights) before the gate and the final rounding."""
+    input_dtype = hidden_states.dtype
+    x = hidden_states.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    out = x * torch.rsqrt(variance + self.variance_epsilon) * self.weight.float()
+    if gate is not None:
+        out = out * nn.functional.silu(gate.float())
+    return out.to(input_dtype)
+
+
+def match_vllm_gated_norm(model_type: str | None) -> bool:
+    """Patch the pure-torch gated RMSNorm of `model_type`'s linear-attention layers (the class, so call it before
+    the model is created; the policy, a reference model and hf rollouts all use it) to round once, as vLLM does.
+    With flash-linear-attention installed transformers uses its fused kernel instead, which already rounds once.
+    Returns whether a class was patched."""
+    import importlib
+
+    if model_type not in _GATED_NORMS:
+        return False
+    module_name, class_name = _GATED_NORMS[model_type]
+    try:
+        module = importlib.import_module(f"transformers.models.{module_name}.modeling_{module_name}")
+    except ImportError:
+        return False
+    cls = getattr(module, class_name, None)
+    if cls is None:
+        return False
+    cls.forward = gated_rms_norm_one_rounding
+    if getattr(module, "FusedRMSNormGated", None) is not None:
+        logger.info(f"{class_name} patched to round once; flash-linear-attention's fused kernel (one rounding) is used")
+    else:
+        logger.info(f"{class_name} patched to round once, as vLLM's RMSNormGated")
+    return True
+
+
 def model_type_of(name_or_path: str, trust_remote_code: bool = False) -> str | None:
     """`model_type` of a model's config (its text config for multimodal checkpoints
     loaded as causal LMs, when Liger knows only that one)."""
@@ -51,7 +103,7 @@ def model_type_of(name_or_path: str, trust_remote_code: bool = False) -> str | N
     try:
         config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
     except Exception as exc:
-        logger.warning(f"Could not read the config of {name_or_path!r} ({exc}); Liger Kernel not applied.")
+        logger.warning(f"Could not read the config of {name_or_path!r} ({exc}); kernel patches not applied.")
         return None
     return getattr(config, "model_type", None)
 

@@ -34,7 +34,12 @@ from typing import Any, Callable
 import torch
 from transformers import AutoTokenizer
 
-from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel, model_type_of
+from palingenesis.kernels import (
+    apply_activation_checkpointing,
+    apply_liger_kernel,
+    match_vllm_gated_norm,
+    model_type_of,
+)
 from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.memory import trim_host_memory
@@ -45,6 +50,8 @@ from palingenesis.opd.rollout import (
     VLLMServer,
     VLLMServerRollout,
     checkpoint_named_parameters,
+    precision_options,
+    serve_flags,
 )
 from palingenesis.opd.teachers import end_of_turn_id, load_causal_lm, right_pad
 from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, prunable_checkpoints, student_stop_ids
@@ -53,7 +60,15 @@ from palingenesis.rl.config import RLConfig, RLConfigError, max_num_seqs
 from palingenesis.rl.data import PromptSampler, check_row_limits, load_rows, prompt_messages, split_rows
 from palingenesis.rl.env import EnvPool, ToolEnv, row_tools
 from palingenesis.rl.formats import convert
-from palingenesis.rl.losses import LowPrecisionWeight, assign_advantages, policy_loss, target_logprobs, token_weights
+from palingenesis.rl.losses import (
+    LowPrecisionWeight,
+    assign_advantages,
+    mismatch_by_bucket,
+    mismatch_metrics,
+    policy_loss,
+    target_logprobs,
+    token_weights,
+)
 from palingenesis.rl.parallel import MasterWeights, Parallel, mean_stats
 from palingenesis.rl.pipeline import RLBatch, RLPipeline
 from palingenesis.rl.rewards import code_reward, load_object, resolve_rewards
@@ -62,6 +77,12 @@ from palingenesis.rl.trajectory import Trajectory
 from palingenesis.seco import use_chunk_attention
 
 logger = logging.getLogger(__name__)
+
+# Step 0 trains on rollouts of the initial weights scored by the same weights, so its policy/mismatch_k3 is the rollout
+# engine's and the trainer's numerics alone (logged as policy/mismatch_k3_step0). bf16 rounding differences stay well
+# below this; above it the two compute different distributions (weights not loaded, a chat template, stop token or
+# temperature difference, FP8 rollouts, kernels that disagree), and the importance weights correct a bug, not rounding.
+MISMATCH_K3_STEP0_WARN = 1e-2
 
 # Statistics summed over data-parallel ranks (the rest are averaged)
 _SUMMED = {
@@ -157,6 +178,13 @@ class RLTrainer:
 
         # A vLLM server starts before the policy loads: it claims its share of free GPU memory.
         self.server = None
+        precision: dict = {}
+        if r.backend != "hf" and not (r.backend == "vllm_server" and r.url):  # a running server keeps its own settings
+            try:  # the installed vLLM must support what is asked (an fp32 head)
+                overrides = r.vllm_args.get("hf_overrides") if r.backend == "vllm" else None
+                precision = precision_options(r.fp32_head, r.ssm_state_dtype, overrides)
+            except ValueError as e:
+                raise RLConfigError(str(e)) from None
         if r.backend == "vllm_server":
             self.server = VLLMServer(
                 m.policy,
@@ -176,10 +204,14 @@ class RLTrainer:
                     *(["--max-num-seqs", str(r.max_num_seqs)] if r.max_num_seqs else []),
                     *(["--kv-cache-dtype", r.kv_cache_dtype] if r.kv_cache_dtype else []),
                     *(["--quantization", r.quantization] if r.quantization else []),
+                    *serve_flags(precision),
                 ),
             )
-        if m.use_liger_kernel and self.device.startswith("cuda") and (model_type := model_type_of(m.policy)):
+        model_type = model_type_of(m.policy) if m.match_vllm_norm or m.use_liger_kernel else None
+        if m.use_liger_kernel and self.device.startswith("cuda") and model_type:
             apply_liger_kernel(model_type)  # patches classes: before the model loads
+        if m.match_vllm_norm:
+            match_vllm_gated_norm(model_type)  # also patches a class
         self.resume_path = _resolve_resume(t.resume_from, t.output_dir)
         fsdp = self.parallel.fsdp
         logger.info(
@@ -218,8 +250,8 @@ class RLTrainer:
         self.head = output_head(self.model)
         self.head_weight = LowPrecisionWeight()  # bf16 copy of the head, cast once per optimizer step
         # The policy is the one that samples: vLLM samples (and reports behaviour log-probs) at rollout.temperature,
-        # so the trainer scores logits / T. With a plain linear head logits / T = W (h / T): the hidden state is scaled,
-        # which every head kernel supports. Before, T != 1 compared an unscaled policy with a scaled sampler.
+        # so the trainer scores logits / T: the fp32 logits of the plain linear head are scaled (target_logprobs'
+        # scale). Before, T != 1 compared an unscaled policy with a scaled sampler.
         self.inv_temperature = 1.0 / config.rollout.temperature
         if self.inv_temperature != 1.0 and not _plain_linear(self.head):
             raise RLConfigError(
@@ -246,6 +278,7 @@ class RLTrainer:
         elif r.backend == "vllm":
             extra = {k: v for k, v in (("kv_cache_dtype", r.kv_cache_dtype), ("quantization", r.quantization)) if v}
             extra.update(r.vllm_args)
+            extra.update(precision)
             self.engine = VLLMColocateRollout(
                 m.policy,
                 self.stop_ids,
@@ -429,6 +462,7 @@ class RLTrainer:
         count = self.parallel.max(len(micro_batches))  # FSDP's gathers are collectives: same count on every rank
         micro_batches += [None] * (count - len(micro_batches))
         device = self.device
+        current = self._current_version()
         self.model.train()
         for i, micro in enumerate(micro_batches):
             self.parallel.gradient_sync(self.model, i == count - 1)
@@ -441,29 +475,35 @@ class RLTrainer:
             ids, _ = right_pad([t.prompt_ids + t.tokens[:-1] for t in micro], self.pad_id, device)
             positions = torch.zeros(ids.shape, dtype=torch.bool)
             targets, behaviour, advantage, weight, seq, forced = [], [], [], [], [], []
+            completion_pos, sampled_by = [], []
             for row, t in enumerate(micro):
                 sampled = [j for j, trained in enumerate(t.mask) if trained]
                 forced += [j in t.forced for j in sampled] if t.forced else [False] * len(sampled)
                 positions[row, [len(t.prompt_ids) + j - 1 for j in sampled]] = True
+                completion_pos += sampled
+                sampled_by += _sampled_by(t, sampled, current)
                 targets += [t.tokens[j] for j in sampled]
                 behaviour += [t.logprobs[j] for j in sampled]
                 advantage += [t.advantage] * len(sampled)
                 weight += [weights[id(t)]] * len(sampled)
                 seq += [row] * len(sampled)
             floats = torch.tensor([behaviour, advantage, weight], dtype=torch.float32).to(device, non_blocking=True)
-            longs = torch.tensor([targets, seq], dtype=torch.long).to(device, non_blocking=True)
+            longs = torch.tensor([targets, seq, completion_pos, sampled_by], dtype=torch.long).to(
+                device, non_blocking=True
+            )
             seq_len = torch.tensor([float(t.sampled_tokens) for t in micro]).to(device, non_blocking=True)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 # right-padded rows need no mask: padding comes after every position scored
                 hidden = final_hidden_states(self.model, ids, None)[positions.to(device, non_blocking=True)]
-            inv_t = getattr(self, "inv_temperature", 1.0)
-            if inv_t != 1.0:
-                hidden = hidden * inv_t
-            lp, entropy = target_logprobs(hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight)
+            inv_t = getattr(self, "inv_temperature", 1.0)  # applied to the fp32 logits
+            lp, entropy = target_logprobs(
+                hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight, scale=inv_t
+            )
             forced_t = torch.tensor(forced, dtype=torch.bool).to(device, non_blocking=True) if any(forced) else None
             loss, stats = policy_loss(
                 lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config, forced_t
             )
+            stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], forced_t))
             if self.ref_lp:
                 loss = self._kl_term(loss, stats, lp, torch.cat([self.ref_lp[id(t)] for t in micro]), floats[2])
             loss.backward()
@@ -482,6 +522,7 @@ class RLTrainer:
             "policy/seq_masked": values["seq_masked"] / max(values["sequences"], 1.0),
             "trained_tokens": values["tokens"],
             "trained_sequences": values["sequences"],
+            **mismatch_metrics(values),
             **advantage_stats,
         }
         if "entropy" in values:
@@ -519,6 +560,7 @@ class RLTrainer:
         from palingenesis.seco_tree import Branch, tree_forward_backward
 
         loss_config, device = self.config.loss, self.device
+        current = self._current_version()
         rest: list[Trajectory] = []
         self.model.train()
         for group in groups:
@@ -537,13 +579,16 @@ class RLTrainer:
             def loss_fn(i: int, hidden: torch.Tensor, trained=trained) -> torch.Tensor:
                 t = trained[i]
                 sampled = [j for j, m in enumerate(t.mask) if m]
-                rows = hidden[0, sampled] * getattr(self, "inv_temperature", 1.0)
+                rows = hidden[0, sampled]
                 targets = torch.tensor([t.tokens[j] for j in sampled], device=device)
                 floats = torch.tensor(
                     [[t.logprobs[j] for j in sampled], [t.advantage] * len(sampled), [weights[id(t)]] * len(sampled)],
                     device=device,
                 )
-                lp, entropy = target_logprobs(rows, self.head, targets, loss_config.log_entropy, self.head_weight)
+                inv_t = getattr(self, "inv_temperature", 1.0)  # applied to the fp32 logits
+                lp, entropy = target_logprobs(
+                    rows, self.head, targets, loss_config.log_entropy, self.head_weight, scale=inv_t
+                )
                 seq = torch.zeros(len(sampled), dtype=torch.long, device=device)
                 seq_len = torch.tensor([float(len(sampled))], device=device)
                 forced = (
@@ -552,6 +597,8 @@ class RLTrainer:
                     else None
                 )
                 loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced)
+                where = torch.tensor([sampled, _sampled_by(t, sampled, current)], dtype=torch.long, device=device)
+                stats.update(mismatch_by_bucket(lp, floats[0], where[0], where[1], forced))
                 if self.ref_lp:
                     loss = self._kl_term(loss, stats, lp, self.ref_lp[id(t)], floats[2])
                 _accumulate(totals, stats, loss, entropy)
@@ -567,6 +614,11 @@ class RLTrainer:
                     branch_tokens=self.config.train.micro_tokens,
                 )
         return rest
+
+    def _current_version(self) -> int:
+        """The policy version being trained: rollouts sampled by it differ from the trainer by numerics alone."""
+        weights = getattr(self, "weights", None)
+        return weights.version if weights is not None else 0
 
     def _push_weights(self, version: int) -> float:
         """FSDP: gather the new weights (one parameter at a time, on every rank) and load them into
@@ -647,6 +699,8 @@ class RLTrainer:
                     }
                 )
                 metrics = self._combine(metrics)
+                if step == 0:
+                    self._parity_check(metrics)
                 if not trained:
                     logger.warning(
                         "step %d: no informative group (every rollout of every prompt got the same "
@@ -674,6 +728,21 @@ class RLTrainer:
             if self.server is not None:
                 self.server.close()
             self.parallel.close()
+
+    def _parity_check(self, metrics: dict[str, float]) -> None:
+        """Step 0 of a fresh run: log the sampler/trainer mismatch before any update, and warn when it is large."""
+        if "policy/mismatch_k3" not in metrics:
+            return
+        k3 = metrics["policy/mismatch_k3_step0"] = metrics["policy/mismatch_k3"]
+        if k3 > MISMATCH_K3_STEP0_WARN and self.parallel.main:
+            logger.warning(
+                "step 0: sampler/trainer mismatch k3 %.3g (> %g) before any update: the rollout engine and the "
+                "trainer compute different distributions. Check that the engine loaded the policy's weights, the "
+                "chat template and stop tokens, FP8 rollouts (rollout.kv_cache_dtype / quantization) and the "
+                "precision options (rollout.fp32_head, rollout.ssm_state_dtype, model.match_vllm_norm).",
+                k3,
+                MISMATCH_K3_STEP0_WARN,
+            )
 
     def _memory(self) -> dict[str, float]:
         """Peak GPU memory of the trainer since the last step (the engine's own is not counted)."""
@@ -826,6 +895,13 @@ class RLTrainer:
 def _plain_linear(head) -> bool:
     """A bias-free nn.Linear head whose logits the model uses as they are (scaling its input scales its logits)."""
     return isinstance(head, torch.nn.Linear) and head.bias is None
+
+
+def _sampled_by(t: Trajectory, sampled: list[int], current: int) -> list[int]:
+    """Per sampled token index: 0 if version `current` (the policy being trained) sampled its whole turn, 1 if an
+    older version sampled any of it, -1 when unknown (see Trajectory.token_versions)."""
+    versions = t.token_versions()
+    return [-1 if versions[j] < 0 else int(versions[j] < current) for j in sampled]
 
 
 def _accumulate(totals: dict[str, torch.Tensor], stats: dict, loss: torch.Tensor, entropy: torch.Tensor) -> None:

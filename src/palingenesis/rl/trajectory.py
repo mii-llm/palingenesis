@@ -22,6 +22,10 @@ class Trajectory:
     mask: list[bool] = field(default_factory=list)  # True: sampled by the policy (trained)
     logprobs: list[float] = field(default_factory=list)  # sampler log-probs (0.0 where not sampled)
     versions: list[int] = field(default_factory=list)  # policy version of each assistant turn
+    # Per assistant turn: the version that sampled its first token (older than `versions` when weights were loaded
+    # while it decoded: partial rollouts), and where it starts in `tokens`.
+    first_versions: list[int] = field(default_factory=list)
+    turn_starts: list[int] = field(default_factory=list)
     finish: str = ""  # stop | length | turns | error
     turns: int = 0
     tool_calls: int = 0
@@ -34,12 +38,16 @@ class Trajectory:
     forced: list[int] = field(default_factory=list)  # token indices trained with a forcing probability (think-skip)
     info: dict[str, Any] = field(default_factory=dict)  # environment / reward extras, logged
 
-    def append_generated(self, ids: list[int], logprobs: list[float], version: int) -> None:
+    def append_generated(
+        self, ids: list[int], logprobs: list[float], version: int, first_version: int | None = None
+    ) -> None:
         if len(logprobs) != len(ids):
             raise ValueError(
                 f"{len(ids)} sampled tokens but {len(logprobs)} log-probs: the rollout engine must "
                 "return the sampler's log-prob of every token (temperature > 0)"
             )
+        self.first_versions.append(version if first_version is None else first_version)
+        self.turn_starts.append(len(self.tokens))
         self.tokens += ids
         self.mask += [True] * len(ids)
         self.logprobs += [lp if math.isfinite(lp) else 0.0 for lp in logprobs]
@@ -62,6 +70,19 @@ class Trajectory:
     @property
     def sampled_tokens(self) -> int:
         return sum(self.mask)
+
+    def token_versions(self) -> list[int]:
+        """Per token of `tokens`, the oldest policy version that sampled any token of its assistant turn (a turn
+        decoded across a weight update counts as sampled by the older weights); -1 outside generated turns (context,
+        a forced prefix) and for trajectories built without append_generated."""
+        out = [-1] * len(self.tokens)
+        ends = self.turn_starts[1:] + [len(self.tokens)]
+        for start, end, version in zip(self.turn_starts, ends, self.first_versions):
+            for j in range(start, end):
+                if not self.mask[j]:  # the turn ended: context follows
+                    break
+                out[j] = version
+        return out
 
     @property
     def version(self) -> int:
