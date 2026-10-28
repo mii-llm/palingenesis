@@ -170,7 +170,11 @@ rocm_qwen3_4b.yaml` + `scripts/lumi/sft_qwen3_4b.sh`. **DPO validated** on gfx90
 (`configs/rocm_dpo_smoke.yaml`): frozen reference + chunked-logprob margins, all
 device-agnostic torch — reward accuracy 0→100%, chosen−rejected margin 0→~1.8, loss
 0.69→0.15; config uses `torch_dtype: float32` (fp32 master) per the framework's DPO
-guidance (bf16 weights round DPO's ~1e-6 updates to zero). Step 8
+guidance (bf16 weights round DPO's ~1e-6 updates to zero). **SeCO validated** on gfx90a
+(`configs/rocm_seco_smoke.yaml`): chunk-by-chunk forward matches the full forward to
+relative diff 7.9e-6 (< 1e-4 fp32 tol), then trains and checkpoints — SeCO's varlen flash
+op (`aten._flash_attention_forward`) already runs on ROCm (used by every SFT run). fp32
+weights + single-process, as the framework requires. Step 8
 partial — off-policy / frozen-teacher vLLM over HTTP works on ROCm; on-policy CUDA-IPC weight
 sync guarded to NVIDIA. Remaining: on-policy ROCm vLLM weight-sync (non-IPC), flash-linear-
 attention (needs Qwen3.5), and validating the in-process `vllm` colocate backend on ROCm.*

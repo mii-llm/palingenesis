@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROCm SeCO smoke test — sequence-chunked long-context training (AMD port, feature 13)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Exercises memory.seco on ROCm: the model runs chunk-by-chunk against a KV cache, and
+# verify_chunked_forward asserts the chunked forward matches the full forward (the one
+# assumption SeCO rests on). SeCO's varlen flash path (aten._flash_attention_forward) is
+# already used on gfx90a by every SFT run (palingenesis_seco_sdpa); this validates the
+# explicit chunked-loss mode. Single process only (no FSDP), fp32 weights, no compile.
+#
+#   python -m palingenesis train --config configs/rocm_seco_smoke.yaml
+#   # on LUMI: PGS_CONFIG=configs/rocm_seco_smoke.yaml bash scripts/lumi/sft_single_gcd.sh
+
+model:
+  name_or_path: Qwen/Qwen3-0.6B
+  torch_dtype: float32      # SeCO requires fp32 weights (config-enforced); compute still bf16
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  compile: false            # SeCO is incompatible with torch.compile
+
+data:
+  dataset: configs/rocm_smoke.data.jsonl
+  max_seq_length: 256
+  messages_field: messages
+  streaming: false
+  num_workers: 1
+
+train:
+  output_dir: ./outputs/rocm_seco_smoke
+  max_steps: 20
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.1
+  lr_scheduler: cosine
+  optimizer: adamw
+  max_grad_norm: 1.0
+  gradient_checkpointing: false
+  logging_steps: 1
+  save_steps: 1000
+  bf16: true                # bf16 compute over the fp32 master weights
+  seed: 42
+
+parallel:
+  fsdp: false               # SeCO is validated single-process only
+  context_parallel: false
+
+memory:
+  seco: true
+  seco_chunk_size: 8        # tiny so even short rows split into several chunks
+  chunked_loss: false       # SeCO does its own per-chunk CE
+
+logging:
+  use_wandb: false
+  use_trackio: false
