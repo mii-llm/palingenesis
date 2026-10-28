@@ -3312,6 +3312,14 @@ prepare = [
 rl = [
     { name = "math-verify" },
 ]
+rocm = [
+    { name = "math-verify" },
+    { name = "mcp" },
+    { name = "schedulefree" },
+    { name = "sentence-transformers" },
+    { name = "trackio" },
+    { name = "wandb" },
+]
 train = [
     { name = "bitsandbytes" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux'" },
@@ -3350,6 +3358,7 @@ requires-dist = [
     { name = "math-verify", marker = "extra == 'rl'", specifier = ">=0.8" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.2" },
     { name = "palingenesis", extras = ["all"], marker = "extra == 'dev'" },
+    { name = "palingenesis", extras = ["logging", "optim", "prepare", "rl", "mcp"], marker = "extra == 'rocm'" },
     { name = "palingenesis", extras = ["train", "float8", "logging", "loss", "optim", "prepare", "rl", "mcp"], marker = "extra == 'all'" },
     { name = "palingenesis", extras = ["vllm"], marker = "extra == 'vllm-server'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
@@ -3370,7 +3379,7 @@ requires-dist = [
     { name = "vllm", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = "==0.26.0", index = "https://wheels.vllm.ai/0.26.0/cu129" },
     { name = "wandb", marker = "extra == 'logging'", specifier = ">=0.19.0" },
 ]
-provides-extras = ["train", "hybrid", "float8", "vllm", "rl", "agent-sandbox", "mcp", "vllm-server", "logging", "loss", "optim", "prepare", "all", "dev"]
+provides-extras = ["train", "hybrid", "float8", "vllm", "rl", "agent-sandbox", "mcp", "vllm-server", "logging", "loss", "optim", "prepare", "rocm", "all", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
