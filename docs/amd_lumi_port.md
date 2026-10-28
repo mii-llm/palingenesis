@@ -181,6 +181,10 @@ weights + single-process, as the framework requires. **vLLM rollouts on ROCm**: 
 frozen-teacher over HTTP works; the in-process colocate backend (`rollout.backend='vllm'`)
 works end-to-end on gfx90a — generate, sleep/wake (CuMemAllocator), and on-policy weight
 update (`apply_model`/`load_weights`, no IPC) — so **on-policy OPD/RL runs on AMD** via
-colocate. The separate-server CUDA-IPC weight sync stays guarded to NVIDIA. Remaining:
-end-to-end OPD distill run on LUMI; flash-linear-attention (needs Qwen3.5); surgery/CMR/RL
-envs; CI. (Non-IPC server-topology weight sync is now optional, not a blocker.)*
+colocate. The separate-server CUDA-IPC weight sync stays guarded to NVIDIA. **End-to-end OPD
+distill validated** on gfx90a (`configs/rocm_opd_smoke.yaml`, Qwen3-1.7B→0.6B): the full
+on-policy loop runs — colocate vLLM sampling (~609 tok/s) + per-step sleep/wake (freed 19 GiB,
+woke ~10 ms) + hf teacher scoring + exact full-vocab reverse KL (residual mass ~1e-9) +
+weight sync, staleness 0, dev KL reported, checkpoint saved. Remaining:
+flash-linear-attention (needs Qwen3.5); surgery/CMR/RL envs; CI. (Non-IPC server-topology
+weight sync is optional, not a blocker.)*

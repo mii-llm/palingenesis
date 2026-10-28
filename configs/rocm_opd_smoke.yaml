@@ -1,0 +1,55 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROCm OPD smoke test — end-to-end on-policy distillation on one GPU (AMD, feature 16)
+# ═══════════════════════════════════════════════════════════════════════════════
+# The payoff: the full on-policy distillation loop on AMD — the student samples its own
+# completions (in-process vLLM colocate engine, validated on gfx90a), a frozen teacher
+# scores them, reverse-KL updates the student, and the new weights sync back into the
+# engine (apply_model, no CUDA IPC). Qwen3-1.7B -> Qwen3-0.6B: both use the Qwen3
+# tokenizer, so the loss is the exact full-vocabulary reverse KL (teacher backend hf).
+#
+#   python -m palingenesis.cli distill --config configs/rocm_opd_smoke.yaml
+#   # on LUMI: bash scripts/lumi/opd_single_gcd.sh
+
+model:
+  student: Qwen/Qwen3-0.6B
+  gradient_checkpointing: true
+  use_liger_kernel: false          # liger absent in base container; avoid the warning
+  stop_tokens: ["<|im_end|>"]
+
+teachers:
+  qwen17:
+    model: Qwen/Qwen3-1.7B
+    backend: hf                     # frozen, full-vocabulary logits — device-agnostic torch
+
+sources:
+  chat:
+    format: messages
+    path: configs/rocm_opd_smoke.data.jsonl
+    dev_size: 8
+    max_new_tokens: 64
+
+rollout:
+  backend: vllm                     # in-process colocate engine (validated on gfx90a)
+  batch_prompts: 8
+  group_size: 2
+  temperature: 1.0
+  gpu_memory_utilization: 0.3       # vLLM share; it sleeps while the student trains
+  max_model_len: 1024
+  enforce_eager: true               # faster start, no CUDA graphs
+  sleep: true                       # CuMemAllocator sleep/wake — works on ROCm
+
+train:
+  output_dir: ./outputs/rocm_opd_smoke
+  steps: 20
+  learning_rate: 1.0e-5
+  warmup_steps: 2
+  lr_scheduler: cosine
+  max_grad_norm: 1.0
+  seed: 0
+  score_micro_seqs: 4
+  eval_every: 1000                  # > steps: skip eval for the smoke
+  save_steps: 1000
+
+logging:
+  log_every: 1
+  use_wandb: false
