@@ -148,6 +148,16 @@ def write_session_files(path: Path, plan: SessionPlan, config) -> None:
     (path / "config.yaml").write_text(yaml.safe_dump(config.to_dict(), sort_keys=False, allow_unicode=True))
 
 
+def discard_leftovers(ss: ScopeStore) -> None:
+    """What a killed session left (taken under the store lock, so no session is running): its temporary
+    session directory, and adapter weights saved before the version's manifest was written."""
+    for stale in sorted((ss.dir / "sessions").glob("*.tmp")):
+        remove_tree(stale)
+    for orphan in sorted((ss.dir / "adapters").iterdir()):
+        if orphan.is_dir() and not (orphan / "manifest.json").exists():
+            remove_tree(orphan)
+
+
 class SessionRunner:
     """Trains one scope. `model` / `tokenizer` / `sampler` override what the config would load (tests,
     notebooks); the model is wrapped by PEFT in place."""
@@ -268,8 +278,8 @@ class SessionRunner:
         device = self.head.weight.device
         targets = torch.tensor([t for *_, c in batch for t in c], device=device)
         weights = torch.full((len(targets),), 1.0 / total_tokens, device=device)
-        hidden = self._hidden([s for _, s, _, _ in batch], [c for *_, c in batch])
         if recipe.mode == "sft":
+            hidden = self._hidden([s for _, s, _, _ in batch], [c for *_, c in batch])
 
             def ce(logits, a, b):
                 lp = F.cross_entropy(logits, targets[a:b], reduction="none")
@@ -277,6 +287,8 @@ class SessionRunner:
 
             value, _ = losses.chunked_head(hidden, self.head, ce)
             return value, float(value.detach())
+        # Teacher passes first: the "previous" role copies the live LoRA weights into the trained parameters
+        # and back, which must not happen between the student's forward and its backward.
         teacher_hidden = []
         with torch.no_grad():
             for policy in (PARENT, PREVIOUS):
@@ -285,6 +297,7 @@ class SessionRunner:
                     with self.roles[policy]():
                         h = self._hidden([batch[i][2] for i in rows], [batch[i][3] for i in rows])
                     teacher_hidden.append((rows, h))
+        hidden = self._hidden([s for _, s, _, _ in batch], [c for *_, c in batch])
         # Teacher states back in batch order (completion tokens are concatenated per row).
         offsets, total = [], 0
         for *_, c in batch:
@@ -333,6 +346,7 @@ class SessionRunner:
     def run(self) -> SessionResult:
         config, ss = self.config, self.ss
         with self.store.lock():
+            discard_leftovers(ss)
             rng = random.Random(config.recipe.seed)
             torch.manual_seed(config.recipe.seed)
             plan = plan_session(ss, self.generator, config, rng)
@@ -410,11 +424,13 @@ class SessionRunner:
             "forced": False,
             "pruned": None,
         }
-        ss.write_manifest(version, manifest)
         (tmp / "train.json").write_text(
             json.dumps({"losses": losses, "seconds": round(time.time() - started, 1)}) + "\n"
         )
         tmp.rename(ss.dir / "sessions" / session)
+        # The manifest last: until it exists the weights are not a version (a killed run leaves them for
+        # discard_leftovers and forget to delete).
+        ss.write_manifest(version, manifest)
         if self.frozen is not None:
             self.frozen.remove()
         return SessionResult(

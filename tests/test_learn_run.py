@@ -19,6 +19,7 @@ transformers = pytest.importorskip("transformers")
 pytest.importorskip("peft")
 
 from palingenesis.learn import LearnConfig, Learner, StoreError  # noqa: E402
+from palingenesis.learn.store import sha256_file  # noqa: E402
 from palingenesis.learn.trainer import PreflightError  # noqa: E402
 
 USER = "user:acme/support/ana"
@@ -132,8 +133,6 @@ def test_hf_sampler_ancestors_and_stacking(tmp_path, base):
     assert json.loads((composite / "adapter_config.json").read_text())["r"] == 8
     # Training the user scope left the org's adapter file as it was.
     org_ss = learner.store.scope("org:acme")
-    from palingenesis.learn.store import sha256_file
-
     assert (
         sha256_file(org_ss.version_dir(org.version) / "adapter_model.safetensors")
         == org_ss.manifest(org.version)["sha256"]
@@ -150,6 +149,36 @@ def test_warm_start_and_replay(tmp_path, base):
     second = learner.run("org:acme", sampler=FixedSampler(tok))
     manifest = learner.store.scope("org:acme").manifest(second.version)
     assert manifest["warm_start"] == first.version and second.new_facts == 1
+
+
+@pytest.mark.parametrize("arm", [{"anchor_teacher": "previous"}, {"replay_teacher": "self"}])
+def test_previous_model_teacher_arms_train(tmp_path, base, arm):
+    """The "previous" teacher swaps the live LoRA weights in and out: it must not break the student's backward."""
+    path, tok = base
+    learner = make_learner(tmp_path, path, steps=2, onpolicy_fraction=0.0, **arm)
+    learner.add_notes("org:acme", ["The price of Orion Pro is 25 euros."], approve=True)
+    learner.set_live("org:acme", learner.run("org:acme", sampler=FixedSampler(tok)).version)
+    learner.add_notes("org:acme", ["The colour of Orion Team is blue."], approve=True)
+    result = learner.run("org:acme", sampler=FixedSampler(tok))
+    assert len(result.losses) == 2 and all(loss == loss for loss in result.losses)
+
+
+def test_killed_session_leftovers_are_discarded(tmp_path, base):
+    path, tok = base
+    learner = make_learner(tmp_path, path, steps=1)
+    learner.add_notes("org:acme", ["The price of Orion Pro is 25 euros."], approve=True)
+    ss = learner.store.scope("org:acme")
+    # What a SIGKILL leaves: a temporary session and adapter weights without a manifest.
+    (ss.dir / "sessions" / "s0001.tmp").mkdir(parents=True)
+    (ss.dir / "sessions" / "s0001.tmp" / "questions.jsonl").write_text('{"q": "x"}\n')
+    (ss.version_dir("v0001")).mkdir(parents=True)
+    (ss.version_dir("v0001") / "adapter_model.safetensors").write_bytes(b"weights")
+    result = learner.run("org:acme", sampler=FixedSampler(tok))
+    assert not list((ss.dir / "sessions").glob("*.tmp"))
+    # The number is free again, and the new version's weights are the trained ones.
+    assert ss.versions() == [result.version] == ["v0001"]
+    weights = ss.version_dir("v0001") / "adapter_model.safetensors"
+    assert weights.read_bytes() != b"weights" and ss.manifest("v0001")["sha256"] == sha256_file(weights)
 
 
 def test_failed_session_leaves_the_live_state_untouched(tmp_path, base):
