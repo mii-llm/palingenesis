@@ -82,6 +82,10 @@ def test_pasted_content_after_the_command_is_ignored():
     assert detect([user(pasted)]).text == "this"
     # Nor does a command whose body is only on the next lines take the pasted block.
     assert detect([user("Remember:\n\nFrom: bob\n" + SECRET)]) is None
+    # Any line boundary ends the body (a carriage return, U+2028, NEL), and none separates the command from it.
+    for brk in ("\r", "\u2028", "\u2029", "\x85", "\v", "\f"):
+        assert detect([user(f"remember my editor is vim{brk}{SECRET}")]).text == "my editor is vim"
+        assert detect([user(f"remember:{brk}{SECRET}")]) is None
 
 
 def test_text_parts_only():

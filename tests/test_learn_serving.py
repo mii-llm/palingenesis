@@ -270,6 +270,20 @@ def test_rollback_reinjects_notes_and_reverts_live(learner, servers):
     assert pub.rollback(ORG, to=2).name == "org:acme@v2"
 
 
+def test_rollback_loads_on_a_replica_added_since(learner, servers):
+    live_version(learner, ORG, "The price of Orion Pro is 25 euros.")
+    answers = gold_answers(learner, [ORG])
+    old = servers(answers=answers)
+    publisher(learner, [old.url], answers)[0].publish(ORG)
+    live_version(learner, ORG, "The price of Orion Max is 40 euros.")
+    answers.update(gold_answers(learner, [ORG]))
+    new = servers(answers=answers)
+    pub, _ = publisher(learner, [old.url, new.url], answers)
+    pub.publish(ORG)
+    result = pub.rollback(ORG)
+    assert result.name == "org:acme@v1" and "org:acme@v1" in new.loaded and "org:acme@v1" in old.loaded
+
+
 def test_forget_unloads_pruned_versions_and_refuses_rollback_to_them(learner, servers):
     learner.add_notes(ORG, ["Project Nightjar's codename is Bluefin Harbor."], approve=True)
     note = learner.store.scope(ORG).active_notes()[0].id

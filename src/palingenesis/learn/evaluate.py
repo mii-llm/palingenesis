@@ -695,6 +695,12 @@ class Evaluator:
                 f"{version} was trained on {manifest.get('parent_versions')} but the ancestors' live versions are "
                 f"{parents}: it is evaluated on the current ones."
             )
+        if live_chain[-1][1] == version:
+            warnings.append(
+                f"{version} is the live version: the paired gates (retention, ancestor retention, general QA, leak, "
+                "confabulation, drift increment) compare it with itself and pass by construction; only the absolute "
+                "gates measure it on the current parents."
+            )
         rng = random.Random(config.eval.seed)
         probes = build_probes(store, ss, manifest, config, rng)
         index = NotesIndex(ss)
@@ -716,6 +722,8 @@ class Evaluator:
         entities = entities_of(ss)
         metrics, diagnostics = compute_metrics(probes, Answers(cand, live, context), entities, self.decline)
         metrics["drift"] = self.drift()
+        active = {f.id for f in ss.active_facts()}
+        metrics["session_facts"] = sum(1 for f in manifest.get("fact_ids", []) if f in active)
         notes = {n.id: n.text for s in ss.scope.chain() for n in store.scope(s).notes()}
         for row in diagnostics:
             row["notes"] = [notes[n] for n in row.get("note_ids", []) if n in notes]

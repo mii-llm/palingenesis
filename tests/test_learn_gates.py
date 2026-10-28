@@ -105,6 +105,15 @@ def test_thresholds_come_from_config():
         config.validate()
 
 
+def test_facts_without_any_probe_fail_acquisition():
+    config = LearnConfig().gates
+    m = metrics(acq=(0, 0))
+    assert by_name(gating.evaluate(m, config))["acquisition"].skipped  # nothing new: skipped
+    m["session_facts"] = 3  # the version consolidates three facts, but no probe measures them
+    acquisition = by_name(gating.evaluate(m, config))["acquisition"]
+    assert not acquisition.skipped and not acquisition.passed and acquisition.value is None
+
+
 def test_no_drift_prompts_skip_the_drift_gates():
     g = by_name(gating.evaluate(metrics(drift=None), LearnConfig().gates))
     assert g["drift_increment"].skipped and g["drift_cap"].skipped

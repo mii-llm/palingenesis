@@ -365,6 +365,52 @@ def test_keys_file_validation(tmp_path):
     assert not entry.remember and not entry.corrections  # admin keys never capture
 
 
+def _raw(url, data: bytes) -> bytes:
+    import socket
+
+    host, port = url.removeprefix("http://").split(":")
+    with socket.create_connection((host, int(port)), timeout=10) as s:
+        s.sendall(data)
+        out = b""
+        while chunk := s.recv(65536):
+            out += chunk
+    return out
+
+
+def test_malformed_and_oversized_bodies_are_refused_unread(env):
+    learner, proxy, upstream, url = env
+    proxy.max_body_bytes = 1024
+    head = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer k-ana\r\n"
+    # A negative length would read to EOF, a huge one into memory: both answer at once and close.
+    for length in (b"-1", b"abc", b"100000000"):
+        out = _raw(url, head + b"Content-Length: " + length + b"\r\n\r\n" + b"x" * 2048)
+        assert out.split(b"\r\n")[0] in (b"HTTP/1.1 411 Length Required", b"HTTP/1.1 413 Request Entity Too Large")
+    out = _raw(url, head + b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 411")
+    # A body left unread (an unknown key) never becomes the next request on the same connection.
+    inner = b"GET /v1/models HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer k-ana\r\n\r\n"
+    out = _raw(url, b"POST /v1/models HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n%s" % (len(inner), inner))
+    assert out.count(b"HTTP/1.1 ") == 1 and out.startswith(b"HTTP/1.1 401")
+    assert upstream.paths("/v1/chat/completions") == []
+
+
+def test_shared_scope_keys_cannot_forget_or_correct(env, tmp_path):
+    learner, proxy, upstream, url = env
+    learner.add_notes(TEAM, ["The support SLA is 4 hours."], approve=True)
+    proxy.keys[hash_key("k-teambot")] = load_keys_entry(TEAM)
+    note = learner.store.scope(TEAM).active_notes()[0].id
+    assert call(url, "/v1/learn/forget", {"ids": [note]}, "k-teambot")[0] == 403
+    assert call(url, "/v1/learn/corrections", {"prompt": "SLA?", "correction": "8 hours"}, "k-teambot")[0] == 403
+    assert [n.id for n in learner.store.scope(TEAM).active_notes()] == [note]
+
+
+def load_keys_entry(scope):
+    from palingenesis.learn.proxy import KeyEntry
+    from palingenesis.learn.store import ScopeId
+
+    return KeyEntry("teambot", ScopeId.parse(scope))  # role user on a team scope: a shared bot key
+
+
 def test_inject_notes_without_notes_is_identity():
     messages = [{"role": "user", "content": "hi"}]
     assert inject_notes(messages, []) == messages
@@ -387,3 +433,13 @@ def test_overhead_is_small(env):
     # The documented target is p50 < 2 ms of added latency; CI machines vary, so this only catches regressions
     # (a store read or a re-render per request).
     assert proxied - direct < 0.05
+
+
+def test_a_retried_command_stores_one_note(env):
+    learner, proxy, upstream, url = env
+    messages = [{"role": "user", "content": "remember that my desk is B12"}]
+    first = chat(url, "ana", messages)[1]
+    again = chat(url, "ana", messages)[1]  # a retry or "regenerate" sends the same newest message
+    assert first["x-learn-note"] == "stored" and again["x-learn-note"] == "unchanged"
+    assert again["x-learn-note-id"] == first["x-learn-note-id"]
+    assert texts(learner, ANA).count("my desk is B12") == 1

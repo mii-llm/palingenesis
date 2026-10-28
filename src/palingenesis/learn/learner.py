@@ -37,6 +37,7 @@ from palingenesis.learn.store import (
     Store,
     StoreError,
     new_id,
+    normalize,
     now,
     read_jsonl,
     sha256_file,
@@ -260,6 +261,16 @@ class Learner:
             )
         reason = "reads like an instruction: confirm it" if looks_like_instruction(text) else ""
         with self.store.lock():
+            # A chat client's retry or "regenerate" sends the same newest message again: one note, not one per try.
+            key = normalize(self.pii.check(text, shared=False).text)
+            ss = self.store.scope(scope)
+            if ss.exists:
+                for n in ss.active_notes():
+                    if normalize(n.text) == key:
+                        return CommitResult("unchanged", note_id=n.id, reason="already noted")
+                for item in ss.inbox():
+                    if normalize((item.payload.get("note") or {}).get("text", "")) == key:
+                        return CommitResult("unchanged", inbox_id=item.id, reason="already waiting in the inbox")
             return self._screened_note(scope, "remembered", text, origin, approve=not reason, reason=reason)
 
     def intake(self, scope, messages: list[dict], origin: str = "api") -> CommitResult | None:
@@ -735,10 +746,12 @@ class Learner:
             return default
         out = Path(out) if out else default
         paths = [self.store.scope(s).version_dir(v) for s, v in chain]
-        adapters.stack_dirs(paths, out, self.store.state["base"], pad_to=rank)
-        (out / "manifest.json").write_text(
-            json.dumps({"chain": chain, "rank": rank, "ranks": ranks, "id": composite}, indent=2) + "\n"
-        )
+        manifest = {"chain": chain, "rank": rank, "ranks": ranks, "id": composite}
+        if out == default:  # the store's copy, read by servers: replaced atomically
+            adapters.stack_composite(paths, out, self.store.state["base"], rank, manifest)
+        else:
+            adapters.stack_dirs(paths, out, self.store.state["base"], pad_to=rank)
+            (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         return out
 
     def wake_notes(self, scope) -> list[Note]:

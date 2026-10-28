@@ -161,3 +161,16 @@ def test_cli_sleep_exit_codes(learner, monkeypatch, capsys):
     monkeypatch.setattr(Learner, "run", lambda self, scope, **kw: StubRun(self, fail=[ANA])(scope))
     assert cli.main(["sleep", root]) == 1
     assert "failed_gates" in capsys.readouterr().out
+
+
+def test_overlapping_sleep_passes_stop_at_once(learner):
+    from palingenesis.learn.scheduler import sleep_lock
+    from palingenesis.learn.store import StoreLocked
+
+    learner.remember(ANA, "my editor is vim")
+    run = StubRun(learner)
+    with sleep_lock(learner.store):  # another cron run is still going
+        with pytest.raises(StoreLocked, match="another pgs learn sleep"):
+            sleep(learner, run=run)
+    assert run.calls == []
+    assert sleep(learner, run=run).entries and run.calls == [ANA]

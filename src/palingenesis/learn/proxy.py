@@ -70,6 +70,13 @@ class KeyEntry:
     role: str = "user"
     remember: bool = True
     corrections: bool = True
+    digest: str = ""  # the key's sha256
+
+    @property
+    def limit_key(self) -> str:
+        """The rate limit's key: the key itself (names repeat across scopes: pgs learn key defaults to the
+        user's name)."""
+        return self.digest or f"{self.scope}|{self.name}"
 
 
 def load_keys(path: str | Path, org: str) -> dict[str, KeyEntry]:
@@ -93,6 +100,7 @@ def load_keys(path: str | Path, org: str) -> dict[str, KeyEntry]:
             role,
             bool(row.get("remember", user)) and user,
             bool(row.get("corrections", user)) and user,
+            digest,
         )
     return out
 
@@ -244,7 +252,7 @@ class LearnProxy:
         signal = detect_command(messages, signals.command_patterns, signals.max_note_chars)
         if signal is None:
             return {}
-        if not self.limiter.allow(entry.name):
+        if not self.limiter.allow(entry.limit_key):
             return {"x-learn-note": "rate_limited"}
         out = self.store_signal(entry, "remembered", signal.text)
         headers = {"x-learn-note": out["status"]}
@@ -271,10 +279,12 @@ class LearnProxy:
             try:
                 conn.request(method, prefix + path, body=body, headers=headers)
                 return conn.getresponse()
-            except (http.client.HTTPException, ConnectionError, OSError):
+            except (http.client.HTTPException, ConnectionError, OSError) as e:
                 conn.close()
                 self._local.conn = None
-                if attempt:
+                # One retry for a kept-alive connection the upstream closed; a timeout means the request was
+                # sent and is still generating: retrying would run it twice and double the wait.
+                if attempt or isinstance(e, TimeoutError):
                     raise
         raise AssertionError("unreachable")
 
@@ -313,9 +323,17 @@ class LearnProxy:
                 return entry
 
             def _body(self) -> dict | None:
-                length = int(self.headers.get("Content-Length") or 0)
+                # A chunked or malformed body is refused, and so is an oversized one, without reading it: the
+                # connection closes instead (a negative length would read to EOF, a huge one into memory).
+                raw_length = (self.headers.get("Content-Length") or "0").strip()
+                if self.headers.get("Transfer-Encoding") or not (raw_length.isascii() and raw_length.isdigit()):
+                    self.close_connection = True
+                    self._error(411, "send the body with a Content-Length (no chunked transfer encoding)")
+                    return None
+                length = int(raw_length)
+                self._consumed = True  # read below, or the connection closes
                 if length > proxy.max_body_bytes:
-                    self.rfile.read(length)
+                    self.close_connection = True
                     self._error(413, f"request body over {proxy.max_body_bytes} bytes")
                     return None
                 try:
@@ -388,9 +406,15 @@ class LearnProxy:
                     self._error(404, f"no route {method} {path}", "not_found_error")
 
             def _run(self, method: str) -> None:
-                started, self._status, self._scope = time.perf_counter(), 0, "-"
+                started, self._status, self._scope, self._consumed = time.perf_counter(), 0, "-", False
                 try:
                     self._dispatch(method)
+                    if not self._consumed and (
+                        self.headers.get("Transfer-Encoding") or self.headers.get("Content-Length", "0").strip() != "0"
+                    ):
+                        # Answered without reading the body (401, 404): its bytes must not be parsed as the next
+                        # request on this connection (a desync behind a reverse proxy that reuses connections).
+                        self.close_connection = True
                 except (BrokenPipeError, ConnectionResetError):
                     # The client left mid-response: drop the upstream connection with its unread rest.
                     self.close_connection = True
@@ -446,6 +470,9 @@ class LearnProxy:
         def error(status, message):
             return status, {"error": {"message": message, "code": status}}
 
+        if path in ("/v1/learn/corrections", "/v1/learn/forget") and entry.scope.shared:
+            # Team and org knowledge changes through admins (pgs learn approve / forget), never a shared key.
+            return error(403, f"{path} acts on a user scope; this key serves the shared scope {entry.scope}")
         if path == "/v1/learn/corrections":
             if not entry.corrections:
                 return error(403, "this key does not send corrections")
@@ -454,7 +481,7 @@ class LearnProxy:
                 return error(400, "a correction needs {prompt, correction} strings")
             if len(correction) > self.learner.config.signals.max_note_chars:
                 return error(400, f"a correction is at most {self.learner.config.signals.max_note_chars} characters")
-            if not self.limiter.allow(entry.name):
+            if not self.limiter.allow(entry.limit_key):
                 return error(429, "too many notes this hour (signals.max_notes_per_hour)")
             return 200, self.store_signal(entry, "correction", correction, prompt)
         if path == "/v1/learn/forget":
@@ -478,7 +505,7 @@ class LearnProxy:
                 return error(400, "kind is fact or instruction")
             if any(len(n) > self.learner.config.signals.max_note_chars for n in notes):
                 return error(400, f"a note is at most {self.learner.config.signals.max_note_chars} characters")
-            if not self.limiter.allow(entry.name, len(notes)):
+            if not self.limiter.allow(entry.limit_key, len(notes)):
                 return error(429, "too many notes this hour (signals.max_notes_per_hour)")
             origin = f"proxy-admin:{entry.name}"
             try:

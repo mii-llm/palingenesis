@@ -92,6 +92,24 @@ def test_recomposes_a_missing_composite(published):
     assert Path(path, "adapter_model.safetensors").read_bytes() == before  # stacking is deterministic
 
 
+def test_an_incomplete_composite_is_stacked_again(published):
+    roots = [published.store.root]
+    name, path = resolve(roots, "Qwen/Qwen3.5-4B", "org:acme@v2")
+    before = Path(path, "adapter_model.safetensors").read_bytes()
+    Path(path, "manifest.json").unlink()  # a stack killed before its manifest (written last)
+    Path(path, "adapter_model.safetensors").write_bytes(b"partial")
+    assert resolve(roots, "Qwen/Qwen3.5-4B", "org:acme@v2") == (name, path)
+    assert Path(path, "adapter_model.safetensors").read_bytes() == before
+    assert not [p for p in Path(path).parent.iterdir() if ".tmp-" in p.name]
+
+
+def test_a_composite_outside_the_store_is_refused(published, tmp_path):
+    data = published.store.published()
+    data["scopes"][ORG]["versions"]["2"]["composite"] = "../../elsewhere"
+    published.store.write_published(data)
+    assert resolve([published.store.root], "Qwen/Qwen3.5-4B", "org:acme@v2") is None
+
+
 def test_store_discovery(published, tmp_path):
     root = published.store.root
     assert find_store([root], "acme") == root  # the store itself
@@ -149,6 +167,9 @@ def test_register_and_resolve_through_vllm_interfaces(published, fake_vllm, monk
     assert request.lora_name == "org:acme@v2" and Path(request.lora_path).is_dir()
     assert asyncio.run(resolver.resolve_lora("Qwen/Qwen3.5-4B", "org:acme@v7")) is None
     assert asyncio.run(resolver.resolve_lora("Qwen/Qwen3.5-4B", "some-other-lora")) is None
+    # A broken store answers None (logged): it must not fail requests for other resolvers' names.
+    (published.store.root / "published.json").write_text("{not json")
+    assert asyncio.run(resolver.resolve_lora("Qwen/Qwen3.5-4B", "org:acme@v1")) is None
 
 
 def test_register_without_a_store_is_a_no_op(fake_vllm, monkeypatch):

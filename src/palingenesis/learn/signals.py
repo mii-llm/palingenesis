@@ -21,8 +21,11 @@ from dataclasses import dataclass
 
 # Command words in several languages, optionally followed by "that" / "che" / "que" / ":".
 _LEAD = r"(?:please\s+|per\s+favore\s+|por\s+favor\s+|s'il\s+te\s+plaît\s+|bitte\s+)?"
-# The body starts on the command's own line ([^\S\n]: whitespace other than a line break).
-_THAT = r"(?:[^\S\n]*[:,-][^\S\n]*|[^\S\n]+)(?:(?:that|che|que|qu'|dass)[^\S\n]+)?"
+# Every line boundary str.splitlines knows (\r, U+2028, NEL, ... besides \n): pasted text may use any of them.
+_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_HS = rf"[^\S{_BREAKS}]"  # whitespace other than a line break
+# The body starts on the command's own line.
+_THAT = rf"(?:{_HS}*[:,-]{_HS}*|{_HS}+)(?:(?:that|che|que|qu'|dass){_HS}+)?"
 _INSTRUCTION = re.compile(
     r"\b(?:always|never|ignore|disregard|you must|from now on|override|"
     r"sempre|mai|ignora|devi|d'ora in poi|"
@@ -78,7 +81,7 @@ def detect_command(messages: list[dict], patterns: list[str], max_chars: int = 1
     if m is None:
         return None
     body = m.group("body")
-    body = re.split(r"\n|```", body, maxsplit=1)[0].strip()
+    body = re.split(rf"[{_BREAKS}]|```", body, maxsplit=1)[0].strip()
     if not body or len(body) > max_chars:
         return None
     return Signal("remembered", body, needs_confirmation=bool(_INSTRUCTION.search(body)))

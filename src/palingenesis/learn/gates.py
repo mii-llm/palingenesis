@@ -13,7 +13,8 @@
     drift_increment      KL(target || candidate) - KL(target || live)       <= drift_increment_max
     drift_cap            KL(target || candidate)                            <= drift_cap
 
-A gate with nothing to measure (no superseded fact, no earlier fact, ...) is skipped and passes. The
+A gate with nothing to measure (no superseded fact, no earlier fact, ...) is skipped and passes, except
+acquisition when the version consolidates facts and no held-out probe measures any of them (it fails). The
 defaults are uncalibrated (`gates.calibrated: false`) until a calibration on null sessions sets each
 threshold to a per-gate false-fail rate; every report says which. A failed gate blocks making the version
 live unless forced, and the manifest records the forced publish.
@@ -79,11 +80,17 @@ def _check(name: str, value, threshold, op: str, n: int, skip: bool = False) -> 
 def evaluate(metrics: dict, config) -> list[Gate]:
     """The gates of `metrics` (evaluate.compute_metrics + drift) under the `gates:` config section."""
     gates = []
+    # A version that consolidates facts with no held-out probe of any of them is unmeasured: it fails
+    # acquisition instead of skipping every fact gate (an empty probe set must not pass).
+    unmeasured = metrics.get("session_facts", 0) > 0 and not (
+        metrics["acquisition"]["candidate"]["n"] or metrics["update"]["candidate"]["n"]
+    )
     for name, threshold in (("acquisition", config.acquisition_min), ("update", config.update_min)):
         m = metrics[name]
         n = m["candidate"]["n"]
+        skip = n == 0 and not (unmeasured and name == "acquisition")
         # No probe answered with the notes in context: the closed-book share is undefined, which fails.
-        gates.append(_check(name, m["relative"]["rate"], threshold, ">=", m["relative"]["n"], skip=n == 0))
+        gates.append(_check(name, m["relative"]["rate"], threshold, ">=", m["relative"]["n"], skip=skip))
     stale = metrics["stale"]["candidate"]
     gates.append(_check("stale", stale["rate"], config.stale_max, "<=", stale["n"], skip=stale["n"] == 0))
     for name, threshold in (

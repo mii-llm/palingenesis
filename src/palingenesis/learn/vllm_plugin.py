@@ -23,7 +23,6 @@ again from the chain's adapters (an exact concatenation of small tensors).
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import zlib
@@ -103,15 +102,21 @@ def resolve(roots: list[Path], base_model_name: str, lora_name: str, check_base:
         )
         return None
     composite = store.root / entry["composite"]
-    if not (composite / "adapter_model.safetensors").exists():
-        from palingenesis.learn import adapter as adapters
-
-        paths = [store.scope(s).version_dir(v) for s, v in entry["chain"]]
-        adapters.stack_dirs(paths, composite, store.state["base"], pad_to=entry["rank"])
-        ranks = [store.scope(s).manifest(v)["rank"] for s, v in entry["chain"]]
-        manifest = {"chain": entry["chain"], "rank": entry["rank"], "ranks": ranks, "id": entry["composite_id"]}
-        (composite / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if not composite.resolve().is_relative_to(store.root.resolve()):
+        logger.warning("palingenesis_learn: %s points outside its store; not resolved", lora_name)
+        return None
+    if not (composite / "manifest.json").exists():  # written last: a composite without it is incomplete
+        _restack(store, entry, composite)
     return entry["name"], str(composite)
+
+
+def _restack(store: Store, entry: dict, composite: Path) -> None:
+    from palingenesis.learn import adapter as adapters
+
+    paths = [store.scope(s).version_dir(v) for s, v in entry["chain"]]
+    ranks = [store.scope(s).manifest(v)["rank"] for s, v in entry["chain"]]
+    manifest = {"chain": entry["chain"], "rank": entry["rank"], "ranks": ranks, "id": entry["composite_id"]}
+    adapters.stack_composite(paths, composite, store.state["base"], entry["rank"], manifest)
 
 
 def register() -> None:
@@ -131,7 +136,11 @@ def register() -> None:
         """Resolves <scope>@v<n> and <scope> to published composites in the learn stores."""
 
         async def resolve_lora(self, base_model_name: str, lora_name: str):
-            found = await asyncio.to_thread(resolve, roots, base_model_name, lora_name, check_base)
+            try:
+                found = await asyncio.to_thread(resolve, roots, base_model_name, lora_name, check_base)
+            except Exception:  # noqa: BLE001 - a broken store must not fail requests for other names
+                logger.exception("palingenesis_learn: resolving %s failed", lora_name)
+                return None
             if found is None:
                 return None
             name, path = found

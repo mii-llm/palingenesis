@@ -844,7 +844,8 @@ class Publisher:
             composite = self.store.root / entry["composite"]
             if not (composite / "manifest.json").exists():
                 composite = self.learner.stack(scope, chain=entry["chain"])
-            urls = list(entry["servers"]) or self.servers
+            # Today's replicas (a replica added since that version was published must serve it too).
+            urls = self.servers or list(entry["servers"])
             todo = [u for u in urls if entry["servers"].get(u) != "loaded"]
             if todo:
                 self._load(entry, engine_adapter(composite, entry["engine"]), todo)

@@ -19,12 +19,13 @@ an error), so cron can mail it.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from palingenesis.learn.store import ScopeId, StoreError
+from palingenesis.learn.store import ScopeId, StoreError, StoreLocked
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,23 @@ def pending_scopes(learner, scopes=None) -> list[tuple[ScopeId, int]]:
     return sorted(out, key=lambda x: (len(x[0].chain()), -x[1], str(x[0])))
 
 
+@contextlib.contextmanager
+def sleep_lock(store):
+    """One sleep pass per store at a time (cron runs that overlap): the second one stops at once. LOCK alone
+    is not enough: a pass releases it between scopes, and a second pass would train the same pending facts."""
+    import fcntl
+
+    with (store.root / "SLEEP.lock").open("a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise StoreLocked(f"{store.root}: another pgs learn sleep pass is running") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def sleep(
     learner,
     scopes=None,
@@ -98,6 +116,13 @@ def sleep(
     """One sleep pass (see the module docstring). `run(scope)` and `evaluate(scope, version)` default to
     Learner.run / Learner.evaluate; `publisher` to Learner.publisher() when publishing. `force` goes to the
     publisher (past a forced or ungated ancestor, recorded); a version whose own gates fail never goes live here."""
+    with sleep_lock(learner.store):
+        return _sleep(
+            learner, scopes, budget_minutes, scope_budget_minutes, publish, publisher, force, run, evaluate, clock
+        )
+
+
+def _sleep(learner, scopes, budget_minutes, scope_budget_minutes, publish, publisher, force, run, evaluate, clock):
     from palingenesis.learn.trainer import PreflightError
 
     config = learner.config.sleep

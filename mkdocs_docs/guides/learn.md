@@ -431,7 +431,8 @@ Per request:
 2. **Signals**: on a chat request from a user key, an explicit command in the newest user message is stored
    in that key's scope through the PII filter (the rules of [Learning signals](#learning-signals)), at most
    `signals.max_notes_per_hour` per key. The response says what happened: `x-learn-note: stored | held |
-   rejected | deferred | rate_limited` and `x-learn-note-id`. While a job holds the store (a session is
+   unchanged | rejected | deferred | rate_limited` (`unchanged`: the same note is already stored or
+   waiting, as when a client retries or regenerates) and `x-learn-note-id`. While a job holds the store (a session is
    training), the signal is PII-screened and spooled, and the next job stores it.
 3. **Notes**: the chain's notes that the served composite does not hold yet are rendered first in the system
    turn, ancestors' first, oldest first: the prefix stays the same between sessions, so the server's prefix
@@ -488,7 +489,12 @@ Without the proxy, `Learner.render_notes(scope, messages)` adds the same notes b
    the remaining budget (`--budget-minutes`, `--scope-budget-minutes`) waits, its notes still in the prompt;
 4. with `sleep.children_follow: gated`, each published descendant of a scope that went live is evaluated on
    the new parent and republished if its gates pass; otherwise it keeps serving its previous composite and is
-   reported.
+   reported. This evaluation compares the descendant's live version with itself, so only the absolute gates
+   (acquisition, update, stale, meta-reference, drift cap) can fail it; the report says so.
+
+The budget is checked before each scope starts, against the estimate from measured sessions: a running
+session is not stopped, and on a store with no measured session yet the estimate is unknown and the scope
+runs.
 
 A failed gate never goes live. The exit code is 1 when something needs a person (a failed gate or canary, an
 error), so cron can mail it.
@@ -510,7 +516,9 @@ error), so cron can mail it.
 - **Keys.** `keys.yaml` holds key hashes only (`pgs learn key` writes it with mode 600). Rotate a key by
   removing its entry and restarting the proxy.
 - **Forget** removes a note from every file of the store, prunes the adapter versions and composites that held
-  it, and unloads their published names from the servers.
+  it, and unloads their published names from the servers. On vLLM (0.26) an unload removes the name only: the
+  weights stay in the workers' LoRA caches, unreachable by any name, until evicted or the server restarts.
+  Restart the servers when the weights themselves must leave memory.
 
 ## Tutorial: teach your model your docs, every week
 

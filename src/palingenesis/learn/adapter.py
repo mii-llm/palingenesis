@@ -182,6 +182,30 @@ def stack_dirs(paths: list[str | Path], out: str | Path, base_model: str, pad_to
     return write_adapter(stack([read_adapter(p)[0] for p in paths], pad_to=pad_to), out, base_model)
 
 
+def stack_composite(paths: list[str | Path], out: str | Path, base_model: str, pad_to: int, manifest: dict) -> None:
+    """stack_dirs into `out` plus its manifest.json, built in a private temporary directory renamed into place:
+    a reader (the vLLM resolver plugin, another replica on the same store) sees no composite or a complete one.
+    manifest.json marks a complete composite."""
+    import os
+    import threading
+
+    from palingenesis.learn.store import remove_tree
+
+    out = Path(out)
+    tmp = out.with_name(f".{out.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    remove_tree(tmp)
+    stack_dirs(paths, tmp, base_model, pad_to=pad_to)
+    (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if out.exists() and not (out / "manifest.json").exists():
+        remove_tree(out)  # the remains of a killed stack
+    try:
+        os.rename(tmp, out)
+    except OSError:
+        remove_tree(tmp)  # another writer finished first: stacking is deterministic, its copy is the same
+        if not (out / "manifest.json").exists():
+            raise
+
+
 def rename_modules(src: str | Path, out: str | Path, renames: dict[str, str]) -> None:
     """Copy a PEFT adapter with module names rewritten (the first matching prefix of `renames` after PEFT's own
     prefix): engines that name a checkpoint's modules differently (SGLang drops `language_model.`)."""
