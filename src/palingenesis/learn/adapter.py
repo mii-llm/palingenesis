@@ -182,6 +182,25 @@ def stack_dirs(paths: list[str | Path], out: str | Path, base_model: str, pad_to
     return write_adapter(stack([read_adapter(p)[0] for p in paths], pad_to=pad_to), out, base_model)
 
 
+def rename_modules(src: str | Path, out: str | Path, renames: dict[str, str]) -> None:
+    """Copy a PEFT adapter with module names rewritten (the first matching prefix of `renames` after PEFT's own
+    prefix): engines that name a checkpoint's modules differently (SGLang drops `language_model.`)."""
+    from safetensors.torch import load_file, save_file
+
+    src, out = Path(src), Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    weights = {}
+    for key, value in load_file(str(src / ADAPTER_WEIGHTS)).items():
+        body = key[len(PEFT_PREFIX) :] if key.startswith(PEFT_PREFIX) else key
+        for old, new in renames.items():
+            if body.startswith(old):
+                body = new + body[len(old) :]
+                break
+        weights[PEFT_PREFIX + body] = value
+    save_file(weights, str(out / ADAPTER_WEIGHTS))
+    (out / ADAPTER_CONFIG).write_text((src / ADAPTER_CONFIG).read_text())
+
+
 class FrozenDelta:
     """Adds a frozen low-rank delta (stacked ancestors) to target linears through forward hooks.
 

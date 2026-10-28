@@ -54,12 +54,17 @@ class LearnNotesConfig:
     teacher_neighbours: int = 4  # BM25 neighbours of a fact's note in the teacher context
     relevance_threshold: float = 0.0  # BM25 score a note needs to enter an anchor / near-miss teacher context
     contradiction_neighbours: int = 8  # active facts compared with each new fact
+    # Budget of the notes a served prompt carries between sessions (about 4 characters per token); notes
+    # past it are left out (ancestors' and older notes first in, so the prefix stays stable).
+    wake_max_tokens: int = 4000
 
 
 @dataclass(slots=True)
 class LearnSignalsConfig:
     command_patterns: list = field(default_factory=lambda: list(DEFAULT_COMMAND_PATTERNS))
     max_note_chars: int = 1000
+    # Notes the proxy captures per API key and hour (commands, corrections and admin notes together).
+    max_notes_per_hour: int = 20
 
 
 @dataclass(slots=True)
@@ -148,6 +153,40 @@ class LearnGatesConfig:
     meta_reference_max: float = 0.02  # closed-book answers that mention notes / context
     drift_increment_max: float = 0.03  # KL(target || candidate) - KL(target || live), nats per token
     drift_cap: float = 0.15  # KL(target || candidate), nats per token
+    # The parity canary of a publish: the served adapter against HF + PEFT on the same tokens.
+    parity_answer_max_net_loss: int = 1  # probes HF answers right and the server wrong, minus the reverse
+    parity_effect_corr_min: float = 0.9  # correlation of the adapter's per-token logprob effect, HF vs server
+    parity_k3_ratio_max: float = 1.5  # k3 mismatch with the adapter / the base model's own k3 on the same tokens
+    parity_k3_floor: float = 1.0e-4  # a base k3 below this counts as this (an exact server would divide by 0)
+
+
+@dataclass(slots=True)
+class LearnServingConfig:
+    """Publishing to inference servers (pgs learn publish / rollback / unload / proxy)."""
+
+    engine: str = "vllm"  # vllm | sglang
+    servers: list = field(default_factory=list)  # base URL of every replica, e.g. http://10.0.0.5:8000
+    # api: each version is loaded through the server's LoRA load route; resolver: the vLLM resolver plugin
+    # loads it from the store on its first request (the warm-up or canary request).
+    transport: str = "api"
+    base_name: str = ""  # the base model's name on the servers (default: the store's base)
+    server_store: str = ""  # the store's path as the servers see it (default: the same path)
+    drain_seconds: int = 60  # an old version stays loaded this long after a publish, for in-flight requests
+    canary_probes: int = 16  # acquisition probes the parity canary asks (HF + PEFT reference vs server)
+    canary_max_new_tokens: int = 48
+    timeout: float = 120.0  # seconds per server request
+    api_key_env: str = "PGS_LEARN_SERVER_KEY"  # environment variable holding the servers' --api-key
+
+
+@dataclass(slots=True)
+class LearnSleepConfig:
+    """pgs learn sleep: one pass over the scopes with pending notes, under a compute budget."""
+
+    budget_minutes: float = 0.0  # the whole pass; 0 = no limit
+    scope_budget_minutes: float = 0.0  # one scope; 0 = no limit
+    # gated: after a parent goes live, its published children are evaluated on the new parent and republished
+    # when their gates pass; none: children keep serving the parent version they were published with.
+    children_follow: str = "gated"
 
 
 @dataclass(slots=True)
@@ -163,6 +202,8 @@ class LearnConfig:
     replay: LearnReplayConfig = field(default_factory=LearnReplayConfig)
     eval: LearnEvalConfig = field(default_factory=LearnEvalConfig)
     gates: LearnGatesConfig = field(default_factory=LearnGatesConfig)
+    serving: LearnServingConfig = field(default_factory=LearnServingConfig)
+    sleep: LearnSleepConfig = field(default_factory=LearnSleepConfig)
 
     @classmethod
     def from_dict(cls, raw: dict, where: str = "config") -> LearnConfig:
@@ -266,6 +307,25 @@ class LearnConfig:
                 errors.append(f"gates.{name} must be >= 0.")
         if g.drift_cap < 0:
             errors.append("gates.drift_cap must be >= 0.")
+        if not -1.0 <= g.parity_effect_corr_min <= 1.0:
+            errors.append("gates.parity_effect_corr_min is a correlation in [-1, 1].")
+        if g.parity_k3_ratio_max <= 0 or g.parity_k3_floor <= 0:
+            errors.append("gates.parity_k3_ratio_max and gates.parity_k3_floor must be > 0.")
+        sv = self.serving
+        if sv.engine not in ("vllm", "sglang"):
+            errors.append(f"serving.engine must be vllm or sglang, got {sv.engine!r}.")
+        if sv.transport not in ("api", "resolver"):
+            errors.append(f"serving.transport must be api or resolver, got {sv.transport!r}.")
+        elif sv.transport == "resolver" and sv.engine != "vllm":
+            errors.append("serving.transport resolver is the vLLM resolver plugin: use it with serving.engine vllm.")
+        if sv.drain_seconds < 0 or sv.canary_probes < 0 or sv.timeout <= 0:
+            errors.append("serving.drain_seconds and serving.canary_probes must be >= 0, serving.timeout > 0.")
+        if self.notes.wake_max_tokens < 0 or self.signals.max_notes_per_hour < 0:
+            errors.append("notes.wake_max_tokens and signals.max_notes_per_hour must be >= 0.")
+        if self.sleep.children_follow not in ("gated", "none"):
+            errors.append(f"sleep.children_follow must be gated or none, got {self.sleep.children_follow!r}.")
+        if self.sleep.budget_minutes < 0 or self.sleep.scope_budget_minutes < 0:
+            errors.append("sleep.budget_minutes and sleep.scope_budget_minutes must be >= 0 (0 = no limit).")
         if errors:
             raise LearnConfigError(
                 "learn configuration has incompatible settings:\n" + "\n".join(f"  - {e}" for e in errors)

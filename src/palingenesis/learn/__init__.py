@@ -20,11 +20,15 @@ Modules:
   gates     publishing gates over the metrics (uncalibrated defaults until null-session calibration)
   report    report.json, report.md and diagnostics.jsonl per session
   forget    purge a note from every file, prune the versions that held it, verify
+  serving   publish a scope's stacked adapter as <scope>@v<n> (vLLM, SGLang), parity canary, rollback, unload
+  vllm_plugin  vLLM LoRA resolver plugin: loads published scope adapters from the store on demand
+  proxy     OpenAI-compatible proxy: API key -> scope, notes in the prompt, routing, deliberate signals
+  scheduler pgs learn sleep: run, evaluate, set live and publish the scopes with pending notes, under a budget
   learner   Learner, the Python API
   cli       pgs learn
 
 Experimental: the recipe defaults and the gate thresholds are hypotheses until benchmarked and calibrated,
-and serving (publishing to an inference server) is not implemented yet.
+and the serving path is tested on CPU against fake servers until the GPU integration tests run.
 """
 
 import warnings

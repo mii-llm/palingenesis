@@ -11,10 +11,19 @@
     pgs learn run      STORE --scope S [--live [--force]] [--no-eval] [--section.option value ...]
     pgs learn eval     STORE --scope S [--version V] [--live [--force]] [--json] [--section.option value ...]
     pgs learn status   STORE [--scope S] [--json]
+    pgs learn publish  STORE --scope S [--servers URL ...] [--engine vllm|sglang] [--transport api|resolver]
+                             [--force] [--no-canary] [--drain-seconds N]
+    pgs learn rollback STORE --scope S [--to N] [--canary] [--drain-seconds N]
+    pgs learn unload   STORE [--scope S] [--all-drained]
+    pgs learn sleep    STORE [--scopes S ...] [--budget-minutes N] [--scope-budget-minutes N] [--publish]
+                             [--servers URL ...]
+    pgs learn proxy    STORE --keys keys.yaml [--upstream URL] [--host H] [--port P] [--access-log]
+    pgs learn key      STORE --scope S --keys keys.yaml [--role user|admin] [--name NAME]
 
 Scopes are org:<org>, team:<org>/<team>, user:<org>/<team>/<user>. Every command that changes the store
 takes its lock. Exit codes: 0 on success, 1 on an error, an unclean forget, failed gates (eval, or run
---live) or an unhealthy status (a pending rebuild, a forced or ungated live version).
+--live), a failed publish or canary, a sleep pass that needs a person, or an unhealthy status (a pending
+rebuild, a forced or ungated live version).
 """
 
 from __future__ import annotations
@@ -97,6 +106,54 @@ def build_parser() -> argparse.ArgumentParser:
     store_arg(p, scope=False)
     p.add_argument("--scope", default=None, help="a scope and its descendants (default: every scope)")
     p.add_argument("--json", action="store_true")
+
+    def server_args(p):
+        p.add_argument("--servers", nargs="+", default=None, help="server base URLs (default: serving.servers)")
+        p.add_argument("--engine", choices=("vllm", "sglang"), default=None, help="default: serving.engine")
+        p.add_argument("--transport", choices=("api", "resolver"), default=None, help="default: serving.transport")
+        p.add_argument("--drain-seconds", type=int, default=None, help="default: serving.drain_seconds")
+
+    p = sub.add_parser("publish", help="publish the scope chain's live adapters as <scope>@v<n> on the servers")
+    store_arg(p)
+    server_args(p)
+    p.add_argument("--force", action="store_true", help="publish past a forced, ungated or stale chain (recorded)")
+    p.add_argument("--no-canary", dest="canary", action="store_false", help="skip the parity canary (recorded)")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("rollback", help="serve an earlier published version of the scope again")
+    store_arg(p)
+    server_args(p)
+    p.add_argument("--to", default=None, help="the published version n (or vN; default: the one before the live one)")
+    p.add_argument("--canary", action="store_true", help="run the parity canary before flipping")
+
+    p = sub.add_parser("unload", help="unload drained and forgotten versions from the servers")
+    store_arg(p, scope=False)
+    p.add_argument("--scope", default=None)
+    p.add_argument("--all-drained", action="store_true", help="also versions still inside their drain time")
+
+    p = sub.add_parser("sleep", help="run, evaluate, set live (and publish) every scope with pending notes")
+    store_arg(p, scope=False)
+    p.add_argument("--scopes", nargs="+", default=None, help="default: every scope")
+    p.add_argument("--budget-minutes", type=float, default=None, help="default: sleep.budget_minutes (0 = no limit)")
+    p.add_argument("--scope-budget-minutes", type=float, default=None, help="default: sleep.scope_budget_minutes")
+    p.add_argument("--publish", action="store_true", help="publish each scope that goes live (with the canary)")
+    p.add_argument("--servers", nargs="+", default=None, help="server base URLs (default: serving.servers)")
+    p.add_argument("--force", action="store_true", help="publish past a forced or ungated ancestor (recorded)")
+
+    p = sub.add_parser("proxy", help="OpenAI-compatible proxy: API key -> scope, notes, routing, deliberate signals")
+    store_arg(p, scope=False)
+    p.add_argument("--keys", required=True, help="keys.yaml (sha256 of each key -> scope, role, consent)")
+    p.add_argument("--upstream", default=None, help="the inference server (default: serving.servers[0])")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8100)
+    p.add_argument("--access-log", action="store_true", help="print method, path, status, scope, latency (no bodies)")
+    p.add_argument("--max-body-mb", type=float, default=8.0)
+
+    p = sub.add_parser("key", help="create an API key for a scope; prints it once and appends its hash to keys.yaml")
+    store_arg(p)
+    p.add_argument("--keys", required=True)
+    p.add_argument("--role", choices=("user", "admin"), default="user")
+    p.add_argument("--name", default=None, help="recorded as the origin of the notes the key sends")
     return ap
 
 
@@ -143,6 +200,8 @@ def _status_text(status: dict) -> str:
         if e["scope"].startswith("user:") and e["scope"].count("/") == 1:
             depth = 1
         live = f"live {e['live']} ({e['live_state']})" if e["live"] else "no live version"
+        if (e.get("published") or {}).get("live"):
+            live += f", serving {e['published']['live']}"
         latest = ""
         if e["latest"] and e["latest"] != e["live"]:
             ev = e["latest_evaluation"]
@@ -162,6 +221,41 @@ def _status_text(status: dict) -> str:
     lines += [f"issue: {i}" for i in status["issues"]]
     lines.append("healthy" if status["healthy"] else f"{len(status['issues'])} issue(s)")
     return "\n".join(lines)
+
+
+def _version_number(text: str | None) -> int | None:
+    if text is None:
+        return None
+    text = text[1:] if text.lower().startswith("v") else text
+    if not text.isdigit():
+        raise ValueError(f"--to takes a published version number (3 or v3), got {text!r}")
+    return int(text)
+
+
+def _new_key(learner, args) -> int:
+    import secrets
+    from pathlib import Path
+
+    import yaml
+
+    from palingenesis.learn.proxy import hash_key, load_keys
+    from palingenesis.learn.store import ScopeId, atomic_write_text
+
+    scope = ScopeId.parse(args.scope)
+    learner.scope(scope)
+    path = Path(args.keys)
+    raw = (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
+    if path.exists():
+        load_keys(path, learner.store.org)  # refuse to append to a broken file
+    key = "pgsk-" + secrets.token_urlsafe(32)
+    raw.setdefault("keys", []).append(
+        {"sha256": hash_key(key), "scope": str(scope), "role": args.role, "name": args.name or scope.path[-1]}
+    )
+    atomic_write_text(path, yaml.safe_dump(raw, sort_keys=False))
+    path.chmod(0o600)
+    print(key)
+    print(f"(shown once; its hash is in {path} for {scope}, role {args.role})", file=sys.stderr)
+    return 0
 
 
 def _rows(path: str) -> list[dict]:
@@ -267,6 +361,86 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  report: {evaluation.session_dir / 'report.md'}")
             if args.live:
                 return _publish(learner, args.scope, result.version, bool(evaluation and evaluation.passed), args.force)
+            return 0
+        if args.cmd in ("publish", "rollback", "unload", "sleep"):
+            from palingenesis.learn.serving import PublishError
+
+            kw = {}
+            if args.cmd != "unload":
+                kw["servers"] = args.servers
+            if args.cmd in ("publish", "rollback"):
+                kw.update(engine=args.engine, transport=args.transport)
+                if args.drain_seconds is not None:
+                    learner.config.serving.drain_seconds = args.drain_seconds
+            publisher = learner.publisher(**kw)
+            try:
+                if args.cmd == "publish":
+                    result = publisher.publish(args.scope, force=args.force, canary=args.canary)
+                elif args.cmd == "rollback":
+                    result = publisher.rollback(args.scope, to=_version_number(args.to), canary=args.canary)
+                elif args.cmd == "unload":
+                    for line in publisher.unload(args.scope, everything_drained=args.all_drained) or [
+                        "nothing to unload"
+                    ]:
+                        print(line)
+                    return 0
+                else:
+                    report = learner.sleep(
+                        args.scopes,
+                        budget_minutes=args.budget_minutes,
+                        scope_budget_minutes=args.scope_budget_minutes,
+                        publish=args.publish,
+                        publisher=publisher if args.publish else None,
+                        force=args.force,
+                    )
+                    print(report.summary())
+                    return 0 if report.ok else 1
+            except PublishError as e:
+                print(f"pgs learn {args.cmd}: {e}", file=sys.stderr)
+                return 1
+            if args.cmd == "publish" and args.json:
+                print(
+                    json.dumps(
+                        {
+                            "name": result.name,
+                            "version": result.version,
+                            "action": result.action,
+                            "previous": result.previous,
+                            "forced": result.forced,
+                            "reasons": result.reasons,
+                            "canary": [c.to_dict() for c in result.canary],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(result.summary())
+            return 0
+        if args.cmd == "key":
+            return _new_key(learner, args)
+        if args.cmd == "proxy":
+            import os
+
+            from palingenesis.learn.proxy import LearnProxy, load_keys
+
+            upstream = args.upstream or (learner.config.serving.servers or [None])[0]
+            if not upstream:
+                raise ValueError("--upstream is required (or set serving.servers)")
+            env = learner.config.serving.api_key_env
+            proxy = LearnProxy(
+                learner,
+                load_keys(args.keys, learner.store.org),
+                upstream,
+                upstream_key=os.environ.get(env, "") if env else "",
+                max_body_bytes=int(args.max_body_mb * (1 << 20)),
+                access_log=args.access_log,
+            )
+            server = proxy.serve(args.host, args.port, background=False)
+            print(f"pgs learn proxy on http://{args.host}:{server.server_address[1]} -> {upstream}", file=sys.stderr)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                server.server_close()
             return 0
         if args.cmd == "eval":
             learner.config.apply_overrides(extra)

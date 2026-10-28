@@ -70,6 +70,7 @@ class ForgetReport:
     pruned_versions: list = field(default_factory=list)
     pruned_composites: list = field(default_factory=list)
     rebuild: list = field(default_factory=list)  # scopes whose adapter must be rebuilt
+    unloaded: list = field(default_factory=list)  # published versions unloaded from servers (Learner.forget)
     leftovers: list = field(default_factory=list)  # files that still hold a forgotten text
 
     @property
@@ -179,7 +180,8 @@ def _purge_sessions(cs, derived, report: ForgetReport) -> None:
 
 
 def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
-    """Forget notes (n_...) or pending inbox items (i_...) of `scope`. Takes the store lock."""
+    """Forget notes (n_...), pending inbox items (i_...) or spooled signals (s_...) of `scope`. Takes the store
+    lock."""
     scope = ScopeId.parse(scope)
     ss = store.scope(scope)
     report = ForgetReport(str(scope), list(ids))
@@ -193,10 +195,11 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
             while nid and nid not in gone_notes:
                 gone_notes.add(nid)
                 nid = by_id[nid].supersedes if nid in by_id else None
-        unknown = wanted - gone_notes - {i.id for i in inbox}
+        spool = ss.spool()
+        unknown = wanted - gone_notes - {i.id for i in inbox} - {r["id"] for r in spool}
         if unknown:
-            raise KeyError(f"{scope}: no note or inbox item {sorted(unknown)}")
-        texts = [by_id[n].text for n in gone_notes]
+            raise KeyError(f"{scope}: no note, inbox item or spooled signal {sorted(unknown)}")
+        texts = [by_id[n].text for n in gone_notes] + [r["text"] for r in spool if r["id"] in wanted]
         gone_facts = {f.id for f in facts if f.note_id in gone_notes}
         texts += [f.sentence for f in facts if f.id in gone_facts and f.sentence]
         gone_values = {f.value for f in facts if f.id in gone_facts}
@@ -297,6 +300,14 @@ def forget(store: Store, scope: str | ScopeId, ids: list[str]) -> ForgetReport:
             if any(t in blob or json.dumps(t)[1:-1] in blob for t in texts if len(t) >= MIN_NEEDLE):
                 return True
             return words is not None and bool(words.search(blob))
+
+        # Signals the proxy spooled while a job held the lock: the forgotten ones, and any stating a forgotten text.
+        with store.spool_lock():
+            spool = ss.spool()
+            kept_spool = [r for r in spool if r["id"] not in wanted and not derived(r)]
+            if len(kept_spool) != len(spool):
+                report.inbox += len(spool) - len(kept_spool)
+                ss.write_spool(kept_spool)
 
         # The scope's files, and its descendants': their evaluations ask the ancestors' probes of the chain.
         for cs in [ss] + [store.scope(c) for c in store.children(scope)]:

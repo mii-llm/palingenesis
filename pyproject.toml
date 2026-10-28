@@ -107,6 +107,11 @@ dev = [
 palingenesis = "palingenesis.cli:main"
 pgs = "palingenesis.cli:main"
 
+# vLLM loads general plugins from this group (VLLM_PLUGINS=palingenesis_learn selects it): the pgs learn
+# LoRA resolver, which loads published scope adapters from PGS_LEARN_STORE on demand.
+[project.entry-points."vllm.general_plugins"]
+palingenesis_learn = "palingenesis.learn.vllm_plugin:register"
+
 [project.urls]
 Repository = "https://github.com/mii-llm/palingenesis"
 Documentation = "https://mii-llm.github.io/palingenesis/"

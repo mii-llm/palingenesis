@@ -4,7 +4,8 @@
     `pgs learn` lives on a feature branch. Its interfaces and defaults may change, and every recipe default
     is a hypothesis until a benchmark settles it. Each trained version is evaluated and gated before it can
     go live, but the gate thresholds are **uncalibrated** defaults until a calibration on null sessions sets
-    them. Serving integration (publishing to an inference server) is not implemented yet.
+    them. Serving (publishing to vLLM or SGLang, the resolver plugin, the proxy) is tested on CPU against
+    fake servers; the GPU integration tests have not run yet.
 
 `palingenesis.learn` keeps what a deployed model must know per **scope** (an organization, a team, a person)
 and consolidates it into one small LoRA adapter per scope.
@@ -15,6 +16,7 @@ pgs learn init stores/acme --base Qwen/Qwen3.5-4B --org acme
 pgs learn add stores/acme --scope org:acme --documents "docs/**/*.md" --approve
 pgs learn plan stores/acme                      # what the next run trains, and its estimated cost
 pgs learn run stores/acme --scope org:acme --live   # train, evaluate, go live if the gates pass
+pgs learn publish stores/acme --scope org:acme --servers http://10.0.0.5:8000   # org:acme@v1, canary first
 pgs learn status stores/acme
 ```
 
@@ -133,8 +135,14 @@ pgs learn status stores/acme                  # exit 1 on a pending rebuild or a
 pgs learn add stores/acme --scope org:acme --documents "**/*.md" --root acme-docs --approve
 pgs learn run stores/acme --scope org:acme --live
 
-# Forget a note everywhere
+# Forget a note everywhere (published versions that held it are unloaded from the servers)
 pgs learn forget stores/acme --scope user:acme/support/ana n_8c1d...
+
+# Serve: publish the stacked chain under a new versioned name, roll back, run everything nightly
+pgs learn publish stores/acme --scope user:acme/support/ana --servers http://10.0.0.5:8000
+pgs learn rollback stores/acme --scope user:acme/support/ana
+pgs learn sleep stores/acme --publish --budget-minutes 240        # from cron
+pgs learn proxy stores/acme --keys keys.yaml --upstream http://10.0.0.5:8000
 ```
 
 The same from Python:
@@ -149,13 +157,15 @@ result = learner.run("org:acme")               # trains, then evaluates against 
 print(result.evaluation.summary())
 learner.set_live("org:acme", result.version)   # StoreError if a gate failed (force=True overrides)
 composite = learner.stack("user:acme/support/ana")   # org + team + user as one PEFT adapter
+learner.publish("org:acme", servers=["http://10.0.0.5:8000"])   # org:acme@v1, after the parity canary
 messages = learner.render_notes("user:acme/support/ana", messages)   # notes not consolidated yet
 report = learner.forget("user:acme/support/ana", ["n_8c1d..."])
 assert report.ok
 ```
 
 Between sessions, `render_notes` puts the chain's unconsolidated notes into the system turn as quoted
-reference data, in the same format the training teacher sees.
+reference data, in the same format the training teacher sees. Once something is published, "unconsolidated"
+means not held by the published composite the scope is served with (the proxy uses the same rule).
 
 ## How a session trains
 
@@ -281,22 +291,289 @@ and the retention trend per session (`--json` for scripts; exit 1 when something
 Session rows derived from the note (questions, probes, near-miss and abstain prompts, cached evaluation
 answers, diagnostics), in the scope and in its descendants, are purged too, and `report.md` is rendered again.
 
+## Serving
+
+A scope is served as **one** LoRA: the live adapters of its chain (org + team + user) stacked exactly into
+one PEFT adapter of the summed rank, padded with zero rank to a rank vLLM accepts (`--max-lora-rank`: 1, 8,
+16, 32, 64, 128, 256, 320 or 512). One base model on one server serves every scope of every tenant.
+
+### Versioned names
+
+Every publish is a **new name**, `<scope>@v<n>` (`user:acme/support/ana@v3`), where n counts the scope's
+publishes. Nothing is reloaded in place:
+
+- vLLM keys its prefix cache by adapter name, so KV blocks (and the recurrent-state checkpoints of hybrid
+  models) computed under one version are never reused under another;
+- requests already running finish on the version they started with;
+- the old version stays loaded for `serving.drain_seconds` (default 60), then is unloaded.
+
+Clients do not need these names: the proxy routes each API key to its scope's live name, and
+`pgs learn status --json` shows it (`published.live`) for clients that call the server directly.
+
+### Publish
+
+```bash
+pgs learn publish stores/acme --scope user:acme/support/ana \
+  --servers http://10.0.0.5:8000 http://10.0.0.6:8000      # every replica
+```
+
+1. **Gates**: publishing is refused when a version of the chain went live forced or ungated, failed its
+   evaluation, or was evaluated on other parent versions than the parents' live ones (evaluate it again).
+   `--force` publishes anyway; the record keeps the reasons and `status` reports them.
+2. **Load**: the composite is built (or reused) under `composites/` and loaded on every server under the new
+   name: `POST /v1/load_lora_adapter` on vLLM, `POST /load_lora_adapter` on SGLang, or nothing with
+   `--transport resolver` (the vLLM plugin below loads it on the first request). Each server must serve the
+   store's base model (`serving.base_name` if it names it differently). A one-token request warms it.
+3. **Canary**: the parity canary (below) runs on every server. If any server fails, or any load fails, the
+   new name is unloaded from every server and the live version stays as it was.
+4. **Flip**: `published.json` records the new live version; the proxy routes to it on the next request.
+
+`pgs learn rollback STORE --scope S [--to N]` serves an earlier version again (loaded again if it was
+unloaded, `--canary` to check it first). The scope's `LIVE` follows the rollback, and what the rolled-back
+versions consolidated counts as unconsolidated again: those notes return to the served prompt and the next
+session trains them. A version that held a forgotten note cannot be rolled back to.
+
+`pgs learn unload STORE` unloads the versions whose drain time has passed; `publish`, `rollback` and `sleep`
+do it too, so no daemon is needed. `forget` unloads every published version that held a forgotten note.
+
+### Parity canary
+
+The canary checks that the server applies the adapter as HF + PEFT does, on the probes where it matters.
+
+- **Reference**: transformers + PEFT loaded with the same composite (not another vLLM run, which would share
+  the loader and miss a key-name bug).
+- **Probes**: probes of the facts the chain consolidated, at most `serving.canary_probes`, preferring those
+  whose greedy answer the adapter changes (elsewhere a server ignoring the adapter would agree anyway).
+- **Checks**, per server (thresholds in `gates:`):
+    - answers: the probes HF answers right and the server wrong, minus the reverse, at most
+      `parity_answer_max_net_loss` (1);
+    - adapter effect: per token of HF's answers, logprob with the adapter minus without, on both sides; the
+      correlation must be at least `parity_effect_corr_min` (0.9);
+    - numerics: the k3 mismatch (`rho - 1 - log rho`, `rho = exp(lp_hf - lp_server)`, the RL trainer's
+      sampler-mismatch metric) with the adapter, divided by the base model's own k3 on the same tokens, at most
+      `parity_k3_ratio_max` (1.5). Hybrid models already differ between HF and the server (fp32 head, recurrent
+      state dtype, norm rounding); the ratio blames the export only for what the adapter adds.
+- A server that ignores the adapter, a wrong module prefix or a dropped module fails it. `--no-canary`
+  publishes without it, recorded as a forced publish.
+- The reference runs where `publish` runs: it loads the base model with transformers on `model.device`
+  (a GPU for anything but small models).
+
+### vLLM
+
+```bash
+VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
+VLLM_PLUGINS=palingenesis_learn PGS_LEARN_STORE=/srv/stores \
+  vllm serve Qwen/Qwen3.5-4B --enable-lora --max-lora-rank 64 --max-loras 8 --max-cpu-loras 64 \
+  --api-key "$PGS_LEARN_SERVER_KEY" --host 10.0.0.5 --port 8000
+```
+
+- `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True` enables the load / unload routes and the resolver plugins. vLLM
+  warns that this is for trusted, isolated environments: anyone who can reach the server can load an adapter
+  from any path the server can read. Keep the server on a private network, behind the proxy, with
+  `--api-key` (the publisher sends the key from `serving.api_key_env`, default `PGS_LEARN_SERVER_KEY`).
+- Without the variable, `publish` fails with a clear error naming it.
+- `--max-lora-rank` is the stacked rank (`pgs learn plan` prints it per scope); `--max-loras` is about the
+  number of scopes active in one batch, `--max-cpu-loras` the scopes active within a few minutes.
+- Run one API server process (`--api-server-count 1`, the default): vLLM tracks runtime-loaded names per
+  front-end process.
+- The adapter is trained in fp32 and served in the server's LoRA dtype (bf16 or fp16); the canary measures the
+  effect.
+- `serving.server_store` maps the store's path to the path the servers see (a shared volume).
+
+**Resolver plugin.** `pip install 'palingenesis[learn]'` in the vLLM environment registers the
+`palingenesis_learn` plugin (`vllm.general_plugins` entry point). With `VLLM_PLUGINS=palingenesis_learn` and
+`PGS_LEARN_STORE` (a store, a directory of stores, or several separated by `:`), a request for
+`<scope>@v<n>` loads that published composite from the store on demand, after a restart or on a replica
+that never received a load call. It resolves only published (not failed) versions whose adapters were not
+forgotten, for the base the server runs (`PGS_LEARN_CHECK_BASE=0` skips that check), and stacks a missing
+composite again. A request for the bare `<scope>` gets the live version; vLLM then keeps that name pinned to
+it until it is unloaded, which `publish` does on the servers it publishes to (the version is loaded under its
+own versioned name, so no cached block crosses versions). Use `--transport resolver` to publish without
+calling the load route.
+
+### SGLang
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3.5-4B --enable-lora --max-lora-rank 64 \
+  --lora-target-modules gate_up_proj down_proj --max-loras-per-batch 4 --api-key "$PGS_LEARN_SERVER_KEY"
+pgs learn publish stores/acme --scope org:acme --engine sglang --servers http://10.0.0.7:30000
+```
+
+- SGLang's `/load_lora_adapter` and `/unload_lora_adapter` share the inference port and have no runtime
+  guard: run it with `--api-key` on a private network.
+- The adapter for SGLang is written with SGLang's module names (`model.language_model.` becomes `model.` on
+  multimodal checkpoints, as SGLang renames the base weights); the canary verifies it.
+- A switch holds two versions of a scope for a moment: size `--max-loras-per-batch` with that in mind.
+- The proxy selects the adapter with SGLang's `lora_path` request field.
+
+### What is published where
+
+`published.json` (store root) records, per scope: the live version, every version with its name, composite,
+chain, rank, engine, servers and their state (`loaded`, `unloaded`, `unload failed: ...`), the canary result
+per server, whether it was forced and why, and a history of publishes, failures, rollbacks and forgotten
+versions. It holds names and ids only, no note text.
+
+## The proxy
+
+`pgs learn proxy` is an optional OpenAI-compatible front for one store (standard library only):
+
+```bash
+pgs learn key stores/acme --scope user:acme/support/ana --keys keys.yaml   # prints a key once
+pgs learn proxy stores/acme --keys keys.yaml --upstream http://10.0.0.5:8000 --port 8100
+curl http://proxy:8100/v1/chat/completions -H "Authorization: Bearer $ANA_KEY" \
+  -d '{"model": "any", "messages": [{"role": "user", "content": "ricorda che il mio progetto è Orion"}]}'
+```
+
+Per request:
+
+1. **Auth**: the key's sha256 maps to a scope, a role and consent flags in `keys.yaml`. The client's key is
+   never forwarded; the upstream gets the server key.
+2. **Signals**: on a chat request from a user key, an explicit command in the newest user message is stored
+   in that key's scope through the PII filter (the rules of [Learning signals](#learning-signals)), at most
+   `signals.max_notes_per_hour` per key. The response says what happened: `x-learn-note: stored | held |
+   rejected | deferred | rate_limited` and `x-learn-note-id`. While a job holds the store (a session is
+   training), the signal is PII-screened and spooled, and the next job stores it.
+3. **Notes**: the chain's notes that the served composite does not hold yet are rendered first in the system
+   turn, ancestors' first, oldest first: the prefix stays the same between sessions, so the server's prefix
+   cache keeps hitting. At most `notes.wake_max_tokens` (about 4 characters per token); `x-learn-notes` and
+   `x-learn-notes-dropped` report the counts. Notes past the budget mean the scope should sleep.
+4. **Routing**: `model` becomes the scope's live name (or the nearest published ancestor's, or the base model
+   when nothing is published). Adapter fields a client sends (`lora_path`, ...) are dropped: a key reaches its
+   own scope only. `x-learn-version` names what answered.
+5. **Forwarding**: streaming (SSE) and tool calls pass through unchanged.
+
+| route | who | what |
+|---|---|---|
+| `POST /v1/chat/completions` | any key | routed, notes injected, commands captured (user keys) |
+| `POST /v1/completions` | any key | routed only |
+| `GET /v1/models` | any key | the key's scope |
+| `POST /v1/learn/corrections` `{prompt, correction}` | user keys | a correction note in the key's scope |
+| `GET /v1/learn/notes` | any key | the scope's notes and pending items |
+| `POST /v1/learn/forget` `{ids}` | user keys | forget the key's own notes |
+| `POST /v1/learn/notes` `{notes, kind}` | admin keys | into the scope's inbox (never approved by the proxy) |
+| `GET /health` | anyone | liveness |
+
+Everything else, the servers' LoRA load and unload routes included, answers 404. The proxy logs nothing by
+default (no prompt, no response); `--access-log` prints method, path, status, scope and latency only. Its
+added latency target is p50 below 2 ms.
+
+```yaml
+# keys.yaml
+keys:
+  - sha256: 9f86d081884c7d65...      # of the key; `pgs learn key` appends entries
+    scope: user:acme/support/ana
+    role: user                       # user | admin
+    name: ana                        # the origin recorded on captured notes
+    remember: true                   # consent to command capture (default true for user keys)
+    corrections: true
+```
+
+Without the proxy, `Learner.render_notes(scope, messages)` adds the same notes block client-side, and
+`status --json` gives the live name.
+
+## Nightly sleep
+
+```bash
+# crontab: every night at 02:00, at most 4 GPU hours
+0 2 * * *  pgs learn sleep /srv/stores/acme --publish --budget-minutes 240 >> /var/log/pgs-learn.log 2>&1
+```
+
+`pgs learn sleep` is one pass, not a daemon:
+
+1. stores spooled signals; with `--publish`, unloads drained and forgotten versions;
+2. orders the scopes with pending work (unconsolidated facts, or a pending rebuild) parents first, then by
+   pending facts (`--scopes` limits it);
+3. per scope: estimates the time from the store's measured sessions (`plan`), runs and evaluates a session,
+   sets it live if every gate passes, and publishes it with the canary (`--publish`). A scope that does not fit
+   the remaining budget (`--budget-minutes`, `--scope-budget-minutes`) waits, its notes still in the prompt;
+4. with `sleep.children_follow: gated`, each published descendant of a scope that went live is evaluated on
+   the new parent and republished if its gates pass; otherwise it keeps serving its previous composite and is
+   reported.
+
+A failed gate never goes live. The exit code is 1 when something needs a person (a failed gate or canary, an
+error), so cron can mail it.
+
+## Security
+
+- **Runtime LoRA loading is a trust boundary.** With `VLLM_ALLOW_RUNTIME_LORA_UPDATING`, anyone who reaches
+  vLLM can load an adapter from a path; SGLang's routes have no switch at all. Servers belong on a private
+  network with `--api-key`, reachable by users only through the proxy, which never forwards those routes.
+- **Poisoning.** Only deliberate signals of an authenticated key reach its own user scope. Shared scopes
+  change only through admins (`pgs learn add`, the admin queue, admin keys into the inbox). A user can still
+  teach their own scope wrong things; that is by design, and `forget` undoes it.
+- **Prompt injection into memory.** Text the user pasted, quoted or fenced, tool outputs, retrieved documents,
+  assistant and system turns and earlier turns are never captured; only the first line of a command is kept.
+  A note that reads like an instruction ("always", "ignore", "you must") waits for confirmation. Notes are
+  rendered as quoted reference data, never as instructions.
+- **PII.** Every note passes the PII filter before it is written, the spool included: secrets are rejected,
+  personal identifiers kept, redacted or held per scope. The proxy stores no prompt or response.
+- **Keys.** `keys.yaml` holds key hashes only (`pgs learn key` writes it with mode 600). Rotate a key by
+  removing its entry and restarting the proxy.
+- **Forget** removes a note from every file of the store, prunes the adapter versions and composites that held
+  it, and unloads their published names from the servers.
+
+## Tutorial: teach your model your docs, every week
+
+A product team keeps its documentation in `acme-docs/` and wants its assistant to know each week's changes
+without retraining a model.
+
+**Once.**
+
+```bash
+pip install 'palingenesis[learn]'
+pgs learn init stores/acme --base Qwen/Qwen3.5-4B --org acme
+pgs learn add stores/acme --scope org:acme --documents "**/*.md" --root acme-docs --approve
+pgs learn plan stores/acme                 # facts, rows, steps, and the stacked rank to serve
+pgs learn run stores/acme --scope org:acme --live
+```
+
+Read `scopes/org/acme/sessions/s0001/report.md`: acquisition relative to the in-context ceiling, the failed
+probes with their notes (rewrite unclear notes), general QA and drift. Then start the server and the proxy
+(see [vLLM](#vllm) and [The proxy](#the-proxy)), and publish:
+
+```bash
+pgs learn publish stores/acme --scope org:acme --servers http://10.0.0.5:8000
+pgs learn key stores/acme --scope user:acme/support/ana --keys keys.yaml
+pgs learn proxy stores/acme --keys keys.yaml --upstream http://10.0.0.5:8000 &
+```
+
+**Every week.** Pull the docs and refresh the source: unchanged chunks keep their notes, changed chunks
+supersede the old ones (their old values become stale values), removed chunks retire. Until the next sleep
+the proxy already injects the changed notes.
+
+```bash
+git -C acme-docs pull
+pgs learn add stores/acme --scope org:acme --documents "**/*.md" --root acme-docs --approve
+pgs learn inbox stores/acme --scope org:acme      # settle conflicts the refresh raised, if any
+```
+
+**Every night** (cron): `pgs learn sleep stores/acme --publish --budget-minutes 240`. The report of the
+session shows the update and stale metrics on the changed values (the new price, not the old one), retention
+of earlier facts and general QA; a failed gate keeps the notes in the prompt and names a remedy. Users'
+"remember ..." notes consolidate into their own adapters the same night.
+
+**When something is wrong.** `pgs learn rollback stores/acme --scope org:acme` serves the previous version
+again and puts its notes back in the prompt; `pgs learn forget` removes a note for good.
+
 ## Store layout
 
 ```
 stores/acme/
   learn_state.yaml          org, base, fingerprint (base revision, tokenizer, chat template, quantization), config
   LOCK                      one mutating command at a time
+  SPOOL.lock                a short lock for the spools
   admin_queue.jsonl         promotions waiting for an admin
+  published.json            what is published where: versions, composites, servers, canary results, history
   scopes/org/acme/
     sources.jsonl notes.jsonl facts.jsonl inbox.jsonl tombstones.jsonl
+    spool.jsonl             signals the proxy captured while a job held LOCK (PII-screened)
     sessions/sNNNN/         questions, probes, near-miss and abstain prompts, config, losses,
                             report.json, report.md, diagnostics.jsonl, answers.jsonl
     pool/replay.jsonl       replay prompts only (no answers)
     adapters/vNNNN/         PEFT adapter + manifest.json
     LIVE
   scopes/team/acme/support/ ...
-  composites/<scope>/<id>/  a stacked chain
+  composites/<scope>/<id>/  a stacked chain (sglang/: the same with SGLang's module names)
 ```
 
 A store refuses to train on a base whose revision, tokenizer, chat template or quantization differs from the
@@ -319,9 +596,11 @@ notes:
   chunk_tokens: 400
   teacher_neighbours: 4
   relevance_threshold: 0.0           # BM25 score for a note to enter an anchor / near-miss teacher context
+  wake_max_tokens: 4000              # notes a served prompt carries between sessions (0 = no limit)
 signals:
   command_patterns: [remember, ricorda, ricordati, recuerda, souviens-toi, merk dir]
   max_note_chars: 1000
+  max_notes_per_hour: 20             # captured by the proxy per key (0 = no limit)
 pii:
   user_scope_personal: allow         # allow | redact | block
   shared_scope_personal: redact
@@ -366,13 +645,35 @@ gates:
   meta_reference_max: 0.02
   drift_increment_max: 0.03
   drift_cap: 0.15
+  parity_answer_max_net_loss: 1      # the parity canary of a publish
+  parity_effect_corr_min: 0.9
+  parity_k3_ratio_max: 1.5
+  parity_k3_floor: 1.0e-4
+serving:
+  engine: vllm                       # vllm | sglang
+  servers: []                        # every replica's base URL
+  transport: api                     # api (load route) | resolver (vLLM plugin)
+  base_name: ""                      # the base's name on the servers (default: the store's base)
+  server_store: ""                   # the store's path as the servers see it
+  drain_seconds: 60
+  canary_probes: 16
+  canary_max_new_tokens: 48
+  timeout: 120.0
+  api_key_env: PGS_LEARN_SERVER_KEY  # environment variable with the servers' --api-key
+sleep:
+  budget_minutes: 0                  # 0 = no limit
+  scope_budget_minutes: 0
+  children_follow: gated             # gated | none
 ```
 
 ## Limits
 
 - Experimental; recipe defaults are untested hypotheses at scale, and the gate thresholds are uncalibrated.
 - The CPU tests check the evaluation's mechanics on tiny random models, not that its thresholds are right.
-- No publishing to inference servers, parity canary or proxy yet; `--live` sets the store's live version.
+- Serving is tested on CPU against fake servers; the GPU integration tests (`tests/test_learn_gpu.py`: vLLM
+  load and versioned swap on a hybrid and a dense model, prefix-cache behaviour, HF + PEFT parity) have not
+  run yet, and the canary thresholds are uncalibrated like the gates.
+- One vLLM API server process per server; several front-end processes do not share runtime-loaded names.
 - On-policy sampling uses HF `generate` (slow); the colocated vLLM sampler is an interface only.
 - MLP-only LoRA; no MoE expert adapters.
 - Not a replacement for retrieval over large corpora.

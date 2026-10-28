@@ -373,8 +373,76 @@ class Learner:
         return self._screened_note(scope, source.kind, source.text, origin, approve=True, prompt=source.prompt)
 
     # ------------------------------------------------------------------ forget, train, serve
-    def forget(self, scope, ids: list[str]) -> ForgetReport:
-        return forget(self.store, scope, ids)
+    def forget(self, scope, ids: list[str], unload: bool = True) -> ForgetReport:
+        """Forget notes, inbox items or spooled signals of `scope`. With unload (default), published versions that
+        held a pruned adapter are unloaded from the servers they were loaded on (report.unloaded)."""
+        report = forget(self.store, scope, ids)
+        if unload and report.pruned_versions and (self.store.root / "published.json").exists():
+            from palingenesis.learn.serving import Publisher
+
+            report.unloaded = Publisher(self).unload()
+        return report
+
+    # ------------------------------------------------------------------ spooled signals
+    def spool(self, scope, kind: str, text: str, origin: str, prompt: str = "") -> CommitResult:
+        """Keep a captured signal for the next job, when LOCK is held (a session is training): PII-screened now,
+        stored as a note (or held in the inbox) by `drain_spool`. Never written for a rejected text."""
+        scope = ScopeId.parse(scope)
+        if scope.shared:
+            raise StoreError("captured signals go to a user scope.")
+        verdict = self.pii.check(text, shared=False)
+        if verdict.action == "reject":
+            return CommitResult("rejected", reason=f"PII filter: {verdict.reason()}")
+        row = {
+            "id": new_id("s"),
+            "kind": kind,
+            "text": verdict.text,
+            "prompt": prompt,
+            "origin": origin,
+            "created": now(),
+        }
+        ss = self.store.scope(scope).ensure()
+        with self.store.spool_lock():
+            ss.write_spool(ss.spool() + [row])
+        return CommitResult("deferred", inbox_id=row["id"], reason="stored when the running job finishes")
+
+    def drain_spool(self, scope=None) -> list[CommitResult]:
+        """Store the spooled signals of `scope` (default: every scope) through the normal intake (PII filter,
+        instruction check). Takes LOCK."""
+        out = []
+        scopes = [ScopeId.parse(scope)] if scope else self.store.scopes()
+        with self.store.lock(), self.store.spool_lock():
+            for s in scopes:
+                ss = self.store.scope(s)
+                rows = ss.spool() if ss.exists else []
+                for row in rows:
+                    if row["kind"] == "correction":
+                        out.append(self.correct(s, row.get("prompt", ""), row["text"], origin=row["origin"]))
+                    else:
+                        out.append(self.remember(s, row["text"], origin=row["origin"]))
+                if rows:
+                    ss.write_spool([])
+        return out
+
+    # ------------------------------------------------------------------ serving
+    def publisher(self, **kwargs):
+        """A serving.Publisher over this store (servers, engine, transport, clients, reference)."""
+        from palingenesis.learn.serving import Publisher
+
+        return Publisher(self, **kwargs)
+
+    def publish(self, scope, force: bool = False, canary: bool = True, **kwargs):
+        """Publish the scope chain's live adapters as <scope>@v<n> on the servers (see serving)."""
+        return self.publisher(**kwargs).publish(scope, force=force, canary=canary)
+
+    def rollback(self, scope, to: int | None = None, canary: bool = False, **kwargs):
+        return self.publisher(**kwargs).rollback(scope, to=to, canary=canary)
+
+    def sleep(self, scopes=None, **kwargs):
+        """One pass over the scopes with pending notes: run, evaluate, set live, publish (see scheduler)."""
+        from palingenesis.learn.scheduler import sleep
+
+        return sleep(self, scopes, **kwargs)
 
     def run(self, scope, model=None, tokenizer=None, sampler=None, evaluate: bool = True):
         """Train the scope's adapter on its unconsolidated facts (plus replay and anchors): a new version,
@@ -382,6 +450,7 @@ class Learner:
         from palingenesis.learn.trainer import SessionRunner
 
         scope = self.scope(scope).id
+        self.drain_spool(scope)  # signals captured while an earlier job held the lock
         runner = SessionRunner(self, scope, self.generator, model=model, tokenizer=tokenizer, sampler=sampler)
         return runner.run(evaluate=evaluate)
 
@@ -560,12 +629,15 @@ class Learner:
         return out
 
     def status(self, scope=None) -> dict:
-        """The scope tree with live versions, gate states, inbox / queue counts and pending rebuilds;
-        `issues` lists what needs a person (a pending rebuild, a forced or ungated live version)."""
+        """The scope tree with live versions, what is served, gate states, inbox / queue counts and pending
+        rebuilds; `issues` lists what needs a person (a pending rebuild, a forced or ungated live version, a
+        version published past its checks)."""
         from palingenesis.learn.config import LearnConfigError
+        from palingenesis.learn.serving import published_summary
 
         root = ScopeId.parse(scope) if scope else None
         queue = self.store.admin_queue()
+        published = {p["scope"]: p for p in published_summary(self.store)}
         rebuild = list(self.store.state.get("rebuild") or [])
         entries, issues = [], []
         for s in self.store.scopes():
@@ -591,6 +663,7 @@ class Learner:
                 "rebuild": str(s) in rebuild,
                 "served_rank": None,
                 "retention_trend": [],
+                "published": published.get(str(s)),
             }
             if live is not None:
                 manifest = ss.manifest(live)
@@ -617,6 +690,9 @@ class Learner:
                 entry["served_rank"] = served_rank(self._chain_ranks(s))
             except LearnConfigError as e:
                 issues.append(f"{s}: {e}")
+            served = entry["published"] or {}
+            if served.get("forced"):
+                issues.append(f"{s}: serving {served['live']} published past: {'; '.join(served['forced_reasons'])}")
             if entry["rebuild"]:
                 issues.append(
                     f"{s}: rebuild pending (forget pruned its adapter or the parent version it was trained on)"
@@ -632,24 +708,33 @@ class Learner:
             "healthy": not issues,
         }
 
-    def stack(self, scope, out: str | Path | None = None, pad: bool = True) -> Path:
-        """The scope chain's live adapters stacked into one PEFT adapter (exact; padded to a vLLM rank)."""
+    def stack(self, scope, out: str | Path | None = None, pad: bool = True, chain: list | None = None) -> Path:
+        """The scope chain's live adapters (or `chain`, [(scope, version), ...]) stacked into one PEFT adapter
+        (exact; padded to a vLLM rank). The default location composites/<scope>/<id>/ is reused when it exists."""
         from palingenesis.learn import adapter as adapters
 
         scope = ScopeId.parse(scope)
-        chain, paths = [], []
-        for s in scope.chain():
-            ss = self.store.scope(s)
-            if ss.live is not None:
-                chain.append((str(s), ss.live))
-                paths.append(ss.version_dir(ss.live))
-        if not paths:
+        if chain is None:
+            chain = []
+            for s in scope.chain():
+                ss = self.store.scope(s)
+                if ss.exists and ss.live is not None:
+                    chain.append((str(s), ss.live))
+        chain = [(str(s), v) for s, v in chain]
+        if not chain:
             raise StoreError(f"no live adapter in the chain of {scope}")
-        ranks = [self.store.scope(s).manifest(v)["rank"] for s, v in chain]
+        manifests = [self.store.scope(s).manifest(v) for s, v in chain]
+        for (s, v), manifest in zip(chain, manifests):
+            if manifest.get("pruned"):
+                raise StoreError(f"{s} {v} was pruned ({manifest['pruned']['reason']}); it cannot be stacked")
+        ranks = [m["rank"] for m in manifests]
         rank = served_rank(ranks) if pad else sum(ranks)
-        sha = "".join(self.store.scope(s).manifest(v)["sha256"] for s, v in chain)
-        composite = sha256_text(sha)[:8]
-        out = Path(out) if out else self.store.root / "composites" / scope.level / Path(*scope.path) / composite
+        composite = sha256_text("".join(m["sha256"] for m in manifests))[:8]
+        default = self.store.root / "composites" / scope.level / Path(*scope.path) / composite
+        if out is None and (default / "manifest.json").exists():
+            return default
+        out = Path(out) if out else default
+        paths = [self.store.scope(s).version_dir(v) for s, v in chain]
         adapters.stack_dirs(paths, out, self.store.state["base"], pad_to=rank)
         (out / "manifest.json").write_text(
             json.dumps({"chain": chain, "rank": rank, "ranks": ranks, "id": composite}, indent=2) + "\n"
@@ -657,7 +742,14 @@ class Learner:
         return out
 
     def wake_notes(self, scope) -> list[Note]:
-        """The chain's active notes that its live adapters do not hold yet (ancestors first)."""
+        """The chain's active notes that what is served does not hold yet (ancestors first): once something in
+        the chain is published, relative to the published composite the scope is served with (the proxy's
+        rule); before, relative to the chain's live adapters (a composite from `stack`)."""
+        from palingenesis.learn import serving
+
+        owner, entry = serving.served_version(self.store, scope)
+        if owner is not None:
+            return serving.wake_notes(self.store, scope, entry)
         out = []
         for s in ScopeId.parse(scope).chain():
             ss = self.store.scope(s)

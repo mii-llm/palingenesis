@@ -3,13 +3,18 @@
     stores/acme/
       learn_state.yaml             org, base model, fingerprint of tokenizer / chat template / quantization,
                                    ranks, target-module regex, config snapshot
-      LOCK                         fcntl lock: one mutating job (add, approve, forget, run) at a time
+      LOCK                         fcntl lock: one mutating job (add, approve, forget, run, publish) at a time
+      SPOOL.lock                   a short lock for the spools (signals captured while LOCK was held)
       admin_queue.jsonl            promotions waiting for an admin
+      published.json               what is published where: per scope, its served versions (<scope>@v<n>),
+                                   their composites, servers, canary results and history
       scopes/org/acme/
         sources.jsonl              {source_key, root, kind, last_seen_hash}
         notes.jsonl                {id, source_key, anchor, hash, kind, text, status, supersedes, locked, ...}
         facts.jsonl                {id, note_id, subject, attribute, value, sentence, stale_values, status, ...}
         inbox.jsonl                pending notes, document refreshes, conflicts, confirmations, PII reviews
+        spool.jsonl                signals the proxy captured while a job held LOCK (PII-screened), stored by
+                                   the next job
         tombstones.jsonl           forgotten items: {id, sha256, forgotten_at} only, never text
         sessions/s0001/            questions.jsonl, probes.jsonl, nearmiss.jsonl, config.yaml, train.json
         pool/replay.jsonl          replay prompts only: {id, q, fact_ids, session, active}
@@ -48,6 +53,10 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 class StoreError(Exception):
     """A store operation that cannot proceed (bad scope, lock held, fingerprint mismatch, ...)."""
+
+
+class StoreLocked(StoreError):
+    """The store's LOCK is held by another job."""
 
 
 def now() -> str:
@@ -295,6 +304,12 @@ class ScopeStore:
     def write_pool(self, rows: list[dict]) -> None:
         write_jsonl(self.dir / "pool" / "replay.jsonl", rows)
 
+    def spool(self) -> list[dict]:
+        return read_jsonl(self.dir / "spool.jsonl")
+
+    def write_spool(self, rows: list[dict]) -> None:
+        write_jsonl(self.dir / "spool.jsonl", rows)
+
     def tombstones(self) -> list[dict]:
         return read_jsonl(self.dir / "tombstones.jsonl")
 
@@ -420,6 +435,37 @@ class Store:
     def write_admin_queue(self, rows: list[dict]) -> None:
         write_jsonl(self.root / "admin_queue.jsonl", rows)
 
+    def published(self) -> dict:
+        """published.json: {"format": 1, "scopes": {scope: {"live", "next", "versions", "history"}}}."""
+        path = self.root / "published.json"
+        if not path.exists():
+            return {"format": 1, "scopes": {}}
+        return json.loads(path.read_text())
+
+    def write_published(self, data: dict) -> None:
+        atomic_write_text(self.root / "published.json", json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    @contextlib.contextmanager
+    def spool_lock(self, timeout: float = 10.0):
+        """A short exclusive lock for reading and rewriting spools, held by the proxy (which cannot take LOCK
+        while a job runs) and by the job that stores the spooled signals."""
+        import fcntl
+
+        with (self.root / "SPOOL.lock").open("a") as f:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise StoreError(f"{self.root}: the spool lock is held") from None
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
     def check_fingerprint(self, fingerprint: dict) -> None:
         """Record the base's fingerprint on the first run; refuse a later run on a different one."""
         stored = self.state.get("fingerprint")
@@ -456,8 +502,8 @@ class Store:
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     f.close()
-                    raise StoreError(
-                        f"{self.root} is locked by another learn job (add, approve, forget or run)."
+                    raise StoreLocked(
+                        f"{self.root} is locked by another learn job (add, approve, forget, run or publish)."
                     ) from None
                 time.sleep(0.2)
         self._lock_depth, self._lock_file = 1, f

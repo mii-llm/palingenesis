@@ -483,11 +483,20 @@ class VLLMServer:
     """A `vllm serve` process launched by the trainer, or an existing one at `url`.
 
     Launched servers get the dev endpoints (pause/resume, weight transfer) and are
-    terminated when the trainer exits; their log goes to `log_path`.
+    terminated when the trainer exits; their log goes to `log_path`. `env` adds
+    environment variables; dev_mode=False leaves out VLLM_SERVER_DEV_MODE and
+    VLLM_ALLOW_INSECURE_SERIALIZATION (servers launched for LoRA serving tests).
     """
 
     def __init__(
-        self, model: str, url: str = "", args: tuple[str, ...] = (), log_path: str = "", startup_timeout: float = 900.0
+        self,
+        model: str,
+        url: str = "",
+        args: tuple[str, ...] = (),
+        log_path: str = "",
+        startup_timeout: float = 900.0,
+        env: dict[str, str] | None = None,
+        dev_mode: bool = True,
     ):
         self.model = model
         self.process = None
@@ -496,7 +505,8 @@ class VLLMServer:
         else:
             port = _free_port()
             self.url = f"http://127.0.0.1:{port}"
-            env = {**os.environ, "VLLM_SERVER_DEV_MODE": "1", "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"}
+            dev = {"VLLM_SERVER_DEV_MODE": "1", "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"} if dev_mode else {}
+            env = {**os.environ, **dev, **(env or {})}
             cmd = [
                 sys.executable,
                 "-m",
