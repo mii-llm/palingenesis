@@ -185,6 +185,12 @@ colocate. The separate-server CUDA-IPC weight sync stays guarded to NVIDIA. **En
 distill validated** on gfx90a (`configs/rocm_opd_smoke.yaml`, Qwen3-1.7B→0.6B): the full
 on-policy loop runs — colocate vLLM sampling (~609 tok/s) + per-step sleep/wake (freed 19 GiB,
 woke ~10 ms) + hf teacher scoring + exact full-vocab reverse KL (residual mass ~1e-9) +
-weight sync, staleness 0, dev KL reported, checkpoint saved. Remaining:
-flash-linear-attention (needs Qwen3.5); surgery/CMR/RL envs; CI. (Non-IPC server-topology
-weight sync is optional, not a blocker.)*
+weight sync, staleness 0, dev KL reported, checkpoint saved. **Qwen3.5 (hybrid
+linear-attention) validated** on gfx90a (`configs/rocm_qwen35_08b.yaml`, Qwen3.5-0.8B): the
+container's transformers 5.10.1 already registers `qwen3_5`, and it trains via the
+**pure-torch linear-attention fallback** (loss 0.64→0.31, checkpoint; ~6–20× slower than fla,
+as warned). **flash-linear-attention acceleration is deferred**: a simple overlay install of
+`flash-linear-attention` 0.6.0 came up incomplete and a *broken* fla makes Qwen3.5 loading
+hard-fail (fla *absent* falls back cleanly) — it needs a known-good ROCm fla build / matching
+version, a follow-up. Remaining: surgery/CMR/RL envs; CI; a known-good ROCm fla build.
+(Non-IPC server-topology weight sync is optional, not a blocker.)*

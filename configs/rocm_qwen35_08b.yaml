@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROCm Qwen3.5-0.8B SFT — hybrid linear-attention model on one GPU (AMD, feature 17)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Qwen3.5 interleaves linear-attention (gated DeltaNet) layers with full attention. Without
+# flash-linear-attention's Triton kernels transformers runs a pure-torch fallback (correct,
+# ~6-20x slower) — this config is the baseline that proves the model trains on ROCm at all.
+# With fla installed the same config picks up the fused kernels (no warning). packing is off
+# (packing Qwen3.5 needs causal-conv1d, a CUDA build not available on ROCm).
+#
+#   python -m palingenesis train --config configs/rocm_qwen35_08b.yaml
+#   # on LUMI: PGS_MODEL=Qwen/Qwen3.5-0.8B PGS_CONFIG=configs/rocm_qwen35_08b.yaml \
+#   #          bash scripts/lumi/sft_single_gcd.sh
+
+model:
+  name_or_path: Qwen/Qwen3.5-0.8B
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  compile: false
+
+data:
+  dataset: configs/rocm_smoke.data.jsonl
+  max_seq_length: 256
+  messages_field: messages
+  streaming: false
+  num_workers: 1
+  packing: false            # Qwen3.5 packing needs causal-conv1d (no ROCm build)
+
+train:
+  output_dir: ./outputs/rocm_qwen35_08b
+  max_steps: 20
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.1
+  lr_scheduler: cosine
+  optimizer: adamw
+  max_grad_norm: 1.0
+  gradient_checkpointing: false
+  logging_steps: 1
+  save_steps: 1000
+  bf16: true
+  seed: 42
+
+parallel:
+  fsdp: false
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 2
+
+logging:
+  use_wandb: false
+  use_trackio: false
