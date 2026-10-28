@@ -335,3 +335,149 @@ def test_cli_run_eval_status(tmp_path, base, capsys):
     # The facts are consolidated now: the next run would replay them with anchors only.
     code, out, _ = cli("plan", store, "--scope", "org:acme")
     assert code == 0 and "0 new facts" in out and "0 questions" in out and "replay rows" in out
+
+
+# ---------------------------------------------------------------------------- children after a parent update
+
+KESTREL, FALCON = "The editor of Kestrel is vim.", "The desk of Falcon is B12."
+
+
+def scramble(learner, scope, version, seed):
+    """Large random weights for `version` (a few training steps leave a LoRA near zero), so every chain is a
+    different function of the input; the manifest's sha256 follows."""
+    from safetensors.torch import load_file, save_file
+
+    from palingenesis.learn import adapter as adapters
+
+    ss = learner.store.scope(scope)
+    path = ss.version_dir(version) / adapters.ADAPTER_WEIGHTS
+    gen = torch.Generator().manual_seed(seed)
+    tensors = {k: 0.3 * torch.randn(v.shape, generator=gen) for k, v in load_file(str(path)).items()}
+    save_file(tensors, str(path))
+    manifest = ss.manifest(version)
+    manifest["sha256"] = sha256_file(path)
+    ss.write_manifest(version, manifest)
+
+
+def chain_sampler(path, tok, learner, labels: dict[str, list], knows: dict[str, dict[str, str]]):
+    """An HFSampler stand-in that answers as the chain the model computes under the role really is: it runs the
+    model on a fixed input inside the role's context and takes the nearest of `labels` ({label: chain}),
+    each computed on a fresh base with the chain stacked as frozen hooks; then answers from knows[label]."""
+    from palingenesis.learn import adapter as adapters
+
+    probe = torch.tensor([tok.encode("Kestrel Falcon Orion", add_special_tokens=False)])
+    references = {}
+    for label, chain in labels.items():
+        model = transformers.AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32)
+        tensors = [adapters.read_adapter(learner.store.scope(s).version_dir(v))[0] for s, v in chain]
+        adapters.FrozenDelta(model, adapters.stack(tensors))
+        with torch.no_grad():
+            references[label] = model(input_ids=probe).logits[0, -1]
+    answers = KeySampler(tok, knows)
+    seen = []
+
+    class ChainSampler:
+        def __init__(self, model, stop_ids, pad_id, roles, micro_seqs=8):
+            self.model, self.roles = model, roles
+
+        def generate(self, prompts, max_new_tokens, temperature, role):
+            with self.roles[role](), torch.no_grad():
+                logits = self.model(input_ids=probe).logits[0, -1]
+            label = min(references, key=lambda k: float((references[k] - logits).norm()))
+            seen.append((role, label))
+            return answers.generate(prompts, max_new_tokens, temperature, label)
+
+    ChainSampler.seen = seen
+    return ChainSampler
+
+
+@pytest.mark.parametrize("destroys", [True, False])
+def test_a_parent_update_that_breaks_a_child_keeps_the_old_composite(tmp_path, base, monkeypatch, destroys):
+    """A child re-evaluated on a new parent is paired against the composite it is served with (the old parent
+    under it), not against itself: a parent version that loses a fact the child retained fails the child's
+    retention gate, the child keeps serving the old composite and is marked for rebuild. A parent update that
+    keeps it lets the child follow."""
+    from types import SimpleNamespace
+
+    from palingenesis.learn import trainer
+    from palingenesis.learn.scheduler import sleep
+
+    path, tok = base
+    org = "org:acme"
+    learner = make_learner(tmp_path, path, steps=1)
+    learner.config.gates.drift_cap = learner.config.gates.drift_increment_max = 100.0
+    learner.config.gates.retention_max_net_loss = 0
+
+    def trained(scope, seed):
+        version = learner.run(scope, sampler=FixedSampler(tok), evaluate=False).version
+        scramble(learner, scope, version, seed)
+        return version
+
+    learner.add_notes(org, [PRICE], approve=True)
+    learner.set_live(org, org1 := trained(org, 1), force=True)
+    learner.add_notes(USER, [KESTREL], approve=True)
+    learner.set_live(USER, trained(USER, 2), force=True)
+    learner.add_notes(USER, [FALCON], approve=True)
+    learner.set_live(USER, user := trained(USER, 3), force=True)
+    served = [[org, org1], [USER, user]]
+    published = learner.store.published()
+    entry = {"name": f"{USER}@v1", "chain": served, "state": "live", "servers": {}}
+    published["scopes"][USER] = {"live": 1, "next": 2, "versions": {"1": entry}, "history": []}
+    learner.store.write_published(published)
+
+    # The parent update: org's next version, trained and set live by a sleep pass.
+    learner.add_notes(org, [COLOUR], approve=True)
+    org2 = []
+
+    def run(scope):  # the random tiny model fails org's own gates: set live forced here, not by the pass
+        org2.append(trained(scope, 4))
+        Learner.set_live(learner, scope, org2[-1], force=True)
+        return SimpleNamespace(version=org2[-1], evaluation=SimpleNamespace(passed=True, report={"gates": []}))
+
+    monkeypatch.setattr(learner, "set_live", lambda scope, version, force=False: None)
+    both = {"Kestrel": "vim", "Falcon": "B12"}
+
+    class Publisher:
+        published = []
+
+        def publish(self, scope, force=False):
+            self.published.append(str(scope))
+            return SimpleNamespace(action="publish", name=f"{scope}@v2")
+
+        def unload(self, scope=None, everything_drained=False):
+            return []
+
+    class LazySampler:
+        """The chain references need org's new version, which the pass trains first."""
+
+        def __new__(cls, *args, **kwargs):
+            labels = {"served": served, "new": [[org, org2[-1]], [USER, user]], "parent": [[org, org2[-1]]]}
+            knows = {"served": both, "new": {"Falcon": "B12"} if destroys else both, "parent": both}
+            sampler = chain_sampler(path, tok, learner, labels, knows)
+            LazySampler.seen = sampler.seen
+            return sampler(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "HFSampler", LazySampler)
+    report = sleep(learner, publish=True, publisher=Publisher(), run=run)
+    assert len(org2) == 1 and learner.store.scope(org).live == org2[0]
+    follow = next(e for e in report.entries if e.scope == USER)
+    ss = learner.store.scope(USER)
+    evaluated = json.loads((ss.dir / "sessions" / ss.manifest(user)["session"] / "report.json").read_text())
+    if destroys:
+        failed = [g["name"] for g in evaluated["gates"] if not g["passed"]]
+        assert failed == ["retention"] and evaluated["metrics"]["retention"]["paired"]["losses"] > 0
+    roles = dict(LazySampler.seen)
+    assert roles["student"] == "new" and roles.get("previous") == "served" and roles["parent"] == "parent"
+    team = ["team:acme/support", None]
+    assert evaluated["baseline_chain"] == [served[0], team, served[1]]
+    assert evaluated["live_chain"] == [[org, org2[0]], team, [USER, user]]
+    assert "served composite" in evaluated["baseline"]
+    assert not any("itself" in w for w in evaluated["warnings"])
+    if destroys:
+        assert follow.action == "failed_gates" and "old composite" in follow.detail and not report.ok
+        assert Publisher.published == [org]  # the child was not republished on the new parent
+        assert learner.store.published()["scopes"][USER]["versions"]["1"]["chain"] == served
+        assert USER in learner.store.state["rebuild"]
+    else:
+        assert evaluated["passed"] and follow.action == "followed" and Publisher.published == [org, USER]
+        assert USER not in (learner.store.state.get("rebuild") or [])

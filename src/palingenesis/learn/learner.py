@@ -511,6 +511,8 @@ class Learner:
         """Make `version` the scope's live adapter: its facts count as consolidated, its train questions join
         the replay pool. Refused unless its evaluation against the current live chain passed every gate;
         force=True overrides, and the manifest records the forced publish and why."""
+        from palingenesis.learn.evaluate import chain_versions
+
         ss, _ = self._stores(scope)
         scope = ss.scope
         with self.store.lock():
@@ -524,6 +526,8 @@ class Learner:
             manifest["forced"] = bool(reasons)
             manifest["forced_reasons"] = reasons
             manifest["live_at"] = now()
+            # The ancestors it went live on: re-evaluating it after a parent update pairs against this chain.
+            manifest["live_parents"] = {s: v for s, v in chain_versions(self.store, scope)[:-1] if v is not None}
             ss.write_manifest(version, manifest)
             rebuild = self.store.state.get("rebuild") or []
             if str(scope) in rebuild:
@@ -706,7 +710,8 @@ class Learner:
                 issues.append(f"{s}: serving {served['live']} published past: {'; '.join(served['forced_reasons'])}")
             if entry["rebuild"]:
                 issues.append(
-                    f"{s}: rebuild pending (forget pruned its adapter or the parent version it was trained on)"
+                    f"{s}: rebuild pending (forget pruned its adapter or the parent version it was trained on, or "
+                    "it failed its gates on a new parent)"
                 )
             entries.append(entry)
         return {

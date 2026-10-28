@@ -251,3 +251,45 @@ def test_set_live_clears_a_pending_rebuild(learner):
     rebuilt, _ = fake_version(learner, "org:acme")
     learner.set_live("org:acme", rebuilt)
     assert learner.store.state["rebuild"] == [] and learner.status()["healthy"]
+
+
+def test_baseline_is_what_the_scope_is_served_with(learner):
+    """What a version is paired against: the live chain for a candidate; for the live version after a parent
+    update, the parents it went live on (not itself); the published composite when there is one; the live chain
+    when that composite holds a forgotten version."""
+    from palingenesis.learn.evaluate import baseline_chain
+    from palingenesis.learn.store import ScopeId
+
+    org, team, user = "org:acme", ["team:acme/support", None], "user:acme/support/ana"
+    store, uid = learner.store, ScopeId.parse("user:acme/support/ana")
+    learner.add_notes(org, ["The price of Orion Pro is 25 euros."], approve=True)
+    o1, _ = fake_version(learner, org)
+    learner.set_live(org, o1)
+    learner.remember(user, "my editor is vim")
+    u1, _ = fake_version(learner, user)
+    assert baseline_chain(store, user, u1) == ([[org, o1], team, [user, None]], "the live chain")
+    learner.set_live(user, u1)
+    went_live = [[org, o1], team, [user, u1]]
+    assert baseline_chain(store, user, u1) == (went_live, f"the chain {u1} went live on")
+    # The parent update: the child's live version is paired against the old parent under it.
+    learner.add_notes(org, ["The colour of Orion Team is blue."], approve=True)
+    o2, _ = fake_version(learner, org)
+    learner.set_live(org, o2)
+    assert chain_versions(store, uid) == [[org, o2], team, [user, u1]]
+    assert baseline_chain(store, user, u1)[0] == went_live
+    learner.remember(user, "my desk is B12")
+    u2, _ = fake_version(learner, user)
+    assert baseline_chain(store, user, u2)[0] == [[org, o2], team, [user, u1]]  # a candidate: the live chain
+    # Published: the served composite, for the live version and for a candidate alike.
+    published = store.published()
+    entry = {"name": f"{user}@v3", "chain": [[org, o1], [user, u1]], "state": "live", "servers": {}}
+    published["scopes"][user] = {"live": 3, "next": 4, "versions": {"3": entry}, "history": []}
+    store.write_published(published)
+    for version in (u1, u2):
+        assert baseline_chain(store, user, version) == (went_live, f"the served composite {user}@v3")
+    # A forgotten version cannot be loaded: the live chain.
+    manifest = store.scope(org).manifest(o1)
+    manifest["pruned"] = {"reason": "forget"}
+    store.scope(org).write_manifest(o1, manifest)
+    chain, source = baseline_chain(store, user, u2)
+    assert chain == chain_versions(store, uid) and "forgotten" in source

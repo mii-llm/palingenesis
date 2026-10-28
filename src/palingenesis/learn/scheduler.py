@@ -11,7 +11,9 @@ not a daemon:
        against the live version) -> set live when every gate passes -> publish (with the parity canary) when
        --publish. A scope that does not fit the remaining budget waits: its notes stay in the served prompt
     4. sleep.children_follow gated (with --publish): after a scope goes live, each published descendant that
-       did not train in this pass is evaluated on the new parent and republished when its gates pass
+       did not train in this pass is evaluated on the new parent, paired against the composite it is served
+       with (the old parent under it), and republished when its gates pass. When they fail it keeps serving
+       the old composite and is marked for rebuild: the next pass trains it again on the new parent
 
 A failed gate never publishes. The exit code is 1 when something needs a person (a failed gate or canary,
 an error), so cron can mail it.
@@ -205,8 +207,16 @@ def _sleep(learner, scopes, budget_minutes, scope_budget_minutes, publish, publi
                     evaluation = evaluate(child, live)
                     if not evaluation.passed:
                         failed = [g["name"] for g in evaluation.report["gates"] if not g["passed"]]
+                        with learner.store.lock():
+                            rebuild = learner.store.state.setdefault("rebuild", [])
+                            if s not in rebuild:
+                                rebuild.append(s)
+                                learner.store.save_state()
                         entry.action = "failed_gates"
-                        entry.detail = f"on the new parent: failed {', '.join(failed)}; sleep the scope again"
+                        entry.detail = (
+                            f"on the new parent: failed {', '.join(failed)}; still serving the old composite, "
+                            "rebuilt on the new parent by the next pass"
+                        )
                         continue
                     entry.version = live
                 do_publish(child, entry)

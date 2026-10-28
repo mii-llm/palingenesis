@@ -63,12 +63,14 @@ def markdown(report: dict, diagnostics: list[dict]) -> str:
     calibration = (
         "calibrated" if report["calibrated"] else "**uncalibrated**: default thresholds, not yet set from null sessions"
     )
-    live = ", ".join(f"{s} {v or '(none)'}" for s, v in report["live_chain"])
+    baseline = report.get("baseline_chain", report["live_chain"])
+    live = ", ".join(f"{s} {v or '(none)'}" for s, v in baseline)
+    source = report.get("baseline", "the live chain")
     out = [
         f"# {report['scope']} {report['version']} ({report['session']})",
         "",
         f"Gates: **{'passed' if report['passed'] else 'failed'}**; thresholds {calibration}.",
-        f"Compared with the live chain: {live}. Evaluated {report['created']}.",
+        f"Compared with {source}: {live} (the live column). Evaluated {report['created']}.",
         "",
         "| metric | candidate | live | note |",
         "|---|---|---|---|",

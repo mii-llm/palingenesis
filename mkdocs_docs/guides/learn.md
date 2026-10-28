@@ -209,8 +209,13 @@ files behind.
 ## Reports and gates
 
 Every metric compares two chains on the same probes, greedy, with the deployment system prompt: the
-**candidate** (the ancestors' live adapters plus the new version) and the **live** chain (the ancestors'
-live adapters plus the scope's live version, or none yet). The in-context ceiling is the parent stack with
+**candidate** (the ancestors' live adapters plus the new version) and the **live** chain, the baseline. The
+baseline is the composite the scope is served with (its live version in `published.json`) when it has one,
+else the ancestors' live adapters plus the scope's live version (or none yet). Evaluating the live version
+itself with nothing published pairs it against the ancestors' versions it went live on. So after a parent
+update a child is compared with what it served before (the old parent under its adapter), never with
+itself: a parent version that breaks a fact the child retained fails the child's retention gate. The
+report records the baseline (`baseline_chain`, `baseline`). The in-context ceiling is the parent stack with
 the notes in the prompt and no adapter of the scope.
 
 | metric | probes | measure |
@@ -323,7 +328,11 @@ pgs learn publish stores/acme --scope user:acme/support/ana \
 2. **Load**: the composite is built (or reused) under `composites/` and loaded on every server under the new
    name: `POST /v1/load_lora_adapter` on vLLM, `POST /load_lora_adapter` on SGLang, or nothing with
    `--transport resolver` (the vLLM plugin below loads it on the first request). Each server must serve the
-   store's base model (`serving.base_name` if it names it differently). A one-token request warms it.
+   store's base model, compared by resolved identity rather than spelling: the same weights (the blob
+   hashes of a Hugging Face cache snapshot, or the etags a `--local-dir` download records) when both are
+   known, else the same hub id, else the same path. A directory or repo that only shares the last path
+   component does not match; set `serving.base_name` to the name the server uses when it cannot be checked
+   from here. A one-token request warms it.
 3. **Canary**: the parity canary (below) runs on every server. If any server fails, or any load fails, the
    new name is unloaded from every server and the live version stays as it was.
 4. **Flip**: `published.json` records the new live version; the proxy routes to it on the next request.
@@ -385,7 +394,8 @@ VLLM_PLUGINS=palingenesis_learn PGS_LEARN_STORE=/srv/stores \
 `PGS_LEARN_STORE` (a store, a directory of stores, or several separated by `:`), a request for
 `<scope>@v<n>` loads that published composite from the store on demand, after a restart or on a replica
 that never received a load call. It resolves only published (not failed) versions whose adapters were not
-forgotten, for the base the server runs (`PGS_LEARN_CHECK_BASE=0` skips that check), and stacks a missing
+forgotten, for the base the server runs (the store's base or its `serving.base_name`, matched as in
+publish; `PGS_LEARN_CHECK_BASE=0` skips that check), and stacks a missing
 composite again. A request for the bare `<scope>` gets the live version; vLLM then keeps that name pinned to
 it until it is unloaded, which `publish` does on the servers it publishes to (the version is loaded under its
 own versioned name, so no cached block crosses versions). Use `--transport resolver` to publish without
@@ -488,9 +498,10 @@ Without the proxy, `Learner.render_notes(scope, messages)` adds the same notes b
    sets it live if every gate passes, and publishes it with the canary (`--publish`). A scope that does not fit
    the remaining budget (`--budget-minutes`, `--scope-budget-minutes`) waits, its notes still in the prompt;
 4. with `sleep.children_follow: gated`, each published descendant of a scope that went live is evaluated on
-   the new parent and republished if its gates pass; otherwise it keeps serving its previous composite and is
-   reported. This evaluation compares the descendant's live version with itself, so only the absolute gates
-   (acquisition, update, stale, meta-reference, drift cap) can fail it; the report says so.
+   the new parent, paired against the composite it is served with (the old parent under its adapter), on its
+   own probes and its ancestors'. It is republished if every gate passes; otherwise it keeps serving its
+   previous composite, is reported, and is marked for rebuild, so the next pass trains it again on the new
+   parent (a child can lag one pass behind a parent update).
 
 The budget is checked before each scope starts, against the estimate from measured sessions: a running
 session is not stopped, and on a store with no measured session yet the estimate is unknown and the scope

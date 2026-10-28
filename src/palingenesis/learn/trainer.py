@@ -204,7 +204,7 @@ class SessionRunner:
                 parents[str(scope)] = ancestor.live
                 ancestor_adapters.append(adapters.read_adapter(ancestor.version_dir(ancestor.live))[0])
         self.parents = parents
-        self.frozen = adapters.FrozenDelta(self.model, adapters.stack(ancestor_adapters)) if ancestor_adapters else None
+        self.frozen = adapters.FrozenDelta(self.model, adapters.stack(ancestor_adapters) if ancestor_adapters else {})
         rank = self.config.scopes.ranks[self.ss.scope.level]
         self.peft = adapters.attach_lora(
             self.model, rank, rank * self.config.adapter.alpha_over_rank, self.config.adapter.target_regex
@@ -397,6 +397,33 @@ class SessionRunner:
         from safetensors.torch import load_file
 
         set_peft_model_state_dict(self.peft, load_file(str(self.ss.version_dir(version) / adapters.ADAPTER_WEIGHTS)))
+
+    def use_baseline(self, chain: list[list]) -> None:
+        """Make role previous the composite `chain` ([[scope, version or None], ...], ancestors first) instead of
+        the live chain: its ancestors' adapters in place of the live ones underneath, and its version of this
+        scope (or no adapter of it). The evaluation pairs a version against what is served, which a parent
+        update makes differ from the live chain."""
+        ancestors = [
+            adapters.read_adapter(self.store.scope(s).version_dir(v))[0] for s, v in chain[:-1] if v is not None
+        ]
+        delta = self.frozen.place(adapters.stack(ancestors) if ancestors else {})
+        own, state = chain[-1][1], None
+        if own is not None:
+            current = adapters.lora_state(self.peft)
+            self.load_version(own)
+            state = adapters.lora_state(self.peft)
+            params = dict(self.peft.named_parameters())
+            with torch.no_grad():
+                for name, value in current.items():
+                    params[name].copy_(value)
+
+        @contextlib.contextmanager
+        def baseline():
+            scope_adapter = self.peft.disable_adapter() if state is None else adapters.swapped_lora(self.peft, state)
+            with self.frozen.swapped(delta), scope_adapter:
+                yield
+
+        self.roles[PREVIOUS] = baseline  # the sampler holds this dict
 
     def release(self) -> None:
         """Take the frozen ancestor hooks off the model (the PEFT wrapping stays)."""

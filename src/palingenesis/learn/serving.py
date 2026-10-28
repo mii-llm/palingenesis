@@ -35,6 +35,7 @@ networks only. SGLang needs --enable-lora; its load / unload routes share the in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -87,10 +88,83 @@ def parse_name(name: str) -> tuple[ScopeId, int | None]:
     return ScopeId.parse(scope), int(m.group(1))
 
 
+_HUB_ID = re.compile(r"^[\w.-]+(?:/[\w.-]+)?$")
+_CACHE_REPO = re.compile(r"^models--(.+)$")
+_WEIGHTS = (".safetensors", ".bin")
+
+
+def _hub_cache() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    home = os.environ.get("HF_HOME") or os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "huggingface")
+    return Path(home).expanduser() / "hub"
+
+
+def _weights_fingerprint(directory: Path) -> str | None:
+    """A digest of the content hashes of a model directory's weight files, read without hashing the weights:
+    the blob names of a Hugging Face cache snapshot (each a symlink to blobs/<sha256>) or the etags a
+    local-dir download records in .cache/huggingface/download/. None when any weight file has neither."""
+    try:
+        files = sorted(f for f in directory.iterdir() if f.name.endswith(_WEIGHTS))
+    except OSError:
+        return None
+    if not files:
+        return None
+    hashes = []
+    for f in files:
+        meta = directory / ".cache" / "huggingface" / "download" / f"{f.name}.metadata"
+        if f.is_symlink() and f.resolve().parent.name == "blobs":
+            hashes.append(f"{f.name}:{f.resolve().name}")
+        elif meta.exists() and len(lines := meta.read_text().splitlines()) >= 2 and lines[1].strip():
+            hashes.append(f"{f.name}:{lines[1].strip()}")
+        else:
+            return None
+    return hashlib.sha256("\n".join(hashes).encode()).hexdigest()
+
+
+def model_identity(name: str) -> dict:
+    """{"hub_id", "path", "weights"} of a base model name: a local directory (its resolved path, the hub id of a
+    Hugging Face cache snapshot, its weights fingerprint), or a hub id (the weights of the snapshot refs/main
+    points at in the local cache, when it is there). A path that does not exist here (a server's own path) keeps
+    its spelling, and a cache snapshot path still names its hub id."""
+    name = str(name).strip()
+    out = {"hub_id": None, "path": None, "weights": None}
+    local = Path(name).expanduser()
+    if not name:
+        return out
+    if not local.is_dir() and _HUB_ID.match(name) and not name.startswith("."):
+        out["hub_id"] = name
+        repo = _hub_cache() / f"models--{name.replace('/', '--')}"
+        ref = repo / "refs" / "main"
+        if ref.exists():
+            out["weights"] = _weights_fingerprint(repo / "snapshots" / ref.read_text().strip())
+        return out
+    if local.is_dir():
+        local = local.resolve()
+        out["path"], out["weights"] = str(local), _weights_fingerprint(local)
+    else:
+        out["path"] = os.path.normpath(name)
+    parts = Path(out["path"]).parts
+    for i, part in enumerate(parts[:-2]):
+        m = _CACHE_REPO.match(part)
+        if m and parts[i + 1] == "snapshots":
+            out["hub_id"] = m.group(1).replace("--", "/")
+    return out
+
+
 def same_model(a: str, b: str) -> bool:
-    """Two names of the same base model: equal, or the same last path component (a hub id and a local copy)."""
-    a, b = str(a).rstrip("/"), str(b).rstrip("/")
-    return a == b or (bool(a) and a.rsplit("/", 1)[-1] == b.rsplit("/", 1)[-1])
+    """Two names of the same base model, by resolved identity: the same weights when both fingerprints are
+    known, else the same hub id, else the same path. A local copy matches a hub id only through its weights
+    (or as a snapshot of that repo in the cache); a different repo or directory with the same last component
+    does not match. serving.base_name sets the name a server uses when it cannot be resolved here."""
+    if str(a).strip().rstrip("/") == str(b).strip().rstrip("/"):
+        return bool(str(a).strip())
+    x, y = model_identity(a), model_identity(b)
+    if x["weights"] and y["weights"]:
+        return x["weights"] == y["weights"]
+    if x["hub_id"] and y["hub_id"]:
+        return x["hub_id"].casefold() == y["hub_id"].casefold()
+    return x["path"] is not None and x["path"] == y["path"]
 
 
 def scope_record(published: dict, scope: str | ScopeId) -> dict:

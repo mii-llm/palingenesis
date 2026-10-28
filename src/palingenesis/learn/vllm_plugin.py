@@ -17,7 +17,8 @@ its resolvers only for a model name it has not loaded, and only with VLLM_ALLOW_
 
 PGS_LEARN_STORE is a store, a directory of stores (one per org), or several of them separated by ':'. A name
 resolves only to a version that was published (not failed), whose adapters were not forgotten, and for the
-base model the server runs (PGS_LEARN_CHECK_BASE=0 skips the base check). A missing composite is stacked
+base model the server runs: the store's base or its serving.base_name, compared by resolved identity (weights
+fingerprint, hub id or path, see serving.same_model). PGS_LEARN_CHECK_BASE=0 skips the base check. A missing composite is stacked
 again from the chain's adapters (an exact concatenation of small tensors).
 """
 
@@ -93,7 +94,8 @@ def resolve(roots: list[Path], base_model_name: str, lora_name: str, check_base:
         return None
     if any(_gone(store, s, v) for s, v in entry["chain"]):
         return None  # a forgotten adapter is never served
-    if check_base and not same_model(store.state["base"], base_model_name):
+    bases = [store.state["base"], store.config().serving.base_name]
+    if check_base and not any(same_model(b, base_model_name) for b in bases if b):
         logger.warning(
             "palingenesis_learn: %s is published for base %s, but this server runs %s; not resolved",
             lora_name,

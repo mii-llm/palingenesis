@@ -13,7 +13,7 @@ warnings.simplefilter("ignore")
 torch = pytest.importorskip("torch")
 pytest.importorskip("safetensors")
 
-from learn_fakes import CharReference, FakeServer, gold_answers, make_version  # noqa: E402
+from learn_fakes import CharReference, FakeServer, fake_hub, gold_answers, make_version  # noqa: E402
 
 from palingenesis.learn import (  # noqa: E402
     LearnConfig,
@@ -85,8 +85,31 @@ def test_served_names():
     for bad in ("user:acme/support/ana@3", "user:acme/support/ana@v0", "nonsense", "org:acme@vx"):
         with pytest.raises(StoreError):
             parse_name(bad)
-    assert serving.same_model("Qwen/Qwen3.5-4B", "/models/Qwen3.5-4B")
     assert not serving.same_model("Qwen/Qwen3.5-4B", "Qwen/Qwen3-4B")
+
+
+def test_same_model_compares_resolved_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    snapshot = fake_hub(tmp_path, "Qwen/Qwen3.5-4B", "a" * 64, local=tmp_path / "models" / "Qwen3.5-4B")
+    fake_hub(tmp_path, "someone/Qwen3.5-4B", "b" * 64, local=tmp_path / "other" / "Qwen3.5-4B")
+    same = serving.same_model
+    # A local copy matches the hub id through its weights; a fine-tune with the same repo name does not.
+    assert same("Qwen/Qwen3.5-4B", str(tmp_path / "models" / "Qwen3.5-4B"))
+    assert same("Qwen/Qwen3.5-4B", str(snapshot)) and same(str(snapshot), str(tmp_path / "models" / "Qwen3.5-4B/"))
+    assert not same("Qwen/Qwen3.5-4B", "someone/Qwen3.5-4B")
+    assert not same("Qwen/Qwen3.5-4B", str(tmp_path / "other" / "Qwen3.5-4B"))
+    # The last path component alone is no identity: a path that cannot be checked here does not match.
+    assert not same("Qwen/Qwen3.5-4B", "/models/Qwen3.5-4B")
+    assert not same("/data/a/Qwen3.5-4B", "/data/b/Qwen3.5-4B")
+    # A server's cache snapshot path names its repo even when it is not on this machine.
+    assert same("Qwen/Qwen3.5-4B", "/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/c0ffee")
+    assert not same("Qwen/Qwen3.5-4B", "/root/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/c0ffee")
+    # The same directory spelled differently; a copy whose weights differ.
+    assert same(str(tmp_path / "models" / "Qwen3.5-4B"), str(tmp_path / "models" / ".." / "models" / "Qwen3.5-4B"))
+    changed = tmp_path / "changed"
+    fake_hub(tmp_path / "x", "Qwen/Qwen3.5-4B", "a" * 64, local=changed, etag="c" * 64)
+    assert not same("Qwen/Qwen3.5-4B", str(changed))
+    assert not same("", "") and same("base-model", "base-model")
 
 
 # ---------------------------------------------------------------------------- refusals

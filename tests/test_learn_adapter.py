@@ -142,6 +142,28 @@ def test_frozen_delta_equals_the_merged_ancestors(tmp_path):
     assert torch.allclose(logits(model, ids), logits(tiny_dense(), ids), atol=0)
 
 
+def test_frozen_delta_swaps_to_another_chain_and_back(tmp_path):
+    """Role previous after a parent update: the old ancestors' delta (or none) for a while, the live one after,
+    on the base linears even once PEFT has wrapped them."""
+    pytest.importorskip("peft")
+    old, new = (adapters.read_adapter(random_adapter(tmp_path / n, 4, 8, s))[0] for n, s in (("old", 1), ("new", 2)))
+    ids = torch.randint(0, 64, (2, 7))
+    model = tiny_dense()
+    frozen = adapters.FrozenDelta(model, new)
+    adapters.attach_lora(model, 2, 4, MLP_TARGET_REGEX)  # B starts at zero: the LoRA adds nothing yet
+    expected = {}
+    for name, tensors in (("old", old), ("new", new), ("none", {})):
+        reference = tiny_dense()
+        adapters.FrozenDelta(reference, tensors)
+        expected[name] = logits(reference, ids)
+    assert torch.allclose(logits(model, ids), expected["new"], atol=1e-6)
+    with frozen.swapped(frozen.place(old)):
+        assert torch.allclose(logits(model, ids), expected["old"], atol=1e-6)
+    with frozen.swapped({}):
+        assert torch.allclose(logits(model, ids), expected["none"], atol=1e-6)
+    assert torch.allclose(logits(model, ids), expected["new"], atol=1e-6)
+
+
 def test_gradients_reach_only_the_scope_adapter(tmp_path):
     pytest.importorskip("peft")
     model = tiny_dense().train()

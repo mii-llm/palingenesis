@@ -229,22 +229,43 @@ class FrozenDelta:
     """Adds a frozen low-rank delta (stacked ancestors) to target linears through forward hooks.
 
     Exact in any base dtype: the delta is computed in fp32 from the layer's input and added to its output,
-    as an unmerged LoRA is. remove() takes the hooks off.
+    as an unmerged LoRA is. Built before PEFT wraps the model, so the hooks sit on the base linears.
+    swapped() runs with another delta (an older ancestor chain); remove() takes the hooks off.
     """
 
     def __init__(self, model: nn.Module, tensors: dict[str, tuple[Tensor, Tensor]]):
-        modules = dict(model.named_modules())
-        missing = sorted(set(tensors) - set(modules))
-        if missing:
-            raise ValueError(f"the ancestor adapters name modules this model does not have: {missing[:3]}")
+        self.modules = dict(model.named_modules())
         self.handles = []
         self.tensors = {}
+        self._install(self.place(tensors))
+
+    def place(self, tensors: dict[str, tuple[Tensor, Tensor]]) -> dict[str, tuple[Tensor, Tensor]]:
+        """`tensors` in fp32 on their modules' devices, ready for swapped()."""
+        missing = sorted(set(tensors) - set(self.modules))
+        if missing:
+            raise ValueError(f"the ancestor adapters name modules this model does not have: {missing[:3]}")
+        out = {}
         for name, (a, b) in tensors.items():
-            module = modules[name]
-            device = module.weight.device
-            pair = (a.to(device, torch.float32), b.to(device, torch.float32))
-            self.tensors[name] = pair
-            self.handles.append(module.register_forward_hook(self._hook(pair)))
+            device = self.modules[name].weight.device
+            out[name] = (a.to(device, torch.float32), b.to(device, torch.float32))
+        return out
+
+    def _install(self, placed: dict[str, tuple[Tensor, Tensor]]) -> None:
+        self.tensors = placed
+        for name, pair in placed.items():
+            self.handles.append(self.modules[name].register_forward_hook(self._hook(pair)))
+
+    @contextlib.contextmanager
+    def swapped(self, placed: dict[str, tuple[Tensor, Tensor]]):
+        """Run with the delta `placed` (from place(); {} for none) instead of the current one."""
+        saved = self.tensors
+        self.remove()
+        self._install(placed)
+        try:
+            yield
+        finally:
+            self.remove()
+            self._install(saved)
 
     @staticmethod
     def _hook(pair):

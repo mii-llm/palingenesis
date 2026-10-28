@@ -56,7 +56,22 @@ def test_resolves_versions_and_the_live_alias(published):
     assert name == "org:acme@v1" and Path(path, "adapter_model.safetensors").exists()
     # the bare scope is the live version, under its versioned name (vLLM keys its prefix cache by it)
     assert resolve(roots, "Qwen/Qwen3.5-4B", "org:acme")[0] == "org:acme@v2"
-    # a local copy of the same base resolves too
+    # a path that is not this base (only its last component is the same) does not resolve
+    assert resolve(roots, "/models/Qwen3.5-4B", "org:acme@v2") is None
+    assert resolve(roots, "someone/Qwen3.5-4B", "org:acme@v2") is None
+
+
+def test_resolves_on_a_local_copy_of_the_base(published, tmp_path, monkeypatch):
+    from learn_fakes import fake_hub
+
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    fake_hub(tmp_path, "Qwen/Qwen3.5-4B", "a" * 64, local=tmp_path / "models" / "Qwen3.5-4B")
+    roots = [published.store.root.parent]
+    assert resolve(roots, str(tmp_path / "models" / "Qwen3.5-4B"), "org:acme@v2") is not None
+    # A copy that cannot be verified here resolves once the store names it as its serving.base_name.
+    assert resolve(roots, "/models/Qwen3.5-4B", "org:acme@v2") is None
+    published.store.state["config"]["serving"]["base_name"] = "/models/Qwen3.5-4B"
+    published.store.save_state()
     assert resolve(roots, "/models/Qwen3.5-4B", "org:acme@v2") is not None
 
 

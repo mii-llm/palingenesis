@@ -1,6 +1,6 @@
 """Fakes for the pgs learn serving tests (CPU, no GPU, no vLLM): an in-process OpenAI-compatible server with
 vLLM's (or SGLang's) LoRA routes, a character-level HF + PEFT reference, and store versions with tiny adapter
-weights and evaluation reports, as run + eval leave them."""
+weights and evaluation reports, as run + eval leave them, and a Hugging Face cache with a local-dir copy."""
 
 from __future__ import annotations
 
@@ -319,3 +319,22 @@ def gold_answers(learner, scopes) -> dict[str, str]:
                 if row.get("kind") == "probe" and values:
                     out[row["q"]] = "It is " + " and ".join(values) + "."
     return out
+
+
+def fake_hub(root, repo, sha, local=None, etag=None):
+    """A Hugging Face cache under root/hub with `repo` at refs/main (weights a symlink to blobs/<sha>), and
+    optionally a local-dir download of it at `local` whose metadata records `etag` for the weights."""
+    cache = root / "hub" / f"models--{repo.replace('/', '--')}"
+    (cache / "blobs").mkdir(parents=True, exist_ok=True)
+    (cache / "blobs" / sha).write_bytes(b"weights")
+    (cache / "refs").mkdir(exist_ok=True)
+    (cache / "refs" / "main").write_text("c0ffee")
+    snapshot = cache / "snapshots" / "c0ffee"
+    snapshot.mkdir(parents=True, exist_ok=True)
+    (snapshot / "model.safetensors").symlink_to(cache / "blobs" / sha)
+    if local is not None:
+        meta = local / ".cache" / "huggingface" / "download"
+        meta.mkdir(parents=True)
+        (local / "model.safetensors").write_bytes(b"weights")
+        (meta / "model.safetensors.metadata").write_text(f"c0ffee\n{etag or sha}\n1700000000.0\n")
+    return snapshot

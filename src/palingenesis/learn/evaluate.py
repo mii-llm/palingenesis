@@ -1,9 +1,13 @@
-"""Evaluation of a scope's adapter version, paired against the scope's LIVE version on the same probes.
+"""Evaluation of a scope's adapter version, paired against what the scope is served with on the same probes.
 
 Every metric compares two stacked chains, greedy, with the deployment system prompt: the candidate (the
-ancestors' live adapters + the evaluated version) and the live chain (the ancestors' live adapters + the
-scope's live version, or none). The in-context ceiling is the parent stack P (no adapter of the scope)
-with the notes in the prompt.
+ancestors' live adapters + the evaluated version) and the baseline. The baseline is the composite published
+for the scope (published.json), else the live chain (the ancestors' live adapters + the scope's live version,
+or none); the live version itself, with nothing published, is paired against the chain it went live on. After
+a parent update the two differ: re-evaluating a child pairs the new parents under its adapter against the
+old composite, so a parent version that breaks what the child retained fails the child's paired gates. The
+in-context ceiling is the parent stack P (no adapter of the scope) with the notes in the prompt. "live" in
+metric names and reports is this baseline.
 
     metric               probes                                              measure
     acquisition          held-out probes of the session's new facts           exclusive match closed-book, among the
@@ -390,6 +394,33 @@ def chain_versions(store: Store, scope: ScopeId) -> list[list]:
     return out
 
 
+def baseline_chain(store: Store, scope: str | ScopeId, version: str) -> tuple[list[list], str]:
+    """(chain [[scope, version or None], ...], where it comes from) that `version` of `scope` is paired against:
+    the scope's live published composite; else, for the live version itself, the ancestors' versions it went
+    live on (or was trained on, for manifests older than that record); else the live chain. A chain holding a
+    version that can no longer be loaded (forgotten) falls back to the live chain."""
+    from palingenesis.learn.serving import _gone
+
+    scope = ScopeId.parse(scope)
+    live = chain_versions(store, scope)
+    rec = store.published()["scopes"].get(str(scope)) or {}
+    held, source = None, "the live chain"
+    if rec.get("live") is not None:
+        entry = rec["versions"][str(rec["live"])]
+        held, source = dict(entry["chain"]), f"the served composite {entry['name']}"
+    elif live[-1][1] == version:
+        manifest = store.scope(scope).manifest(version)
+        parents = manifest.get("live_parents", manifest.get("parent_versions") or {})
+        held, source = {**parents, str(scope): version}, f"the chain {version} went live on"
+    if held is None:
+        return live, source
+    chain = [[s, held.get(s)] for s, _ in live]
+    gone = [f"{s} {v}" for s, v in chain if v is not None and _gone(store, s, v)]
+    if gone:
+        return live, f"the live chain ({source} holds {', '.join(gone)}, which was forgotten)"
+    return chain, source
+
+
 def _chain_id(store: Store, chain: list[list]) -> str:
     parts = []
     for scope, version in chain:
@@ -683,9 +714,12 @@ class Evaluator:
         live_chain = chain_versions(store, ss.scope)
         candidate_chain = [*live_chain[:-1], [str(ss.scope), version]]
         parent_chain = [*live_chain[:-1], [str(ss.scope), None]]
+        baseline, baseline_source = baseline_chain(store, ss.scope, version)
+        if baseline != live_chain:
+            self.runner.use_baseline(baseline)
         ids = {
             STUDENT: _chain_id(store, candidate_chain),
-            PREVIOUS: _chain_id(store, live_chain),
+            PREVIOUS: _chain_id(store, baseline),
             PARENT: _chain_id(store, parent_chain) + "+notes",
         }
         warnings = []
@@ -694,12 +728,6 @@ class Evaluator:
             warnings.append(
                 f"{version} was trained on {manifest.get('parent_versions')} but the ancestors' live versions are "
                 f"{parents}: it is evaluated on the current ones."
-            )
-        if live_chain[-1][1] == version:
-            warnings.append(
-                f"{version} is the live version: the paired gates (retention, ancestor retention, general QA, leak, "
-                "confabulation, drift increment) compare it with itself and pass by construction; only the absolute "
-                "gates measure it on the current parents."
             )
         rng = random.Random(config.eval.seed)
         probes = build_probes(store, ss, manifest, config, rng)
@@ -735,6 +763,8 @@ class Evaluator:
             "created": now(),
             "live_chain": live_chain,
             "candidate_chain": candidate_chain,
+            "baseline_chain": baseline,
+            "baseline": baseline_source,
             "calibrated": bool(config.gates.calibrated),
             "probes": {k: sum(1 for p in probes if p.kind == k) for k in KINDS},
             "metrics": metrics,
