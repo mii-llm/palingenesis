@@ -74,10 +74,21 @@ def looped(text: str, finish: str) -> bool:
     return any(tail.count(tail[i : i + 60]) >= 4 for i in range(0, max(0, len(tail) - 60), 30))
 
 
-def with_privileged(messages: list[dict], privileged: str, template: str) -> list[dict]:
+def with_privileged(messages: list[dict], privileged: str, template: str, placement: str = "user") -> list[dict]:
     """The teacher's copy of `messages`: the last user turn rewritten by `template` ({content}, {privileged}).
     The last user turn, not the last message: in a mid-episode state the conversation ends with a tool
-    result, which must stay what the tool returned."""
+    result, which must stay what the tool returned.
+
+    placement="system": the privileged text goes into the system turn instead (reference notes the teacher
+    holds for the whole conversation). An existing system turn is rewritten by `template`, with {content} its
+    text; without one, a system turn holding only `privileged` is inserted first."""
+    if placement == "system":
+        if messages and messages[0]["role"] == "system":
+            first = {**messages[0], "content": template.format(content=messages[0]["content"], privileged=privileged)}
+            return [first] + list(messages[1:])
+        return [{"role": "system", "content": privileged}] + list(messages)
+    if placement != "user":
+        raise ValueError(f"placement must be 'user' or 'system', got {placement!r}")
     last = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=None)
     if last is None:
         raise ValueError("privileged context needs a user turn to attach to")

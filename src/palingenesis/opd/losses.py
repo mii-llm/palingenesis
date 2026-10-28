@@ -12,6 +12,10 @@ so micro-batches accumulate to exactly the full-batch gradient.
 
   full_rkl     exact reverse KL over the shared vocabulary, from the teacher's
                full distribution (HF teacher). The default.
+  full_fkl     exact forward KL(teacher || student), same inputs as full_rkl
+               (the mass-covering direction, for supervised and mixed GKD rows).
+  full_jsd     exact generalized Jensen-Shannon divergence JSD(beta) of GKD,
+               between full_fkl (beta -> 0) and full_rkl (beta -> 1).
   topk_kl      KL between coarse-grained distributions: the teacher's top-k tokens
                plus the realized token, and a tail bucket with the remaining mass
                on both sides. `beta` weights reverse vs forward KL.
@@ -227,6 +231,57 @@ def full_rkl(
         k1 = (lq.gather(1, tgt) - lp.gather(1, tgt)).squeeze(1)
         stats = {"kl": kl.detach().sum(), "k1": k1.detach().sum(), "residual": (1 - q.detach().sum(-1)).sum()}
         return (weights[a:b] * kl).sum(), stats
+
+    return chunked_head(hidden, head, fn)
+
+
+def full_fkl(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    vocab: SharedVocab,
+    teacher_logprobs: Callable[[int, int], Tensor],
+) -> tuple[Tensor, dict[str, float]]:
+    """Exact forward KL sum_v p(v) (log p(v) - log q(v)) per token, over the shared vocabulary.
+
+    Arguments as full_rkl. The teacher's mass on ids the student cannot produce is
+    dropped (the teacher log-probs cover vocab.size ids).
+    """
+
+    def fn(logits: Tensor, a: int, b: int):
+        lq = vocab.project(F.log_softmax(logits, -1))
+        lp = teacher_logprobs(a, b).to(lq.device, lq.dtype)
+        kl = (lp.exp() * (lp - lq)).sum(-1)
+        tgt = targets[a:b, None]
+        k1 = (lq.gather(1, tgt) - lp.gather(1, tgt)).squeeze(1)
+        return (weights[a:b] * kl).sum(), {"kl": kl.detach().sum(), "k1": k1.detach().sum()}
+
+    return chunked_head(hidden, head, fn)
+
+
+def full_jsd(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    weights: Tensor,
+    vocab: SharedVocab,
+    teacher_logprobs: Callable[[int, int], Tensor],
+    beta: float = 0.5,
+) -> tuple[Tensor, dict[str, float]]:
+    """Generalized JSD(beta) = beta KL(p || m) + (1 - beta) KL(q || m), m = beta p + (1 - beta) q, per token
+    (p the teacher, q the student; GKD, Agarwal et al. 2024, arXiv 2306.13649). beta in (0, 1)."""
+    if not 0.0 < beta < 1.0:
+        raise ValueError(f"full_jsd needs beta in (0, 1), got {beta}")
+
+    def fn(logits: Tensor, a: int, b: int):
+        lq = vocab.project(F.log_softmax(logits, -1))
+        lp = teacher_logprobs(a, b).to(lq.device, lq.dtype)
+        lm = torch.logaddexp(lp + math.log(beta), lq + math.log1p(-beta))
+        jsd = beta * (lp.exp() * (lp - lm)).sum(-1) + (1 - beta) * (lq.exp() * (lq - lm)).sum(-1)
+        tgt = targets[a:b, None]
+        k1 = (lq.gather(1, tgt) - lp.gather(1, tgt)).squeeze(1)
+        return (weights[a:b] * jsd).sum(), {"kl": jsd.detach().sum(), "k1": k1.detach().sum()}
 
     return chunked_head(hidden, head, fn)
 
