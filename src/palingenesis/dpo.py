@@ -235,8 +235,14 @@ class PreferenceDataset(_Epochs, IterableDataset):
         ):
             self.stats["dropped_identical"] += 1  # no preference to learn
             return None
+        weight = example.get("sft_weight")
+        if weight is None:
+            weight = 1.0
+        weight = float(weight)
+        if not 0.0 <= weight <= 1.0 or weight != weight:
+            raise ValueError(f"sft_weight must be in [0, 1], got {example.get('sft_weight')!r}")
         self.stats["pairs"] += 1
-        return {"chosen": chosen, "rejected": rejected}
+        return {"chosen": chosen, "rejected": rejected, "sft_weight": weight}
 
 
 def collate_preferences(batch: list[dict], pad_id: int, pad_to_multiple: int = 1) -> dict[str, torch.Tensor]:
@@ -245,6 +251,7 @@ def collate_preferences(batch: list[dict], pad_id: int, pad_to_multiple: int = 1
     rows = [pair["chosen"] for pair in batch] + [pair["rejected"] for pair in batch]
     out = _collate_fn(rows, pad_id, pad_to_multiple)
     out["num_pairs"] = torch.tensor(len(batch))
+    out["sft_pair_weight"] = torch.tensor([float(pair.get("sft_weight", 1.0)) for pair in batch])
     return out
 
 
@@ -407,8 +414,18 @@ def score_weights(shifted_labels: torch.Tensor, num_pairs: int, ld_alpha: float 
     return torch.where(position <= shared, mask, ld_alpha * mask)
 
 
-def sft_token_mask(shifted_labels: torch.Tensor, num_pairs: int, scope: str = "all", window: int = 8) -> torch.Tensor:
+def sft_token_mask(
+    shifted_labels: torch.Tensor,
+    num_pairs: int,
+    scope: str = "all",
+    window: int = 8,
+    pair_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     """[2P, S] float mask of the chosen tokens the SFT (RPO) term covers; rejected rows are 0.
+
+    pair_weight: optional [P] per-pair scale of the mask (the rows' `sft_weight` field), so
+    a pair with weight 0 takes part in the preference loss but not in the SFT term, e.g. a
+    chosen answer written by another model rather than edited from the policy's own.
 
     scope "all": every scored chosen token. scope "edits": only the scored chosen tokens
     inside a non-equal region of a token-level diff between the pair's chosen and
@@ -421,7 +438,7 @@ def sft_token_mask(shifted_labels: torch.Tensor, num_pairs: int, scope: str = "a
     mask = torch.zeros(shifted_labels.shape, dtype=torch.float32, device=shifted_labels.device)
     if scope == "all":
         mask[:num_pairs] = valid[:num_pairs].float()
-        return mask
+        return _scale_pairs(mask, num_pairs, pair_weight)
     labels_cpu, valid_cpu = shifted_labels.cpu(), valid.cpu()
     for b in range(num_pairs):
         pos = valid_cpu[b].nonzero().squeeze(1)
@@ -436,6 +453,12 @@ def sft_token_mask(shifted_labels: torch.Tensor, num_pairs: int, scope: str = "a
                 if op != "equal":
                     keep[max(0, i1 - window) : min(len(chosen), max(i2, i1 + 1) + window)] = True
         mask[b, pos[keep].to(mask.device)] = 1.0
+    return _scale_pairs(mask, num_pairs, pair_weight)
+
+
+def _scale_pairs(mask: torch.Tensor, num_pairs: int, pair_weight: torch.Tensor | None) -> torch.Tensor:
+    if pair_weight is not None:
+        mask[:num_pairs] *= pair_weight.to(device=mask.device, dtype=mask.dtype).unsqueeze(1)
     return mask
 
 
@@ -502,6 +525,7 @@ def preference_step(
     num_chunks: int = 1,
     sft_scope: str = "all",
     sft_edit_window: int = 8,
+    sft_pair_weight: torch.Tensor | None = None,
 ) -> PreferenceStep:
     """The DPO loss for one micro-batch, via two chunked passes (see module doc).
 
@@ -513,6 +537,7 @@ def preference_step(
                 average exactly as SFT's valid-token denominator does.
     chosen_token_denom: normaliser of the SFT term (defaults to the local tokens it covers).
     sft_scope / sft_edit_window: which chosen tokens the SFT term covers (`sft_token_mask`).
+    sft_pair_weight: optional [P] per-pair scale of the SFT term (the rows' `sft_weight`).
     """
     shifted = shift_labels(labels)
     a = score_weights(shifted, num_pairs, ld_alpha)
@@ -530,7 +555,7 @@ def preference_step(
     weights = grad_scores.unsqueeze(1) * a  # dL/dlog pi(y_t) for every token
 
     chosen_mask = (
-        sft_token_mask(shifted, num_pairs, sft_scope, sft_edit_window).to(a.dtype)
+        sft_token_mask(shifted, num_pairs, sft_scope, sft_edit_window, sft_pair_weight).to(a.dtype)
         if sft_weight
         else torch.zeros_like(a)
     )

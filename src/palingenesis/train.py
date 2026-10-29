@@ -1111,12 +1111,16 @@ def train(config: Config):
                     num_chunks = _dynamic_num_chunks(input_ids.numel(), _loss_vocab_size)
                     # Averages match SFT's global-token denominator: pairs (and chosen
                     # tokens, for the SFT term) summed over ranks and GA micro-steps.
-                    if dpo.sft_scope == "all":
+                    sft_pair_weight = batch.get("sft_pair_weight")
+                    if dpo.sft_scope == "all" and sft_pair_weight is None:
                         local_chosen = (shift_labels(raw_labels[:num_pairs]) != IGNORE_INDEX).sum()
-                    else:  # the SFT term averages over the tokens it covers
+                    else:  # the SFT term averages over the (weighted) tokens it covers
                         local_chosen = (
-                            sft_token_mask(shift_labels(raw_labels), num_pairs, dpo.sft_scope, dpo.sft_edit_window)
+                            sft_token_mask(
+                                shift_labels(raw_labels), num_pairs, dpo.sft_scope, dpo.sft_edit_window, sft_pair_weight
+                            )
                             .sum()
+                            .round()
                             .long()
                         )
                     if is_fsdp:
@@ -1150,6 +1154,7 @@ def train(config: Config):
                         num_chunks=num_chunks,
                         sft_scope=dpo.sft_scope,
                         sft_edit_window=dpo.sft_edit_window,
+                        sft_pair_weight=sft_pair_weight,
                     )
                     loss = step_out.loss
                     del ref_logps

@@ -244,6 +244,17 @@ def test_collate_puts_chosen_first(tokenizer):
     )
 
 
+def test_row_sft_weight_reaches_the_batch(tokenizer):
+    ds, tok = _dataset(tokenizer, TEMPLATE_WITH_GENERATION)
+    pairs = [ds.process(PAIR), ds.process({**PAIR, "chosen": "x y z", "sft_weight": 0})]
+    assert [p["sft_weight"] for p in pairs] == [1.0, 0.0]
+    batch = collate_preferences(pairs, tok.pad_token_id)
+    assert batch["sft_pair_weight"].tolist() == [1.0, 0.0]
+    for bad in (1.5, -0.1, float("nan")):
+        with pytest.raises(ValueError):
+            ds.process({**PAIR, "sft_weight": bad})
+
+
 # ── loss definitions ─────────────────────────────────────────────────────────
 
 
@@ -433,6 +444,51 @@ def test_sft_token_mask_edits_window():
     assert torch.equal(sft_token_mask(other, 2, "edits")[0], (other[0] != IGNORE_INDEX).float())
     with pytest.raises(ValueError):
         sft_token_mask(shifted, 2, "spans")
+
+
+def test_sft_token_mask_pair_weight():
+    shifted = _edit_pair_labels()
+    w = torch.tensor([0.0, 0.5])
+    for scope in ("all", "edits"):
+        base = sft_token_mask(shifted, 2, scope, window=2)
+        m = sft_token_mask(shifted, 2, scope, window=2, pair_weight=w)
+        assert m[0].sum() == 0 and torch.equal(m[1], 0.5 * base[1]) and m[2:].sum() == 0
+
+
+@pytest.mark.parametrize("num_chunks", [1, 3])
+def test_chunked_gradients_equal_naive_with_pair_weighted_sft(num_chunks):
+    model = _tiny_model()
+    ref = copy.deepcopy(model)
+    with torch.no_grad():
+        for p in ref.parameters():
+            p.add_(0.01 * torch.randn_like(p))
+    ids, mask, labels = _toy_batch()
+    P = ids.shape[0] // 2
+    w = torch.tensor([0.0] + [1.0] * (P - 1))
+    with torch.no_grad():
+        ref_logps = token_logps(
+            ref.transformer(input_ids=ids, attention_mask=mask)[0], shift_labels(labels), ref.lm_head, num_chunks=1
+        )
+    logits = model(input_ids=ids, attention_mask=mask).logits.double()
+    shifted = shift_labels(labels)
+    logp = torch.log_softmax(logits, -1).gather(-1, shifted.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    logp = torch.where(shifted != IGNORE_INDEX, logp, 0.0)
+    a = score_weights(shifted, P, None).double()
+    naive = preference_loss((logp * a).sum(1), (ref_logps.double() * a).sum(1), a.sum(1), beta=0.1).sum() / P
+    chosen = (shifted[:P] != IGNORE_INDEX).double() * w.double().unsqueeze(1)
+    naive = naive + 0.3 * -(logp[:P] * chosen).sum() / chosen.sum()
+    naive.backward()
+    naive_grads = {n: p.grad.clone() for n, p in model.named_parameters()}
+    model.zero_grad()
+    hidden = model.transformer(input_ids=ids, attention_mask=mask)[0]
+    step = preference_step(
+        hidden, labels, model.lm_head, ref_logps, P, beta=0.1, sft_weight=0.3, num_chunks=num_chunks, sft_pair_weight=w
+    )
+    step.loss.backward()
+    assert torch.allclose(step.loss, naive, atol=1e-12, rtol=1e-10)
+    for n, p in model.named_parameters():
+        scale = naive_grads[n].abs().max().clamp(min=1e-30)
+        assert (p.grad - naive_grads[n]).abs().max() / scale < 1e-6, n
 
 
 @pytest.mark.parametrize("num_chunks", [1, 3])

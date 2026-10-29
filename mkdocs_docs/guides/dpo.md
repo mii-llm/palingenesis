@@ -109,6 +109,8 @@ Two modifiers combine with any of them:
 
 **`sft_weight`** adds `sft_weight × mean NLL of the chosen answer` (as in RPO, [arXiv:2404.19733](https://arxiv.org/abs/2404.19733)). Pure DPO can widen the margin by pushing the rejected answer down while the chosen one falls too. The anchor keeps the chosen answer likely, so the objective becomes "produce this" and not merely "avoid that".
 
+A row may carry its own `sft_weight` field in [0, 1] (default 1), which scales the SFT term for that pair only. Set it to 0 for pairs whose chosen answer was written by another model rather than edited from the policy's own: they still teach the preference, but the policy is not trained to imitate the other model's text.
+
 **`ld_alpha < 1`** is LD-DPO ([arXiv:2409.06411](https://arxiv.org/abs/2409.06411)). Tokens up to the length both answers share count fully, and the longer answer's tail counts `ld_alpha`. This counters DPO's bias towards longer answers.
 
 !!! tip "When not to use `ld_alpha`"
