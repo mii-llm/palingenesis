@@ -219,7 +219,7 @@ class ChatMessagesSource:
         field = self.config.privileged_field
         if field and row.get(field):
             meta["teacher_messages"] = with_privileged(
-                row["messages"], str(row[field]), self.config.privileged_template
+                row["messages"], str(row[field]), self.config.privileged_template, self.config.privileged_role
             )
         return meta
 

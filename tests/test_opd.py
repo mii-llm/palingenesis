@@ -908,6 +908,22 @@ def test_privileged_options_are_validated():
     assert "privileged_template" in errors(privileged_field="solution", privileged_template="{content} only")
     assert "privileged_template" in errors(privileged_field="solution", privileged_template="{content}{privileged}{x}")
     assert "format 'messages' only" in errors(privileged_field="solution", format="mcqa")
+    assert "privileged" not in errors(privileged_field="solution", privileged_role="system")
+    assert "privileged_role" in errors(privileged_field="solution", privileged_role="assistant")
+
+
+def test_privileged_context_in_the_system_turn():
+    """privileged_role "system": the teacher's system turn carries the note (appended, or a new first turn); the
+    user turns stay the user's words, so the teacher does not read the note as something the user said."""
+    from palingenesis.opd.formatting import with_privileged
+
+    msgs = [{"role": "user", "content": "Ciao!"}]
+    out = with_privileged(msgs, "Nota: rispondi.", "{content}\n\n{privileged}", role="system")
+    assert out == [{"role": "system", "content": "Nota: rispondi."}, {"role": "user", "content": "Ciao!"}]
+    assert msgs == [{"role": "user", "content": "Ciao!"}]  # the student's copy is untouched
+    sys_msgs = [{"role": "system", "content": "Sei utile."}, {"role": "user", "content": "Ciao!"}]
+    out = with_privileged(sys_msgs, "Nota: rispondi.", "{content}\n\n{privileged}", role="system")
+    assert out[0]["content"] == "Sei utile.\n\nNota: rispondi." and out[1] == sys_msgs[1] and len(out) == 2
 
 
 def test_samplings_truncation_and_loop_detector():

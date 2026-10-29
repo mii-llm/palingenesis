@@ -127,6 +127,26 @@ sources:
 
 Metrics are reported per teacher (`kl/<teacher>`, `k1/<teacher>`, `tokens/<teacher>`) and dev metrics per source (`eval/dev_kl/<source>`). An hf teacher that does not fit next to the others can wait on CPU between scoring calls (`offload: true`) or live on another GPU (`device: cuda:1`).
 
+### Privileged context (on-policy self-distillation)
+
+A `messages` source can give the teacher information the student does not see: `privileged_field` names a row field
+(a resolved fact, a tool result, a short hint), and `privileged_template` (`{content}`, `{privileged}`) places it. With
+`privileged_role: user` (default) the template rewrites the last user turn; with `privileged_role: system` it rewrites the
+system turn (or adds one), so the teacher reads the note as an instruction to itself rather than as the user's words.
+With the student's own checkpoint as teacher this is on-policy self-distillation with privileged information (OPSD,
+arXiv:2602.04942): the student is pulled towards what it would say if it knew. It works best when the privileged text is
+something the student could look up or decide in one step; a full reference solution tends to teach the teacher's
+compressed style instead.
+
+```yaml
+sources:
+  help:
+    path: help_rows.jsonl          # each row: messages, hint
+    privileged_field: hint
+    privileged_role: system
+    privileged_template: "{content}\n\n{privileged}"
+```
+
 ## Measured
 
 Student Qwen3-0.6B, non-thinking, on GSM8K train prompts; one A100 80GB (vLLM 0.26, torch 2.11, cu129). Every run: 64 prompts per step, 512 new tokens, temperature 1, 60 steps, learning rate 3e-6 (5 warmup steps, cosine), `configs/distill_math.yaml` with the changes listed. Dev metrics on 200 GSM8K test questions: `dev_kl` is the on-policy sampled reverse-KL estimate per student token (on the teacher's own tokens for xtok, whitespace chunks excluded), accuracy is greedy with the last number after "Answer:". Greedy accuracy of the models alone on the same questions: Qwen3-0.6B 64.5%, Qwen3-1.7B 79.0%, Qwen3.5-0.8B 52.0%, SmolLM2-360M-Instruct 10.0%.

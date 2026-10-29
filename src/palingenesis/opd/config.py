@@ -92,6 +92,9 @@ class SourceConfig:
     # is the student's own checkpoint. Empty = off; rows without the field are ordinary rows.
     privileged_field: str = ""
     privileged_template: str = "{content}\n\n{privileged}"
+    # "user": the template rewrites the last user turn; "system": it rewrites (or creates) the system turn, so the
+    # teacher reads the note as an instruction to itself rather than as the user's words
+    privileged_role: str = "user"
     # ---- rollout sampling of this source's prompts ----
     # A mixture drawn per rollout: [{weight, temperature, top_p, top_k}, ...] (missing keys: weight 1,
     # temperature rollout.temperature, top_p 1, top_k 0). E.g. half the non-thinking rollouts at the
@@ -438,6 +441,10 @@ class OPDConfig:
             if source.privileged_field:
                 if source.format != "messages":
                     errors.append(f"{where}.privileged_field applies to format 'messages' only.")
+                if source.privileged_role not in ("user", "system"):
+                    errors.append(
+                        f"{where}.privileged_role must be 'user' or 'system', got {source.privileged_role!r}."
+                    )
                 try:
                     source.privileged_template.format(content="", privileged="")
                     complete = all(f"{{{k}}}" in source.privileged_template for k in ("content", "privileged"))
