@@ -105,6 +105,7 @@ nav:
     - Model Merging: guides/merging.md
     - Common-Mode Rejection (CMR): guides/cmr.md
     - Margin Surgery: guides/surgery.md
+    - Reading Model Internals: guides/internals.md
     - SFT → RL Transition: guides/sft-to-rl.md
   - Reference:
     - Configuration: reference/configuration.md
@@ -117,4 +118,5 @@ nav:
     - Overview: architecture/overview.md
     - Philosophy: architecture/philosophy.md
     - Research: architecture/research.md
+    - Interpretability Research: architecture/interpretability.md
   - Contributing: contributing.md

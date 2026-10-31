@@ -100,6 +100,27 @@ pgs surgery span --model CUR --groups TWINS.jsonl --targets TARGET.jsonl --decis
 of the target set's margin gradient inside the span of K group gradients. Common options: `--micro-batch`,
 `--max-side-tokens`, `--dtype`, `--device`, `--limit`, `--json`.
 
+### internals
+
+Read a model's internals: residual-stream capture, linear probes per layer, logit / tuned lens, checkpoint comparison,
+steering, ablation and activation patching. See [Reading Model Internals](../guides/internals.md).
+
+```bash
+pgs internals run --config internals.yaml [--set layers=12-20] [--overwrite]
+pgs internals capture --model M --data rows.jsonl --out acts/m [--position last_prompt] [--layers all] [--store-dtype bfloat16]
+pgs internals probe --acts acts/m --out probes/m [--test it=acts/m_it] [--kind logistic|diffmean|lda] [--bootstrap 1000]
+pgs internals compare --a acts/base --b acts/sft
+pgs internals lens --model M --data chats.jsonl [--position assistant_all] [--decision "<tool_call>"] [--tuned lens.safetensors]
+pgs internals tuned-lens --model M --data chats.jsonl --out lens.safetensors [--steps 250]
+pgs internals causal --model M --probe probes/m/best.safetensors --data rows.jsonl --decision TOKEN [--alphas -2,-1,0,1,2]
+pgs internals patch --model M --twins twins.jsonl --decision "<tool_call>" [--offsets -1,-2,-3] [--mode denoise|noise]
+pgs internals steer --model M --probe P --prompt "..." [--alpha 0,1,2] [--positions all|last_and_new]
+pgs internals score --probe P --data rows.jsonl --out scored.jsonl [--column known] [--gate fpr_0.05]
+```
+
+Model options: `--dtype`, `--device`, `--chat-template-kwargs '{"enable_thinking": false}'`, `--batch-size`,
+`--max-tokens`, `--limit`. Most commands take `--json`.
+
 ### autopilot
 
 Zero-config autonomous training. Profiles hardware, sweeps LR, trains to completion.
