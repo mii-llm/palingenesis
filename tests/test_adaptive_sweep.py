@@ -60,9 +60,9 @@ def test_coarse_candidates_scale_with_model_size():
     # Center of large-model candidates should be lower
     small_center = small[len(small) // 2]
     large_center = large[len(large) // 2]
-    assert large_center < small_center, (
-        f"Large model center ({large_center:.2e}) should be < small model center ({small_center:.2e})"
-    )
+    assert (
+        large_center < small_center
+    ), f"Large model center ({large_center:.2e}) should be < small model center ({small_center:.2e})"
 
     print(f"  0.5B center: {small_center:.2e}")
     print(f"  8.0B center: {large_center:.2e}")
@@ -199,9 +199,9 @@ def test_refinement_handles_edge_best():
     refinement = generate_refinement_candidates(coarse_results, n_refine=3)
 
     # Should explore below 5e-6 since best was at the edge
-    assert any(lr < 5e-6 for lr in refinement), (
-        f"Expected some candidates below 5e-6, got {[f'{c:.2e}' for c in refinement]}"
-    )
+    assert any(
+        lr < 5e-6 for lr in refinement
+    ), f"Expected some candidates below 5e-6, got {[f'{c:.2e}' for c in refinement]}"
 
     print(f"  Edge refinement: {[f'{c:.2e}' for c in refinement]}")
     print("✓ test_refinement_handles_edge_best PASSED\n")
@@ -287,9 +287,9 @@ def test_correction_is_monotonic_with_horizon():
     corrected_5k = correct_lr_adaptive(3e-5, 100, 5000, results)
     corrected_20k = correct_lr_adaptive(3e-5, 100, 20000, results)
 
-    assert corrected_1k >= corrected_5k >= corrected_20k, (
-        f"Not monotonic: 1k={corrected_1k:.2e}, 5k={corrected_5k:.2e}, 20k={corrected_20k:.2e}"
-    )
+    assert (
+        corrected_1k >= corrected_5k >= corrected_20k
+    ), f"Not monotonic: 1k={corrected_1k:.2e}, 5k={corrected_5k:.2e}, 20k={corrected_20k:.2e}"
 
     print(f"  100→1K: {corrected_1k:.2e}")
     print(f"  100→5K: {corrected_5k:.2e}")

@@ -40,9 +40,9 @@ def test_empty_source_is_dropped_not_fatal(caplog):
 
     got = sorted(int(x["input_ids"][0]) for x in out)
     assert got == [0, 1, 2, 3, 4], "all items from the non-empty source must survive the empty one"
-    assert any("BAD_EMPTY" in r.message and "0 usable" in r.message for r in caplog.records), (
-        "the empty source must be named in a loud warning"
-    )
+    assert any(
+        "BAD_EMPTY" in r.message and "0 usable" in r.message for r in caplog.records
+    ), "the empty source must be named in a loud warning"
 
 
 def test_all_empty_sources_yields_nothing_without_hanging():

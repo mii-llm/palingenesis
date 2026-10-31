@@ -346,9 +346,9 @@ def test_global_valid_token_normalization():
         with open(results_path) as f:
             result = json.load(f)
 
-        assert result["normalization_correct"], (
-            f"Global valid tokens = {result['global_valid']}, expected = {result['expected_global']}"
-        )
+        assert result[
+            "normalization_correct"
+        ], f"Global valid tokens = {result['global_valid']}, expected = {result['expected_global']}"
         assert result["global_valid"] == 64
         assert result["local_valid"] == 16  # rank 0 has 16 valid
 

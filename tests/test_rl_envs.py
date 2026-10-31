@@ -307,8 +307,16 @@ def _submit_pipeline(env, rows, sampler, settings=None):
     }.items():
         config.set(key, value)
     return RLPipeline(
-        tok, ChatFormat(tok, eot, kwargs), engine, PublishedWeights(torch.nn.Linear(1, 1)), config, sampler, [],
-        EnvPool(env), None, (eot,),
+        tok,
+        ChatFormat(tok, eot, kwargs),
+        engine,
+        PublishedWeights(torch.nn.Linear(1, 1)),
+        config,
+        sampler,
+        [],
+        EnvPool(env),
+        None,
+        (eot,),
     )
 
 

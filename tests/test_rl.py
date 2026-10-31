@@ -1226,7 +1226,12 @@ def test_prompt_sampler_retry_queue():
     t = PromptSampler(rows, seed=1, revisit_after_steps=3)
     t.load_state(pickle.loads(pickle.dumps(s.state())))
     assert (t.version, t.draws, t.pending, t.first_solved, t.solved_after_fail, t.history) == (
-        s.version, s.draws, s.pending, s.first_solved, s.solved_after_fail, s.history
+        s.version,
+        s.draws,
+        s.pending,
+        s.first_solved,
+        s.solved_after_fail,
+        s.history,
     )
     s.in_flight.clear()  # the resumed sampler has no groups in flight
     assert [t.draw(v)[0] for v in (5, 6, 7, 7, 8, 8)] == [s.draw(v)[0] for v in (5, 6, 7, 7, 8, 8)]
@@ -1255,8 +1260,15 @@ def test_prompt_sampler_cooldown_never_repeats_a_row_at_one_version():
     from palingenesis.rl.data import PromptSampler
 
     rows = [{"prompt": f"p{i}"} for i in range(12)]
-    s = PromptSampler(rows, seed=4, revisit_after_steps=1, revisit_partial_after_steps=1, revisit_max_failed=99,
-                      revisit_max_partial=99, revisit_share=1.0)
+    s = PromptSampler(
+        rows,
+        seed=4,
+        revisit_after_steps=1,
+        revisit_partial_after_steps=1,
+        revisit_max_failed=99,
+        revisit_max_partial=99,
+        revisit_share=1.0,
+    )
     for version in range(60):  # 5 draws a step, the epoch rolls over mid-step, every group is partly solved
         drawn = [s.draw(version)[0] for _ in range(5)]
         assert len(set(drawn)) == 5, (version, drawn)  # neither the queue nor a new epoch repeats a row in a step
@@ -1473,7 +1485,9 @@ def test_plain_prompt_boundary_is_token_stable_and_raw_whitespace_is_kept():
         alone = tok.encode(answer, add_special_tokens=False)
         assert joint == prompt + alone  # no merge across the prompt / completion boundary
         assert tok.encode(tok.decode(alone), add_special_tokens=False) == alone  # stable round trip
-    assert len(tok.encode(" Hello", add_special_tokens=False)) == len(tok.encode("Hello", add_special_tokens=False)) == 1
+    assert (
+        len(tok.encode(" Hello", add_special_tokens=False)) == len(tok.encode("Hello", add_special_tokens=False)) == 1
+    )
 
     plain = ChatFormat(tok, end_of_turn_id(tok, kwargs), kwargs)
     turn = parse_assistant(" Hello! How can I help?", plain)

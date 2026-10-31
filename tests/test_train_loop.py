@@ -540,9 +540,9 @@ def test_chunked_deft_matches_standard():
     )
 
     diff = abs(std_loss.item() - chunked_loss.item())
-    assert diff < 0.01, (
-        f"Chunked DEFT diverges: std={std_loss.item():.4f}, chunked={chunked_loss.item():.4f}, diff={diff:.4f}"
-    )
+    assert (
+        diff < 0.01
+    ), f"Chunked DEFT diverges: std={std_loss.item():.4f}, chunked={chunked_loss.item():.4f}, diff={diff:.4f}"
 
     print(f"  Standard DEFT: {std_loss.item():.4f}")
     print(f"  Chunked DEFT: {chunked_loss.item():.4f}")

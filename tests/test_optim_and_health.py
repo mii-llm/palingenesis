@@ -47,9 +47,9 @@ def test_power_decay_scheduler():
     lr_at_550 = optimizer.param_groups[0]["lr"]
     # Power decay: (1-0.5)^4 = 0.0625 → LR = 0.1 + 0.9*0.0625 = 0.15625 of peak
     expected_fraction = 0.1 + 0.9 * (0.5**4)
-    assert abs(lr_at_550 / 1e-3 - expected_fraction) < 0.02, (
-        f"Mid-training LR should be ~{expected_fraction * 1e-3:.6f}, got {lr_at_550:.6f}"
-    )
+    assert (
+        abs(lr_at_550 / 1e-3 - expected_fraction) < 0.02
+    ), f"Mid-training LR should be ~{expected_fraction * 1e-3:.6f}, got {lr_at_550:.6f}"
 
     # End of training: should be at min_lr_ratio
     for _ in range(450):
@@ -127,9 +127,9 @@ def test_scheduler_monotonicity():
         # After warmup (step 50+), LR should be non-increasing
         post_warmup = lrs[50:]
         for i in range(1, len(post_warmup)):
-            assert post_warmup[i] <= post_warmup[i - 1] + 1e-10, (
-                f"{sched_type}: LR increased at step {50 + i}: {post_warmup[i - 1]:.8f} -> {post_warmup[i]:.8f}"
-            )
+            assert (
+                post_warmup[i] <= post_warmup[i - 1] + 1e-10
+            ), f"{sched_type}: LR increased at step {50 + i}: {post_warmup[i - 1]:.8f} -> {post_warmup[i]:.8f}"
 
         print(f"  {sched_type}: peak={max(lrs):.6f}, end={lrs[-1]:.6f} ✓")
 
