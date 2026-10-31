@@ -164,7 +164,7 @@ def main():
             print(f"palingenesis {__version__}")
             print(f"  PyTorch: {_torch_version()}")
             print(f"  Transformers: {_transformers_version()}")
-            print(f"  CUDA: {_cuda_info()}")
+            print(f"  GPU: {_gpu_info()}")
             print(f"  Liger Kernel: {_liger_version()}")
 
         case _:
@@ -371,15 +371,11 @@ def _transformers_version() -> str:
         return "not installed"
 
 
-def _cuda_info() -> str:
+def _gpu_info() -> str:
     try:
-        import torch
+        from palingenesis.accelerator import describe
 
-        if torch.cuda.is_available():
-            name = torch.cuda.get_device_name(0)
-            mem = torch.cuda.get_device_properties(0).total_memory / 2**30
-            return f"{name} ({mem:.0f} GB)"
-        return "not available"
+        return describe()
     except Exception:
         return "unknown"
 
