@@ -33,6 +33,7 @@ pgs train --config configs/quickstart.yaml
 
 In a notebook or a script: `palingenesis.train.train(config)` on one GPU, see
 [Training from a notebook](https://mii-llm.github.io/palingenesis/getting-started/notebook/).
+AMD GPUs (ROCm): [Training on AMD GPUs](https://mii-llm.github.io/palingenesis/getting-started/amd/).
 
 ## What it does
 

@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+# AMD GPUs (ROCm). Not built or tested in CI; see the "Training on AMD GPUs" guide.
+#   docker build -f Dockerfile.rocm -t palingenesis:rocm .
+# vLLM's official ROCm image supplies Python 3.12, ROCm torch (with its Triton) and vLLM
+# 0.26.0, the version the vllm extra pins for NVIDIA. (AMD's rocm/vllm images are deprecated.)
+FROM vllm/vllm-openai-rocm:v0.26.0
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Inductor/Triton compile host launchers at runtime, so a C/C++ compiler is needed.
+# GPU access for the non-root user comes from `docker run --group-add` with the host's
+# video and render group ids (see the guide).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libgomp1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 trainer && \
+    useradd --uid 10001 --gid 10001 --create-home trainer && \
+    mkdir -p /workspace /cache /outputs && \
+    chown trainer:trainer /workspace /cache /outputs
+# Not `uv sync --locked`: uv.lock resolves torch and vLLM from the CUDA 12.9 indexes.
+# pip keeps the image's ROCm torch and vLLM (they satisfy torch>=2.11). liger-kernel and
+# cut-cross-entropy declare a dependency on PyPI's `triton`, which would shadow the
+# image's ROCm Triton, so they go in without dependencies. The last line fails the
+# build if anything replaced the ROCm torch.
+# hadolint ignore=DL3013
+RUN --mount=type=bind,source=.,target=/source,rw \
+    python3 -m pip install --no-cache-dir "/source[logging,rl,mcp]" && \
+    python3 -m pip install --no-cache-dir bitsandbytes "flash-linear-attention[rocm]" kernels && \
+    python3 -m pip install --no-cache-dir --no-deps liger-kernel cut-cross-entropy && \
+    python3 -c "import torch, vllm; assert torch.version.hip, torch.__version__; print(torch.__version__, vllm.__version__)"
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    HF_HOME=/cache/huggingface TORCH_HOME=/cache/torch \
+    TORCHINDUCTOR_CACHE_DIR=/cache/inductor TRITON_CACHE_DIR=/cache/triton \
+    XDG_CACHE_HOME=/cache
+WORKDIR /workspace
+USER 10001:10001
+ENTRYPOINT ["pgs"]
+CMD ["--help"]
