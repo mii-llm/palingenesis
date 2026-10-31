@@ -30,6 +30,7 @@ import torch
 from torch import Tensor
 from transformers import AutoTokenizer
 
+from palingenesis.accelerator import check_visible_devices
 from palingenesis.kernels import apply_liger_kernel, model_type_of
 from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
@@ -109,6 +110,7 @@ class OPDTrainer:
         # Not MPS: rollouts run on the orchestrator's thread, and Metal command
         # buffers are not safe to use from two threads.
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        check_visible_devices()
         self.rng = random.Random(config.train.seed)
         torch.manual_seed(config.train.seed)
         os.makedirs(config.train.output_dir, exist_ok=True)

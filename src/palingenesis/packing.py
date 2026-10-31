@@ -9,8 +9,9 @@ keeps a document from attending to the previous one depends on the layer:
     A flattened row under sdpa in training runs variable-length flash attention instead
     (seco._varlen_attention, from `cu_seq_lens_q`): with the mask, SDPA's memory-efficient
     kernel did L^2 work over the whole packed row (75% of a Qwen3.5 CPT step).
-  * flash_attention_2: variable-length kernels, from `cu_seq_lens_q/k` and
-    `max_length_q/k`, for one flattened row.
+  * flash_attention_2, and Hub flash kernels such as kernels-community/aiter-flash-attn
+    (transformers runs both through its flash path): variable-length kernels, from
+    `cu_seq_lens_q/k` and `max_length_q/k`, for one flattened row.
   * linear attention (Qwen3.5 / Qwen3-Next Gated DeltaNet): the recurrent state is
     reset at `cu_seq_lens_q` by flash-linear-attention's kernel and the short causal
     convolution at `seq_idx` by causal-conv1d. Both need one flattened row; the
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 
 import torch
 
+from palingenesis.accelerator import is_flash_varlen
 from palingenesis.config import ConfigError
 
 # Layer types whose documents are separated by the attention mask.
@@ -71,10 +73,10 @@ def check_packing_support(model: torch.nn.Module, attn_implementation: str) -> N
                 "carry the recurrent state across packed documents. Install them (`uv sync --extra train "
                 "--extra hybrid`, see the installation guide) or set data.packing: false."
             )
-    if attn_implementation not in ("sdpa", "eager", "flash_attention_2", "flex_attention"):
+    if attn_implementation not in ("sdpa", "eager", "flex_attention") and not is_flash_varlen(attn_implementation):
         raise ConfigError(
             f"data.packing is not supported with attn_implementation={attn_implementation!r}: use sdpa, "
-            "flash_attention_2 or flex_attention."
+            "flash_attention_2, a Hub flash kernel (e.g. kernels-community/aiter-flash-attn@v2) or flex_attention."
         )
 
 

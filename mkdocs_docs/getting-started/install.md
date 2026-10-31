@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-1. **Linux with an NVIDIA GPU.** The default install targets CUDA 12.9, which needs an NVIDIA driver ≥ 575 (`nvidia-smi` shows the driver version).
+1. **Linux with an NVIDIA GPU.** The default install targets CUDA 12.9, which needs an NVIDIA driver ≥ 575 (`nvidia-smi` shows the driver version). AMD Instinct GPUs (ROCm) install differently: see [Training on AMD GPUs](amd.md).
 2. **[uv](https://docs.astral.sh/uv/)** (recommended): `curl -LsSf https://astral.sh/uv/install.sh | sh`
 3. **Python 3.11 or 3.12.** uv downloads one if needed.
 
@@ -95,11 +95,11 @@ Expected (versions from `uv.lock`):
 palingenesis 0.3.0
   PyTorch: 2.11.0+cu129
   Transformers: 5.12.1
-  CUDA: NVIDIA A100-SXM4-80GB (80 GB)
+  GPU: 1x NVIDIA A100-SXM4-80GB (80 GB), CUDA 12.9, arch sm_80
   Liger Kernel: installed
 ```
 
-If you see `CUDA: not available`, your PyTorch installation doesn't have CUDA support. Reinstall PyTorch from the [official instructions](https://pytorch.org/get-started/locally/).
+If you see `GPU: not available (torch built for CPU)`, your PyTorch installation doesn't have CUDA support. Reinstall PyTorch from the [official instructions](https://pytorch.org/get-started/locally/).
 
 ---
 

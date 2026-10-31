@@ -34,6 +34,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from palingenesis import accelerator
 from palingenesis.checkpoint import (
     BestModelTracker,
     find_latest_checkpoint,
@@ -262,12 +263,8 @@ def train(config: Config):
     rank, local_rank, world_size = setup_distributed()
     setup_logging(rank)
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            f"No usable CUDA GPU (torch {torch.__version__}, built for CUDA {torch.version.cuda}). If `nvidia-smi` "
-            "works, this torch build needs a newer NVIDIA driver than the machine has: reinstall torch from a CUDA "
-            "index your driver supports, e.g. `uv pip install torch --index-url "
-            "https://download.pytorch.org/whl/cu128` (driver >= 570). See docs: Installation."
-        )
+        raise RuntimeError(accelerator.no_gpu_message())
+    accelerator.check_visible_devices()
     device = torch.device(f"cuda:{local_rank}")
 
     logger.info(f"rank={rank} local_rank={local_rank} world_size={world_size}")
@@ -310,6 +307,8 @@ def train(config: Config):
     # no fused attention, fp32 GEMMs and activations (measured 1.7x slower on Qwen3.5-0.8B).
     compute_dtype = torch.bfloat16 if model_dtype == torch.float32 else model_dtype
 
+    # flash_attention_2 / Hub kernels: a clear error now, not an ImportError deep in from_pretrained
+    accelerator.check_attn_implementation(config.model.attn_implementation)
     logger.info(f"Loading model: {config.model.name_or_path}")
     model = AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path,
@@ -362,7 +361,7 @@ def train(config: Config):
     flatten_packed = False
     if config.data.packing:
         check_packing_support(model, config.model.attn_implementation)
-        flatten_packed = config.model.attn_implementation == "flash_attention_2" or has_linear_attention(model)
+        flatten_packed = accelerator.is_flash_varlen(config.model.attn_implementation) or has_linear_attention(model)
 
     # ── sdpa: fused attention kernels under autocast (see seco.use_chunk_attention) ──
     if config.model.attn_implementation == "sdpa":
@@ -691,7 +690,12 @@ def train(config: Config):
         if lm_head is None:
             logger.warning("Could not find lm_head, falling back to standard loss")
             use_chunked_loss = False
-        elif cce_available() and not _needs_logits and not isinstance(lm_head, PostProcessedHead):
+        elif (
+            cce_available()
+            and not _needs_logits
+            and not isinstance(lm_head, PostProcessedHead)
+            and _cce_supported(config.memory.float32_matmul_precision)
+        ):
             # CCE: zero-memory CE, replaces chunked when no plugin needs full logits
             use_cce = True
             use_chunked_loss = False
@@ -1587,6 +1591,15 @@ def _compile_layers(model: torch.nn.Module, backend: str = "inductor", mode: str
             return
         except (AttributeError, TypeError):
             continue
+
+
+def _cce_supported(matmul_precision: str) -> bool:
+    """Whether Cut Cross-Entropy's kernels compile on this GPU (AMD: see accelerator.cce_support);
+    logs why when they do not."""
+    ok, reason = accelerator.cce_support(matmul_precision)
+    if not ok:
+        logger.warning(reason)
+    return ok
 
 
 def _get_lm_head(model: torch.nn.Module):

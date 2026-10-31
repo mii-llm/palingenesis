@@ -42,6 +42,8 @@ from typing import Protocol
 import torch
 from torch import Tensor, nn
 
+from palingenesis.accelerator import is_rocm
+
 logger = logging.getLogger(__name__)
 
 
@@ -242,7 +244,7 @@ def _import_vllm():
     except ImportError as e:
         raise ImportError(
             "rollout.backend / teacher backend 'vllm' needs vLLM: install palingenesis[vllm] "
-            "(Linux, NVIDIA driver >= 575)."
+            "(Linux, NVIDIA driver >= 575; on AMD GPUs vLLM's ROCm build or container, see the AMD GPUs guide)."
         ) from e
     return vllm
 
@@ -590,6 +592,12 @@ class VLLMServerRollout:
     """
 
     def __init__(self, server: VLLMServer, stop_ids: tuple[int, ...]):
+        if is_rocm():
+            logger.warning(
+                "rollout.backend vllm_server on ROCm is untested: the weight push uses torch's CUDA IPC handles "
+                "(HIP IPC on AMD). Check that rollouts after a weight update come from the updated policy (in RL, "
+                "policy/abs_ratio_dev stays near 0), or use rollout.backend vllm."
+            )
         self.server = server
         self.stop_ids = stop_ids
         self.version = 0

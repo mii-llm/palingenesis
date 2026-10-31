@@ -39,7 +39,9 @@ jobs:
         run: ruff format --check .
       - name: Lint Dockerfile
         # Debian packages receive security updates instead of fixed version pins.
-        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < Dockerfile
+        run: |
+          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < Dockerfile
+          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 - < Dockerfile.rocm
       - name: Validate deployment contracts and configuration
         run: pytest -q tests/test_container_contract.py tests/test_config_validation.py
 

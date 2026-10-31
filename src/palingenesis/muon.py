@@ -99,8 +99,11 @@ QUACK_MIN_SIDE = 256  # quack's symmetric kernels tile at 256: smaller matrices 
 
 
 def _quack_ops():
-    """The quack backend when installed and the GPU is sm90 or newer, else None."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+    """The quack backend when installed and the GPU is an NVIDIA sm90 or newer, else None.
+    quack is CUDA (CuTe DSL); AMD GPUs report capability (9, x) too, hence the ROCm check."""
+    from palingenesis.accelerator import is_rocm
+
+    if not torch.cuda.is_available() or is_rocm() or torch.cuda.get_device_capability()[0] < 9:
         return None
     try:
         return _QuackOps()

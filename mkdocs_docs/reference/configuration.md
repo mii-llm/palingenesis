@@ -11,7 +11,7 @@
 | `name_or_path` | str | `meta-llama/Llama-3.1-8B-Instruct` | HuggingFace model ID or local path. Any `AutoModelForCausalLM`-compatible model. |
 | `trust_remote_code` | bool | `true` | Allow executing model code from HuggingFace. Required for Qwen, Gemma. |
 | `torch_dtype` | str | `bfloat16` | Weight precision. Options: `bfloat16`, `float16`, `float32`. bf16 recommended for A100+. |
-| `attn_implementation` | str | `sdpa` | Attention backend. `sdpa` works everywhere (packing included); `flash_attention_2` (if installed) packs without an explicit mask; `eager` for debugging. |
+| `attn_implementation` | str | `sdpa` | Attention backend. `sdpa` works everywhere (packing included); `flash_attention_2` (if installed; otherwise training stops with a config error before loading the model) packs without an explicit mask; a Hub kernel `org/repo[@revision]` loaded through the `kernels` package, e.g. `kernels-community/aiter-flash-attn@v2` on [AMD GPUs](../getting-started/amd.md); `eager` for debugging. |
 | `use_liger_kernel` | bool | `true` | Liger's fused Triton kernels (RMSNorm, SwiGLU, RoPE, ...) for the model's `model_type`. Applied only when `compile` is false: torch.compile fuses the same ops (faster in our measurements) and cannot trace Liger's kernels. |
 | `compile` | bool | `true` | `torch.compile` each transformer layer. First step is slow (compilation), then 20-40% faster. |
 | `compile_backend` | str | `inductor` | Compiler backend. `inductor` (default, fastest), `aot_eager` (debugging). |
