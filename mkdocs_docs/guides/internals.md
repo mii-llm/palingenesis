@@ -4,6 +4,9 @@
 built for post-training: run it before and after a stage to see what the stage changed inside the model, not only in
 its outputs.
 
+!!! note "Status"
+    New in this release. Validated on CPU and on small models; large-model runs are pending, so expect follow-up fixes.
+
 - **Capture** the residual stream of every decoder layer at positions taken from the chat template (the last prompt
   token, the assistant / answer / reasoning tokens training puts loss on), streamed to sharded files on disk.
 - **Probe** each layer with a linear classifier: grouped splits, a control task, calibrated probabilities, AUROC with
