@@ -139,3 +139,24 @@ def test_a_rotated_away_source_warns_and_the_policy_restores_the_layout(tmp_path
     save_hf_model(model, None, tmp_path / "kept", source_layout=True)
     assert json.loads((tmp_path / "kept" / "config.json").read_text())["model_type"] == "qwen3_5"
     assert _keys(tmp_path / "kept") == _keys(multimodal)
+
+
+def test_resume_loads_a_checkpoint_saved_under_the_source_names(tmp_path, multimodal):
+    """transformers 5's save_pretrained reverts the load-time renaming, so the trainer's own step checkpoints of a causal
+    LM loaded from a multimodal checkpoint carry model.language_model.* names; resume maps them back (it failed with
+    "Checkpoint ... has weights this model does not: ['model.language_model.embed_tokens.weight', ...]")."""
+    from transformers import AutoModelForCausalLM
+
+    from palingenesis.checkpoint import load_checkpoint, save_checkpoint
+
+    model = AutoModelForCausalLM.from_pretrained(multimodal)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    save_checkpoint(model, None, torch.optim.AdamW(model.parameters()), None, step=7, output_dir=str(tmp_path / "run"))
+    assert any("language_model" in k for k in _keys(tmp_path / "run" / "step-7" / "model"))
+    fresh = AutoModelForCausalLM.from_pretrained(multimodal)
+    meta = load_checkpoint(fresh, torch.optim.AdamW(fresh.parameters()), None, str(tmp_path / "run" / "step-7"))
+    assert meta["step"] == 7
+    for (name, p), (_, q) in zip(model.named_parameters(), fresh.named_parameters()):
+        torch.testing.assert_close(p, q, rtol=0, atol=0, msg=name)

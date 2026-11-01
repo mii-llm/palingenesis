@@ -74,8 +74,9 @@ def save_hf_model(
     language model as Qwen3_5ForCausalLM), save in that checkpoint's layout: its
     config, the weights under its names, and the weights the causal LM does not have
     (the vision tower) copied from it. Then it loads wherever the original does (vLLM
-    serves Qwen3.5 only through the multimodal architecture). Exports use it; the
-    trainer's own resume checkpoints keep the model's names.
+    serves Qwen3.5 only through the multimodal architecture). Exports use it. The
+    trainer's resume checkpoints are written by save_pretrained, which in transformers 5
+    reverts the load-time renaming too (model.language_model.*); resume maps the names back.
     """
     path.mkdir(parents=True, exist_ok=True)
     state = hf_state_dict(state if state is not None else model.state_dict())
@@ -409,6 +410,30 @@ def load_checkpoint(
     return meta
 
 
+def _saved_names(model, own: dict[str, str]) -> dict[str, str]:
+    """Names save_pretrained writes for the model's weights -> the model's own names, where they differ.
+
+    transformers 5's save_pretrained reverts the renaming applied at load: a causal LM loaded from a
+    multimodal Qwen3.5 checkpoint saves its model.* weights as model.language_model.*. Only pure
+    renames are mapped (the reverted tensor is the model's own); a weight that a converter merges or
+    splits stays unmapped, so loading it still fails loudly.
+    """
+    try:
+        from transformers.core_model_loading import revert_weight_conversion
+    except ImportError:  # transformers < 5: save_pretrained keeps the model's names
+        return {}
+    base = getattr(model, "_orig_mod", model)
+    state = hf_state_dict(model.state_dict())
+    names = {}
+    for clean, tensor in state.items():
+        reverted = revert_weight_conversion(base, {clean: tensor})
+        if len(reverted) == 1:
+            [(saved, out)] = reverted.items()
+            if saved != clean and out is tensor:
+                names[saved] = own[clean]
+    return names
+
+
 def _load_single(model, optimizer, path, device):
     """Load single-GPU checkpoint with low memory usage.
 
@@ -419,7 +444,8 @@ def _load_single(model, optimizer, path, device):
     model_path = path / "model"
     if model_path.exists():
         # Model names without wrapper prefixes -> the model's own names
-        own = {hf: name for name, hf in zip(model.state_dict(), hf_state_dict(dict.fromkeys(model.state_dict())))}
+        names = {hf: name for name, hf in zip(model.state_dict(), hf_state_dict(dict.fromkeys(model.state_dict())))}
+        own = {**names, **_saved_names(model, names)}  # also the names save_pretrained writes
         shard_files = sorted(model_path.glob("*.safetensors"))
         if not shard_files:
             raise FileNotFoundError(f"No model weights (*.safetensors) in {model_path}")
@@ -431,10 +457,10 @@ def _load_single(model, optimizer, path, device):
             if unknown:
                 raise RuntimeError(f"Checkpoint {model_path} has weights this model does not: {unknown[:5]}")
             model.load_state_dict({own[k]: v for k, v in shard.items()}, strict=False)
-            loaded.update(shard)
+            loaded.update(own[k] for k in shard)
             del shard  # Free immediately
         tied = _tied_parameter_names(model)
-        missing = [k for k in own if k not in loaded and k not in tied]
+        missing = [k for k, name in names.items() if name not in loaded and k not in tied]
         if missing:
             raise RuntimeError(f"Checkpoint {model_path} lacks weights of this model: {missing[:5]}")
         logger.info(f"Loaded model from {len(shard_files)} file(s)")
