@@ -163,6 +163,274 @@ def test_loss_false_turn_is_context_only():
     assert _trained(TOK, ChatDataset(None, TOK, 4096)._process({"messages": msgs})) == "ANSWER<|im_end|>"
 
 
+def test_inject_loop_pastes_an_untrained_repeat_before_the_next_gold_turn():
+    from palingenesis.data import inject_loop
+
+    assert inject_loop(AGENT, 0.0) is AGENT and inject_loop(AGENT, 1.0, seed=1) == inject_loop(AGENT, 1.0, seed=1)
+    for seed in range(8):
+        out = inject_loop(AGENT, 1.0, seed=seed)
+        copies = (len(out) - len(AGENT)) // 2
+        assert copies in (1, 2, 3) and out[:3] == AGENT[:3] and out[-1] == AGENT[-1]
+        assert out[3:-1] == [{**AGENT[1], "loss": False}, AGENT[2]] * copies
+    assert inject_loop(AGENT[:2], 1.0) == AGENT[:2]  # no observation and next turn: unchanged
+    assert inject_loop(AGENT, 1.0)[1] is AGENT[1] and "loss" not in AGENT[1]  # the input is not modified
+
+
+@needs_tok
+def test_loop_recovery_trains_the_original_call_and_the_escape_only():
+    res = ChatDataset(None, TOK, 4096, loop_recovery=1.0)._process({"messages": AGENT, "tools": TOOLS})
+    text = TOK.decode(res["input_ids"])
+    assert text.count("SUNNY_24C") >= 2  # the repeated observation is in the context
+    trained = _trained(TOK, res)
+    assert trained.count("<function=get_weather>") == 1 and trained.endswith("It is sunny, 24C.<|im_end|>")
+
+
+REASONING_ROW = [
+    {"role": "user", "content": "Weather in Rome?"},
+    {
+        "role": "assistant",
+        "content": "Let me check.",
+        "reasoning_content": "The user wants the weather in Rome. I should call the weather tool. Then I answer briefly.",
+        "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Rome"}'}}],
+    },
+    {"role": "tool", "content": "SUNNY_24C"},
+    {"role": "assistant", "content": "It is sunny, 24C."},
+]
+SENTENCES = ["The user wants the weather in Rome.", "I should call the weather tool."]
+
+
+def test_inject_loop_repeats_a_reasoning_sentence_and_marks_the_copies():
+    from palingenesis.data import UNTRAINED_REASONING, inject_loop
+
+    for seed in range(6):
+        out = inject_loop(REASONING_ROW, 0.0, seed=seed, reasoning_share=1.0)
+        text = out[1]["reasoning_content"]
+        [(start, end, stop)] = out[1][UNTRAINED_REASONING]
+        assert text[start:end] in SENTENCES and text[end:stop] in [(" " + text[start:end]) * n for n in range(1, 5)]
+        assert text[:end] + text[stop:] == REASONING_ROW[1]["reasoning_content"]  # without the copies: the gold
+    assert UNTRAINED_REASONING not in REASONING_ROW[1]
+    padded = [dict(m) for m in REASONING_ROW]
+    padded[1]["reasoning_content"] = "\n\n  " + padded[1]["reasoning_content"]  # templates trim: never start in blanks
+    for seed in range(6):
+        [(start, _, _)] = inject_loop(padded, 0.0, seed=seed, reasoning_share=1.0)[1][UNTRAINED_REASONING]
+        assert not padded[1]["reasoning_content"][start].isspace()
+
+
+@needs_tok
+def test_loop_recovery_leaves_a_row_unaugmented_when_the_copies_would_not_fit():
+    row = {"messages": AGENT, "tools": TOOLS}
+    n = len(ChatDataset(None, TOK, 4096)._process(row)["input_ids"])
+    ds = ChatDataset(None, TOK, n + 2, loop_recovery=1.0)
+    res = ds._process(row)
+    assert len(res["input_ids"]) == n and ds.stats["loop_recovery_skipped"] == 1 and not ds.stats["truncated"]
+
+
+@needs_tok
+def test_reasoning_loop_recovery_trains_around_the_copies_only():
+    res = ChatDataset(None, TOK, 4096, reasoning_loop_recovery=1.0)._process({"messages": REASONING_ROW})
+    rendered, trained = TOK.decode(res["input_ids"]), _trained(TOK, res)
+    assert max(rendered.count(x) for x in SENTENCES) >= 2  # the repetition is in the context
+    assert all(trained.count(x) == 1 for x in SENTENCES)  # the original sentence is trained, its copies are not
+    assert "Then I answer briefly." in trained and trained.endswith("It is sunny, 24C.<|im_end|>")
+
+
+def _call(name, city, **extra):
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"type": "function", "function": {"name": name, "arguments": {"city": city}}}],
+        **extra,
+    }
+
+
+def _targets(msgs, kind="repeat_targets", tok=None):
+    tok = tok or TOK
+    res = ChatDataset(None, tok, 4096, repeat_targets=True)._process({"messages": msgs})
+    ids, rt = res["input_ids"], res[kind]
+    pos = (rt != IGNORE_INDEX).nonzero().flatten().tolist()
+    return [(tok.decode(ids[:p]), tok.decode([int(ids[p])]), tok.decode([int(rt[p])])) for p in pos], res
+
+
+@needs_tok
+def test_repeat_targets_mark_the_escape_after_a_repeated_call():
+    obs = {"role": "tool", "content": "ERROR"}
+    looped = [{"role": "user", "content": "Weather?"}, _call("get_weather", "Rome"), obs]
+    looped += [_call("get_weather", "Rome", loss=False), obs, _call("get_time", "Milan")]
+    targets, res = _targets(looped)
+    [(before, gold, repeat)] = targets  # inside a loop the first divergence is the target, even the tool name
+    assert before.count("get_weather") == 2 and gold != repeat and repeat.strip() in "get_weather"
+    assert res["labels"][len(TOK(before)["input_ids"])] != IGNORE_INDEX  # a trained position
+
+    # no loop: another tool right away is ordinary variety, not a repetition
+    plain = [{"role": "user", "content": "Weather?"}, _call("get_weather", "Rome"), obs, _call("get_time", "Milan")]
+    assert _targets(plain)[0] == []
+
+
+@needs_tok
+def test_repeat_targets_mark_the_escape_after_a_repeated_sentence():
+    s = "The weather tool needs the city name."
+    row = [
+        {"role": "user", "content": "Weather?"},
+        {"role": "assistant", "content": "Ok.", "reasoning_content": f"{s} {s} Then I call it for Rome now."},
+    ]
+    [(before, gold, repeat)] = _targets(row)[0]
+    assert before.endswith(f"{s} {s}") and gold.strip() == "Then" and repeat.strip() == "The"
+    # different sentences: none
+    row[1]["reasoning_content"] = f"{s} Then I call it for Rome now. Rome is in Italy."
+    assert _targets(row)[0] == []
+
+
+@needs_tok
+def test_stop_targets_cover_the_ways_a_call_could_start_after_the_final_reply():
+    row = [dict(m) for m in AGENT]
+    row[-1] = {"role": "assistant", "content": "It is sunny, 24C.\nEnjoy the day."}
+    targets, res = _targets(row, "stop_targets")
+    assert _targets(row)[0] == []  # no repeat targets here
+    # derived from the template (this one writes "\n<tool_call>" after text): the reply's first token, the token
+    # after the separator, and the separator at the end of the turn
+    assert [(gold, repeat) for _, gold, repeat in targets] == [
+        ("It", "<tool_call>"),
+        ("Enjoy", "<tool_call>"),
+        ("<|im_end|>", "\n"),
+    ]
+    # chat (no tool calls before), and a row cut by truncation (its last kept turn is not the end): no targets
+    assert (
+        _targets([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hello there."}], "stop_targets")[
+            0
+        ]
+        == []
+    )
+    n = len(ChatDataset(None, TOK, 4096)._process({"messages": row[:4]})["input_ids"])
+    long = row[:4] + [{"role": "user", "content": "more " * 50}, {"role": "assistant", "content": "x " * 50}]
+    cut = ChatDataset(None, TOK, n + 5, repeat_targets=True)._process({"messages": long})
+    assert int((cut["stop_targets"] != IGNORE_INDEX).sum()) == 0
+
+
+@pytest.mark.parametrize("name", ["Qwen/Qwen3.5-0.8B"])
+def test_repeat_targets_ignore_call_scaffolding_on_the_qwen_template(name):
+    tok = _cached_tokenizer(name)
+    if tok is None:
+        pytest.skip(f"{name} tokenizer not cached")
+
+    def bash(cmd, **extra):
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "bash", "arguments": {"command": cmd}}}],
+            **extra,
+        }
+
+    obs = {"role": "tool", "content": "out"}
+    for a, b in [("ls", "cat a"), ("cat a", "cat b"), ("cat b", "pwd")]:  # ordinary variety: no target
+        assert _targets([{"role": "user", "content": "go"}, bash(a), obs, bash(b)], tok=tok)[0] == []
+    # a late divergence in a long near-repeat is one
+    a, b = (
+        "cd /testbed && python -m pytest tests/test_parser.py -x -q",
+        "cd /testbed && python -m pytest tests/test_lexer.py -x -q",
+    )
+    [(_, gold, repeat)] = _targets([{"role": "user", "content": "go"}, bash(a), obs, bash(b)], tok=tok)[0]
+    assert gold != repeat
+    # after a repeated call, the escape is a target even when it differs at once
+    [(_, gold, repeat)] = _targets(
+        [{"role": "user", "content": "go"}, bash("ls"), obs, bash("ls", loss=False), obs, bash("pwd")], tok=tok
+    )[0]
+    assert (gold, repeat) == ("pwd", "ls")
+
+
+def _toy_tok(template):
+    tok = _make_tok()
+    tok.chat_template = template
+    return tok
+
+
+@needs_tok
+def test_reasoning_loop_recovery_with_a_template_that_reads_message_reasoning():
+    tok = _toy_tok(QWEN_LIKE_TEMPLATE.replace("reasoning_content", "reasoning"))
+    row = [dict(m) for m in REASONING_ROW]
+    row[1] = {k: v for k, v in row[1].items() if k != "reasoning_content"} | {
+        "reasoning": REASONING_ROW[1]["reasoning_content"]
+    }
+    res = ChatDataset(None, tok, 4096, reasoning_loop_recovery=1.0)._process({"messages": row})
+    rendered, trained = tok.decode(res["input_ids"]), _trained(tok, res)
+    assert max(rendered.count(x) for x in SENTENCES) >= 2 and all(trained.count(x) == 1 for x in SENTENCES)
+    assert "<function=get_weather>" in trained  # the turn keeps its loss
+
+
+@needs_tok
+def test_call_opener_is_derived_from_the_template_or_refused(caplog):
+    from palingenesis.data import derive_call_opener
+
+    def opener(tok):
+        return derive_call_opener(lambda m, **kw: tok.apply_chat_template(m, tokenize=False, **kw), tok)
+
+    c = opener(TOK)
+    assert TOK.decode([c.opener]) == "<tool_call>" and c.separator_text == "\n"
+    # calls that start with ordinary text ("{"): pushing that down would suppress replies, so no opener
+    json_calls = QWEN_LIKE_TEMPLATE.replace(
+        "'\\n<tool_call>\\n<function=' + tc.function.name + '>\\n'", "'\\n{\"name\": \"' + tc.function.name + '\"'"
+    )
+    assert opener(_toy_tok(json_calls)) is None
+    # and the dataset says so once, instead of silently training without stop targets
+    with caplog.at_level("WARNING"):
+        ChatDataset(None, _toy_tok(json_calls), 4096, repeat_targets=True)._process({"messages": AGENT})
+    assert "opener could not be derived" in caplog.text
+
+
+@pytest.mark.parametrize("name", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3-0.6B"])
+def test_stop_targets_on_real_templates(name):
+    tok = _cached_tokenizer(name)
+    if tok is None:
+        pytest.skip(f"{name} tokenizer not cached")
+    row = [dict(m) for m in AGENT]
+    row[-1] = {"role": "assistant", "content": "Done. The fix works."}
+    targets = [(gold, repeat) for _, gold, repeat in _targets(row, "stop_targets", tok)[0]]
+    assert targets[0] == ("Done", "<tool_call>")
+    assert ("<|im_end|>", "\n\n" if "3.5" in name else "\n") in targets
+    if "3.5" not in name:  # Qwen3 merges "." with the newline: that path is a target too
+        assert any(gold == "." and repeat.startswith(".") for gold, repeat in targets)
+
+
+@pytest.mark.parametrize("name", ["Qwen/Qwen3.5-0.8B"])
+def test_repeat_target_found_when_the_text_quotes_the_command(name):
+    tok = _cached_tokenizer(name)
+    if tok is None:
+        pytest.skip(f"{name} tokenizer not cached")
+    a = "cd /testbed && python -m pytest tests/test_parser.py -x -q"
+    b = "cd /testbed && python -m pytest tests/test_lexer.py -x -q"
+
+    def bash(cmd, content=""):
+        call = {"type": "function", "function": {"name": "bash", "arguments": {"command": cmd}}}
+        return {"role": "assistant", "content": content, "tool_calls": [call]}
+
+    msgs = [{"role": "user", "content": "go"}, bash(a, f"Run {a}"), {"role": "tool", "content": "out"}, bash(b)]
+    assert len(_targets(msgs, tok=tok)[0]) == 1
+
+
+@needs_tok
+def test_repeat_targets_stay_fast_on_long_reasoning():
+    import time
+
+    long = " ".join(f"Step {i} checks the value of item number {i} in the list." for i in range(400))
+    row = [{"role": "user", "content": "go"}, {"role": "assistant", "content": "ok", "reasoning_content": long}]
+    t0 = time.perf_counter()
+    ChatDataset(None, TOK, 65536, repeat_targets=True)._process({"messages": row})
+    assert time.perf_counter() - t0 < 2.0
+
+
+def test_repeat_unlikelihood_needs_seco():
+    from palingenesis.config import Config, ConfigError
+
+    cfg = Config()
+    cfg.data.repeat_unlikelihood = 5.0
+    with pytest.raises(ConfigError, match="repeat_unlikelihood"):
+        cfg.validate()
+    cfg.memory.seco = True
+    try:
+        cfg.validate()
+    except ConfigError as e:  # other settings of a default config may object; this one must not
+        assert "repeat_unlikelihood" not in str(e)
+
+
 @needs_tok
 def test_all_turns_flagged_off_drops_the_row():
     msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x", "loss": False}]

@@ -96,8 +96,8 @@ class SourceConfig:
     # teacher reads the note as an instruction to itself rather than as the user's words
     privileged_role: str = "user"
     # ---- rollout sampling of this source's prompts ----
-    # A mixture drawn per rollout: [{weight, temperature, top_p, top_k}, ...] (missing keys: weight 1,
-    # temperature rollout.temperature, top_p 1, top_k 0). E.g. half the non-thinking rollouts at the
+    # A mixture drawn per rollout: [{weight, temperature, top_p, top_k, presence_penalty}, ...] (missing keys:
+    # weight 1, temperature rollout.temperature, top_p 1, top_k 0, presence_penalty 0). E.g. half the non-thinking rollouts at the
     # deployment sampling ({temperature: 0.7, top_p: 0.8, top_k: 20}) so the student is trained on the states
     # it reaches when deployed, where repetition loops start, not only on its T=1 states. full_rkl, topk_kl
     # and rs_kd score the student's own (unscaled) distribution on whatever states were visited, so they stay
@@ -116,6 +116,19 @@ class SourceConfig:
     # (empty = the student template's own, else <think></think>); see data.think_tags.
     think_tags: list = field(default_factory=list)
     branches_per_trace: int = 8  # turns regenerated per sampled trace (0 = all)
+    # Repetition onsets (opd.traces.OnsetScan), for traces the student recorded itself: where an assistant turn starts
+    # to repeat earlier assistant text (a share >= onset_threshold of the last onset_window tokens close an
+    # onset_ngram-token n-gram seen before; n-grams in more than onset_common of the earlier turns are scaffolding and
+    # do not count). onset_branches: extra regenerated turns per trace, starting at the earliest onsets, mid-turn
+    # (the student continues from the token before the repetition; 0 = off). onset_kd_tokens: recorded-turn
+    # distillation keeps this many tokens of each repetitive run (the teacher agrees with a loop a few repeats in;
+    # -1 = keep all). Both off by default; with either on, the trunk may be the whole trace (its last turn included).
+    onset_branches: int = 0
+    onset_kd_tokens: int = -1
+    onset_ngram: int = 6
+    onset_window: int = 32
+    onset_threshold: float = 0.75
+    onset_common: float = 0.5
     max_context: int = 32768  # tokens of context a regenerated turn may have
     max_new_tokens: int = 512
     # Held-out rows: split off `path` (deterministic, hash-ranked, unique), or all
@@ -247,7 +260,8 @@ class OPDTrainConfig:
     score_micro_seqs: int = 16  # sequences per scoring forward (student and teacher)
     eval_every: int = 50  # dev metrics every N steps, and before the first (0 = off)
     eval_samples: int = 200  # dev prompts per source
-    # Also sample each messages source's dev prompts at this sampling ({temperature, top_p, top_k}, e.g. a model's
+    # Also sample each messages source's dev prompts at this sampling ({temperature, top_p, top_k, presence_penalty},
+    # e.g. a model's
     # recommended deployment settings) and report dev_loop (share of answers that end in a repetition loop or hit
     # the token budget) and dev_len_deploy. Loops after on-policy distillation can appear only at the deployment
     # sampling, not at the rollout temperature. Empty = off.
@@ -456,11 +470,20 @@ class OPDConfig:
                         f"placeholder, got {source.privileged_template!r}."
                     )
             for entry in source.sampling_mix:
-                if not isinstance(entry, dict) or set(entry) - {"weight", "temperature", "top_p", "top_k"}:
+                if not isinstance(entry, dict) or set(entry) - {
+                    "weight",
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "presence_penalty",
+                }:
                     errors.append(
-                        f"{where}.sampling_mix entries are {{weight, temperature, top_p, top_k}}, got {entry!r}."
+                        f"{where}.sampling_mix entries are {{weight, temperature, top_p, top_k, presence_penalty}}, "
+                        f"got {entry!r}."
                     )
                     continue
+                if entry.get("presence_penalty", 0.0) < 0:
+                    errors.append(f"{where}.sampling_mix: presence_penalty must be >= 0, got {entry!r}.")
                 if entry.get("weight", 1.0) < 0 or entry.get("temperature", 1.0) <= 0:
                     errors.append(f"{where}.sampling_mix: weight must be >= 0 and temperature > 0, got {entry!r}.")
                 if not 0 < entry.get("top_p", 1.0) <= 1 or entry.get("top_k", 0) < 0:
@@ -478,6 +501,7 @@ class OPDConfig:
                         e.get("temperature", self.rollout.temperature) != 1.0
                         or e.get("top_p", 1.0) < 1.0
                         or e.get("top_k", 0) > 0
+                        or e.get("presence_penalty", 0.0) != 0
                     )
                 ]
                 teachers = {source.teacher or next(iter(self.teachers), "")} | set(source.topic_teachers)
@@ -494,6 +518,18 @@ class OPDConfig:
                     errors.append(f"{where}.max_context must be >= 16, got {source.max_context}.")
                 if source.branches_per_trace < 0:
                     errors.append(f"{where}.branches_per_trace must be >= 0 (0 = every turn).")
+                if source.onset_branches < 0 or source.onset_kd_tokens < -1:
+                    errors.append(f"{where}: onset_branches must be >= 0 and onset_kd_tokens >= -1.")
+                if source.onset_ngram < 1 or source.onset_window < 1 or not 0 < source.onset_threshold <= 1:
+                    errors.append(f"{where}: onset_ngram and onset_window must be >= 1, onset_threshold in (0, 1].")
+                if not 0 < source.onset_common <= 1:
+                    errors.append(f"{where}.onset_common must be in (0, 1], got {source.onset_common}.")
+                if source.onset_branches > 0 and self.loss.trace_branch_weight == 0:
+                    errors.append(f"{where}.onset_branches needs loss.trace_branch_weight > 0 (they are regenerated).")
+                if source.onset_kd_tokens >= 0 and self.loss.trace_kd_weight == 0:
+                    errors.append(
+                        f"{where}.onset_kd_tokens shapes recorded-turn distillation: set loss.trace_kd_weight."
+                    )
             if not source.path:
                 errors.append(f"{where}.path is required.")
             if source.teacher and source.teacher not in self.teachers:
@@ -579,13 +615,15 @@ class OPDConfig:
             )
         sampling = self.train.eval_sampling
         if sampling and (
-            set(sampling) - {"temperature", "top_p", "top_k"}
+            set(sampling) - {"temperature", "top_p", "top_k", "presence_penalty"}
             or sampling.get("temperature", 1.0) <= 0
+            or sampling.get("presence_penalty", 0.0) < 0
             or not 0 < sampling.get("top_p", 1.0) <= 1
             or sampling.get("top_k", 0) < 0
         ):
             errors.append(
-                f"train.eval_sampling must be {{temperature > 0, top_p in (0, 1], top_k >= 0}}, got {sampling!r}."
+                "train.eval_sampling must be {temperature > 0, top_p in (0, 1], top_k >= 0, presence_penalty >= 0}, "
+                f"got {sampling!r}."
             )
         if not 0.0 <= loss.beta <= 1.0:
             errors.append(f"loss.beta must be in [0, 1], got {loss.beta}.")

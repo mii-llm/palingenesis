@@ -270,6 +270,60 @@ On an 8-turn, 30k-token trace, prefix caching alone turns 3.2 s of prefill into 
 
 **Budget.** A step lasts as long as its longest regenerated turn: `max_new_tokens` bounds it. A truncated turn is still a valid sample (every token of it is a state the student reached); recorded agent turns are mostly short (median 130–340 tokens, p95 0.6–1.5k, office agents writing files up to 5k).
 
+### The student's own episodes: training where it starts to repeat itself
+
+A student distilled from teacher traces is trained only on states the teacher reached. Its own failure states, the
+context after its own wrong command or several thousand tokens into a turn that keeps restating the same doubt, never
+appear in that data, and that is where small distilled students loop (2512.12895; self-conditioning on one's own
+errors, 2509.09677). Patching the forms one can name (an exact repeated call, a repeated sentence) moves the failure to
+the forms one did not name: sub-word runs, counting enumerations, near-paraphrases.
+
+Recorded traces need not come from a teacher. Run the student in its environment, record its episodes (successes and
+failures, tools included), and give them to an `agent_traces` source: every regenerated turn then starts from a state
+the student reached itself, and the teacher's distribution says what to do there (DAgger, 1011.0686; for LLM agents
+2605.12913). Two options aim that compute at the states that matter:
+
+```yaml
+sources:
+  own:
+    format: agent_traces
+    path: data/student_episodes.jsonl   # the student's own episodes on training tasks (never the eval tasks)
+    branches_per_trace: 2               # ordinary turns, as for any trace
+    onset_branches: 2                   # plus up to 2 turns regenerated from where a recorded turn started repeating
+    onset_kd_tokens: 32                 # recorded-turn distillation keeps 32 tokens of each repetitive run
+    max_context: 65536
+    max_new_tokens: 4096
+  teacher_traces: {format: agent_traces, path: data/teacher_traces.jsonl, weight: 1.0}  # keep the skill source
+loss: {trace_kd_weight: 0.5}
+```
+
+**Where a turn starts repeating itself.** `opd.traces.repetition_runs` scans the recorded assistant turns, token ids
+only: a token is a repeat when the `onset_ngram` tokens ending at it were already written by the assistant (this turn
+or an earlier one; tool outputs and prompts do not count, so quoting an observation is not a repeat), n-grams written
+by more than `onset_common` of the earlier turns are scaffolding (call markup, habitual openers) and never count, and a
+run starts where `onset_threshold` of the last `onset_window` tokens are repeats. No phrase, call syntax or format is
+named, so exact loops, sub-word runs, enumerations, near-paraphrases that reuse their phrases and turns that copy
+earlier turns all qualify. Legitimate copies (a path written again, a code block rewritten) qualify too; that costs
+compute only: the teacher agrees with a good copy and its KL there is small. On a set of repetitive but healthy
+search-agent traces, the defaults (6, 32, .75, .5) put 3% of assistant tokens inside runs.
+
+**`onset_branches`.** Up to this many extra regenerated turns per trace start at the earliest runs, mid-turn: the
+student continues from the token before the repetition and the teacher scores its continuation (reported as
+`kl_onset/<teacher>`, and `eval/dev_kl_onset/<source>` on held-out traces). The earliest runs, because a teacher
+reading a long loop starts agreeing with it (TIDE, 2608.09836): the corrective signal sits at the onset. With either
+option on, the trunk may be the whole trace, so the last turn (where an episode cut at the token budget runs on) is
+scanned and distilled too. The scan sees what the template renders: a template that drops earlier reasoning after a
+new user message hides that reasoning from the scan as from the model.
+
+**`onset_kd_tokens`.** With `trace_kd_weight`, recorded-turn distillation keeps this many tokens of each run and drops
+the rest: thousands of loop tokens on which the teacher agrees would otherwise dilute the per-token mean. Turns that
+deliberate without repeating themselves are distilled whole.
+
+Nothing in the target is a rule: no stop string, no banned phrase, no length cap. The scan only chooses where the
+student is trained; what it learns there is the teacher's distribution. Screen the teacher on the same prefixes first:
+from the student's onset states it should continue differently from the student (a teacher that loops from there
+teaches the loop). Mix the teacher-trace source back in, so the run keeps what the student learned from it.
+
 ## Multiple-choice pools
 
 `format: mcqa` sources train on multiple-choice pools in a benchmark's exact prompt format (`configs/distill_opd.yaml` carries ITALIC's verbatim templates), with the reference shots, random pool shots and zero-shot mixed per prompt, and greedy letter accuracy as the dev metric.

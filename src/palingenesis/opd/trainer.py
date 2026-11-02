@@ -886,7 +886,12 @@ def _sampling_mix(source, temperature: float) -> list[tuple[float, Sampling]]:
     return [
         (
             float(e.get("weight", 1.0)),
-            Sampling(float(e.get("temperature", temperature)), float(e.get("top_p", 1.0)), int(e.get("top_k", 0))),
+            Sampling(
+                float(e.get("temperature", temperature)),
+                float(e.get("top_p", 1.0)),
+                int(e.get("top_k", 0)),
+                float(e.get("presence_penalty", 0.0)),
+            ),
         )
         for e in source.sampling_mix
     ]
@@ -913,7 +918,10 @@ class _SourceEngine:
         if not sampling:
             return None
         sp = Sampling(
-            float(sampling.get("temperature", 1.0)), float(sampling.get("top_p", 1.0)), int(sampling.get("top_k", 0))
+            float(sampling.get("temperature", 1.0)),
+            float(sampling.get("top_p", 1.0)),
+            int(sampling.get("top_k", 0)),
+            float(sampling.get("presence_penalty", 0.0)),
         )
         return self.trainer.sample_generate(messages_list, max_new_tokens, metas, sp)
 

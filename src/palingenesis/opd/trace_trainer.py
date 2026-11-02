@@ -30,6 +30,7 @@ from palingenesis.opd import losses
 from palingenesis.opd.fused_rkl import fused_full_rkl
 from palingenesis.opd.orchestrator import Pipeline
 from palingenesis.opd.traces import (
+    OnsetScan,
     TracePlan,
     TracePlanner,
     TraceSample,
@@ -184,6 +185,7 @@ class TracePipeline(Pipeline):
             "stop_rate": sum(f == "stop" for f in finish) / max(1, len(finish)),
             "trunk_tokens": sum(len(s.plan.trunk) for s in samples) / max(1, len(samples)),
             "branches": sum(len(s.completions) for s in samples),
+            "onset_branches": sum(b.onset for s in samples for b in s.plan.branches),
         }
         version = min((rollouts[i].policy_version for i in range(len(rollouts))), default=self.engine.version)
         return TraceBatch(samples, version, stats)
@@ -242,6 +244,18 @@ class TracePipeline(Pipeline):
                 teacher.model.to("cpu")
 
 
+def _onset_scan(source, kd: bool) -> OnsetScan | None:
+    scan = OnsetScan(
+        source.onset_branches,
+        source.onset_kd_tokens if kd else -1,
+        source.onset_ngram,
+        source.onset_window,
+        source.onset_threshold,
+        source.onset_common,
+    )
+    return scan if scan.active else None
+
+
 class TraceTrainer(OPDTrainer):
     """OPDTrainer on agent traces: same models, rollout engines, schedule, checkpoints."""
 
@@ -272,6 +286,7 @@ class TraceTrainer(OPDTrainer):
                 # recorded turns only: every turn that fits, so the trunk holds as many as can be
                 source.branches_per_trace if config.loss.trace_branch_weight > 0 else 0,
                 recorded_kd=config.loss.trace_kd_weight > 0,
+                onsets=_onset_scan(source, kd=config.loss.trace_kd_weight > 0),
             )
             for name, source in config.sources.items()
         }
@@ -284,6 +299,7 @@ class TraceTrainer(OPDTrainer):
                 source.max_context,
                 source.branches_per_trace,
                 recorded_kd=False,
+                onsets=_onset_scan(source, kd=False),  # dev reports the KL at the onsets apart (dev_kl_onset)
             )
             for name, source in config.sources.items()
         }
@@ -372,6 +388,9 @@ class TraceTrainer(OPDTrainer):
             stats[f"residual/{name}"] += s["residual"]
             stats[f"tokens/{name}"] += h.shape[0]
             stats[f"loss/{name}"] += float(value.detach())
+            if plan.branches[i].onset:
+                stats[f"onset_kl/{name}"] += s["kl"]
+                stats[f"onset_tokens/{name}"] += h.shape[0]
             return value
 
         def recorded_loss(positions: list[int], h):
@@ -433,6 +452,8 @@ class TraceTrainer(OPDTrainer):
                 metrics[f"k1/{name}"] = stats[f"k1/{name}"] / tokens
                 metrics[f"tokens/{name}"] = tokens
                 metrics[f"residual_mass/{name}"] = stats[f"residual/{name}"] / tokens
+            if stats.get(f"onset_tokens/{name}"):  # the regenerated turns that start where a recorded one repeated
+                metrics[f"kl_onset/{name}"] = stats[f"onset_kl/{name}"] / stats[f"onset_tokens/{name}"]
             if stats.get(f"kd_tokens/{name}"):
                 metrics[f"kd_kl/{name}"] = stats[f"kd_kl/{name}"] / stats[f"kd_tokens/{name}"]
                 metrics[f"kd_tokens/{name}"] = stats[f"kd_tokens/{name}"]
@@ -470,12 +491,16 @@ class TraceTrainer(OPDTrainer):
                         totals["tokens"] += tokens
                         totals["kl"] += kl
                         totals["k1"] += k1
+                        for key in ("onset_kl", "onset_tokens"):
+                            totals[key] += sum(v for k, v in stats.items() if k.startswith(f"{key}/"))
                         if topic is not None and tokens:
                             metrics[f"dev_kl_full/{name}/{topic}"] = kl / tokens
                 metrics[f"dev_kl/{name}"] = totals["k1"] / max(totals["tokens"], 1)
                 metrics[f"dev_kl_full/{name}"] = totals["kl"] / max(totals["tokens"], 1)
                 metrics[f"dev_len/{name}"] = totals["tokens"] / max(1, batch.stats["branches"])
                 metrics[f"dev_stop_rate/{name}"] = batch.stats["stop_rate"]
+                if totals["onset_tokens"]:
+                    metrics[f"dev_kl_onset/{name}"] = totals["onset_kl"] / totals["onset_tokens"]
         finally:
             self.student.train()
         return metrics

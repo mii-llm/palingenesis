@@ -322,6 +322,9 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `chat_template_kwargs` | dict | `{}` | Chat-template arguments for this source over `model.chat_template_kwargs` (e.g. `{enable_thinking: true}`). `messages` rows: a row's own kwargs win. `agent_traces` runs: every row of the source renders with them; a `messages` row that disagrees is an error. |
 | `messages_field` / `tools_field` | str | `messages` / `tools` | agent_traces: the columns holding the conversation and the tool schemas (lists or JSON strings). |
 | `branches_per_trace` | int | `8` | agent_traces: assistant turns regenerated per sampled trace (0 = all). |
+| `onset_branches` | int | `0` | agent_traces: extra regenerated turns per trace starting mid-turn where a recorded assistant turn begins to repeat earlier assistant text (`opd.traces.repetition_runs`; for the student's own episodes). 0 = off. |
+| `onset_kd_tokens` | int | `-1` | agent_traces, with `trace_kd_weight`: recorded-turn distillation keeps this many tokens of each repetitive run (-1 = all). |
+| `onset_ngram` / `onset_window` / `onset_threshold` / `onset_common` | int / int / float / float | `6` / `32` / `0.75` / `0.5` | The repetition scan: n-gram length, window, share of repeated tokens that starts a run, share of earlier turns above which an n-gram is scaffolding. |
 | `max_context` | int | `32768` | agent_traces: longest context (tokens) a regenerated turn may have; later turns are not sampled. |
 | `max_new_tokens` | int | `512` | Completion budget (mcqa: fast-template prompts). |
 | `dev_size` | int | `200` | Held-out rows split off `path` (deterministic, hash-ranked, unique). |

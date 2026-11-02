@@ -946,6 +946,15 @@ def test_samplings_truncation_and_loop_detector():
     assert kept(truncate_scores(scores, 0, 0.81)) == [True, True, True, False]  # the token crossing top_p stays
     assert kept(truncate_scores(scores, 0, 1.0)) == [True] * 4
 
+    # presence penalty: only tokens generated so far (after the prompt), once each however often they appeared
+    from palingenesis.opd.rollout import _RecordLogprobs
+
+    recorder = _RecordLogprobs(Sampling(1.0, presence_penalty=1.5), prompt_width=2)
+    logits = torch.zeros(1, 5)
+    penalised = recorder(torch.tensor([[0, 1, 3, 3]]), logits)  # prompt [0, 1], generated [3, 3]
+    assert penalised.tolist() == [[0.0, 0.0, 0.0, -1.5, 0.0]]
+    assert torch.equal(_RecordLogprobs(Sampling(1.0))(torch.tensor([[0, 1, 3, 3]]), logits), logits)
+
     assert looped("abc", "length")
     assert looped("Ciao! " + "Questa frase si ripete senza fine, ancora e ancora. " * 12, "stop")
     assert not looped("Una risposta normale, con frasi diverse. Poi un'altra idea. Fine.", "stop")
@@ -989,6 +998,12 @@ def test_sampling_mix_options_are_validated():
     assert "positive total weight" in errors(sampling_mix=[{"weight": 0}])
     assert "train.eval_sampling" in errors(eval_sampling={"temperature": 0})
     assert errors(eval_sampling=deploy) == ""
+    card = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5}  # Qwen3.5 thinking
+    assert errors(sampling_mix=[card]) == "" and errors(eval_sampling=card) == ""
+    assert "presence_penalty" in errors(sampling_mix=[{"presence_penalty": -1.0}])
+    assert "train.eval_sampling" in errors(eval_sampling={"presence_penalty": -1.0})
+    # a penalised sampler is not the student's own distribution: importance-weighted losses refuse it
+    assert "sampled_rkl" in errors("sampled_rkl", sampling_mix=[{"temperature": 1.0, "presence_penalty": 1.5}])
 
 
 def test_vllm_greedy_duplicates_share_one_sample():

@@ -26,6 +26,16 @@ The trunk also holds the recorded turns themselves. The teacher's hidden states
 there come from the pass it makes anyway, so `loss.trace_kd_weight` adds
 distillation on those recorded turns at the cost of the output-head projections
 only (off-policy, next to the on-policy branches).
+
+Traces recorded from the student itself (its own episodes in the environment)
+put its own states into training, the failure states included: repetition,
+rumination, turns that never end. `OnsetScan` finds where a recorded turn starts
+to repeat earlier assistant text (a form-agnostic measure on token ids: no
+phrase, call or format is named) and adds branches there: the student
+regenerates from the token where it began to repeat itself, and the teacher
+scores what it writes. Distillation on recorded turns can stop a few tokens
+into each such run: deeper in, a teacher reading the repeated text agrees with
+it, and those tokens would only dilute the loss.
 """
 
 import bisect
@@ -53,17 +63,110 @@ class BranchPlan:
     context: list[int]  # the full context the student generates from
     attach: int  # trunk position the branch continues from
     prefix: list[int]  # branch tokens before the completion (the context's tail, or its last token)
+    onset: bool = False  # starts inside a recorded turn, where it began to repeat itself (OnsetScan)
 
 
 @dataclass
 class TracePlan:
     trunk: list[int]
     branches: list[BranchPlan]
-    kd_spans: list[tuple[int, int]] = field(default_factory=list)  # trunk token ranges of recorded turns
+    # trunk token ranges of the recorded turns distilled (OnsetScan.kd_tokens cuts the repetitive runs out of them)
+    kd_spans: list[tuple[int, int]] = field(default_factory=list)
 
     def kd_positions(self) -> list[int]:
         """Trunk positions whose hidden state predicts a recorded-turn token (p predicts trunk[p + 1])."""
         return [p for a, b in self.kd_spans for p in range(a - 1, b - 1)]
+
+
+@dataclass(frozen=True)
+class OnsetScan:
+    """Where recorded assistant turns start to repeat themselves, and what the planner does there.
+
+    A token is a repeat when the `ngram` tokens ending at it already occurred in assistant text before (this turn's
+    or an earlier turn's; tool outputs and prompts do not count, so quoting an observation is not a repeat). N-grams
+    written by more than `common` of the earlier assistant turns are the turns' shared scaffolding (call markup,
+    habitual openers) and never count (with the default .5, a turn copying the one turn before it is caught from the
+    third turn on). A run starts where at least `threshold` of the last `window` tokens
+    are repeats, at the first repeated n-gram of that window, and ends where the share falls below it. This measures
+    the student's own text and names no form: exact loops, sub-word runs, counting enumerations, near-paraphrases that
+    keep reusing their phrases, and turns that copy earlier turns all qualify; legitimate copies trigger it too, which
+    costs only compute (the teacher agrees with a good copy, so its KL there is small).
+
+    branches: regenerated turns per trace starting at the earliest runs (0 = none): the student continues from the
+    token before the run, the teacher scores its continuation. kd_tokens: recorded-turn distillation keeps this many
+    tokens of each run and drops the rest (-1 = keep all).
+    """
+
+    branches: int = 0
+    kd_tokens: int = -1
+    ngram: int = 6
+    window: int = 32
+    threshold: float = 0.75
+    common: float = 0.5
+
+    @property
+    def active(self) -> bool:
+        return self.branches > 0 or self.kd_tokens >= 0
+
+
+def repetition_runs(
+    ids: list[int],
+    spans: list[tuple[int, int]],
+    ngram: int = 6,
+    window: int = 32,
+    threshold: float = 0.75,
+    common: float = 0.5,
+) -> list[tuple[int, int]]:
+    """Token ranges [start, end) inside `spans` (the assistant turns, in order) where the text repeats earlier
+    assistant text; see OnsetScan. A run never crosses a turn boundary; a turn that repeats an earlier one starts a
+    run at (or near) its first token."""
+    turns_with: dict[tuple[int, ...], int] = {}  # n-gram -> assistant turns it occurred in so far
+    last_turn: dict[tuple[int, ...], int] = {}
+    runs: list[tuple[int, int]] = []
+    need = threshold * window
+    for turn, (a, b) in enumerate(spans):
+        hits: list[bool] = []
+        for t in range(a, b):
+            if t - a + 1 < ngram:
+                hits.append(False)
+                continue
+            g = tuple(ids[t - ngram + 1 : t + 1])
+            here = last_turn.get(g) == turn
+            earlier = turns_with.get(g, 0) - here  # earlier turns that wrote it
+            hits.append((here or earlier > 0) and earlier <= common * turn)
+            if not here:
+                last_turn[g] = turn
+                turns_with[g] = earlier + 1
+        count, start = 0, None
+        for i, hit in enumerate(hits):
+            count += hit
+            if i >= window:
+                count -= hits[i - window]
+            if start is None and count >= need:
+                first = next(j for j in range(max(0, i - window + 1), i + 1) if hits[j])
+                start = a + max(first - ngram + 1, 0)
+                if runs and runs[-1][1] > start:  # the window reaches back into the previous run of this turn
+                    start = runs[-1][1]
+            elif start is not None and count < need:
+                runs.append((start, a + i))
+                start = None
+        if start is not None:
+            runs.append((start, b))
+    return runs
+
+
+def cut_runs(spans: list[tuple[int, int]], runs: list[tuple[int, int]], keep: int) -> list[tuple[int, int]]:
+    """`spans` without the tokens of each run past its first `keep`."""
+    out = []
+    for a, b in spans:
+        pieces = [(a, b)]
+        for s, e in runs:
+            lo, hi = s + keep, e
+            if lo >= hi:
+                continue
+            pieces = [p for x, y in pieces for p in ((x, min(y, lo)), (max(x, hi), y)) if p[0] < p[1]]
+        out.extend(pieces)
+    return out
 
 
 def is_trainable_turn(message: dict) -> bool:
@@ -85,8 +188,10 @@ class TracePlanner:
         max_context: int,
         branches_per_trace: int,
         recorded_kd: bool,
+        onsets: OnsetScan | None = None,
     ):
         self.tok = tok
+        self.onsets = onsets if onsets is not None and onsets.active else None
         self.kwargs = chat_template_kwargs
         self.stop_ids = set(stop_ids)
         self.max_context = max_context
@@ -158,7 +263,11 @@ class TracePlanner:
             chosen = sorted(rng.sample(pool, count))
             # The trunk: the longest context that fits (every branch attaches at its common prefix with
             # it), so it also holds as many recorded turns as can be distilled, the chosen ones included.
-            candidates = [k for k in pool if k >= chosen[-1]] if self.recorded_kd else [chosen[-1]]
+            # Scanning for repetition, it may be the whole trace: the last turn is where a student's own
+            # episode most often runs on (cut at the token budget).
+            candidates = [k for k in pool if k >= chosen[-1]] if self.recorded_kd or self.onsets else [chosen[-1]]
+            if self.onsets and pool[-1] == turns[-1]:
+                candidates.append(len(messages))
             trunk = None
             lo_c, hi_c = 0, len(candidates)  # contexts grow with the turn: binary search
             while lo_c < hi_c:
@@ -190,23 +299,45 @@ class TracePlanner:
                 branches.append(BranchPlan(k, context, t, tail))
             else:  # re-feed the last context token: its output predicts
                 branches.append(BranchPlan(k, context, t - 1, [trunk[t - 1]]))  # the first completion token
+        recorded = (
+            self._recorded_turns(messages, trunk_turn, trunk_text, trunk, ends)
+            if self.recorded_kd or self.onsets
+            else []
+        )
+        runs = []
+        if self.onsets and recorded:
+            scan = self.onsets
+            runs = repetition_runs(
+                trunk, [(a, b) for _, a, b in recorded], scan.ngram, scan.window, scan.threshold, scan.common
+            )
+            starts = {len(b.context) for b in branches if b.context == trunk[: len(b.context)]}
+            for start, _ in runs:
+                if len([b for b in branches if b.onset]) >= scan.branches:
+                    break
+                if start < 1 or start in starts:
+                    continue
+                turn = next(k for k, a, b in recorded if a <= start < b)
+                branches.append(BranchPlan(turn, trunk[:start], start - 1, [trunk[start - 1]], onset=True))
+                starts.add(start)
         if not branches:
             return None
         plan = TracePlan(trunk, branches)
         if self.recorded_kd:
-            plan.kd_spans = self._recorded_turns(messages, trunk_turn, trunk_text, trunk, ends)
+            plan.kd_spans = [(a, b) for _, a, b in recorded]
+            if self.onsets and self.onsets.kd_tokens >= 0:
+                plan.kd_spans = cut_runs(plan.kd_spans, runs, self.onsets.kd_tokens)
         return plan
 
     def _recorded_turns(
         self, messages: list[dict], last_turn: int, trunk_text: str, trunk: list[int], ends: list[int]
-    ) -> list[tuple[int, int]]:
-        """Token ranges [a, b) of the recorded assistant turns inside the trunk, each through its
-        end-of-turn token. The trunk renders messages[:last_turn] and then opens the next turn, so
+    ) -> list[tuple[int, int, int]]:
+        """(message index, a, b): token ranges [a, b) of the recorded assistant turns inside the trunk, each
+        through its end-of-turn token. The trunk renders messages[:last_turn] and then opens the next turn, so
         the template's turn headers in it number one more than those assistant messages, in
         order; anything else (the header text inside some content, say) gives no ranges."""
         if not self.turn_header:
             return []
-        assistants = [m for m in messages[:last_turn] if m.get("role") == "assistant"]
+        assistants = [(k, m) for k, m in enumerate(messages[:last_turn]) if m.get("role") == "assistant"]
         starts, pos = [], trunk_text.find(self.turn_header)
         while pos >= 0:  # a turn's text starts after the full opening where it has one, else after the header
             opening = self.turn_opening if trunk_text.startswith(self.turn_opening, pos) else self.turn_header
@@ -215,7 +346,7 @@ class TracePlanner:
         if len(starts) != len(assistants) + 1:
             return []
         spans = []
-        for message, char_start in zip(assistants, starts):
+        for (k, message), char_start in zip(assistants, starts):
             if not is_trainable_turn(message):
                 continue
             # From the first token not entirely before the turn's text: where no token boundary falls
@@ -225,7 +356,7 @@ class TracePlanner:
                 continue
             b = next((i + 1 for i in range(a, len(trunk)) if trunk[i] in self.stop_ids), None)
             if b is not None:
-                spans.append((a, b))
+                spans.append((k, a, b))
         return spans
 
 

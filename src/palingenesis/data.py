@@ -35,6 +35,7 @@ Config examples:
 
 import bisect
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -341,6 +342,76 @@ def derive_turn_markers(render, tokenizer) -> TurnMarkers | None:
     return TurnMarkers(header=header, end=end, turn_open=turn_open)
 
 
+_PROBE_FN, _PROBE_ARG, _PROBE_VALUE = "zqprobefn", "zqprobearg", "zqprobevalue"
+# A sentence end in reasoning: ". ! ?" before blanks, or a full-width end (CJK, no space after it).
+_SENTENCE_END = re.compile(r"[.!?](?=\s+\S)|[。！？](?=\s*\S)")
+
+
+@dataclass(frozen=True)
+class CallOpener:
+    """How a chat template starts a tool call: `opener` (first token of the call, e.g. "<tool_call>") and `separator`
+    (first token of what the template puts between a reply's text and the call, e.g. "\n\n"; None when nothing)."""
+
+    opener: int
+    separator: int | None
+    separator_text: str = ""
+
+
+def derive_call_opener(render, tokenizer) -> CallOpener | None:
+    """How a chat template starts a tool call after a reply's text, read from the template itself: the probe answer is
+    rendered without and with a probe call (also with `tools=` declaring the probe function, and with the arguments as
+    a JSON string, for templates that need either), and what the call render inserts after the answer, up to the
+    function name, is split into its leading blanks (the separator) and the rest, which starts with the opener.
+
+    The opener must be an added or special token (e.g. "<tool_call>", "[TOOL_CALLS]"): a template whose calls start
+    with ordinary text (a code fence, "{") gives None, since pushing that text down would suppress ordinary replies.
+    None as well when the template drops the text of a turn with calls or renders no calls."""
+    schema = {"type": "object", "properties": {_PROBE_ARG: {"type": "string"}}}
+    tools = [{"type": "function", "function": {"name": _PROBE_FN, "description": "probe", "parameters": schema}}]
+    user, answer = {"role": "user", "content": _PROBE_USER}, {"role": "assistant", "content": _PROBE_ANSWER}
+    special = set(getattr(tokenizer, "all_special_ids", []) or []) | set((tokenizer.get_added_vocab() or {}).values())
+    for args in ({_PROBE_ARG: _PROBE_VALUE}, json.dumps({_PROBE_ARG: _PROBE_VALUE})):
+        call = {"type": "function", "function": {"name": _PROBE_FN, "arguments": args}}
+        for kw in ({}, {"tools": tools}):
+            try:
+                without = render([user, answer], **kw)
+                with_call = render([user, {**answer, "tool_calls": [call]}], **kw)
+            except Exception:
+                continue
+            a = with_call.find(_PROBE_ANSWER)
+            b = with_call.find(_PROBE_FN, a + 1) if a >= 0 else -1
+            if a < 0 or b < 0 or without.find(_PROBE_ANSWER) < 0:
+                continue
+            between = with_call[a + len(_PROBE_ANSWER) : b]
+            opener = between.lstrip()
+            separator = between[: len(between) - len(opener)]
+            ids = tokenizer.encode(opener, add_special_tokens=False)
+            if not ids or ids[0] not in special:
+                return None
+            sep = tokenizer.encode(separator, add_special_tokens=False) if separator else []
+            return CallOpener(ids[0], sep[0] if sep else None, separator)
+    return None
+
+
+def _argument_texts(msg: dict) -> list[str]:
+    """The argument values of a turn's tool calls as a template may render them: strings as they are and JSON-escaped,
+    other values as JSON."""
+    out = []
+    for call in msg.get("tool_calls") or []:
+        args = (call.get("function") or {}).get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {"": args}
+        for value in (args or {}).values() if isinstance(args, dict) else []:
+            if isinstance(value, str):
+                out += [value, json.dumps(value, ensure_ascii=False)[1:-1]]
+            else:  # JSON (true, 1.5, {...}) or the Python form some templates print (True)
+                out += [json.dumps(value, ensure_ascii=False), str(value)]
+    return [v for v in dict.fromkeys(out) if v.strip()]
+
+
 def special_token_ids(tokenizer) -> set[int]:
     """Ids of every special token. `all_special_ids` lists only the named ones in
     transformers 5 (Qwen3.5 leaves out <|im_start|>); added tokens flagged special
@@ -423,6 +494,84 @@ def _echo_text_spans(text: str) -> list[tuple[int, int]]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+_MAX_STOP_POINTS = 32  # stop targets per reply at most (templates whose separator is "\n" mark every line)
+UNTRAINED_REASONING = "_untrained_reasoning"
+REASONING_KEYS = ("reasoning_content", "reasoning")  # (start, end) characters of reasoning_content that get no loss
+
+
+def inject_loop(messages: list[dict], share: float, seed: int = 0, reasoning_share: float = 0.0) -> list[dict]:
+    """Loop-recovery augmentation. Rows are chosen by a hash of their content and `seed`, so a row is augmented the
+    same way on every pass and in every cache; the input is not modified.
+
+    share (data.loop_recovery): assistant tool calls with their observations are pasted again 1-3 times right after
+    themselves with `"loss": false` (one site per 10 eligible calls, at least one); the next gold turn keeps its loss
+    and is learned after a repeated action.
+    reasoning_share (data.reasoning_loop_recovery): in trained turns' reasoning (one turn in three, at least one), a
+    sentence is written 1-4 more times right after itself; those characters get no loss (UNTRAINED_REASONING), the rest
+    of the gold reasoning does, so the model learns to continue after a repeated sentence. Rows without a place for
+    either stay unchanged."""
+    if share <= 0 and reasoning_share <= 0:
+        return messages
+    digest = hashlib.sha256(f"{seed}:{json.dumps(messages, sort_keys=True, default=str)}".encode()).digest()
+    rng = random.Random(digest)
+    turn_draw, reasoning_draw = rng.random(), rng.random()
+    if turn_draw < share:
+        messages = _repeat_turn(messages, rng)
+    if reasoning_draw < reasoning_share:
+        messages = _repeat_sentence(messages, rng)
+    return messages
+
+
+def _repeat_turn(messages: list[dict], rng: random.Random) -> list[dict]:
+    from palingenesis.validate_data import is_trained_message
+
+    points = []
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            continue
+        j = i + 1
+        while j < len(messages) and messages[j].get("role") == "tool":
+            j += 1
+        after = messages[j] if j < len(messages) else {}
+        if j > i + 1 and after.get("role") == "assistant" and is_trained_message(after):
+            points.append((i, j))
+    if not points:
+        return messages
+    out = list(messages)
+    for i, j in sorted(rng.sample(points, max(1, len(points) // 10)), reverse=True):  # from the back: indices hold
+        repeat = [{**messages[i], "loss": False}] + [dict(m) for m in messages[i + 1 : j]]
+        out[j:j] = repeat * rng.choice((1, 2, 3))
+    return out
+
+
+def _repeat_sentence(messages: list[dict], rng: random.Random) -> list[dict]:
+    from palingenesis.validate_data import is_trained_message
+
+    points = {}  # message index -> [(sentence start, end)]: sentences of 20-300 characters with text after them
+    for i, m in enumerate(messages):
+        text = m.get("reasoning_content") or m.get("reasoning")
+        if m.get("role") != "assistant" or not isinstance(text, str) or not is_trained_message(m):
+            continue
+        start = len(text) - len(text.lstrip())  # the template trims the reasoning: a sentence never starts in blanks
+        for end in (x.end() for x in _SENTENCE_END.finditer(text)):
+            if 20 <= end - start <= 300:
+                points.setdefault(i, []).append((start, end))
+            start = end + len(text[end:]) - len(text[end:].lstrip())
+    if not points:
+        return messages
+    out = list(messages)
+    for i in rng.sample(sorted(points), max(1, len(points) // 3)):
+        start, end = rng.choice(points[i])
+        text = messages[i].get("reasoning_content") or messages[i].get("reasoning")
+        sep = text[end:][: len(text[end:]) - len(text[end:].lstrip())]  # the original break (" ", "\n\n", ...)
+        copies = (sep + text[start:end]) * rng.choice((1, 2, 3, 4))
+        # every reasoning key the turn has (normalize_messages fills both; templates read one or the other)
+        turn = {**messages[i], **{k: text[:end] + copies + text[end:] for k in REASONING_KEYS if messages[i].get(k)}}
+        turn[UNTRAINED_REASONING] = [(start, end, end + len(copies))]  # the original sentence, then its copies
+        out[i] = turn
+    return out
+
+
 class ChatDataset(_Epochs, IterableDataset):
     """SFT dataset: chat template masking, only assistant tokens get loss.
 
@@ -449,8 +598,16 @@ class ChatDataset(_Epochs, IterableDataset):
         shuffle: bool = False,
         think_tags: tuple[str, str] | list[str] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        loop_recovery: float = 0.0,
+        reasoning_loop_recovery: float = 0.0,
+        repeat_targets: bool = False,
     ):
         self.dataset = dataset
+        self.loop_recovery = loop_recovery  # see inject_loop
+        self.reasoning_loop_recovery = reasoning_loop_recovery
+        # Yield `repeat_targets` (see _repeat_targets) for data.repeat_unlikelihood; needs the offset masker.
+        self.repeat_targets = repeat_targets
+        self._row_complete = True
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.messages_field = messages_field
@@ -535,6 +692,17 @@ class ChatDataset(_Epochs, IterableDataset):
         self._log_stats()
 
     def _log_stats(self) -> None:
+        if self.stats["offset_masker_failed"] and (self.repeat_targets or self.reasoning_loop_recovery):
+            logger.warning(
+                f"Offset masker failed on {self.stats['offset_masker_failed']} rows (rank {self.rank}): they have no "
+                "repeat / stop targets and no reasoning loop recovery"
+            )
+        if self.stats["loop_recovery_skipped"] or self.stats["loop_recovery_untrained_turn"]:
+            logger.info(
+                f"Loop recovery (rank {self.rank}): {self.stats['loop_recovery_skipped']} rows left unaugmented (the "
+                f"pasted context would not fit), {self.stats['loop_recovery_untrained_turn']} turns without loss (copies "
+                "not found in the render)"
+            )
         dropped = self.stats["dropped_too_long"] + self.stats["dropped_no_target"]
         if not dropped and not self.stats["truncated"]:
             return
@@ -613,17 +781,42 @@ class ChatDataset(_Epochs, IterableDataset):
             return None  # unparseable: dropped (counted), not a crash
         # If normalization returns None, use raw messages (may still work with some templates)
 
+        # Masking part of a turn needs the offset masker (fast tokenizers); without it the copies would be trained.
+        fast = getattr(self.tokenizer, "is_fast", False)
+        augmented = inject_loop(
+            messages, self.loop_recovery, self.shuffle_seed, self.reasoning_loop_recovery if fast else 0.0
+        )
+        fitted = None
+        if augmented is not messages:
+            counts = self.stats.copy()
+            kept = self._smart_truncate(augmented)
+            self.stats = counts  # a trial: only the row actually used is counted
+            if kept is not None and len(kept) == len(augmented):
+                messages = fitted = kept
+            else:  # the pasted context would cut trained turns: this row stays as it was
+                self.stats["loop_recovery_skipped"] += 1
+
         # Smart truncation: if conversation exceeds max_seq_length, truncate at
         # the last complete turn boundary that fits AND contains an assistant turn.
         # This preserves training signal (partial conversations with no assistant = useless).
-        messages = self._smart_truncate(messages)
+        n_messages = len(messages)
+        messages = fitted if fitted is not None else self._smart_truncate(messages)
+        # stop targets only where the row really ends on the reply: uncut, and its last message is the assistant's
+        self._row_complete = bool(messages) and len(messages) == n_messages and messages[-1].get("role") == "assistant"
         if not messages:
             return None
 
         # The template's {% generation %} mask cannot tell turns apart, so per-message
         # training flags (`"loss": false`) need the turn-aware masker.
-        per_turn_flags = any(m.get("role") == "assistant" and not is_trained_message(m) for m in messages)
-        if per_turn_flags or self.turn_scaling != "uniform" or not self._template_has_generation_span():
+        per_turn_flags = any(
+            m.get("role") == "assistant" and (not is_trained_message(m) or UNTRAINED_REASONING in m) for m in messages
+        )
+        if (
+            per_turn_flags
+            or self.repeat_targets
+            or self.turn_scaling != "uniform"
+            or not self._template_has_generation_span()
+        ):
             return self._fallback(messages)
 
         try:
@@ -753,7 +946,179 @@ class ChatDataset(_Epochs, IterableDataset):
                 return self._fallback_offsets(messages)
             except Exception as e:
                 logger.debug(f"offset masker failed ({e!r}); using the progressive masker")
+                self.stats["offset_masker_failed"] += 1
+        if any(UNTRAINED_REASONING in m for m in messages):
+            return None  # the progressive masker cannot leave part of a turn untrained
         return self._fallback_progressive(messages)
+
+    @staticmethod
+    def _repeat_targets(
+        full: str,
+        turns: list,
+        spans: "_TokenSpans",
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        tags: tuple[str, str] = THINK_TAGS,
+        call: "CallOpener | None" = None,
+        complete: bool = True,
+        encode=None,
+        specials: frozenset = frozenset(),
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Two [S] tensors of token ids (IGNORE_INDEX elsewhere) for data.repeat_unlikelihood / stop_unlikelihood.
+
+        repeat: at the trained position where the gold stops repeating, the token that would have continued it:
+        - a tool-call turn after a tool-call turn; outside a loop only when the divergence falls inside one of the
+          previous call's argument values (located in the render from the message's own arguments: the template's
+          call syntax never counts) after >= 4 tokens and >= half of that value agree (an early divergence, `ls` ->
+          `cat a`, or another tool, is ordinary variety);
+        - a reasoning sentence that agrees with the previous one on >= 3 tokens and >= half of it;
+        - inside a loop (the previous action or sentence already repeats the one before it, e.g. data.loop_recovery's
+          pasted copies) the first divergence, wherever it is: the escape. Identical turns get none.
+
+        stop: on the final reply of an agent trace (the row's last message, plain text after tool calls; not on a
+        row cut by truncation), the ways a call could start instead, as the template writes them (`call`, from
+        derive_call_opener): the call opener at the reply's first token and after each occurrence of the template's
+        text-to-call separator (e.g. a blank line), and that separator's first token at the end-of-turn position (the
+        path "reply, then call anyway"). Summed, -log P(no
+        call where the gold stopped): the decision CE trains on ~1% of a trace's tokens."""
+        ids = input_ids.tolist()
+        repeat = torch.full_like(input_ids, IGNORE_INDEX)
+        stop = torch.full_like(input_ids, IGNORE_INDEX)
+        offsets = spans.offsets
+
+        def piece(t):
+            return full[offsets[t][0] : offsets[t][1]]
+
+        # first non-blank character of each token (byte-level BPE merges the leading space): once, it is monotonic
+        keys = [a + len(full[a:b]) - len(full[a:b].lstrip()) for a, b in offsets]
+        key = keys.__getitem__
+
+        def same(x: int, y: int) -> bool:  # tokens equal up to merged blanks (" The" vs "\n\nThe")
+            return ids[x] == ids[y] or (piece(x).strip() != "" and piece(x).strip() == piece(y).strip())
+
+        def text(tokens: list[int]) -> str:
+            return full[offsets[tokens[0]][0] : offsets[tokens[-1]][1]].strip() if tokens else ""
+
+        def value_span(prev: list[int], prev_msg: dict, d: int) -> tuple[int, int] | None:
+            """(index in prev where the argument value holding token d starts, its length in tokens), or None when d
+            is not inside an argument value."""
+            lo, hi, at = offsets[prev[0]][0], offsets[prev[-1]][1], key(prev[d])
+            for value in _argument_texts(prev_msg):
+                a = full.find(value, lo, hi)
+                while a >= 0:  # every occurrence: the text before the call may quote the same command
+                    if a <= at < a + len(value):
+                        inside = [k for k, t in enumerate(prev) if a <= key(t) < a + len(value)]
+                        return (inside[0], len(inside)) if inside else None
+                    a = full.find(value, a + 1, hi)
+            return None
+
+        def diverge(prev: list[int], cur: list[int], in_loop: bool, prev_msg: dict | None = None):
+            d = next((k for k, (x, y) in enumerate(zip(prev, cur)) if not same(x, y)), None)
+            if d is None or labels[cur[d]] == IGNORE_INDEX:
+                return
+            if prev_msg is None:  # sentences
+                c, n, need = 0, len(prev), 3
+            else:
+                span = value_span(prev, prev_msg, d)
+                c, n, need = span + (4,) if span else (0, 0, None)
+            if in_loop or (need is not None and d - c >= need and d - c >= n / 2):
+                repeat[cur[d]] = ids[prev[d]]
+
+        open_tag, close_tag = tags
+        previous = before = previous_msg = None
+        last = turns[-1][1] if turns else None
+        agent = any(m.get("tool_calls") for _, m in turns)
+        for tset, msg in turns:
+            if not tset:
+                continue
+            c_lo, c_hi = offsets[tset[0]][0], offsets[tset[-1]][1]
+            close = full.find(close_tag, c_lo, c_hi)
+            action_start = close + len(close_tag) if close >= 0 else c_lo
+            action = [t for t in tset[:-1] if key(t) >= action_start and full[slice(*offsets[t])].strip()]
+            calls = action  # for call vs call comparison: after the turn's own text (found from the message data)
+            said = msg.get("content") if isinstance(msg.get("content"), str) else ""
+            at = full.find(said.strip(), action_start, c_hi) if msg.get("tool_calls") and said.strip() else -1
+            if at >= 0:
+                calls = [t for t in action if key(t) >= at + len(said.strip())]
+            if msg.get("tool_calls") and previous is not None:
+                diverge(previous, calls, before is not None and text(before) == text(previous), previous_msg)
+            if msg.get("tool_calls"):
+                before, previous, previous_msg = previous, calls, msg
+            else:
+                before = previous = previous_msg = None
+            if msg is last and complete and agent and not msg.get("tool_calls") and action and call is not None:
+                sep = call.separator_text  # where the template would put a call after text
+                points = [action[0]] + [t for t in action[1:] if sep and piece(t - 1).endswith(sep)]
+                for t in points[:_MAX_STOP_POINTS]:
+                    if labels[t] != IGNORE_INDEX and ids[t] != call.opener:
+                        stop[t] = call.opener
+                # the end-of-turn marker's first token: there the template would write the separator instead
+                end = next((t for t in tset if key(t) >= action_start and ids[t] in specials), tset[-1])
+                after = call.separator if call.separator is not None else call.opener
+                if labels[end] != IGNORE_INDEX and ids[end] != after:
+                    stop[end] = after
+                # vocabularies that merge the separator into the text before it ("." + "\n\n" -> ".\n\n")
+                merged = encode(piece(end - 1) + sep) if encode is not None and sep and end > 0 else []
+                if len(merged) == 1 and merged[0] != ids[end - 1] and labels[end - 1] != IGNORE_INDEX:
+                    stop[end - 1] = merged[0]
+            if close < 0:
+                continue
+            open_ = full.find(open_tag, c_lo, close)
+            r0 = open_ + len(open_tag) if open_ >= 0 else c_lo
+            reasoning = [t for t in tset if r0 <= key(t) < close and piece(t).strip()]  # blank tokens never align
+            rkeys = [key(t) for t in reasoning]
+            starts = [r0] + [r0 + m.end() for m in _SENTENCE_END.finditer(full[r0:close])] + [close]
+            cuts = [bisect.bisect_left(rkeys, c) for c in starts]
+            sentences = [reasoning[a:b] for a, b in zip(cuts, cuts[1:])]
+            for k in range(1, len(sentences)):
+                prev, cur = sentences[k - 1], sentences[k]
+                rest = reasoning[cuts[k] :] if cur else []
+                diverge(prev, rest, k >= 2 and bool(prev) and text(sentences[k - 2]) == text(prev))
+        return repeat, stop
+
+    @staticmethod
+    def _untrain_reasoning(full: str, msg: dict, tset: list[int], spans: "_TokenSpans", labels: torch.Tensor) -> bool:
+        """No loss on the reasoning characters inject_loop marked (UNTRAINED_REASONING). The marked region (the
+        sentence and its copies) is found in the turn's rendered text. When the template does not render this turn's
+        reasoning there is nothing to mask; when only the sentence is found (the copies cut by truncation or altered by
+        the template) the whole turn is left untrained and False is returned."""
+        if UNTRAINED_REASONING not in msg or not tset:
+            return True
+        c_lo, c_hi = spans.offsets[tset[0]][0], spans.offsets[tset[-1]][1]
+        text = msg.get("reasoning_content") or msg.get("reasoning")
+        for start, end, stop in msg[UNTRAINED_REASONING]:
+            pos = full.find(text[start:stop], c_lo, c_hi)
+            if pos < 0:
+                if full.find(text[start:end], c_lo, c_hi) >= 0:
+                    labels[torch.tensor(tset, dtype=torch.long)] = IGNORE_INDEX  # cut or altered: train none of it
+                    return False
+                continue
+            idx = spans.overlapping(pos + end - start, pos + stop - start)
+            if idx:
+                labels[torch.tensor(idx, dtype=torch.long)] = IGNORE_INDEX
+        return True
+
+    def _call_opener(self) -> "CallOpener | None":
+        """How this row's template starts a tool call (derive_call_opener), cached per template kwargs."""
+        cache = self.__dict__.setdefault("_call_cache", {})
+        kwargs = {k: v for k, v in self._template_kwargs.items() if k != "tools"}
+        key = json.dumps(kwargs, sort_keys=True, default=str)
+        if key not in cache:
+            cache[key] = derive_call_opener(
+                lambda m, **kw: self.tokenizer.apply_chat_template(m, tokenize=False, **{**kwargs, **kw}),
+                self.tokenizer,
+            )
+            if cache[key] is None:
+                logger.warning(
+                    "data.stop_unlikelihood: the chat template's tool-call opener could not be derived (no calls "
+                    "rendered after text, or calls that start with ordinary text): no stop targets for these rows"
+                )
+        return cache[key]
+
+    def _specials(self) -> frozenset:
+        if "_specials_cache" not in self.__dict__:
+            self._specials_cache = frozenset(special_token_ids(self.tokenizer))
+        return self._specials_cache
 
     def _turn_markers(self) -> "TurnMarkers | None":
         """The template's assistant-turn markers for the current row's template kwargs
@@ -818,8 +1183,10 @@ class ChatDataset(_Epochs, IterableDataset):
         trained_turns = [(tset, i) for i, (tset, msg) in enumerate(turns) if is_trained_message(msg)]
         if self.last_turn_only and trained_turns:
             trained_turns = trained_turns[-1:]
-        for tset, _ in trained_turns:
+        for tset, i in trained_turns:
             train(tset)
+            if not self._untrain_reasoning(full, turns[i][1], tset, spans, labels):
+                self.stats["loop_recovery_untrained_turn"] += 1
 
         labels[attn_mask == 0] = IGNORE_INDEX
 
@@ -831,6 +1198,19 @@ class ChatDataset(_Epochs, IterableDataset):
             return None
 
         result = {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
+        if self.repeat_targets:
+            result["repeat_targets"], result["stop_targets"] = self._repeat_targets(
+                full,
+                turns,
+                spans,
+                input_ids,
+                labels,
+                self._render_tags(),
+                self._call_opener(),
+                self._row_complete,
+                lambda text: self.tokenizer.encode(text, add_special_tokens=False),
+                self._specials(),
+            )
 
         n_trained = len(trained_turns)
         if self.turn_scaling != "uniform" and n_trained > 1:
@@ -1588,7 +1968,10 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
         max_len = ((max_len + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
     has_positions = "position_ids" in batch[0]
     has_weights = any("loss_weights" in x for x in batch)
+    extra = [k for k in ("repeat_targets", "stop_targets") if any(k in x for x in batch)]
     out: dict[str, list[torch.Tensor]] = {"input_ids": [], "attention_mask": [], "labels": []}
+    for k in extra:
+        out[k] = []
     if has_positions:
         out["position_ids"] = []
     if has_weights:
@@ -1607,6 +1990,11 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
             if weights is None:
                 weights = (item["labels"] != IGNORE_INDEX).float()
             out["loss_weights"].append(torch.cat([weights.float(), torch.zeros(pad_len)]))
+        for k in extra:  # unlikelihood targets (data.repeat_unlikelihood / stop_unlikelihood)
+            t = item.get(k)
+            if t is None:
+                t = torch.full_like(item["labels"], IGNORE_INDEX)
+            out[k].append(torch.cat([t, torch.full((pad_len,), IGNORE_INDEX, dtype=torch.long)]))
 
     return {k: torch.stack(v) for k, v in out.items()}
 
@@ -1700,6 +2088,9 @@ def source_stage(
         world_size=world_size,
         include_observations=config.include_observations,
         turn_scaling=config.turn_scaling,
+        loop_recovery=getattr(config, "loop_recovery", 0.0),
+        reasoning_loop_recovery=getattr(config, "reasoning_loop_recovery", 0.0),
+        repeat_targets=getattr(config, "repeat_unlikelihood", 0.0) > 0 or getattr(config, "stop_unlikelihood", 0.0) > 0,
         train_on_reasoning=getattr(config, "train_on_reasoning", True),
         last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
         shuffle_buffer=shuffle_buffer,
@@ -2073,6 +2464,11 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
         "replay": [d.pretrain_replay_dataset, d.pretrain_replay_weight],
         "sources": sources_sig,
     }
+    for knob in ("loop_recovery", "reasoning_loop_recovery"):  # only when set: existing caches stay valid
+        if getattr(d, knob, 0.0):
+            payload[knob] = getattr(d, knob)
+    if getattr(d, "repeat_unlikelihood", 0.0) or getattr(d, "stop_unlikelihood", 0.0):
+        payload["unlikelihood_targets"] = True
     blob = _json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()
 

@@ -83,6 +83,29 @@ class DataConfig:
     # "last_heavy": final turn gets 2x weight, others 1x
     #   Rationale: final answer quality matters most
     turn_scaling: str = "uniform"
+    # Loop-recovery augmentation: the share of multi-turn rows in which assistant tool calls (one per 10, at least one)
+    # and their observations are pasted again 1-3 times right after themselves, untrained ("loss": false), so the
+    # following gold turn is
+    # learned in a context where the agent has just repeated itself, i.e. the way out of a loop. Distilled students
+    # loop at repeated decision points their teachers handle (arxiv:2512.12895); masking the bad action and
+    # supervising the correction follows arxiv:2609.40111. Deterministic per row content; a row whose copies would
+    # not fit max_seq_length stays unaugmented (so the share achieved leans to shorter rows); 0 = off.
+    loop_recovery: float = 0.0
+    # The same inside one reply: the share of rows in which a sentence of trained turns' reasoning (one turn in
+    # three, at least one) is written 1-4 more times right after itself; the copies get no loss, the rest of the gold reasoning does (continue after a
+    # repeated sentence, the within-reply loop of distilled thinking students). Needs a fast tokenizer; 0 = off.
+    reasoning_loop_recovery: float = 0.0
+    # Repetition unlikelihood at decision points: weight of -log(1 - p(repeat token)) at the trained positions where
+    # the gold stops repeating a previous action or reasoning sentence (ChatDataset._repeat_targets: after an exact
+    # repeat, or late in a near-repeat), added to the CE sum with the same denominator (one target counts like this many
+    # tokens). Distilled students fall back on copying their context at hard decision points (arxiv:2512.12895); plain
+    # CE never pushes that option down. Only these few positions: legitimate copying (paths, code) is untouched,
+    # unlike token-level unlikelihood. Needs memory.seco, no packing, no pretokenize. 0 = off.
+    repeat_unlikelihood: float = 0.0
+    # The same for stopping: at the final reply of an agent trace, the ways a tool call could start instead (the call
+    # opener at the reply's first token and after paragraph breaks, the paragraph break at its end); the summed term is
+    # -log P(no call where the gold stopped). Weight per target. Same requirements. 0 = off.
+    stop_unlikelihood: float = 0.0
     # Train ONLY on the final assistant turn; mask all earlier assistant turns.
     # Use when earlier assistant turns are a FIXED context you must not fit — e.g.
     # n-shot MCQA prompts where the exemplar answers are constant and only the final
@@ -611,6 +634,14 @@ class Config:
                     "drop msft_tracking to cache a fixed stream)."
                 )
 
+        for knob in ("repeat_unlikelihood", "stop_unlikelihood"):
+            if getattr(self.data, knob) < 0:
+                errors.append(f"data.{knob} must be >= 0, got {getattr(self.data, knob)}.")
+            elif getattr(self.data, knob) > 0 and (not self.memory.seco or self.data.packing or self.data.pretokenize):
+                errors.append(f"data.{knob} is implemented on the memory.seco path without packing or pretokenize.")
+        for knob in ("loop_recovery", "reasoning_loop_recovery"):
+            if not 0.0 <= getattr(self.data, knob) <= 1.0:
+                errors.append(f"data.{knob} must be in [0, 1], got {getattr(self.data, knob)}.")
         if self.data.turn_scaling not in ("uniform", "progressive", "last_heavy"):
             errors.append(
                 f"data.turn_scaling={self.data.turn_scaling!r} is not one of uniform, progressive, last_heavy."

@@ -47,11 +47,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Sampling:
-    """How a rollout is sampled: temperature (0 = greedy), nucleus top_p (1 = off), top_k (0 = off)."""
+    """How a rollout is sampled: temperature (0 = greedy), nucleus top_p (1 = off), top_k (0 = off), and
+    presence_penalty (0 = off), subtracted from the logits of every token already generated in this completion (as in
+    vLLM and the OpenAI API: prompt tokens are not penalised). Qwen3.5 recommends 1.5-2.0 against repetition loops."""
 
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
+    presence_penalty: float = 0.0
 
     @property
     def truncated(self) -> bool:
@@ -140,14 +143,18 @@ class _RecordLogprobs:
     and records each sampled token's log-probability. The token sampled at step t is
     visible at step t+1 as input_ids[:, -1], so each call records the previous step's choice."""
 
-    def __init__(self, sampling: Sampling):
+    def __init__(self, sampling: Sampling, prompt_width: int = 0):
         self.sampling = sampling
+        self.prompt_width = prompt_width  # generated tokens start here; only they get the presence penalty
         self.previous: Tensor | None = None
         self.logprobs: list[Tensor] = []
 
     def __call__(self, input_ids: Tensor, scores: Tensor) -> Tensor:
         if self.previous is not None:
             self.logprobs.append(self.previous.gather(1, input_ids[:, -1:]).squeeze(1))
+        if self.sampling.presence_penalty and input_ids.shape[1] > self.prompt_width:
+            seen = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, input_ids[:, self.prompt_width :], True)
+            scores = scores - self.sampling.presence_penalty * seen
         scores = truncate_scores(scores / self.sampling.temperature, self.sampling.top_k, self.sampling.top_p)
         self.previous = torch.log_softmax(scores.float(), -1)
         return scores
@@ -191,6 +198,8 @@ class HFRollout:
             for budget, sampling in sorted(set(zip(max_new_tokens, per_prompt)), key=lambda x: (x[0], repr(x[1]))):
                 idx = [i for i, (m, sp) in enumerate(zip(max_new_tokens, per_prompt)) if m == budget and sp == sampling]
                 temperature = sampling.temperature
+                if temperature == 0 and sampling.presence_penalty:
+                    raise ValueError("presence_penalty with greedy decoding: use temperature > 0 or the vLLM engine")
                 for start in range(0, len(idx), self.micro_seqs):
                     chunk = idx[start : start + self.micro_seqs]
                     width = max(len(prompts[i]) for i in chunk)
@@ -208,7 +217,7 @@ class HFRollout:
                         use_cache=True,  # the model config may disable it for training
                         **sample_kwargs,
                     )
-                    recorder = _RecordLogprobs(sampling) if temperature > 0 else None
+                    recorder = _RecordLogprobs(sampling, width) if temperature > 0 else None
                     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                         seqs = self.model.generate(
                             ids.to(device),
@@ -429,6 +438,7 @@ class VLLMColocateRollout:
             temperature=sampling.temperature,
             top_p=sampling.top_p,
             top_k=sampling.top_k,
+            presence_penalty=sampling.presence_penalty,
             logprobs=0 if sampling.temperature > 0 else None,
             stop_token_ids=list(self.stop_ids),
             detokenize=False,
@@ -644,6 +654,7 @@ class VLLMServerRollout:
                 temperature=sampling.temperature,
                 top_p=sampling.top_p,
                 top_k=sampling.top_k,
+                presence_penalty=sampling.presence_penalty,
                 logprobs=0 if sampling.temperature > 0 else None,
                 stop_token_ids=list(self.stop_ids),
                 return_token_ids=True,

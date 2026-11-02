@@ -18,7 +18,7 @@ sys.path.insert(0, "tests")
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
-from test_opd_traces import TOOLS, agent_trace  # noqa: E402
+from test_opd_traces import TOOLS, agent_trace, looping_trace  # noqa: E402
 from test_opd_trainer import tiny_model  # noqa: E402
 
 
@@ -32,11 +32,11 @@ def models(tmp_path_factory):
     }
 
 
-def write_traces(path, n=12):
+def write_traces(path, n=12, looping=False):
     rows = []
     for i in range(n):
-        messages = agent_trace(2 + i % 3)
-        if i % 4 == 3:  # a second user query: the template rewrites the earlier turns
+        messages = looping_trace() if looping else agent_trace(2 + i % 3)
+        if i % 4 == 3 and not looping:  # a second user query: the template rewrites the earlier turns
             messages += [
                 {"role": "user", "content": "And now?"},
                 {"role": "assistant", "reasoning_content": "Think again.", "content": "Fine."},
@@ -296,6 +296,35 @@ def test_cmr_holds_the_common_margin_in_a_trace_run(tmp_path, models):
     assert common["on"] < 0.5 * common["off"] + 1e-4
 
 
+def test_onset_branches_and_kd_cut_in_a_training_run(tmp_path, models):
+    """Student-recorded traces that repeat themselves: regenerated turns start at the repetition (reported apart as
+    kl_onset in training and dev_kl_onset in evaluation), recorded-turn distillation keeps only a run's first tokens."""
+    from palingenesis.opd.trace_trainer import TraceTrainer
+
+    overrides = {
+        "sources.traces.path": write_traces(tmp_path / "loops.jsonl", looping=True),
+        "sources.traces.branches_per_trace": 1,
+        "sources.traces.onset_branches": 2,
+        "sources.traces.onset_kd_tokens": 4,
+        "rollout.group_size": 1,
+    }
+    trainer = TraceTrainer(make_config(tmp_path, models, **overrides))
+    plans = [
+        trainer.planners["traces"].plan(r["messages"], r.get("tools"), random.Random(0))
+        for r in trainer.source.train["traces"]
+    ]
+    assert any(b.onset for p in plans for b in p.branches)
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append((kind, step, metrics))
+    trainer.train()
+    steps = [m for kind, _, m in logged if kind == "step"]
+    evals = [m for kind, _, m in logged if kind == "eval"]
+    assert sum(m["onset_branches"] for m in steps) > 0
+    assert any(k.startswith("kl_onset/") for m in steps for k in m)
+    assert any("dev_kl_onset/traces" in m for m in evals)
+    assert all(m["grad_norm"] > 0 for m in steps)
+
+
 def test_trace_config_validation(tmp_path, models):
     from palingenesis.opd.config import OPDConfigError
 
@@ -308,6 +337,10 @@ def test_trace_config_validation(tmp_path, models):
     invalid("needs topic_field", **{"sources.traces.topic_field": ""})
     invalid("full_rkl from an hf teacher", **{"teachers.coder.loss": "sampled_rkl"})
     invalid("branches_per_trace", **{"sources.traces.branches_per_trace": -1})
+    invalid("onset_branches needs", **{"sources.traces.onset_branches": 2, "loss.trace_branch_weight": 0.0})
+    invalid("onset_kd_tokens shapes", **{"sources.traces.onset_kd_tokens": 8, "loss.trace_kd_weight": 0.0})
+    invalid("onset_threshold", **{"sources.traces.onset_threshold": 0.0})
+    invalid("onset_common", **{"sources.traces.onset_common": 1.5})
     invalid("tree_chunk_size bounds", **{"model.gradient_checkpointing": True})
     invalid("cmr.families", **{"cmr.enabled": True})
     invalid("mcqa sources need a plain OPD run", **{"sources.pool.format": "mcqa", "sources.pool.path": "x.jsonl"})

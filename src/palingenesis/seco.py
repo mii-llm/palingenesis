@@ -299,6 +299,10 @@ class ChunkwiseResult:
     loss: float
     num_chunks: int
     backpropagated: int
+    # unlikelihood terms (data.repeat_unlikelihood / stop_unlikelihood), one entry per term: sum of p(target) over
+    # its targets, and their count
+    unlikely_p: tuple = ()
+    unlikely_n: tuple = ()
 
 
 def seco_forward_backward(model, input_ids, labels, *, chunk_size: int = 4096, **kwargs) -> ChunkwiseResult:
@@ -362,6 +366,7 @@ def _chunkwise(
     num_loss_chunks=None,
     rng: random.Random | None = None,
     kv_offload: bool = False,
+    unlikely: list | None = None,
 ) -> ChunkwiseResult:
     """Accumulate d(loss)/d(params) into `.grad`, chunk by chunk; the caller must
     NOT call `.backward()` afterwards.
@@ -375,6 +380,9 @@ def _chunkwise(
     num_loss_chunks: tokens -> number of lm_head chunks (bounds logits memory).
     kv_offload: keep full-attention K/V (and recurrent start states) in pinned CPU
                 memory, streamed to the GPU block by block. Exact; costs transfers.
+    unlikely:   [(targets, weight)]: targets [B, S] like labels (unshifted), token ids whose probability is
+                pushed down by weight * -log(1 - p) / loss_denom; IGNORE_INDEX elsewhere (data.repeat_unlikelihood,
+                data.stop_unlikelihood).
     """
     backbone, lm_head = _backbone(model), _lm_head(model)
     if getattr(backbone, "gradient_checkpointing", False) and backbone.training:
@@ -392,16 +400,26 @@ def _chunkwise(
     sparse = budget is not None and budget < k
     loss_chunks = num_loss_chunks or (lambda n: 1)
 
-    def chunk_loss(hidden, lo, hi, weight=1.0):
+    # positions kept (a term that is off stays None), so the statistics line up with the caller's list
+    terms = [(shift_labels(t) if t is not None and w > 0 else None, w) for t, w in (unlikely or [])]
+    stats = [[0.0, 0, 0.0] for _ in terms]  # per term: sum of p, targets, the term's value (kept out of the logged CE)
+
+    def chunk_loss(hidden, lo, hi, weight=1.0, with_repeat=True):
         # The weight goes into the denominator: chunked CE computes lm_head's
         # gradients inside this call, so scaling the returned loss would miss them.
-        return chunked_cross_entropy_loss(
+        loss = chunked_cross_entropy_loss(
             hidden,
             shifted[:, lo:hi],
             lm_head,
             num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
             global_valid_tokens=denom / weight,
         )
+        if with_repeat:
+            for (targets, w), st in zip(terms, stats):
+                if targets is None:
+                    continue
+                loss = loss + _repeat_unlikelihood(hidden, targets[:, lo:hi], lm_head, w * weight / denom, st)
+        return loss
 
     # K/V are cached in the autocast dtype: attention consumes them in that dtype
     # anyway (autocast casts its inputs), so this matches the full forward exactly
@@ -438,7 +456,7 @@ def _chunkwise(
             _attach_stores(cache, in_store, stores, seq_len, lo, write=True, offload=kv_offload)
             hidden = _run(backbone, input_ids[:, lo:hi], cache)
             if sparse:  # skipped chunks are not recomputed; report their loss from here
-                logged += float(chunk_loss(hidden, lo, hi))
+                logged += float(chunk_loss(hidden, lo, hi, with_repeat=False))
             del hidden
     # Append-only checkpoints: ONE leaf per layer holding the whole sequence's K/V.
     # A chunk's prefix is a view of it (no copy), and every chunk's gradient
@@ -513,7 +531,28 @@ def _chunkwise(
         next_leaves, next_chunk = leaves, i
         del cache, hidden, loss, roots, grads, before
     _ACTIVE.clear()
-    return ChunkwiseResult(loss=logged, num_chunks=k, backpropagated=len(order))
+    return ChunkwiseResult(
+        loss=logged - (0.0 if sparse else sum(st[2] for st in stats)),
+        num_chunks=k,
+        backpropagated=len(order),
+        unlikely_p=tuple(st[0] for st in stats),
+        unlikely_n=tuple(st[1] for st in stats),
+    )
+
+
+def _repeat_unlikelihood(hidden: torch.Tensor, targets: torch.Tensor, lm_head: nn.Module, scale: float, stats: list):
+    """scale * sum of -log(1 - p(target)) over the positions with a target (a handful per row: only their logits are
+    computed); stats accumulates [sum of p, count, value] for logging (stage 2 only: each chunk once)."""
+    where = (targets != IGNORE_INDEX).nonzero(as_tuple=True)
+    if where[0].numel() == 0:
+        return hidden.new_zeros(())
+    logp = torch.log_softmax(lm_head(hidden[where]).float(), -1)
+    p = logp.gather(-1, targets[where].unsqueeze(-1)).squeeze(-1).exp()
+    term = scale * -torch.log1p(-p.clamp(max=1 - 1e-6)).sum()
+    stats[0] += float(p.detach().sum())
+    stats[1] += int(p.numel())
+    stats[2] += float(term.detach())
+    return term
 
 
 # ── cache plumbing ─────────────────────────────────────────────────────────────

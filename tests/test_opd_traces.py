@@ -9,7 +9,14 @@ sys.path.insert(0, "src")
 
 transformers = pytest.importorskip("transformers")
 
-from palingenesis.opd.traces import TracePlanner, is_trainable_turn, topic_teacher  # noqa: E402
+from palingenesis.opd.traces import (  # noqa: E402
+    OnsetScan,
+    TracePlanner,
+    cut_runs,
+    is_trainable_turn,
+    repetition_runs,
+    topic_teacher,
+)
 
 TOOLS = [
     {
@@ -199,3 +206,100 @@ def test_source_kwargs_change_the_rendering(tok):
     )
     a, b = (tok.decode(x.plan(msgs, None, random.Random(0)).branches[0].context) for x in (think, plain))
     assert a != b and b.rstrip().endswith("</think>")  # non-thinking opens with an empty think block
+
+
+# ---------------------------------------------------------------- repetition onsets (student-recorded traces)
+
+
+def test_repetition_runs_on_token_ids():
+    fresh = list(range(100, 200))
+    # one turn, no repeats: nothing
+    assert repetition_runs(fresh, [(0, 100)], ngram=4, window=8, threshold=0.75) == []
+    # a turn that writes a 10-token phrase five times: the run starts where the second copy starts
+    phrase = list(range(10))
+    ids = fresh[:20] + phrase * 5
+    runs = repetition_runs(ids, [(0, len(ids))], ngram=4, window=8, threshold=0.75)
+    assert len(runs) == 1 and runs[0] == (30, len(ids))
+    # across turns: the third turn copies the first (observations between them are never scanned)
+    obs = list(range(500, 540))
+    ids = fresh[:30] + obs + fresh[30:60] + obs + fresh[:30]
+    spans = [(0, 30), (70, 100), (140, 170)]
+    assert repetition_runs(ids, spans, ngram=4, window=8, threshold=0.75) == [(140, 170)]
+    # the second turn copying the first is not caught: with one earlier turn, what it wrote is all "shared"
+    assert repetition_runs(fresh[:30] + obs + fresh[:30], [(0, 30), (70, 100)], ngram=4, window=8) == []
+    # quoting an observation is not a repeat (only assistant text counts); quoting it again is
+    ids = obs[:30] + obs[:30] + obs[:30]
+    assert repetition_runs(ids, [(30, 60)], ngram=4, window=8, threshold=0.75) == []
+    assert repetition_runs(ids, [(30, 90)], ngram=4, window=8, threshold=0.75) == [(60, 90)]
+
+
+def test_shared_scaffolding_is_not_a_repeat():
+    """N-grams found in most earlier turns (call markup, say) never count; a turn that repeats one turn does."""
+    scaffold = list(range(900, 912))
+    turns = [scaffold + list(range(1000 + 50 * i, 1000 + 50 * i + 20)) for i in range(6)]
+    ids, spans = [], []
+    for t in turns:
+        spans.append((len(ids), len(ids) + len(t)))
+        ids += t + [7] * 5
+    assert repetition_runs(ids, spans, ngram=4, window=8, threshold=0.75) == []
+    # common=1: nothing is scaffolding, so every turn from the second on starts with a repeat (its markup)
+    assert len(repetition_runs(ids, spans, ngram=4, window=8, threshold=0.75, common=1.0)) == 5
+    looped = turns + [turns[3]]  # the 7th turn copies the 4th
+    ids, spans = [], []
+    for t in looped:
+        spans.append((len(ids), len(ids) + len(t)))
+        ids += t + [7] * 5
+    # the copy's run starts after the shared markup: at its first n-gram that is not scaffolding
+    assert repetition_runs(ids, spans, ngram=4, window=8, threshold=0.75) == [(spans[-1][0] + 12 - 3, spans[-1][1])]
+
+
+def test_cut_runs_keeps_the_start_of_each_run():
+    spans = [(0, 10), (20, 60)]
+    assert cut_runs(spans, [(30, 50)], 4) == [(0, 10), (20, 34), (50, 60)]
+    assert cut_runs(spans, [(30, 60)], 0) == [(0, 10), (20, 30)]
+    assert cut_runs(spans, [(30, 33)], 4) == spans  # shorter than what is kept
+    assert cut_runs(spans, [], 4) == spans
+
+
+def looping_trace():
+    """An agent trace whose last turn (cut at the token budget, say) ruminates."""
+    msgs = agent_trace(4)
+    loop = "Line 1 = `# ad servers`?? no. Line 2 = `ads.example.com Track.Example.NET`?? no. "
+    msgs[-1]["reasoning_content"] = "The tests pass now, so I can report. Let me count the lines again. " + loop * 12
+    return msgs
+
+
+def test_onset_branches_start_where_a_recorded_turn_repeats_itself(tok):
+    msgs = looping_trace()
+    p = planner(tok, branches_per_trace=1, onsets=OnsetScan(branches=2))
+    plan = p.plan(msgs, TOOLS, random.Random(0))
+    onset = [b for b in plan.branches if b.onset]
+    assert len(onset) == 1  # one run in this trace
+    b = onset[0]
+    assert b.turn == len(msgs) - 1  # the last turn: the trunk is the whole trace
+    assert b.context == plan.trunk[: len(b.context)] and b.prefix == [plan.trunk[b.attach]]
+    written = tok.decode(b.context).rsplit("<think>\n", 1)[1]  # what the turn wrote before the onset
+    assert msgs[-1]["reasoning_content"].startswith(written)
+    assert written.startswith("The tests pass now") and written.count("Line 2 =") <= 1  # within the first copy
+    # regular branches are unchanged by the scan: the same turns as without it
+    plain = planner(tok, branches_per_trace=1).plan(msgs, TOOLS, random.Random(0))
+    assert [x.turn for x in plan.branches if not x.onset] == [x.turn for x in plain.branches]
+    # a trace without repetition gets no onset branch
+    assert not any(x.onset for x in p.plan(agent_trace(4), TOOLS, random.Random(0)).branches)
+
+
+def test_onset_kd_tokens_cut_the_inside_of_a_run(tok):
+    msgs = looping_trace()
+    full = planner(tok, onsets=OnsetScan(kd_tokens=-1, branches=1)).plan(msgs, TOOLS, random.Random(0))
+    cut = planner(tok, onsets=OnsetScan(kd_tokens=8)).plan(msgs, TOOLS, random.Random(0))
+    assert full.trunk == cut.trunk
+    last = full.kd_spans[-1]
+    assert tok.decode(full.trunk[last[0] : last[1]]).count("Line 2") == 12  # the last turn is distilled whole
+    onset = next(b for b in full.branches if b.onset)
+    kept = {p for a, b in cut.kd_spans for p in range(a, b)}
+    assert set(range(len(onset.context), len(onset.context) + 8)) <= kept  # the run's first tokens stay
+    assert len(onset.context) + 8 not in kept
+    assert len(kept) < sum(b - a for a, b in full.kd_spans) - 200
+    # without the scan the last turn is not a recorded target (its context is the trunk)
+    plain = planner(tok).plan(msgs, TOOLS, random.Random(0))
+    assert len(plain.kd_spans) == len(full.kd_spans) - 1

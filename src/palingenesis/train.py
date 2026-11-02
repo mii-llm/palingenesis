@@ -991,6 +991,8 @@ def _train(config: Config, run: dict) -> TrainResult:
     accum_ce = 0.0  # unweighted CE (chunked-DEFT side metric; free)
     accum_gate = 0.0  # mean token gate (DEFT, DFT, InfoSFT, CADFT)
     accum_ce_micro = 0
+    # unlikelihood terms (repeat, stop): summed p(target) at their targets, and their count
+    accum_unlikely = [[0.0, 0], [0.0, 0]]
     tokens_total = 0  # cumulative input tokens, padding excluded (this process)
     trained_tokens_total = 0  # cumulative tokens with a loss (this process)
     # Whether train/loss IS a cross-entropy (ppl and eval/gap only make sense
@@ -1039,6 +1041,7 @@ def _train(config: Config, run: dict) -> TrainResult:
         accum_loss, accum_tokens, accum_trained, accum_micro = 0.0, 0, 0, 0
         accum_ce, accum_gate, accum_ce_micro = 0.0, 0.0, 0
         accum_dpo, accum_dpo_micro = {}, 0
+        accum_unlikely = [[0.0, 0], [0.0, 0]]
 
         epoch_saw_batch = False
         for micro_step, batch in enumerate(batch_iter):
@@ -1134,8 +1137,15 @@ def _train(config: Config, run: dict) -> TrainResult:
                         loss_denom=loss_denom,
                         kv_offload=config.memory.seco_kv_offload,
                         num_loss_chunks=lambda n: _dynamic_num_chunks(n, _loss_vocab_size),
+                        unlikely=[
+                            (batch.get("repeat_targets"), config.data.repeat_unlikelihood),
+                            (batch.get("stop_targets"), config.data.stop_unlikelihood),
+                        ],
                     )
                     loss_val = result.loss * current_ga
+                    for term, (p_sum, n) in enumerate(zip(result.unlikely_p, result.unlikely_n)):
+                        accum_unlikely[term][0] += p_sum
+                        accum_unlikely[term][1] += n
                     backward_done = True
                 elif dpo is not None:
                     # Rows [0, P) are chosen answers, [P, 2P) the paired rejected ones.
@@ -1415,6 +1425,11 @@ def _train(config: Config, run: dict) -> TrainResult:
                         metrics["train/token_gate"] = accum_gate / accum_ce_micro
                     elif _objective_is_ce:
                         metrics["train/ppl"] = math.exp(min(step_loss, 20.0))
+                    # the student's pull to keep repeating (repeat) / to call again (stop) where the gold stopped
+                    for name, (p_sum, n) in zip(("repeat", "stop"), accum_unlikely):
+                        if n:
+                            metrics[f"train/{name}_p"] = p_sum / n
+                            metrics[f"train/{name}_targets"] = n
 
                     if accum_dpo_micro:
                         keys = sorted(accum_dpo)
@@ -1479,6 +1494,7 @@ def _train(config: Config, run: dict) -> TrainResult:
 
                 accum_loss, accum_tokens, accum_trained, accum_micro = 0.0, 0, 0, 0
                 accum_ce, accum_gate, accum_ce_micro = 0.0, 0.0, 0
+                accum_unlikely = [[0.0, 0], [0.0, 0]]
                 accum_dpo, accum_dpo_micro = {}, 0
                 t_step = time.perf_counter()
 

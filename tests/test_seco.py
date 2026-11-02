@@ -135,6 +135,36 @@ def test_seco_equals_full_backprop(arch, chunk_size):
 
 
 @pytest.mark.parametrize("arch", MODELS)
+def test_repeat_unlikelihood_equals_the_full_backprop_term(arch):
+    """data.repeat_unlikelihood: the chunk-wise term at a few target positions gives the gradient of
+    CE + weight * sum -log(1 - p(target)) over the same denominator; the logged loss stays the CE alone."""
+    model = MODELS[arch]()
+    ids, labels, mask = _batch()
+    repeat = torch.full_like(ids, IGNORE_INDEX)
+    repeat[0, [9, 30, 31, 64]] = torch.tensor([3, 50, 7, 11])  # positions in different chunks, two adjacent
+    weight = 5.0
+
+    model.zero_grad()
+    logits = model(input_ids=ids, attention_mask=mask).logits.double()
+    shifted, shifted_repeat = shift_labels(labels), shift_labels(repeat)
+    denom = (shifted != IGNORE_INDEX).sum()
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, VOCAB), shifted.reshape(-1), ignore_index=IGNORE_INDEX, reduction="sum"
+    )
+    where = (shifted_repeat != IGNORE_INDEX).nonzero(as_tuple=True)
+    p = torch.softmax(logits[where], -1).gather(-1, shifted_repeat[where].unsqueeze(-1)).squeeze(-1)
+    ((ce + weight * -torch.log1p(-p).sum()) / denom).backward()
+    full_grads = {n: q.grad.clone() for n, q in model.named_parameters() if q.grad is not None}
+
+    result, grads = _chunked(model, ids, labels, chunk_size=16, unlikely=[(None, 1.0), (repeat, weight)])
+    assert abs(result.loss - ce.item() / denom.item()) < LOSS_TOL * result.loss  # logged: the CE only
+    assert result.unlikely_n == (0, 4) and abs(result.unlikely_p[1] - p.sum().item()) < 1e-5
+    assert _max_rel_err(grads, full_grads) < TOL[arch]
+    plain, plain_grads = _chunked(model, ids, labels, chunk_size=16, unlikely=[(repeat, 0.0)])
+    assert plain.unlikely_n == (0,) and _max_rel_err(plain_grads, full_grads) > 1e-3  # the term changes the gradient
+
+
+@pytest.mark.parametrize("arch", MODELS)
 def test_right_padded_batch(arch):
     model = MODELS[arch]()
     ids, labels, mask = _batch(batch=2, seq=50, pad_to=64)
