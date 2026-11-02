@@ -129,6 +129,33 @@ class SourceConfig:
     onset_window: int = 32
     onset_threshold: float = 0.75
     onset_common: float = 0.5
+    # Failed tool calls (opd.traces.FailedTurns), read from the data whatever the harness or template: an assistant
+    # turn failed when an observation answering it (messages up to the next assistant turn with a role in
+    # error_roles) matches one of error_patterns (regular expressions, re.search; e.g. "^Error:", "command not
+    # found"), when it or such an observation has a truthy error_field (a per-message error record), or, with
+    # error_invalid_calls, when it calls a tool the trace does not declare or with arguments that are not a JSON
+    # object. error_weight: loss weight of a failed turn's tokens, regenerated and recorded (SAGE-OPD gives
+    # deterministic failures full weight). first_error_weight: the first failed turn's, in failed episodes
+    # (success_field: a row field, falsy or <= 0 = failed; empty = every episode). error_branches: extra
+    # regenerated turns per trace at failed turns, the first one first. The loss stays a weighted mean (weights
+    # renormalized over the batch). All off by default (weights 1, no patterns).
+    error_patterns: list = field(default_factory=list)
+    error_roles: list = field(default_factory=lambda: ["tool"])
+    error_field: str = ""
+    error_invalid_calls: bool = False
+    error_weight: float = 1.0
+    first_error_weight: float = 1.0
+    success_field: str = ""
+    error_branches: int = 0
+    # Teacher-reliability cutoff (opd.traces.TeacherCutoff, STRIDE): per recorded turn, the teacher's mean log-prob
+    # of its tokens (the first cutoff_tokens; 0 = all); the trace stops being supervised after the first turn where
+    # their sum from the first turn (cutoff_window 0, STRIDE's statistic: -1 to -3 there) or their mean over the
+    # last cutoff_window turns falls below cutoff_logp. Later turns, recorded and regenerated, get loss weight
+    # cutoff_weight (0 = dropped). 0 = off. Training only: dev metrics score every held-out turn.
+    cutoff_logp: float = 0.0
+    cutoff_window: int = 0
+    cutoff_tokens: int = 0
+    cutoff_weight: float = 0.0
     max_context: int = 32768  # tokens of context a regenerated turn may have
     max_new_tokens: int = 512
     # Held-out rows: split off `path` (deterministic, hash-ranked, unique), or all
@@ -530,6 +557,13 @@ class OPDConfig:
                     errors.append(
                         f"{where}.onset_kd_tokens shapes recorded-turn distillation: set loss.trace_kd_weight."
                     )
+                errors.extend(_failed_turn_errors(where, source, self.loss.trace_branch_weight))
+                if source.cutoff_logp > 0:
+                    errors.append(f"{where}.cutoff_logp is a log-prob threshold: < 0 (0 = off).")
+                if source.cutoff_window < 0 or source.cutoff_tokens < 0:
+                    errors.append(f"{where}: cutoff_window and cutoff_tokens must be >= 0.")
+                if not 0 <= source.cutoff_weight < 1:
+                    errors.append(f"{where}.cutoff_weight must be in [0, 1) (0 = drop the turns after the cutoff).")
             if not source.path:
                 errors.append(f"{where}.path is required.")
             if source.teacher and source.teacher not in self.teachers:
@@ -573,11 +607,19 @@ class OPDConfig:
                     "the activation memory)."
                 )
             for name, teacher in self.teachers.items():
-                if teacher.backend != "hf" or teacher.loss not in ("", "full_rkl"):
+                if teacher.backend == "hf" and teacher.loss not in ("", "full_rkl"):
                     errors.append(
                         f"teachers.{name}: agent traces are distilled with full_rkl from an hf teacher "
                         "(the teacher scores each regenerated turn from the trace's shared prefill)."
                     )
+                if teacher.backend == "vllm" and teacher.loss not in ("", "topk_kl"):
+                    errors.append(
+                        f"teachers.{name}: agent traces are distilled with topk_kl from a vllm teacher (its "
+                        "prompt log-probs: top-k and the student's token at every position)."
+                    )
+                if teacher.backend == "vllm" and self.loss.top_k < 1:
+                    errors.append(f"teachers.{name}: a vllm teacher of agent traces needs loss.top_k >= 1.")
+
             if rollout.backend in ("vllm", "vllm_server") and not rollout.prefix_caching:
                 warnings.append(
                     "agent_traces without rollout.prefix_caching: every regenerated turn prefills its "
@@ -655,6 +697,30 @@ class OPDConfig:
                 "OPD configuration has incompatible settings:\n" + "\n".join(f"  ✗ {e}" for e in errors)
             )
         return warnings
+
+
+def _failed_turn_errors(where: str, source, branch_weight: float) -> list[str]:
+    import re
+
+    errors = []
+    for pattern in source.error_patterns:
+        try:
+            re.compile(pattern)
+        except (re.error, TypeError) as e:
+            errors.append(f"{where}.error_patterns: {pattern!r} is not a regular expression ({e}).")
+    if source.error_weight < 0 or source.first_error_weight < 0 or source.error_branches < 0:
+        errors.append(f"{where}: error_weight, first_error_weight and error_branches must be >= 0.")
+    uses = source.error_weight != 1 or source.first_error_weight != 1 or source.error_branches > 0
+    if uses and not (source.error_patterns or source.error_field or source.error_invalid_calls):
+        errors.append(
+            f"{where}: error_weight / first_error_weight / error_branches need a failure signal: error_patterns, "
+            "error_field or error_invalid_calls."
+        )
+    if source.error_branches > 0 and branch_weight == 0:
+        errors.append(f"{where}.error_branches needs loss.trace_branch_weight > 0 (they are regenerated).")
+    if source.success_field and source.first_error_weight == 1:
+        errors.append(f"{where}.success_field only selects where first_error_weight applies: set it too.")
+    return errors
 
 
 class OPDConfigError(Exception):

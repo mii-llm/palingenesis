@@ -352,3 +352,310 @@ def test_trace_config_validation(tmp_path, models):
             "sources.chat.sampling_mix": [{"weight": 1}],
         },
     )
+
+
+# ---------------------------------------------------------------- failed turns, teacher cutoff, vLLM teacher
+
+ERRORS = ["^Error:", "command not found"]
+
+
+def failing_trace():
+    from test_opd_traces import failing_trace as trace
+
+    return trace()
+
+
+def write_failing_traces(path, n=12):
+    rows = [
+        {
+            "messages": json.dumps(failing_trace() if i % 2 == 0 else agent_trace(3 + i % 2)),
+            "tools": json.dumps(TOOLS),
+            "domain": ["code", "office"][i % 2],
+            "solved": i % 4 == 1,
+        }
+        for i in range(n)
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return str(path)
+
+
+def naive_teacher_logp(model, ids: list[int]) -> torch.Tensor:
+    """log p(ids[t] | ids[:t]) for t >= 1 from one full forward."""
+    with torch.no_grad():
+        logits = model(input_ids=torch.tensor([ids])).logits[0, :-1].float()
+    return torch.log_softmax(logits, -1).gather(1, torch.tensor(ids[1:])[:, None]).squeeze(1)
+
+
+def test_weighted_turns_loss_equals_the_weighted_naive_loss(tmp_path, models, monkeypatch):
+    """Failed-turn weights scale each regenerated and recorded token's KL; the result is the naive per-turn loss
+    with the same per-token weights."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    from palingenesis.logits import output_head
+    from palingenesis.opd.fused_rkl import fused_full_rkl
+    from palingenesis.opd.trace_trainer import TraceBatch, TraceTrainer
+    from palingenesis.opd.traces import TraceSample
+
+    overrides = {
+        "rollout.group_size": 1,
+        "sources.traces.error_patterns": ERRORS,
+        "sources.traces.error_weight": 2.0,
+        "sources.traces.first_error_weight": 5.0,
+        "sources.traces.error_branches": 2,
+    }
+    trainer = TraceTrainer(make_config(tmp_path, models, **overrides))
+    student, teacher = trainer.student, trainer.routes["general"].teacher
+    plan = trainer.planners["traces"].plan(failing_trace(), TOOLS, random.Random(0), {})
+    assert {4, 8} <= {b.turn for b in plan.branches} and plan.turn_weights == {4: 5.0, 8: 2.0}
+    g = torch.Generator().manual_seed(1)
+    completions = [torch.randint(10, 1000, (2 + i,), generator=g).tolist() for i in range(len(plan.branches))]
+    sample = TraceSample(plan, completions, [[]] * len(completions), ["stop"] * len(completions), "general", {})
+    trainer.pipeline._score(sample)
+    kd_positions, kd_weights = plan.kd_positions(), plan.kd_weights()
+    branch_total = sum(len(c) * b.weight for b, c in zip(plan.branches, completions))
+    size = trainer.routes["general"].aligner.bridge.shared_vocab_size
+
+    student.zero_grad()
+    head = output_head(student)
+    for b, c, t_hidden in zip(plan.branches, completions, sample.teacher_hidden):
+        hidden = student.base_model(input_ids=torch.tensor([b.context + c[:-1]])).last_hidden_state[0, -len(c) :]
+        w = torch.full((len(c),), b.weight / branch_total)
+        fused_full_rkl(hidden, head, t_hidden, teacher.head, torch.tensor(c), w, size)[0].backward()
+    trunk = torch.tensor([plan.trunk])
+    s_trunk = student.base_model(input_ids=trunk).last_hidden_state[0, kd_positions]
+    w = 0.5 * torch.tensor(kd_weights) / sum(kd_weights)
+    targets = trunk[0, [p + 1 for p in kd_positions]]
+    fused_full_rkl(s_trunk, head, sample.teacher_kd_hidden, teacher.head, targets, w, size)[0].backward()
+    want = {n: p.grad.clone() for n, p in student.named_parameters() if p.grad is not None}
+
+    student.zero_grad()
+    stats = trainer._scores(TraceBatch([sample], 0, {}), train=True)  # the batch normalization included
+    got = {n: p.grad.clone() for n, p in student.named_parameters() if p.grad is not None}
+    for n in want:
+        err = float((got[n] - want[n]).norm() / want[n].norm().clamp(min=1e-30))
+        assert err < 1e-4, (n, err)
+    assert stats["error_tokens/general"] == sum(len(c) for b, c in zip(plan.branches, completions) if b.error)
+
+
+def test_teacher_cutoff_drops_the_turns_after_the_teacher_stops_endorsing(tmp_path, models, monkeypatch):
+    """The per-turn means are the teacher's own log-probs of the recorded tokens; the plan, the completions and the
+    teacher's states lose everything after the cutoff turn, and the remaining kd states are the right rows."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    from palingenesis.opd.trace_trainer import TraceTrainer
+    from palingenesis.opd.traces import TraceSample
+
+    def build(logp):
+        overrides = {
+            "rollout.group_size": 1,
+            "sources.traces.cutoff_logp": logp,
+            "sources.traces.branches_per_trace": 0,
+        }
+        return TraceTrainer(make_config(tmp_path, models, **overrides))
+
+    trainer = build(-1e-9)
+    teacher = trainer.routes["general"].teacher
+    plan = trainer.planners["traces"].plan(agent_trace(5), TOOLS, random.Random(0), {})
+    assert len(plan.turns) >= 4 and plan.kd_spans
+    lp = naive_teacher_logp(teacher.model, plan.trunk)  # lp[p] = log p(trunk[p + 1])
+    means = [float(lp[a - 1 : b - 1].mean()) for _, a, b in plan.turns]
+    # a threshold between the running sums after the second and third turns: the cut falls on the third turn
+    sums = torch.tensor(means).cumsum(0).tolist()
+    trainer = build((sums[1] + sums[2]) / 2)
+    cut_turn = plan.turns[2][0]
+    completions = [[11, 12, 13]] * len(plan.branches)
+    sample = TraceSample(plan, completions, [[]] * len(completions), ["stop"] * len(completions), "general", {})
+    sample.meta["_src"], sample.meta["_cutoff"] = "traces", True
+    trainer.pipeline._score(sample)
+    assert sample.cutoff["cut"] == 1 and sample.cutoff["logp_sum"] == pytest.approx(sum(means), abs=2e-2)
+    assert all(b.turn <= cut_turn for b in sample.plan.branches)
+    assert len(sample.completions) == len(sample.teacher_hidden) == len(sample.plan.branches) < len(plan.branches)
+    assert sample.plan.kd_spans and max(b for _, b in sample.plan.kd_spans) <= plan.turns[2][2]
+    with torch.no_grad():
+        want = teacher.model.base_model(input_ids=torch.tensor([plan.trunk])).last_hidden_state[0]
+    rows = sample.plan.kd_positions()
+    torch.testing.assert_close(sample.teacher_kd_hidden.float(), want[rows].float(), rtol=2e-2, atol=3e-2)
+    stats = trainer.pipeline._cut_stats([sample])
+    later = sum(b - a for k, a, b in plan.turns if k > cut_turn)
+    assert stats["cut_token_share"] == pytest.approx(later / sum(b - a for _, a, b in plan.turns))
+    assert stats["cut_trace_share"] == 1 and 0 < stats["cut_branch_share"] < 1
+
+
+def test_failed_turns_and_cutoff_in_a_training_run(tmp_path, models):
+    from palingenesis.opd.trace_trainer import TraceTrainer
+
+    overrides = {
+        "sources.traces.path": write_failing_traces(tmp_path / "fail.jsonl"),
+        "sources.traces.topic_teachers": {"coder": ["code"]},
+        "sources.traces.branches_per_trace": 1,
+        "sources.traces.error_patterns": ERRORS,
+        "sources.traces.error_weight": 2.0,
+        "sources.traces.first_error_weight": 3.0,
+        "sources.traces.success_field": "solved",
+        "sources.traces.error_branches": 1,
+        "sources.traces.cutoff_logp": -2.0,
+        "sources.traces.cutoff_window": 2,
+        "sources.traces.cutoff_tokens": 8,
+        "sources.traces.cutoff_weight": 0.5,  # a random tiny teacher disowns every turn: keep them, down-weighted
+        "rollout.group_size": 1,
+    }
+    trainer = TraceTrainer(make_config(tmp_path, models, **overrides))
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append((kind, step, metrics))
+    trainer.train()
+    steps = [m for kind, _, m in logged if kind == "step"]
+    evals = [m for kind, _, m in logged if kind == "eval"]
+    for m in steps:
+        assert {"cut_trace_share", "cut_token_share", "cut_branch_share", "teacher_turn_logp"} <= set(m)
+        assert m["teacher_turn_logp"] < 0 and 0 <= m["cut_token_share"] <= 1
+    assert any(m.get("error_branches", 0) > 0 and 0 < m["error_token_share"] <= 1 for m in steps)
+    assert any(k.startswith("kl_error/") for m in steps for k in m)
+    assert any("dev_kl_error/traces" in m for m in evals)
+    assert not any(k.startswith("cut_") for m in evals for k in m)  # dev: no cutoff
+
+
+class FakeVLLMServer:
+    """vLLM's /v1/completions with prompt_logprobs, computed by an HF model: the top-k and the actual token at
+    every prompt position (None at position 0), as the server returns them."""
+
+    def __init__(self, path):
+        self.model = transformers.AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32).eval()
+        self.requests = []
+
+    def complete(self, prompts, parallel=4, max_tokens=1, temperature=1.0, prompt_logprobs=1):
+        self.requests.append([len(p) for p in prompts])
+        choices = []
+        for i, ids in enumerate(prompts):
+            with torch.no_grad():
+                logp = torch.log_softmax(self.model(input_ids=torch.tensor([ids])).logits[0].float(), -1)
+            entries = [None]
+            for t in range(1, len(ids)):
+                row = logp[t - 1]
+                top = row.topk(prompt_logprobs)
+                entry = {str(int(j)): {"logprob": float(v), "rank": r + 1} for r, (v, j) in enumerate(zip(*top))}
+                rank = int((row > row[ids[t]]).sum()) + 1
+                entry.setdefault(str(ids[t]), {"logprob": float(row[ids[t]]), "rank": rank})
+                entries.append(entry)
+            choices.append({"index": i, "prompt_logprobs": entries})
+        return choices
+
+
+@pytest.fixture
+def vllm_teacher(monkeypatch, models):
+    from palingenesis.opd.teachers import VLLMTeacher
+    from palingenesis.opd.trace_trainer import TraceTrainer
+
+    servers = {}
+
+    def fake(self, name, teacher):
+        servers[name] = FakeVLLMServer(teacher.model)
+        return VLLMTeacher(servers[name])
+
+    monkeypatch.setattr(TraceTrainer, "_vllm_teacher", fake)
+    return servers
+
+
+def test_vllm_teacher_trace_loss_equals_naive_topk_kl(tmp_path, models, vllm_teacher, monkeypatch):
+    """A vLLM teacher: sparse targets from prompt log-probs of each regenerated turn (its full context) and of the
+    trunk; the trace loss equals topk_kl turn by turn against the same server's answers."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    from palingenesis.logits import output_head
+    from palingenesis.opd import losses
+    from palingenesis.opd.trace_trainer import TraceBatch, TraceTrainer
+    from palingenesis.opd.traces import TraceSample
+
+    trainer = TraceTrainer(
+        make_config(tmp_path, models, **{"rollout.group_size": 1, "teachers.general.backend": "vllm", "loss.top_k": 4})
+    )
+    student, server = trainer.student, vllm_teacher["general"]
+    plan = trainer.planners["traces"].plan(agent_trace(4), TOOLS, random.Random(0), {})
+    completions = [[21 + i, 400, 7 + i] for i in range(len(plan.branches))]
+    sample = TraceSample(plan, completions, [[]] * len(completions), ["stop"] * len(completions), "general", {})
+    trainer.pipeline._score(sample)
+    # one request per regenerated turn (context + completion) and one for the trunk
+    assert server.requests[-1] == [len(b.context) + len(c) for b, c in zip(plan.branches, completions)] + [
+        len(plan.trunk)
+    ]
+    kd_positions = plan.kd_positions()
+    assert sample.teacher_kd_hidden.topk_ids.shape == (len(kd_positions), 4)
+    size = trainer.routes["general"].aligner.bridge.shared_vocab_size
+    vocab = losses.SharedVocab(size, {})
+    head = output_head(student)
+
+    def topk(hidden, targets, lp_rows, weights):
+        """topk_kl against the teacher's full log-probs restricted to its top-4 plus the realized token."""
+        top = lp_rows.topk(4)
+        token_lp = lp_rows.gather(1, targets[:, None]).squeeze(1)
+        in_top = (top.indices == targets[:, None]).any(1, keepdim=True)
+        support = torch.cat([top.indices, targets[:, None]], 1)
+        valid = torch.cat([torch.ones_like(top.values, dtype=torch.bool), ~in_top], 1)
+        lp = torch.cat([top.values, token_lp[:, None]], 1)
+        return losses.topk_kl(hidden, head, targets, weights, vocab, support, lp, valid, token_lp)[0]
+
+    student.zero_grad()
+    total = sum(len(c) for c in completions)
+    for b, c in zip(plan.branches, completions):
+        ids = b.context + c
+        with torch.no_grad():
+            lp = torch.log_softmax(server.model(input_ids=torch.tensor([ids])).logits[0, -len(c) - 1 : -1].float(), -1)
+        hidden = student.base_model(input_ids=torch.tensor([ids[:-1]])).last_hidden_state[0, -len(c) :]
+        topk(hidden, torch.tensor(c), lp, torch.full((len(c),), 1 / total)).backward()
+    with torch.no_grad():
+        lp = torch.log_softmax(server.model(input_ids=torch.tensor([plan.trunk])).logits[0].float(), -1)
+    trunk_hidden = student.base_model(input_ids=torch.tensor([plan.trunk])).last_hidden_state[0, kd_positions]
+    targets = torch.tensor([plan.trunk[p + 1] for p in kd_positions])
+    w = torch.full((len(kd_positions),), 0.5 / len(kd_positions))
+    topk(trunk_hidden, targets, lp[kd_positions], w).backward()
+    want = {n: p.grad.clone() for n, p in student.named_parameters() if p.grad is not None}
+
+    student.zero_grad()
+    trainer._scores(TraceBatch([sample], 0, {}), train=True)
+    got = {n: p.grad.clone() for n, p in student.named_parameters() if p.grad is not None}
+    assert got.keys() == want.keys()
+    for n in want:
+        err = float((got[n] - want[n]).norm() / want[n].norm().clamp(min=1e-30))
+        assert err < 1e-4, (n, err)
+
+
+def test_vllm_teacher_in_a_training_run_with_cutoff(tmp_path, models, vllm_teacher):
+    """One vLLM teacher next to an hf one, the cutoff reading the vLLM teacher's prompt log-probs."""
+    from palingenesis.opd.trace_trainer import TraceTrainer
+
+    overrides = {
+        "teachers.coder.backend": "vllm",
+        "loss.top_k": 3,
+        "sources.traces.cutoff_logp": -3.0,
+        "rollout.group_size": 1,
+    }
+    trainer = TraceTrainer(make_config(tmp_path, models, **overrides))
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append((kind, step, metrics))
+    trainer.train()
+    steps = [m for kind, _, m in logged if kind == "step"]
+    assert all(m["grad_norm"] > 0 and "teacher_turn_logp" in m for m in steps)
+    assert any(k.startswith("kl/coder") for m in steps for k in m) and vllm_teacher["coder"].requests
+
+
+def test_failed_turn_and_cutoff_config_validation(tmp_path, models):
+    from palingenesis.opd.config import OPDConfigError
+
+    def invalid(match, **overrides):
+        with pytest.raises(OPDConfigError, match=match):
+            make_config(tmp_path, models, **overrides).validate()
+
+    invalid("need a failure signal", **{"sources.traces.error_weight": 2.0})
+    invalid("not a regular expression", **{"sources.traces.error_patterns": ["("]})
+    invalid("must be >= 0", **{"sources.traces.error_patterns": ["x"], "sources.traces.error_weight": -1.0})
+    invalid(
+        "error_branches needs",
+        **{
+            "sources.traces.error_patterns": ["x"],
+            "sources.traces.error_branches": 1,
+            "loss.trace_branch_weight": 0.0,
+        },
+    )
+    invalid("success_field only selects", **{"sources.traces.success_field": "solved"})
+    invalid("cutoff_logp is a log-prob", **{"sources.traces.cutoff_logp": 1.0})
+    invalid("cutoff_window and cutoff_tokens", **{"sources.traces.cutoff_window": -1})
+    invalid("cutoff_weight must be", **{"sources.traces.cutoff_weight": 1.0})
+    invalid("topk_kl from a vllm teacher", **{"teachers.coder.backend": "vllm", "teachers.coder.loss": "full_rkl"})
+    invalid("loss.top_k >= 1", **{"teachers.coder.backend": "vllm", "loss.top_k": 0})
+    make_config(tmp_path, models, **{"teachers.coder.backend": "vllm"}).validate()  # a vllm teacher is allowed

@@ -222,17 +222,25 @@ class VLLMTeacher:
             raise ValueError("a vLLM teacher returns only its top-k: rs_kd needs an hf teacher")
         if keep_hidden:
             raise ValueError("a vLLM teacher has no hidden states for full_rkl; use topk_kl or sampled_rkl")
-        choices = self.server.complete(
-            [v.input_ids for v in views], max_tokens=1, temperature=1.0, prompt_logprobs=max(top_k, 1)
+        return self.score_targets(
+            [v.input_ids for v in views], [range(v.prompt_len, len(v.input_ids)) for v in views], top_k
         )
-        return [self._parse(view, choice["prompt_logprobs"], top_k) for view, choice in zip(views, choices)]
+
+    def score_targets(self, sequences: list[list[int]], targets: list, top_k: int = 0) -> list[TeacherScores]:
+        """Per sequence, the teacher's log-prob of the tokens at the `targets` indices (each given the tokens
+        before it) and its top-k there. One prefill-only request per sequence."""
+        choices = self.server.complete(sequences, max_tokens=1, temperature=1.0, prompt_logprobs=max(top_k, 1))
+        return [
+            self._parse(ids, positions, choice["prompt_logprobs"], top_k)
+            for ids, positions, choice in zip(sequences, targets, choices)
+        ]
 
     @staticmethod
-    def _parse(view: TeacherView, prompt_logprobs: list, top_k: int) -> TeacherScores:
+    def _parse(input_ids: list[int], positions, prompt_logprobs: list, top_k: int) -> TeacherScores:
         token_lp, topk_ids, topk_lp = [], [], []
-        for pos in range(view.prompt_len, len(view.input_ids)):
+        for pos in positions:
             entries = prompt_logprobs[pos]
-            actual = entries.get(str(view.input_ids[pos]))
+            actual = entries.get(str(input_ids[pos]))
             if actual is None:
                 raise RuntimeError(f"vLLM returned no log-prob for the actual token at position {pos}")
             token_lp.append(_finite(actual["logprob"]))

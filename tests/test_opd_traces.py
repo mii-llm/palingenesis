@@ -303,3 +303,93 @@ def test_onset_kd_tokens_cut_the_inside_of_a_run(tok):
     # without the scan the last turn is not a recorded target (its context is the trunk)
     plain = planner(tok).plan(msgs, TOOLS, random.Random(0))
     assert len(plain.kd_spans) == len(full.kd_spans) - 1
+
+
+# ---------------------------------------------------------------- failed turns and the teacher cutoff
+
+
+def failing_trace():
+    """agent_trace(5) whose turns 1 and 3 (message indices 4 and 8) got an error back from the harness."""
+    msgs = agent_trace(5)
+    msgs[5]["content"] = "Error: the text occurs 0 times in file1.py"
+    msgs[9]["content"] = "bash: foo: command not found"
+    return msgs
+
+
+def test_failed_turns_from_observations_fields_and_invalid_calls():
+    from palingenesis.opd.traces import FailedTurns, failed_turn_weights, failed_turns
+
+    msgs = failing_trace()
+    assert failed_turns(msgs, TOOLS, FailedTurns()) == []  # no signal configured: nothing detected
+    rules = FailedTurns(patterns=("^Error:", "command not found"))
+    assert failed_turns(msgs, TOOLS, rules) == [4, 8]
+    # only the configured roles are observations: a user nudge does not count unless asked for
+    nudged = agent_trace(2)
+    nudged.insert(5, {"role": "user", "content": "Error: you did not call a tool."})
+    assert failed_turns(nudged, TOOLS, FailedTurns(patterns=("^Error:",))) == []
+    assert failed_turns(nudged, TOOLS, FailedTurns(patterns=("^Error:",), roles=("tool", "user"))) == [4]
+    # a per-message error record, on the assistant turn or on its observation
+    flagged = agent_trace(3)
+    flagged[2]["error"] = "timeout"
+    flagged[7]["error"] = True
+    assert failed_turns(flagged, TOOLS, FailedTurns(field="error")) == [2, 6]
+    # calls to an undeclared tool, or with arguments that never parsed to an object
+    bad = agent_trace(3)
+    bad[2]["tool_calls"][0]["function"]["name"] = "cat"
+    bad[4]["tool_calls"][0]["function"]["arguments"] = '{"command": "ls'
+    assert failed_turns(bad, TOOLS, FailedTurns(invalid_calls=True)) == [2, 4]
+    assert failed_turns(bad, None, FailedTurns(invalid_calls=True)) == [4]  # no declared tools: names unchecked
+    # weights: the first failed turn of a failed episode gets its own
+    rules = FailedTurns(patterns=("^Error:",), weight=2.0, first_weight=4.0, success_field="solved")
+    assert failed_turn_weights([4, 8], rules, rules.episode_failed({"solved": False})) == {4: 4.0, 8: 2.0}
+    assert failed_turn_weights([4, 8], rules, rules.episode_failed({"solved": True})) == {4: 2.0, 8: 2.0}
+    assert [rules.episode_failed({"solved": v}) for v in (0.0, 1.0, None, "yes")] == [True, False, True, False]
+    assert FailedTurns(patterns=("x",), success_field="").episode_failed({"solved": True})  # empty: every episode
+    assert not FailedTurns(patterns=("x",)).active and FailedTurns(patterns=("x",), branches=1).active
+
+
+def test_failed_turns_weight_branches_and_recorded_tokens(tok):
+    from palingenesis.opd.traces import FailedTurns
+
+    msgs = failing_trace()
+    rules = FailedTurns(patterns=("^Error:", "command not found"), weight=2.0, first_weight=3.0, branches=2)
+    plan = planner(tok, branches_per_trace=1, failures=rules).plan(msgs, TOOLS, random.Random(0))
+    plain = planner(tok, branches_per_trace=1).plan(msgs, TOOLS, random.Random(0))
+    turns = {b.turn for b in plan.branches}
+    assert {4, 8} <= turns and {b.turn for b in plain.branches} <= turns  # the random choice is kept
+    for b in plan.branches:
+        assert b.error == (b.turn in (4, 8))
+        assert b.weight == {4: 3.0, 8: 2.0}.get(b.turn, 1.0)
+    assert plan.turn_weights == {4: 3.0, 8: 2.0}
+    # recorded-turn distillation: each kd token carries its turn's weight
+    weights = dict(zip(plan.kd_positions(), plan.kd_weights()))
+    for k, a, b in plan.turns:
+        assert {weights[p] for p in range(a - 1, b - 1)} == {plan.turn_weights.get(k, 1.0)}
+    assert len(plan.kd_weights()) == len(plan.kd_positions())
+    # the failures off: identical plan to before
+    assert plain.kd_weights() == [1.0] * len(plain.kd_positions()) and not plain.turns
+
+
+def test_teacher_cutoff_statistic_and_plan():
+    from palingenesis.opd.traces import BranchPlan, TeacherCutoff, TracePlan, apply_cutoff
+
+    stride = TeacherCutoff(logp=-1.5)  # STRIDE: the sum of per-turn means from the first turn
+    assert stride.cut_index([-0.2, -0.3, -0.4, -0.9]) == 3  # -1.8 at the fourth turn
+    assert stride.cut_index([-0.2, -0.3]) is None
+    window = TeacherCutoff(logp=-1.0, window=2)  # the mean of the last two turns
+    assert window.cut_index([-0.2, -0.3, -0.4, -0.9, -2.0]) == 4  # (-0.9 - 2.0) / 2
+    assert window.cut_index([-3.0]) == 0
+    assert not TeacherCutoff().active and TeacherCutoff(logp=-1).active
+    assert TeacherCutoff(logp=-1, tokens=2).positions([(2, 10, 20), (4, 30, 31)]) == [[9, 10], [29]]
+
+    turns = [(2, 10, 20), (4, 30, 40), (6, 50, 60)]
+    branches = [BranchPlan(k, [0] * a, a - 1, [0]) for k, a in ((2, 10), (4, 30), (6, 50))]
+    branches.append(BranchPlan(4, [0] * 35, 34, [0], onset=True))  # inside turn 4
+    plan = TracePlan([0] * 61, branches, [(10, 20), (30, 40), (50, 60)], turns, {6: 2.0})
+    cut, keep = apply_cutoff(plan, 4, 0.0)
+    assert keep == [0, 1, 3] and [b.turn for b in cut.branches] == [2, 4, 4]
+    assert cut.kd_spans == [(10, 20), (30, 40)]
+    weighted, keep = apply_cutoff(plan, 4, 0.25)
+    assert keep == [0, 1, 2, 3] and weighted.branches[2].weight == 0.25 and plan.branches[2].weight == 1.0
+    assert weighted.kd_spans == plan.kd_spans and weighted.turn_weights == {6: 0.5}
+    assert weighted.kd_weights() == [1.0] * 20 + [0.5] * 10

@@ -301,7 +301,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `model` | str | — | Teacher model. |
 | `tokenizer` | str | `""` | Tokenizer to render and score with (empty = the model's). |
 | `backend` | str | `hf` | `hf`: in-process, frozen bf16, full distribution. `vllm`: a vLLM server scoring prefill-only top-k log-probs (launched on the student's GPU, or reached at `url`). |
-| `loss` | str | `""` | `full_rkl`, `topk_kl`, `sampled_rkl`, `xtok` or `rs_kd`. Empty = `full_rkl` (hf) or `topk_kl` (vllm) for a teacher sharing the student's vocabulary, `xtok` otherwise. `full_rkl` and `rs_kd` need the hf backend; all but `xtok` need a shared vocabulary (checked when the tokenizers load). |
+| `loss` | str | `""` | `full_rkl`, `topk_kl`, `sampled_rkl`, `xtok` or `rs_kd`. Empty = `full_rkl` (hf) or `topk_kl` (vllm) for a teacher sharing the student's vocabulary, `xtok` otherwise. `full_rkl` and `rs_kd` need the hf backend; all but `xtok` need a shared vocabulary (checked when the tokenizers load). agent_traces runs: `full_rkl` (hf) or `topk_kl` (vllm). |
 | `device` | str | `""` | hf: device (empty = the student's), e.g. `cuda:1`. |
 | `offload` | bool | `false` | hf: keep the model on CPU between scoring calls (the output head stays on the device). |
 | `url` | str | `""` | vllm: an already running server. |
@@ -325,6 +325,18 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `onset_branches` | int | `0` | agent_traces: extra regenerated turns per trace starting mid-turn where a recorded assistant turn begins to repeat earlier assistant text (`opd.traces.repetition_runs`; for the student's own episodes). 0 = off. |
 | `onset_kd_tokens` | int | `-1` | agent_traces, with `trace_kd_weight`: recorded-turn distillation keeps this many tokens of each repetitive run (-1 = all). |
 | `onset_ngram` / `onset_window` / `onset_threshold` / `onset_common` | int / int / float / float | `6` / `32` / `0.75` / `0.5` | The repetition scan: n-gram length, window, share of repeated tokens that starts a run, share of earlier turns above which an n-gram is scaffolding. |
+| `error_patterns` | list | `[]` | agent_traces: regular expressions (`re.search`) on the observations answering an assistant turn (messages up to the next assistant turn with a role in `error_roles`); a match marks the turn's tool call as failed (`opd.traces.FailedTurns`). |
+| `error_roles` | list | `[tool]` | agent_traces: roles of the observation messages `error_patterns` and `error_field` read. |
+| `error_field` | str | `""` | agent_traces: a per-message key marking an error when truthy, on the assistant turn or its observations. |
+| `error_invalid_calls` | bool | `false` | agent_traces: a call to a tool the trace does not declare, or with arguments that are not a JSON object, marks a failed turn. |
+| `error_weight` | float | `1.0` | agent_traces: loss weight of a failed turn's tokens, regenerated and recorded (weights renormalized over the batch). Needs a failure signal above. |
+| `first_error_weight` | float | `1.0` | agent_traces: loss weight of the first failed turn of a failed episode (replaces `error_weight` there). |
+| `success_field` | str | `""` | agent_traces: row field telling whether the episode succeeded (falsy or <= 0 = failed); `first_error_weight` applies to failed episodes only. Empty = every episode. |
+| `error_branches` | int | `0` | agent_traces: extra regenerated turns per trace at failed turns, the first one first. |
+| `cutoff_logp` | float | `0.0` | agent_traces: teacher-reliability cutoff (`opd.traces.TeacherCutoff`, STRIDE): supervision stops after the first recorded turn where the statistic of per-turn mean teacher log-probs falls below this (< 0; 0 = off). Training only. |
+| `cutoff_window` | int | `0` | 0: the statistic is the sum of per-turn means from the first turn (STRIDE); W >= 1: their mean over the last W turns. |
+| `cutoff_tokens` | int | `0` | Each turn's mean covers its first this many tokens (0 = all). |
+| `cutoff_weight` | float | `0.0` | Loss weight of the turns after the cutoff, recorded and regenerated (0 = dropped; < 1). |
 | `max_context` | int | `32768` | agent_traces: longest context (tokens) a regenerated turn may have; later turns are not sampled. |
 | `max_new_tokens` | int | `512` | Completion budget (mcqa: fast-template prompts). |
 | `dev_size` | int | `200` | Held-out rows split off `path` (deterministic, hash-ranked, unique). |

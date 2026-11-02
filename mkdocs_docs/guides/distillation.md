@@ -324,6 +324,97 @@ student is trained; what it learns there is the teacher's distribution. Screen t
 from the student's onset states it should continue differently from the student (a teacher that loops from there
 teaches the loop). Mix the teacher-trace source back in, so the run keeps what the student learned from it.
 
+### Failed tool calls and where the teacher stops being reliable
+
+Two more options for the student's own episodes, both off by default.
+
+```yaml
+sources:
+  own:
+    format: agent_traces
+    path: data/student_episodes.jsonl
+    branches_per_trace: 2
+    # failed tool calls: what the harness answered, read from the data
+    error_patterns: ["^Error:", "command not found", "No such file or directory"]
+    error_invalid_calls: true          # a call to an undeclared tool, or arguments that are not a JSON object
+    error_weight: 2.0                  # loss weight of a failed turn's tokens
+    first_error_weight: 3.0            # the first failed turn of a failed episode
+    success_field: solved              # row field: falsy or <= 0 = the episode failed
+    error_branches: 2                  # plus up to 2 turns regenerated at failed turns, the first one first
+    # teacher-reliability cutoff
+    cutoff_logp: -2.0                  # stop supervising where the statistic falls below -2
+    cutoff_window: 0                   # 0: STRIDE's sum of per-turn means from the first turn; W: mean of the last W
+    cutoff_tokens: 150                 # each turn's mean over its first 150 tokens (0 = all)
+    cutoff_weight: 0.0                 # turns after the cutoff: dropped (or down-weighted, e.g. 0.25)
+```
+
+**Failed turns.** A turn whose tool call failed is a state the student caused and must learn to avoid, and where
+its episode starts to drift. SAGE-OPD (2606.19659) gives such deterministic failures (malformed actions, failed tool
+calls) full weight while down-weighting other turns, and STRIDE (2609.14636) finds the teacher's endorsement of a
+student trajectory drops at its first wrong action, not gradually with the turn index. Failures are read from the
+data, never from the rendered text, so any harness and chat template qualify:
+
+- `error_patterns`: regular expressions (`re.search`) on the observations that answer the turn, i.e. the messages
+  after it up to the next assistant turn whose role is in `error_roles` (default `[tool]`; add `user` for harnesses
+  that answer a malformed turn with a user message). Choose patterns that mean "the call did not run as intended"
+  (an edit that matched nothing, an unknown command); a test run that fails is information, not a failed call.
+- `error_field`: a per-message key that marks an error when truthy, on the assistant turn or on its observations
+  (for episodes that record one).
+- `error_invalid_calls`: a call to a tool the trace does not declare, or with arguments that never parsed to a JSON
+  object.
+
+`error_weight` scales every token of a failed turn, regenerated or recorded; `first_error_weight` replaces it for
+the first failed turn of an episode that failed (`success_field`; empty = every episode), a cheap stand-in for the
+first wrong action. The loss stays a weighted mean: the per-token weights are renormalized over the batch, as in
+SAGE-OPD's normalization, so the loss scale does not move with the share of failed turns. With
+`branches_per_trace` small, a random choice of turns rarely lands on the failed ones: `error_branches` adds
+regenerated turns there. Reported as `error_branches` and `error_token_share` (the share of regenerated tokens on
+failed turns) per step, `kl_error/<teacher>` (the KL on those turns) and `eval/dev_kl_error/<source>`.
+
+**The teacher-reliability cutoff.** Deep into a drifted episode the teacher reads a history it would never have
+written, and its targets there are least reliable (teacher perplexity on student tokens grows with the turn index,
+Guided-OPD 2606.15912). STRIDE stops a rollout once the running sum of per-turn mean teacher log-probs of the
+student's tokens falls below λ (−1 to −3 on τ²-bench), keeping the turn that crossed it, and finds the informative
+part of a turn in its first ~150 tokens. Here, per recorded turn k inside the trunk, `l_k` is the teacher's mean
+log-prob of the turn's recorded tokens (its first `cutoff_tokens`); the statistic is the sum `l_1 + ... + l_k`
+(`cutoff_window: 0`, STRIDE's; it grows with the number of turns, so on long episodes it acts partly as a turn
+budget) or the mean of the last `cutoff_window` values (a per-token scale, independent of the episode's length; e.g.
+`cutoff_window: 3, cutoff_logp: -1.5`). At the first turn where it falls below `cutoff_logp`, the turns after it,
+recorded and regenerated (their context holds it), get `cutoff_weight`: 0 drops them. The teacher computes these
+log-probs in the pass it makes anyway; turns are chosen before the teacher reads the trace, so the regenerated turns
+it then drops have cost a rollout. Screen λ on the teacher's log-probs over a sample of episodes first (the
+`teacher_turn_logp` metric reports their mean). Reported per step as `cut_trace_share` (traces cut),
+`cut_token_share` (recorded-turn tokens after the cutoff), `cut_branch_share` (regenerated turns after it) and
+`teacher_turn_logp` (mean per-turn teacher log-prob of the recorded turns: it should rise as the student improves,
+STRIDE's progress signal). Training only: evaluation scores every held-out turn the same way in every configuration.
+
+### A vLLM teacher for agent traces
+
+An `hf` teacher reads each trace once in bf16 next to the student. A teacher too large for that (a 27B in bf16 is
+~54 GB) can run as a vLLM server instead, quantized (`vllm_args: ["--quantization", "fp8"]`, weight-only on GPUs
+without fp8 compute), and the student trains on `topk_kl` against its top-k:
+
+```yaml
+teachers:
+  big:
+    model: Qwen/Qwen3.5-27B
+    backend: vllm
+    gpu_memory_utilization: 0.45
+    vllm_args: ["--quantization", "fp8"]
+loss: {top_k: 16, trace_kd_weight: 0.5}
+rollout: {backend: vllm, prefix_caching: true, max_model_len: 69632}   # also the teacher server's context
+```
+
+Each regenerated turn is one prefill-only request (its context and completion; `prompt_logprobs` gives the top-k and
+the student token's log-prob at every position), and the trunk one more when recorded turns are distilled or the
+cutoff is on. The cost differs from an `hf` teacher's in two ways. vLLM computes prompt log-probs without its prefix
+cache, so every regenerated turn costs a full prefill of its context (an `hf` teacher reads the shared context once
+per trace): keep `branches_per_trace` small on long traces. And the response carries `top_k` entries for every
+position of the context, not only the completion's, so its size grows with context × `top_k`. The targets are sparse
+(the teacher's top-k plus the student's token, the rest in one tail bucket), so `kl/<teacher>` is the coarse KL.
+The path is tested against a mock server on CPU (its loss equals `topk_kl` turn by turn); the sizes above are
+illustrative, so check the teacher server's and the trainer's memory together on a short run first.
+
 ## Multiple-choice pools
 
 `format: mcqa` sources train on multiple-choice pools in a benchmark's exact prompt format (`configs/distill_opd.yaml` carries ITALIC's verbatim templates), with the reference shots, random pool shots and zero-shot mixed per prompt, and greedy letter accuracy as the dev metric.
@@ -355,6 +446,9 @@ A source is any object with `sample()` (messages, max_new_tokens, meta), `evalua
 | `eval/dev_kl/<source>` | `k1` on held-out prompts, sampled on-policy: the quantity being trained, out of sample |
 | `eval/dev_kl_full/<source>` | exact per-token reverse KL (full_rkl teachers) |
 | `eval/dev_acc/<source>` | greedy accuracy (messages rows with an `answer`, mcqa letters) |
+| `kl_onset/<teacher>`, `kl_error/<teacher>`, `eval/dev_kl_onset/<source>`, `eval/dev_kl_error/<source>` | agent traces: the KL on regenerated turns that start at a repetition onset, or regenerate a turn whose tool call failed |
+| `error_branches`, `error_token_share` | agent traces with failed-turn detection: regenerated turns at failed turns, and their share of regenerated tokens |
+| `cut_trace_share`, `cut_token_share`, `cut_branch_share`, `teacher_turn_logp` | agent traces with the teacher cutoff: traces cut, recorded tokens and regenerated turns after the cutoff, the teacher's mean per-turn log-prob of the recorded turns |
 | `residual_mass/<teacher>` | student mass on tokens the teacher cannot see; stays ≈ 0 |
 | `is_dropped/<teacher>`, `abs_log_ratio/<teacher>` | policy-gradient losses: tokens outside the importance-ratio range, and the mean trainer/rollout log-prob gap |
 | `dense_kl/<teacher>`, `dense_fraction/<teacher>` | xtok dense term: its KL per supervised position, and the share of tokens that have one |
