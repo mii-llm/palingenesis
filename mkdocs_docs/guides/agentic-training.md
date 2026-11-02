@@ -157,6 +157,39 @@ The default is `uniform`. The case for `progressive`: in a 10-turn trace, the ea
 
 ---
 
+## Repetition loops and runaway episodes
+
+A small student distilled from a stronger teacher often repeats a failed tool call, writes the same reasoning sentence
+over and over, or keeps calling tools after the task is done. The cause is the student's own uncertainty at hard
+decision points, amplified by repetition: once a call or sentence is in the context, repeating it becomes more likely
+(arXiv 2512.12895). Measure it before fixing it: the share of episodes with a loop and how episodes end (the model
+stops, hits the per-turn token limit, or hits the turn limit), at the sampling you deploy, in each thinking mode.
+
+Two levels of fix:
+
+- **During SFT** (`data` keys, all opt-in): `loop_recovery` and `reasoning_loop_recovery` paste untrained copies of a
+  call or a sentence so the model sees itself mid-loop and is trained on the gold way out; `repeat_unlikelihood`
+  lowers the probability of continuing a repeat exactly where the gold escapes, and `stop_unlikelihood` lowers the
+  probability of another tool call in the final reply. They need `memory.seco: true`. Watch `train/repeat_p` and
+  `train/stop_p`: both should fall. These remove the loop forms they target; they do not teach recovery from states
+  the teacher's traces never contain.
+
+  ```yaml
+  memory: {seco: true}
+  data:
+    loop_recovery: 0.2
+    reasoning_loop_recovery: 0.2
+    repeat_unlikelihood: 20.0
+    stop_unlikelihood: 5.0
+  ```
+
+- **On the student's own episodes** (the cause): record the student's episodes and distil a teacher on them, with
+  extra branches where the student starts to repeat itself, extra weight on failed calls, and a cutoff where the
+  teacher stops being reliable. See [Distillation: agent traces](distillation.md#the-students-own-episodes-training-where-it-starts-to-repeat-itself).
+
+At inference, `presence_penalty` (in rollout and eval sampling, e.g. `sampling_mix` entries of a distillation source)
+reduces repetition without training; it is a stopgap, not a fix.
+
 ## Example config for agentic traces
 
 ```yaml title="agentic config (Qwen3.5, long traces)"

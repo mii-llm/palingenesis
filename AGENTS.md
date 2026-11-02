@@ -75,6 +75,15 @@ Training issue?
 │   ├── Check: python -m palingenesis.agent_tooling.profile_memory --config ... --gpu_memory_gb 80
 │   ├── Likely causes: Seq too long, batch too big, no checkpointing
 │   └── Fix: Enable chunked_loss, selective AC, reduce seq/batch, add FSDP/CP
+├── Trained model loops, rambles to the token limit, or never stops calling tools
+│   ├── Measure: the loop share and how episodes end (stop / length limit / turn limit) at deployment sampling,
+│   │   in both thinking modes; during SFT watch train/repeat_p and train/stop_p
+│   ├── Likely cause: exposure bias: teacher-forced data never shows the student its own failure states
+│   ├── SFT fix (removes enumerated loop forms): data.loop_recovery, data.reasoning_loop_recovery,
+│   │   data.repeat_unlikelihood, data.stop_unlikelihood (need memory.seco; no packing / pretokenize)
+│   ├── Root-cause fix: OPD on the student's own episodes (agent_traces source) with onset_branches,
+│   │   error_patterns / error_weight / first_error_weight, cutoff_logp (see the distillation guide)
+│   └── Stopgap at inference: presence_penalty (sampling)
 ├── Training too slow
 │   ├── Check: python -m palingenesis.agent_tooling.monitor_run --log_file ... --brief
 │   ├── Likely causes: Data loading bottleneck, no compile, small batch
@@ -82,6 +91,13 @@ Training issue?
 └── Want to verify everything is OK before starting
     └── Run: python -m palingenesis.agent_tooling.diagnose --config ... --mode pre --json
 ```
+
+## In-process use (scripts, notebooks)
+
+`palingenesis.train.train(Config)` runs SFT / DPO in-process on one GPU and returns a `TrainResult` (output_dir,
+global_step, metrics, best_eval_loss); `RLTrainer(...).train()` and `OPDTrainer(...).train()` also run in-process.
+Multi-GPU needs `torchrun` (`pgs train`). `pgs init <name>` writes an example config. See the "Training from a
+notebook" docs page.
 
 ## Exit Codes
 
@@ -100,3 +116,5 @@ Use `--json` flag (where available) for structured output suitable for programma
 | No improvement | Increase LR, check masking with `validate_masking` |
 | Slow throughput | `model.compile: true`, `data.packing: true`, increase `data.num_workers` |
 | Long seq OOM | `parallel.context_parallel: true`, `memory.loss_num_chunks: 16` |
+| Repetition loops after SFT | `data.loop_recovery: 0.2`, `data.reasoning_loop_recovery: 0.2`, `data.repeat_unlikelihood: 20`, `data.stop_unlikelihood: 5` (with `memory.seco: true`) |
+| Agent drifts on its own errors | OPD `sources.<name>.format: agent_traces` on the student's episodes + `onset_branches`, `error_patterns`, `cutoff_logp` |
