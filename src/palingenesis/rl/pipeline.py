@@ -81,7 +81,8 @@ class RLPipeline:
         self.rollout_start = 0.0  # loop time the current batch's collection started
         self.dropped: list[list[Trajectory]] = []  # zero-variance groups of the batch (dumps)
         self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self.loop.run_forever, name="pgs-rl-rollouts", daemon=True).start()
+        self.loop_thread = threading.Thread(target=self.loop.run_forever, name="pgs-rl-rollouts", daemon=True)
+        self.loop_thread.start()
 
     def _await(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
@@ -698,7 +699,25 @@ class RLPipeline:
             except Exception:  # noqa: BLE001 — best effort at shutdown
                 logger.warning("sandbox close failed", exc_info=True)
         self.client.close()
-        self.loop.call_soon_threadsafe(self.loop.stop)
+        # Release the threads (a notebook runs many trainings in one process): the loop's default executor
+        # (to_thread / run_in_executor calls), then the loop and its thread.
+        if self.loop.is_running():
+
+            async def drain():
+                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.loop.shutdown_default_executor()
+
+            try:  # bounded: a tool call stuck in a worker thread must not hang the shutdown
+                asyncio.run_coroutine_threadsafe(drain(), self.loop).result(timeout=60)
+            except Exception:  # noqa: BLE001 — best effort at shutdown
+                logger.warning("rollout executor shutdown failed", exc_info=True)
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.loop_thread.join(timeout=10)
+        if not self.loop.is_running() and not self.loop.is_closed():
+            self.loop.close()
 
 
 def _timeline_stats(timeline: list[tuple[float, int, int]]) -> dict[str, float]:

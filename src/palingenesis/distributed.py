@@ -33,7 +33,10 @@ def setup_distributed() -> tuple[int, int, int]:
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
-    torch.cuda.set_device(local_rank)
+    # Without a usable GPU the caller raises its own, explanatory error (set_device would fail first with a
+    # less helpful one).
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size
 
 

@@ -6,6 +6,16 @@
 
 ## Commands
 
+### init
+
+Write a shipped example config to start from (works after `pip install`, no checkout needed).
+
+```bash
+pgs init --list              # sft, dpo, distill, rl
+pgs init sft                 # ./sft.yaml
+pgs init rl my_rl.yaml       # another file name (--force overwrites)
+```
+
 ### train
 
 The main training command. Usually launched via `torchrun` for proper distributed setup.

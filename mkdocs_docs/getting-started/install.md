@@ -12,7 +12,29 @@
 
 ## Install
 
-=== "uv sync (recommended)"
+!!! warning "Linux + pip: install the CUDA build of torch first"
+    `pip install palingenesis` pulls torch from PyPI, whose Linux wheels target the newest CUDA (torch 2.14: CUDA 13.0, NVIDIA driver ≥ 580). Package metadata cannot name PyTorch's index, so on Linux install torch from a CUDA index your driver supports **before** palingenesis:
+
+    ```bash
+    pip install "torch>=2.11" --index-url https://download.pytorch.org/whl/cu129   # driver >= 575
+    pip install "palingenesis[train,logging]"
+    ```
+
+    With uv: `uv pip install "torch>=2.11" --index-url https://download.pytorch.org/whl/cu129` then `uv pip install "palingenesis[train,logging]"`. A source checkout with `uv sync` (below) does this automatically.
+
+=== "pip install (from PyPI)"
+
+    ```bash
+    python -m venv .venv && source .venv/bin/activate
+    pip install "torch>=2.11" --index-url https://download.pytorch.org/whl/cu129   # Linux: FIRST, the CUDA build
+    pip install "palingenesis[train,logging]"
+    pgs init sft                      # writes ./sft.yaml, an example config to edit
+    pgs train --config sft.yaml
+    ```
+
+    `pgs init --list` shows the shipped examples (`sft`, `dpo`, `distill`, `rl`). The larger configs referenced in these docs (`configs/...`) are in the [repository](https://github.com/mii-llm/palingenesis/tree/main/configs). macOS installs work for data tooling and tests, not training (no CUDA).
+
+=== "uv sync (from source)"
 
     ```bash
     git clone https://github.com/mii-llm/palingenesis.git

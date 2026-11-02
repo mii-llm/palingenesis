@@ -9,7 +9,6 @@ packing all behave as in training.
 
 from collections.abc import Iterator
 
-import agent_tooling._path_setup  # noqa: F401
 from palingenesis.config import Config
 
 

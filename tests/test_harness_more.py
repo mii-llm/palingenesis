@@ -1,7 +1,7 @@
 """Harness profiles, phase 2: unknown-tool wording and aliases, per-profile chat template kwargs, the recording stub
 (pgs harness serve / capture), conformance with recorded requests, the new profiles (swe-agent, qwen-code, goose,
-hermes, kimi-cli, terminus-2), run_episodes. Docker tests run Scrivania tasks per new profile (terminus-2 needs the
-harbor3-base:3 image with tmux)."""
+hermes, kimi-cli, terminus-2), run_episodes. Docker tests run local Harbor tasks per new profile (terminus-2 needs the
+task image with tmux, PGS_TMUX_IMAGE)."""
 
 from __future__ import annotations
 
@@ -51,7 +51,8 @@ def local_harbor(rt, monkeypatch):
     return rt
 
 
-FIXTURES = Path(__file__).parent.parent / "research" / "tiny-reliable-agent" / "harness" / "fixtures"
+# Requests recorded with `pgs harness capture <agent>` (local only: some harness prompts are not ours to redistribute).
+FIXTURES = Path(os.environ["PGS_HARNESS_FIXTURES"]) if os.environ.get("PGS_HARNESS_FIXTURES") else None
 
 
 # ================================================================== unknown tools and aliases
@@ -188,6 +189,8 @@ def _content(m) -> str:
 
 
 def _recorded(agent: str):
+    if FIXTURES is None:
+        pytest.skip("PGS_HARNESS_FIXTURES not set (recorded requests from pgs harness capture / serve)")
     path = FIXTURES / agent / "requests.jsonl"
     if not path.exists():
         pytest.skip(f"no recorded requests for {agent} (pgs harness capture / serve)")
@@ -244,7 +247,7 @@ def test_kimi_cli_results_match_the_recording(rt):
 
 @pytest.mark.parametrize("agent", ["opencode", "mini-swe-agent"])
 def test_harbor_cli_capture_matches_the_profile(agent):
-    """Recorded on the box with `pgs harness capture <agent>` (Harbor 0.24 CLI, the real agent installed in the task
+    """Recorded with `pgs harness capture <agent>` (Harbor 0.24 CLI, the real agent installed in the task
     container): tool schemas equal; system prompt / first user turn compared loosely (profiles paraphrase them)."""
     first, pairs, _ = _recorded(agent)
     profile = get_profile(agent)
@@ -279,7 +282,7 @@ def _docker_replay(agent: str, task: str):
         env.close()
 
 
-@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the Scrivania tasks unavailable")
+@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the local Harbor tasks unavailable")
 def test_opencode_results_match_the_harbor_cli_recording():
     rows = _docker_replay("opencode", ENV_EDIT)
     for name, args, expected, got in rows:
@@ -291,7 +294,7 @@ def test_opencode_results_match_the_harbor_cli_recording():
             assert got == expected, (name, args)
 
 
-@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the Scrivania tasks unavailable")
+@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the local Harbor tasks unavailable")
 def test_mini_swe_agent_results_match_the_harbor_cli_recording():
     rows = _docker_replay("mini-swe-agent", ENV_EDIT)
     assert rows and all(got == expected for _, _, expected, got in rows), rows
@@ -459,9 +462,9 @@ def test_run_episodes_budget_covers_every_turn(local_harbor):
     assert t.finish != "length" and t.turns == 4
 
 
-# ================================================================== Docker: Scrivania tasks per new profile
+# ================================================================== Docker: local Harbor tasks per new profile
 
-TMUX_IMAGE = os.environ.get("PGS_TMUX_IMAGE", "harbor3-base:3")
+TMUX_IMAGE = os.environ.get("PGS_TMUX_IMAGE", "")  # the tasks' docker_image with tmux installed
 
 
 def _image_ok(tag):
@@ -553,14 +556,16 @@ SCRIPTS = {
 }
 
 
-@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the Scrivania tasks unavailable")
+@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the local Harbor tasks unavailable")
 @pytest.mark.parametrize("profile", sorted(SCRIPTS))
-def test_scrivania_oracle_and_noop_per_new_profile(profile):
+def test_harbor_tasks_oracle_and_noop_per_new_profile(profile):
     images = {}
     if profile == "terminus-2":
-        if not _image_ok(TMUX_IMAGE):
-            pytest.skip(f"{TMUX_IMAGE} (tmux) not built")
-        images = {"harbor3-base:1": TMUX_IMAGE}
+        if not TMUX_IMAGE or not _image_ok(TMUX_IMAGE):
+            pytest.skip("PGS_TMUX_IMAGE (the task image with tmux) not set or not built")
+        from palingenesis.rl.envs.harbor import HarborTask
+
+        images = {HarborTask.load(TASKS / ARCHIVE).image(): TMUX_IMAGE}
     for task in (ARCHIVE, ENV_EDIT):
         for mode in (task, "noop"):
             env = HarborEnv(profile=profile, images=images)

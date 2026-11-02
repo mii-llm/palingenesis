@@ -167,6 +167,8 @@ class GenerationClient:
         if self.streaming and self.thread.is_alive():
             self.inbox.put(None)
             self.thread.join(timeout=10)
+        if not self.streaming:
+            self.executor.shutdown(wait=False, cancel_futures=True)  # its thread exits after the call in flight
 
     # ------------------------------------------------------------------ batch
 

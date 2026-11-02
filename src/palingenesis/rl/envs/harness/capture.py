@@ -8,9 +8,9 @@
 serve: a stub OpenAI-compatible endpoint (/v1/chat/completions, streaming or not; /v1/models) that answers from a
 script and appends every request body, exactly as received, to a JSONL file. capture: the same stub, then the real
 agent run once through the Harbor CLI (`uv run --with harbor==<version> harbor run -p <task> -a <agent> ...`) against
-it; <dir>/requests.jsonl is the fixture a conformance test diffs a profile against (tests/test_harness_profiles.py
-reads research/tiny-reliable-agent/harness/fixtures/<agent>/requests.jsonl when present). Fixtures stay local: some
-harness prompts are not ours to redistribute.
+it; <dir>/requests.jsonl is the fixture a conformance test diffs a profile against (tests/test_harness_more.py reads
+$PGS_HARNESS_FIXTURES/<agent>/requests.jsonl when that variable is set). Fixtures stay local: some harness prompts
+are not ours to redistribute.
 
 Script (JSON): a list of assistant turns, each {"tool_calls": [{"name": ..., "arguments": {...}}]} or {"content":
 "..."} (text protocols: the text the harness parses). Turns advance per conversation (requests sharing their first two

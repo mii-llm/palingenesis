@@ -3243,11 +3243,13 @@ wheels = [
 
 [[package]]
 name = "palingenesis"
-version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.12' and sys_platform != 'linux') or (python_full_version >= '3.13' and sys_platform == 'linux')" },
+    { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and sys_platform != 'linux'" },
     { name = "pyyaml" },
     { name = "safetensors" },
     { name = "torch", version = "2.11.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
@@ -3340,37 +3342,61 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=1.10" },
+    { name = "bitsandbytes", marker = "extra == 'all'", specifier = ">=0.49" },
+    { name = "bitsandbytes", marker = "extra == 'dev'", specifier = ">=0.49" },
     { name = "bitsandbytes", marker = "extra == 'train'", specifier = ">=0.49" },
     { name = "causal-conv1d", marker = "sys_platform == 'linux' and extra == 'hybrid'", specifier = ">=1.5" },
+    { name = "cut-cross-entropy", marker = "extra == 'all'", specifier = ">=25.1.0" },
+    { name = "cut-cross-entropy", marker = "extra == 'dev'", specifier = ">=25.1.0" },
     { name = "cut-cross-entropy", marker = "extra == 'loss'", specifier = ">=25.1.0" },
     { name = "datasets", specifier = ">=4.0" },
+    { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'all'", specifier = ">=0.4" },
+    { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'dev'", specifier = ">=0.4" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'train'", specifier = ">=0.4" },
     { name = "k8s-agent-sandbox", extras = ["async"], marker = "extra == 'agent-sandbox'", specifier = ">=1.0" },
+    { name = "liger-kernel", marker = "sys_platform == 'linux' and extra == 'all'", specifier = ">=0.5.0" },
+    { name = "liger-kernel", marker = "sys_platform == 'linux' and extra == 'dev'", specifier = ">=0.5.0" },
     { name = "liger-kernel", marker = "sys_platform == 'linux' and extra == 'train'", specifier = ">=0.5.0" },
+    { name = "math-verify", marker = "extra == 'all'", specifier = ">=0.8" },
+    { name = "math-verify", marker = "extra == 'dev'", specifier = ">=0.8" },
     { name = "math-verify", marker = "extra == 'rl'", specifier = ">=0.8" },
+    { name = "mcp", marker = "extra == 'all'", specifier = ">=2.2" },
+    { name = "mcp", marker = "extra == 'dev'", specifier = ">=2.2" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.2" },
-    { name = "palingenesis", extras = ["all"], marker = "extra == 'dev'" },
-    { name = "palingenesis", extras = ["train", "float8", "logging", "loss", "optim", "prepare", "rl", "mcp"], marker = "extra == 'all'" },
-    { name = "palingenesis", extras = ["vllm"], marker = "extra == 'vllm-server'" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ray", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = ">=2.40" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8.0" },
     { name = "safetensors", specifier = ">=0.4.0" },
+    { name = "schedulefree", marker = "extra == 'all'", specifier = ">=1.4.0" },
+    { name = "schedulefree", marker = "extra == 'dev'", specifier = ">=1.4.0" },
     { name = "schedulefree", marker = "extra == 'optim'", specifier = ">=1.4.0" },
+    { name = "sentence-transformers", marker = "extra == 'all'", specifier = ">=3.0.0" },
+    { name = "sentence-transformers", marker = "extra == 'dev'", specifier = ">=3.0.0" },
     { name = "sentence-transformers", marker = "extra == 'prepare'", specifier = ">=3.0.0" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.11" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchao", marker = "extra == 'all'", specifier = ">=0.9.0" },
+    { name = "torchao", marker = "extra == 'dev'", specifier = ">=0.9.0" },
     { name = "torchao", marker = "extra == 'float8'", specifier = ">=0.9.0" },
     { name = "torchaudio", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchaudio", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchcodec", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = ">=0.14", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchcodec", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = ">=0.14", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "trackio", marker = "extra == 'all'", specifier = ">=0.25.0" },
+    { name = "trackio", marker = "extra == 'dev'", specifier = ">=0.25.0" },
     { name = "trackio", marker = "extra == 'logging'", specifier = ">=0.25.0" },
     { name = "transformers", specifier = ">=5.12,<6" },
     { name = "vllm", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = "==0.26.0", index = "https://wheels.vllm.ai/0.26.0/cu129" },
+    { name = "vllm", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = "==0.26.0", index = "https://wheels.vllm.ai/0.26.0/cu129" },
+    { name = "wandb", marker = "extra == 'all'", specifier = ">=0.19.0" },
+    { name = "wandb", marker = "extra == 'dev'", specifier = ">=0.19.0" },
     { name = "wandb", marker = "extra == 'logging'", specifier = ">=0.19.0" },
 ]
-provides-extras = ["train", "hybrid", "float8", "vllm", "rl", "agent-sandbox", "mcp", "vllm-server", "logging", "loss", "optim", "prepare", "all", "dev"]
+provides-extras = ["agent-sandbox", "all", "dev", "float8", "hybrid", "logging", "loss", "mcp", "optim", "prepare", "rl", "train", "vllm", "vllm-server"]
 
 [package.metadata.requires-dev]
 dev = [

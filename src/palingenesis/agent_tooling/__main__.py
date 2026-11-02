@@ -1,4 +1,4 @@
-"""Entry point: python -m agent_tooling <command>
+"""Entry point: python -m palingenesis.agent_tooling <command>
 
 Dispatches to the appropriate diagnostic tool.
 """
@@ -6,20 +6,20 @@ Dispatches to the appropriate diagnostic tool.
 import sys
 
 TOOLS = {
-    "diagnose": "agent_tooling.diagnose",
-    "inspect_batch": "agent_tooling.inspect_batch",
-    "validate_masking": "agent_tooling.validate_masking",
-    "check_loss": "agent_tooling.check_loss",
-    "check_gradients": "agent_tooling.check_gradients",
-    "profile_memory": "agent_tooling.profile_memory",
-    "monitor_run": "agent_tooling.monitor_run",
+    "diagnose": "palingenesis.agent_tooling.diagnose",
+    "inspect_batch": "palingenesis.agent_tooling.inspect_batch",
+    "validate_masking": "palingenesis.agent_tooling.validate_masking",
+    "check_loss": "palingenesis.agent_tooling.check_loss",
+    "check_gradients": "palingenesis.agent_tooling.check_gradients",
+    "profile_memory": "palingenesis.agent_tooling.profile_memory",
+    "monitor_run": "palingenesis.agent_tooling.monitor_run",
 }
 
 HELP = """
 palingenesis diagnostic tools
 
 Usage:
-    python -m agent_tooling <tool> [args...]
+    python -m palingenesis.agent_tooling <tool> [args...]
 
 Available tools:
     diagnose          All-in-one health check (pre/post/full)
@@ -31,9 +31,9 @@ Available tools:
     monitor_run       Monitor active training from log output
 
 Examples:
-    python -m agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre
-    python -m agent_tooling check_loss --log_file train.log
-    python -m agent_tooling profile_memory --config configs/long_context.yaml
+    python -m palingenesis.agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre
+    python -m palingenesis.agent_tooling check_loss --log_file train.log
+    python -m palingenesis.agent_tooling profile_memory --config configs/long_context.yaml
 """
 
 

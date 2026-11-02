@@ -7,13 +7,13 @@ is healthy or what's wrong.
 
 Usage:
     # Pre-training check (no GPU needed for masking + memory)
-    python -m agent_tooling.diagnose --config configs/llama3_8b.yaml --mode pre
+    python -m palingenesis.agent_tooling.diagnose --config configs/llama3_8b.yaml --mode pre
 
     # Post-training check (analyzes loss log)
-    python -m agent_tooling.diagnose --config configs/llama3_8b.yaml --mode post --log_file train.log
+    python -m palingenesis.agent_tooling.diagnose --config configs/llama3_8b.yaml --mode post --log_file train.log
 
     # Full check (requires GPU — runs gradient check too)
-    python -m agent_tooling.diagnose --config configs/llama3_8b.yaml --mode full
+    python -m palingenesis.agent_tooling.diagnose --config configs/llama3_8b.yaml --mode full
 
 Output: Structured JSON-compatible report suitable for agent consumption.
 """
@@ -22,7 +22,6 @@ import json
 import sys
 import time
 
-import agent_tooling._path_setup  # noqa: F401
 from palingenesis.config import Config
 
 
@@ -32,7 +31,7 @@ def diagnose_pre(config: Config, gpu_memory_gb: float = 80.0) -> dict:
 
     # 1. Memory estimate
     print("Running memory estimate...")
-    from agent_tooling.profile_memory import estimate_memory
+    from palingenesis.agent_tooling.profile_memory import estimate_memory
 
     mem = estimate_memory(config, gpu_memory_gb)
     report["checks"]["memory"] = {
@@ -44,7 +43,7 @@ def diagnose_pre(config: Config, gpu_memory_gb: float = 80.0) -> dict:
 
     # 2. Masking validation
     print("Running masking validation (50 samples)...")
-    from agent_tooling.validate_masking import validate
+    from palingenesis.agent_tooling.validate_masking import validate
 
     masking = validate(config, num_samples=50)
     has_critical = any("CRITICAL" in i or "BUG" in i for i in masking["issues"])
@@ -80,7 +79,7 @@ def diagnose_post(config: Config, log_file: str) -> dict:
 
     # 1. Loss analysis
     print(f"Analyzing loss from: {log_file}")
-    from agent_tooling.check_loss import analyze_losses, parse_losses_from_text
+    from palingenesis.agent_tooling.check_loss import analyze_losses, parse_losses_from_text
 
     with open(log_file) as f:
         text = f.read()
@@ -115,7 +114,7 @@ def diagnose_full(config: Config, gpu_memory_gb: float = 80.0) -> dict:
 
     if torch.cuda.is_available():
         print("Running gradient health check (1 forward-backward pass)...")
-        from agent_tooling.check_gradients import check_gradients
+        from palingenesis.agent_tooling.check_gradients import check_gradients
 
         grad_result = check_gradients(config)
         has_critical = any("CRITICAL" in i for i in grad_result["issues"])

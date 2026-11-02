@@ -5,7 +5,7 @@ Checks that the data pipeline correctly masks non-assistant tokens and
 only trains on assistant content. Reports statistics and flags problems.
 
 Usage:
-    python -m agent_tooling.validate_masking --config configs/llama3_8b.yaml --num_samples 100
+    python -m palingenesis.agent_tooling.validate_masking --config configs/llama3_8b.yaml --num_samples 100
 
 What it checks:
     - Trained tokens ratio is reasonable (5-80% for multi-turn chat)
@@ -17,8 +17,7 @@ What it checks:
 
 import sys
 
-import agent_tooling._path_setup  # noqa: F401
-from agent_tooling._pipeline import load_tokenizer, training_samples
+from palingenesis.agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
 from palingenesis.data import IGNORE_INDEX
 

@@ -8,14 +8,13 @@ Run this to verify that:
   4. Padding is correct
 
 Usage:
-    python -m agent_tooling.inspect_batch --config configs/llama3_8b.yaml --num_samples 3
+    python -m palingenesis.agent_tooling.inspect_batch --config configs/llama3_8b.yaml --num_samples 3
 
 Output: Colored text showing which tokens are trained on (green = loss computed,
         gray = masked/ignored), plus statistics.
 """
 
-import agent_tooling._path_setup  # noqa: F401 — adds src/ to sys.path
-from agent_tooling._pipeline import load_tokenizer, training_samples
+from palingenesis.agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
 from palingenesis.data import IGNORE_INDEX
 

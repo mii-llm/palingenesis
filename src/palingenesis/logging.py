@@ -60,6 +60,8 @@ class Tracker:
         self._trackio = None
         self._wandb_errors = 0
         self._trackio_errors = 0
+        # The latest value of every scalar logged (train/loss, eval/loss, ...): train() returns it.
+        self.latest: dict[str, float] = {}
         if not is_main:
             return
 
@@ -105,6 +107,7 @@ class Tracker:
                 self._trackio = None
 
     def log(self, metrics: dict[str, Any], step: int | None = None):
+        self.latest.update({k: float(v) for k, v in metrics.items() if isinstance(v, int | float)})
         # Include the step as a metric so wandb's define_metric x-axis works
         if step is not None and WANDB_STEP_METRIC not in metrics:
             metrics = wandb_row(metrics, step)
@@ -131,12 +134,14 @@ class Tracker:
                 if self._trackio_errors <= 3:
                     logger.warning(f"trackio log failed (continuing training): {e}")
 
-    def finish(self):
+    def finish(self, exit_code: int = 0):
+        """Close the runs (idempotent). A non-zero exit_code marks the wandb run as failed."""
         if self._wandb:
             try:
-                self._wandb.finish()
+                self._wandb.finish(exit_code=exit_code)
             except Exception as e:
                 logger.warning(f"wandb finish failed: {e}")
+            self._wandb = None
         if self._trackio:
             try:
                 import trackio
@@ -144,6 +149,7 @@ class Tracker:
                 trackio.finish()
             except Exception as e:
                 logger.warning(f"trackio finish failed: {e}")
+            self._trackio = None
 
 
 def _will_resume(config: Config) -> bool:

@@ -15,6 +15,9 @@ source .venv/bin/activate
 
 Other ways to install (pip, other CUDA versions): see [Installation](install.md).
 
+Installed from PyPI instead? `pgs init sft` writes the same config as `sft.yaml` in the current directory: use it
+wherever this page says `configs/quickstart.yaml`.
+
 ## 2. Run
 
 ```bash

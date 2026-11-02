@@ -1,7 +1,7 @@
 """Built-in harness profiles (phase 1). Each emulates one pinned harness version: its tool contracts (parameter
 schemas copied exactly: they are interface contracts), its observation and error wording (from the source at that
 version), its stop and answer rules; system prompts and long tool descriptions are concise paraphrases of the
-originals (summarised in research/tiny-reliable-agent/harness/profiles/), never the long upstream text.
+originals, never the long upstream text.
 
     palingenesis-default@1   HarborEnv's own prompt and tools (bash, read_file, write_file, str_replace, submit);
                              rendered byte-identically to HarborEnv without profiles

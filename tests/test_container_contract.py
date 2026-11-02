@@ -2,14 +2,18 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from palingenesis.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy" / "kubernetes"
+# The deployment files live in the repository, not in the sdist.
+needs_deploy = pytest.mark.skipif(not DEPLOY.exists(), reason="deploy/ not present (sdist)")
 
 
+@needs_deploy
 def test_training_config_and_persistent_paths(tmp_path):
     configmap = yaml.safe_load((DEPLOY / "configmap.yaml").read_text())
     path = tmp_path / "train.yaml"
@@ -33,6 +37,7 @@ def test_training_config_and_persistent_paths(tmp_path):
     assert volumes["config"]["configMap"]["name"] == configmap["metadata"]["name"]
 
 
+@needs_deploy
 def test_gpu_security_and_writable_runtime_directories():
     pod = yaml.safe_load((DEPLOY / "job.yaml").read_text())["spec"]["template"]["spec"]
     container = pod["containers"][0]
@@ -49,4 +54,5 @@ def test_package_diagnostics_are_included_in_wheel():
     import tomllib
 
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert "agent_tooling" in metadata["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
+    assert "src/palingenesis" in metadata["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
+    assert (ROOT / "src" / "palingenesis" / "agent_tooling" / "__init__.py").exists()

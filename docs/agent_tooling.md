@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `agent_tooling/` directory contains standalone diagnostic scripts that an AI agent (or human developer) can run to assess training health without modifying the training loop. They're designed for:
+The `palingenesis.agent_tooling` package (`src/palingenesis/agent_tooling/`) contains standalone diagnostic scripts that an AI agent (or human developer) can run to assess training health without modifying the training loop. They're designed for:
 
 1. **Pre-flight validation** — confirm everything will work before burning GPU hours
 2. **Live monitoring** — check if a running training is healthy
@@ -17,16 +17,16 @@ The master diagnostic tool. Runs appropriate checks based on mode.
 
 ```bash
 # Pre-training (no GPU needed): memory + masking + config sanity
-python -m agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre
+python -m palingenesis.agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre
 
 # Post-training (analyzes log): loss curve pathologies
-python -m agent_tooling diagnose --config configs/llama3_8b.yaml --mode post --log_file train.log
+python -m palingenesis.agent_tooling diagnose --config configs/llama3_8b.yaml --mode post --log_file train.log
 
 # Full (needs GPU): pre + gradient check
-python -m agent_tooling diagnose --config configs/llama3_8b.yaml --mode full
+python -m palingenesis.agent_tooling diagnose --config configs/llama3_8b.yaml --mode full
 
 # JSON output for programmatic parsing
-python -m agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre --json
+python -m palingenesis.agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre --json
 ```
 
 **Exit codes**: 0 = healthy, 1 = issues found
@@ -50,7 +50,7 @@ python -m agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre --js
 Shows actual tokenization with colored output — green tokens have loss, gray tokens are masked.
 
 ```bash
-python -m agent_tooling inspect_batch --config configs/llama3_8b.yaml --num_samples 3
+python -m palingenesis.agent_tooling inspect_batch --config configs/llama3_8b.yaml --num_samples 3
 ```
 
 **Output**:
@@ -70,7 +70,7 @@ Sample 1 — 2847 tokens, 891 trained (31.3%)
 Processes many samples and checks for masking anomalies.
 
 ```bash
-python -m agent_tooling validate_masking --config configs/llama3_8b.yaml --num_samples 200
+python -m palingenesis.agent_tooling validate_masking --config configs/llama3_8b.yaml --num_samples 200
 ```
 
 **Checks**:
@@ -86,13 +86,13 @@ Detects pathologies in training loss without needing the model.
 
 ```bash
 # From a log file
-python -m agent_tooling check_loss --log_file outputs/train.log
+python -m palingenesis.agent_tooling check_loss --log_file outputs/train.log
 
 # From stdin (pipe from training)
-grep "loss=" train.log | python -m agent_tooling check_loss --stdin
+grep "loss=" train.log | python -m palingenesis.agent_tooling check_loss --stdin
 
 # From wandb
-python -m agent_tooling check_loss --wandb_run user/project/run_id
+python -m palingenesis.agent_tooling check_loss --wandb_run user/project/run_id
 ```
 
 **Detects**:
@@ -107,7 +107,7 @@ python -m agent_tooling check_loss --wandb_run user/project/run_id
 Runs one forward-backward pass and reports gradient statistics.
 
 ```bash
-python -m agent_tooling check_gradients --config configs/single_gpu.yaml
+python -m palingenesis.agent_tooling check_gradients --config configs/single_gpu.yaml
 ```
 
 **Requires**: 1 GPU with enough memory for the model + 1 batch.
@@ -159,14 +159,14 @@ Parses training log output and reports status.
 
 ```bash
 # Quick status (for agent polling)
-python -m agent_tooling monitor_run --log_file outputs/train.log --brief
+python -m palingenesis.agent_tooling monitor_run --log_file outputs/train.log --brief
 # Output: [HEALTHY] step=1234 loss=1.2345 trend=-0.5% tok/s=5432 eta=2.3h
 
 # Full report
-python -m agent_tooling monitor_run --log_file outputs/train.log --max_steps 5000
+python -m palingenesis.agent_tooling monitor_run --log_file outputs/train.log --max_steps 5000
 
 # Last N steps only
-python -m agent_tooling monitor_run --log_file outputs/train.log --last 50
+python -m palingenesis.agent_tooling monitor_run --log_file outputs/train.log --last 50
 ```
 
 ## Agent Decision Framework
@@ -175,45 +175,40 @@ python -m agent_tooling monitor_run --log_file outputs/train.log --last 50
 START
   │
   ├── Before training
-  │   └── python -m agent_tooling diagnose --mode pre --json
+  │   └── python -m palingenesis.agent_tooling diagnose --mode pre --json
   │       ├── memory.status == "fail" → adjust config (reduce seq, add FSDP)
   │       ├── masking.status == "fail" → check chat template, inspect_batch
   │       └── all pass → proceed to training
   │
   ├── During training (poll every 5 min)
-  │   └── python -m agent_tooling monitor_run --brief
+  │   └── python -m palingenesis.agent_tooling monitor_run --brief
   │       ├── status == "CRASHED" → check_loss for details, fix and restart
   │       ├── status == "WARNING" → read detailed issues, may need intervention
   │       └── status == "HEALTHY" → continue
   │
   ├── Training not converging
-  │   ├── python -m agent_tooling check_loss --log_file ...
+  │   ├── python -m palingenesis.agent_tooling check_loss --log_file ...
   │   │   ├── Plateaued → increase LR or check data
   │   │   ├── Diverging → decrease LR
   │   │   └── Spikes → check data quality, reduce LR
-  │   ├── python -m agent_tooling validate_masking --num_samples 200
+  │   ├── python -m palingenesis.agent_tooling validate_masking --num_samples 200
   │   │   └── Low train_ratio → data issue, consider packing
-  │   └── python -m agent_tooling check_gradients
+  │   └── python -m palingenesis.agent_tooling check_gradients
   │       ├── Dead layers → LR too low or frozen params
   │       └── Exploding → LR too high or grad clip too loose
   │
   └── After training
-      └── python -m agent_tooling diagnose --mode post --log_file ...
+      └── python -m palingenesis.agent_tooling diagnose --mode post --log_file ...
           └── Report on convergence quality
 ```
 
 ## Implementation Details
 
-### Path Resolution
+### Location
 
-All tools use `agent_tooling/_path_setup.py` to ensure `palingenesis` is importable regardless of how the tool is invoked:
-
-```python
-import agent_tooling._path_setup  # Adds src/ to sys.path
-from palingenesis.config import Config
-```
-
-This works whether the package is installed (`pip install -e .`) or run from the repo root.
+The tools are a subpackage of `palingenesis` and ship in the wheel, so they import it like any other module: no
+`sys.path` setup. From a source checkout, `python -m agent_tooling <tool>` keeps working through a thin shim at the
+repository root (not shipped).
 
 ### Standalone Tools
 
@@ -227,5 +222,5 @@ All tools follow Unix convention:
 
 This enables scripting:
 ```bash
-python -m agent_tooling diagnose --mode pre --config ... || echo "Pre-flight failed"
+python -m palingenesis.agent_tooling diagnose --mode pre --config ... || echo "Pre-flight failed"
 ```

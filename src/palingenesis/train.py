@@ -28,6 +28,7 @@ import math
 import os
 import re
 import time
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -250,7 +251,38 @@ def eval_reader(config, tokenizer, eval_ds):
     )
 
 
-def train(config: Config):
+@dataclass
+class TrainResult:
+    """What train() returns: where the model went and how the run ended (on rank 0 the metrics are the last values
+    logged, e.g. metrics["train/loss"], metrics["eval/loss"]; best_eval_loss is set when an eval set was configured)."""
+
+    output_dir: str
+    global_step: int = 0
+    total_time_s: float = 0.0
+    tokens_total: int = 0
+    metrics: dict[str, float] = field(default_factory=dict)
+    best_eval_loss: float | None = None
+    best_step: int | None = None
+
+
+def train(config: Config) -> TrainResult:
+    """Run SFT / DPO training to completion and return a TrainResult.
+
+    Callable in-process (a script or a notebook, one GPU) or under torchrun. Whatever happens (an error, a
+    KeyboardInterrupt), the experiment trackers are closed and the process group is torn down."""
+    run: dict = {"tracker": None}
+    ok = False
+    try:
+        result = _train(config, run)
+        ok = True
+        return result
+    finally:
+        if run["tracker"] is not None:
+            run["tracker"].finish(exit_code=0 if ok else 1)
+        cleanup_distributed()
+
+
+def _train(config: Config, run: dict) -> TrainResult:
     # ── CUDA allocator: expandable segments ───────────────────────────────
     # Variable-length batches fragment the caching allocator (tens of GB
     # "reserved but unallocated" → spurious OOM despite free memory).
@@ -719,6 +751,7 @@ def train(config: Config):
 
     # ── Tracker ───────────────────────────────────────────────────────────
     tracker = Tracker(config, is_main=is_main())
+    run["tracker"] = tracker  # train() closes it, also on errors
 
     # ── Health Monitor ────────────────────────────────────────────────────
     health = HealthMonitor(
@@ -1513,8 +1546,15 @@ def train(config: Config):
         {"train/total_steps": global_step, "train/total_time_s": total_time, "train/tokens_total": tokens_total},
         step=global_step,
     )
-    tracker.finish()
-    cleanup_distributed()
+    return TrainResult(
+        output_dir=config.train.output_dir,
+        global_step=global_step,
+        total_time_s=total_time,
+        tokens_total=int(tokens_total),
+        metrics=dict(tracker.latest),
+        best_eval_loss=_best_tracker.best_loss if _best_tracker is not None and _best_tracker.best_step >= 0 else None,
+        best_step=_best_tracker.best_step if _best_tracker is not None and _best_tracker.best_step >= 0 else None,
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

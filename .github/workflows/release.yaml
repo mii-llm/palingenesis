@@ -1,0 +1,65 @@
+name: Release to PyPI
+
+# Builds the sdist and the wheel from a clean checkout of the released tag and publishes them with PyPI trusted
+# publishing (OIDC, no API token). Before the first release, register this repository and workflow
+# (release.yaml, environment "pypi") as a trusted publisher of the palingenesis project on pypi.org.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload to PyPI (otherwise build and check only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.6'
+      - name: Build sdist and wheel
+        run: uv build --out-dir dist
+      - name: Check the distributions
+        run: |
+          uvx twine check --strict dist/*
+          # Only the package, tests, configs and top-level metadata belong in the sdist.
+          if tar -tzf dist/*.tar.gz | grep -E '^[^/]+/(\.claude|\.github|\.vscode|research|post-training|projects|deploy|utils|scripts|agent_tooling)/'; then
+            echo "unexpected files in the sdist" && exit 1
+          fi
+      - name: The tag matches the package version
+        if: github.event_name == 'release'
+        run: |
+          version=$(unzip -p dist/*.whl '*.dist-info/METADATA' | sed -n 's/^Version: //p')
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != version ${version}"; exit 1; }
+      - name: Smoke test the wheel
+        run: |
+          uv venv /tmp/smoke --python 3.12
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+          cd /tmp && /tmp/smoke/bin/pgs --help && /tmp/smoke/bin/pgs init sft && /tmp/smoke/bin/python -m palingenesis.agent_tooling --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    if: github.event_name == 'release' || inputs.publish
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/palingenesis
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,13 +1,28 @@
 # palingenesis
 
 <p align="center">
-  <img src="./assets/pgs.webp" alt="palingenesis" width="100%">
+  <img src="https://raw.githubusercontent.com/mii-llm/palingenesis/main/assets/pgs.webp" alt="palingenesis" width="100%">
 </p>
 
 **Post-train LLMs and agents from one config: SFT, multi-turn RL in tool environments, on-policy distillation, DPO and
 merging, with state-of-the-art defaults.**
 
-[Documentation](https://mii-llm.github.io/palingenesis/) · [Quickstart](https://mii-llm.github.io/palingenesis/getting-started/quickstart/) · [Configs](configs/)
+[Documentation](https://mii-llm.github.io/palingenesis/) · [Quickstart](https://mii-llm.github.io/palingenesis/getting-started/quickstart/) · [Configs](https://github.com/mii-llm/palingenesis/tree/main/configs)
+
+From PyPI (Linux + NVIDIA GPU):
+
+```bash
+pip install "torch>=2.11" --index-url https://download.pytorch.org/whl/cu129   # FIRST: the CUDA 12.9 build (driver >= 575)
+pip install "palingenesis[train,logging]"
+pgs init sft                     # writes ./sft.yaml: set your model and dataset
+pgs train --config sft.yaml
+```
+
+> **Install torch from PyTorch's CUDA index first.** Plain `pip install palingenesis` on Linux otherwise pulls PyPI's
+> default torch, built for the newest CUDA (13.x, driver >= 580): on an older driver it installs fine and then sees no
+> GPU. Other CUDA versions: [Installation](https://mii-llm.github.io/palingenesis/getting-started/install/).
+
+From source (the locked, tested versions; the CUDA torch index is configured for you):
 
 ```bash
 git clone https://github.com/mii-llm/palingenesis.git && cd palingenesis
@@ -16,7 +31,8 @@ source .venv/bin/activate
 pgs train --config configs/quickstart.yaml
 ```
 
-Other install paths (pip, CUDA versions, troubleshooting): [Installation](https://mii-llm.github.io/palingenesis/getting-started/install/).
+In a notebook or a script: `palingenesis.train.train(config)` on one GPU, see
+[Training from a notebook](https://mii-llm.github.io/palingenesis/getting-started/notebook/).
 
 ## What it does
 
@@ -64,7 +80,7 @@ Other install paths (pip, CUDA versions, troubleshooting): [Installation](https:
 sbatch scripts/train_slurm.sh configs/qwen35_35b_moe/a100_80gb_multigpu.yaml     # SLURM
 ```
 
-Containers and Kubernetes: [docs/containers.md](docs/containers.md).
+Containers and Kubernetes: [docs/containers.md](https://github.com/mii-llm/palingenesis/blob/main/docs/containers.md).
 
 ## Development
 
@@ -75,6 +91,6 @@ mkdocs serve                  # docs locally (pip install mkdocs-material)
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](https://github.com/mii-llm/palingenesis/blob/main/LICENSE).
 
 *A new form emerging from what came before.*

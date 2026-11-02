@@ -89,6 +89,7 @@ nav:
     - Installation: getting-started/install.md
     - Quickstart: getting-started/quickstart.md
     - Your First Training: getting-started/first-training.md
+    - Training from a Notebook: getting-started/notebook.md
   - Guides:
     - Data Preparation: guides/data.md
     - Agentic & Reasoning Models: guides/agentic-training.md

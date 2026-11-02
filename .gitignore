@@ -32,6 +32,9 @@ projects/*/checkpoints_cpt/
 projects/*/data/
 projects/*/prepared/
 
-# Research notebooks and papers (kept out of the library repo; preserved on the HF org)
+# Local working folders (not part of the library)
 research/
 post-training/
+
+# Local agent tooling (skills, worktrees)
+.claude/

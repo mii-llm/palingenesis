@@ -412,7 +412,7 @@ class Config:
         import logging
         import sys
 
-        args = args or sys.argv[1:]
+        args = sys.argv[1:] if args is None else args
         config = cls()
         config_source: str | None = None
 

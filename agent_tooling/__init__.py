@@ -1,15 +1,17 @@
-"""
-Agent tooling for diagnosing agentic SFT training.
+"""Source-checkout shim: the diagnostics now live in `palingenesis.agent_tooling`.
 
-Standalone scripts an AI agent or developer can run to check if training is healthy.
-Each tool can be invoked independently — no GPU required for most analysis tools.
-
-Tools:
-    inspect_batch      — Visualize processed batches: tokens, masks, label alignment
-    validate_masking   — Verify assistant-only masking across many samples
-    check_loss         — Analyze loss curves for NaN, spikes, plateaus, divergence
-    check_gradients    — Per-layer gradient norm analysis (live or from logs)
-    profile_memory     — Estimate peak memory for a given config before training
-    monitor_run        — Monitor active training: loss, throughput, ETA, health
-    diagnose           — All-in-one health check: runs all diagnostics and reports
+Keeps `python -m agent_tooling.<tool>` working from a repository checkout. This
+directory is not shipped in the wheel or the sdist; installed users run
+`pgs diagnose ...` or `python -m palingenesis.agent_tooling.<tool>`.
 """
+
+import sys
+from pathlib import Path
+
+try:
+    import palingenesis.agent_tooling as _real
+except ModuleNotFoundError:  # checkout without an installed palingenesis
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    import palingenesis.agent_tooling as _real
+
+__path__ = list(_real.__path__)

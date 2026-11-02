@@ -591,7 +591,7 @@ capacity to benefit from subsequent RL**:
 
 ```bash
 # Check RL-readiness of a checkpoint
-python -m agent_tooling.diagnose --config your_config.yaml --mode post --log_file outputs/train.log
+python -m palingenesis.agent_tooling.diagnose --config your_config.yaml --mode post --log_file outputs/train.log
 ```
 
 The health metrics will show `health/output_entropy` and `health/rl_readiness_warning`

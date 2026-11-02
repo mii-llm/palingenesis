@@ -10,11 +10,10 @@ import torch
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT))
 
-from agent_tooling._logparse import parse_steps  # noqa: E402
-from agent_tooling.check_loss import parse_losses_from_text  # noqa: E402
-from agent_tooling.monitor_run import analyze_run, parse_training_log, print_brief  # noqa: E402
+from palingenesis.agent_tooling._logparse import parse_steps  # noqa: E402
+from palingenesis.agent_tooling.check_loss import parse_losses_from_text  # noqa: E402
+from palingenesis.agent_tooling.monitor_run import analyze_run, parse_training_log, print_brief  # noqa: E402
 from palingenesis.config import Config  # noqa: E402
 
 # Lines exactly as palingenesis.train logs them (SFT, DEFT, DPO) plus the
@@ -128,7 +127,7 @@ CHATS = [
 
 
 def test_training_samples_are_the_trainers_stream(tmp_path, model_dir):
-    from agent_tooling._pipeline import load_tokenizer, training_samples
+    from palingenesis.agent_tooling._pipeline import load_tokenizer, training_samples
     from palingenesis.data import IGNORE_INDEX, _load_dataset_source, build_dataset
 
     config = _config(tmp_path, model_dir, CHATS)
@@ -144,7 +143,7 @@ def test_training_samples_are_the_trainers_stream(tmp_path, model_dir):
 
 
 def test_training_samples_follow_dpo(tmp_path, model_dir):
-    from agent_tooling._pipeline import load_tokenizer, training_samples
+    from palingenesis.agent_tooling._pipeline import load_tokenizer, training_samples
 
     pairs = [
         {
@@ -160,7 +159,7 @@ def test_training_samples_follow_dpo(tmp_path, model_dir):
 
 
 def test_validate_masking_runs_on_local_data_without_false_pad_bug(tmp_path, model_dir):
-    from agent_tooling.validate_masking import validate
+    from palingenesis.agent_tooling.validate_masking import validate
 
     config = _config(tmp_path, model_dir, CHATS)  # gpt2: pad token == eos token
     report = validate(config, num_samples=6)
@@ -175,7 +174,7 @@ def test_validate_masking_runs_on_local_data_without_false_pad_bug(tmp_path, mod
 def test_profile_counts_parameters_exactly(tmp_path, model_dir):
     from transformers import AutoModelForCausalLM
 
-    from agent_tooling.profile_memory import estimate_memory
+    from palingenesis.agent_tooling.profile_memory import estimate_memory
 
     config = _config(tmp_path, model_dir, CHATS)
     config.model.torch_dtype = "float32"
@@ -191,7 +190,7 @@ def test_profile_counts_parameters_exactly(tmp_path, model_dir):
 
 
 def test_profile_refuses_to_guess_an_unknown_model(tmp_path, model_dir):
-    from agent_tooling.profile_memory import estimate_memory
+    from palingenesis.agent_tooling.profile_memory import estimate_memory
 
     config = _config(tmp_path, model_dir, CHATS)
     config.model.name_or_path = str(tmp_path / "does-not-exist")
@@ -202,7 +201,7 @@ def test_profile_refuses_to_guess_an_unknown_model(tmp_path, model_dir):
 def test_profile_accepts_gpu_flag(tmp_path, model_dir, monkeypatch, capsys):
     import yaml
 
-    from agent_tooling import profile_memory
+    from palingenesis.agent_tooling import profile_memory
 
     config_file = tmp_path / "c.yaml"
     config_file.write_text(

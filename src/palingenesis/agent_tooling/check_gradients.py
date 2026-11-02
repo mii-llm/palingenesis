@@ -9,7 +9,7 @@ per-layer gradient statistics to diagnose:
     - Imbalanced norms across depth (gradient should flow smoothly)
 
 Usage:
-    python -m agent_tooling.check_gradients --config configs/single_gpu.yaml
+    python -m palingenesis.agent_tooling.check_gradients --config configs/single_gpu.yaml
 
 Requires 1 GPU. Loads model, runs 1 forward-backward, reports norms.
 """
@@ -19,8 +19,7 @@ import sys
 import torch
 from transformers import AutoModelForCausalLM
 
-import agent_tooling._path_setup  # noqa: F401
-from agent_tooling._pipeline import load_tokenizer, training_samples
+from palingenesis.agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
 from palingenesis.data import collate_fn
 

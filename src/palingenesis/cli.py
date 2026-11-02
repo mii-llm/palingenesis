@@ -10,13 +10,15 @@ Usage:
 
 import sys
 
-BANNER = r"""
-                 _ _                            _
-  _ __  __ _ _ _(_) |_ _  __ _ ___ _ _  ___ __(_)___
- | '_ \/ _` | '_| | | ' \/ _` / -_) ' \/ -_|_-< (_-<
- | .__/\__,_|_| |_|_|_||_\__, \___|_||_\___/__/_/__/
- |_|                     |___/
-                                            v0.3.0
+from palingenesis import __version__
+
+BANNER = rf"""
+             _ _                           _
+  _ __  __ _| (_)_ _  __ _ ___ _ _  ___ __(_)___
+ | '_ \/ _` | | | ' \/ _` / -_) ' \/ -_|_-< (_-<
+ | .__/\__,_|_|_|_||_\__, \___|_||_\___/__/_/__/
+ |_|                 |___/
+                                        v{__version__}
 """
 
 HELP = f"""{BANNER}
@@ -25,6 +27,7 @@ HELP = f"""{BANNER}
   Alias: pgs (short form)
 
 Commands:
+  init        Write an example config to start from (pgs init --list)
   train       Start training (use with torchrun for multi-GPU)
   distill     On-policy distillation: the student samples, its teachers score, KL update
   distill-score  Annotate an mcqa distillation pool with the teacher's answers (filter before training)
@@ -47,6 +50,7 @@ Commands:
   version     Show version info
 
 Usage:
+  pgs init sft && pgs train --config sft.yaml
   pgs train --config configs/quickstart.yaml
   pgs distill --config configs/distill_math.yaml
   pgs rl --config configs/rl_math.yaml
@@ -75,6 +79,11 @@ def main():
     sys.argv = [sys.argv[0]] + sys.argv[2:]
 
     match cmd:
+        case "init":
+            from palingenesis.examples import main as init_main
+
+            sys.exit(init_main())
+
         case "train":
             from palingenesis.train import main as train_main
 
@@ -137,30 +146,28 @@ def main():
             _run_s0_tune()
 
         case "diagnose":
-            _run_agent_tool("agent_tooling.diagnose")
+            _run_agent_tool("palingenesis.agent_tooling.diagnose")
 
         case "inspect":
-            _run_agent_tool("agent_tooling.inspect_batch")
+            _run_agent_tool("palingenesis.agent_tooling.inspect_batch")
 
         case "validate":
-            _run_agent_tool("agent_tooling.validate_masking")
+            _run_agent_tool("palingenesis.agent_tooling.validate_masking")
 
         case "profile":
             # Translate --gpu to --gpu_memory_gb for the tool
-            _run_agent_tool("agent_tooling.profile_memory")
+            _run_agent_tool("palingenesis.agent_tooling.profile_memory")
 
         case "monitor":
-            _run_agent_tool("agent_tooling.monitor_run")
+            _run_agent_tool("palingenesis.agent_tooling.monitor_run")
 
         case "loss":
-            _run_agent_tool("agent_tooling.check_loss")
+            _run_agent_tool("palingenesis.agent_tooling.check_loss")
 
         case "gradients":
-            _run_agent_tool("agent_tooling.check_gradients")
+            _run_agent_tool("palingenesis.agent_tooling.check_gradients")
 
         case "version":
-            from palingenesis import __version__
-
             print(f"palingenesis {__version__}")
             print(f"  PyTorch: {_torch_version()}")
             print(f"  Transformers: {_transformers_version()}")
@@ -174,37 +181,10 @@ def main():
 
 
 def _run_agent_tool(module_name: str):
-    """Run an agent_tooling module's main() function.
-
-    agent_tooling is normally installed alongside palingenesis (it ships in
-    the wheel). For older installs or source checkouts, fall back to the
-    source-tree root and the current directory.
-    """
+    """Run a palingenesis.agent_tooling module's main() function."""
     import importlib
-    from pathlib import Path
 
-    # Fallback locations: source-tree root (editable/src layout) and cwd
-    # (running `pgs` from a repo checkout with a site-packages install).
-    for candidate in (Path(__file__).parent.parent.parent, Path.cwd()):
-        if (candidate / "agent_tooling" / "__init__.py").exists():
-            if str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-            break
-
-    try:
-        mod = importlib.import_module(module_name)
-    except ModuleNotFoundError as e:
-        if e.name and e.name.startswith("agent_tooling"):
-            print(
-                "Error: the 'agent_tooling' package is not available.\n"
-                "It ships with palingenesis >= 0.3.0 wheels — reinstall with:\n"
-                "  uv pip install -e '.[train]'   (from the repo root)\n"
-                "or run the tool from a source checkout of the repository.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        raise
-    mod.main()
+    importlib.import_module(module_name).main()
 
 
 def _run_prepare_multi():

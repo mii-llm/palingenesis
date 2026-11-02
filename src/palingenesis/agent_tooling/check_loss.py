@@ -11,13 +11,13 @@ Detects common training pathologies:
 
 Usage:
     # From a log file (one loss value per line, or "step=X loss=Y" format)
-    python -m agent_tooling.check_loss --log_file training.log
+    python -m palingenesis.agent_tooling.check_loss --log_file training.log
 
     # From wandb (requires wandb to be installed + authenticated)
-    python -m agent_tooling.check_loss --wandb_run user/project/run_id
+    python -m palingenesis.agent_tooling.check_loss --wandb_run user/project/run_id
 
     # Pipe from training output
-    grep "loss=" train_output.log | python -m agent_tooling.check_loss --stdin
+    grep "loss=" train_output.log | python -m palingenesis.agent_tooling.check_loss --stdin
 """
 
 import math
@@ -55,7 +55,7 @@ def parse_losses_from_text(text: str) -> list[tuple[int, float]]:
         2.3456  (one value per line, step = line number)
     """
     # The trainer's own step lines (training loss only, never eval_loss)
-    from agent_tooling._logparse import parse_steps
+    from palingenesis.agent_tooling._logparse import parse_steps
 
     pairs = [(s["step"], s["loss"]) for s in parse_steps(text)]
     if pairs:

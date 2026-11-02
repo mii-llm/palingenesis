@@ -5,6 +5,8 @@ import asyncio
 import json
 import math
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -395,6 +397,14 @@ def test_multi_turn_rollout_is_token_exact_and_masked():
         groups = pipeline._await(pipeline._eval(rows, 1.0))
     finally:
         pipeline.close()
+    # close() releases its threads (many runs in one process, e.g. a notebook, must not pile them up)
+    assert pipeline.loop.is_closed() and not pipeline.loop_thread.is_alive()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(
+        th.name.startswith(("pgs-generate", "pgs-rl-rollouts")) for th in threading.enumerate()
+    ):
+        time.sleep(0.05)
+    assert not [th.name for th in threading.enumerate() if th.name.startswith(("pgs-generate", "pgs-rl-rollouts"))]
     t = groups[0][0]
     assert t.finish == "stop" and t.turns == 2 and t.tool_calls == 1 and t.tool_errors == 0
     assert t.rewards == {"m": 1.0} and t.reward == 1.0

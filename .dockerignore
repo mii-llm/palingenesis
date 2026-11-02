@@ -6,7 +6,5 @@
 !README.md
 !src/
 !src/**
-!agent_tooling/
-!agent_tooling/**
 **/__pycache__/
 **/*.pyc

@@ -6,8 +6,9 @@ persistent tmux pane; the next user turn is the terminal output (new output, els
 The response parser follows terminus_json_plain_parser.py (Harbor, Apache-2.0), including its tolerance for small-
 model JSON mistakes: extra text around the object is a warning, a missing closing brace or an object buried in prose
 is auto-corrected with a warning, anything else is a parsing error that executes nothing and is answered with
-terminus's own feedback ("Previous response had parsing errors: ..."). The task image needs tmux (harbor3-base:3:
-research/tiny-reliable-agent/harness/Dockerfile.tmux; HarborEnv(images={"harbor3-base:1": "harbor3-base:3"})).
+terminus's own feedback ("Previous response had parsing errors: ..."). The task image needs tmux: build a variant of
+the task's image with tmux installed (see TMUX_DOCKERFILE) and map it with HarborEnv(images={"<task image>": "<task
+image with tmux>"}).
 """
 
 from __future__ import annotations
@@ -25,6 +26,12 @@ from palingenesis.rl.envs.harness.rules import StopAnswer, StopRule
 
 ACTION = "__terminus__"
 MAX_BYTES = 10000
+# A task image plus tmux (Debian/Ubuntu base; same verifier and users, so scores stay comparable across profiles):
+TMUX_DOCKERFILE = """    # docker build -t <task image>-tmux --build-arg BASE=<task image> - < Dockerfile.tmux
+    ARG BASE
+    FROM ${BASE}
+    RUN apt-get update && apt-get install -y --no-install-recommends tmux && rm -rf /var/lib/apt/lists/*
+"""
 
 TERMINUS_USER = (
     "You are an AI assistant tasked with solving command-line tasks in a Linux environment. You will be given a task "
@@ -292,9 +299,10 @@ def _terminus_start(s) -> dict[str, str]:
         tmux.start()
     except OpError as e:
         raise RuntimeError(
-            "terminus-2 needs tmux in the task image (build harbor3-base:3 from "
-            "research/tiny-reliable-agent/harness/Dockerfile.tmux and pass HarborEnv(images="
-            "{'harbor3-base:1': 'harbor3-base:3'})): " + str(e.data.get("detail", ""))
+            "terminus-2 needs tmux in the task image. Build a variant of the task's image with tmux installed,\n"
+            + TMUX_DOCKERFILE
+            + "and pass HarborEnv(images={'<task image>': '<task image>-tmux'}): "
+            + str(e.data.get("detail", ""))
         ) from None
     tmux.wait(0.5)
     s.flags["tmux"] = tmux

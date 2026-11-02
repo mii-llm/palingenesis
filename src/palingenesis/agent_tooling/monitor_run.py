@@ -9,13 +9,13 @@ Tails a training log file and reports real-time statistics:
 
 Usage:
     # Monitor from log file (can be running or completed)
-    python -m agent_tooling.monitor_run --log_file outputs/train.log
+    python -m palingenesis.agent_tooling.monitor_run --log_file outputs/train.log
 
     # Monitor last N steps only
-    python -m agent_tooling.monitor_run --log_file outputs/train.log --last 50
+    python -m palingenesis.agent_tooling.monitor_run --log_file outputs/train.log --last 50
 
     # Get quick status (for agent use)
-    python -m agent_tooling.monitor_run --log_file outputs/train.log --brief
+    python -m palingenesis.agent_tooling.monitor_run --log_file outputs/train.log --brief
 """
 
 import sys
@@ -34,7 +34,7 @@ class StepInfo:
 
 def parse_training_log(text: str) -> list[StepInfo]:
     """The trainer's step lines (SFT, DEFT, DPO formats alike), one StepInfo per step."""
-    from agent_tooling._logparse import parse_steps
+    from palingenesis.agent_tooling._logparse import parse_steps
 
     return [
         StepInfo(
@@ -200,7 +200,6 @@ def main():
     parser.add_argument("--config", help="Training config: takes max_steps from train.max_steps")
     args = parser.parse_args()
     if args.max_steps is None and args.config:
-        import agent_tooling._path_setup  # noqa: F401
         from palingenesis.config import Config
 
         max_steps = Config.from_yaml(args.config).train.max_steps

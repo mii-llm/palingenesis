@@ -1,5 +1,5 @@
 """Parameter schemas copied verbatim from requests the real harnesses sent to a recording stub (pgs harness serve):
-kimi-cli 1.52.0, qwen-code 0.25.2 (local runs) and opencode 1.19.2 (Harbor 0.24 CLI run) (research/tiny-reliable-agent/harness/fixtures/). Interface contracts: keep them
+kimi-cli 1.52.0, qwen-code 0.25.2 (local runs) and opencode 1.19.2 (Harbor 0.24 CLI run), recorded with `pgs harness capture`. Interface contracts: keep them
 byte-exact; tool descriptions are paraphrased in profiles_more.py."""
 
 # fmt: off

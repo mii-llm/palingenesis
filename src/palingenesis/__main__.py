@@ -1,5 +1,6 @@
-"""python -m palingenesis"""
+"""python -m palingenesis --config <file.yaml>: SFT / DPO training (the same as `pgs train`)."""
 
-from palingenesis.train import main
+if __name__ == "__main__":
+    from palingenesis.train import main
 
-main()
+    main()

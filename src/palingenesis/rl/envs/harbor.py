@@ -725,7 +725,7 @@ class HarborEnv:
         self.session = None
         self.episode_info: dict = {}
         self.profile_chat_kwargs = dict(profile_chat_kwargs or {})  # {profile name: chat_template_kwargs} overrides
-        self.images = dict(images or {})  # {task docker_image: image to use}, e.g. harbor3-base:1 -> :3 (tmux)
+        self.images = dict(images or {})  # {task docker_image: image to use}, e.g. -> its tmux variant
         if profile or profiles:
             from palingenesis.rl.envs.harness import HarnessMix
 

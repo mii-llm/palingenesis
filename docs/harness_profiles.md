@@ -7,7 +7,7 @@ Small agents are deployed inside agent harnesses (opencode, pi, mini-swe-agent, 
 speaks its own dialect: system prompt, tool names and argument names, observation format, error wording, how an
 episode ends and where the final answer comes from. A **harness profile** reproduces one harness at a pinned version
 inside `HarborEnv`, token-exact and offline, so the policy can be trained and evaluated under several dialects on the
-same Harbor tasks. Design: `research/tiny-reliable-agent/harness/REPORT.md` §4.
+same Harbor tasks.
 
 ```yaml
 env:
@@ -16,7 +16,7 @@ env:
     profiles: {palingenesis-default: 1, opencode: 1, pi: 1, mini-swe-agent: 1, openhands-sdk: 1}
     profile_seed: 0                                        # optional
     profile_chat_kwargs: {opencode: {enable_thinking: true}}   # optional, per profile
-    images: {"harbor3-base:1": "harbor3-base:3"}            # terminus-2 needs tmux
+    images: {"my-base:1": "my-base:1-tmux"}                 # terminus-2 needs tmux
 ```
 
 `profile: opencode` runs a single profile. Without `profile`/`profiles` HarborEnv behaves exactly as before
@@ -48,8 +48,8 @@ answered as an error. A mix of versions logs them all under `metric/profile/pali
 kimi-cli ≈ 4k, OpenHands ≈ 5k): system prompts and long tool descriptions are concise paraphrases, never the long
 upstream text; parameter schemas, tool names and order, and result / error strings are exact where recorded.
 
-**Fidelity sources.** Recorded with `pgs harness` (fixtures, local only, in
-`research/tiny-reliable-agent/harness/fixtures/`): opencode and mini-swe-agent through the Harbor 0.24 CLI on the box
+**Fidelity sources.** Recorded with `pgs harness` (fixtures stay local; point `PGS_HARNESS_FIXTURES` at them to run
+the conformance tests): opencode and mini-swe-agent through the Harbor 0.24 CLI
 (the real agent installed in the task container), qwen-code and kimi-cli run locally against `pgs harness serve`.
 From source at the pinned revision: pi, OpenHands (schemas dumped from the installed SDK; file_editor strings checked
 against it), SWE-agent, goose, hermes, terminus-2 (parser ported). Strings seen neither in a capture nor in the source
@@ -79,8 +79,8 @@ the profile and compare results (qwen-code, kimi-cli locally; opencode and mini-
 - *hermes* tracks main (Harbor installs main): pinned to e6899c8; a compact subset of the hermes-cli toolset (terminal,
   read_file, write_file, patch, search_files) with the advanced parameters left out; result JSON shapes follow its
   result classes.
-- *terminus-2* needs tmux in the image: `research/tiny-reliable-agent/harness/Dockerfile.tmux` builds
-  `harbor3-base:3` = `:1` + tmux (same verifier); pass `images={"harbor3-base:1": "harbor3-base:3"}`. Its parser
+- *terminus-2* needs tmux in the image: build a variant of the task image with tmux installed (same verifier; see
+  the user guide) and pass `images={"my-base:1": "my-base:1-tmux"}`. Its parser
   (Harbor's, Apache-2.0) tolerates small-model JSON mistakes: extra text is a warning, a missing closing brace or an
   object inside prose is auto-corrected with a warning, anything else executes nothing and gets terminus's own
   feedback ("Previous response had parsing errors: ..."). Waits are deterministic: after the keystrokes the pane is
@@ -124,12 +124,7 @@ Set `env.max_tool_output_tokens` above the profiles' own limits so the harness w
 ## Evaluation under a profile
 
 `palingenesis.rl.episodes.run_episodes(engine, tok, rows, HarborEnv, env_args, k=...)` runs episodes outside training
-through the pipeline's own rollout loop. `research/tiny-reliable-agent/scripts/eval/harbor_eval.py` uses it:
-
-    python harbor_eval.py --profile opencode --k 4 small=Qwen/Qwen3.5-0.8B
-    python harbor_eval.py --profiles 'opencode:1,pi:1,mini-swe-agent:1' --k 4 small=...
-    python harbor_eval.py --profile terminus-2 --images harbor3-base:1=harbor3-base:3 small=...
-
+through the pipeline's own rollout loop, so an evaluation script can score a model under one profile or a mix.
 Results are tagged by profile (per episode, and `by_profile` pass@1 in the summary).
 
 ## `pgs harness` (recording real harnesses)

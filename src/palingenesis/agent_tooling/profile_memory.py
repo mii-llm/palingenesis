@@ -24,7 +24,6 @@ import sys
 
 import torch
 
-import agent_tooling._path_setup  # noqa: F401
 from palingenesis.config import Config
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
@@ -199,7 +198,7 @@ def measure_memory(config: Config, steps: int = 2) -> dict:
     import json
     import tempfile
 
-    from agent_tooling._pipeline import load_tokenizer
+    from palingenesis.agent_tooling._pipeline import load_tokenizer
     from palingenesis.train import train
 
     tokenizer = load_tokenizer(config)

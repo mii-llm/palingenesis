@@ -78,7 +78,7 @@ jobs:
         run: |
           docker run --rm palingenesis:ci --help
           docker run --rm palingenesis:ci version
-          docker run --rm --entrypoint python palingenesis:ci -c 'import torch, transformers, agent_tooling.diagnose; assert torch.version.cuda == "12.9"'
+          docker run --rm --entrypoint python palingenesis:ci -c 'import torch, transformers, palingenesis.agent_tooling.diagnose; assert torch.version.cuda == "12.9"'
       - name: Run CPU training regression tests inside the image
         run: |
           docker run --rm --user 0 --entrypoint sh \

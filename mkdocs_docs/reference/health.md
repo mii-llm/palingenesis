@@ -135,7 +135,7 @@ Metrics logging is designed so it can never cost you a run:
 
 ## Agent tooling commands
 
-Palingenesis includes diagnostic CLI tools for debugging training before, during, and after a run. These wrap the `agent_tooling/` module.
+Palingenesis includes diagnostic CLI tools for debugging training before, during, and after a run. These wrap the `palingenesis.agent_tooling` package (also runnable as `python -m palingenesis.agent_tooling <tool>`).
 
 ### Pre-flight: diagnose
 

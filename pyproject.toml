@@ -1,6 +1,6 @@
 [project]
 name = "palingenesis"
-version = "0.3.0"
+dynamic = ["version"]  # from src/palingenesis/__init__.py
 description = "Fire-and-forget LLM fine-tuning with state-of-the-art defaults."
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,7 +26,8 @@ dependencies = [
     "torch>=2.11",
     "transformers>=5.12,<6",
     "datasets>=4.0",
-    "accelerate>=1.10",
+    "accelerate>=1.10",  # transformers device_map="auto" (pgs s0-tune)
+    "numpy>=1.26",
     "pyyaml>=6.0",
     "safetensors>=0.4.0",
 ]
@@ -113,10 +114,18 @@ Documentation = "https://mii-llm.github.io/palingenesis/"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/palingenesis/__init__.py"
+
 [tool.hatch.build.targets.wheel]
-# agent_tooling ships in the wheel so `pgs diagnose/inspect/validate/...`
-# work from any directory, not just a source checkout.
-packages = ["src/palingenesis", "agent_tooling"]
+# The diagnostics (palingenesis.agent_tooling) and the example configs (palingenesis.examples, `pgs init`) are
+# inside the package, so `pgs diagnose/inspect/validate/init ...` work from any directory.
+packages = ["src/palingenesis"]
+
+[tool.hatch.build.targets.sdist]
+# An explicit list: everything else in the checkout (local tooling, notes, deployment files) stays out.
+only-include = ["src/palingenesis", "tests", "configs", "README.md", "LICENSE", "pyproject.toml"]
+exclude = ["__pycache__", "*.pyc"]
 
 [tool.uv]
 # causal-conv1d (hybrid extra) compiles CUDA code against the torch it will run with.
@@ -161,3 +170,4 @@ ignore = ["E501"]  # line length handled by formatter
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # tests import shared helpers as `tests.<module>`

@@ -1,6 +1,6 @@
 """Harness profiles for HarborEnv (palingenesis.rl.envs.harness). The ops run against a local stand-in for the
-episode container (bash in a temporary directory); the Docker test runs Scrivania tasks per profile and is skipped
-unless docker and the task directory (PGS_SCRIVANIA_TASKS) are available."""
+episode container (bash in a temporary directory); the Docker test runs local Harbor tasks per profile and is skipped
+unless docker and the task directory (PGS_HARBOR_TASKS) are available."""
 
 from __future__ import annotations
 
@@ -761,9 +761,10 @@ def test_trainer_rollout_with_a_native_profile(local_harbor):
     assert t.info["harness_profile"] == "opencode@1.19.2" and LocalRuntime.verified == ["Wrote hello.txt."]
 
 
-# ================================================================== Docker: Scrivania tasks per profile
+# ================================================================== Docker: local Harbor tasks per profile
 
-TASKS = Path(os.environ.get("PGS_SCRIVANIA_TASKS", str(Path.home() / "pgs-run/data/harbor3/scrivania/tasks")))
+# A local Harbor task set with the two tasks below (not shipped): PGS_HARBOR_TASKS=<dir>.
+TASKS = Path(os.environ.get("PGS_HARBOR_TASKS", "/nonexistent"))
 ARCHIVE, ENV_EDIT = "scr_archive_create_l1_en_0000", "scr_env_edit_l1_en_0003"
 TAR = "cd /workdir && tar -czf website.tar.gz -C Projects website"
 SED = "sed -i 's/^DEBUG=true$/DEBUG=false/' /workdir/Projects/sito/.env"
@@ -891,9 +892,9 @@ def play(env: HarborEnv, turns) -> tuple[list[dict], list[str]]:
     return messages, seen
 
 
-@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the Scrivania tasks unavailable")
+@pytest.mark.skipif(not _docker_tasks_ok(), reason="docker or the local Harbor tasks unavailable")
 @pytest.mark.parametrize("profile", sorted(SCRIPTS))
-def test_scrivania_oracle_and_noop_per_profile(profile):
+def test_harbor_tasks_oracle_and_noop_per_profile(profile):
     for task in (ARCHIVE, ENV_EDIT):
         for mode in (task, "noop"):
             env = HarborEnv(profile=profile)

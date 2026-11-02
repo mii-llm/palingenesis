@@ -10,7 +10,7 @@
     kimi-cli@1.52.0          Shell, ReadFile, Glob, Grep, WriteFile, StrReplaceFile; <system> status tags
 
 Sources and fidelity: qwen-code and kimi-cli parameter schemas and most result strings were recorded from the real
-CLIs against `pgs harness serve` (fixtures in research/tiny-reliable-agent/harness/fixtures/); swe-agent, goose and
+CLIs against `pgs harness serve` (recorded with `pgs harness capture`); swe-agent, goose and
 hermes are written from their source at the pinned revision. Strings not observed in a capture or the source are
 marked "approx." where they are produced. Prompts and long tool descriptions are concise paraphrases.
 
