@@ -39,6 +39,39 @@ def test_dry_run_writes_valid_configs(smoke, tmp_path, capsys):
     assert RLConfig.from_yaml(written["rl"]).data.retire_above == 0.0
 
 
+def test_gpus_keeps_the_work_per_gpu(smoke, tmp_path, capsys):
+    assert smoke.main(["--out", str(tmp_path), "--dry-run", "--gpus", "2", "--rollout", "vllm"]) == 0
+    written = json.loads(capsys.readouterr().out)
+    rows = {s: len((tmp_path / "data" / f"{s}.jsonl").read_text().splitlines()) for s in smoke.STAGES}
+    assert rows == {"sft": 1024, "dpo": 512, "opd": 256, "rl": 512}  # SFT/DPO: data for 30 steps on 2 ranks
+    from palingenesis.config import Config
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.rl.config import RLConfig
+
+    assert Config.from_yaml(written["sft"]).train.per_device_batch_size == 8
+    assert RLConfig.from_yaml(written["rl"]).rollout.batch_prompts == 16  # global, 8 per rank
+    assert OPDConfig.from_yaml(written["opd"]).teachers["teacher"].device == "cuda:1"
+    sft = smoke.command("sft", Path("c.yaml"), 2)
+    assert "--nproc_per_node=2" in sft and sft[-3:] == ["palingenesis.train", "--config", "c.yaml"]
+    assert smoke.command("rl", Path("c.yaml"), 2)[-3:] == ["palingenesis.rl.trainer", "--config", "c.yaml"]
+    assert "distill" in smoke.command("opd", Path("c.yaml"), 2)  # one process
+    assert "rl" in smoke.command("rl", Path("c.yaml"), 1)  # one GPU: the CLI, as before
+
+
+def test_gpus_refuses_hf_rl(smoke, tmp_path):
+    with pytest.raises(SystemExit):  # hf generates with the sharded model: refused by the RL trainer too
+        smoke.main(["--out", str(tmp_path), "--dry-run", "--gpus", "2"])
+    assert smoke.main(["--out", str(tmp_path), "--dry-run", "--gpus", "2", "--stages", "sft,dpo,opd"]) == 0
+
+
+def test_one_gpu_data_is_unchanged(smoke, tmp_path):
+    one = smoke.write_data(tmp_path / "one")
+    two = smoke.write_data(tmp_path / "two", gpus=2)
+    for stage in ("sft", "dpo"):  # the first rows are the same: one-GPU runs stay comparable with earlier ones
+        a, b = one[stage].read_text().splitlines(), two[stage].read_text().splitlines()
+        assert len(b) == 2 * len(a) and b[: len(a)] == a
+
+
 def test_data_is_deterministic(smoke, tmp_path):
     a = smoke.write_data(tmp_path / "a")
     b = smoke.write_data(tmp_path / "b")

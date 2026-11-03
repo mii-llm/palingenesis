@@ -9,15 +9,28 @@ The build is told apart with ``torch.version.hip`` (a version string on ROCm, No
 otherwise), as PyTorch's HIP notes recommend; the GPU generation with the device's
 ``gcnArchName`` (e.g. "gfx942:sramecc+:xnack-").
 
+Also here: keeping the *current* device right (``device_scope``, ``on_current_device``).
+Triton kernels (Liger's, flash-linear-attention's, vLLM's, palingenesis's own) launch on
+the current device, not on their tensors' device; the current device is per thread and a
+new thread starts on GPU 0. A kernel launched on GPU 0 with another GPU's tensors reads
+memory that is not mapped there: on AMD GPUs a "Memory access fault by GPU node-N"
+that kills the process (measured on MI250X: OPD's teacher on cuda:1, RL ranks > 0).
+
 Only code that needs one of these decisions imports this module.
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import os
 import re
+from collections.abc import Callable
+from typing import TypeVar
 
 import torch
+
+_T = TypeVar("_T")
 
 # FP8 training (torchao float8). NVIDIA: SM89+ (Ada, Hopper, Blackwell), validated.
 # ROCm: torchao picks e4m3fnuz on MI300 (gfx942) and OCP e4m3fn on MI350 (gfx950)
@@ -60,6 +73,30 @@ def gpu_arch(device: int = 0) -> str | None:
     if arch:
         return arch.split(":")[0]  # drop feature flags (":sramecc+:xnack-")
     return f"sm_{props.major}{props.minor}"
+
+
+def device_scope(device: str | torch.device) -> contextlib.AbstractContextManager:
+    """Make `device` the current GPU inside the block (a no-op for CPU or a bare "cuda"),
+    for work on a model that lives on another GPU than the thread's current one."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is not None and torch.cuda.is_available():
+        return torch.cuda.device(device)
+    return contextlib.nullcontext()
+
+
+def on_current_device(fn: Callable[..., _T]) -> Callable[..., _T]:
+    """`fn`, run on the GPU that is current where it was wrapped: for thread targets and
+    executor initializers, since a new thread starts on GPU 0 (see the module docstring)."""
+    if not torch.cuda.is_available():
+        return fn
+    index = torch.cuda.current_device()
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        torch.cuda.set_device(index)
+        return fn(*args, **kwargs)
+
+    return run
 
 
 def platform_name() -> str:

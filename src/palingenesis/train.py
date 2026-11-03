@@ -268,6 +268,13 @@ def train(config: Config):
     device = torch.device(f"cuda:{local_rank}")
 
     logger.info(f"rank={rank} local_rank={local_rank} world_size={world_size}")
+    if world_size > 1 and not config.parallel.fsdp:
+        # FSDP is the only data-parallel path (no DDP): without it each rank would train its
+        # own copy of the model on its shard of the data, with no gradient exchange.
+        raise ConfigError(
+            f"{world_size} ranks with parallel.fsdp: false would train {world_size} separate models: "
+            "set parallel.fsdp: true, or run one process."
+        )
 
     # ── Config validation (raises on hard incompatibilities) ─────────────
     for warning in config.validate():
@@ -1365,6 +1372,14 @@ def train(config: Config):
                     # (when available) is the comparable cross-entropy.
                     step_loss = accum_loss / max(accum_micro, 1)
                     ce_loss = accum_ce / accum_ce_micro if accum_ce_micro else None
+                    if is_fsdp:
+                        # A token loss is this rank's share of the global per-token loss (its
+                        # sum over the global valid-token count): the ranks' values add up. DPO's
+                        # loss and the CE side metric are rank means: averaged.
+                        both = torch.tensor([step_loss, ce_loss or 0.0], device=device, dtype=torch.float64)
+                        dist.all_reduce(both, op=dist.ReduceOp.SUM)
+                        step_loss = both[0].item() / (world_size if accum_dpo_micro else 1)
+                        ce_loss = both[1].item() / world_size if ce_loss is not None else None
 
                     metrics = {
                         "train/loss": step_loss,

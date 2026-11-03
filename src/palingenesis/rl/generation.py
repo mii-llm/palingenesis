@@ -27,6 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+from palingenesis.accelerator import on_current_device
 from palingenesis.opd.rollout import RolloutEngine
 
 
@@ -59,10 +60,13 @@ class GenerationClient:
         if self.streaming:
             self.inbox: queue.Queue = queue.Queue()
             self.ids = itertools.count()
-            self.thread = threading.Thread(target=self._engine_loop, name="pgs-engine", daemon=True)
+            self.thread = threading.Thread(target=on_current_device(self._engine_loop), name="pgs-engine", daemon=True)
             self.thread.start()
         else:
-            self.executor = ThreadPoolExecutor(1, thread_name_prefix="pgs-generate")  # one engine call at a time
+            # one engine call at a time, on this rank's GPU
+            self.executor = ThreadPoolExecutor(
+                1, thread_name_prefix="pgs-generate", initializer=on_current_device(lambda: None)
+            )
             self.pending: list[tuple[list[int], int, float, asyncio.Future]] = []
             self._arrived: asyncio.Event | None = None
             self._flusher: asyncio.Task | None = None

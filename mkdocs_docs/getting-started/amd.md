@@ -67,7 +67,7 @@ snapshot_download("kernels-community/aiter-flash-attn", repo_type="kernel", revi
 | | MI250 / MI250X (gfx90a) | MI300 (gfx942) | MI350 (gfx950) |
 |---|---|---|---|
 | bf16 SFT, DPO, OPD, RL (`rollout.backend: hf`) | yes | yes | yes |
-| FSDP2 / multi-GPU (RCCL via `nccl`) | yes | yes | yes |
+| FSDP2 / multi-GPU (RCCL via `nccl`) | yes (SFT, DPO, RL on 2 and 8 GCDs; OPD teacher on a second GCD, measured) | yes | yes |
 | `attn_implementation: sdpa` | yes (torch's ROCm SDPA) | yes | yes |
 | `attn_implementation: kernels-community/aiter-flash-attn@v2` | **no**: aiter ships no Triton configs for gfx90a, refused | untested | untested |
 | `attn_implementation: flash_attention_2` | yes with a ROCm flash-attn build (SFT 2.6x sdpa, measured) | only with a ROCm flash-attn build installed | same |
@@ -124,6 +124,7 @@ python scripts/acceptance_smoke.py --out runs/acceptance-aiter --stages sft,dpo 
 python scripts/acceptance_smoke.py --out runs/acceptance-fa2 --stages sft,dpo \
     --attn flash_attention_2                                                     # with ROCm flash-attn (MI250)
 python scripts/acceptance_smoke.py --out runs/acceptance-vllm --stages opd,rl --rollout vllm
+python scripts/acceptance_smoke.py --out runs/acceptance-8gpu --gpus 8 --stages sft,dpo,rl --rollout vllm
 ```
 
-It uses Qwen/Qwen3-0.6B (student) and Qwen/Qwen3-1.7B (OPD teacher) by default, 30 steps per stage, one GPU. `--dry-run` writes the data and configs and validates them without a GPU.
+It uses Qwen/Qwen3-0.6B (student) and Qwen/Qwen3-1.7B (OPD teacher) by default, 30 steps per stage, one GPU. `--gpus N` runs SFT, DPO and RL on N ranks with FSDP2 (RCCL) and the same work per GPU (RL's global `rollout.batch_prompts` grows N-fold), so compare it with a reference run at the same N; OPD stays one process and puts its teacher on the second GPU. `--dry-run` writes the data and configs and validates them without a GPU.
