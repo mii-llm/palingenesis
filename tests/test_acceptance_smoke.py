@@ -33,6 +33,10 @@ def test_dry_run_writes_valid_configs(smoke, tmp_path, capsys):
 
     opd = OPDConfig.from_yaml(written["opd"])
     assert list(opd.teachers) == ["teacher"] and list(opd.sources) == ["chat"]  # sections replaced, not merged
+    from palingenesis.rl.config import RLConfig
+
+    # the student solves this arithmetic: retiring solved prompts would empty the data before --steps
+    assert RLConfig.from_yaml(written["rl"]).data.retire_above == 0.0
 
 
 def test_data_is_deterministic(smoke, tmp_path):
@@ -59,3 +63,6 @@ def test_parse_logs(smoke):
     parsed = smoke.parse_log("rl", rl)
     assert parsed["steps_logged"] == 4 and parsed["s_per_step_median"] == 13.5
     assert parsed["reward_median"] == pytest.approx(0.7)
+    # a step whose groups all got one reward trains nothing and logs no loss, but it ran
+    parsed = smoke.parse_log("rl", rl + "\nINFO palingenesis.rl.trainer: step 5 | grad_norm=0 time/step=1")
+    assert parsed["steps_logged"] == 5 and parsed["loss_last"] == pytest.approx(0.4)

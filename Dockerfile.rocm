@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # hadolint ignore=DL3013
 RUN --mount=type=bind,source=.,target=/source,rw \
     python3 -m pip install --no-cache-dir "/source[logging,rl,mcp]" && \
-    python3 -m pip install --no-cache-dir bitsandbytes "flash-linear-attention[rocm]" kernels && \
+    python3 -m pip install --no-cache-dir bitsandbytes "flash-linear-attention[rocm]" \
+        "transformers>=5.22" "kernels>=0.17.2,<0.18" && \
     python3 -m pip install --no-cache-dir --no-deps liger-kernel cut-cross-entropy && \
     python3 -c "import torch, vllm; assert torch.version.hip, torch.__version__; print(torch.__version__, vllm.__version__)"
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
