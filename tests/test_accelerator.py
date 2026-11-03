@@ -164,13 +164,28 @@ def attn_env(monkeypatch):
     return use
 
 
-@pytest.mark.parametrize("name", ["mi250", "mi300"])
-def test_flash_attention_2_missing_on_rocm_is_a_config_error(gpu, attn_env, name):
+@pytest.mark.parametrize("name,suggests_aiter", [("mi250", False), ("mi300", True), ("mi355", True)])
+def test_flash_attention_2_missing_on_rocm_is_a_config_error(gpu, attn_env, name, suggests_aiter):
     gpu(name)
     # kernels installed does not help on ROCm: transformers would fetch kernels-community/flash-attn2 (CUDA only)
     attn_env(flash_attn=False, kernels=True)
-    with pytest.raises(ConfigError, match="aiter-flash-attn"):
+    with pytest.raises(ConfigError, match="sdpa") as e:
         accelerator.check_attn_implementation("flash_attention_2")
+    assert ("attn_implementation: kernels-community/aiter-flash-attn" in str(e.value)) is suggests_aiter
+
+
+@pytest.mark.parametrize("name,ok", [("mi250", False), ("mi300", True), ("mi355", True)])
+def test_aiter_only_on_the_gpus_it_ships_configs_for(gpu, attn_env, name, ok):
+    """aiter reads configs/<arch>-MHA-DEFAULT.json at its first call; there is none for gfx90a."""
+    gpu(name)
+    attn_env(flash_attn=True, kernels=True)
+    for spec in ("kernels-community/aiter-flash-attn@v2", "kernels-community/aiter-flash-attn"):
+        if ok:
+            accelerator.check_attn_implementation(spec)
+        else:
+            with pytest.raises(ConfigError, match="gfx90a") as e:
+                accelerator.check_attn_implementation(spec)
+            assert "sdpa" in str(e.value) and "ROCm flash-attn" in str(e.value)
 
 
 def test_flash_attention_2_on_nvidia_unchanged(gpu, attn_env):
@@ -225,6 +240,36 @@ def test_unavailable_flash_attention_fails_before_any_model_load(gpu, attn_env, 
         train_mod.train(config)
     assert loads == []
     assert config.model.attn_implementation == "flash_attention_2"
+
+
+@pytest.mark.parametrize(
+    "attn,dtype,autocast",
+    [
+        ("flash_attention_2", torch.float32, True),  # DPO's fp32 weights: flash kernels take fp16 / bf16 only
+        ("kernels-community/aiter-flash-attn@v2", torch.float32, True),
+        ("sdpa", torch.float32, False),
+        ("flash_attention_2", torch.bfloat16, False),
+    ],
+)
+def test_output_head_check_runs_flash_attention_in_bf16(attn, dtype, autocast):
+    """The pre-training head check calls the model's forward; with fp32 weights and flash
+    attention it must run under bf16 autocast like training, or the kernel rejects fp32."""
+    from palingenesis.logits import verify_output_head
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(_attn_implementation=attn)
+            self.embed, self.lm_head = nn.Embedding(64, 16), nn.Linear(16, 64, bias=False)
+            self.autocast = []
+
+        def forward(self, input_ids):
+            self.autocast.append(torch.is_autocast_enabled("cpu"))
+            return types.SimpleNamespace(logits=self.lm_head(self.embed(input_ids)))
+
+    model = Tiny().to(dtype)
+    verify_output_head(model, model.lm_head, backbone=lambda input_ids: model.embed(input_ids))
+    assert model.autocast == [autocast]
 
 
 def test_packing_accepts_hub_flash_kernels():

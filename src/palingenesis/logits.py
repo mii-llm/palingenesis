@@ -86,8 +86,17 @@ def verify_output_head(
 ) -> float:
     """Raise if head(backbone(x)) differs from model(x).logits. Random tokens,
     eval mode (restored afterwards). Returns the relative max difference. `device` is
-    where the inputs go (default: the parameters'; FSDP with CPU offload needs the GPU)."""
+    where the inputs go (default: the parameters'; FSDP with CPU offload needs the GPU).
+
+    fp32 weights with flash attention (flash_attention_2, Hub flash kernels) run the check
+    under bf16 autocast, as training does: transformers otherwise hands the fp32 q/k/v to
+    the kernel, which accepts only fp16 / bf16."""
+    from palingenesis.accelerator import is_flash_varlen
+
     device = device or next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    attn = getattr(getattr(model, "config", None), "_attn_implementation", None) or ""
+    flash_fp32 = dtype in (torch.float32, torch.float64) and is_flash_varlen(attn)
     vocab = head.weight.shape[0]
     ids = torch.randint(0, vocab, (1, tokens), generator=torch.Generator().manual_seed(0)).to(device)
     was_training = model.training
@@ -95,15 +104,15 @@ def verify_output_head(
     matmul_precision = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("highest")  # compare implementations, not TF32 noise
     try:
-        reference = model(input_ids=ids).logits.float()
-        hidden = final_hidden_states(model, ids) if backbone is None else _last_hidden(backbone(input_ids=ids))
-        ours = head(hidden).float()
+        with torch.amp.autocast(torch.device(device).type, dtype=torch.bfloat16, enabled=flash_fp32):
+            reference = model(input_ids=ids).logits.float()
+            hidden = final_hidden_states(model, ids) if backbone is None else _last_hidden(backbone(input_ids=ids))
+            ours = head(hidden).float()
     finally:
         model.train(was_training)
         torch.set_float32_matmul_precision(matmul_precision)
     diff = float((ours - reference).abs().max() / reference.abs().max().clamp(min=1e-30))
-    dtype = next(model.parameters()).dtype
-    tolerance = 1e-4 if dtype in (torch.float32, torch.float64) else 2e-2
+    tolerance = 1e-4 if dtype in (torch.float32, torch.float64) and not flash_fp32 else 2e-2
     if diff > tolerance:
         raise NotImplementedError(
             f"The model's forward transforms the lm_head output in a way palingenesis does not replicate "

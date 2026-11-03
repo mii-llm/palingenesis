@@ -36,6 +36,11 @@ _ROCM_TF32_DOT_ARCHS = {"gfx942"}
 # transformers' pattern for an attention kernel on the Hub: "org/repo[@revision][:function]".
 _HUB_KERNEL = re.compile(r"^[^/:]+/[^/:]+(?:@[^/:]+)?(?::[^/:]+)?$")
 ROCM_ATTENTION_KERNEL = "kernels-community/aiter-flash-attn@v2"
+_AITER_REPO = "kernels-community/aiter-flash-attn"
+# aiter's Triton attention reads build/torch-rocm/configs/<arch>-MHA-DEFAULT.json at its first
+# call and ships one only for these targets (v1 and v2): on gfx90a (MI250) it fails with
+# FileNotFoundError mid-forward, measured on an MI250X.
+_AITER_ARCHS = {"gfx942", "gfx950", "gfx1150", "gfx1151", "gfx1250"}
 
 AMD_DOCS = "https://mii-llm.github.io/palingenesis/getting-started/amd/"
 
@@ -175,13 +180,31 @@ def is_flash_varlen(attn_implementation: str) -> bool:
     )
 
 
+def aiter_supported(arch: str | None = None) -> bool:
+    """Whether aiter's Hub flash attention has Triton configs for this AMD GPU (device 0 by default)."""
+    return (arch or gpu_arch()) in _AITER_ARCHS
+
+
+def _rocm_flash_alternatives(arch: str | None) -> str:
+    """The flash attention options to suggest on this AMD GPU."""
+    if aiter_supported(arch):
+        return (
+            f"Use model.attn_implementation: {ROCM_ATTENTION_KERNEL} (AMD's aiter flash attention from the Hub; "
+            "`pip install kernels`) or sdpa, or install ROCm flash-attn."
+        )
+    return (
+        f"Use model.attn_implementation: sdpa, or install a ROCm flash-attn build for {arch} "
+        "(aiter's Hub kernel has no configs for this GPU)."
+    )
+
+
 def check_attn_implementation(attn_implementation: str) -> None:
-    """Raise ConfigError when model.attn_implementation cannot load in this environment.
+    """Raise ConfigError when model.attn_implementation cannot load or run in this environment.
 
     flash_attention_2 needs the flash-attn package; on NVIDIA transformers also accepts the
     `kernels` package instead (it then loads kernels-community/flash-attn2, which has no
-    ROCm build). A Hub kernel needs the `kernels` package. Other names are left to
-    transformers.
+    ROCm build). A Hub kernel needs the `kernels` package, and aiter's only runs on the AMD
+    GPUs it ships configs for. Other names are left to transformers.
     """
     from transformers.utils import is_flash_attn_2_available, is_kernels_available
 
@@ -193,8 +216,7 @@ def check_attn_implementation(attn_implementation: str) -> None:
         if is_rocm():
             raise ConfigError(
                 "model.attn_implementation=flash_attention_2, but flash-attn is not installed for this ROCm torch "
-                f"({platform_name()}). Use model.attn_implementation: {ROCM_ATTENTION_KERNEL} (AMD's aiter flash "
-                f"attention from the Hub; `pip install kernels`) or sdpa, or install ROCm flash-attn. See {AMD_DOCS}"
+                f"({platform_name()}). {_rocm_flash_alternatives(gpu_arch())} See {AMD_DOCS}"
             )
         raise ConfigError(
             "model.attn_implementation=flash_attention_2, but neither flash-attn nor the `kernels` package is "
@@ -205,4 +227,12 @@ def check_attn_implementation(attn_implementation: str) -> None:
         raise ConfigError(
             f"model.attn_implementation={attn_implementation!r} is a Hub kernel and needs the `kernels` package: "
             "`pip install kernels`."
+        )
+    repo = attn_implementation.split("@")[0].split(":")[0]
+    if repo == _AITER_REPO and is_rocm() and torch.cuda.is_available() and not aiter_supported():
+        arch = gpu_arch()
+        raise ConfigError(
+            f"model.attn_implementation={attn_implementation!r}: aiter's flash attention ships Triton configs only "
+            f"for {', '.join(sorted(_AITER_ARCHS))}; this GPU is {arch}. {_rocm_flash_alternatives(arch)} "
+            f"See {AMD_DOCS}"
         )

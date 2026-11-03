@@ -171,7 +171,9 @@ def stage_overrides(stage: str, args, data: dict[str, Path], out: Path) -> dict:
     if stage == "rl":
         return {
             "model": {"policy": args.student, "chat_template_kwargs": NO_THINKING},
-            "data": {"dataset": str(data["rl"]), "eval_dataset": ""},
+            # rl_math retires prompts solved 90% of the time; the student solves ~98% of this
+            # arithmetic, so all 512 rows retire in ~25 steps and the run stops before --steps
+            "data": {"dataset": str(data["rl"]), "eval_dataset": "", "retire_above": 0.0},
             "rollout": {
                 "backend": args.rollout,
                 "batch_prompts": 8,
@@ -238,13 +240,15 @@ _KV_LINE = re.compile(r"\bstep (\d+) \| (.*)$")
 
 def parse_log(stage: str, text: str) -> dict:
     """Losses and throughput from a stage's log: SFT/DPO step lines, OPD/RL `step N | k=v` lines."""
-    losses, speed, extra = [], [], {}
+    losses, speed, extra, steps = [], [], {}, set()
     for line in text.splitlines():
         if stage in ("sft", "dpo"):
             if m := _SFT_LINE.search(line):
+                steps.add(int(m.group(1)))
                 losses.append(float(m.group(2)))
                 speed.append(float(m.group(3)))
         elif m := _KV_LINE.search(line):
+            steps.add(int(m.group(1)))  # RL steps whose groups all got one reward log no loss
             kv = dict(item.split("=", 1) for item in m.group(2).split() if "=" in item)
             if "loss" in kv:
                 losses.append(float(kv["loss"]))
@@ -255,7 +259,7 @@ def parse_log(stage: str, text: str) -> dict:
                     extra.setdefault(key, []).append(float(kv[key]))
     later = speed[len(speed) // 2 :]  # the first steps include compilation and warm-up
     summary = {
-        "steps_logged": len(losses),
+        "steps_logged": len(steps),
         "loss_first": losses[0] if losses else None,
         "loss_last": losses[-1] if losses else None,
     }

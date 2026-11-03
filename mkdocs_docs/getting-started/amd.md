@@ -14,7 +14,8 @@ cd palingenesis
 python -m venv .venv && source .venv/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2   # FIRST: ROCm torch (2.11+)
 pip install -e ".[logging,rl]"
-pip install bitsandbytes "flash-linear-attention[rocm]" kernels                     # kernels with ROCm builds
+pip install bitsandbytes "flash-linear-attention[rocm]"                            # kernels with ROCm builds
+pip install "transformers>=5.22" "kernels>=0.17.2,<0.18"                           # Hub attention kernels (aiter)
 pip install --no-deps liger-kernel cut-cross-entropy                               # keep torch's ROCm Triton
 python -c "import torch; print(torch.__version__, torch.version.hip)"              # must still say +rocm
 ```
@@ -25,6 +26,7 @@ python -c "import torch; print(torch.__version__, torch.version.hip)"           
 - **bitsandbytes** ships ROCm builds in its PyPI wheel for gfx90a, gfx942 and gfx950 ([installation guide](https://huggingface.co/docs/bitsandbytes/main/en/installation#rocm)), so the 8-bit optimizers are available.
 - **flash-linear-attention** (Qwen3.5 / Qwen3-Next linear-attention layers) has a `rocm` extra that does not pin a Triton build ([README](https://github.com/fla-org/flash-linear-attention#installation)).
 - **causal-conv1d** (the `hybrid` extra) is compiled against your torch; it is untested here on ROCm. Without it Qwen3.5 trains with transformers' slower convolution and cannot use `data.packing`.
+- **kernels** (only for Hub attention kernels such as aiter) must match transformers: transformers 5.22 accepts `kernels>=0.17.2,<0.18` and treats newer releases as not installed, and transformers 5.12.x fails at `import transformers.activations` (`ValueError: Either a revision or a version must be specified`) once a current `kernels` is installed, which stops every model load. Hence both pins above.
 
 ### Container
 
@@ -47,6 +49,17 @@ pgs version
 #   GPU: 8x AMD Instinct MI300X (192 GB), ROCm 7.2.x, arch gfx942
 ```
 
+### Offline compute nodes
+
+On clusters whose GPU nodes have no internet, download on a login node into the `HF_HOME` the jobs use, then run with `HF_HUB_OFFLINE=1`. Hub attention kernels are their own repository type (`kernel`), separate from the model repository of the same name, which has different branches: download them with `repo_type="kernel"`, or the offline run reports no local snapshot.
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download("Qwen/Qwen3-0.6B")
+snapshot_download("kernels-community/aiter-flash-attn", repo_type="kernel", revision="v2")
+```
+
 ---
 
 ## What works
@@ -56,15 +69,15 @@ pgs version
 | bf16 SFT, DPO, OPD, RL (`rollout.backend: hf`) | yes | yes | yes |
 | FSDP2 / multi-GPU (RCCL via `nccl`) | yes | yes | yes |
 | `attn_implementation: sdpa` | yes (torch's ROCm SDPA) | yes | yes |
-| `attn_implementation: kernels-community/aiter-flash-attn@v2` | untested | untested | untested |
-| `attn_implementation: flash_attention_2` | only with a ROCm flash-attn build installed | same | same |
+| `attn_implementation: kernels-community/aiter-flash-attn@v2` | **no**: aiter ships no Triton configs for gfx90a, refused | untested | untested |
+| `attn_implementation: flash_attention_2` | yes with a ROCm flash-attn build (SFT 2.6x sdpa, measured) | only with a ROCm flash-attn build installed | same |
 | Cut Cross-Entropy | chunked CE instead (see below) | yes | chunked CE instead |
 | FP8 (`memory.float8_training`) | **no**: no FP8 hardware, refused | opt-in (torchao uses e4m3fnuz) | opt-in |
 | Muon (`train.optimizer: muon`) | torch backend | torch backend | torch backend |
-| vLLM rollouts (`rollout.backend: vllm`) | needs vLLM's ROCm build, untested | same | same |
+| vLLM rollouts (`rollout.backend: vllm`) | yes with vLLM's ROCm build (0.26.0: OPD and RL, measured) | needs vLLM's ROCm build, untested | same |
 | `rollout.backend: vllm_server` | untested, warns | untested, warns | untested, warns |
 
-**Attention.** `sdpa` works everywhere. For flash attention on AMD use AMD's aiter kernel from the Hugging Face Hub, as [TRL recommends](https://github.com/huggingface/trl/blob/main/docs/source/amd_gpus.md); transformers loads Hub kernels given as `org/repo[@revision]` through the [`kernels`](https://github.com/huggingface/kernels) package:
+**Attention.** `sdpa` works everywhere. For flash attention on MI300 / MI350 use AMD's aiter kernel from the Hugging Face Hub, as [TRL recommends](https://github.com/huggingface/trl/blob/main/docs/source/amd_gpus.md); transformers loads Hub kernels given as `org/repo[@revision]` through the [`kernels`](https://github.com/huggingface/kernels) package. aiter reads a per-GPU Triton config at its first call and ships them only for gfx942, gfx950, gfx1150, gfx1151 and gfx1250, so on MI250 (gfx90a) training stops before loading the model with a config error; there use `flash_attention_2` with a ROCm flash-attn build, or `sdpa`:
 
 ```yaml
 model:
@@ -107,7 +120,9 @@ vLLM supports MI200 (gfx90a), MI300 (gfx942) and MI350 (gfx950, ROCm ≥ 7.0) ([
 ```bash
 python scripts/acceptance_smoke.py --out runs/acceptance                        # sdpa, hf rollouts
 python scripts/acceptance_smoke.py --out runs/acceptance-aiter --stages sft,dpo \
-    --attn kernels-community/aiter-flash-attn@v2
+    --attn kernels-community/aiter-flash-attn@v2                                 # MI300 / MI350
+python scripts/acceptance_smoke.py --out runs/acceptance-fa2 --stages sft,dpo \
+    --attn flash_attention_2                                                     # with ROCm flash-attn (MI250)
 python scripts/acceptance_smoke.py --out runs/acceptance-vllm --stages opd,rl --rollout vllm
 ```
 
