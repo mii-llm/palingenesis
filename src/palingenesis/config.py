@@ -18,7 +18,9 @@ class ModelConfig:
     name_or_path: str = "meta-llama/Llama-3.1-8B-Instruct"
     trust_remote_code: bool = True
     torch_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
-    attn_implementation: Literal["sdpa", "flash_attention_2", "eager"] = "sdpa"
+    # sdpa | flash_attention_2 | flex_attention | eager, or a Hub kernel "org/repo[@rev]" loaded by
+    # transformers through the `kernels` package (AMD: "kernels-community/aiter-flash-attn@v2")
+    attn_implementation: str = "sdpa"
     use_liger_kernel: bool = True  # used when compile is false (compile fuses the same ops)
     compile: bool = True
     compile_backend: str = "inductor"
@@ -479,7 +481,15 @@ class Config:
         warnings: list[str] = []
 
         # ── Hard incompatibilities (raise) ────────────────────────────────
+        from palingenesis.accelerator import is_hub_kernel
         from palingenesis.validate_data import valid_think_tags
+
+        attn = self.model.attn_implementation
+        if attn not in ("sdpa", "flash_attention_2", "flex_attention", "eager") and not is_hub_kernel(attn):
+            errors.append(
+                f"model.attn_implementation={attn!r}: expected sdpa, flash_attention_2, flex_attention, eager "
+                'or a Hub kernel "org/repo[@rev]" (e.g. kernels-community/aiter-flash-attn@v2)'
+            )
 
         for where, tags in [("data.think_tags", self.data.think_tags)] + [
             (f"data.sources[{i}].think_tags", s.get("think_tags"))

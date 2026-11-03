@@ -13,6 +13,8 @@ import math
 
 import torch
 
+from palingenesis.accelerator import fp8_support
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +34,8 @@ def profile_hardware() -> dict:
         "compute_capability": (props.major, props.minor),
         "num_gpus": torch.cuda.device_count(),
         "supports_bf16": props.major >= 8,
-        "supports_float8": (props.major, props.minor) >= (8, 9),  # Ada, Hopper, Blackwell
+        # validated FP8 only (NVIDIA SM89+): never switched on automatically where it is unvalidated (AMD)
+        "supports_float8": fp8_support()[0] == "supported",
     }
 
 

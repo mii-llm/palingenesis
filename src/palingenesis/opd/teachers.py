@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from palingenesis.accelerator import device_scope
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.opd.align import TeacherView
 from palingenesis.opd.rollout import VLLMServer
@@ -114,7 +115,9 @@ class HFTeacher:
     """A frozen transformers model scoring in bf16 on `device`.
 
     With `offload`, the model waits on CPU between scoring calls (the output head
-    stays on the device for full_rkl's projections during the loss).
+    stays on the device for full_rkl's projections during the loss). Its forwards run
+    with `device` current: on another GPU than the student's (`teachers.<name>.device`),
+    Liger's and flash-linear-attention's Triton kernels would launch on the student's.
     """
 
     def __init__(self, model: str, device: str, offload: bool = False, seed: int = 0):
@@ -123,14 +126,20 @@ class HFTeacher:
         logger.info("Loading teacher %s (bf16, frozen) on %s", model, device)
         self.model = load_causal_lm(model, torch.bfloat16).to(device).eval().requires_grad_(False)
         self.head = output_head(self.model)
-        verify_output_head(self.model, self.head)
+        with device_scope(device):
+            verify_output_head(self.model, self.head)
         self.generator = torch.Generator(device=device).manual_seed(seed)  # rs_kd's draws
         if offload:
             self.head = copy.deepcopy(self.head)
             self.model.to("cpu")
 
     @torch.no_grad()
-    def score(
+    def score(self, views: list[TeacherView], **kwargs) -> list[TeacherScores]:
+        """Scores of each view's completion tokens (see `_score`), on the teacher's GPU."""
+        with device_scope(self.device):
+            return self._score(views, **kwargs)
+
+    def _score(
         self,
         views: list[TeacherView],
         top_k: int = 0,
@@ -199,7 +208,11 @@ class HFTeacher:
 
     def log_probs(self, hidden: Tensor, size: int) -> Tensor:
         """Log-softmax of the teacher's logits for hidden-state rows, first `size` ids."""
-        with torch.no_grad(), torch.autocast(hidden.device.type, dtype=torch.bfloat16, enabled=hidden.is_cuda):
+        with (
+            torch.no_grad(),
+            device_scope(hidden.device),
+            torch.autocast(hidden.device.type, dtype=torch.bfloat16, enabled=hidden.is_cuda),
+        ):
             return torch.log_softmax(self.head(hidden).float(), -1)[:, :size]
 
 

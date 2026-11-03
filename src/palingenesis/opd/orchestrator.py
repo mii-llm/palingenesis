@@ -36,6 +36,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from palingenesis.accelerator import on_current_device
 from palingenesis.opd.align import TeacherView
 from palingenesis.opd.formatting import encode_prompt
 from palingenesis.opd.rollout import RolloutEngine, Sampling, checkpoint_named_parameters
@@ -273,7 +274,7 @@ class Orchestrator:
         self.queue: queue.Queue = queue.Queue(maxsize=max_staleness + 1)
         self.stop_event = threading.Event()
         self.dropped = 0
-        self.thread = threading.Thread(target=self._produce, name="opd-orchestrator", daemon=True)
+        self.thread = threading.Thread(target=on_current_device(self._produce), name="opd-orchestrator", daemon=True)
 
     def start(self) -> None:
         self.thread.start()

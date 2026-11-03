@@ -16,7 +16,7 @@ source .venv/bin/activate
 pgs train --config configs/quickstart.yaml
 ```
 
-Other install paths (pip, CUDA versions, troubleshooting): [Installation](https://mii-llm.github.io/palingenesis/getting-started/install/).
+Other install paths (pip, CUDA versions, troubleshooting): [Installation](https://mii-llm.github.io/palingenesis/getting-started/install/). AMD GPUs (ROCm): [Training on AMD GPUs](https://mii-llm.github.io/palingenesis/getting-started/amd/).
 
 ## What it does
 

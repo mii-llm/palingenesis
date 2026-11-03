@@ -38,17 +38,16 @@ def apply_float8_training(model: nn.Module) -> bool:
         )
         return False
 
-    # Check hardware capability
-    if not torch.cuda.is_available():
-        logger.warning("Float8 training requires CUDA. Skipping.")
-        return False
+    # Check hardware: by architecture, not get_device_capability(), whose numbers on AMD
+    # are gfx-derived (MI250's gfx90a reports (9, 0) and has no FP8).
+    from palingenesis.accelerator import fp8_support
 
-    capability = torch.cuda.get_device_capability()
-    if capability < (8, 9):
-        logger.warning(
-            f"Float8 training requires SM89+ (H100/B200). Current device is SM{capability[0]}{capability[1]}. Skipping."
-        )
+    status, reason = fp8_support()
+    if status == "unsupported":
+        logger.warning(f"Float8 training needs NVIDIA SM89+ or AMD MI300/MI350: {reason}. Skipping (bf16).")
         return False
+    if status == "unvalidated":
+        logger.warning(f"Float8 training on {reason}: watch the loss against a bf16 run.")
 
     # Use rowwise recipe (best for SFT workloads)
     try:

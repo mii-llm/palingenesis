@@ -25,6 +25,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
+from palingenesis.accelerator import on_current_device
 from palingenesis.opd.orchestrator import PublishedWeights
 from palingenesis.opd.rollout import RolloutEngine
 from palingenesis.rl.chat import ChatFormat, ToolCall, encode_prompt, parse_assistant
@@ -81,7 +82,7 @@ class RLPipeline:
         self.rollout_start = 0.0  # loop time the current batch's collection started
         self.dropped: list[list[Trajectory]] = []  # zero-variance groups of the batch (dumps)
         self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self.loop.run_forever, name="pgs-rl-rollouts", daemon=True).start()
+        threading.Thread(target=on_current_device(self.loop.run_forever), name="pgs-rl-rollouts", daemon=True).start()
 
     def _await(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()

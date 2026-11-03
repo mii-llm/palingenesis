@@ -87,6 +87,7 @@ nav:
   - Home: index.md
   - Getting Started:
     - Installation: getting-started/install.md
+    - AMD GPUs: getting-started/amd.md
     - Quickstart: getting-started/quickstart.md
     - Your First Training: getting-started/first-training.md
   - Guides:

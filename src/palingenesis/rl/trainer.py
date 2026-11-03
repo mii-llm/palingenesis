@@ -34,6 +34,7 @@ from typing import Any, Callable
 import torch
 from transformers import AutoTokenizer
 
+from palingenesis.accelerator import check_visible_devices
 from palingenesis.kernels import (
     apply_activation_checkpointing,
     apply_liger_kernel,
@@ -130,6 +131,7 @@ class RLTrainer:
             logger.warning(warning)
         self.config = config
         m, r, t = config.model, config.rollout, config.train
+        check_visible_devices()
         self.parallel = Parallel(t.fsdp, t.cpu_offload, t.reshard_after_forward)
         rank, world = self.parallel.rank, self.parallel.world
         self.device = self.parallel.device
