@@ -9,7 +9,13 @@ should start and end close to the reference run's, and tok/s says how fast it is
     python scripts/acceptance_smoke.py --out runs/acceptance-aiter --stages sft,dpo \\
         --attn kernels-community/aiter-flash-attn@v2
     python scripts/acceptance_smoke.py --out runs/acceptance-vllm --stages opd,rl --rollout vllm
+    python scripts/acceptance_smoke.py --out runs/acceptance-8gpu --gpus 8      # FSDP2 over 8 GPUs
     python scripts/acceptance_smoke.py --out /tmp/x --dry-run   # write data + configs, validate, run nothing
+
+--gpus N runs SFT, DPO and RL on N ranks (torchrun, FSDP2) with the same work per GPU:
+SFT/DPO keep their per-device batch and RL's global rollout.batch_prompts grows N-fold,
+so tok/s should grow close to N-fold and losses compare with another machine's run at
+the same N. OPD runs in one process and places its teacher on the second GPU.
 
 Each stage starts from the repository's own config (configs/quickstart.yaml,
 dpo_qwen35_08b.yaml, distill_chat.yaml, rl_math.yaml) with the overrides below,
@@ -59,8 +65,10 @@ def _problems(n: int, seed: int) -> list[tuple[str, int]]:
     return out
 
 
-def write_data(data_dir: Path, seed: int = 0) -> dict[str, Path]:
-    """Synthetic arithmetic rows for every stage; the same bytes on every machine."""
+def write_data(data_dir: Path, seed: int = 0, gpus: int = 1) -> dict[str, Path]:
+    """Synthetic arithmetic rows for every stage; the same bytes on every machine. SFT and
+    DPO get `gpus` times the rows, so N ranks at the same per-device batch still have
+    data for every step (one GPU: the rows of earlier versions of this script)."""
     data_dir.mkdir(parents=True, exist_ok=True)
     rows = {
         "sft": [
@@ -70,7 +78,7 @@ def write_data(data_dir: Path, seed: int = 0) -> dict[str, Path]:
                     {"role": "assistant", "content": f"Working it out step by step, the answer is {a}."},
                 ]
             }
-            for q, a in _problems(512, seed)
+            for q, a in _problems(512 * gpus, seed)
         ],
         "dpo": [
             {
@@ -79,7 +87,7 @@ def write_data(data_dir: Path, seed: int = 0) -> dict[str, Path]:
                 "rejected": [{"role": "assistant", "content": f"The answer is {a + (i % 7) + 1}."}],
                 "chat_template_kwargs": NO_THINKING,
             }
-            for i, (q, a) in enumerate(_problems(256, seed + 1))
+            for i, (q, a) in enumerate(_problems(256 * gpus, seed + 1))
         ],
         "opd": [
             {"messages": [{"role": "user", "content": f"{q} Explain briefly."}], "chat_template_kwargs": NO_THINKING}
@@ -148,11 +156,13 @@ def stage_overrides(stage: str, args, data: dict[str, Path], out: Path) -> dict:
             "dpo": {"reference_model": ""},
             "train": {**sft_like_train, "per_device_batch_size": 4, "epochs": 1},
             "logging": logging,
+            # the base config is for one GPU (fsdp off); several ranks need FSDP to share gradients
+            **({"parallel": {"fsdp": True}} if args.gpus > 1 else {}),
         }
     if stage == "opd":
         return {
             "model": {"student": args.student, "stop_tokens": [], "chat_template_kwargs": NO_THINKING},
-            "=teachers": {"teacher": {"model": args.teacher}},
+            "=teachers": {"teacher": {"model": args.teacher, **({"device": "cuda:1"} if args.gpus > 1 else {})}},
             "=sources": {
                 "chat": {"format": "messages", "path": str(data["opd"]), "dev_size": 32, "max_new_tokens": 128}
             },
@@ -176,7 +186,7 @@ def stage_overrides(stage: str, args, data: dict[str, Path], out: Path) -> dict:
             "data": {"dataset": str(data["rl"]), "eval_dataset": "", "retire_above": 0.0},
             "rollout": {
                 "backend": args.rollout,
-                "batch_prompts": 8,
+                "batch_prompts": 8 * args.gpus,  # global: 8 per rank
                 "group_size": 4,
                 "max_new_tokens": 256,
                 "max_model_len": 1024,
@@ -222,14 +232,12 @@ def validate_config(stage: str, path: Path) -> None:
 # ---------------------------------------------------------------------- runs
 
 
-def command(stage: str, config: Path) -> list[str]:
+def command(stage: str, config: Path, gpus: int = 1) -> list[str]:
+    torchrun = [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={gpus}"]
     if stage in ("sft", "dpo"):
-        return [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=1"] + [
-            "-m",
-            "palingenesis.train",
-            "--config",
-            str(config),
-        ]
+        return torchrun + ["-m", "palingenesis.train", "--config", str(config)]
+    if stage == "rl" and gpus > 1:
+        return torchrun + ["-m", "palingenesis.rl.trainer", "--config", str(config)]
     cli = "from palingenesis.cli import main; main()"
     return [sys.executable, "-c", cli, "distill" if stage == "opd" else "rl", "--config", str(config)]
 
@@ -288,14 +296,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--attn", default="sdpa", help="model.attn_implementation for SFT and DPO")
     p.add_argument("--rollout", default="hf", choices=("hf", "vllm", "vllm_server"), help="OPD/RL rollout backend")
     p.add_argument("--steps", type=int, default=30)
+    p.add_argument("--gpus", type=int, default=1, help="ranks for SFT, DPO and RL (FSDP2); OPD's teacher on cuda:1")
     p.add_argument("--dry-run", action="store_true", help="write data and configs and validate them; run nothing")
     args = p.parse_args(argv)
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+    if args.gpus < 1:
+        p.error("--gpus must be >= 1")
+    if args.gpus > 1 and "rl" in stages and args.rollout == "hf":
+        p.error("RL on several GPUs needs --rollout vllm (one engine per rank): hf generates with the sharded model")
     if unknown := set(stages) - set(STAGES):
         p.error(f"unknown stages {sorted(unknown)}; choose from {', '.join(STAGES)}")
 
     out = args.out.resolve()
-    data = write_data(out / "data")
+    data = write_data(out / "data", gpus=args.gpus)
     configs = {stage: write_config(stage, args, data, out) for stage in stages}
     for stage, path in configs.items():
         validate_config(stage, path)
@@ -308,12 +321,11 @@ def main(argv: list[str] | None = None) -> int:
     failed = False
     for stage in stages:
         log = out / "logs" / f"{stage}.log"
-        print(f"== {stage}: {' '.join(command(stage, configs[stage]))}\n   log: {log}", flush=True)
+        cmd = command(stage, configs[stage], args.gpus)
+        print(f"== {stage}: {' '.join(cmd)}\n   log: {log}", flush=True)
         t0 = time.time()
         with open(log, "w") as f:
-            code = subprocess.run(
-                command(stage, configs[stage]), stdout=f, stderr=subprocess.STDOUT, cwd=ROOT
-            ).returncode
+            code = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=ROOT).returncode
         result = {"exit_code": code, "wall_s": round(time.time() - t0, 1), **parse_log(stage, log.read_text())}
         failed |= code != 0 or not result["steps_logged"]
         results["stages"][stage] = result

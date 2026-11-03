@@ -149,6 +149,17 @@ def test_train_checks_visible_devices_before_loading(gpu, train_mod, monkeypatch
         train_mod.train(Config())
 
 
+def test_train_refuses_several_ranks_without_fsdp(gpu, train_mod, monkeypatch):
+    """There is no DDP path: with parallel.fsdp false every rank would train its own model."""
+    gpu("mi250")
+    monkeypatch.setattr(train_mod, "setup_distributed", lambda: (1, 1, 2))
+    monkeypatch.setattr(train_mod.AutoModelForCausalLM, "from_pretrained", lambda *a, **k: pytest.fail("loaded"))
+    config = Config()
+    config.parallel.fsdp = False
+    with pytest.raises(ConfigError, match="2 separate models"):
+        train_mod.train(config)
+
+
 # ------------------------------------------------------------------ attention
 
 
@@ -425,3 +436,55 @@ def test_config_rejects_unknown_attn_implementation():
             c.validate()
         except ConfigError as e:
             assert "attn_implementation" not in str(e)
+
+
+@pytest.fixture
+def fake_devices(monkeypatch):
+    """torch.cuda's current device, per thread as on a real GPU (a new thread starts on 0)."""
+    import threading
+
+    local = threading.local()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: getattr(local, "index", 0))
+    monkeypatch.setattr(torch.cuda, "set_device", lambda i: setattr(local, "index", torch.device("cuda", i).index))
+    return local
+
+
+def test_thread_targets_keep_the_rank_device(fake_devices):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    torch.cuda.set_device(3)  # rank 3's main thread
+    seen = {}
+
+    def worker(name):
+        seen[name] = torch.cuda.current_device()
+
+    for name, target in (("bare", worker), ("wrapped", accelerator.on_current_device(worker))):
+        t = threading.Thread(target=target, args=(name,))
+        t.start()
+        t.join()
+    with ThreadPoolExecutor(1, initializer=accelerator.on_current_device(lambda: None)) as pool:
+        seen["executor"] = pool.submit(torch.cuda.current_device).result()
+    assert seen == {"bare": 0, "wrapped": 3, "executor": 3}
+
+
+def test_device_scope(monkeypatch):
+    entered = []
+
+    class Guard:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            entered.append(str(self.device))
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", Guard)
+    for device in ("cuda:1", torch.device("cuda", 2), "cuda", "cpu"):
+        with accelerator.device_scope(device):
+            pass
+    assert entered == ["cuda:1", "cuda:2"]  # a bare "cuda" or CPU keeps the current device
