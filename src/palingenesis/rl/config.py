@@ -121,6 +121,13 @@ class RLRolloutConfig:
     # clip); the rest of the prefix is context. First assistant turn only. 0 = off.
     think_skip: float = 0.0
     think_skip_prefix: str = "</think>\n\n"
+    # Stop resampling, outside training only (evaluation, run_episodes): when an environment episode's turn ends without
+    # a tool call (the model would stop), sample that turn again up to this many times and keep the first sample that
+    # calls a tool; the episode stops only if every sample stops. Measures how many failed episodes ended on a sampling
+    # draw and collects episodes that continued past such a stop, for verified recovery data. The discarded samples are
+    # kept in trajectory.info["stop_resamples"]. Refused in a training config (a sample conditioned on calling biases
+    # the policy ratios, and the run's evaluations would change); never applied to training rollouts. 0 = off.
+    stop_resample: int = 0
     # vllm
     gpu_memory_utilization: float = 0.3
     max_model_len: int = 8192  # prompt + completion tokens of a trajectory
@@ -599,6 +606,13 @@ class RLConfig:
             errors.append(f"loss.is_cap must be >= 1, got {loss.is_cap}.")
         if not 0 < loss.icepop_low < 1 < loss.icepop_high:
             errors.append("loss.icepop_low must be in (0, 1) and loss.icepop_high > 1.")
+        if r.stop_resample < 0:
+            errors.append("rollout.stop_resample must be >= 0.")
+        elif r.stop_resample:
+            errors.append(
+                "rollout.stop_resample is for evaluation outside training (run_episodes): in a training run it would "
+                "also change the run's own evaluations."
+            )
         if not 0.0 <= r.think_skip < 1.0:
             errors.append("rollout.think_skip must be in [0, 1).")
         if r.think_skip and loss.type == "gspo":

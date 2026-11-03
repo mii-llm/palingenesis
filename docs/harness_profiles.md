@@ -127,6 +127,14 @@ Set `env.max_tool_output_tokens` above the profiles' own limits so the harness w
 through the pipeline's own rollout loop, so an evaluation script can score a model under one profile or a mix.
 Results are tagged by profile (per episode, and `by_profile` pass@1 in the summary).
 
+**Stop resampling** (`run_episodes(..., stop_resample=N)`, config `rollout.stop_resample`; evaluation only, refused in
+training): a turn that would end the episode without a tool call is sampled again up to N times and the first sample
+that calls a tool is kept. Comparing pass@1 with and without it measures how many failures ended on a sampling draw at
+the stop decision (an agent that stops too early, not one that is lost), and the episodes that continue past such a
+stop and pass the task's tests are verified recovery data: the model's own tokens, with the stop it discarded kept in
+`t.info["stop_resamples"]` (one entry per discarded sample: the turn index and the message). Train on them without the
+option; the deployed model runs without it.
+
 ## `pgs harness` (recording real harnesses)
 
     pgs harness serve   --script turns.json --out requests.jsonl [--port 8000]

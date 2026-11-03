@@ -11,6 +11,8 @@ max_completion_tokens: the generated tokens of a whole episode (all turns); defa
 context, max_model_len, still bounds it). engine: a rollout engine (palingenesis.opd.rollout: VLLMColocateRollout for vLLM in-process, or anything with
 generate(prompts, max_new_tokens, temperature)); temperature: a float or an opd.rollout.Sampling (top_p / top_k;
 streaming engines only). A group's k samples share the environment's per-group choices (a harness profile).
+stop_resample: a turn that would end the episode without a tool call is sampled again up to this many times, and the
+first sample that calls a tool is kept (rollout.stop_resample; the discarded samples are in t.info["stop_resamples"]).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ def run_episodes(
     tool_timeout: float = 600.0,
     max_tool_output_tokens: int = 1536,
     tool_parser: str = "auto",
+    stop_resample: int = 0,
 ) -> list[list[Any]]:
     import torch
 
@@ -66,6 +69,7 @@ def run_episodes(
         "rollout.max_new_tokens": max_new_tokens,
         "rollout.max_completion_tokens": max_completion_tokens,
         "rollout.max_model_len": max_model_len,
+        "rollout.stop_resample": stop_resample,
     }.items():
         config.set(key, value)
     try:

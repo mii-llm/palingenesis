@@ -803,3 +803,112 @@ def test_text_protocol_environment_runs_actions_from_text():
     assert t.finish == "stop" and t.turns == 2 and t.reward == 1.0
     roles = [m["role"] for m in t.messages]
     assert roles[-3:] == ["assistant", "user", "assistant"] and "<result>Rome</result>" in t.messages[-2]["content"]
+
+
+class _SequenceEngine:
+    """Answers each generate request with the next text of a list (the last one repeats), whatever the prompt."""
+
+    def __init__(self, tok, eot, texts):
+        self.tok, self.eot, self.texts, self.version, self.n = tok, eot, texts, 0, 0
+
+    def generate(self, prompts, max_new_tokens, temperature):
+        from palingenesis.opd.rollout import Rollout
+
+        out = []
+        for _ in prompts:
+            text = self.texts[min(self.n, len(self.texts) - 1)]
+            self.n += 1
+            ids = self.tok.encode(text, add_special_tokens=False) + [self.eot]
+            out.append(Rollout(ids, [-0.25] * len(ids), "stop", self.version))
+        return out
+
+    def update_weights(self, named, version):
+        self.version = version
+
+    def sleep(self):
+        pass
+
+    def wake(self):
+        pass
+
+
+def test_stop_resample_keeps_the_first_sample_that_calls_a_tool():
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from tests.test_rl import tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    eot = end_of_turn_id(tok, kwargs)
+    call = '<tool_call>\n{"name": "submit", "arguments": {"answer": "5"}}\n</tool_call>'
+
+    def run(texts, resample, training=False):
+        config = RLConfig()
+        for key, value in {
+            "model.policy": "x",
+            "model.chat_template_kwargs": kwargs,
+            "env.max_turns": 4,
+            "rollout.max_new_tokens": 64,
+            "rollout.max_model_len": 4096,
+            "rollout.stop_resample": resample,
+        }.items():
+            config.set(key, value)
+        rows = [{"prompt": "What is 2 + 3? Submit it."}]
+        engine = _SequenceEngine(tok, eot, texts)
+        pipeline = RLPipeline(
+            tok,
+            ChatFormat(tok, eot, kwargs),
+            engine,
+            PublishedWeights(torch.nn.Linear(1, 1)),
+            config,
+            PromptSampler(rows),
+            [],
+            EnvPool(Submission),
+            None,
+            (eot,),
+        )
+        try:
+            if training:
+                t, env = pipeline._await(pipeline._trajectory(rows[0], 0, 1.0, True))
+                pipeline._await(pipeline.env_pool.release(env))
+            else:
+                ((t,),) = pipeline._await(pipeline._eval(rows, 1.0))
+        finally:
+            pipeline.close()
+        return t, engine.n
+
+    # off: the first stop ends the episode
+    t, n = run(["I think it is done.", call], 0)
+    assert t.finish == "stop" and n == 1 and "stop_resamples" not in t.info
+    # two stops, then a call: the call is kept, the stops are recorded, the episode goes on and is solved
+    t, n = run(["Done.", "All done.", call], 3)
+    assert t.finish == "env_done" and t.reward == 1.0 and n == 3 and t.turns == 1
+    assert [r["message"]["content"] for r in t.info["stop_resamples"]] == ["Done.", "All done."]
+    assert [m["role"] for m in t.messages if m["role"] == "assistant"] == ["assistant"]
+    assert t.tokens[: len(tok.encode(call, add_special_tokens=False))] == tok.encode(call, add_special_tokens=False)
+    # the budget runs out: the last sample's stop stands
+    t, n = run(["Done."], 2)
+    assert t.finish == "stop" and n == 3 and len(t.info["stop_resamples"]) == 2
+    assert t.messages[-1]["content"] == "Done."
+    # never in training (a sample conditioned on calling would bias the ratios)
+    t, n = run(["Done.", call], 3, training=True)
+    assert t.finish == "stop" and n == 1
+
+
+def test_stop_resample_is_refused_in_a_training_config():
+    import pytest
+
+    from palingenesis.rl.config import RLConfig, RLConfigError
+
+    for value, message in ((-1, "stop_resample must be >= 0"), (2, "stop_resample is for evaluation")):
+        config = RLConfig()
+        config.set("rollout.stop_resample", value)
+        with pytest.raises(RLConfigError, match=message):
+            config.validate()

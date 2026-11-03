@@ -343,30 +343,42 @@ class RLPipeline:
                 if prefix:
                     trajectory.append_forced(prefix, math.log(r.think_skip))
                 t_generate = clock()
-                out = await self.client.generate(trajectory.prompt_ids + trajectory.tokens, room, temperature)
+                # stop resampling (evaluation only): a turn that would stop the episode is sampled again
+                resamples = 0 if training or env is None or turn == max_turns - 1 else r.stop_resample
+                for attempt in range(resamples + 1):
+                    out = await self.client.generate(trajectory.prompt_ids + trajectory.tokens, room, temperature)
+                    text = self.tok.decode(
+                        prefix + [t for t in out.ids if t not in self.stop_ids],
+                        skip_special_tokens=True,
+                    )
+                    parsed = parse_assistant(text, chat, e.tool_parser, by_name, f"call_{turn}")
+                    # text-protocol environments (tools described in the prompt as tags, ReAct lines, JSON actions...):
+                    # the environment parses actions from the assistant's text and answers in a user turn
+                    text_protocol = False
+                    if (
+                        out.finish != "length"
+                        and env is not None
+                        and not (parsed.calls or parsed.errors)
+                        and hasattr(env, "text_actions")
+                    ):
+                        actions = await call_sync_or_async(env.text_actions, parsed.content) or []
+                        parsed.calls = [
+                            ToolCall(name, dict(args or {}), f"call_{turn}_{k}")
+                            for k, (name, args) in enumerate(actions)
+                        ]
+                        text_protocol = bool(parsed.calls)
+                    if out.finish == "length" or parsed.calls or parsed.errors or attempt == resamples:
+                        break
+                    trajectory.info.setdefault("stop_resamples", []).append({"turn": turn, "message": parsed.message()})
                 turn_timing = {"generate_s": clock() - t_generate, "tokens": len(out.ids), "context": context}
                 timing["turns"].append(turn_timing)
                 logprobs = out.logprobs if out.logprobs or training else [0.0] * len(out.ids)
                 trajectory.append_generated(out.ids, logprobs, out.version, out.first_version)
-                text = self.tok.decode(
-                    prefix + [t for t in out.ids if t not in self.stop_ids],
-                    skip_special_tokens=True,
-                )
-                parsed = parse_assistant(text, chat, e.tool_parser, by_name, f"call_{turn}")
                 trajectory.messages.append(parsed.message())
                 trajectory.info.setdefault("raw_contents", []).append(parsed.raw_content)
                 if out.finish == "length":
                     trajectory.finish = "length"
                     break
-                # text-protocol environments (tools described in the prompt as tags, ReAct lines, JSON actions...):
-                # the environment parses actions from the assistant's text and answers in a user turn
-                text_protocol = False
-                if env is not None and not (parsed.calls or parsed.errors) and hasattr(env, "text_actions"):
-                    actions = await call_sync_or_async(env.text_actions, parsed.content) or []
-                    parsed.calls = [
-                        ToolCall(name, dict(args or {}), f"call_{turn}_{k}") for k, (name, args) in enumerate(actions)
-                    ]
-                    text_protocol = bool(parsed.calls)
                 if env is None or not (parsed.calls or parsed.errors):
                     trajectory.finish = "stop"
                     break
