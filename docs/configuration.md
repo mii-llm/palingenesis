@@ -146,7 +146,7 @@ grep "STATUS: experimental" src/palingenesis/config.py
 
 **Notes**:
 - FSDP is automatically disabled for single-GPU runs
-- Context Parallel: full-causal and sliding-window attention are supported. Recurrent / linear-attention layers (Qwen3.5 Gated DeltaNet, Mamba), chunked attention, soft-capping and attention sinks are refused at startup (see the multi-GPU guide)
+- Context Parallel: full-causal and sliding-window attention and Gated DeltaNet linear attention (Qwen3.5, Qwen3-Next) are supported. Other recurrent / linear-attention layers (Mamba), chunked attention, soft-capping and attention sinks are refused at startup (see the multi-GPU guide)
 - Keep a context-parallel group within a node: every attention layer all-gathers K/V over it
 - CPU offload reduces GPU memory by ~60% but slows training by 3-5x
 - `reshard_after_forward=false` keeps params in memory (faster but uses more memory)

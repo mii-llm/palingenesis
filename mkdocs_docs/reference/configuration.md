@@ -153,7 +153,7 @@
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `fsdp` | bool | `true` | Enable FSDP2 data parallelism (multi-GPU). Auto-disabled for single GPU. |
-| `context_parallel` | bool | `false` | Split every sequence over a group of ranks (all-gather K/V, head-tail load balancing); exact. Needs `fsdp: true`. For sequences whose activations do not fit one GPU. Refuses recurrent / linear-attention layers (see the multi-GPU guide). |
+| `context_parallel` | bool | `false` | Split every sequence over a group of ranks (all-gather K/V, head-tail load balancing); exact. Needs `fsdp: true`. For sequences whose activations do not fit one GPU. Gated DeltaNet hybrids (Qwen3.5, Qwen3-Next) by state passing; refuses other recurrent / linear-attention layers (see the multi-GPU guide). |
 | `cp_degree` | int | `0` | Ranks per context-parallel group; must divide the world size. `0` = min(world_size, 8) when it divides it, else all ranks. |
 | `cp_rotate_method` | str | `allgather` | How K/V reach the other ranks: `allgather`, the only method implemented. |
 | `cpu_offload` | bool | `false` | Offload FSDP parameters to CPU. Extreme memory savings but very slow. |

@@ -78,9 +78,22 @@ Backward: all-gather K, V again (only local K/V are saved), kernel backward,
 Sliding-window layers: only the keys within the window, SDPA with a band mask
 ```
 
+Per Gated DeltaNet layer (Qwen3.5, Qwen3.5-MoE, Qwen3-Next), by state passing:
+
+```
+Convolution: all-gather the last kernel-1 inputs of every chunk (the halo); each chunk is
+             convolved after the previous chunk's halo (zeros before chunk 0)
+Delta rule:  one kernel call on both local chunks with values [v | 0] from the state [0 | I]:
+             outputs from a zero state, each chunk's affine map S -> A S + B and the map of
+             the entering state into the outputs; all-gather every chunk's (A, B), compose the
+             state entering each local chunk, correct the outputs
+Backward:    autograd through the composition and the kernel; reduce-scatter of the gathered
+             states' and halos' gradients to the owning ranks
+```
+
 Exact (tested with several CPU processes: loss and gradients equal the unsplit sequence's).
-Recurrent / linear-attention layers (Gated DeltaNet, Mamba), chunked attention, soft-capping and
-attention sinks are refused. See the multi-GPU guide for the full list.
+Other recurrent / linear-attention layers (Mamba, linear attention of another structure), chunked
+attention, soft-capping and attention sinks are refused. See the multi-GPU guide for the full list.
 
 ### Communication/Computation Overlap
 

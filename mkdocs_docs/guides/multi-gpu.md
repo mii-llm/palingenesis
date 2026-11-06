@@ -145,13 +145,23 @@ The result is exact: loss and gradients equal those of the unsplit sequence. The
 |---|---|
 | Full causal attention (Llama, Qwen2/3, Mistral, Gemma 3 global layers) | Supported. Fused path: flash on CUDA for bf16 / fp16, exact math kernel otherwise. |
 | Sliding-window attention (Gemma 3 local layers, Qwen3 / Mistral windows) | Supported. Only the keys within the window are attended, through SDPA with a band mask. |
-| Linear attention / recurrent (Qwen3.5 and Qwen3-Next Gated DeltaNet, Mamba, short convolutions) | Refused at startup. The state would have to pass from one GPU's chunk to the next. |
+| Gated DeltaNet linear attention and its causal convolution (Qwen3.5, Qwen3.5-MoE, Qwen3-Next) | Supported, by state passing (below). On flash-linear-attention and causal-conv1d when installed, transformers' torch kernels otherwise. |
+| Other recurrent / linear-attention layers (Mamba, OLMo hybrid's Gated DeltaNet, other short convolutions) | Refused at startup. |
 | Chunked attention (Llama 4), attention soft-capping (Gemma 2), attention sinks, ALiBi | Refused. |
 | Packing, left padding, DPO, SeCO | Refused by config validation or at the first batch. |
 
-A runtime check backs up the startup checks. Under context parallelism every decoder layer must have run its attention through it in each forward, or the step raises. A model whose layers bypass transformers' attention interface therefore fails loudly instead of silently attending within one GPU's slice.
+**Linear attention.** A Gated DeltaNet layer carries a state S (per head, key dim x value dim) along the sequence: S_t = A_t S_t-1 + B_t with A_t = g_t (I - beta_t k_t k_t^T) and B_t = beta_t k_t v_t^T. Over a chunk, the final state and the outputs are therefore affine in the state entering it. Each GPU:
 
-**Cost.** Per layer, the forward all-gathers K/V, and the backward does one all-gather plus a reduce-scatter. Keep the context-parallel group within a node (NVLink): the default `cp_degree` caps it at 8. Communication is not overlapped with the attention kernels.
+- runs the layer's kernel once on its two chunks, with the values extended by zero columns and the initial state [0 | I]. That one call gives the outputs from a zero state, each chunk's map S -> A S + B (its final state), and the term that carries an entering state into the outputs;
+- all-gathers every chunk's (A, B) (one collective per layer, as in LASP-2, [arXiv:2502.07563](https://arxiv.org/abs/2502.07563), here with the matrix transitions of the delta rule), composes the state entering each of its chunks in sequence order, and corrects its outputs.
+
+The backward is autograd through the composition and the kernel; the gathered states' gradients are reduce-scattered back to the GPUs that own those chunks. The short causal convolution in front of the delta rule reads the last kernel - 1 inputs of the previous chunk (a halo, also all-gathered; its gradient goes back the same way). Cost per linear-attention layer: the kernel's value width grows from the value head dim to value + key head dim, and the gathered states are 2 x `cp_degree` x heads x key dim x (key + value dim) fp32 values per row (about 67 MB per row and layer for 32 heads of 128 at `cp_degree: 8`). Unsupported under context parallelism: packed rows (`cu_seqlens`), cached states (generation runs without context parallelism), and chunks shorter than the convolution's look-back (kernel - 1 tokens).
+
+Gated DeltaNet: [arXiv:2412.06464](https://arxiv.org/abs/2412.06464); the chunkwise delta rule: [arXiv:2406.06484](https://arxiv.org/abs/2406.06484). flash-linear-attention ships a context-parallel path of its own (`fla.ops.cp`, single varlen rows); this one uses only the public kernel, so it works with any batch size, on the torch fallback, and with the same head-tail layout as attention.
+
+A runtime check backs up the startup checks. Under context parallelism every decoder layer must have run its sequence mixer through it in each forward (attention, or both the convolution and the delta rule of a Gated DeltaNet layer), or the step raises. A model whose layers bypass transformers' attention interface therefore fails loudly instead of silently attending within one GPU's slice.
+
+**Cost.** Per attention layer, the forward all-gathers K/V, and the backward does one all-gather plus a reduce-scatter. Keep the context-parallel group within a node (NVLink): the default `cp_degree` caps it at 8. Communication is not overlapped with the attention kernels.
 
 For a single GPU, use [SeCO](long-sequences.md) instead: it trains sequences of any length chunk by chunk.
 

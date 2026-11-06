@@ -76,7 +76,9 @@ tokens one sequence's activations exceed one GPU.
    by the global trained-token count.
 
 Exact: loss and gradients equal the unsplit sequence's (multi-process tests). Sliding-window
-layers attend only the keys within their window. Recurrent / linear-attention layers are refused.
+layers attend only the keys within their window. Gated DeltaNet layers (Qwen3.5, Qwen3-Next) pass
+their state across the ranks (one all-gather of chunk states per layer); other recurrent /
+linear-attention layers are refused.
 
 ### When to use
 
