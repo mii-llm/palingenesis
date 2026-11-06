@@ -114,18 +114,46 @@ Now every rank's loss contributes proportionally to how many real tokens it proc
 
 ---
 
-## Context Parallel (Ring Attention)
+## Context Parallel
 
-For sequences longer than one GPU can hold (>32K on 80 GB), enable Context Parallel:
+Context parallelism helps when one sequence's activations do not fit on one GPU (more than about 32K tokens on 80 GB). It splits every sequence over a group of GPUs:
 
 ```yaml
 parallel:
+  fsdp: true             # required: FSDP sums the gradients of the GPUs that split a sequence
   context_parallel: true
+  cp_degree: 4           # GPUs per sequence; 0 (default) = min(world_size, 8)
 ```
 
-This shards the *sequence dimension* across GPUs. Each GPU holds `seq_len / num_gpus` tokens. During attention, KV pairs are rotated through the ring — each GPU computes attention on its local queries against all keys (received via rotation).
+With 8 GPUs and `cp_degree: 4` the mesh is 2 (data) x 4 (context). Each group of 4 GPUs reads the same rows and holds a quarter of each. FSDP shards the parameters over all 8.
 
-The trade-off: more communication (KV rotation), but you can now train on 128K+ sequences that would never fit on one device.
+**Computation.** Embeddings, MLPs, norms and the loss are computed per token, so each GPU runs them on its own tokens. Attention needs the whole sequence:
+
+- Every attention layer all-gathers the sequence's K/V from the group. This is the all-gather form of context parallelism, as in Llama 3 training. Grouped-query attention keeps K/V small.
+- Each GPU attends its own queries to the gathered K/V, causally, using its tokens' global positions.
+- The backward gathers K/V again and reduce-scatters the K/V gradients (in fp32) back to the GPUs that own those tokens. So no layer keeps the whole sequence's K/V between forward and backward.
+
+The result is exact: loss and gradients equal those of the unsplit sequence. The tests check this with several processes, end to end through the trainer.
+
+**Layout.** Each sequence is cut into 2 x `cp_degree` chunks, and GPU *r* holds chunks *r* and 2 x `cp_degree` - 1 - *r* (head-tail load balancing). Every GPU then does the same amount of causal attention work. Rows are right-padded to a multiple of 2 x `cp_degree`. This padding carries no label, and causal attention keeps it inert. Labels are shifted on the whole row before it is split, so the token that predicts across a chunk boundary keeps its target.
+
+**Normalisation.** The loss is the sum over every GPU's tokens divided by the global count of trained tokens. The logged `train/loss` is summed over the context-parallel group. Evaluation is split the same way.
+
+**Supported layers:**
+
+| Layer | Status |
+|---|---|
+| Full causal attention (Llama, Qwen2/3, Mistral, Gemma 3 global layers) | Supported. Fused path: flash on CUDA for bf16 / fp16, exact math kernel otherwise. |
+| Sliding-window attention (Gemma 3 local layers, Qwen3 / Mistral windows) | Supported. Only the keys within the window are attended, through SDPA with a band mask. |
+| Linear attention / recurrent (Qwen3.5 and Qwen3-Next Gated DeltaNet, Mamba, short convolutions) | Refused at startup. The state would have to pass from one GPU's chunk to the next. |
+| Chunked attention (Llama 4), attention soft-capping (Gemma 2), attention sinks, ALiBi | Refused. |
+| Packing, left padding, DPO, SeCO | Refused by config validation or at the first batch. |
+
+A runtime check backs up the startup checks. Under context parallelism every decoder layer must have run its attention through it in each forward, or the step raises. A model whose layers bypass transformers' attention interface therefore fails loudly instead of silently attending within one GPU's slice.
+
+**Cost.** Per layer, the forward all-gathers K/V, and the backward does one all-gather plus a reduce-scatter. Keep the context-parallel group within a node (NVLink): the default `cp_degree` caps it at 8. Communication is not overlapped with the attention kernels.
+
+For a single GPU, use [SeCO](long-sequences.md) instead: it trains sequences of any length chunk by chunk.
 
 ---
 

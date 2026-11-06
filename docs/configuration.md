@@ -38,7 +38,8 @@ except ConfigError as e:
 | `gradient_release + GA > 1` | FORGE fuses optimizer into backward; cannot accumulate |
 | `gradient_release + muon` | Muon needs full gradient for orthogonalization |
 | `gradient_release + ga_ramp` | Dynamic accumulation is impossible without GA |
-| `packing + context_parallel` | Ring Attention requires single-document sequences |
+| `packing + context_parallel` | Context-parallel attention is causal over one document per row |
+| `context_parallel` without `fsdp` | FSDP sums the gradients of the ranks that split a sequence |
 | `mona + schedule_free` | Both replace optimizer internals |
 | `hyperball + schedule_free` | Hyperball wraps step(); SF has no standard step() |
 | `hyperball + gradient_release` | The optimizer steps inside backward, so Hyperball would never run |
@@ -100,7 +101,7 @@ grep "STATUS: experimental" src/palingenesis/config.py
 
 **Notes**:
 - Streaming is recommended for large datasets (>100k examples)
-- `max_seq_length` must be divisible by CP degree when Context Parallel is enabled
+- Under Context Parallel rows are right-padded to a multiple of 2 x `cp_degree` (no constraint on `max_seq_length`)
 - Packing should be disabled for long-context training (sequences already fill the block)
 - `messages_field` must point to a list of `{"role": str, "content": str}` dicts
 
@@ -125,7 +126,7 @@ grep "STATUS: experimental" src/palingenesis/config.py
 | `bf16` | bool | `true` | Enable bf16 mixed precision |
 | `gradient_checkpointing` | str | `selective` | AC mode: `selective`, `full`, `none` |
 
-**Effective batch size** = `per_device_batch_size * gradient_accumulation_steps * world_size`
+**Effective batch size** = `per_device_batch_size * gradient_accumulation_steps * data-parallel ranks` (`world_size`, or `world_size / cp_degree` under Context Parallel)
 
 **LR recommendations for SFT**:
 - Fine-tuning instruct models: `1e-5` to `5e-5`
@@ -137,16 +138,16 @@ grep "STATUS: experimental" src/palingenesis/config.py
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `fsdp` | bool | `true` | Enable FSDP2 parameter sharding |
-| `context_parallel` | bool | `false` | Enable Context Parallel (sequence sharding) |
-| `cp_rotate_method` | str | `allgather` | CP rotation: `allgather` or `alltoall` |
+| `context_parallel` | bool | `false` | Split every sequence over a group of ranks, attention exact across them (needs `fsdp: true`) |
+| `cp_degree` | int | `0` | Ranks per context-parallel group; must divide the world size. `0` = min(world_size, 8) when it divides it, else all ranks |
+| `cp_rotate_method` | str | `allgather` | How K/V reach the other ranks: `allgather` (the only method implemented) |
 | `cpu_offload` | bool | `false` | Offload params/optim to CPU (extreme memory saving) |
 | `reshard_after_forward` | bool | `true` | Free params after forward (memory vs speed tradeoff) |
 
 **Notes**:
 - FSDP is automatically disabled for single-GPU runs
-- Context Parallel requires `max_seq_length % world_size == 0`
-- `allgather` rotation is better for most topologies (used by Llama 3)
-- `alltoall` can be better when inter-node bandwidth is limited
+- Context Parallel: full-causal and sliding-window attention are supported. Recurrent / linear-attention layers (Qwen3.5 Gated DeltaNet, Mamba), chunked attention, soft-capping and attention sinks are refused at startup (see the multi-GPU guide)
+- Keep a context-parallel group within a node: every attention layer all-gathers K/V over it
 - CPU offload reduces GPU memory by ~60% but slows training by 3-5x
 - `reshard_after_forward=false` keeps params in memory (faster but uses more memory)
 
@@ -230,7 +231,7 @@ Off-policy knowledge distillation, a mode of `pgs train` (design: [offpolicy_dis
 | `feature_lr` | float | `0.0` | Learning rate of the feature projections (0 = `train.learning_rate`) |
 | `rows_per_slice` | int | `0` | Rows per slice of the chunked loss (0 = automatic, ~512 MB of fp32 logits per side) |
 
-Incompatible (rejected by `validate()`): `dpo.enabled`, `plugins.deft/dft/cadft/info_sft/pre_rl`, `memory.gradient_release`; `features` with `memory.seco`; online teachers with context parallel; an online teacher's view with packing or pretokenize; views with loop-recovery augmentation.
+Incompatible (rejected by `validate()`): `dpo.enabled`, `plugins.deft/dft/cadft/info_sft/pre_rl`, `memory.gradient_release`; `features` with `memory.seco`; an online teacher's view with context parallel; an online teacher's view with packing or pretokenize; views with loop-recovery augmentation.
 
 ## Section: `plugins.custom`
 

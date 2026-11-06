@@ -2,42 +2,36 @@
 
 ## Parallelism Dimensions
 
-The system supports three composable parallelism dimensions:
+Two composable dimensions: data parallelism (FSDP2) and context parallelism (CP).
 
 ```
-┌───────────────────────────────────────────────────────┐
-│                    World Size = 16                     │
-│                                                       │
-│  ┌─────────────── DP (FSDP2) ────────────────────┐   │
-│  │  Rank 0─7: shard params/grads/optim            │   │
-│  │                                                │   │
-│  │  ┌──── CP (Context Parallel) ────────────┐    │   │
-│  │  │  Rank 0─3: seq shard (ring attention) │    │   │
-│  │  │  Rank 4─7: seq shard (ring attention) │    │   │
-│  │  └───────────────────────────────────────┘    │   │
-│  └────────────────────────────────────────────────┘   │
-│                                                       │
-│  ┌─────────────── DP (FSDP2) ────────────────────┐   │
-│  │  Rank 8─15: shard params/grads/optim           │   │
-│  │  ...                                           │   │
-│  └────────────────────────────────────────────────┘   │
-└───────────────────────────────────────────────────────┘
+World size 8, parallel.cp_degree: 4  ->  mesh ("dp", "cp") of shape (2, 4)
+
+            cp=0     cp=1     cp=2     cp=3
+  dp=0   [ rank 0 | rank 1 | rank 2 | rank 3 ]   same rows, a quarter of each
+  dp=1   [ rank 4 | rank 5 | rank 6 | rank 7 ]   other rows
+
+FSDP2 shards parameters / gradients / optimizer state over all 8 (the mesh flattened).
 ```
 
 ### Device Mesh Construction
 
 ```python
 # Without Context Parallel (pure FSDP):
-mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+mesh = init_device_mesh(device, (world_size,), mesh_dim_names=("dp",))
 
-# With Context Parallel:
-# world_size=8, cp_degree=8, dp_degree=1
-mesh = init_device_mesh("cuda", (dp_degree, cp_degree), mesh_dim_names=("dp", "cp"))
+# With Context Parallel (cp_degree 0 = min(world_size, 8) when it divides world_size):
+mesh = init_device_mesh(device, (world_size // cp_degree, cp_degree), mesh_dim_names=("dp", "cp"))
+fsdp_mesh = mesh["dp", "cp"]._flatten("dp_cp")   # distributed.fsdp_mesh
 ```
 
-The mesh is a multi-dimensional grid where:
-- `"dp"` axis: FSDP shards parameters across these ranks
-- `"cp"` axis: Context Parallel shards sequences across these ranks
+- `"dp"`: ranks that read different data (the data loader shards by the dp rank).
+- `"cp"`: ranks that split the same sequences (palingenesis.context_parallel).
+- FSDP2 shards over both: the ranks of a CP group compute gradients from different tokens, so
+  their gradients are summed like data-parallel ones (sum reduction, the loss is already divided
+  by the global valid-token count).
+
+`device` is `cuda`, or `cpu` without GPUs (gloo, used by the multi-process tests).
 
 ### Scaling Rules
 
@@ -69,18 +63,24 @@ With `reshard_after_forward=False`:
 - Lower communication but higher peak memory
 - Use when memory is not the bottleneck
 
-### Context Parallel Communication
+### Context Parallel
 
-Per attention layer:
-```
-All-gather based (default):
-  Forward:  all-gather K, V across CP group (1 collective per layer)
-  Backward: reduce-scatter dK, dV across CP group
+Every sequence is right-padded to a multiple of 2 x cp and cut into 2 x cp chunks; CP rank r
+holds chunks r and 2cp-1-r (head-tail load balancing: equal causal-attention work per rank).
+Labels are shifted on the whole sequence before the split, and the model gets the tokens' global
+position ids. Per attention layer:
 
-All-to-all based (alternative):
-  Forward:  N-1 all-to-all rounds (ring rotation of KV shards)
-  Backward: N-1 all-to-all rounds (ring rotation of dKV shards)
 ```
+Forward:  all-gather K, V over the CP group; attend this rank's two query chunks to the keys
+          before them (full) and their own chunk (causal), merged by log-sum-exp
+Backward: all-gather K, V again (only local K/V are saved), kernel backward,
+          reduce-scatter dK, dV (fp32) to the owning ranks
+Sliding-window layers: only the keys within the window, SDPA with a band mask
+```
+
+Exact (tested with several CPU processes: loss and gradients equal the unsplit sequence's).
+Recurrent / linear-attention layers (Gated DeltaNet, Mamba), chunked attention, soft-capping and
+attention sinks are refused. See the multi-GPU guide for the full list.
 
 ### Communication/Computation Overlap
 

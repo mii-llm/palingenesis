@@ -75,7 +75,7 @@ Palingenesis adds two optimizations over vanilla FSDP2:
 
 ### Context Parallel (sequence sharding)
 
-For sequences longer than one GPU's memory can handle, the sequence dimension is split across GPUs. Attention uses Ring Attention — each GPU computes attention on its local chunk while rotating KV through the ring.
+For sequences longer than one GPU's memory can handle, every sequence is split over a group of GPUs (`palingenesis.context_parallel`). Each attention layer all-gathers the sequence's K/V from the group and attends its own queries to them, causally, at their global positions (exact; head-tail load balancing). FSDP shards over the data and context dimensions flattened. See the multi-GPU guide.
 
 ### Global valid-token normalization
 

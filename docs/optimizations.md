@@ -52,43 +52,31 @@ For an 8B parameter model in bf16:
 
 ---
 
-## 2. Context Parallel (Ring Attention)
+## 2. Context Parallel
 
-**API**: `torch.distributed.tensor.experimental.context_parallel`  
-**PyTorch version**: 2.7+ (experimental/unstable)  
-**Memory reduction**: Attention activations divided by CP degree
+**Module**: `palingenesis.context_parallel`
+**Memory reduction**: activations per GPU divided by the CP degree
 
 ### The problem
 
-Self-attention has O(S^2) memory for the attention score matrix. For S=65536:
-- Attention scores: B * H * S * S * 2 bytes = B * 32 * 65536^2 * 2 = **256 GB per sample** (without FlashAttention)
-- Even with FlashAttention (O(S) memory), the KV cache and intermediate activations scale linearly with S
+Even with flash attention (O(S) memory), activations grow linearly with the sequence: at 128K
+tokens one sequence's activations exceed one GPU.
 
-### How Ring Attention works
+### How it works (all-gather context parallelism, as in Llama 3 training)
 
-Sequence is split across CP_degree GPUs. Each GPU holds `S / CP_degree` query tokens but needs to attend to ALL key-value tokens.
+1. Each sequence is right-padded to a multiple of 2 x CP and cut into 2 x CP chunks; rank r holds
+   chunks r and 2CP-1-r (head-tail load balancing: equal causal work per rank). Labels are
+   shifted on the whole sequence first; the model gets the tokens' global position ids.
+2. Every attention layer all-gathers K and V over the CP group (small with grouped-query
+   attention) and attends its local queries to them: per chunk, the keys before it (full) and the
+   chunk itself (causal), merged through the log-sum-exp; flash kernels on CUDA.
+3. The backward all-gathers K/V again (only local tensors are saved) and reduce-scatters dK/dV in
+   fp32 to the ranks that own those tokens.
+4. FSDP2 shards over data x context ranks flattened; gradients are summed, the loss is divided
+   by the global trained-token count.
 
-**All-gather variant** (our default, used in Llama 3 training):
-1. Each GPU has local Q chunk: `[B, H, S/CP, D]`
-2. All-gather K and V across CP group → each GPU reconstructs full K, V
-3. Compute attention: local Q against full K, V
-4. Communication overlapped with initial local attention computation
-
-**All-to-all variant** (alternative, better for some topologies):
-1. K, V shards are rotated ring-style via all-to-all collectives
-2. Partial attention computed against each arriving shard
-3. Results combined with online softmax normalization
-
-### Our implementation
-
-We shard input tensors along the sequence dimension before the model forward:
-
-```python
-# Each rank gets seq_len // cp_world_size tokens
-input_ids[:, start:end]  # local sequence chunk
-```
-
-The `context_parallel()` context manager replaces `F.scaled_dot_product_attention` with Ring Attention at the dispatcher level — the model code doesn't change.
+Exact: loss and gradients equal the unsplit sequence's (multi-process tests). Sliding-window
+layers attend only the keys within their window. Recurrent / linear-attention layers are refused.
 
 ### When to use
 
