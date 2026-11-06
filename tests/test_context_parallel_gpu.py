@@ -1,5 +1,7 @@
 """Context parallelism on GPUs (NCCL, bf16, flash kernels): loss and gradients of a context-parallel
-group equal one GPU's on the whole sequence, for full-causal and sliding-window attention.
+group equal one GPU's on the whole sequence, for full-causal and sliding-window attention and for a
+Qwen3.5-style hybrid (Gated DeltaNet with its causal convolution, on flash-linear-attention and
+causal-conv1d when installed, and full attention).
 Needs at least 2 CUDA devices; run with `pytest tests/test_context_parallel_gpu.py`."""
 
 import json
@@ -38,6 +40,23 @@ def _model(kind: str):
         from transformers import LlamaConfig, LlamaForCausalLM
 
         model = LlamaForCausalLM(LlamaConfig(**common))
+    elif kind == "qwen3_5":
+        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+        model = Qwen3_5ForCausalLM(
+            Qwen3_5TextConfig(
+                **{**common, "num_hidden_layers": 3},
+                layer_types=["linear_attention", "full_attention", "linear_attention"],
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+                linear_key_head_dim=64,
+                linear_value_head_dim=64,
+            )
+        )
+        for layer in model.model.layers:  # slow decays: the state carries across the GPUs' chunks
+            if hasattr(layer, "linear_attn"):
+                with torch.no_grad():
+                    layer.linear_attn.A_log.copy_(torch.empty_like(layer.linear_attn.A_log).uniform_(0.001, 0.01).log())
     else:
         from transformers import Qwen3Config, Qwen3ForCausalLM
 
@@ -108,7 +127,7 @@ def _worker(rank, world, kind, seq_len, port, out):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("kind", ["llama", "qwen3_sliding"])
+@pytest.mark.parametrize("kind", ["llama", "qwen3_sliding", "qwen3_5"])
 def test_context_parallel_matches_one_gpu(kind):
     from palingenesis.loss import shift_labels
 

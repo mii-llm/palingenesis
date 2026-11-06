@@ -508,7 +508,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             route_attention(m, _find_transformer_layers(m))
         logger.info(
             f"Context parallel: {cp.size} ranks per sequence ({_dp_world_size(mesh)} data-parallel group(s)), "
-            "attention over the whole sequence (K/V all-gather), head-tail load balancing"
+            "attention over the whole sequence (K/V all-gather), linear attention by state passing (one "
+            "all-gather of chunk states), head-tail load balancing"
         )
     elif config.parallel.context_parallel:
         logger.warning("parallel.context_parallel: one process, nothing to split; training without it")

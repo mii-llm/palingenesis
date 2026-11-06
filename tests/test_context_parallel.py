@@ -1,8 +1,10 @@
 """Context parallelism (palingenesis.context_parallel) is exact: CPU processes (gloo) that each hold a
 slice of the sequence give the same loss and gradients as one process on the whole sequence, for
-full-causal and sliding-window attention, grouped K/V heads, padding to the layout's multiple and
-uneven valid-token counts. Also: the layout's bookkeeping, and the refusal of layer types that
-cannot be split (recurrent / linear attention, soft-capping)."""
+full-causal and sliding-window attention, Gated DeltaNet linear attention with its causal
+convolution (Qwen3.5), grouped K/V heads, padding to the layout's multiple and uneven valid-token
+counts; and they do not when the linear attention's state or convolution halo is dropped. Also:
+the layout's bookkeeping, and the refusal of layer types that cannot be split (other recurrent /
+linear attention, soft-capping)."""
 
 import json
 import os
@@ -82,30 +84,109 @@ def test_labels_shifted_before_the_split_score_across_chunk_boundaries():
         assert torch.equal(local_labels, nxt)
 
 
-def _qwen35_tiny():
-    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+def test_gated_delta_net_layers_are_supported():
+    model = _model("qwen3_5")
+    C.check_model_support(model)
+    assert sum(C.is_gated_delta_net(m) for m in model.modules()) == 2
+    assert C.route_attention(model, list(model.model.layers)) == 3  # one attention config, two linear layers
+    assert C.route_attention(model, list(model.model.layers)) == 3  # routed once
 
-    cfg = Qwen3_5TextConfig(
+
+def test_linear_attention_of_another_structure_is_refused():
+    """OLMo hybrid's Gated DeltaNet has three convolution modules of its own, not the kernel attributes
+    the split computes: refused."""
+    from transformers import OlmoHybridConfig, OlmoHybridForCausalLM
+
+    cfg = OlmoHybridConfig(
         vocab_size=VOCAB,
+        pad_token_id=0,
+        eos_token_id=1,
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=8,
         layer_types=["linear_attention", "full_attention"],
-        linear_num_key_heads=2,
-        linear_num_value_heads=2,
-        linear_key_head_dim=8,
-        linear_value_head_dim=8,
     )
-    return Qwen3_5ForCausalLM(cfg)
-
-
-def test_linear_attention_layers_are_refused():
-    pytest.importorskip("transformers.models.qwen3_5")
     with pytest.raises(ConfigError, match="linear_attention"):
-        C.check_model_support(_qwen35_tiny())
+        C.check_model_support(OlmoHybridForCausalLM(cfg))
+
+
+def test_incoming_states_compose_the_chunks_in_sequence_order():
+    """The state entering chunk c is the composition of chunks 0..c-1 (S -> A S + B), whichever ranks hold them."""
+    torch.manual_seed(0)
+    b, h, n, dk, dv = 2, 3, 6, 4, 5
+    states = torch.randn(b, h, n, dk, dv + dk, dtype=torch.float64)
+    expected, s = [], torch.zeros(b, h, dk, dv, dtype=torch.float64)
+    for c in range(n):
+        expected.append(s)
+        s = states[:, :, c, :, dv:] @ s + states[:, :, c, :, :dv]
+    for blocks in [(0, 5), (1, 4), (2, 3)]:
+        got = C.incoming_states(states, blocks, dv)
+        torch.testing.assert_close(got, torch.cat([expected[c] for c in blocks]))
+
+
+def test_split_delta_rule_equals_the_whole_sequence(single):
+    """A group of one holds chunks 0 and 1: the extended-value kernel call, the state of chunk 0 passed
+    into chunk 1 and the output correction give the kernel's own result on the whole sequence, values
+    and gradients (transformers' torch kernel, whose internal chunks of 64 the split does not align with)."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule as kernel
+
+    torch.manual_seed(0)
+    b, t, h, dk, dv = 2, 150, 2, 4, 6
+    inputs = [torch.randn(b, t, h, d, dtype=torch.float64) for d in (dk, dk, dv)]
+    inputs += [-torch.rand(b, t, h, dtype=torch.float64), torch.rand(b, t, h, dtype=torch.float64)]
+    inputs = [x.requires_grad_() for x in inputs]
+    q, k, v, g, beta = inputs
+    ref, _ = kernel(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
+    got = single.gated_delta_rule(kernel, q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
+    torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-6)
+    weight = torch.randn_like(ref)
+    for a, r in zip(
+        torch.autograd.grad((got * weight).sum(), inputs), torch.autograd.grad((ref * weight).sum(), inputs)
+    ):
+        torch.testing.assert_close(a, r, rtol=1e-4, atol=1e-5)  # the kernel computes in fp32
+
+
+def test_conv_halo_reads_the_previous_chunk(single):
+    """A group of one: the convolution of the two local chunks with the halo equals the convolution of the
+    whole sequence (the tail chunk reads the head chunk's last inputs)."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 5, 12)
+    weight = torch.randn(5, 4)
+
+    def conv(t):
+        return torch.nn.functional.conv1d(t, weight.unsqueeze(1), padding=3, groups=5)[..., : t.shape[-1]]
+
+    torch.testing.assert_close(single.causal_conv1d(conv, x, 4), conv(x))
+    with pytest.raises(C.ContextParallelError, match="look-back"):
+        single.causal_conv1d(conv, x[..., :4], 4)  # chunks of 2 tokens, a look-back of 3
+
+
+def test_linear_attention_refuses_a_cached_state_or_packing(single):
+    model = _model("qwen3_5")
+    C.route_attention(model, list(model.model.layers))
+    gdn = model.model.layers[0].linear_attn
+    q = torch.randn(1, 6, 4, 8)
+    single.activate()
+    with pytest.raises(C.ContextParallelError, match="cached state"):
+        gdn.chunk_gated_delta_rule(q, q, q, g=q[..., 0], beta=q[..., 0], initial_state=None, output_final_state=True)
+    with pytest.raises(C.ContextParallelError, match="packed"):
+        gdn.causal_conv1d_fn(x=torch.randn(1, 4, 6), weight=torch.randn(4, 4), seq_idx=torch.zeros(1, 6))
+
+
+def test_routed_linear_attention_generates_like_the_original():
+    """Outside context parallelism the routed kernels are the layer's own: cached generation (prefill,
+    one-token and chunked decode) gives the same tokens and logits."""
+    ref_model, model = _model("qwen3_5"), _model("qwen3_5")
+    C.route_attention(model, list(model.model.layers))
+    ids = torch.randint(0, VOCAB, (2, 9))
+    kwargs = dict(max_new_tokens=6, do_sample=False, use_cache=True, output_logits=True, return_dict_in_generate=True)
+    ref = ref_model.generate(ids, attention_mask=torch.ones_like(ids), **kwargs)
+    got = model.generate(ids, attention_mask=torch.ones_like(ids), **kwargs)
+    assert torch.equal(got.sequences, ref.sequences)
+    for a, b in zip(got.logits, ref.logits):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
 def test_softcapping_is_refused():
@@ -169,7 +250,7 @@ def single():
     cp.deactivate()
 
 
-@pytest.mark.parametrize("kind", ["llama", "qwen3_sliding", "gemma3"])
+@pytest.mark.parametrize("kind", ["llama", "qwen3_sliding", "gemma3", "qwen3_5"])
 @pytest.mark.parametrize("fused", [True, False])
 def test_a_group_of_one_equals_the_plain_model(kind, fused, single, monkeypatch):
     """Both attention paths (gathered causal kernel, SDPA under autograd) reproduce the model's own
@@ -281,7 +362,7 @@ def test_recurrent_module_names_are_refused():
 
 
 def test_supported_models_pass_the_check():
-    for kind in ("llama", "qwen3_sliding", "gemma3"):
+    for kind in ("llama", "qwen3_sliding", "gemma3", "qwen3_5"):
         C.check_model_support(_model(kind))
 
 
@@ -362,6 +443,25 @@ def _model(kind: str):
                 **common, head_dim=8, sliding_window=4, layer_types=["sliding_attention", "full_attention"]
             )
         )
+    elif kind == "qwen3_5":  # Gated DeltaNet, full attention, Gated DeltaNet (grouped linear-attention heads)
+        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+        model = Qwen3_5ForCausalLM(
+            Qwen3_5TextConfig(
+                **{**common, "num_hidden_layers": 3},
+                head_dim=8,
+                layer_types=["linear_attention", "full_attention", "linear_attention"],
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+                linear_key_head_dim=8,
+                linear_value_head_dim=8,
+                linear_conv_kernel_dim=4,
+            )
+        )
+        for layer in model.model.layers:  # slow decays: the state carries across chunk boundaries
+            if hasattr(layer, "linear_attn"):
+                with torch.no_grad():
+                    layer.linear_attn.A_log.copy_(torch.empty_like(layer.linear_attn.A_log).uniform_(0.01, 0.1).log())
     else:
         raise ValueError(kind)
     model.config.use_cache = False
@@ -391,13 +491,28 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _worker(rank, world, kind, seq_len, fused, port, out):
+def _break(what: str):
+    """Drop what the split linear attention takes from earlier chunks: the entering state or the halo."""
+    if what == "state":
+        real = C.incoming_states
+        C.incoming_states = lambda states, blocks, dv: torch.zeros_like(real(states, blocks, dv))
+    elif what == "halo":
+
+        def local(self, conv, x, kernel_size):
+            return torch.cat([conv(part) for part in x.chunk(2, dim=-1)], dim=-1)
+
+        C.ContextParallel.causal_conv1d = local
+
+
+def _worker(rank, world, kind, seq_len, fused, port, out, broken=None):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         from palingenesis.loss import shift_labels
 
         C.FUSED = fused
+        if broken:
+            _break(broken)
         model = _model(kind)
         C.route_attention(model, list(model.model.layers))
         cp = C.ContextParallel(dist.group.WORLD, world, rank)
@@ -432,23 +547,43 @@ def _worker(rank, world, kind, seq_len, fused, port, out):
         ("qwen3_sliding", 2, 22, True),
         ("qwen3_sliding", 3, 30, True),
         ("gemma3", 2, 20, True),
+        ("qwen3_5", 2, 24, True),
+        ("qwen3_5", 3, 30, True),
+        ("qwen3_5", 4, 21, True),  # padded to 24: chunks of 3 tokens, the convolution's whole look-back
     ],
 )
 def test_context_parallel_matches_one_process(kind, world, seq_len, fused):
+    ref, ref_grads = _reference(kind, seq_len)
+    got = _spawn(world, kind, seq_len, fused)
+    assert got["loss"] == pytest.approx(ref.item(), rel=1e-5)
+    assert got["grads"].keys() == ref_grads.keys()
+    for name, g in ref_grads.items():
+        torch.testing.assert_close(torch.tensor(got["grads"][name]), g, rtol=1e-4, atol=1e-6, msg=name)
+
+
+def _reference(kind: str, seq_len: int):
     from palingenesis.loss import shift_labels
 
     model = _model(kind)
     ids, labels = _batch(seq_len)
     ref = _loss_sum(model, ids, shift_labels(labels))
     ref.backward()
-    ref_grads = {n: p.grad.flatten() for n, p in model.named_parameters()}
+    return ref, {n: p.grad.flatten() for n, p in model.named_parameters()}
 
+
+def _spawn(world: int, kind: str, seq_len: int, fused: bool, broken: str | None = None) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         out = f"{tmp}/result.json"
-        mp.spawn(_worker, args=(world, kind, seq_len, fused, _free_port(), out), nprocs=world, join=True)
-        got = json.loads(Path(out).read_text())
+        mp.spawn(_worker, args=(world, kind, seq_len, fused, _free_port(), out, broken), nprocs=world, join=True)
+        return json.loads(Path(out).read_text())
 
-    assert got["loss"] == pytest.approx(ref.item(), rel=1e-5)
-    assert got["grads"].keys() == ref_grads.keys()
-    for name, g in ref_grads.items():
-        torch.testing.assert_close(torch.tensor(got["grads"][name]), g, rtol=1e-4, atol=1e-6, msg=name)
+
+@pytest.mark.parametrize("broken", ["state", "halo"])
+def test_dropping_what_earlier_chunks_pass_on_breaks_exactness(broken):
+    """The exactness above rests on the state and the halo crossing ranks: without either, the loss and
+    the linear-attention gradients move."""
+    ref, ref_grads = _reference("qwen3_5", 24)
+    got = _spawn(2, "qwen3_5", 24, True, broken)
+    assert got["loss"] != pytest.approx(ref.item(), rel=1e-5)
+    name = "model.layers.0.linear_attn.in_proj_qkv.weight"
+    assert not torch.allclose(torch.tensor(got["grads"][name]), ref_grads[name], rtol=1e-4, atol=1e-6)
