@@ -84,6 +84,15 @@ Training issue?
 │   ├── Root-cause fix: OPD on the student's own episodes (agent_traces source) with onset_branches,
 │   │   error_patterns / error_weight / first_error_weight, cutoff_logp (see the distillation guide)
 │   └── Stopgap at inference: presence_penalty (sampling)
+├── Distilling a larger teacher on fixed data (off-policy KD in pgs train), or QAT while distilling
+│   ├── Setup: distill.enabled + distill.teachers.<name>: {model: ...} (online) or {cache: ...} (pgs distill-cache)
+│   ├── Check before: pgs profile --config ... (counts teacher weights and targets); the teacher must share
+│   │   the student's vocabulary (startup error otherwise: use OPD xtok across tokenizers)
+│   ├── Watch: train/kd_loss falling, train/kd_coverage == 1.0, train/topk_mass/<teacher> (cached: > ~0.9)
+│   ├── "no teacher target" error: the cache was built from other data / masking -> rebuild it from the
+│   │   training config, or distill.missing: skip (uncovered tokens get only ce_weight * CE)
+│   ├── OOM from the teacher: teachers.<name>.placement: shard (multi-GPU), dtype: bfloat16, or cache it
+│   └── QAT: plugins.custom: palingenesis.qat:TernaryQAT (watch plugins/ternary_qat/codes_changed, strength)
 ├── Training too slow
 │   ├── Check: python -m palingenesis.agent_tooling.monitor_run --log_file ... --brief
 │   ├── Likely causes: Data loading bottleneck, no compile, small batch
@@ -94,8 +103,10 @@ Training issue?
 
 ## In-process use (scripts, notebooks)
 
-`palingenesis.train.train(Config)` runs SFT / DPO in-process on one GPU and returns a `TrainResult` (output_dir,
-global_step, metrics, best_eval_loss); `RLTrainer(...).train()` and `OPDTrainer(...).train()` also run in-process.
+`palingenesis.train.train(Config, plugins=[...])` runs SFT / DPO / off-policy distillation in-process on one GPU and
+returns a `TrainResult` (output_dir, global_step, metrics, best_eval_loss); `plugins` are `palingenesis.hooks.TrainerPlugin`
+objects (layer substitution, extra losses, optimizer groups, export folding). `RLTrainer(...).train()` and
+`OPDTrainer(...).train()` also run in-process.
 Multi-GPU needs `torchrun` (`pgs train`). `pgs init <name>` writes an example config. See the "Training from a
 notebook" docs page.
 
@@ -118,3 +129,6 @@ Use `--json` flag (where available) for structured output suitable for programma
 | Long seq OOM | `parallel.context_parallel: true`, `memory.loss_num_chunks: 16` |
 | Repetition loops after SFT | `data.loop_recovery: 0.2`, `data.reasoning_loop_recovery: 0.2`, `data.repeat_unlikelihood: 20`, `data.stop_unlikelihood: 5` (with `memory.seco: true`) |
 | Agent drifts on its own errors | OPD `sources.<name>.format: agent_traces` on the student's episodes + `onset_branches`, `error_patterns`, `cutoff_logp` |
+| Off-policy KD: teacher too large | `distill.teachers.<name>.placement: shard` (FSDP), or `pgs distill-cache` once and `cache: <dir>` |
+| Off-policy KD: "no teacher target" | rebuild the cache with the training config, or `distill.missing: skip` + `distill.ce_weight: 0.1` |
+| Off-policy KD: student copies the teacher's tail / rambles | `distill.divergence: reverse_kl` or `jsd`, add `distill.ce_weight` |

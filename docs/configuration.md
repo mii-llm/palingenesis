@@ -210,6 +210,34 @@ Preference optimisation (DPO and variants). When `enabled`, `data.dataset` and `
 
 `per_device_batch_size` counts **pairs**. Incompatible (rejected by `validate()`): packing, `data.sources`, `data.eval_sources`, pretokenize, MSFT, seq-len curriculum, pretrain replay, `preprocess.enabled`, context parallel, gradient release, and the token-weighting plugins.
 
+## Section: `distill`
+
+Off-policy knowledge distillation, a mode of `pgs train` (design: [offpolicy_distillation.md](offpolicy_distillation.md); usage: the "Off-Policy Distillation" guide). Off by default.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Off-policy distillation in `pgs train`: the student trains on the data's sequences against its teachers' distributions |
+| `teachers` | dict | `{}` | name → `{model: ...}` (online, frozen) or `{cache: ...}` (a `pgs distill-cache` top-k cache); per teacher: `weight`, `sources`, `dtype`, `placement` (`auto`/`replicate`/`shard`), `device`, `attn_implementation`, `tokenizer`, `eos_map`, `probe_texts`, `top_k`, and the teacher view keys `system_prompt`, `prefix_messages`, `privileged_field` / `privileged_template` / `privileged_role`, `messages_field`, `chat_template_kwargs`, `view_fn`, `max_seq_length` |
+| `divergence` | str | `forward_kl` | `forward_kl`, `reverse_kl`, `jsd` (GKD), `skew_forward_kl`, `skew_reverse_kl` (DistiLLM), `tvd` |
+| `beta` | float | `0.5` | `jsd` mixture weight of the teacher / `skew_*` skew coefficient, in (0, 1) |
+| `temperature` | float | `1.0` | Softmax temperature of both distributions |
+| `temperature_scale` | bool | `true` | Multiply the divergence by temperature² |
+| `kd_weight` | float | `1.0` | Weight of the divergence per trained token |
+| `ce_weight` | float | `0.0` | Weight of cross-entropy on the gold token |
+| `topk_mode` | str | `tail` | Cached teachers: `tail` (top-k + gold + a tail bucket per side) or `renorm` (both renormalised over the support) |
+| `missing` | str | `error` | A trained token no teacher covers: `error` or `skip` (CE only) |
+| `features` | list | `[]` | Hidden-state / module-output matching: `{student, teacher, weight, loss: mse/nmse/cosine/lens_kl, projection: auto/linear/none, via}` |
+| `feature_lr` | float | `0.0` | Learning rate of the feature projections (0 = `train.learning_rate`) |
+| `rows_per_slice` | int | `0` | Rows per slice of the chunked loss (0 = automatic, ~512 MB of fp32 logits per side) |
+
+Incompatible (rejected by `validate()`): `dpo.enabled`, `plugins.deft/dft/cadft/info_sft/pre_rl`, `memory.gradient_release`; `features` with `memory.seco`; an online teacher's view with packing, context parallel or pretokenize; views with loop-recovery augmentation.
+
+## Section: `plugins.custom`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `custom` | list | `[]` | Trainer plugins (`palingenesis.hooks.TrainerPlugin`): `module:Class`, `path/file.py:Class`, an entry point of group `palingenesis.plugins`, or `{class: ..., args: {...}}`. See [plugins.md](plugins.md#trainer-plugins) |
+
 ## Section: `logging`
 
 | Field | Type | Default | Description |

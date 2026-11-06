@@ -6,7 +6,7 @@
 
 ## Offline vs on-policy
 
-The usual way to distill is offline: the teacher generates a dataset, the student does SFT on it. That trains the student on the **teacher's** trajectories, but at inference the student walks its own path, and every early deviation lands it in states the training data never covered.
+The usual way to distill is offline: the teacher generates a dataset, the student does SFT on it (or trains against the teacher's distributions on fixed data: [off-policy distillation](offpolicy-distillation.md), a mode of `pgs train`). That trains the student on the **teacher's** trajectories, but at inference the student walks its own path, and every early deviation lands it in states the training data never covered.
 
 On-policy distillation (OPD) flips the sampling. Every step the student samples completions with its current weights, the teacher scores exactly those tokens, and the loss is the reverse KL from the student to the teacher on the student's own states:
 

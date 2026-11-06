@@ -193,6 +193,7 @@
 | `pre_rl` | bool | `false` | Pre-RL mode: entropy bonus + KL anchor to preserve diversity for subsequent GRPO/DPO. Exclusive with the other objectives (a configuration error otherwise); materializes the full logits whatever `memory.chunked_loss` says. |
 | `pre_rl_entropy_coeff` | float | `0.1` | Entropy bonus weight. Higher = more output diversity preserved. |
 | `pre_rl_kl_coeff` | float | `0.5` | KL penalty weight. Higher = less drift from base model. |
+| `custom` | list | `[]` | Your own trainer plugins (`palingenesis.hooks.TrainerPlugin`): `module:Class`, `path/file.py:Class`, an entry point of group `palingenesis.plugins`, or `{class: ..., args: {...}}`, run in order. See [Trainer plugins](plugins.md#trainer-plugins). |
 
 ---
 
@@ -240,6 +241,28 @@ Preference optimization (DPO and variants), a mode of `pgs train`. When `enabled
 | `disable_dropout` | bool | `true` | Zero dropout in the policy, so its log-probs are deterministic like the reference's. |
 
 `train.per_device_batch_size` counts **pairs**. Use `model.torch_dtype: float32`: without an fp32 master copy, DPO-sized updates round to zero in bf16. Incompatible (rejected by validation): packing, `data.sources`, `data.eval_sources`, pretokenize, MSFT, sequence-length curriculum, pretrain replay, `preprocess.enabled`, context parallel, gradient release, and the token-weighting plugins.
+
+---
+
+## distill
+
+Off-policy knowledge distillation, a mode of `pgs train`: the student trains on the data's sequences against one or more teachers' distributions at every trained token. See the [Off-Policy Distillation guide](../guides/offpolicy-distillation.md) (every teacher key is listed there).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | bool | `false` | Off-policy distillation in `pgs train`: the student trains on the data's sequences against its teachers' distributions |
+| `teachers` | dict | `{}` | name → `{model: ...}` (online, frozen) or `{cache: ...}` (a `pgs distill-cache` top-k cache); per teacher: `weight`, `sources`, `dtype`, `placement` (`auto`/`replicate`/`shard`), `device`, `attn_implementation`, `tokenizer`, `eos_map`, `probe_texts`, `top_k`, and the teacher view keys `system_prompt`, `prefix_messages`, `privileged_field` / `privileged_template` / `privileged_role`, `messages_field`, `chat_template_kwargs`, `view_fn`, `max_seq_length` |
+| `divergence` | str | `forward_kl` | `forward_kl`, `reverse_kl`, `jsd` (GKD), `skew_forward_kl`, `skew_reverse_kl` (DistiLLM), `tvd` |
+| `beta` | float | `0.5` | `jsd` mixture weight of the teacher / `skew_*` skew coefficient, in (0, 1) |
+| `temperature` | float | `1.0` | Softmax temperature of both distributions |
+| `temperature_scale` | bool | `true` | Multiply the divergence by temperature² |
+| `kd_weight` | float | `1.0` | Weight of the divergence per trained token |
+| `ce_weight` | float | `0.0` | Weight of cross-entropy on the gold token |
+| `topk_mode` | str | `tail` | Cached teachers: `tail` (top-k + gold + a tail bucket per side) or `renorm` (both renormalised over the support) |
+| `missing` | str | `error` | A trained token no teacher covers: `error` or `skip` (CE only) |
+| `features` | list | `[]` | Hidden-state / module-output matching: `{student, teacher, weight, loss: mse/nmse/cosine/lens_kl, projection: auto/linear/none, via}` |
+| `feature_lr` | float | `0.0` | Learning rate of the feature projections (0 = `train.learning_rate`) |
+| `rows_per_slice` | int | `0` | Rows per slice of the chunked loss (0 = automatic, ~512 MB of fp32 logits per side) |
 
 ---
 

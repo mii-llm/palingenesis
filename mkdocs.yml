@@ -99,6 +99,7 @@ nav:
     - Multi-Node & SLURM: guides/multi-node.md
     - Autopilot: guides/autopilot.md
     - On-Policy Distillation: guides/distillation.md
+    - Off-Policy Distillation: guides/offpolicy-distillation.md
     - Preference Optimization (DPO): guides/dpo.md
     - Reinforcement Learning: guides/rl.md
     - Harbor Environments: guides/harbor.md

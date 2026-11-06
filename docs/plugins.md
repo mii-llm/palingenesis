@@ -207,3 +207,94 @@ plugins:
   cadft_beta: 1.0
   sym_noise: true
 ```
+
+---
+
+## Trainer plugins
+
+Your own code inside `pgs train` (SFT and [off-policy distillation](offpolicy_distillation.md)): substitute layers, add loss terms and regularisers, change teacher targets, set optimizer groups, ramp anything with training progress, log metrics, fold weights on export. A plugin is a subclass of `palingenesis.hooks.TrainerPlugin` overriding the hooks it needs; every hook is optional.
+
+```yaml
+plugins:
+  custom:
+    - my_package.plugins:MyPlugin                       # module:Class
+    - {class: ./plugins/qat.py:MyQAT, args: {bits: 2}}  # a file, with constructor arguments
+    - my-registered-plugin                              # an entry point of group "palingenesis.plugins"
+```
+
+```python
+from palingenesis.train import train
+train(config, plugins=[MyPlugin(), "my_package.plugins:Other"])   # after the config's
+```
+
+A package registers plugins for the short form with an entry point:
+
+```toml
+[project.entry-points."palingenesis.plugins"]
+my-registered-plugin = "my_package.plugins:MyPlugin"
+```
+
+### Hooks, in the order they run
+
+| Hook | When | Use it to |
+|---|---|---|
+| `setup(ctx)` | once, after the config is validated, before anything loads | check or adjust `ctx.config` |
+| `transform_model(model, ctx)` | once, after the student loads, **before** float8, activation checkpointing, FSDP and compile | substitute layers, wrap the embedding or the head, freeze, add modules or parameters (they are then sharded, checkpointed and resumed like the rest) |
+| `feature_requests(ctx)` | once (needs `distill.enabled`) | return `FeatureSpec`s: student / teacher module outputs to capture and match at the trained positions |
+| `param_groups(model, ctx)` | once, before the scheduler is built | return overrides `{"params": [...] or "names": regex, "lr", "eps", "weight_decay", "betas"}`; the parameters move to groups of their own (the schedule still applies relative to the group's lr) |
+| `on_train_start(model, ctx)` | once, before the first step, after a resume | calibration, statistics, initial snapshots |
+| `on_forward_start(model, batch, ctx)` | every micro-batch | set step-dependent module state (quantisation strength, temperatures) |
+| `transform_targets(targets, batch, ctx)` | every micro-batch with a teacher | reweight tokens (`targets.token_weights`), change teacher targets, drop teachers |
+| `loss(inputs, ctx)` | every micro-batch, after the forward | return a scalar or `{name: scalar}`: extra loss terms (logged as `plugins/<name>/<key>`) |
+| `on_before_optimizer_step(model, optimizer, ctx)` | each step, gradients complete, before clipping | mask gradients, add regulariser gradients |
+| `on_after_optimizer_step(model, optimizer, ctx)` | each step, after `optimizer.step()` | clamp or project weights |
+| `metrics(model, ctx)` | logging steps | return scalars (logged as `plugins/<name>/<key>`); `ctx.log(key, value)` from any hook |
+| `export_state_dict(state, model, ctx)` | final and best-model exports (never resume checkpoints) | fold quantised weights, rename, drop training-only tensors; `state` is the full state dict under the architecture's names |
+| `state_dict()` / `load_state_dict(state)` | every checkpoint / resume | plugin state, saved as `plugins.pt` next to the checkpoint |
+| `on_train_end(model, ctx)` | after the last step, before the final save | final statistics |
+
+`ctx` (`PluginContext`) carries the config, `step` (optimizer steps done), `total_steps`, `progress` (0 to 1), `rank`, `world_size`, `dp_world_size`, `device`, `is_fsdp`, `output_dir` and, when distilling, the `distiller` (its teachers and caches). `palingenesis.hooks.Ramp(start, end, start_value, end_value, shape)` is a schedule over `progress` (`linear`, `cosine`, `step`); `Ramp.parse` accepts a number or a mapping, so ramps can come straight from plugin arguments.
+
+### `loss` inputs and scaling
+
+`LossInputs` holds the model, the batch, the student's final hidden states `[B, T, H]` (with gradient), the shifted labels, `rows` (flat indices of the trained positions), the captured `features` (`{name: (student [N, Ds], teacher [N, Dt])}`), the teacher targets, the output head, the global token denominator and the accumulation steps.
+
+The trainer adds a plugin's term multiplied by `1 / (gradient accumulation steps × data-parallel ranks)`: gradients are summed over the accumulation window and over ranks, so return a **per-rank mean** (for example a mean over this rank's tokens). For a sum over tokens normalised like the main loss, multiply by `inputs.token_sum_scale`.
+
+Loss hooks run where the trainer has the student's forward in hand (SFT with chunked / cut / plain cross-entropy, the gated objectives, off-policy distillation). Paths that run their own backward refuse them at startup: SeCO, DPO, `plugins.pre_rl`, `memory.gradient_release`. Put gradient-level terms in `on_before_optimizer_step` instead: they work on every path.
+
+### FSDP
+
+- Modules added in `transform_model` exist before FSDP wraps the model: they are sharded, their gradients reduced and their weights checkpointed like the rest.
+- In the optimizer-step hooks, parameters and gradients are sharded DTensors. FSDP2 shards dimension 0, so `p.to_local()` holds whole rows: per-row and per-group statistics are local; a per-tensor statistic needs an all-reduce over `p.device_mesh.get_group()` (see `palingenesis.qat`).
+- `export_state_dict` receives the gathered full state on rank 0.
+
+### Example: a regulariser and a metric
+
+```python
+import torch
+from palingenesis.hooks import Ramp, TrainerPlugin
+
+class L2ToStart(TrainerPlugin):
+    """Pull the weights towards their initial values with a ramped strength (gradient-level)."""
+
+    name = "l2_to_start"
+
+    def __init__(self, lam=1e-4):
+        self.lam = Ramp(0.0, 0.2, 0.0, lam)
+
+    def on_train_start(self, model, ctx):
+        self.start = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+
+    @torch.no_grad()
+    def on_before_optimizer_step(self, model, optimizer, ctx):
+        lam = self.lam(ctx.progress)
+        for n, p in model.named_parameters():
+            if p.grad is not None and n in self.start:
+                p.grad.add_(2 * lam * (p - self.start[n]))
+
+    def metrics(self, model, ctx):
+        return {"lambda": self.lam(ctx.progress)}
+```
+
+`palingenesis.qat.TernaryQAT` is a complete example (layer substitution, a straight-through quantiser, a strength ramp, a grid regulariser, latent clamping, optimizer groups, hidden-state targets, folded export): see [Quantisation-aware training while distilling](offpolicy_distillation.md#quantisation-aware-training-while-distilling).

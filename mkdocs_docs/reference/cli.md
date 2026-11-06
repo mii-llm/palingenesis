@@ -11,7 +11,7 @@
 Write a shipped example config to start from (works after `pip install`, no checkout needed).
 
 ```bash
-pgs init --list              # sft, dpo, distill, rl
+pgs init --list              # sft, dpo, distill, kd, rl
 pgs init sft                 # ./sft.yaml
 pgs init rl my_rl.yaml       # another file name (--force overwrites)
 ```
@@ -41,6 +41,20 @@ pgs distill --config configs/distill_math.yaml --train.learning_rate 1e-6 --teac
 ```
 
 See the [On-Policy Distillation guide](../guides/distillation.md).
+
+Off-policy distillation (fixed data, the teacher's distributions as targets) is a mode of `pgs train`: `distill.enabled: true` (`pgs init kd`). See the [Off-Policy Distillation guide](../guides/offpolicy-distillation.md).
+
+### distill-cache
+
+Precompute a teacher's top-k log-probabilities at every trained position of the training config's data, for off-policy distillation against a teacher you cannot run every step. The cache is content-addressed (found by each document's tokens and mask, whatever the order, packing or rank count), sharded, memory-mapped, resumable, and checked against the student's vocabulary.
+
+```bash
+pgs distill-cache --config kd.yaml --teacher big --out caches/big --top_k 64        # HF teacher
+torchrun --nproc_per_node 8 -m palingenesis.distill.build --config kd.yaml --teacher big
+pgs distill-cache --config kd.yaml --teacher big --backend vllm --tensor_parallel_size 4
+```
+
+Options: `--teacher` (a name in `distill.teachers` with a `model`), `--out` (default: the teacher's `cache`), `--backend hf|vllm`, `--top_k`, `--temperature` (hf), `--max_batch_tokens`, `--max_docs`, `--lp_dtype float16|float32`, `--gpu_memory_utilization` and `--tensor_parallel_size` (vllm), and `--section.option value` overrides of the config.
 
 ### distill-score
 
