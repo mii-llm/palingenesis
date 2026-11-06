@@ -671,7 +671,8 @@ def test_harbor_env_runs_a_profile_and_logs_it(local_harbor):
     conv = env.reset(**_row())
     name = env.session.profile.name
     assert env.episode_info == {"harness_profile": env.session.profile.id}
-    assert conv[0]["role"] == "system" and conv[-1]["content"] == harbor.HarborTask.load(FIXTURE).instruction
+    # the profile is drawn from the task's path, so either one may come up; each wraps the instruction its own way
+    assert conv[0]["role"] == "system" and harbor.HarborTask.load(FIXTURE).instruction in conv[-1]["content"]
     assert [t["function"]["name"] for t in env.tool_schemas()] == [t.name for t in env.session.profile.tools]
     if name == "openhands-sdk":
         env.call_tool("terminal", {"command": "echo ciao > hello.txt"})
