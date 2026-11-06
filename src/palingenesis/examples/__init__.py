@@ -16,6 +16,7 @@ EXAMPLES = {
     "sft": ("pgs train", "supervised fine-tuning on chat data (any GPU with 24+ GB)"),
     "dpo": ("pgs train", "preference optimization (DPO) on top of an SFT checkpoint"),
     "distill": ("pgs distill", "on-policy distillation from a larger teacher (needs the vllm extra)"),
+    "kd": ("pgs train", "off-policy distillation: train on data against a larger teacher's distributions"),
     "rl": ("pgs rl", "RL with a verifiable math reward (needs the rl and vllm extras)"),
 }
 

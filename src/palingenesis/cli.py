@@ -28,8 +28,9 @@ HELP = f"""{BANNER}
 
 Commands:
   init        Write an example config to start from (pgs init --list)
-  train       Start training (use with torchrun for multi-GPU)
+  train       Start training (use with torchrun for multi-GPU); off-policy distillation with distill.enabled
   distill     On-policy distillation: the student samples, its teachers score, KL update
+  distill-cache  Precompute a teacher's top-k targets for off-policy distillation (HF or vLLM)
   distill-score  Annotate an mcqa distillation pool with the teacher's answers (filter before training)
   rl          Reinforcement learning: rollouts scored by rewards (math, code, tools, your own)
   harbor      Harbor task directories (Docker envs with tests): check oracle/nop, export RL rows
@@ -123,6 +124,11 @@ def main():
             from palingenesis.internals.cli import main as internals_main
 
             sys.exit(internals_main())
+
+        case "distill-cache":
+            from palingenesis.distill.build import main as distill_cache_main
+
+            sys.exit(distill_cache_main())
 
         case "distill-score":
             from palingenesis.opd.score_pool import main as distill_score_main

@@ -12,6 +12,8 @@ from typing import Literal
 
 import yaml
 
+from palingenesis.distill.config import DistillConfig
+
 
 @dataclass(slots=True)
 class ModelConfig:
@@ -288,6 +290,9 @@ class PluginsConfig:
     pre_rl: bool = False  # STATUS: validated — Pre-RL mode: preserve diversity for GRPO/DPO (arxiv:2605.29303)
     pre_rl_entropy_coeff: float = 0.1  # Entropy bonus weight (higher = more diverse)
     pre_rl_kl_coeff: float = 0.5  # KL penalty weight (higher = less drift from base)
+    # Your own trainer plugins (palingenesis.hooks.TrainerPlugin): "module:Class", "path/file.py:Class",
+    # an entry point of group "palingenesis.plugins", or {class: ..., args: {...}}. Run in order.
+    custom: list = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -403,6 +408,7 @@ class Config:
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     dpo: DPOConfig = field(default_factory=DPOConfig)
+    distill: DistillConfig = field(default_factory=DistillConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     @classmethod
@@ -475,13 +481,16 @@ class Config:
             if args[i].startswith("--") and i + 1 < len(args):
                 key, value = args[i][2:], args[i + 1]
                 parts = key.split(".")
-                if len(parts) != 2:
+                if len(parts) < 2:
                     raise ConfigError(
                         f"--{key}: overrides are --section.option value (e.g. --train.learning_rate 1e-5)."
                     )
-                section_name, field_name = parts
+                section_name, field_name = parts[0], parts[1]
                 section = _section(config, section_name, where="command line")
-                _set_option(section, section_name, field_name, value, where="command line")
+                if len(parts) > 2:  # into a mapping option: --distill.teachers.big.placement shard
+                    _set_nested(section, section_name, field_name, parts[2:], value)
+                else:
+                    _set_option(section, section_name, field_name, value, where="command line")
                 i += 2
             else:
                 i += 1
@@ -672,6 +681,14 @@ class Config:
             errors.extend(self._dpo_errors())
         if self.memory.seco:
             errors.extend(self._seco_errors())
+        if self.distill.enabled:
+            from palingenesis.distill.config import distill_errors
+
+            errors.extend(distill_errors(self))
+        elif self.distill.teachers or self.distill.features:
+            warnings.append("distill.teachers / distill.features are set but distill.enabled is false: ignored.")
+        if not isinstance(self.plugins.custom, list):
+            errors.append("plugins.custom must be a list of plugin entries (module:Class or {class, args}).")
 
         # ── Soft warnings (untested combinations) ─────────────────────────
         if self.dpo.enabled and self.model.torch_dtype != "float32":
@@ -835,6 +852,30 @@ def _section(config: Config, name: str, where: str):
             + (f" (did you mean `{hint[0]}`?)" if hint else f"; sections: {', '.join(names)}")
         )
     return getattr(config, name)
+
+
+def _set_nested(section, section_name: str, key: str, path: list[str], value: str) -> None:
+    """A command-line value inside a mapping option (`--distill.teachers.big.model x`): the value is
+    read as YAML (numbers, booleans, lists), intermediate mappings are created."""
+    import dataclasses
+
+    names = [f.name for f in dataclasses.fields(section)]
+    if key not in names or not isinstance(getattr(section, key), dict):
+        raise ConfigError(
+            f"command line: --{section_name}.{key}.{'.'.join(path)}: only mapping options take nested keys "
+            f"({section_name}.{key} is not one)."
+        )
+    node = getattr(section, key)
+    for part in path[:-1]:
+        child = node.get(part)
+        if child is None:
+            child = node[part] = {}
+        elif isinstance(child, str):  # a shorthand (teacher: model id) becomes a mapping
+            child = node[part] = {"model": child}
+        elif not isinstance(child, dict):
+            raise ConfigError(f"command line: {section_name}.{key}.{part} is not a mapping.")
+        node = child
+    node[path[-1]] = yaml.safe_load(value) if isinstance(value, str) else value
 
 
 def _set_option(section, section_name: str, key: str, value, where: str) -> None:

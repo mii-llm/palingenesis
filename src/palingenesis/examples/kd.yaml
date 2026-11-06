@@ -1,0 +1,48 @@
+# Off-policy distillation: Qwen3-4B -> Qwen3-0.6B on chat data, inside `pgs train`.
+# The student trains on the dataset's conversations against the teacher's full distribution at
+# every assistant token (forward KL), plus a little cross-entropy on the gold tokens.
+#
+#   pgs train --config kd.yaml                                         (written by `pgs init kd`)
+#   torchrun --nproc_per_node 8 -m palingenesis.train --config kd.yaml  (student and teacher sharded)
+#
+# A teacher too large to run every step: score it once, then train against its top-k cache:
+#   pgs distill-cache --config kd.yaml --teacher qwen3_4b --out caches/qwen3_4b
+#   and add `cache: caches/qwen3_4b` to the teacher below.
+
+model:
+  name_or_path: Qwen/Qwen3-0.6B
+  torch_dtype: float32            # fp32 master weights; compute runs in bf16 (train.bf16)
+  attn_implementation: sdpa
+
+data:
+  dataset: HuggingFaceH4/ultrachat_200k
+  dataset_split: train_sft
+  max_seq_length: 4096
+  chat_template_kwargs: {enable_thinking: false}
+
+distill:
+  enabled: true
+  divergence: forward_kl          # reverse_kl | jsd | skew_forward_kl | skew_reverse_kl | tvd
+  temperature: 1.0
+  kd_weight: 1.0
+  ce_weight: 0.1
+  teachers:
+    qwen3_4b:
+      model: Qwen/Qwen3-4B        # same tokenizer family as the student (required)
+      dtype: bfloat16
+      placement: auto             # sharded with FSDP on several GPUs, else next to the student
+      top_k: 64                   # used by pgs distill-cache
+
+train:
+  output_dir: runs/kd
+  max_steps: 2000
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  warmup_ratio: 0.03
+  save_steps: 500
+
+logging:
+  use_wandb: false
+  project: palingenesis-kd

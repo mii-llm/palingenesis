@@ -68,6 +68,14 @@ from palingenesis.dpo import (
     sft_token_mask,
 )
 from palingenesis.health import HealthMonitor
+from palingenesis.hooks import (
+    LossInputs,
+    PluginContext,
+    PluginError,
+    PluginManager,
+    apply_param_groups,
+    load_plugins,
+)
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel, model_type_of
 from palingenesis.logging import Tracker, setup_logging
 from palingenesis.logits import (
@@ -265,12 +273,15 @@ class TrainResult:
     best_step: int | None = None
 
 
-def train(config: Config) -> TrainResult:
-    """Run SFT / DPO training to completion and return a TrainResult.
+def train(config: Config, plugins: list | None = None) -> TrainResult:
+    """Run SFT / DPO / off-policy distillation training to completion and return a TrainResult.
 
     Callable in-process (a script or a notebook, one GPU) or under torchrun. Whatever happens (an error, a
-    KeyboardInterrupt), the experiment trackers are closed and the process group is torn down."""
-    run: dict = {"tracker": None}
+    KeyboardInterrupt), the experiment trackers are closed and the process group is torn down.
+
+    plugins: palingenesis.hooks.TrainerPlugin objects (or "module:Class" strings), run after the ones the
+    config lists in `plugins.custom`."""
+    run: dict = {"tracker": None, "plugins": plugins}
     ok = False
     try:
         result = _train(config, run)
@@ -303,14 +314,29 @@ def _train(config: Config, run: dict) -> TrainResult:
     device = torch.device(f"cuda:{local_rank}")
 
     logger.info(f"rank={rank} local_rank={local_rank} world_size={world_size}")
+    return _train_on(config, run, run.get("plugins"), rank, world_size, device)
+
+
+def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: int, device) -> TrainResult:
+    """The training run proper on `device`: a CUDA device in training, the CPU in the library's tests."""
 
     # ── Config validation (raises on hard incompatibilities) ─────────────
     for warning in config.validate():
         logger.warning(f"Config warning: {warning}")
 
+    # ── Trainer plugins (palingenesis.hooks) ──────────────────────────────
+    plugin_ctx = PluginContext(config=config, rank=rank, world_size=world_size, output_dir=config.train.output_dir)
+    plugin_ctx.device = device
+    plugin_mgr = PluginManager(load_plugins(config.plugins.custom, extra_plugins), plugin_ctx)
+    if plugin_mgr:
+        logger.info(f"Trainer plugins: {', '.join(PluginManager._name(p) for p in plugin_mgr)}")
+        _check_plugin_paths(config, plugin_mgr)
+        plugin_mgr.setup()
+
     # ── Reproducibility ───────────────────────────────────────────────────
     torch.manual_seed(config.train.seed + rank)
-    torch.cuda.manual_seed_all(config.train.seed + rank)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(config.train.seed + rank)
     torch.set_float32_matmul_precision(config.memory.float32_matmul_precision)
 
     # ── Liger Kernel (BEFORE model load) ──────────────────────────────────
@@ -352,6 +378,37 @@ def _train(config: Config, run: dict) -> TrainResult:
     )
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
+    if plugin_mgr:
+        model = plugin_mgr.transform_model(model)
+
+    # ── Device mesh (FSDP2 / context parallel); sharded teachers use it too ──
+    mesh = build_mesh(world_size, config.parallel)
+    is_fsdp = config.parallel.fsdp and world_size > 1 and mesh is not None
+    plugin_ctx.is_fsdp = is_fsdp
+    plugin_ctx.dp_world_size = _dp_world_size(mesh) if is_fsdp else 1
+
+    # ── Off-policy distillation: teachers, caches, feature hooks (before AC / FSDP / compile) ──
+    distiller = None
+    if config.distill.enabled:
+        from palingenesis.distill.distiller import build_distiller
+
+        distiller = build_distiller(
+            config,
+            tokenizer,
+            device,
+            mesh=mesh if is_fsdp else None,
+            extra_features=plugin_mgr.feature_requests() if plugin_mgr else None,
+        )
+        distiller.attach_features(model, next(model.parameters()).device)
+        plugin_ctx.distiller = distiller
+        if config.data.packing:
+            for teacher in distiller.online.values():
+                check_packing_support(
+                    teacher.model, teacher.spec.attn_implementation or config.model.attn_implementation
+                )
+    elif plugin_mgr and plugin_mgr.feature_requests():
+        raise PluginError("a plugin requests teacher features (feature_requests) but distill.enabled is false")
+
     if has_linear_attention(model) and (missing := missing_linear_attention_kernels()):
         logger.warning(
             f"{', '.join(missing)} not installed: the linear-attention layers run on transformers' torch "
@@ -414,10 +471,7 @@ def _train(config: Config, run: dict) -> TrainResult:
 
         apply_selective_diff_v2(model)
 
-    # ── Device Mesh + FSDP2 ───────────────────────────────────────────────
-    mesh = build_mesh(world_size, config.parallel)
-    is_fsdp = config.parallel.fsdp and world_size > 1 and mesh is not None
-
+    # ── FSDP2 ─────────────────────────────────────────────────────────────
     if is_fsdp:
         logger.info("Applying FSDP2 (fully_shard)")
         model = apply_fsdp(model, mesh, config.parallel, bf16=config.train.bf16)
@@ -445,6 +499,12 @@ def _train(config: Config, run: dict) -> TrainResult:
     logger.info("Loading dataset(s)")
     _estimate = None  # sizes the LR schedule without a pass over the data (None: exact scan)
     bs = config.train.per_device_batch_size
+    # off-policy distillation: teacher renderings, source tags for routing, cached targets (in the workers)
+    kd_data = {}
+    kd_transform = None
+    if distiller is not None:
+        kd_data = {"teacher_views": distiller.teacher_views(), "tag_sources": distiller.needs_source_tags}
+        kd_transform = distiller.batch_transform()
     if config.data.pretokenize:
         # Materialize the fully-assembled (tokenized → masked → mixed → packed)
         # stream once, then load tensors directly. Cache is fingerprinted, so any
@@ -482,7 +542,13 @@ def _train(config: Config, run: dict) -> TrainResult:
 
         def _make_dataloader():
             return build_pretokenized_dataloader(
-                cache_dir, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
+                cache_dir,
+                tokenizer,
+                config.data,
+                rank,
+                world_size,
+                config.train.per_device_batch_size,
+                batch_transform=kd_transform,
             )
 
         def _estimate():  # the cache's row count is its number of training sequences
@@ -498,7 +564,14 @@ def _train(config: Config, run: dict) -> TrainResult:
 
         def _make_dataloader():
             return build_dataloader(
-                config.data, tokenizer, config.data, rank, world_size, config.train.per_device_batch_size
+                config.data,
+                tokenizer,
+                config.data,
+                rank,
+                world_size,
+                config.train.per_device_batch_size,
+                batch_transform=kd_transform,
+                **kd_data,
             )
 
         def _estimate():
@@ -577,6 +650,8 @@ def _train(config: Config, run: dict) -> TrainResult:
                     config.train.per_device_batch_size,
                     streaming_shuffle_buffer=streaming_shuffle_buffer,
                     shuffle=shuffle_rows,
+                    batch_transform=kd_transform,
+                    **kd_data,
                 )
 
             def _estimate():
@@ -586,11 +661,24 @@ def _train(config: Config, run: dict) -> TrainResult:
 
     # ── Optimizer + Scheduler ─────────────────────────────────────────────
     total_steps = _resolve_total_steps(config, world_size, _make_dataloader, device, _estimate)
+    plugin_ctx.total_steps = total_steps
+    # Parameter-group overrides (plugins: latent weights, scales; distillation projections), applied
+    # before the scheduler records each group's learning rate.
+    group_overrides = plugin_mgr.param_groups(model) if plugin_mgr else []
+    if distiller is not None and distiller.projections is not None and config.distill.feature_lr > 0:
+        group_overrides.append({"names": r"(^|\.)distill_aux\.", "lr": config.distill.feature_lr})
+
+    def _override_groups(optimizer):
+        if group_overrides:
+            moved = apply_param_groups(optimizer, model, group_overrides)
+            logger.info(f"Parameter-group overrides: {moved} parameter(s) in {len(group_overrides)} group(s)")
+
     if config.plugins.schedule_free:
         warmup_steps = int(total_steps * config.train.warmup_ratio)
         optimizer = build_schedule_free_optimizer(
             model, config.train.learning_rate, config.train.weight_decay, warmup_steps
         )
+        _override_groups(optimizer)
         scheduler = None  # Schedule-Free doesn't need a scheduler
     else:
         optimizer = build_optimizer(
@@ -602,6 +690,7 @@ def _train(config: Config, run: dict) -> TrainResult:
             optimizer_name=config.train.optimizer,
             muon=config.train.muon_options(),
         )
+        _override_groups(optimizer)
         scheduler = build_scheduler(
             optimizer,
             config.train.lr_scheduler,
@@ -707,6 +796,17 @@ def _train(config: Config, run: dict) -> TrainResult:
             f"SeCO: chunk_size={config.memory.seco_chunk_size} "
             + (f"SpaCO budget={config.memory.spaco_budget} chunks" if config.memory.spaco_budget else "(exact)")
         )
+    elif distiller is not None:
+        lm_head = _get_lm_head(model)
+        if lm_head is None:
+            raise RuntimeError("Off-policy distillation needs the model's output head (model.lm_head).")
+        use_chunked_loss = False  # the distillation loss runs its own slices over the trained rows
+        d = config.distill
+        logger.info(
+            f"Off-policy distillation: {d.divergence} (T={d.temperature}) x {d.kd_weight} + CE x {d.ce_weight}; "
+            f"teachers: {', '.join(list(distiller.online) + list(distiller.caches))}"
+            + (f"; features: {', '.join(f.name for f in distiller.features)}" if distiller.features else "")
+        )
     elif dpo is not None:
         lm_head = _get_lm_head(model)
         if lm_head is None:
@@ -764,8 +864,15 @@ def _train(config: Config, run: dict) -> TrainResult:
 
     # ── Best Model Tracker (saves best eval-loss checkpoint) ──────────────
     # Driven by either the single eval_dataset OR the multi-source composite score.
+    def _export(state: dict) -> dict:
+        """An exported model's state: without distillation projections, then the plugins' export hooks."""
+        state = {k: v for k, v in state.items() if not _is_aux(k)}
+        return plugin_mgr.export_state_dict(state, model) if plugin_mgr else state
+
     _best_tracker = (
-        BestModelTracker(config.train.output_dir) if (config.data.eval_dataset or config.data.eval_sources) else None
+        BestModelTracker(config.train.output_dir, export=_export)
+        if (config.data.eval_dataset or config.data.eval_sources)
+        else None
     )
 
     # ── Multi-source eval (per-capability losses + weighted composite) ─────
@@ -882,6 +989,8 @@ def _train(config: Config, run: dict) -> TrainResult:
         # run continues with the next one, at the start of an accumulation window.
         start_micro = meta["micro_step"] + 1 if start_step > 0 and "micro_step" in meta else 0
         logger.info(f"Resumed: step={start_step}, epoch={start_epoch}")
+        if plugin_mgr:
+            _load_plugin_state(plugin_mgr, resume_path)
 
     # ── Performance: GC Control ───────────────────────────────────────────
     gc_ctrl = GCControl(gc_every=100)
@@ -981,6 +1090,10 @@ def _train(config: Config, run: dict) -> TrainResult:
     )
     if start_step > 0:
         logger.info(f"Resuming from step {start_step} — {max(total_steps - start_step, 0)} steps remaining")
+    plugin_ctx.step = start_step
+    if plugin_mgr:
+        plugin_mgr.on_train_start(model)
+    plugin_loss_scale = 1.0 / plugin_ctx.dp_world_size
     model.train()
 
     global_step = start_step
@@ -1004,6 +1117,7 @@ def _train(config: Config, run: dict) -> TrainResult:
         or config.plugins.info_sft
         or config.plugins.pre_rl
         or dpo is not None
+        or (distiller is not None and config.distill.kd_weight > 0)
     )
     accum_dpo: dict[str, float] = {}  # DPO metrics summed over the accumulation window
     accum_dpo_micro = 0
@@ -1031,7 +1145,8 @@ def _train(config: Config, run: dict) -> TrainResult:
             logger.info(f"  Skipping {skip_count} micro-steps for resume...")
 
         # Wrap dataloader with CUDA prefetcher for overlapped H2D transfer
-        batch_iter = _lockstep(CUDAPrefetcher(dataloader, device), _lockstep_group)
+        loader = CUDAPrefetcher(dataloader, device) if device.type == "cuda" else _on_device(dataloader, device)
+        batch_iter = _lockstep(loader, _lockstep_group)
         _accum_counter = 0  # tracks micro-steps within current accumulation window
         # The previous epoch's trailing micro-batches (fewer than one accumulation
         # window) are dropped, as the step count assumes: their gradients and loss
@@ -1060,6 +1175,8 @@ def _train(config: Config, run: dict) -> TrainResult:
             labels = shift_labels(batch["labels"], position_ids)
             # Per-token loss weights (data.turn_scaling), aligned like the labels
             loss_weights = shift_weights(batch["loss_weights"]) if "loss_weights" in batch else None
+            raw_input_ids = input_ids
+            kd_reshape = None  # per-token batch fields -> the layout the student sees
             if position_ids is not None:
                 # Packed: forward arguments that keep the documents apart (palingenesis.packing)
                 packed = PackedBatch.build(
@@ -1067,12 +1184,20 @@ def _train(config: Config, run: dict) -> TrainResult:
                 )
                 input_ids, labels, loss_weights = packed.input_ids, packed.labels, packed.loss_weights
                 fwd_kwargs = {"input_ids": input_ids, **packed.forward_kwargs}
+                if flatten_packed:
+                    kd_reshape = _flatten_rows
             else:
                 # ── Context Parallel: shard sequence (never packed: see Config.validate)
                 if cp_enabled:
                     input_ids, attention_mask, labels = shard_for_context_parallel(
                         input_ids, attention_mask, labels, cp_mesh
                     )
+                    if loss_weights is not None:
+                        loss_weights = _cp_shard(loss_weights, cp_mesh)
+
+                    def kd_reshape(t, _mesh=cp_mesh):
+                        return _cp_shard(t, _mesh)
+
                 # Right padding only (the collator's): no mask. Padding after a row's tokens cannot
                 # reach them under causal attention (linear-attention layers included), and its
                 # labels are ignored. Without a mask attention is plain causal, which runs as flash
@@ -1123,10 +1248,54 @@ def _train(config: Config, run: dict) -> TrainResult:
 
             loss_val = None
             backward_done = False
+            hidden = None
+            kd_targets = None
+            student_features = None
+            if plugin_mgr:
+                plugin_mgr.on_forward_start(model, batch)
             # a flattened packed row: variable-length attention over its documents (seco.PACKED_VARLEN)
             _varlen = PACKED_VARLEN.set(position_ids is not None and flatten_packed)
-            with torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16):
-                if seco:
+            with torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16 and device.type == "cuda"):
+                if distiller is not None:
+                    teacher_inputs = (
+                        _teacher_packed_inputs(distiller, raw_input_ids, position_ids, flatten_packed, config)
+                        if position_ids is not None
+                        else None
+                    )
+                    kd_targets = distiller.targets(
+                        batch,
+                        input_ids,
+                        labels,
+                        fwd_kwargs,
+                        loss_weights,
+                        teacher_inputs=teacher_inputs,
+                        reshape=kd_reshape,
+                        compute_dtype=compute_dtype,
+                        autocast=config.train.bf16,
+                    )
+                    if plugin_mgr:
+                        kd_targets = plugin_mgr.transform_targets(kd_targets, batch)
+                if seco and distiller is not None:
+                    result = chunkwise_forward_backward(
+                        model,
+                        input_ids,
+                        batch["labels"],
+                        chunk_size=config.memory.seco_chunk_size,
+                        budget=config.memory.spaco_budget or None,
+                        loss_denom=loss_denom,
+                        kv_offload=config.memory.seco_kv_offload,
+                        loss_fn=distiller.seco_loss_fn(kd_targets, lm_head),
+                    )
+                    loss_val = result.loss * current_ga
+                    backward_done = True
+                elif distiller is not None:
+                    with distiller.capturing():
+                        hidden = _get_hidden_states(model, **fwd_kwargs)
+                    student_features = distiller.student_feature_rows(kd_targets)
+                    loss, _ = distiller.loss(
+                        hidden, kd_targets, lm_head, loss_denom, student_features, plugin_ctx.progress
+                    )
+                elif seco:
                     # Forward AND backward, chunk by chunk (gradients accumulate in .grad).
                     result = chunkwise_forward_backward(
                         model,
@@ -1291,6 +1460,30 @@ def _train(config: Config, run: dict) -> TrainResult:
 
             PACKED_VARLEN.reset(_varlen)
 
+            # ── Plugin loss terms (palingenesis.hooks: scaled by 1 / (GA x data-parallel ranks)) ──
+            if plugin_mgr and not backward_done and plugin_mgr.implementing("loss"):
+                inputs = LossInputs(
+                    model=model,
+                    batch=batch,
+                    hidden=hidden,
+                    labels=labels,
+                    rows=kd_targets.rows
+                    if kd_targets is not None
+                    else torch.nonzero(labels.reshape(-1) != IGNORE_INDEX).flatten(),
+                    loss_denom=loss_denom,
+                    grad_accum=current_ga,
+                    features=distiller.feature_pairs(kd_targets, student_features) if kd_targets is not None else {},
+                    teacher=kd_targets,
+                    head=lm_head,
+                )
+                extra, plugin_terms = plugin_mgr.loss(inputs)
+                if extra is not None:
+                    loss = loss + extra * (plugin_loss_scale / current_ga)
+                    for k, v in plugin_terms.items():
+                        plugin_ctx.log(k, v)
+            if distiller is not None:
+                distiller.release()
+
             # ── RL-readiness: record output entropy (once per logged step) ──
             if config.logging.rl_readiness and is_last_micro and (global_step + 1) % config.train.logging_steps == 0:
                 if use_cce or _chunked_objective or use_chunked_loss:
@@ -1337,6 +1530,8 @@ def _train(config: Config, run: dict) -> TrainResult:
                     if _ema is not None and global_step % config.train.ema_every == 0:
                         _ema.update()
                 else:
+                    if plugin_mgr:
+                        plugin_mgr.on_before_optimizer_step(model, optimizer)
                     # Standard mode: clip, detect spikes, step
                     if _adagc:
                         grad_norm = _adagc.clip(global_step)
@@ -1365,6 +1560,8 @@ def _train(config: Config, run: dict) -> TrainResult:
                             _hyperball.step()  # base step + Hyperball update on constrained matrices
                         else:
                             optimizer.step()
+                        if plugin_mgr:
+                            plugin_mgr.on_after_optimizer_step(model, optimizer)
                         if scheduler is not None:
                             scheduler.step()
                             if _adamc is not None:
@@ -1378,6 +1575,7 @@ def _train(config: Config, run: dict) -> TrainResult:
                             _ema.update()
 
                 dt = time.perf_counter() - t_step
+                plugin_ctx.step = global_step
 
                 # GC: run every 100 steps to prevent stalls
                 gc_ctrl.step(global_step)
@@ -1439,6 +1637,10 @@ def _train(config: Config, run: dict) -> TrainResult:
                             vals /= world_size
                         metrics.update({f"train/{k}": float(v) for k, v in zip(keys, vals.tolist())})
 
+                    if distiller is not None:
+                        metrics.update(distiller.pop_metrics())
+                    if plugin_mgr:
+                        metrics.update(plugin_mgr.metrics(model))
                     if _spike_detector is not None:
                         metrics["train/spikes_skipped"] = _spike_detector.spikes_detected
                     if _adagc is not None:
@@ -1475,6 +1677,8 @@ def _train(config: Config, run: dict) -> TrainResult:
                             else ""
                         )
                         ce_str = f" ce={ce_loss:.4f}" if ce_loss is not None else ""
+                        if "train/kd_loss" in metrics:
+                            ce_str += f" kd={metrics['train/kd_loss']:.4f} ce={metrics.get('train/ce_loss', 0.0):.4f}"
                         if "train/rewards/accuracies" in metrics:
                             ce_str += (
                                 f" acc={metrics['train/rewards/accuracies']:.3f}"
@@ -1500,6 +1704,8 @@ def _train(config: Config, run: dict) -> TrainResult:
 
                 # ── Checkpoint ────────────────────────────────────────
                 if config.train.save_steps > 0 and global_step % config.train.save_steps == 0:
+                    if plugin_mgr:
+                        _save_plugin_state(plugin_mgr, config.train.output_dir, global_step)
                     save_checkpoint(
                         model,
                         tokenizer,
@@ -1556,8 +1762,10 @@ def _train(config: Config, run: dict) -> TrainResult:
         logger.info("Applying EMA weights for final save (better generalization)")
         _ema.apply_to_model()
 
+    if plugin_mgr:
+        plugin_mgr.on_train_end(model)
     if config.train.save_final:
-        save_final(model, tokenizer, config.train.output_dir, is_fsdp)
+        save_final(model, tokenizer, config.train.output_dir, is_fsdp, export=_export)
     tracker.log(
         {"train/total_steps": global_step, "train/total_time_s": total_time, "train/tokens_total": tokens_total},
         step=global_step,
@@ -1594,6 +1802,102 @@ def _log_prepared_meta(output_dir: str):
         )
     except Exception:
         pass
+
+
+PLUGIN_STATE_FILE = "plugins.pt"
+
+
+def _check_plugin_paths(config: Config, plugin_mgr: PluginManager) -> None:
+    """Refuse plugin hooks the configured training path cannot run."""
+    losses = [PluginManager._name(p) for p in plugin_mgr.implementing("loss")]
+    if losses:
+        unsupported = [
+            name
+            for name, on in (
+                ("memory.seco", config.memory.seco),
+                ("dpo.enabled", config.dpo.enabled),
+                ("plugins.pre_rl", config.plugins.pre_rl),
+                ("memory.gradient_release", config.memory.gradient_release),
+            )
+            if on
+        ]
+        if unsupported:
+            raise PluginError(
+                f"plugin(s) {losses} add loss terms, which {', '.join(unsupported)} cannot take: "
+                "those paths run their own backward. Use on_before_optimizer_step for gradient-level terms."
+            )
+    steps = plugin_mgr.implementing("on_before_optimizer_step") + plugin_mgr.implementing("on_after_optimizer_step")
+    if steps and config.memory.gradient_release:
+        raise PluginError(
+            "optimizer-step plugin hooks do not run under memory.gradient_release (steps inside backward)"
+        )
+
+
+def _dp_world_size(mesh) -> int:
+    """Ranks that hold different data (FSDP's data-parallel dimension)."""
+    if mesh is None:
+        return 1
+    return mesh["dp"].size() if "dp" in (mesh.mesh_dim_names or ()) else mesh.size()
+
+
+def _is_aux(name: str) -> bool:
+    from palingenesis.distill.distiller import AUX_MODULE
+
+    return name.startswith(AUX_MODULE + ".") or f".{AUX_MODULE}." in name
+
+
+def _save_plugin_state(plugin_mgr: PluginManager, output_dir: str, step: int) -> None:
+    from pathlib import Path
+
+    state = plugin_mgr.state_dict()
+    if not is_main() or not any(state.values()):
+        return
+    path = Path(output_dir) / f"step-{step}"
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(state, path / PLUGIN_STATE_FILE)
+
+
+def _load_plugin_state(plugin_mgr: PluginManager, checkpoint_dir: str) -> None:
+    from pathlib import Path
+
+    path = Path(checkpoint_dir) / PLUGIN_STATE_FILE
+    if path.exists():
+        plugin_mgr.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+        logger.info(f"Plugin state restored from {path}")
+    elif any(p.overrides("state_dict") for p in plugin_mgr):
+        logger.warning(f"No plugin state in {checkpoint_dir}: plugins resume from their initial state")
+
+
+def _on_device(dataloader, device):
+    """Batches moved to `device` (no CUDA stream: the CPU path of the tests)."""
+    for batch in dataloader:
+        yield {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+def _flatten_rows(t: torch.Tensor) -> torch.Tensor:
+    """A per-token [B, T, ...] field in the layout of a flattened packed batch: [1, B*T, ...]."""
+    return t.reshape(1, -1, *t.shape[2:])
+
+
+def _cp_shard(t: torch.Tensor, cp_mesh) -> torch.Tensor:
+    """This context-parallel rank's slice of a per-token [B, T, ...] field (as shard_for_context_parallel)."""
+    size = t.shape[1] // cp_mesh.size()
+    start = cp_mesh.get_local_rank() * size
+    return t[:, start : start + size].contiguous()
+
+
+def _teacher_packed_inputs(distiller, input_ids, position_ids, student_flatten: bool, config: Config) -> dict:
+    """Per online teacher whose packed layout differs from the student's (a flattened row for one, not
+    the other): its own (input_ids, forward kwargs). Flattening keeps the token order, so the trained
+    rows' flat indices are the same."""
+    out = {}
+    for name, teacher in distiller.online.items():
+        attn = teacher.spec.attn_implementation or config.model.attn_implementation
+        flatten = attn == "flash_attention_2" or has_linear_attention(teacher.model)
+        if flatten != student_flatten:
+            packed = PackedBatch.build(input_ids, torch.zeros_like(input_ids), position_ids, flatten, attn)
+            out[name] = (packed.input_ids, packed.forward_kwargs)
+    return out
 
 
 def _compile_layers(model: torch.nn.Module, backend: str = "inductor", mode: str = "default"):

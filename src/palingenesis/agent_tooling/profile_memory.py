@@ -86,6 +86,38 @@ def _text_dims(model_config):
     return hidden, layers, text.vocab_size, kv_heads, head_dim, full_layers
 
 
+def _distill_memory(config: Config, rows: int, seq: int, act_bytes: int) -> tuple[float, float]:
+    """Off-policy distillation: (online teachers' weights, per-micro-batch teacher buffers) in GiB.
+
+    Teachers: exact parameter counts from their configs (meta device) in their dtype, divided by the
+    data-parallel ranks under placement shard (the world size from WORLD_SIZE, else 1). Buffers: an online
+    teacher's final hidden states at every position plus one slice of its fp32 logits; a cached teacher's
+    top-k ids and log-probs per position."""
+    import os
+
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from palingenesis.distill.chunked import SLICE_ELEMENTS
+    from palingenesis.distill.config import parse_teachers
+
+    if not config.distill.enabled:
+        return 0.0, 0.0
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    weights = buffers = 0.0
+    for spec in parse_teachers(config.distill.teachers):
+        if spec.cache:
+            buffers += rows * seq * (spec.top_k * (4 + 2) + 5)
+            continue
+        cfg = AutoConfig.from_pretrained(spec.model, trust_remote_code=config.model.trust_remote_code)
+        with torch.device("meta"):
+            teacher = AutoModelForCausalLM.from_config(cfg, trust_remote_code=config.model.trust_remote_code)
+        n = sum(p.numel() for p in teacher.parameters())
+        shards = world if spec.placement == "shard" or (spec.placement == "auto" and world > 1) else 1
+        weights += n * (torch.finfo(_DTYPES[spec.dtype]).bits // 8) / shards
+        buffers += rows * seq * _text_dims(cfg)[0] * act_bytes + SLICE_ELEMENTS * 4
+    return weights / GB, buffers / GB
+
+
 def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     from palingenesis.train import _dynamic_num_chunks
 
@@ -123,6 +155,10 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     chunks = _dynamic_num_chunks(ce_tokens, vocab)
     logits_gb = 2 * ce_tokens / chunks * vocab * 4 / GB  # fp32 logits + their gradient, one chunk
 
+    teacher_gb, teacher_buffers_gb = _distill_memory(config, rows, seq, act_bytes)
+    if config.distill.enabled:
+        logits_gb *= 2  # a slice of the student's logits and one of the teacher's (or its top-k support)
+
     kv_gb = 0.0
     if config.memory.seco:
         # K/V store + its gradient on the GPU (sdpa); only the gradient with offload;
@@ -130,8 +166,8 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         copies = 1 if config.memory.seco_kv_offload else (2 if config.model.attn_implementation == "sdpa" else 3)
         kv_gb = copies * rows * seq * full_layers * 2 * kv_heads * head_dim * act_bytes / GB
 
-    exact_gb = params_gb + optimizer_gb + grads_gb + reference_gb
-    total_gb = (exact_gb + activations_gb + logits_gb + kv_gb) * 1.10
+    exact_gb = params_gb + optimizer_gb + grads_gb + reference_gb + teacher_gb
+    total_gb = (exact_gb + activations_gb + logits_gb + kv_gb + teacher_buffers_gb) * 1.10
     return {
         "model": config.model.name_or_path,
         "total_params_B": params / 1e9,
@@ -142,6 +178,8 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         "optimizer_label": config.train.optimizer + (" + hyperball" if config.train.hyperball else ""),
         "grad_memory_gb": grads_gb,
         "reference_memory_gb": reference_gb,
+        "teacher_memory_gb": teacher_gb,
+        "teacher_buffers_gb": teacher_buffers_gb,
         "activation_memory_gb": activations_gb,
         "ce_peak_gb": logits_gb,
         "kv_memory_gb": kv_gb,
@@ -215,6 +253,7 @@ def measure_memory(config: Config, steps: int = 2) -> dict:
         cfg.data.messages_field = "messages"
         cfg.data.num_workers = 0  # workers would split the few rows below one batch each
         cfg.preprocess.enabled = False
+        cfg.distill.missing = "skip"  # a teacher cache holds the real rows, not these (online teachers still run)
         cfg.train.max_steps = steps
         cfg.train.save_steps, cfg.train.save_final, cfg.train.resume_from = 0, False, None
         cfg.train.output_dir = f"{tmp}/out"
@@ -249,10 +288,14 @@ def print_report(est: dict):
     print(f"    Gradients:            {est['grad_memory_gb']:6.1f} GiB")
     if est["reference_memory_gb"]:
         print(f"    DPO reference model:  {est['reference_memory_gb']:6.1f} GiB")
+    if est.get("teacher_memory_gb"):
+        print(f"    Online teachers:      {est['teacher_memory_gb']:6.1f} GiB  [frozen, distill.teachers]")
     print("  Estimated:")
     print(f"    Logits (one chunk):   {est['ce_peak_gb']:6.1f} GiB")
     if est["kv_memory_gb"]:
         print(f"    SeCO K/V cache:       {est['kv_memory_gb']:6.1f} GiB")
+    if est.get("teacher_buffers_gb"):
+        print(f"    Teacher targets:      {est['teacher_buffers_gb']:6.1f} GiB  [per micro-batch]")
     print(f"    Activations (rough):  {est['activation_memory_gb']:6.1f} GiB  [checkpointing: {est['ac_mode']}]")
     print(f"    {'─' * 50}")
     print(

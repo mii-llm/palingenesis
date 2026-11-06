@@ -16,9 +16,11 @@ from palingenesis.examples import main as init_main
 @pytest.mark.parametrize("name", sorted(EXAMPLES))
 def test_shipped_examples_load_with_their_config_class(name, tmp_path):
     path = write_example(name, tmp_path / f"{name}.yaml")
-    if name in ("sft", "dpo"):
+    if name in ("sft", "dpo", "kd"):
         config = Config.from_yaml(str(path))
         assert config.dpo.enabled == (name == "dpo")
+        assert config.distill.enabled == (name == "kd")
+        config.validate()
     elif name == "rl":
         from palingenesis.rl.config import RLConfig
 
