@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass, field, replace
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -291,11 +292,17 @@ class Distiller:
                     name, batch, input_ids, rows, route, forward_kwargs, teacher_inputs, compute_dtype, autocast
                 )
         targets = TeacherTargets(rows=rows, gold=gold, token_weights=weights, teachers=teachers, seq_len=seq_len)
-        if self.config.missing == "error" and self.config.kd_weight > 0 and rows.numel():
-            uncovered = int((~targets.covered()).sum())
+        if self.config.missing == "error" and self.config.kd_weight > 0:
+            uncovered = (~targets.covered()).sum().reshape(1).to(torch.long)
+
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                # every rank checks at every micro-batch and all raise together: a rank raising alone
+                # would leave the others waiting in the next FSDP collective
+                dist.all_reduce(uncovered, op=dist.ReduceOp.MAX)
+            uncovered = int(uncovered.item())
             if uncovered:
                 raise MissingTeacherError(
-                    f"{uncovered} of {rows.numel()} trained tokens of this micro-batch have no teacher target (a cache "
+                    f"{uncovered} of {rows.numel()} trained tokens of a micro-batch (on the worst rank) have no teacher target (a cache "
                     "built from other data or masking, or a data source routed to no teacher). Rebuild the cache "
                     "with the training config, or set distill.missing: skip (those tokens then get only the CE term)."
                 )
@@ -532,13 +539,13 @@ class Distiller:
 
     def pop_metrics(self) -> dict[str, float]:
         """Means since the last call: train/kd_loss (per covered token), train/kd/<teacher>,
-        train/ce_loss, train/feature/<name>, train/kd_coverage, train/topk_mass/<teacher>."""
+        train/gold_ce (CE on the gold tokens), train/feature/<name>, train/kd_coverage, train/topk_mass/<teacher>."""
         c, self._counts = self._counts, {}
         out = {}
         if c.get("kd_tokens"):
             out["train/kd_loss"] = c["kd_sum"] / c["kd_tokens"]
         if c.get("tokens"):
-            out["train/ce_loss"] = c.get("ce_sum", 0.0) / c["tokens"]
+            out["train/gold_ce"] = c.get("ce_sum", 0.0) / c["tokens"]
             out["train/kd_coverage"] = c.get("kd_tokens", 0.0) / c["tokens"]
         for k, v in c.items():
             if k.startswith("kd_sum/"):

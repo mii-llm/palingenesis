@@ -1117,7 +1117,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         or config.plugins.info_sft
         or config.plugins.pre_rl
         or dpo is not None
-        or (distiller is not None and config.distill.kd_weight > 0)
+        or distiller is not None  # train/loss is the distillation objective (train/gold_ce is the CE)
     )
     accum_dpo: dict[str, float] = {}  # DPO metrics summed over the accumulation window
     accum_dpo_micro = 0
@@ -1486,7 +1486,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
             # ── RL-readiness: record output entropy (once per logged step) ──
             if config.logging.rl_readiness and is_last_micro and (global_step + 1) % config.train.logging_steps == 0:
-                if use_cce or _chunked_objective or use_chunked_loss:
+                if distiller is not None:
+                    if hidden is not None:  # SeCO keeps no full-sequence hidden states
+                        health.record_entropy_from_hidden(hidden.detach(), labels, lm_head)
+                elif use_cce or _chunked_objective or use_chunked_loss:
                     health.record_entropy_from_hidden(hidden.detach(), labels, lm_head)
                 else:
                     health.record_logit_entropy(logits.detach(), labels)
@@ -1678,7 +1681,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         )
                         ce_str = f" ce={ce_loss:.4f}" if ce_loss is not None else ""
                         if "train/kd_loss" in metrics:
-                            ce_str += f" kd={metrics['train/kd_loss']:.4f} ce={metrics.get('train/ce_loss', 0.0):.4f}"
+                            ce_str += (
+                                f" kd={metrics['train/kd_loss']:.4f} gold_ce={metrics.get('train/gold_ce', 0.0):.4f}"
+                            )
                         if "train/rewards/accuracies" in metrics:
                             ce_str += (
                                 f" acc={metrics['train/rewards/accuracies']:.3f}"

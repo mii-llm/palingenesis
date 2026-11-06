@@ -230,7 +230,7 @@ Off-policy knowledge distillation, a mode of `pgs train` (design: [offpolicy_dis
 | `feature_lr` | float | `0.0` | Learning rate of the feature projections (0 = `train.learning_rate`) |
 | `rows_per_slice` | int | `0` | Rows per slice of the chunked loss (0 = automatic, ~512 MB of fp32 logits per side) |
 
-Incompatible (rejected by `validate()`): `dpo.enabled`, `plugins.deft/dft/cadft/info_sft/pre_rl`, `memory.gradient_release`; `features` with `memory.seco`; an online teacher's view with packing, context parallel or pretokenize; views with loop-recovery augmentation.
+Incompatible (rejected by `validate()`): `dpo.enabled`, `plugins.deft/dft/cadft/info_sft/pre_rl`, `memory.gradient_release`; `features` with `memory.seco`; online teachers with context parallel; an online teacher's view with packing or pretokenize; views with loop-recovery augmentation.
 
 ## Section: `plugins.custom`
 

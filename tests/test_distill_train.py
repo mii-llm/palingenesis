@@ -255,6 +255,22 @@ def test_view_with_packing_is_refused_for_online_teachers():
     c.validate()  # cached: the view was applied when the cache was built
 
 
+def test_online_teachers_are_refused_under_context_parallel():
+    c = Config()
+    c.distill.enabled, c.distill.teachers, c.parallel.context_parallel = True, {"t": "m"}, True
+    with pytest.raises(ConfigError, match="context_parallel"):
+        c.validate()
+    c.distill.teachers = {"t": {"cache": "dir"}}
+    c.validate()
+
+
+def test_rl_readiness_entropy_with_distillation(setup):
+    c = _config(setup, "readiness")
+    c.logging.rl_readiness = True
+    c.train.max_steps = 2
+    assert "train/kd_loss" in H.run_cpu(c).metrics
+
+
 def test_distill_is_exclusive_with_dpo_and_gated_objectives():
     c = Config()
     c.distill.enabled, c.distill.teachers, c.plugins.deft = True, {"t": "m"}, True

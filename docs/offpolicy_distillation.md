@@ -80,6 +80,6 @@ See the guide's section of the same name for the reference plugin, `palingenesis
 
 - Large-model GPU validation (throughput, memory against `pgs profile`, a quality comparison against SFT on teacher outputs).
 - Cross-tokenizer off-policy KD (byte-chunk alignment as in on-policy `xtok`, or universal logit distillation) is not implemented.
-- The SFT trainer's context parallelism shards inputs but does not dispatch attention to ring attention; distillation shards its fields consistently and will work once that path does.
+- The SFT trainer's context parallelism shards inputs but does not dispatch attention to ring attention; distillation shards cached targets and its per-token fields consistently; online teachers are refused under CP (they would need the whole sequence, or ring attention of their own).
 - Per-teacher divergence and temperature (one setting for all teachers today).
 - An evaluation of the divergence to the teacher on the held-out set (evaluation reports the student's CE).

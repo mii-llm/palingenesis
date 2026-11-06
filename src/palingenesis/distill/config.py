@@ -224,14 +224,19 @@ def distill_errors(config) -> list[str]:
                 f"{where}.sources {unknown_sources} are not data source names ({sorted(source_names) or 'none'}; "
                 "a data.sources entry is named by its `name`, else its `dataset`)."
             )
+        if t.online and config.parallel.context_parallel:
+            # each CP rank holds a slice of the sequence: an online teacher there would read a truncated context
+            errors.append(
+                f"{where}: an online teacher does not support parallel.context_parallel (it would see only this "
+                "rank's slice of each sequence). Cache the teacher (pgs distill-cache): cached targets are computed "
+                "on the whole sequence and sharded like the inputs."
+            )
         if t.online and t.has_view:
             if config.data.packing:
                 errors.append(
                     f"{where}: a teacher view (context distillation) with an online teacher needs data.packing: "
                     "false (each row has its own teacher rendering). Cache the teacher (pgs distill-cache) to pack."
                 )
-            if config.parallel.context_parallel:
-                errors.append(f"{where}: a teacher view with an online teacher does not support context parallel.")
             if config.data.pretokenize:
                 errors.append(f"{where}: a teacher view with an online teacher does not support data.pretokenize.")
         if t.has_view and (config.data.loop_recovery or config.data.reasoning_loop_recovery):

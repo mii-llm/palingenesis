@@ -123,7 +123,7 @@ Token-level KD compares the two distributions id by id, so the teacher must shar
 - `temperature` softens both distributions; with `temperature_scale: true` (default) the divergence is multiplied by T², which keeps gradient magnitudes comparable across temperatures (Hinton et al.).
 - `ce_weight` mixes in cross-entropy on the gold token; `kd_weight: 0` turns distillation into plain SFT plus whatever features / plugins add.
 - The data's per-token weights apply (`data.turn_scaling`), and only trained tokens are distilled: chat masking decides what the teacher supervises (assistant turns, `include_observations`, `train_on_reasoning`, per-message `"loss": false`). Pretraining-mode sources (`mode: pretrain`) distill every token.
-- `train/kd_loss` (per covered token), `train/ce_loss` (always reported), `train/kd_coverage`, `train/kd/<teacher>`.
+- `train/kd_loss` (per covered token), `train/gold_ce` (cross-entropy on the gold tokens, always reported), `train/kd_coverage`, `train/kd/<teacher>`.
 
 ## Context distillation (teacher views)
 
@@ -169,7 +169,7 @@ Attention-score distillation is not built in: it needs the `[T, T]` attention ma
 - **Packing** keeps documents apart in the student and the teacher (each model gets its own variable-length arguments when one flattens a packed batch and the other does not); cached targets follow their documents into the packed rows.
 - **SeCO** (`memory.seco`): chunk-wise forward/backward for sequences far longer than activations allow on one GPU; the distillation loss runs per chunk on the trained rows inside it. The online teacher's forward runs once over the whole sequence (no gradient, so only one layer's activations at a time).
 - **FSDP2.** The student is sharded as in SFT; the teacher shards with it under `placement: shard`. Gradients are reduced exactly like the SFT loss's (tested: two-process FSDP equals one process on the whole batch, student and teacher sharded, QAT plugin included).
-- **Context parallel.** The trainer's `parallel.context_parallel` shards each sequence's inputs over the CP ranks; distillation shards its per-token fields (cached targets, source tags, data weights) and the online teacher's inputs the same way. Note that the SFT trainer does not yet route attention through PyTorch's context-parallel (ring) dispatcher, so each rank attends within its own shard: until it does, use SeCO for sequences longer than one GPU's activations, and FSDP for scale.
+- **Context parallel.** The trainer's `parallel.context_parallel` shards each sequence's inputs over the CP ranks; distillation supports it with cached teachers (targets computed on whole sequences, sharded like the inputs, with source tags and data weights); online teachers are refused under context parallel, since each rank would feed its teacher only its slice. Note that the SFT trainer does not yet route attention through PyTorch's context-parallel (ring) dispatcher, so each rank attends within its own shard: until it does, use SeCO for sequences longer than one GPU's activations, and FSDP for scale.
 - **Resume** is deterministic like SFT's: the data stream is replayed to the next micro-batch, a cached teacher's targets are found by content, and plugin state is restored from the checkpoint.
 - **Memory estimate**: `pgs profile --config kd.yaml` counts the teachers' weights (exact, divided by the ranks when sharded) and their per-micro-batch targets.
 
@@ -262,7 +262,7 @@ The plugin is also registered as the entry point `ternary-qat` (`plugins.custom:
 
 Command-line overrides reach named teachers: `--distill.teachers.big.placement shard`, `--distill.teachers.cached.cache caches/big`.
 
-**Not combinable** (refused by validation): `dpo.enabled`, the gated SFT objectives (`plugins.deft`, `dft`, `cadft`, `info_sft`, `pre_rl`), `memory.gradient_release`; feature matching with `memory.seco`; an online teacher view with packing, context parallel or pretokenize; teacher views with loop-recovery augmentation; `sources` routing of an online teacher with pretokenize.
+**Not combinable** (refused by validation): `dpo.enabled`, the gated SFT objectives (`plugins.deft`, `dft`, `cadft`, `info_sft`, `pre_rl`), `memory.gradient_release`; feature matching with `memory.seco`; online teachers with `parallel.context_parallel`; an online teacher view with packing or pretokenize; teacher views with loop-recovery augmentation; `sources` routing of an online teacher with pretokenize.
 
 ## Examples
 

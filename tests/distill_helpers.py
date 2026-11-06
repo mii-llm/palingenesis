@@ -12,7 +12,10 @@ TEMPLATE = (pathlib.Path(__file__).parent / "fixtures" / "qwen3_5_chat_template.
 def tokenizer():
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained("gpt2")
+    try:  # the local cache first: no Hub request (and no failure when the network is down)
+        tok = AutoTokenizer.from_pretrained("gpt2", local_files_only=True)
+    except OSError:
+        tok = AutoTokenizer.from_pretrained("gpt2")
     tok.chat_template = TEMPLATE
     tok.pad_token = tok.eos_token
     return tok
