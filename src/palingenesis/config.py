@@ -234,8 +234,13 @@ class TrainConfig:
 @dataclass(slots=True)
 class ParallelConfig:
     fsdp: bool = True
-    context_parallel: bool = False  # enable for multi-GPU long sequences
-    cp_rotate_method: Literal["allgather", "alltoall"] = "allgather"
+    # Split every sequence over a group of ranks (palingenesis.context_parallel): exact attention
+    # across them (K/V all-gather), head-tail load balancing. Needs fsdp: true.
+    context_parallel: bool = False
+    # Ranks per context-parallel group; 0 = min(world_size, 8) when it divides world_size, else all.
+    cp_degree: int = 0
+    # How K/V reach the other ranks: allgather (the only method implemented).
+    cp_rotate_method: Literal["allgather"] = "allgather"
     cpu_offload: bool = False
     reshard_after_forward: bool = True
 
@@ -573,6 +578,8 @@ class Config:
         if self.preprocess.strategy not in strategies:
             errors.append(f"preprocess.strategy={self.preprocess.strategy!r} is not one of {', '.join(strategies)}.")
 
+        errors += self._context_parallel_errors()
+
         if self.data.packing and self.parallel.context_parallel:
             errors.append(
                 "packing=true is incompatible with context_parallel=true. "
@@ -797,6 +804,23 @@ class Config:
         for name, on in unsupported.items():
             if on:
                 errors.append(f"dpo.enabled=true does not support {name}; disable it for preference training.")
+        return errors
+
+    def _context_parallel_errors(self) -> list[str]:
+        p = self.parallel
+        errors: list[str] = []
+        if p.cp_degree < 0:
+            errors.append(f"parallel.cp_degree must be >= 0 (got {p.cp_degree}; 0 = automatic).")
+        if p.cp_rotate_method != "allgather":
+            errors.append(
+                f"parallel.cp_rotate_method={p.cp_rotate_method!r}: only allgather is implemented (each attention "
+                "layer gathers the sequence's K/V from the context-parallel group)."
+            )
+        if p.context_parallel and not p.fsdp:
+            errors.append(
+                "parallel.context_parallel needs parallel.fsdp: true (FSDP sums the gradients of the ranks that "
+                "split a sequence)."
+            )
         return errors
 
     def _seco_errors(self) -> list[str]:

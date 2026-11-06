@@ -255,13 +255,15 @@ def test_view_with_packing_is_refused_for_online_teachers():
     c.validate()  # cached: the view was applied when the cache was built
 
 
-def test_online_teachers_are_refused_under_context_parallel():
+def test_online_teacher_views_are_refused_under_context_parallel():
     c = Config()
     c.distill.enabled, c.distill.teachers, c.parallel.context_parallel = True, {"t": "m"}, True
+    c.validate()  # an online teacher runs on the student's slices, attention across the group
+    c.distill.teachers = {"t": {"model": "m", "system_prompt": "x"}}
     with pytest.raises(ConfigError, match="context_parallel"):
         c.validate()
-    c.distill.teachers = {"t": {"cache": "dir"}}
-    c.validate()
+    c.distill.teachers = {"t": {"cache": "dir", "system_prompt": "x"}}
+    c.validate()  # cached: the view was applied when the cache was built
 
 
 def test_rl_readiness_entropy_with_distillation(setup):

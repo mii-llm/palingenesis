@@ -361,79 +361,6 @@ def test_global_valid_token_normalization():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEST 3: Context Parallel sequence sharding is lossless
-# Verify that sharding + reassembly reconstructs the original tensors exactly.
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def test_context_parallel_sharding_roundtrip():
-    """Context parallel sharding splits and can reconstruct original tensors."""
-    from unittest.mock import MagicMock
-
-    # Mock a DeviceMesh with 4 ranks
-    for cp_rank in range(4):
-        mock_mesh = MagicMock()
-        mock_mesh.get_local_rank.return_value = cp_rank
-        mock_mesh.size.return_value = 4
-
-        batch_size, seq_len = 2, 64
-        input_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
-        attention_mask = torch.ones(batch_size, seq_len)
-        labels = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).clone()
-
-        from palingenesis.context_parallel import shard_for_context_parallel
-
-        ids_shard, mask_shard, labels_shard = shard_for_context_parallel(input_ids, attention_mask, labels, mock_mesh)
-
-        # Each shard should be seq_len / cp_world_size = 16 tokens
-        assert ids_shard.shape == (batch_size, 16), f"Expected (2,16), got {ids_shard.shape}"
-        assert mask_shard.shape == (batch_size, 16)
-        assert labels_shard.shape == (batch_size, 16)
-
-        # Verify correct slice
-        expected_start = cp_rank * 16
-        expected_ids = input_ids[:, expected_start : expected_start + 16]
-        assert torch.equal(ids_shard, expected_ids), f"Rank {cp_rank}: shard content mismatch"
-
-    # Verify all shards together reconstruct the original
-    all_shards = []
-    for cp_rank in range(4):
-        mock_mesh = MagicMock()
-        mock_mesh.get_local_rank.return_value = cp_rank
-        mock_mesh.size.return_value = 4
-        ids_shard, _, _ = shard_for_context_parallel(input_ids, attention_mask, labels, mock_mesh)
-        all_shards.append(ids_shard)
-
-    reconstructed = torch.cat(all_shards, dim=1)
-    assert torch.equal(reconstructed, input_ids), "Shards don't reconstruct original"
-
-    print("  4-way CP sharding: all shards correct, roundtrip verified")
-    print("✓ test_context_parallel_sharding_roundtrip PASSED\n")
-
-
-def test_context_parallel_rejects_indivisible_seqlen():
-    """CP raises clear error when seq_len % cp_world_size != 0."""
-    from unittest.mock import MagicMock
-
-    from palingenesis.context_parallel import shard_for_context_parallel
-
-    mock_mesh = MagicMock()
-    mock_mesh.get_local_rank.return_value = 0
-    mock_mesh.size.return_value = 4
-
-    # seq_len=30 is not divisible by 4
-    input_ids = torch.randint(0, 100, (2, 30))
-    attention_mask = torch.ones(2, 30)
-    labels = torch.randint(0, 100, (2, 30))
-
-    with pytest.raises(AssertionError, match="divisible"):
-        shard_for_context_parallel(input_ids, attention_mask, labels, mock_mesh)
-
-    print("  Indivisible seq_len correctly rejected")
-    print("✓ test_context_parallel_rejects_indivisible_seqlen PASSED\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # TEST 4: FSDP2 gradient sync control during accumulation
 # Verify that disabling gradient sync during accumulation microsteps doesn't
 # corrupt final gradients (accumulated grad after sync == sum of microsteps).
@@ -893,10 +820,6 @@ if __name__ == "__main__":
     print("=" * 70 + "\n")
 
     # Non-distributed tests (always runnable)
-    print("── Context Parallel ──\n")
-    test_context_parallel_sharding_roundtrip()
-    test_context_parallel_rejects_indivisible_seqlen()
-
     print("── Mesh Topology ──\n")
     test_build_mesh_topology_single_gpu()
 

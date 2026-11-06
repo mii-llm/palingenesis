@@ -88,37 +88,48 @@ def release_cuda_memory() -> None:
 
 
 def build_mesh(world_size: int, config: ParallelConfig) -> DeviceMesh | None:
-    """Build device mesh for FSDP + optional Context Parallel.
+    """The device mesh for FSDP2 and, optionally, context parallelism.
 
-    With CP enabled: mesh = (cp_size, dp_size) where dp handles FSDP sharding
-    and cp handles sequence sharding.
+    Without context parallelism: a 1-D mesh ("dp",) over every rank.
 
-    Without CP: mesh = (world_size,) for pure FSDP.
+    With it: a 2-D mesh ("dp", "cp") of shape (world_size / cp, cp). The ranks of one "cp" row
+    split the same sequences between them (palingenesis.context_parallel); the "dp" dimension
+    holds different data. FSDP2 shards parameters over both dimensions flattened (see
+    `fsdp_mesh`): every rank computes gradients from different tokens, and all of them are summed.
+    `parallel.cp_degree` sets cp (0: min(world_size, 8) when that divides world_size, else
+    world_size; groups of up to 8 keep the K/V all-gathers on one node's NVLink).
     """
     if world_size <= 1:
         return None
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if config.context_parallel and world_size >= 2:
-        # Use all GPUs: split between CP and DP
-        # Heuristic: CP degree = min(world_size, 8) for reasonable communication
-        # User can tune via the mesh. For now, use all GPUs as CP if <= 8,
-        # otherwise split into CP groups of 8.
-        cp_degree = min(world_size, 8)
-        dp_degree = world_size // cp_degree
-        if dp_degree * cp_degree != world_size:
-            # Fallback: no CP split if world_size not evenly divisible
+    if config.context_parallel:
+        cp_degree = config.cp_degree or min(world_size, 8)
+        if not config.cp_degree and world_size % cp_degree:
             cp_degree = world_size
-            dp_degree = 1
+        if cp_degree < 1 or world_size % cp_degree:
+            from palingenesis.config import ConfigError
 
-        mesh = init_device_mesh(
-            "cuda",
-            (dp_degree, cp_degree),
-            mesh_dim_names=("dp", "cp"),
-        )
+            raise ConfigError(
+                f"parallel.cp_degree={config.cp_degree} must divide the number of processes ({world_size})."
+            )
+        return init_device_mesh(device, (world_size // cp_degree, cp_degree), mesh_dim_names=("dp", "cp"))
+    return init_device_mesh(device, (world_size,), mesh_dim_names=("dp",))
+
+
+def fsdp_mesh(mesh: DeviceMesh) -> DeviceMesh:
+    """The mesh FSDP2 shards over: the whole mesh, flattened to one dimension.
+
+    Under context parallelism the ranks of a "cp" group hold different tokens of the same
+    sequences, so their gradients must be summed like those of data-parallel ranks; sharding over
+    "dp" alone would leave each cp rank with the gradient of its own slice only."""
+    names = mesh.mesh_dim_names or ()
+    if "cp" not in names:
         return mesh
-    else:
-        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
-        return mesh
+    try:
+        return mesh["dp_cp"]  # flattened before (the student and a sharded teacher share it)
+    except (KeyError, RuntimeError, ValueError):
+        return mesh["dp", "cp"]._flatten("dp_cp")
 
 
 def apply_fsdp(
@@ -142,8 +153,8 @@ def apply_fsdp(
     from torch.distributed._composable.fsdp import FSDPModule
     from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 
-    # Get the DP submesh (or full mesh if no CP)
-    dp_mesh = mesh["dp"] if "cp" in (mesh.mesh_dim_names or ()) else mesh
+    # Every rank (data- and context-parallel): their gradients come from different tokens
+    dp_mesh = fsdp_mesh(mesh)
 
     # bf16=False: parameters stay in the model's dtype (no float16: without a
     # gradient scaler, fp16 training over/underflows)

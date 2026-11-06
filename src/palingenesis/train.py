@@ -43,7 +43,7 @@ from palingenesis.checkpoint import (
     save_final,
 )
 from palingenesis.config import Config, ConfigError
-from palingenesis.context_parallel import enable_context_parallel, shard_for_context_parallel
+from palingenesis.context_parallel import ContextParallel, ContextParallelError, check_model_support, route_attention
 from palingenesis.data import (
     IGNORE_INDEX,
     _load_dataset_source,
@@ -56,7 +56,14 @@ from palingenesis.data import (
     pretokenize_fingerprint,
     pretokenized_cache_valid,
 )
-from palingenesis.distributed import apply_fsdp, build_mesh, cleanup_distributed, is_main, setup_distributed
+from palingenesis.distributed import (
+    _find_transformer_layers,
+    apply_fsdp,
+    build_mesh,
+    cleanup_distributed,
+    is_main,
+    setup_distributed,
+)
 from palingenesis.dpo import (
     PreferenceDataset,
     PreferenceEvaluator,
@@ -384,6 +391,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # ── Device mesh (FSDP2 / context parallel); sharded teachers use it too ──
     mesh = build_mesh(world_size, config.parallel)
     is_fsdp = config.parallel.fsdp and world_size > 1 and mesh is not None
+    # Ranks that hold different data. The ranks of a context-parallel group split the same rows,
+    # so they read the same shard of the data.
+    if mesh is not None and "cp" in (mesh.mesh_dim_names or ()):
+        data_rank, data_world = mesh["dp"].get_local_rank(), mesh["dp"].size()
+    else:
+        data_rank, data_world = rank, world_size
     plugin_ctx.is_fsdp = is_fsdp
     plugin_ctx.dp_world_size = _dp_world_size(mesh) if is_fsdp else 1
 
@@ -482,11 +495,23 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         if ref_model is not None:
             ref_model = ref_model.to(device)
 
-    # ── Context Parallel ──────────────────────────────────────────────────
-    cp_enabled = config.parallel.context_parallel and mesh is not None and "cp" in (mesh.mesh_dim_names or ())
-    cp_mesh = mesh["cp"] if cp_enabled else None
-    if cp_enabled:
-        enable_context_parallel(cp_mesh, config.parallel.cp_rotate_method)
+    # ── Context Parallel: each rank holds a slice of every sequence (palingenesis.context_parallel) ──
+    cp = None
+    if config.parallel.context_parallel and mesh is not None and "cp" in (mesh.mesh_dim_names or ()):
+        cp = ContextParallel.from_mesh(mesh["cp"])
+        cp.deactivate()  # nothing left active by an earlier run in this process
+        cp_models = [("the model", model)]
+        if distiller is not None:
+            cp_models += [(f"teacher {name}", t.model) for name, t in distiller.online.items()]
+        for label, m in cp_models:
+            check_model_support(m, label)
+            route_attention(m, _find_transformer_layers(m))
+        logger.info(
+            f"Context parallel: {cp.size} ranks per sequence ({_dp_world_size(mesh)} data-parallel group(s)), "
+            "attention over the whole sequence (K/V all-gather), head-tail load balancing"
+        )
+    elif config.parallel.context_parallel:
+        logger.warning("parallel.context_parallel: one process, nothing to split; training without it")
 
     # ── torch.compile (per-layer for efficiency) ──────────────────────────
     if config.model.compile:
@@ -545,14 +570,14 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 cache_dir,
                 tokenizer,
                 config.data,
-                rank,
-                world_size,
+                data_rank,
+                data_world,
                 config.train.per_device_batch_size,
                 batch_transform=kd_transform,
             )
 
         def _estimate():  # the cache's row count is its number of training sequences
-            return estimate_pretokenized(cache_dir, world_size, bs)
+            return estimate_pretokenized(cache_dir, data_world, bs)
 
         dataloader = _make_dataloader()
     elif config.data.sources:
@@ -567,15 +592,15 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 config.data,
                 tokenizer,
                 config.data,
-                rank,
-                world_size,
+                data_rank,
+                data_world,
                 config.train.per_device_batch_size,
                 batch_transform=kd_transform,
                 **kd_data,
             )
 
         def _estimate():
-            return estimate_run(config.data, tokenizer, world_size, bs)
+            return estimate_run(config.data, tokenizer, data_world, bs)
 
         dataloader = _make_dataloader()
     else:
@@ -626,8 +651,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     tokenizer,
                     config.data,
                     dpo,
-                    rank,
-                    world_size,
+                    data_rank,
+                    data_world,
                     config.train.per_device_batch_size,
                     streaming_shuffle_buffer=streaming_shuffle_buffer,
                     shuffle_seed=config.train.seed,
@@ -637,7 +662,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             def _estimate():
                 from palingenesis.dpo import estimate_preferences
 
-                return estimate_preferences(dataset_id, dataset, tokenizer, config.data, dpo, world_size, bs)
+                return estimate_preferences(dataset_id, dataset, tokenizer, config.data, dpo, data_world, bs)
         else:
 
             def _make_dataloader():
@@ -645,8 +670,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     dataset,
                     tokenizer,
                     config.data,
-                    rank,
-                    world_size,
+                    data_rank,
+                    data_world,
                     config.train.per_device_batch_size,
                     streaming_shuffle_buffer=streaming_shuffle_buffer,
                     shuffle=shuffle_rows,
@@ -655,12 +680,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 )
 
             def _estimate():
-                return estimate_run(config.data, tokenizer, world_size, bs, dataset=dataset, dataset_id=dataset_id)
+                return estimate_run(config.data, tokenizer, data_world, bs, dataset=dataset, dataset_id=dataset_id)
 
         dataloader = _make_dataloader()
 
     # ── Optimizer + Scheduler ─────────────────────────────────────────────
-    total_steps = _resolve_total_steps(config, world_size, _make_dataloader, device, _estimate)
+    total_steps = _resolve_total_steps(config, data_world, _make_dataloader, device, _estimate)
     plugin_ctx.total_steps = total_steps
     # Parameter-group overrides (plugins: latent weights, scales; distillation projections), applied
     # before the scheduler records each group's learning rate.
@@ -1052,7 +1077,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 config.train.bf16,
             )
         if eval_batches:
-            loss = _compute_eval_loss(model, eval_batches, device, compute_dtype, config.train.bf16)
+            loss = _compute_eval_loss(model, eval_batches, device, compute_dtype, config.train.bf16, cp=cp)
             return {"eval/loss": loss, "eval/ppl": math.exp(min(loss, 20.0))}
         if _multi_evaluator is not None:
             me = _multi_evaluator.evaluate(model, dtype=compute_dtype)
@@ -1079,21 +1104,22 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             logger.info(f"step=0 eval={baseline['eval/loss']:.4f} (before training)")
 
     # ── Training Loop ─────────────────────────────────────────────────────
-    _effective_batch = config.train.per_device_batch_size * world_size * config.train.gradient_accumulation_steps
+    _effective_batch = config.train.per_device_batch_size * data_world * config.train.gradient_accumulation_steps
     _warmup_steps = int(total_steps * config.train.warmup_ratio)
     _steps_note = "" if config.train.max_steps > 0 else f" (~{config.train.epochs} epoch(s))"
     logger.info(
         f"Training started │ total_steps={total_steps}{_steps_note} │ "
         f"warmup={_warmup_steps} ({config.train.warmup_ratio:.0%}) │ "
         f"effective_batch={_effective_batch} "
-        f"({config.train.per_device_batch_size}/gpu × {world_size} gpu × {config.train.gradient_accumulation_steps} ga)"
+        f"({config.train.per_device_batch_size}/gpu × {data_world} data-parallel × {config.train.gradient_accumulation_steps} ga)"
     )
     if start_step > 0:
         logger.info(f"Resuming from step {start_step} — {max(total_steps - start_step, 0)} steps remaining")
     plugin_ctx.step = start_step
     if plugin_mgr:
         plugin_mgr.on_train_start(model)
-    plugin_loss_scale = 1.0 / plugin_ctx.dp_world_size
+    # gradients are summed over every rank FSDP shards over (data- and context-parallel)
+    plugin_loss_scale = 1.0 / (plugin_ctx.dp_world_size * (cp.size if cp is not None else 1))
     model.train()
 
     global_step = start_step
@@ -1187,17 +1213,6 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 if flatten_packed:
                     kd_reshape = _flatten_rows
             else:
-                # ── Context Parallel: shard sequence (never packed: see Config.validate)
-                if cp_enabled:
-                    input_ids, attention_mask, labels = shard_for_context_parallel(
-                        input_ids, attention_mask, labels, cp_mesh
-                    )
-                    if loss_weights is not None:
-                        loss_weights = _cp_shard(loss_weights, cp_mesh)
-
-                    def kd_reshape(t, _mesh=cp_mesh):
-                        return _cp_shard(t, _mesh)
-
                 # Right padding only (the collator's): no mask. Padding after a row's tokens cannot
                 # reach them under causal attention (linear-attention layers included), and its
                 # labels are ignored. Without a mask attention is plain causal, which runs as flash
@@ -1207,6 +1222,28 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     (attention_mask[:, 1:] > attention_mask[:, :-1]).any()
                 )
                 fwd_kwargs = {"input_ids": input_ids, "attention_mask": None if right_padded else attention_mask}
+                # ── Context parallel: this rank's slice of every row (never packed: see Config.validate).
+                # Labels were shifted on the whole rows above, so tokens predicting across a slice
+                # boundary keep their targets; padding to the layout's multiple carries no label.
+                if cp is not None:
+                    if attention_mask is not None and not right_padded:
+                        raise ContextParallelError(
+                            "context parallel needs right-padded rows (causal attention keeps the padding inert); "
+                            "this batch has padding before real tokens."
+                        )
+                    seq_len = input_ids.shape[1]
+                    input_ids = cp.shard(input_ids, pad_value=0)
+                    labels = cp.shard(labels, pad_value=IGNORE_INDEX)
+                    attention_mask = cp.shard(attention_mask, pad_value=0) if attention_mask is not None else None
+                    if loss_weights is not None:
+                        loss_weights = cp.shard(loss_weights, pad_value=0)
+                    kd_reshape = cp.shard
+                    fwd_kwargs = {
+                        "input_ids": input_ids,
+                        "attention_mask": None,
+                        "position_ids": cp.position_ids(seq_len, input_ids.shape[0], input_ids.device),
+                    }
+                    cp.activate(seq_len, input_ids.device)
 
             # ── Gradient sync control for accumulation ────────────────
             # Dynamic GA: ramp from ga_ramp_start to grad_accum over training
@@ -1501,6 +1538,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 loss_val = loss.detach().float().item() * current_ga
             if not backward_done:
                 loss.backward()
+            if cp is not None:
+                cp.deactivate()
 
             # MONA: augment gradients with curvature-aware acceleration (before optimizer step)
             if _mona is not None:
@@ -1508,7 +1547,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
             accum_loss += loss_val
             accum_micro += 1
-            _n_valid, _n_input = torch.stack([local_valid, batch["attention_mask"].sum()]).tolist()
+            # this process's tokens (under context parallel, its slice of the rows)
+            _input_mask = attention_mask if cp is not None and attention_mask is not None else batch["attention_mask"]
+            _n_valid, _n_input = torch.stack([local_valid, _input_mask.sum()]).tolist()
             accum_tokens += _n_input
             accum_trained += _n_valid
             tokens_total += _n_input
@@ -1603,6 +1644,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     # NOTE: with DEFT/DFT-family objectives this is the gated
                     # loss, numerically much smaller than a CE. train/ce_loss
                     # (when available) is the comparable cross-entropy.
+                    if cp is not None:
+                        # each rank's loss covers its slice of the rows: the group's sum is the rows' loss
+                        accum_loss = cp.all_reduce_sum([accum_loss], device)[0]
                     step_loss = accum_loss / max(accum_micro, 1)
                     ce_loss = accum_ce / accum_ce_micro if accum_ce_micro else None
 
@@ -1884,13 +1928,6 @@ def _flatten_rows(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(1, -1, *t.shape[2:])
 
 
-def _cp_shard(t: torch.Tensor, cp_mesh) -> torch.Tensor:
-    """This context-parallel rank's slice of a per-token [B, T, ...] field (as shard_for_context_parallel)."""
-    size = t.shape[1] // cp_mesh.size()
-    start = cp_mesh.get_local_rank() * size
-    return t[:, start : start + size].contiguous()
-
-
 def _teacher_packed_inputs(distiller, input_ids, position_ids, student_flatten: bool, config: Config) -> dict:
     """Per online teacher whose packed layout differs from the student's (a flattened row for one, not
     the other): its own (input_ids, forward kwargs). Flattening keeps the token order, so the trained
@@ -2025,8 +2062,12 @@ def _compute_eval_loss(
     device: torch.device,
     dtype: torch.dtype,
     bf16: bool,
+    cp: ContextParallel | None = None,
 ) -> float:
-    """Compute average CE loss over pre-collected eval batches. No gradient."""
+    """Compute average CE loss over pre-collected eval batches. No gradient.
+
+    Under context parallelism every rank of the group scores its slice of each row (as in
+    training) and the group sums the slices."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -2035,10 +2076,23 @@ def _compute_eval_loss(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = shift_labels(batch["labels"].to(device))
-
-        # Logits only at scored positions, in slices (palingenesis.logits): the
-        # model's own forward would materialise the full [B, S, V] logits.
-        loss, valid = scored_ce_sum(model, input_ids, attention_mask, labels, dtype, autocast=bf16)
+        kwargs = {}
+        right_padded = not bool((attention_mask[:, 1:] > attention_mask[:, :-1]).any())
+        if cp is not None and right_padded:
+            seq_len = input_ids.shape[1]
+            kwargs["position_ids"] = cp.position_ids(seq_len, input_ids.shape[0], device)
+            input_ids, labels = cp.shard(input_ids), cp.shard(labels, pad_value=IGNORE_INDEX)
+            attention_mask = None
+            cp.activate(seq_len, device)
+        try:
+            # Logits only at scored positions, in slices (palingenesis.logits): the
+            # model's own forward would materialise the full [B, S, V] logits.
+            loss, valid = scored_ce_sum(model, input_ids, attention_mask, labels, dtype, autocast=bf16, **kwargs)
+        finally:
+            if cp is not None:
+                cp.deactivate()
+        if cp is not None and right_padded:
+            loss, valid = cp.all_reduce_sum([loss, valid], device)
         total_loss += loss
         total_tokens += valid
 

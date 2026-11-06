@@ -172,6 +172,7 @@ def scored_ce_sum(
     autocast: bool = True,
     ignore_index: int = -100,
     chunk_bytes: float = 1e9,
+    position_ids: torch.Tensor | None = None,
 ) -> tuple[float, int]:
     """Summed cross-entropy over the scored positions, and their count, for evaluation.
 
@@ -180,10 +181,12 @@ def scored_ce_sum(
     of fp32 at a time. The model's forward would materialise [B, S, V] logits
     (8 GB in bf16 for 4 x 4096 tokens at a 248k vocabulary, twice that once
     upcast), which dominated the trainer's peak memory at evaluation time.
+    `position_ids` (optional) go to the forward (a context-parallel slice of the rows).
     """
+    kwargs = {} if position_ids is None else {"position_ids": position_ids}
     valid = shifted_labels != ignore_index
     count = int(valid.sum())
-    if count == 0:
+    if count == 0 and position_ids is None:  # a context-parallel slice still runs: the group's attention needs it
         return 0.0, 0
     head = output_head(model)
     try:
@@ -193,11 +196,11 @@ def scored_ce_sum(
     targets = shifted_labels[valid]
     with torch.amp.autocast("cuda", dtype=dtype, enabled=autocast and input_ids.is_cuda):
         if not separable:  # no separable head: score the model's own logits
-            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            out = model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
             rows = (out.logits if hasattr(out, "logits") else out[0])[valid]
             project = None
         else:
-            rows = final_hidden_states(model, input_ids, attention_mask)[valid]
+            rows = final_hidden_states(model, input_ids, attention_mask, **kwargs)[valid]
             project = head
         vocab = head.weight.shape[0] if project is not None else rows.shape[-1]
         step = max(1, int(chunk_bytes // (vocab * 4)))
