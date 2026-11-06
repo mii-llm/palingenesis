@@ -216,7 +216,8 @@ def test_build_cache_matches_the_teachers_distribution(tmp_path):
     sample = next(iter(stage))
     doc = cache.get(*sequence_key(sample["input_ids"], sample["labels"]), int(sample["input_ids"].numel()))
     with torch.no_grad():
-        lp = torch.log_softmax(teacher(input_ids=sample["input_ids"][None]).logits[0].float(), -1)
+        device = next(teacher.parameters()).device  # the builder may have moved the teacher to a GPU
+        lp = torch.log_softmax(teacher(input_ids=sample["input_ids"][None].to(device)).logits[0].float(), -1).cpu()
     pos = torch.from_numpy(np.array(doc.positions)).long()
     top = lp[pos].topk(5, -1)
     np.testing.assert_array_equal(np.asarray(doc.ids), top.indices.numpy())
@@ -273,6 +274,7 @@ def test_cache_of_a_teacher_view_is_in_student_positions(tmp_path):
     assert t_ids.numel() > sample["input_ids"].numel()  # the hint is in the teacher's copy only
     doc = cache.get(*sequence_key(sample["input_ids"], sample["labels"]), int(sample["input_ids"].numel()))
     with torch.no_grad():
-        lp = torch.log_softmax(teacher(input_ids=t_ids[None]).logits[0].float(), -1)
+        device = next(teacher.parameters()).device  # the builder may have moved the teacher to a GPU
+        lp = torch.log_softmax(teacher(input_ids=t_ids[None].to(device)).logits[0].float(), -1).cpu()
     q = sample["teacher_positions.big"][torch.from_numpy(np.array(doc.positions)).long()]
     np.testing.assert_array_equal(np.asarray(doc.ids), lp[q].topk(5, -1).indices.numpy())
