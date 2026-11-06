@@ -599,7 +599,7 @@ def _load_fsdp(model, optimizer, path):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def save_final(model, tokenizer, output_dir: str, is_fsdp: bool = False):
+def save_final(model, tokenizer, output_dir: str, is_fsdp: bool = False, export=None):
     """Save final model in HF-compatible sharded safetensors format.
 
     For FSDP: gathers the full model state to rank 0, then saves in HF format.
@@ -608,14 +608,18 @@ def save_final(model, tokenizer, output_dir: str, is_fsdp: bool = False):
 
     The final export is always HF-format (loadable by from_pretrained anywhere).
     Intermediate checkpoints use sharded DCP (fast, zero extra memory).
+
+    export: a function state_dict -> state_dict applied to the full state before it is written
+    (trainer plugins' export_state_dict: fold quantised weights, drop training-only modules).
+    Resume checkpoints never go through it.
     """
     path = Path(output_dir) / "final"
-    _save_gathered_or_local(model, tokenizer, path, is_fsdp)
+    _save_gathered_or_local(model, tokenizer, path, is_fsdp, export)
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(f"Final model saved (HF format) -> {path}")
 
 
-def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool) -> None:
+def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool, export=None) -> None:
     """HF-format save; under FSDP the full state is gathered to rank 0 (CPU) and saved
     from there, leaving every rank's sharded model untouched."""
     if is_fsdp and dist.is_initialized():  # also one rank: FSDP2 with CPU offload on a single GPU
@@ -625,12 +629,15 @@ def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool) -> None
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         state = get_model_state_dict(model, options=opts)
         if dist.get_rank() == 0:
+            if export is not None:
+                state = export(hf_state_dict(state))
             save_hf_model(model, tokenizer, path, state=state, source_layout=True)
         del state
         release_cuda_memory()  # the gather's GPU blocks, before the barrier's NCCL allocation
         barrier()
     else:
-        save_hf_model(model, tokenizer, path, source_layout=True)
+        state = export(hf_state_dict(model.state_dict())) if export is not None else None
+        save_hf_model(model, tokenizer, path, state=state, source_layout=True)
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
@@ -730,8 +737,9 @@ class BestModelTracker:
                 logger.info(f"New best model at step {step} (eval_loss={eval_loss:.4f})")
     """
 
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str, export=None):
         self.output_dir = output_dir
+        self.export = export  # see save_final
         self.best_loss = float("inf")
         self.best_step = -1
 
@@ -759,7 +767,7 @@ class BestModelTracker:
         is_main = not dist.is_initialized() or dist.get_rank() == 0
         if is_main and path.exists():
             shutil.rmtree(path)
-        _save_gathered_or_local(model, tokenizer, path / "model", is_fsdp)
+        _save_gathered_or_local(model, tokenizer, path / "model", is_fsdp, self.export)
         if is_main:
             _save_best_meta(path, step, eval_loss)
 

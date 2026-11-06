@@ -367,6 +367,7 @@ def _chunkwise(
     rng: random.Random | None = None,
     kv_offload: bool = False,
     unlikely: list | None = None,
+    loss_fn=None,
 ) -> ChunkwiseResult:
     """Accumulate d(loss)/d(params) into `.grad`, chunk by chunk; the caller must
     NOT call `.backward()` afterwards.
@@ -383,6 +384,9 @@ def _chunkwise(
     unlikely:   [(targets, weight)]: targets [B, S] like labels (unshifted), token ids whose probability is
                 pushed down by weight * -log(1 - p) / loss_denom; IGNORE_INDEX elsewhere (data.repeat_unlikelihood,
                 data.stop_unlikelihood).
+    loss_fn:    replaces the chunk's cross-entropy: loss_fn(hidden [B, L, H], lo, hi, denom) -> the chunk's
+                loss divided by denom, with the head's gradients already accumulated (off-policy
+                distillation: palingenesis.distill.Distiller.seco_loss_fn).
     """
     backbone, lm_head = _backbone(model), _lm_head(model)
     if getattr(backbone, "gradient_checkpointing", False) and backbone.training:
@@ -407,13 +411,16 @@ def _chunkwise(
     def chunk_loss(hidden, lo, hi, weight=1.0, with_repeat=True):
         # The weight goes into the denominator: chunked CE computes lm_head's
         # gradients inside this call, so scaling the returned loss would miss them.
-        loss = chunked_cross_entropy_loss(
-            hidden,
-            shifted[:, lo:hi],
-            lm_head,
-            num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
-            global_valid_tokens=denom / weight,
-        )
+        if loss_fn is not None:
+            loss = loss_fn(hidden, lo, hi, denom / weight)
+        else:
+            loss = chunked_cross_entropy_loss(
+                hidden,
+                shifted[:, lo:hi],
+                lm_head,
+                num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
+                global_valid_tokens=denom / weight,
+            )
         if with_repeat:
             for (targets, w), st in zip(terms, stats):
                 if targets is None:

@@ -601,8 +601,12 @@ class ChatDataset(_Epochs, IterableDataset):
         loop_recovery: float = 0.0,
         reasoning_loop_recovery: float = 0.0,
         repeat_targets: bool = False,
+        teacher_views: list | None = None,
     ):
         self.dataset = dataset
+        # Off-policy distillation with a teacher view (palingenesis.distill.views): [(view, teacher
+        # ChatDataset)]; each kept row also gets the teacher's rendering and the position alignment.
+        self.teacher_views = list(teacher_views or [])
         self.loop_recovery = loop_recovery  # see inject_loop
         self.reasoning_loop_recovery = reasoning_loop_recovery
         # Yield `repeat_targets` (see _repeat_targets) for data.repeat_unlikelihood; needs the offset masker.
@@ -684,12 +688,48 @@ class ChatDataset(_Epochs, IterableDataset):
         for example in dataset:
             too_long = self.stats["dropped_too_long"]
             result = self._process(example)
+            if result is not None and self.teacher_views:
+                result = self._with_teacher_views(example, result)
+                if result is None:
+                    self.stats["kd_view_mismatch"] += 1
+                    continue
             if result is not None:
                 self.stats["kept"] += 1
                 yield result
             elif self.stats["dropped_too_long"] == too_long:
                 self.stats["dropped_no_target"] += 1
         self._log_stats()
+
+    def _with_teacher_views(self, example: dict[str, Any], result: dict) -> dict | None:
+        """Add each teacher view's rendering of `example` (distill.views) to the student's sample, or None
+        when a teacher's trained tokens are not the student's."""
+        from palingenesis.distill.views import input_field, positions_field
+        from palingenesis.validate_data import normalize_messages
+
+        messages = normalize_messages(example, self.messages_field, think_tags=self._data_tags())
+        if not messages:
+            messages = example.get(self.messages_field) or []
+        row_kwargs = example.get("chat_template_kwargs") or {}
+        if isinstance(row_kwargs, str):
+            row_kwargs = json.loads(row_kwargs) if row_kwargs.strip() else {}
+        for view, teacher_ds in self.teacher_views:
+            teacher_messages = view.messages(example, messages)
+            if not teacher_messages:
+                return None
+            teacher_row = {
+                **example,
+                teacher_ds.messages_field: teacher_messages,
+                "chat_template_kwargs": {**row_kwargs, **view.spec.chat_template_kwargs},
+            }
+            rendered = teacher_ds._process(teacher_row)
+            if rendered is None:
+                return None
+            positions = view.align(result, rendered)
+            if positions is None:
+                return None
+            result[input_field(view.name)] = rendered["input_ids"]
+            result[positions_field(view.name)] = positions
+        return result
 
     def _log_stats(self) -> None:
         if self.stats["offset_masker_failed"] and (self.repeat_targets or self.reasoning_loop_recovery):
@@ -702,6 +742,11 @@ class ChatDataset(_Epochs, IterableDataset):
                 f"Loop recovery (rank {self.rank}): {self.stats['loop_recovery_skipped']} rows left unaugmented (the "
                 f"pasted context would not fit), {self.stats['loop_recovery_untrained_turn']} turns without loss (copies "
                 "not found in the render)"
+            )
+        if self.stats["kd_view_mismatch"]:
+            logger.warning(
+                f"Teacher views (rank {self.rank}): {self.stats['kd_view_mismatch']} rows dropped because a teacher's "
+                "rendering did not train the same answer tokens as the student's (or did not fit its length limit)"
             )
         dropped = self.stats["dropped_too_long"] + self.stats["dropped_no_target"]
         if not dropped and not self.stats["truncated"]:
@@ -1841,7 +1886,7 @@ class PackedDataset(_Epochs, IterableDataset):
     def _doc(self, ex: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # Oversized documents are cut to max_len (the chat pipeline already keeps whole
         # turns within max_seq_length; this only guards other sources).
-        keys = ["input_ids", "labels"] + (["loss_weights"] if "loss_weights" in ex else [])
+        keys = ["input_ids", "labels"] + [k for k in ("loss_weights", "source_ids") if k in ex]
         return {k: ex[k][: self.max_len] for k in keys}
 
     @staticmethod
@@ -1969,6 +2014,11 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
     has_positions = "position_ids" in batch[0]
     has_weights = any("loss_weights" in x for x in batch)
     extra = [k for k in ("repeat_targets", "stop_targets") if any(k in x for x in batch)]
+    # Off-policy distillation: source tags and teacher views, per token (-1 = none); a teacher's own
+    # rendering is padded to its own length.
+    per_token = [k for k in ("source_ids",) if any(k in x for x in batch)]
+    per_token += sorted({k for x in batch for k in x if k.startswith("teacher_positions.")})
+    teacher_inputs = sorted({k for x in batch for k in x if k.startswith("teacher_input_ids.")})
     out: dict[str, list[torch.Tensor]] = {"input_ids": [], "attention_mask": [], "labels": []}
     for k in extra:
         out[k] = []
@@ -1996,7 +2046,20 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
                 t = torch.full_like(item["labels"], IGNORE_INDEX)
             out[k].append(torch.cat([t, torch.full((pad_len,), IGNORE_INDEX, dtype=torch.long)]))
 
-    return {k: torch.stack(v) for k, v in out.items()}
+    result = {k: torch.stack(v) for k, v in out.items()}
+    for k in per_token:
+        rows = [x[k] if k in x else torch.full_like(x["input_ids"], -1) for x in batch]
+        result[k] = torch.stack([torch.cat([r, torch.full((max_len - r.size(0),), -1, dtype=r.dtype)]) for r in rows])
+    for k in teacher_inputs:  # a row without a rendering of its own is scored on the student's tokens
+        positions = "teacher_positions." + k[len("teacher_input_ids.") :]
+        if positions not in result:
+            raise ValueError(f"collate: {k} without {positions}")
+        rows = [x[k] if k in x else x["input_ids"] for x in batch]
+        width = max(r.size(0) for r in rows)
+        if pad_to_multiple > 1:
+            width = ((width + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
+        result[k] = torch.stack([torch.cat([r, torch.full((width - r.size(0),), pad_id, dtype=r.dtype)]) for r in rows])
+    return result
 
 
 # Keep backward-compatible name
@@ -2059,10 +2122,14 @@ def source_stage(
     world_size: int,
     shuffle_buffer: int = 0,
     shuffle: bool = False,
+    teacher_views: list | None = None,
 ) -> "ChatDataset | PretrainDataset":
     """The per-row stage of one data source: `src` is a data.sources entry (its options
     override the config's), None for the single data.dataset. The training pipeline and the
-    size estimate (data_size) both build their stages here."""
+    size estimate (data_size) both build their stages here.
+
+    teacher_views: [(distill.views.TeacherView, teacher tokenizer, teacher max length)]: chat rows
+    also get each teacher's rendering (off-policy context distillation); pretraining text has none."""
     src = src or {}
     mode = src.get("mode", "sft")
     if mode == "pretrain":
@@ -2079,23 +2146,12 @@ def source_stage(
         )
     if mode != "sft":
         raise ValueError(f"Unknown data mode: {mode}. Use 'sft' or 'pretrain'.")
-    return ChatDataset(
-        raw,
-        tokenizer,
-        config.max_seq_length,
+    # masking rules shared by the student's rendering and any teacher view's
+    masking = dict(
         messages_field=src.get("messages_field", config.messages_field if not src else "messages"),
-        rank=rank,
-        world_size=world_size,
         include_observations=config.include_observations,
-        turn_scaling=config.turn_scaling,
-        loop_recovery=getattr(config, "loop_recovery", 0.0),
-        reasoning_loop_recovery=getattr(config, "reasoning_loop_recovery", 0.0),
-        repeat_targets=getattr(config, "repeat_unlikelihood", 0.0) > 0 or getattr(config, "stop_unlikelihood", 0.0) > 0,
         train_on_reasoning=getattr(config, "train_on_reasoning", True),
         last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
-        shuffle_buffer=shuffle_buffer,
-        shuffle_seed=config.seed,
-        shuffle=shuffle,
         tools_field=src.get("tools_field", config.tools_field),
         think_tags=src.get("think_tags", getattr(config, "think_tags", None)),
         chat_template_kwargs={
@@ -2103,6 +2159,41 @@ def source_stage(
             **(src.get("chat_template_kwargs") or {}),
         },
     )
+    views = [
+        (view, ChatDataset(None, teacher_tok, teacher_max_len, **masking))
+        for view, teacher_tok, teacher_max_len in teacher_views or []
+    ]
+    return ChatDataset(
+        raw,
+        tokenizer,
+        config.max_seq_length,
+        rank=rank,
+        world_size=world_size,
+        turn_scaling=config.turn_scaling,
+        loop_recovery=getattr(config, "loop_recovery", 0.0),
+        reasoning_loop_recovery=getattr(config, "reasoning_loop_recovery", 0.0),
+        repeat_targets=getattr(config, "repeat_unlikelihood", 0.0) > 0 or getattr(config, "stop_unlikelihood", 0.0) > 0,
+        shuffle_buffer=shuffle_buffer,
+        shuffle_seed=config.seed,
+        shuffle=shuffle,
+        teacher_views=views,
+        **masking,
+    )
+
+
+class SourceTagged(_Epochs, IterableDataset):
+    """Adds `source_ids` (the data source's index, per token) to a source's samples, so that a teacher
+    can be routed to the sources it supervises (off-policy distillation). Packing keeps the tags per
+    document."""
+
+    def __init__(self, base: IterableDataset, index: int):
+        self.base = base
+        self.index = index
+
+    def __iter__(self):
+        for sample in self.base:
+            sample["source_ids"] = torch.full_like(sample["input_ids"], self.index)
+            yield sample
 
 
 def estimate_pretokenized(cache_dir, world_size: int, batch_size: int):
@@ -2242,9 +2333,13 @@ def build_dataset(
     batch_size: int,
     streaming_shuffle_buffer: int = 0,
     shuffle: bool = False,
+    teacher_views: list | None = None,
+    tag_sources: bool = False,
 ) -> IterableDataset:
     """Assemble the final training IterableDataset (everything the DataLoader wraps).
     `shuffle`: a pre-loaded map-style dataset gets a new random order every epoch.
+    `teacher_views` (off-policy distillation, see source_stage) and `tag_sources` (samples carry
+    `source_ids`, the index of their data.sources entry) are for the distillation trainer.
 
     Handles three cases:
     1. Pre-built dataset object (backward compat)
@@ -2268,18 +2363,18 @@ def build_dataset(
         for src in config.sources:
             raw = _load_dataset_source(src["dataset"], src.get("split", "train"), streaming=config.streaming)
             # A new order every epoch, inside the dataset (see _shard_then_shuffle)
-            source_datasets.append(
-                source_stage(
-                    raw,
-                    tokenizer,
-                    config,
-                    src,
-                    rank,
-                    world_size,
-                    shuffle_buffer=10_000 if config.streaming else 0,
-                    shuffle=not config.streaming,
-                )
+            stage = source_stage(
+                raw,
+                tokenizer,
+                config,
+                src,
+                rank,
+                world_size,
+                shuffle_buffer=10_000 if config.streaming else 0,
+                shuffle=not config.streaming,
+                teacher_views=teacher_views,
             )
+            source_datasets.append(SourceTagged(stage, len(names)) if tag_sources else stage)
             names.append(source_name(src, len(names)))
         if rank == 0:
             _log_mixture(names, weights, rows, draws, world_size)
@@ -2298,6 +2393,7 @@ def build_dataset(
             world_size,
             shuffle_buffer=streaming_shuffle_buffer,
             shuffle=shuffle,
+            teacher_views=teacher_views,
         )
     else:
         # Single dataset from config
@@ -2311,6 +2407,7 @@ def build_dataset(
             world_size,
             shuffle_buffer=10_000 if config.streaming else 0,
             shuffle=not config.streaming,
+            teacher_views=teacher_views,
         )
 
     # ── Pretraining Replay (arxiv:2603.04964) ─────────────────────────────────
@@ -2332,6 +2429,8 @@ def build_dataset(
         # Mix: (1-w) * target_data + w * replay_data. An epoch is one pass over the target
         # (its rows) plus the replay examples drawn alongside: target rows / (1 - w) draws.
         w = config.pretrain_replay_weight
+        if tag_sources:  # replay text belongs to no data.sources entry
+            replay_ds = SourceTagged(replay_ds, -1)
         target_rows = _target_rows(config, dataset_or_config)
         draws = None
         if config.mix_epoch == "total" and target_rows is not None and w < 1:
@@ -2359,14 +2458,31 @@ def build_dataset(
     return final_ds
 
 
+class _Collate:
+    """collate_fn, then an optional transform of the collated batch (run in the DataLoader workers:
+    e.g. distill.cache.CacheLookup reading a teacher's cached targets)."""
+
+    def __init__(self, pad_id: int, transform=None):
+        self.pad_id = pad_id
+        self.transform = transform
+
+    def __call__(self, batch):
+        out = collate_fn(batch, self.pad_id, pad_to_multiple=64)
+        return self.transform(out) if self.transform is not None else out
+
+
 def _dataloader_from_dataset(
-    final_ds: IterableDataset, tokenizer: PreTrainedTokenizerBase, num_workers: int, batch_size: int
+    final_ds: IterableDataset,
+    tokenizer: PreTrainedTokenizerBase,
+    num_workers: int,
+    batch_size: int,
+    batch_transform=None,
 ) -> DataLoader:
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     return DataLoader(
         final_ds,
         batch_size=batch_size,
-        collate_fn=lambda b: collate_fn(b, pad_id, pad_to_multiple=64),
+        collate_fn=_Collate(pad_id, batch_transform),
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
@@ -2383,8 +2499,12 @@ def build_dataloader(
     batch_size: int,
     streaming_shuffle_buffer: int = 0,
     shuffle: bool = False,
+    teacher_views: list | None = None,
+    tag_sources: bool = False,
+    batch_transform=None,
 ) -> DataLoader:
-    """Build the complete data pipeline (assemble the dataset, then wrap in a DataLoader)."""
+    """Build the complete data pipeline (assemble the dataset, then wrap in a DataLoader).
+    `batch_transform` runs on every collated batch, in the workers."""
     final_ds = build_dataset(
         dataset_or_config,
         tokenizer,
@@ -2394,8 +2514,10 @@ def build_dataloader(
         batch_size,
         streaming_shuffle_buffer=streaming_shuffle_buffer,
         shuffle=shuffle,
+        teacher_views=teacher_views,
+        tag_sources=tag_sources,
     )
-    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)
+    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size, batch_transform)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2597,7 +2719,9 @@ class PretokenizedDataset(_Epochs, IterableDataset):
             yield out
 
 
-def build_pretokenized_dataloader(cache_dir, tokenizer, config: DataConfig, rank, world_size, batch_size) -> DataLoader:
+def build_pretokenized_dataloader(
+    cache_dir, tokenizer, config: DataConfig, rank, world_size, batch_size, batch_transform=None
+) -> DataLoader:
     """Load the cached pre-tokenized parquet and wrap it in a DataLoader (no re-tokenization).
 
     Packed caches are all-max-length (no padding), so length grouping is a no-op there.
@@ -2613,4 +2737,4 @@ def build_pretokenized_dataloader(cache_dir, tokenizer, config: DataConfig, rank
     if not config.packing and batch_size > 1 and getattr(config, "length_group_buffer", 512) > 0:
         final_ds = LengthGroupedDataset(final_ds, batch_size, buffer_size=config.length_group_buffer, seed=config.seed)
 
-    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size)
+    return _dataloader_from_dataset(final_ds, tokenizer, config.num_workers, batch_size, batch_transform)
