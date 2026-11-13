@@ -303,3 +303,126 @@ def test_validate_allows_plain_pretokenize():
     cfg = Config()
     cfg.data.pretokenize = True
     cfg.validate()  # must not raise
+
+
+# ── reading the cache: tensors straight from Arrow, per-token loss weights kept ──
+def _cached_dataset(cache):
+    from datasets import load_dataset
+
+    return load_dataset("parquet", data_files=str(cache / PRETOK_DATA), split="train", streaming=False)
+
+
+@needs_tok
+def test_cached_rows_are_decoded_as_tensors_not_python_lists(tmp_path):
+    """A row decoded as Python lists costs milliseconds per 4k-token sequence; the stage must ask the dataset for
+    tensors, and what it yields must still be the materialized stream in int64."""
+    import torch
+
+    p = tmp_path / "d.jsonl"
+    _write(p, ROWS)
+    cache = tmp_path / "cache"
+    cfg = _cfg(p, packing=True)
+    _materialize(cfg, cache)
+    ds = _cached_dataset(cache)
+
+    class Spy:  # stands for the datasets.Dataset: iterating it in the default (Python) format is the regression
+        formats = []
+
+        def with_format(self, fmt):
+            Spy.formats.append(fmt)
+            return ds.with_format(fmt)
+
+        def __iter__(self):
+            raise AssertionError("cached rows were decoded as Python objects")
+
+    cached = list(PretokenizedDataset(Spy()))
+    assert Spy.formats == ["torch"]
+    live = list(build_dataset(cfg, TOK, cfg, 0, 1, 1))
+    assert len(cached) == len(live) > 0
+    for a, b in zip(cached, live):
+        assert set(a) == {"input_ids", "attention_mask", "labels", "position_ids"}
+        for k in a:
+            assert a[k].dtype == torch.long and torch.equal(a[k], b[k])
+
+
+TWO_TURNS = [
+    {
+        "messages": [
+            {"role": "user", "content": f"Q{i}"},
+            {"role": "assistant", "content": f"first answer {i}"},
+            {"role": "user", "content": "and then?"},
+            {"role": "assistant", "content": f"second answer {i}"},
+        ]
+    }
+    for i in range(6)
+]
+
+
+@needs_tok
+@pytest.mark.parametrize("packing", [False, True])
+def test_cache_keeps_turn_scaling_loss_weights(tmp_path, packing):
+    """data.turn_scaling yields per-token loss_weights; a cache that dropped them trained with uniform weights."""
+    import torch
+
+    p = tmp_path / "d.jsonl"
+    _write(p, TWO_TURNS + ROWS[:3])  # single-turn rows carry no weights: the column must allow that
+    cache = tmp_path / "cache"
+    cfg = _cfg(p, turn_scaling="progressive", packing=packing)
+    _materialize(cfg, cache)
+    live = list(build_dataset(cfg, TOK, cfg, 0, 1, 1))
+    cached = list(PretokenizedDataset(_cached_dataset(cache)))
+    assert any("loss_weights" in x for x in live)
+    assert len(cached) == len(live)
+    for a, b in zip(cached, live):
+        assert ("loss_weights" in a) == ("loss_weights" in b)
+        if "loss_weights" in b:
+            assert a["loss_weights"].dtype == torch.float32 and torch.equal(a["loss_weights"], b["loss_weights"])
+            assert len(set(b["loss_weights"][b["labels"] != -100].tolist())) > 1  # really per-turn weights
+    assert json.loads((cache / PRETOK_META).read_text())["has_loss_weights"] is True
+    batch = next(iter(build_pretokenized_dataloader(cache, TOK, cfg, 0, 1, 2)))
+    assert batch["loss_weights"].shape == batch["labels"].shape
+
+
+@needs_tok
+def test_cache_without_turn_scaling_has_no_weight_column(tmp_path):
+    p = tmp_path / "d.jsonl"
+    _write(p, TWO_TURNS)
+    cache = tmp_path / "cache"
+    _materialize(_cfg(p), cache)
+    assert "loss_weights" not in _cached_dataset(cache).column_names
+    assert all("loss_weights" not in x for x in PretokenizedDataset(_cached_dataset(cache)))
+
+
+@needs_tok
+def test_fingerprint_covers_mix_epoch_tools_field_and_stored_weights(tmp_path):
+    p = tmp_path / "d.jsonl"
+    _write(p, ROWS)
+    fp = lambda c: pretokenize_fingerprint(_Wrap(c), TOK)  # noqa: E731
+    base = _cfg(p)
+    assert fp(base) != fp(_cfg(p, mix_epoch="first_exhausted")), "mix_epoch changes how many examples are drawn"
+    assert fp(base) != fp(_cfg(p, tools_field="functions")), "tools_field changes the rendered system prompt"
+    src = {"dataset": str(p), "split": "train", "mode": "sft", "messages_field": "messages"}
+    assert fp(base) != fp(_cfg(p, sources=[{**src, "tools_field": "functions"}])), "per-source tools_field too"
+    # a cache written before the weights were stored must not validate for a turn_scaling config (it would be read
+    # as uniform weights); caches of configs that never had weights keep their fingerprint
+    from palingenesis.data import _fingerprint_payload
+
+    assert _fingerprint_payload(_Wrap(_cfg(p, turn_scaling="progressive")), TOK)["loss_weights"] is True
+    assert not {"loss_weights", "mix_epoch", "tools_field"} & set(_fingerprint_payload(_Wrap(base), TOK))
+
+
+@needs_tok
+def test_packing_rows_with_and_without_turn_weights(tmp_path):
+    """Under data.turn_scaling only multi-turn conversations carry loss_weights; packing them next to single-turn
+    ones raised KeyError (or dropped the weights when the block started with a single-turn row)."""
+    import torch
+
+    p = tmp_path / "d.jsonl"
+    _write(p, ROWS[:2] + TWO_TURNS[:2] + ROWS[2:4])
+    cfg = _cfg(p, turn_scaling="progressive", packing=True)
+    blocks = list(build_dataset(cfg, TOK, cfg, 0, 1, 1))
+    assert blocks and all(b["loss_weights"].shape == b["labels"].shape for b in blocks)
+    for b in blocks:
+        trained = b["labels"] != -100
+        assert torch.all(b["loss_weights"][~trained] == 0) and torch.all(b["loss_weights"][trained] > 0)
+    assert any(len(set(b["loss_weights"][b["labels"] != -100].tolist())) > 1 for b in blocks)

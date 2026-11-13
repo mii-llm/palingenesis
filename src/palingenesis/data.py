@@ -1421,7 +1421,11 @@ class ChatDataset(_Epochs, IterableDataset):
 
         # Tokenize the full conversation
         full_text = self._render_chat(messages, tokenize=False, add_generation_prompt=False)
-        tokens = self.tokenizer(full_text, truncation=True, max_length=self.max_seq_length, return_tensors="pt")
+        # add_special_tokens=False here and for every prefix below: the render already holds the template's special
+        # tokens, and a tokenizer that adds BOS on its own (Llama, Mistral) would write a second one
+        tokens = self.tokenizer(
+            full_text, truncation=True, max_length=self.max_seq_length, return_tensors="pt", add_special_tokens=False
+        )
         input_ids = tokens["input_ids"].squeeze(0)
         attn_mask = tokens["attention_mask"].squeeze(0)
         seq_len = len(input_ids)
@@ -1444,7 +1448,9 @@ class ChatDataset(_Epochs, IterableDataset):
             try:
                 # Tokenize prefix including this turn
                 prefix_text = self._render_chat(messages[: i + 1], tokenize=False, add_generation_prompt=False)
-                prefix_ids = self.tokenizer(prefix_text, truncation=True, max_length=self.max_seq_length)["input_ids"]
+                prefix_ids = self.tokenizer(
+                    prefix_text, truncation=True, max_length=self.max_seq_length, add_special_tokens=False
+                )["input_ids"]
                 curr_len = len(prefix_ids)
             except Exception:
                 # Some prefixes (e.g. system-only prefixes) are not renderable
@@ -1478,9 +1484,9 @@ class ChatDataset(_Epochs, IterableDataset):
                     stub_messages = messages[:i] + [stub_msg]
                     try:
                         stub_text = self._render_chat(stub_messages, tokenize=False, add_generation_prompt=False)
-                        stub_ids = self.tokenizer(stub_text, truncation=True, max_length=self.max_seq_length)[
-                            "input_ids"
-                        ]
+                        stub_ids = self.tokenizer(
+                            stub_text, truncation=True, max_length=self.max_seq_length, add_special_tokens=False
+                        )["input_ids"]
                         # The stub renders the turn-CLOSING tokens (e.g. <|im_end|>)
                         # right after the header, so len(stub_ids) overshoots the
                         # content start by the closing-tag length. The exact
@@ -1891,6 +1897,12 @@ class PackedDataset(_Epochs, IterableDataset):
 
     @staticmethod
     def _block(docs: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        if any("loss_weights" in d for d in docs):
+            # only conversations with several trained turns carry weights (data.turn_scaling): the others weigh 1
+            # per trained token, as in the collator
+            docs = [
+                d if "loss_weights" in d else {**d, "loss_weights": (d["labels"] != IGNORE_INDEX).float()} for d in docs
+            ]
         block = {k: torch.cat([d[k] for d in docs]) for k in docs[0]}
         n = block["input_ids"].numel()
         block["attention_mask"] = torch.ones(n, dtype=torch.long)
@@ -2534,11 +2546,8 @@ PRETOK_DATA = "train.parquet"
 PRETOK_META = "pretokenized_meta.json"
 
 
-def pretokenize_fingerprint(config, tokenizer) -> str:
-    """Stable SHA-256 over everything that changes the materialized token stream."""
-    import hashlib
-    import json as _json
-
+def _fingerprint_payload(config, tokenizer) -> dict:
+    """Everything that changes the materialized token stream (hashed by pretokenize_fingerprint)."""
     d = config.data
 
     def _src_sig(src: dict) -> dict:
@@ -2550,7 +2559,7 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
                 stat = [st.st_size, int(st.st_mtime)]
         except OSError:
             stat = None
-        return {
+        sig = {
             "dataset": src.get("dataset", ""),
             "split": src.get("split", "train"),
             "weight": src.get("weight", 1.0),
@@ -2562,6 +2571,9 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
             "chat_template_kwargs": src.get("chat_template_kwargs"),
             "stat": stat,
         }
+        if src.get("tools_field") is not None:  # only when set: existing caches stay valid
+            sig["tools_field"] = src["tools_field"]
+        return sig
 
     if d.sources:
         sources_sig = [_src_sig(s) for s in d.sources]
@@ -2591,7 +2603,22 @@ def pretokenize_fingerprint(config, tokenizer) -> str:
             payload[knob] = getattr(d, knob)
     if getattr(d, "repeat_unlikelihood", 0.0) or getattr(d, "stop_unlikelihood", 0.0):
         payload["unlikelihood_targets"] = True
-    blob = _json.dumps(payload, sort_keys=True, default=str).encode()
+    if getattr(d, "tools_field", "tools") != "tools":  # the tools a row declares are rendered into its prompt
+        payload["tools_field"] = d.tools_field
+    if getattr(d, "mix_epoch", "total") != "total":  # how many examples an epoch of the mix draws
+        payload["mix_epoch"] = d.mix_epoch
+    if getattr(d, "turn_scaling", "uniform") != "uniform":
+        # the cache stores the per-token loss weights: one written without them must be rebuilt, not read as uniform
+        payload["loss_weights"] = True
+    return payload
+
+
+def pretokenize_fingerprint(config, tokenizer) -> str:
+    """Stable SHA-256 over everything that changes the materialized token stream."""
+    import hashlib
+    import json as _json
+
+    blob = _json.dumps(_fingerprint_payload(config, tokenizer), sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()
 
 
@@ -2616,8 +2643,9 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
     """Iterate the assembled (masked/mixed/packed) stream once and write tensors to parquet.
 
     Writes ``{cache_dir}/train.parquet`` (columns: input_ids, attention_mask, labels,
-    and position_ids when packed) plus ``pretokenized_meta.json`` with the fingerprint
-    and exact sequence count. Returns the number of sequences written.
+    position_ids when packed, and loss_weights under data.turn_scaling: null for a
+    sequence without per-turn weights) plus ``pretokenized_meta.json`` with the
+    fingerprint and exact sequence count. Returns the number of sequences written.
     """
     import json as _json
 
@@ -2633,7 +2661,8 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
     writer: "pq.ParquetWriter | None" = None
     count = 0
     has_pos: bool | None = None
-    buf: dict[str, list] = {"input_ids": [], "attention_mask": [], "labels": [], "position_ids": []}
+    has_weights = getattr(config.data, "turn_scaling", "uniform") != "uniform"
+    buf: dict[str, list] = {"input_ids": [], "attention_mask": [], "labels": [], "position_ids": [], "loss_weights": []}
 
     def _flush():
         nonlocal writer
@@ -2646,6 +2675,8 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
         }
         if has_pos:
             cols["position_ids"] = buf["position_ids"]
+        if has_weights:  # typed: a first chunk of rows without weights would otherwise fix the column as null
+            cols["loss_weights"] = pa.array(buf["loss_weights"], type=pa.list_(pa.float32()))
         table = pa.table(cols)
         if writer is None:
             writer = pq.ParquetWriter(str(tmp), table.schema)
@@ -2662,6 +2693,9 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
             buf["labels"].append(ex["labels"].tolist())
             if has_pos:
                 buf["position_ids"].append(ex["position_ids"].tolist())
+            if has_weights:
+                weights = ex.get("loss_weights")
+                buf["loss_weights"].append(None if weights is None else weights.tolist())
             count += 1
             if len(buf["input_ids"]) >= 1000:
                 _flush()
@@ -2683,6 +2717,7 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
         "max_seq_length": config.data.max_seq_length,
         "packing": config.data.packing,
         "has_position_ids": bool(has_pos),
+        "has_loss_weights": has_weights,
     }
     meta_path.write_text(_json.dumps(meta, indent=2))
     return count
@@ -2707,15 +2742,15 @@ class PretokenizedDataset(_Epochs, IterableDataset):
         # epoch 0 is the cached order (already the materialized stream's); later epochs permute it
         shuffle = self.shuffle and self.epoch > 0
         dataset = _shard_then_shuffle(self.dataset, self.rank, self.world_size, 0, self.seed, shuffle, self.epoch)
-        for ex in dataset:
-            out = {
-                "input_ids": torch.as_tensor(ex["input_ids"], dtype=torch.long),
-                "attention_mask": torch.as_tensor(ex["attention_mask"], dtype=torch.long),
-                "labels": torch.as_tensor(ex["labels"], dtype=torch.long),
-            }
+        # Arrow -> tensors directly: decoding a row into Python lists first costs milliseconds per 4k-token sequence
+        for ex in dataset.with_format("torch"):
+            out = {k: ex[k].long() for k in ("input_ids", "attention_mask", "labels")}
             pos = ex.get("position_ids")
             if pos is not None:
-                out["position_ids"] = torch.as_tensor(pos, dtype=torch.long)
+                out["position_ids"] = pos.long()
+            weights = ex.get("loss_weights")  # data.turn_scaling; null for a sequence without per-turn weights
+            if weights is not None:
+                out["loss_weights"] = weights.float()
             yield out
 
 

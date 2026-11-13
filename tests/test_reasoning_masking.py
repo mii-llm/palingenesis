@@ -43,7 +43,7 @@ class FakeReasoningTokenizer:
         assert not tokenize, "test tokenizer only renders text"
         return text
 
-    def __call__(self, text, truncation=False, max_length=None, return_tensors=None):
+    def __call__(self, text, truncation=False, max_length=None, return_tensors=None, add_special_tokens=True):
         ids = [ord(c) for c in text]
         if truncation and max_length:
             ids = ids[:max_length]

@@ -167,3 +167,41 @@ if __name__ == "__main__":
             fn()
             print(f"OK {name}")
     print("ALL FALLBACK-OFFSET TESTS PASSED")
+
+
+def _bos_tok():
+    """A tokenizer that adds BOS to every encoding, under a template that writes BOS itself (the Llama / Mistral
+    arrangement): tokenising a rendered conversation with special tokens added gives two."""
+    from tokenizers.processors import TemplateProcessing
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    tok.add_special_tokens({"bos_token": "<s>", "additional_special_tokens": ["<|im_start|>", "<|im_end|>"]})
+    tok._tokenizer.post_processor = TemplateProcessing(single="<s> $A", special_tokens=[("<s>", tok.bos_token_id)])
+    tok.chat_template = (
+        "{{ bos_token }}{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n{% endfor %}"
+    )
+    tok.eos_token = "<|im_end|>"
+    tok.pad_token = tok.eos_token
+    return tok
+
+
+@needs_tok
+def test_progressive_masker_tokenises_the_render_like_the_template():
+    """The legacy masker must feed the model the ids apply_chat_template gives (one BOS), as the offset masker does."""
+    tok = _bos_tok()
+    assert tok("x")["input_ids"][0] == tok.bos_token_id  # the tokenizer does add BOS on its own
+    messages = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "hello there"},
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "sure thing"},
+    ]
+    ds = ChatDataset(None, tok, 256)
+    want = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_dict=True)["input_ids"]
+    offsets, progressive = ds._fallback_offsets(messages), ds._fallback_progressive(messages)
+    assert offsets["input_ids"].tolist() == want
+    assert progressive["input_ids"].tolist() == want
+    assert int((progressive["input_ids"] == tok.bos_token_id).sum()) == 1
+    trained = tok.decode(progressive["input_ids"][progressive["labels"] != IGNORE_INDEX])
+    assert "hello there" in trained and "sure thing" in trained and "question" not in trained
