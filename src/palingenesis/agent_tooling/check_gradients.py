@@ -33,7 +33,7 @@ def check_gradients(config: Config) -> dict:
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     model_dtype = dtype_map[config.model.torch_dtype]
 
-    print(f"Loading model: {config.model.name_or_path} ({model_dtype})")
+    print(f"Loading model: {config.model.name_or_path} ({model_dtype})", file=sys.stderr)
     model = AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path,
         dtype=model_dtype,
@@ -52,20 +52,31 @@ def check_gradients(config: Config) -> dict:
             break
 
     if not samples:
-        return {
+        return {  # every key print_report reads
             "issues": ["CRITICAL: No samples processed from dataset."],
             "loss": float("nan"),
             "total_grad_norm": 0.0,
+            "total_params": 0,
+            "params_with_grad": 0,
+            "zero_grad_params": 0,
+            "num_layers": 0,
+            "min_norm": 0,
+            "max_norm": 0,
+            "median_norm": 0,
             "dead_layers": [],
+            "tiny_grad_layers": [],
+            "huge_grad_layers": [],
+            "top_layers": [],
         }
 
     pad_id = tokenizer.pad_token_id or 0
     batch = collate_fn(samples, pad_id)
-    batch.pop("position_ids", None)  # packed rows: document masking is the trainer's job, not needed here
-    batch = {k: v.to(device) for k, v in batch.items()}
+    # The model's own inputs only: loss weights, unlikelihood targets and source tags belong to the trainer's
+    # losses, and for packed rows (position_ids) document masking is the trainer's job, not needed here.
+    batch = {k: batch[k].to(device) for k in ("input_ids", "attention_mask", "labels")}
 
     # Forward-backward
-    print("Running forward-backward pass...")
+    print("Running forward-backward pass...", file=sys.stderr)
     with torch.amp.autocast("cuda", dtype=model_dtype, enabled=config.train.bf16):
         outputs = model(**batch)
         loss = outputs.loss

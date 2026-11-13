@@ -15,7 +15,8 @@ Usage:
     # Full check (requires GPU — runs gradient check too)
     python -m palingenesis.agent_tooling.diagnose --config configs/llama3_8b.yaml --mode full
 
-Output: Structured JSON-compatible report suitable for agent consumption.
+Output: Structured JSON-compatible report suitable for agent consumption. Progress lines go to stderr, so with
+--json stdout holds the report and nothing else.
 """
 
 import json
@@ -25,12 +26,16 @@ import time
 from palingenesis.config import Config
 
 
+def _progress(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 def diagnose_pre(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     """Pre-training diagnostics — no GPU needed."""
     report = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": "pre", "checks": {}}
 
     # 1. Memory estimate
-    print("Running memory estimate...")
+    _progress("Running memory estimate...")
     from palingenesis.agent_tooling.profile_memory import estimate_memory
 
     mem = estimate_memory(config, gpu_memory_gb)
@@ -42,7 +47,7 @@ def diagnose_pre(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     }
 
     # 2. Masking validation
-    print("Running masking validation (50 samples)...")
+    _progress("Running masking validation (50 samples)...")
     from palingenesis.agent_tooling.validate_masking import validate
 
     masking = validate(config, num_samples=50)
@@ -78,15 +83,15 @@ def diagnose_post(config: Config, log_file: str) -> dict:
     report = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": "post", "checks": {}}
 
     # 1. Loss analysis
-    print(f"Analyzing loss from: {log_file}")
+    _progress(f"Analyzing loss from: {log_file}")
     from palingenesis.agent_tooling.check_loss import analyze_losses, parse_losses_from_text
 
     with open(log_file) as f:
         text = f.read()
     pairs = parse_losses_from_text(text)
     if pairs:
-        losses = [value for _, value in sorted(pairs)]
-        analysis = analyze_losses(losses)
+        pairs = sorted(pairs)
+        analysis = analyze_losses([value for _, value in pairs], steps=[step for step, _ in pairs])
         report["checks"]["loss"] = {
             "status": "pass" if analysis.healthy else "fail",
             "steps": analysis.total_steps,
@@ -113,7 +118,7 @@ def diagnose_full(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     import torch
 
     if torch.cuda.is_available():
-        print("Running gradient health check (1 forward-backward pass)...")
+        _progress("Running gradient health check (1 forward-backward pass)...")
         from palingenesis.agent_tooling.check_gradients import check_gradients
 
         grad_result = check_gradients(config)

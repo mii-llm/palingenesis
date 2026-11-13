@@ -11,8 +11,10 @@ Usage:
     python -m palingenesis.agent_tooling.inspect_batch --config configs/llama3_8b.yaml --num_samples 3
 
 Output: Colored text showing which tokens are trained on (green = loss computed,
-        gray = masked/ignored), plus statistics.
+        gray = masked/ignored), plus statistics. Exit code 1 when nothing is trained on.
 """
+
+import sys
 
 from palingenesis.agent_tooling._pipeline import load_tokenizer, training_samples
 from palingenesis.config import Config
@@ -27,7 +29,8 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 
-def inspect(config: Config, num_samples: int = 3):
+def inspect(config: Config, num_samples: int = 3) -> list[str]:
+    """Print the samples and the summary; returns the issues found (empty = healthy)."""
     tokenizer = load_tokenizer(config)
     chat_ds = training_samples(config, tokenizer)  # exactly what the trainer consumes
 
@@ -116,7 +119,7 @@ def inspect(config: Config, num_samples: int = 3):
     issues = []
     if total_trained == 0:
         issues.append(f"{RED}CRITICAL: No tokens are being trained on! Check chat template masking.{RESET}")
-    if total_trained == total_tokens:
+    elif total_trained == total_tokens:
         issues.append(f"{YELLOW}WARNING: ALL tokens are trained on — assistant masking may not be working.{RESET}")
     if total_trained / max(total_tokens, 1) < 0.05:
         issues.append(
@@ -129,6 +132,7 @@ def inspect(config: Config, num_samples: int = 3):
             print(f"  {issue}")
     else:
         print(f"\n  {GREEN}✓ Masking looks healthy{RESET}")
+    return issues
 
 
 def main():
@@ -140,7 +144,8 @@ def main():
     args = parser.parse_args()
 
     config = Config.from_yaml(args.config)
-    inspect(config, args.num_samples)
+    issues = inspect(config, args.num_samples)
+    sys.exit(1 if any("CRITICAL" in issue for issue in issues) else 0)
 
 
 if __name__ == "__main__":

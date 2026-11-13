@@ -219,3 +219,127 @@ def test_monitor_throughput_flags_sustained_drops_not_batch_variation():
     assert not any("Throughput" in i for i in analyze_run(parse_training_log("\n".join(varied)))["issues"])
     slowed = [f"step={i} loss=1.0 lr=1e-5 tok/s={900 if i <= 20 else 200} grad_norm=1 dt=1s" for i in range(1, 31)]
     assert any("Throughput dropped" in i for i in analyze_run(parse_training_log("\n".join(slowed)))["issues"])
+
+
+# ── diagnostics: cost, machine-readable output, exit codes ───────────────────
+
+
+def test_training_samples_do_not_buffer_a_length_group(tmp_path, model_dir, monkeypatch):
+    """Length grouping only reorders rows; with it, showing 3 samples tokenised a whole 512-row buffer."""
+    from palingenesis import data
+    from palingenesis.agent_tooling._pipeline import load_tokenizer, training_samples
+
+    rows = [
+        {"messages": [{"role": "user", "content": f"q {i}"}, {"role": "assistant", "content": f"a {i}"}]}
+        for i in range(600)
+    ]
+    config = _config(tmp_path, model_dir, rows, length_group_buffer=512)
+    config.train.per_device_batch_size = 4
+    calls = []
+    process = data.ChatDataset._process
+    monkeypatch.setattr(data.ChatDataset, "_process", lambda self, ex: calls.append(1) or process(self, ex))
+    stream = training_samples(config, load_tokenizer(config))
+    first = [next(stream) for _ in range(3)]
+    assert len(calls) == 3
+    assert [load_tokenizer(config).decode(s["input_ids"]).count("q ") for s in first] == [1, 1, 1]
+    assert config.data.length_group_buffer == 512  # the caller's config is left alone
+
+
+def _run(module, argv, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["pgs", *argv])
+    with pytest.raises(SystemExit) as exit_info:
+        module.main()
+    return exit_info.value.code
+
+
+def _yaml(tmp_path, config, **data):
+    import yaml
+
+    path = tmp_path / "c.yaml"
+    section = {"dataset": config.data.dataset, "streaming": False, "max_seq_length": 256, **data}
+    path.write_text(
+        yaml.safe_dump(
+            {"model": {"name_or_path": config.model.name_or_path, "torch_dtype": "float32"}, "data": section}
+        )
+    )
+    return str(path)
+
+
+def test_diagnose_json_prints_only_json_on_stdout(tmp_path, model_dir, monkeypatch, capsys):
+    from palingenesis.agent_tooling import diagnose
+
+    path = _yaml(tmp_path, _config(tmp_path, model_dir, CHATS))
+    code = _run(diagnose, ["--config", path, "--mode", "pre", "--json", "--gpu_memory_gb", "80"], monkeypatch)
+    report = json.loads(capsys.readouterr().out)  # progress lines go to stderr
+    assert report["mode"] == "pre" and report["checks"]["masking"]["samples_checked"] == 6
+    assert code == (0 if report["overall"] == "HEALTHY" else 1)
+    log = tmp_path / "train.log"
+    log.write_text(LOG)
+    _run(diagnose, ["--config", path, "--mode", "post", "--log_file", str(log), "--json"], monkeypatch)
+    assert json.loads(capsys.readouterr().out)["checks"]["loss"]["steps"] == 4
+
+
+USER_ONLY = [{"messages": [{"role": "user", "content": f"question {i}"}]} for i in range(4)]  # nothing to train on
+
+
+def test_inspect_exits_1_when_nothing_is_trained(tmp_path, model_dir, monkeypatch, capsys):
+    from palingenesis.agent_tooling import inspect_batch
+
+    bad = _yaml(tmp_path, _config(tmp_path, model_dir, USER_ONLY))
+    assert _run(inspect_batch, ["--config", bad], monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert "CRITICAL" in out and "ALL tokens" not in out
+    good = _yaml(tmp_path, _config(tmp_path, model_dir, CHATS))
+    assert _run(inspect_batch, ["--config", good, "--num_samples", "2"], monkeypatch) == 0
+
+
+def test_check_gradients_reports_an_empty_dataset(tmp_path, model_dir, monkeypatch, capsys):
+    from palingenesis.agent_tooling import check_gradients
+
+    bad = _yaml(tmp_path, _config(tmp_path, model_dir, USER_ONLY))
+    assert _run(check_gradients, ["--config", bad], monkeypatch) == 1  # used to die on a KeyError in the report
+    assert "CRITICAL: No samples" in capsys.readouterr().out
+
+
+def test_check_gradients_gives_the_model_only_its_inputs(tmp_path, model_dir, monkeypatch):
+    """With data.turn_scaling the collated batch also holds loss_weights, which is not a model input."""
+    from transformers import LlamaForCausalLM
+
+    from palingenesis.agent_tooling.check_gradients import check_gradients
+
+    two_turns = [
+        {
+            "messages": c["messages"]
+            + [{"role": "user", "content": "more"}, {"role": "assistant", "content": "a second answer"}]
+        }
+        for c in CHATS
+    ]
+    config = _config(tmp_path, model_dir, two_turns, turn_scaling="progressive")
+    config.model.torch_dtype = "float32"
+    config.train.bf16 = False
+    seen = {}
+    forward = LlamaForCausalLM.forward
+
+    def spy(self, *args, **kwargs):
+        seen["keys"] = sorted(kwargs)
+        return forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(LlamaForCausalLM, "forward", spy)
+    result = check_gradients(config)
+    assert seen["keys"] == ["attention_mask", "input_ids", "labels"]
+    assert result["loss"] > 0 and result["total_grad_norm"] > 0
+
+
+def test_check_loss_reports_logged_step_numbers():
+    from palingenesis.agent_tooling.check_loss import analyze_losses, parse_losses_from_text
+
+    lines = [f"step={10 * i} loss={'nan' if i == 7 else 1.0} lr=1e-5 tok/s=1 grad_norm=1 dt=1s" for i in range(1, 9)]
+    pairs = sorted(parse_losses_from_text("\n".join(lines)))
+    analysis = analyze_losses([v for _, v in pairs], steps=[s for s, _ in pairs])
+    assert analysis.nan_steps == [70]  # the logged step, not its position in the list (6)
+    assert "steps: [70]" in analysis.issues[0]
+    flat = [2.0] * 30 + [50.0] + [2.0] * 200
+    spiky = analyze_losses(flat, steps=[5 * (i + 1) for i in range(len(flat))])
+    assert spiky.spike_steps == [155]
+    assert spiky.plateau_ranges and spiky.plateau_ranges[-1][1] == 5 * len(flat)
+    assert analyze_losses(flat).spike_steps == [30]  # without step numbers: positions, as before

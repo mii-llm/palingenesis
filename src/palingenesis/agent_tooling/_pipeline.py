@@ -7,6 +7,7 @@ local files, multi-source mixes, prepared datasets, masking options and
 packing all behave as in training.
 """
 
+import dataclasses
 from collections.abc import Iterator
 
 from palingenesis.config import Config
@@ -46,6 +47,9 @@ def training_samples(config: Config, tokenizer) -> Iterator[dict]:
     from palingenesis.data import _load_dataset_source, build_dataset
 
     batch_size = config.train.per_device_batch_size
+    # Length grouping only reorders the rows, and fills a buffer (512 rows by default) before it yields the first:
+    # a diagnostic that looks at a few samples must not tokenise hundreds.
+    data = dataclasses.replace(config.data, length_group_buffer=0)
     if config.dpo.enabled:
         from palingenesis.dpo import PreferenceDataset
 
@@ -67,7 +71,7 @@ def training_samples(config: Config, tokenizer) -> Iterator[dict]:
             yield {**pair["rejected"], "side": "rejected"}
         return
     if config.data.sources:
-        yield from build_dataset(config.data, tokenizer, config.data, 0, 1, batch_size)
+        yield from build_dataset(data, tokenizer, data, 0, 1, batch_size)
         return
     raw = _load_dataset_source(dataset_id(config), config.data.dataset_split, config.data.streaming)
-    yield from build_dataset(raw, tokenizer, config.data, 0, 1, batch_size)
+    yield from build_dataset(raw, tokenizer, data, 0, 1, batch_size)

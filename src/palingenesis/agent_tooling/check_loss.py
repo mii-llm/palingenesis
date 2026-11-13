@@ -83,8 +83,14 @@ def parse_losses_from_text(text: str) -> list[tuple[int, float]]:
     return pairs
 
 
-def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
-    """Analyze a loss curve for common training pathologies."""
+def analyze_losses(losses: list[float], window: int = 20, steps: list[int] | None = None) -> LossAnalysis:
+    """Analyze a loss curve for common training pathologies.
+
+    steps: the logged step of each loss. With it, the steps reported (NaN / Inf, spikes, plateau ranges) are the
+    trainer's step numbers; without it they are positions in `losses`, which differ as soon as logging_steps > 1,
+    the run was resumed, or the log starts at step 1."""
+    if steps is not None and len(steps) != len(losses):
+        raise ValueError(f"analyze_losses: {len(steps)} steps for {len(losses)} losses")
     result = LossAnalysis()
     result.total_steps = len(losses)
     result.losses = losses
@@ -103,12 +109,15 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
         max(value for value in losses if math.isfinite(value)) if any(math.isfinite(value) for value in losses) else 0
     )
 
+    def step_of(i: int) -> int:
+        return steps[i] if steps is not None else i
+
     # Check NaN/Inf
     for i, value in enumerate(losses):
         if math.isnan(value):
-            result.nan_steps.append(i)
+            result.nan_steps.append(step_of(i))
         elif math.isinf(value):
-            result.inf_steps.append(i)
+            result.inf_steps.append(step_of(i))
 
     if result.nan_steps:
         result.issues.append(
@@ -121,7 +130,7 @@ def analyze_losses(losses: list[float], window: int = 20) -> LossAnalysis:
         result.healthy = False
 
     # Filter finite losses for remaining analysis
-    finite = [(i, value) for i, value in enumerate(losses) if math.isfinite(value)]
+    finite = [(step_of(i), value) for i, value in enumerate(losses) if math.isfinite(value)]
     if len(finite) < 5:
         return result
 
@@ -270,8 +279,8 @@ def main():
         print("ERROR: Could not parse any loss values from input.", file=sys.stderr)
         sys.exit(1)
 
-    losses = [value for _, value in sorted(pairs)]
-    analysis = analyze_losses(losses)
+    pairs = sorted(pairs)
+    analysis = analyze_losses([value for _, value in pairs], steps=[step for step, _ in pairs])
     print_report(analysis)
     sys.exit(0 if analysis.healthy else 1)
 
