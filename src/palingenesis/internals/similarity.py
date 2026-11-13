@@ -117,13 +117,19 @@ def compare_stores(
 
 
 def summarise_transfer(entry: dict) -> str:
-    """One line per layer for the CLI: CKA, cosine, and A->A / A->B / B->B AUROC."""
+    """One line per layer for the CLI: CKA, cosine, and A->A / A->B / B->B AUROC. An undefined value (stored as
+    null: e.g. the CKA of a residual that is the same for every row, as residual 0 is at last_prompt) prints "nan"."""
+
+    def num(value, spec: str = ".3f") -> str:
+        return format(value, spec) if isinstance(value, (int, float)) else "nan"
+
     t = entry.get("transfer")
-    base = f"cka {entry['cka']:.3f}  cos {entry['cosine']:.3f}  norm x{entry['norm_ratio']:.2f}"
+    base = f"cka {num(entry['cka'])}  cos {num(entry['cosine'])}  norm x{num(entry['norm_ratio'], '.2f')}"
     if not t:
         return base
-    f = lambda d: f"{d['auroc']:.3f}" if d.get("auroc") is not None else "  nan"  # noqa: E731
+    auroc = lambda d: num(d.get("auroc"))  # noqa: E731
     return (
         base
-        + f"  auroc A->A {f(t['a_on_a'])}  A->B {f(t['a_on_b'])}  B->B {f(t['b_on_b'])}  dir cos {t['direction_cosine']:.3f}"
+        + f"  auroc A->A {auroc(t['a_on_a'])}  A->B {auroc(t['a_on_b'])}  B->B {auroc(t['b_on_b'])}"
+        + f"  dir cos {num(t['direction_cosine'])}"
     )

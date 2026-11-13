@@ -298,6 +298,57 @@ def test_dataset_validation_report():
     print("✓ test_dataset_validation_report PASSED\n")
 
 
+_READ_FILE = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    },
+}
+
+
+def test_tool_validation_tolerates_arrow_null_fields():
+    """Arrow fills a struct field that a row lacks with None: `tool_calls` on a plain assistant turn, `properties`
+    / `required` on a tool without parameters. None of them is an error."""
+    from palingenesis.validate_data import validate_dataset, validate_tool_calls
+
+    sample = {
+        "messages": [
+            {"role": "user", "content": "hi", "tool_calls": None},
+            {"role": "assistant", "content": "hello", "tool_calls": None, "function_call": None},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "now", "arguments": None}}],
+            },
+        ],
+        "tools": [
+            _READ_FILE,
+            {"type": "function", "function": {"name": "now", "parameters": {"properties": None, "required": None}}},
+        ],
+    }
+    assert validate_tool_calls(sample) == []
+    report = validate_dataset([sample])
+    assert report["valid"] == 1 and report["tools_called"] == {"now": 1}
+    print("✓ test_tool_validation_tolerates_arrow_null_fields PASSED\n")
+
+
+def test_dataset_validation_counts_only_checked_samples_when_truncated():
+    """The scan stops at max_errors: samples it never looked at are not `valid`."""
+    from palingenesis.validate_data import validate_dataset
+
+    bad = {
+        "messages": [{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "nope"}}]}],
+        "tools": [_READ_FILE],
+    }
+    report = validate_dataset([bad] * 10, max_errors=3)
+    assert report["truncated"] is True
+    assert report["total"] == 10 and report["checked"] == 3 and report["valid"] == 0
+    full = validate_dataset([bad] * 2 + [{"messages": [{"role": "user", "content": "x"}]}], max_errors=50)
+    assert (full["total"], full["checked"], full["valid"], full["truncated"]) == (3, 3, 1, False)
+    print("✓ test_dataset_validation_counts_only_checked_samples_when_truncated PASSED\n")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("DATA VALIDATION TESTS")
@@ -314,6 +365,8 @@ if __name__ == "__main__":
     test_tool_validation_missing_required()
     test_tool_validation_no_tools_field()
     test_dataset_validation_report()
+    test_tool_validation_tolerates_arrow_null_fields()
+    test_dataset_validation_counts_only_checked_samples_when_truncated()
 
     print("=" * 60)
     print("ALL DATA VALIDATION TESTS PASSED ✓")

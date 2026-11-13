@@ -318,8 +318,9 @@ def validate_tool_calls(
     Returns:
         List of validation error strings (empty = valid)
     """
-    messages = sample.get(messages_field, [])
-    tools = sample.get(tools_field, [])
+    # `or`: a field that is present but None (Arrow fills missing struct fields) counts as absent, here and below
+    messages = sample.get(messages_field) or []
+    tools = sample.get(tools_field) or []
 
     if not tools:
         return []  # No tools declared — nothing to validate
@@ -339,7 +340,7 @@ def validate_tool_calls(
         if str(role).lower() not in ("assistant", "gpt", "ai", "model"):
             continue
 
-        tool_calls = msg.get("tool_calls", [])
+        tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
             # Check for function_call (OpenAI legacy)
             fc = msg.get("function_call")
@@ -439,8 +440,8 @@ def _extract_params(schema: dict) -> dict[str, dict]:
     if not isinstance(schema, dict):
         return {}
 
-    properties = schema.get("properties", {})
-    required_list = set(schema.get("required", []))
+    properties = schema.get("properties") or {}
+    required_list = set(schema.get("required") or [])
 
     params = {}
     for param_name, param_def in properties.items():
@@ -466,8 +467,9 @@ def validate_dataset(
     """Validate an entire dataset for tool-call consistency.
 
     Returns a report dict with:
-    - total: number of samples checked
-    - valid: number passing all checks
+    - total: number of samples given
+    - checked: number of samples looked at (fewer than total when the scan stopped at max_errors)
+    - valid: number of checked samples passing all checks
     - errors: list of (sample_index, error_message) tuples
     - tool_coverage: which tools are actually called vs declared
     """
@@ -475,12 +477,14 @@ def validate_dataset(
     tools_called: dict[str, int] = {}
     tools_declared: set[str] = set()
     samples_with_tools = 0
+    checked = 0
 
     for idx, sample in enumerate(samples):
         if len(errors) >= max_errors:
             break
+        checked += 1
 
-        tools = sample.get(tools_field, [])
+        tools = sample.get(tools_field) or []
         if tools:
             samples_with_tools += 1
             registry = _build_tool_registry(tools)
@@ -491,11 +495,11 @@ def validate_dataset(
             errors.append((idx, err))
 
         # Track which tools are actually called
-        messages = sample.get(messages_field, [])
+        messages = sample.get(messages_field) or []
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            for call in msg.get("tool_calls", []):
+            for call in msg.get("tool_calls") or []:
                 if isinstance(call, dict):
                     func = call.get("function", call)
                     if isinstance(func, dict):
@@ -508,7 +512,8 @@ def validate_dataset(
 
     return {
         "total": len(samples),
-        "valid": len(samples) - len(set(idx for idx, _ in errors)),
+        "checked": checked,
+        "valid": checked - len(set(idx for idx, _ in errors)),  # samples never looked at are not valid
         "samples_with_tools": samples_with_tools,
         "errors": errors[:max_errors],
         "tools_declared": sorted(tools_declared),

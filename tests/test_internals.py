@@ -578,3 +578,32 @@ def test_cli_capture_probe_compare_and_run(chat, tmp_path, capsys):
     mtime = (tmp_path / "run" / "acts" / "a" / "train" / "meta.json").stat().st_mtime
     assert main(["run", "--config", str(tmp_path / "run.yaml")]) == 0  # stores reused
     assert (tmp_path / "run" / "acts" / "a" / "train" / "meta.json").stat().st_mtime == mtime
+
+
+def test_compare_summary_prints_an_undefined_cka(tmp_path):
+    """A residual that is the same for every row has no CKA: at last_prompt, residual 0 is the embedding of the one
+    token every prompt ends with. The report stores null there and the CLI line must still print."""
+    from palingenesis.internals.similarity import summarise_transfer
+
+    def store(name, seed):
+        g = torch.Generator().manual_seed(seed)
+        meta = {
+            "model": {"weights_sha": name, "hidden_size": 8, "num_layers": 1},
+            "position": "last_prompt",
+            "layers": [0, 1],
+            "mixers": ["embedding", "attention"],
+            "dtype": "float32",
+        }
+        w = StoreWriter(tmp_path / name, meta)
+        rows = [{"row": i, "id": i, "label": float(i % 2), "group": None, "n_tokens": 5, "token": 4} for i in range(40)]
+        w.add({0: torch.full((40, 8), 0.37), 1: torch.randn(40, 8, generator=g)}, rows)
+        return w.close()
+
+    res = compare_stores(store("a", 0), store("b", 1), resamples=0)
+    constant = res["layers"][0]
+    assert constant["cka"] is None and constant["cosine"] == 1.0
+    line = summarise_transfer(constant)
+    assert line.startswith("cka nan  cos 1.000  norm x1.00")
+    assert "dir cos" in line  # the probe-transfer part prints too (its direction is undefined on a constant layer)
+    assert summarise_transfer(res["layers"][1]).startswith("cka ")
+    json.dumps(res)
