@@ -278,3 +278,14 @@ def test_cache_of_a_teacher_view_is_in_student_positions(tmp_path):
         lp = torch.log_softmax(teacher(input_ids=t_ids[None].to(device)).logits[0].float(), -1).cpu()
     q = sample["teacher_positions.big"][torch.from_numpy(np.array(doc.positions)).long()]
     np.testing.assert_array_equal(np.asarray(doc.ids), lp[q].topk(5, -1).indices.numpy())
+
+
+def test_vllm_teacher_reserves_only_the_documents_length():
+    """The vLLM backend's context is the longest document the teacher scores (+1 generated token): the view's limit when
+    a view is set, else the training sequence length; never the model's full context."""
+    from palingenesis.distill.build import teacher_max_len
+
+    config = SimpleNamespace(data=SimpleNamespace(max_seq_length=32768))
+    assert teacher_max_len(config, SimpleNamespace(max_seq_length=0), has_view=False) == 32768
+    assert teacher_max_len(config, SimpleNamespace(max_seq_length=0), has_view=True) == 65536
+    assert teacher_max_len(config, SimpleNamespace(max_seq_length=40000), has_view=True) == 40000

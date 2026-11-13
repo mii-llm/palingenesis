@@ -220,6 +220,14 @@ def score_vllm(llm, docs: list[dict], name: str, k: int, bridge, student_vocab: 
 # ─────────────────────────────────────────────────────────────── the build
 
 
+def teacher_max_len(config, spec, has_view: bool) -> int:
+    """Token limit of the documents the teacher scores: the teacher view's limit when a view is set (its own
+    max_seq_length, else twice the student's), else the training sequence length."""
+    if has_view:
+        return spec.max_seq_length or 2 * config.data.max_seq_length
+    return config.data.max_seq_length
+
+
 def build_cache(
     config,
     teacher: str,
@@ -283,7 +291,7 @@ def build_cache(
         raise ValueError(f"unknown backend {backend!r} (hf or vllm)")
 
     view = TeacherView(spec, bridge) if spec.has_view else None
-    views = [(view, teacher_tok, spec.max_seq_length or 2 * config.data.max_seq_length)] if view else None
+    views = [(view, teacher_tok, teacher_max_len(config, spec, True))] if view else None
     meta = CacheMeta(
         top_k=k,
         vocab_hash=vocab_fingerprint(tok),
@@ -303,6 +311,16 @@ def build_cache(
         from vllm import LLM
 
         options = {"gpu_memory_utilization": 0.85, **(vllm_options or {})}
+        if not options.get("max_model_len"):
+            # Prefill only: the longest document the teacher scores (its view's limit, else the training sequence
+            # length) plus the one generated token. Without it vLLM sizes the KV cache for the model's full context
+            # (262k for Qwen3.5 / 3.8), which a single GPU holding a large teacher cannot reserve.
+            options["max_model_len"] = teacher_max_len(config, spec, view is not None) + 1
+        # Prefill only (one generated token per document): a few documents at a time keep the GPU busy, and every
+        # sequence of a hybrid model (Mamba / Gated DeltaNet layers) needs its own recurrent-state block, so vLLM's
+        # serving default (256) does not fit next to a large teacher.
+        options.setdefault("max_num_seqs", 16)
+        options = {key: v for key, v in options.items() if v}
         llm = LLM(model=spec.model, tokenizer=spec.tokenizer or spec.model, max_logprobs=k, dtype=spec.dtype, **options)
 
     def score(batch):
@@ -380,6 +398,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lp_dtype", default="float16", choices=("float16", "float32"))
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.85, help="vllm")
     ap.add_argument("--tensor_parallel_size", type=int, default=1, help="vllm")
+    ap.add_argument(
+        "--max_model_len",
+        type=int,
+        default=0,
+        help="vllm: context length to reserve (default: the longest document the teacher scores + 1)",
+    )
+    ap.add_argument("--max_num_seqs", type=int, default=16, help="vllm: documents scored concurrently")
+    ap.add_argument(
+        "--max_num_batched_tokens",
+        type=int,
+        default=0,
+        help="vllm: prefill tokens per step (0 = vLLM's default); lower it if the full-vocabulary "
+        "prompt log-probs run out of memory",
+    )
     args, rest = ap.parse_known_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = Config.from_cli(["--config", args.config, *rest])
@@ -397,6 +429,9 @@ def main(argv: list[str] | None = None) -> int:
         vllm_options={
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "tensor_parallel_size": args.tensor_parallel_size,
+            "max_model_len": args.max_model_len,
+            "max_num_seqs": args.max_num_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
         },
     )
     print(stats)
