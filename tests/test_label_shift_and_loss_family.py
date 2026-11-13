@@ -225,6 +225,40 @@ def test_cadft_loss_masked_and_finite():
     print("✓ test_cadft_loss_masked_and_finite PASSED")
 
 
+def test_cadft_loss_one_row_is_dft():
+    """A batch of one row (train.batch_size: 1) has no spread to normalise by: the row keeps
+    weight 1, so the loss is DFT's, not NaN from the standard deviation of one value."""
+    from palingenesis.plugins import _dft_loss_fused, cadft_loss, compute_sample_compatibility
+
+    torch.manual_seed(5)
+    logits = torch.randn(1, 6, 11, requires_grad=True)
+    labels = torch.randint(0, 11, (1, 6))
+    labels[0, 0] = IGNORE_INDEX
+
+    assert compute_sample_compatibility(logits, labels, beta=1.0).tolist() == [1.0]
+    loss = cadft_loss(logits, labels, beta=1.0)
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(logits.grad).all()
+    torch.testing.assert_close(loss, _dft_loss_fused(logits.detach(), labels))
+
+
+def test_importing_plugins_does_not_load_the_compiler():
+    """The compiled losses are built on their first call: importing the module (every trainer
+    process does) must not pay for torch._dynamo."""
+    import subprocess
+
+    code = (
+        "import sys, torch, palingenesis.plugins as p\n"
+        "assert 'torch._dynamo.eval_frame' not in sys.modules, 'compiled at import'\n"
+        "assert p._compiled(p._dft_loss_fused) is p._compiled(p._dft_loss_fused)\n"
+    )
+    src = str(Path(__file__).parent.parent / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", f"import sys; sys.path.insert(0, {src!r})\n{code}"], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # INFOSFT: INFORMATION-AWARE TOKEN WEIGHTING
 # ══════════════════════════════════════════════════════════════════════════════

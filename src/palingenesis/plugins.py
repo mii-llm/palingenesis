@@ -22,6 +22,7 @@ Performance: All loss computations are compiled via torch.compile into fused
 kernels. Zero accuracy loss, pure speed.
 """
 
+import functools
 import logging
 import math
 
@@ -30,6 +31,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _compiled(fn):
+    """torch.compile(fn), built on the first call of a loss: compiling at import loaded
+    torch._dynamo (about a second) in every process that imports this module, whether or not
+    it uses a compiled loss. dynamic=True handles variable sequence lengths."""
+    return torch.compile(fn, dynamic=True)
 
 
 # ===== SYMNOISE =====
@@ -137,10 +146,6 @@ def _infosft_fused(logits: torch.Tensor, labels: torch.Tensor, logit_pbar: float
     return weighted.sum()
 
 
-# Compile for maximum fusion -- dynamic=True handles variable seq lengths
-_infosft_compiled = torch.compile(_infosft_fused, dynamic=True)
-
-
 def infosft_weighted_loss(
     logits: torch.Tensor, labels: torch.Tensor, p_bar: float = INFOSFT_PBAR_DEFAULT
 ) -> torch.Tensor:
@@ -151,7 +156,7 @@ def infosft_weighted_loss(
     """
     logit_pbar = math.log(p_bar / (1.0 - p_bar))
     try:
-        return _infosft_compiled(logits, labels, logit_pbar)
+        return _compiled(_infosft_fused)(logits, labels, logit_pbar)
     except Exception:
         return _infosft_fused(logits, labels, logit_pbar)
 
@@ -422,9 +427,6 @@ def chunked_deft_loss(
     )
 
 
-_deft_compiled = torch.compile(_deft_loss_fused, dynamic=True)
-
-
 def deft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """DEFT loss: parameter-free adaptive SFT objective.
 
@@ -438,7 +440,7 @@ def deft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     Returns: sum-reduced loss (divide by valid_tokens externally).
     """
     try:
-        return _deft_compiled(logits, labels)
+        return _compiled(_deft_loss_fused)(logits, labels)
     except Exception:
         return _deft_loss_fused(logits, labels)
 
@@ -493,9 +495,6 @@ def _dft_loss_fused(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return weighted.sum()
 
 
-_dft_compiled = torch.compile(_dft_loss_fused, dynamic=True)
-
-
 def dft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Dynamic Fine-Tuning loss with bounded gradient scaling.
 
@@ -505,7 +504,7 @@ def dft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     Returns: sum-reduced loss (divide by valid_tokens externally).
     """
     try:
-        return _dft_compiled(logits, labels)
+        return _compiled(_dft_loss_fused)(logits, labels)
     except Exception:
         return _dft_loss_fused(logits, labels)
 
@@ -553,9 +552,11 @@ def compute_sample_compatibility(logits: torch.Tensor, labels: torch.Tensor, bet
         c_raw = (loss_flat * valid_mask.float()).sum(dim=1) / token_counts  # [B]
 
         # Z-score normalization within batch
-        mu = c_raw.mean()
-        sigma = c_raw.std().clamp(min=1e-6)
-        c_hat = (c_raw - mu) / sigma
+        # (one row has no spread: std() is NaN there; it takes weight 1, as in the chunked loss)
+        if c_raw.numel() > 1:
+            c_hat = (c_raw - c_raw.mean()) / c_raw.std().clamp(min=1e-6)
+        else:
+            c_hat = torch.zeros_like(c_raw)
 
         # Exponential decay for incompatible samples
         weights = torch.exp(-beta * c_hat.clamp(min=0.0))  # [B], in (0, 1]
@@ -764,9 +765,6 @@ def _pre_rl_loss_inner(
     return total
 
 
-_pre_rl_compiled = torch.compile(_pre_rl_loss_inner, dynamic=True)
-
-
 def pre_rl_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -795,7 +793,7 @@ def pre_rl_loss(
         Scalar loss
     """
     try:
-        return _pre_rl_compiled(
+        return _compiled(_pre_rl_loss_inner)(
             logits,
             labels,
             ref_logits,
