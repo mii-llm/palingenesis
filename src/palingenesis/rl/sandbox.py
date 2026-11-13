@@ -136,6 +136,7 @@ class _Container:
         self.pending: dict[int, asyncio.Future] = {}
         self.reader: asyncio.Task | None = None
         self.write_lock = asyncio.Lock()
+        self.restart_lock = asyncio.Lock()  # one restart at a time: `slots` jobs may find it dead together
         self.jobs = 0
 
     async def start(self) -> None:
@@ -294,9 +295,10 @@ class DockerSandbox:
     async def _one(self, job: ExecJob) -> ExecResult:
         container = min(self.containers, key=lambda c: len(c.pending))
         async with container.slots:
-            if not container.alive or (container.jobs >= self.RECYCLE_AFTER and not container.pending):
-                await container.stop()
-                await container.start()
+            async with container.restart_lock:  # the check again under the lock: another job may have restarted it
+                if not container.alive or (container.jobs >= self.RECYCLE_AFTER and not container.pending):
+                    await container.stop()
+                    await container.start()
             return ExecResult.from_worker(await container.submit(job.payload(next(self.ids))))
 
     async def run(self, jobs: list[ExecJob]) -> list[ExecResult]:

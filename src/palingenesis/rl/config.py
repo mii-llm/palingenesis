@@ -598,8 +598,10 @@ class RLConfig:
             errors.append("loss.kl_coef and loss.kl_ref_reset must be >= 0.")
         if (loss.kl_coef > 0 or loss.kl_ref_reset > 0) and not loss.kl_ref:
             errors.append('loss.kl_coef / kl_ref_reset need loss.kl_ref ("start" or a checkpoint).')
-        if loss.kl_ref and self.train.fsdp:
-            errors.append("loss.kl_ref is not supported with train.fsdp yet.")
+        # FSDP2 shards the policy with train.fsdp, with train.cpu_offload and under torchrun (rl.parallel)
+        sharded = t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"
+        if loss.kl_ref and sharded:
+            errors.append("loss.kl_ref is not supported with FSDP yet (train.fsdp, train.cpu_offload, torchrun).")
         if not 0 < loss.eps_low < 1 or loss.eps_high <= 0:
             errors.append("loss.eps_low must be in (0, 1) and loss.eps_high > 0.")
         if loss.is_cap < 1:
@@ -665,8 +667,11 @@ class RLConfig:
             errors.append("train.steps and train.micro_tokens must be >= 1.")
         if self.cmr.enabled:
             errors += self.cmr.validate()
-            if self.train.fsdp:
-                errors.append("cmr is single-GPU only (the update correction needs the full parameters); turn off fsdp")
+            if sharded:
+                errors.append(
+                    "cmr is single-GPU only (the update correction needs the full parameters); turn off fsdp "
+                    "(train.fsdp, train.cpu_offload, torchrun)"
+                )
         if t.learning_rate > 1e-5:
             warnings.append(f"train.learning_rate {t.learning_rate}: RL recipes use 5e-7 to 2e-6.")
 

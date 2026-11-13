@@ -1171,6 +1171,7 @@ def test_eval_reports_per_family_metrics_on_the_fixed_rows():
     pipe.config, pipe.env_pool, pipe.lock = config, None, threading.RLock()
     pipe.weights = SimpleNamespace(sync=lambda engine: None)
     pipe.engine = SimpleNamespace(wake=lambda: None, sleep=lambda: None)
+    pipe.client = SimpleNamespace(paused=threading.Lock)
 
     def traj(source, reward, n):
         t = Trajectory({"source": source}, 0, [1], [], tokens=[1] * n, mask=[True] * n, finish="stop")
@@ -1773,3 +1774,171 @@ def test_temperature_scales_the_fp32_logits_not_the_bf16_hidden_state(softcap):
         with torch.no_grad():
             old, _ = target_logprobs(hidden * inv_t, head, targets)
         assert (old.double() - reference).abs().mean() > 10 * (lp.double() - reference).abs().mean()
+
+
+# --------------------------------------------------------------------- engine pauses, greedy requests, restarts
+
+
+def test_greedy_streaming_requests_are_never_merged():
+    """vLLM refuses n > 1 without sampling: identical greedy requests (duplicate held-out prompts at
+    eval_temperature 0) stay one request each."""
+    from palingenesis.rl.generation import GenerationClient
+
+    engine = _StreamingEngine()
+    client = GenerationClient(engine)
+
+    async def main():
+        return await asyncio.gather(*(client.generate([7, 7], 8, 0.0) for _ in range(3)))
+
+    try:
+        outs = asyncio.run(main())
+    finally:
+        client.close()
+    assert engine.added == [((7, 7), 1)] * 3 and [o.ids for o in outs] == [[7]] * 3
+
+
+def test_evaluation_loads_weights_between_engine_steps():
+    """Groups of the last batch may still be decoding when an evaluation starts (max_staleness > 0): the weights are
+    loaded with the engine paused, as before a training batch."""
+    from palingenesis.rl.generation import GenerationClient
+    from palingenesis.rl.pipeline import RLPipeline
+
+    engine = _StreamingEngine()
+    client = GenerationClient(engine)
+    loop = asyncio.new_event_loop()
+    client.inbox.put(([1] * 100_000, 8, 1.0, loop.create_future(), loop))  # a rollout that outlives the test
+    deadline = time.time() + 5
+    while not engine.live and time.time() < deadline:
+        time.sleep(0.001)
+    steps = []
+
+    def sync(_engine):
+        (state,) = engine.live.values()
+        before = state[0]
+        time.sleep(0.05)
+        steps.append(before - state[0])
+
+    pipe = RLPipeline.__new__(RLPipeline)
+    pipe.config, pipe.env_pool, pipe.lock, pipe.client = RLConfig(), None, threading.RLock(), client
+    pipe.weights = SimpleNamespace(sync=sync)
+    pipe.engine = SimpleNamespace(wake=lambda: None, sleep=lambda: None)
+    pipe._await = lambda coro: (coro.close(), [])[1]
+    try:
+        pipe.evaluate([], 0.0)
+        (state,) = engine.live.values()
+        before = state[0]
+        time.sleep(0.05)
+        assert state[0] < before  # and the engine steps again afterwards
+    finally:
+        client.close()
+        loop.close()
+    assert steps == [0]
+
+
+def test_fsdp_weight_push_pauses_the_engine():
+    from palingenesis.opd.rollout import VLLMColocateRollout
+    from palingenesis.rl.trainer import RLTrainer
+
+    engine_lock, held = threading.Lock(), []
+    trainer = object.__new__(RLTrainer)
+    trainer.engine = object.__new__(VLLMColocateRollout)
+    trainer.engine.update_weights = lambda named, version: held.append((engine_lock.locked(), version))
+    trainer.model = torch.nn.Linear(1, 1)
+    trainer.parallel = SimpleNamespace(full_parameters=lambda model: iter(()))
+    trainer.pipeline = SimpleNamespace(lock=threading.RLock(), client=SimpleNamespace(paused=lambda: engine_lock))
+    trainer._push_weights(3)
+    assert held == [(True, 3)] and not engine_lock.locked()
+
+
+def test_zero_weight_pass_shares_the_cast_head_weight(monkeypatch):
+    """A rank with fewer micro-batches than the others pads with zero-weight passes: they use the step's bf16 copy
+    of the head, not a cast of their own."""
+    from test_seco import MODELS
+
+    from palingenesis.logits import output_head
+    from palingenesis.rl import trainer as trainer_module
+    from palingenesis.rl.losses import LowPrecisionWeight
+    from palingenesis.rl.parallel import Parallel
+
+    torch.manual_seed(0)
+    model = MODELS["gpt2"]()
+    group = []
+    for k in range(2):
+        t = Trajectory({}, 0, [5, 6, 7], [])
+        t.append_generated([8 + k, 9, 10], [-1.0, -1.0, -1.0], version=0)
+        t.reward = float(k)
+        group.append(t)
+    trainer = object.__new__(trainer_module.RLTrainer)
+    trainer.config = RLConfig()
+    trainer.config.set("train.prompt_sharing", "off")
+    trainer.parallel, trainer.device, trainer.pad_id = Parallel(fsdp=False), "cpu", 0
+    trainer.parallel.max = lambda n: n + 1  # another rank has one more micro-batch
+    trainer.model, trainer.head, trainer.head_weight = model, output_head(model), LowPrecisionWeight()
+    trainer.weights = SimpleNamespace(version=0)
+    lows = []
+
+    def spy(hidden, head, targets, entropy=False, low=None, scale=1.0):
+        lows.append(low)
+        return target_logprobs(hidden, head, targets, entropy, low, scale)
+
+    monkeypatch.setattr(trainer_module, "target_logprobs", spy)
+    trainer._train_step([group])
+    assert len(lows) == 2 and all(low is trainer.head_weight for low in lows)
+
+
+def test_kl_ref_and_cmr_are_refused_whenever_the_policy_is_sharded(monkeypatch):
+    """FSDP2 is on with train.fsdp, with train.cpu_offload and under torchrun: all three are refused."""
+
+    def errors(**options):
+        config = RLConfig()
+        for key, value in {"model.policy": "x", "data.dataset": "d.jsonl", "rewards.m.fn": "math", **options}.items():
+            config.set(key.replace("__", "."), value)
+        try:
+            config.validate()
+        except RLConfigError as e:
+            return str(e)
+        return ""
+
+    assert "kl_ref is not supported" not in errors(loss__kl_ref="start")
+    assert "kl_ref is not supported" in errors(loss__kl_ref="start", train__fsdp=True)
+    assert "kl_ref is not supported" in errors(loss__kl_ref="start", train__cpu_offload=True)
+    assert "cmr is single-GPU only" in errors(cmr__enabled=True, train__cpu_offload=True)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    assert "kl_ref is not supported" in errors(loss__kl_ref="start")
+    assert "cmr is single-GPU only" in errors(cmr__enabled=True)
+
+
+def test_docker_sandbox_restarts_a_dead_container_once(monkeypatch):
+    """Several jobs may find a container dead (or due for recycling) together: one of them restarts it."""
+    from palingenesis.rl import sandbox as sandbox_module
+
+    class Container(sandbox_module._Container):
+        up, starts = False, 0
+
+        @property
+        def alive(self):
+            return self.up
+
+        async def start(self):
+            await asyncio.sleep(0)
+            self.up, self.starts, self.jobs = True, self.starts + 1, 0
+
+        async def stop(self):
+            await asyncio.sleep(0)
+            self.up = False
+
+        async def submit(self, payload):
+            await asyncio.sleep(0)
+            self.jobs += 1
+            return {"status": "ok"}
+
+    monkeypatch.setattr(sandbox_module.shutil, "which", lambda name: "/usr/bin/docker")
+
+    async def main():
+        box = sandbox_module.DockerSandbox(workers=1, slots=4)
+        box.containers = [Container([], 4)]
+        results = await asyncio.gather(*(box._one(sandbox_module.ExecJob({})) for _ in range(4)))
+        return box.containers[0], results
+
+    container, results = asyncio.run(main())
+    assert container.starts == 1 and [r.status for r in results] == ["ok"] * 4

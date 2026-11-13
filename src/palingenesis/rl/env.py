@@ -140,7 +140,8 @@ def env_tools(env: Any) -> dict[str, Callable]:
     return tools
 
 
-async def call_sync_or_async(fn: Callable, *args, **kwargs) -> Any:
+async def call_sync_or_async(fn: Callable, /, *args, **kwargs) -> Any:
+    # fn is positional-only: a tool argument or a dataset column may itself be named "fn"
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
     return await asyncio.get_running_loop().run_in_executor(None, lambda: fn(*args, **kwargs))

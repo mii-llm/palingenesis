@@ -912,3 +912,21 @@ def test_stop_resample_is_refused_in_a_training_config():
         config.set("rollout.stop_resample", value)
         with pytest.raises(RLConfigError, match=message):
             config.validate()
+
+
+def test_a_tool_argument_named_fn_is_a_tool_error_not_a_crash():
+    """The policy chooses argument names: one that collides with a helper's own parameter is answered like any other
+    wrong argument, and a tool that takes `fn` receives it."""
+    from palingenesis.rl.env import call_sync_or_async, run_tool
+
+    class Env:
+        def search(self, query: str) -> str:
+            return query
+
+        def apply(self, fn: str) -> str:
+            return f"applied {fn}"
+
+    text, failed = asyncio.run(run_tool(Env(), "search", {"fn": "x"}, 5))
+    assert failed and text.startswith("Error:") and "fn" in text
+    assert asyncio.run(run_tool(Env(), "apply", {"fn": "abs"}, 5)) == ("applied abs", False)
+    assert asyncio.run(call_sync_or_async(lambda **row: sorted(row), fn=1, prompt="p")) == ["fn", "prompt"]

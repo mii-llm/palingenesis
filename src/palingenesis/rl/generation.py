@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from palingenesis.accelerator import on_current_device
-from palingenesis.opd.rollout import RolloutEngine
+from palingenesis.opd.rollout import RolloutEngine, samplings
 
 
 @dataclass
@@ -125,7 +125,9 @@ class GenerationClient:
         nothing is in flight)."""
         groups: dict[tuple, list] = {}
         for i, (prompt, budget, temperature, future, loop) in enumerate(items):
-            key = (tuple(prompt), budget, temperature) if self.merge else (tuple(prompt), budget, temperature, i)
+            # greedy requests stay separate: vLLM refuses n > 1 without sampling
+            merge = self.merge and samplings(temperature, 1)[0].temperature > 0
+            key = (tuple(prompt), budget, temperature) if merge else (tuple(prompt), budget, temperature, i)
             groups.setdefault(key, []).append((future, loop))
         for (prompt, budget, temperature, *_), waiters in groups.items():
             request_id = str(next(self.ids))

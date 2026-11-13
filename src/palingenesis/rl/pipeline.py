@@ -671,7 +671,8 @@ class RLPipeline:
         family's trend is not confounded by which prompts training happened to sample (training-time family curves
         are)."""
         with self.lock:
-            self.weights.sync(self.engine)
+            with self.client.paused():  # groups still decoding from the last batch: load between engine steps
+                self.weights.sync(self.engine)
             self.engine.wake()
             groups = self._await(self._eval(rows, temperature))
             self.engine.sleep()

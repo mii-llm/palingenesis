@@ -471,7 +471,9 @@ class RLTrainer:
             if micro is None:  # this rank ran out: a zero-weight pass keeps the collectives in step
                 with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                     hidden = final_hidden_states(self.model, torch.full((1, 2), self.pad_id, device=device), None)
-                lp, _ = target_logprobs(hidden[0, -1:], self.head, torch.tensor([self.pad_id], device=device))
+                lp, _ = target_logprobs(
+                    hidden[0, -1:], self.head, torch.tensor([self.pad_id], device=device), low=self.head_weight
+                )
                 (lp.sum() * 0.0).backward()
                 continue
             ids, _ = right_pad([t.prompt_ids + t.tokens[:-1] for t in micro], self.pad_id, device)
@@ -627,7 +629,9 @@ class RLTrainer:
         this rank's engine, on the trainer thread. Seconds spent."""
         start = time.perf_counter()
         if isinstance(self.engine, VLLMColocateRollout):
-            with self.pipeline.lock:  # the engine is between batches
+            # no batch is being collected and the engine does not step: partial rollouts (max_staleness > 0) keep
+            # decoding between batches, and continue with the new weights
+            with self.pipeline.lock, self.pipeline.client.paused():
                 named = checkpoint_named_parameters(self.model, self.parallel.full_parameters(self.model))
                 self.engine.update_weights(named, version)
         else:
