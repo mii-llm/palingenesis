@@ -144,7 +144,14 @@ def arrow_row_sizes(table) -> "list[int]":
 
     def add(array, owner):
         if isinstance(array, pa.ChunkedArray):
-            array = array.combine_chunks()
+            # chunk by chunk: combining them overflows 32-bit offsets past 2 GiB of strings
+            start = 0
+            for chunk in array.chunks:
+                add(chunk, owner[start : start + len(chunk)])
+                start += len(chunk)
+            return
+        if isinstance(array, pa.ExtensionArray):  # e.g. `datasets`' Json columns: size their storage
+            array = array.storage
         t = array.type
         if pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_binary(t) or pa.types.is_large_binary(t):
             lengths = pc.fill_null(pc.binary_length(array), 0).to_numpy(zero_copy_only=False)
@@ -154,7 +161,7 @@ def arrow_row_sizes(table) -> "list[int]":
             add(pc.list_flatten(array), owner[parents])
         elif pa.types.is_struct(t):
             for i in range(t.num_fields):
-                add(array.field(i), owner)
+                add(pc.struct_field(array, [i]), owner)  # field() ignores a sliced chunk's offset
 
     for column in table.columns:
         add(column, np.arange(n))
@@ -175,9 +182,10 @@ def census(dataset_id: str, split: str = "train", dataset: Any = None) -> Census
         table = dataset.data.table if hasattr(dataset, "data") else None
         if table is None:
             return None
+        sizes = arrow_row_sizes(table)
         if getattr(dataset, "_indices", None) is not None:
-            table = table.take(dataset._indices.column(0))
-        return _census_of_sizes(arrow_row_sizes(table))
+            sizes = [sizes[i] for i in dataset._indices.column(0).to_pylist()]
+        return _census_of_sizes(sizes)
     path = local_file(dataset_id)
     if path is None:
         return None
@@ -279,9 +287,21 @@ def _jsonl_sample(path: Path, k: int, rng: random.Random) -> Sample:
     return Sample(rows, sizes, weights)
 
 
-def _arrow_sample(table, k: int, rng: random.Random) -> Sample:
-    take = sorted(rng.sample(range(table.num_rows), min(k, table.num_rows)))
-    part = table.take(take)
+def take_rows(table, rows: "list[int]"):
+    """table.take(rows) without combining chunks (Table.take does, and that overflows 32-bit
+    offsets past 2 GiB of strings): one zero-copy slice per row."""
+    import pyarrow as pa
+
+    if not rows:
+        return table.slice(0, 0)
+    return pa.concat_tables([table.slice(int(i), 1) for i in rows])
+
+
+def _arrow_sample(table, k: int, rng: random.Random, rows: "list[int] | None" = None) -> Sample:
+    """k rows of the table, or of its `rows` (a dataset's index mapping) when given."""
+    n = table.num_rows if rows is None else len(rows)
+    take = sorted(rng.sample(range(n), min(k, n)))
+    part = take_rows(table, take if rows is None else [rows[i] for i in take])
     return Sample(part.to_pylist(), arrow_row_sizes(part), [1.0] * len(take))
 
 
@@ -307,10 +327,9 @@ def sample_rows(dataset_id: str, split: str, k: int, seed: int, dataset: Any = N
     rng = random.Random(seed)
     if dataset is not None and not _is_streaming_obj(dataset):
         table = dataset.data.table
-        if getattr(dataset, "_indices", None) is not None:
-            table = table.take(dataset._indices.column(0))
-        sample = _arrow_sample(table, k, rng)
-        sample.exhaustive = table.num_rows <= k
+        rows = dataset._indices.column(0).to_pylist() if getattr(dataset, "_indices", None) is not None else None
+        sample = _arrow_sample(table, k, rng, rows)
+        sample.exhaustive = (table.num_rows if rows is None else len(rows)) <= k
         return sample
     if dataset is None:
         path = local_file(dataset_id)

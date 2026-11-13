@@ -50,6 +50,55 @@ def test_count_rows_and_uniform_jsonl_sampling(tmp_path):
     assert abs(exact - 0.5) < 0.005 and error < 0.005  # size-stratified: known from the census
 
 
+def test_arrow_row_sizes_go_chunk_by_chunk():
+    # a chunked table (as a large dataset loads) sizes like the same rows in one chunk; chunks are not
+    # combined, which overflows 32-bit offsets past 2 GiB of strings
+    import pyarrow as pa
+
+    rows = [
+        {
+            "messages": [{"role": "user", "content": "x" * (i % 7)}, {"role": "assistant", "content": "yy" * i}],
+            "src": "s" * i,
+        }
+        for i in range(10)
+    ]
+    whole = pa.Table.from_pylist(rows)
+    chunked = pa.concat_tables([pa.Table.from_pylist(rows[:3]), pa.Table.from_pylist(rows[3:])])
+    sliced = pa.concat_tables([whole.slice(0, 4), whole.slice(4)])
+    expected = [len("user") + i % 7 + len("assistant") + 2 * i + i for i in range(10)]
+    assert data_size.arrow_row_sizes(whole) == expected
+    assert data_size.arrow_row_sizes(chunked) == expected
+    assert data_size.arrow_row_sizes(sliced) == expected
+
+
+def test_arrow_row_sizes_count_extension_columns():
+    # `datasets` stores free-form JSON as an Arrow extension type: its storage strings are the row's size
+    import pyarrow as pa
+
+    if not hasattr(pa, "json_"):
+        pytest.skip("pyarrow without the JSON extension type")
+    texts = ['{"a": 1}', '{"content": "hello"}']
+    values = pa.ExtensionArray.from_storage(pa.json_(), pa.array([texts[0], texts[1], texts[0]]))
+    table = pa.table({"messages": pa.ListArray.from_arrays(pa.array([0, 1, 3], pa.int32()), values)})
+    assert data_size.arrow_row_sizes(table) == [len(texts[0]), len(texts[1]) + len(texts[0])]
+
+
+def test_sampling_and_census_follow_a_datasets_index_mapping():
+    # a shuffled / selected dataset keeps its table and an index mapping: sampled rows and sizes are the mapped rows'
+    datasets = pytest.importorskip("datasets")
+    import pyarrow as pa
+
+    rows = [{"text": "z" * (i + 1)} for i in range(12)]
+    dataset = datasets.Dataset(
+        pa.concat_tables([pa.Table.from_pylist(rows[:5]), pa.Table.from_pylist(rows[5:])])
+    ).select([11, 2, 7, 3])
+    assert dataset._indices is not None
+    sample = data_size.sample_rows("x", "train", 10, 0, dataset)
+    assert sample.exhaustive and sorted(r["text"] for r in sample.rows) == sorted(r["text"] for r in dataset)
+    assert sorted(sample.sizes) == [3, 4, 8, 12]
+    assert data_size.census("x", "train", dataset).rows == 4
+
+
 def test_local_jsonl_stream_shards_cover_every_line_once(tmp_path):
     rows = [{"id": i, "text": "y" * (i % 50)} for i in range(3001)]
     path = _write_jsonl(tmp_path / "d.jsonl", rows)
