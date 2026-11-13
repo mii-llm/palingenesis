@@ -53,12 +53,13 @@
   justify-content: space-between;
 }
 .pg-hero__lead {
-  max-width: 36rem;
+  max-width: 34rem;
   margin: 0;
-  color: var(--pg-text-2);
-  font-family: var(--pg-font-serif);
-  font-size: 1.16rem;
-  line-height: 1.42;
+  color: var(--pg-text);
+  font-size: 1.08rem;
+  font-weight: 400;
+  letter-spacing: -0.022em;
+  line-height: 1.38;
   text-wrap: pretty;
 }
 .pg-hero__actions {
@@ -132,10 +133,11 @@
   display: none;
   margin: 2rem 0 0;
   border: 1px solid var(--pg-text);
-  border-radius: var(--pg-radius);
+  border-radius: 8px;
   background: var(--pg-bg);
   color: var(--pg-text);
   text-align: left;
+  overflow: hidden;
 }
 .pg-js .pg-console {
   display: block;
@@ -452,12 +454,12 @@
 .pg-home .pg-body > div > :first-child {
   margin-top: 0;
 }
+/* As in the guides: titles in the serif, third-level headings in the text face */
 .pg-home h3 {
   margin: 0 0 0.4rem;
-  font-family: var(--pg-font-serif);
-  font-size: 1.2rem;
-  font-weight: 400;
-  letter-spacing: -0.01em;
+  font-size: 0.86rem;
+  font-weight: 600;
+  letter-spacing: -0.012em;
 }
 
 /* Recipes without JavaScript: one per row */
@@ -564,7 +566,7 @@
     padding-top: 2rem;
   }
   .pg-hero__lead {
-    font-size: 1.02rem;
+    font-size: 0.96rem;
   }
   .pg-console {
     margin-top: 2rem;

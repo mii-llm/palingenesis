@@ -6,7 +6,7 @@
        marks state: where you are, what is focused, what warns. A blue and a
        green join it in code, and nowhere else.
      - Structure comes from hairlines, alignment and type size. No cards,
-       no shadows, no gradients, square corners.
+       no shadows, no gradients, corners only slightly rounded.
      - Three typefaces, each with one job: Newsreader for titles, Geist for
        text and interface, JetBrains Mono for code and small labels.
      - Motion is a short fade when a page arrives, and nothing else.
@@ -55,7 +55,8 @@
   --pg-font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --pg-font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
 
-  --pg-radius: 2px;
+  --pg-radius: 6px;
+  --pg-radius-small: 4px;
   --pg-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --pg-fast: 120ms;
   --pg-slow: 360ms;
@@ -388,7 +389,7 @@ body {
 
 .md-typeset code {
   padding: 0.1em 0.32em;
-  border-radius: var(--pg-radius);
+  border-radius: var(--pg-radius-small);
   font-size: 0.84em;
   font-variant-ligatures: none;
   word-break: normal;
