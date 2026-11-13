@@ -280,6 +280,17 @@ class TrainResult:
     best_step: int | None = None
 
 
+def _per_source_eval(metrics: dict) -> str:
+    """' eval_sources=name:loss,...' for the log line when per-source eval sets are configured (eval_sources), so
+    forgetting on one source shows in the plain log, not only in the tracker."""
+    parts = [
+        f"{k[len('eval/'):-len('/loss')]}:{v:.4f}"
+        for k, v in sorted(metrics.items())
+        if k.startswith("eval/") and k.endswith("/loss") and k.count("/") == 2
+    ]
+    return f" eval_sources={','.join(parts)}" if parts else ""
+
+
 def train(config: Config, plugins: list | None = None) -> TrainResult:
     """Run SFT / DPO / off-policy distillation training to completion and return a TrainResult.
 
@@ -1102,7 +1113,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         baseline = _evaluate()
         if baseline:
             tracker.log(baseline, step=0)
-            logger.info(f"step=0 eval={baseline['eval/loss']:.4f} (before training)")
+            logger.info(f"step=0 eval={baseline['eval/loss']:.4f}{_per_source_eval(baseline)} (before training)")
 
     # ── Training Loop ─────────────────────────────────────────────────────
     _effective_batch = config.train.per_device_batch_size * data_world * config.train.gradient_accumulation_steps
@@ -1718,7 +1729,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
                     tracker.log(metrics, step=global_step)
                     if is_main():
-                        eval_str = f" eval={metrics.get('eval/loss', 0):.4f}" if "eval/loss" in metrics else ""
+                        eval_str = (
+                            f" eval={metrics.get('eval/loss', 0):.4f}{_per_source_eval(metrics)}"
+                            if "eval/loss" in metrics
+                            else ""
+                        )
                         entropy_str = (
                             f" entropy={metrics['health/output_entropy']:.2f}"
                             if "health/output_entropy" in metrics
@@ -1766,6 +1781,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         is_fsdp,
                         epoch=epoch,
                         micro_step=micro_step,
+                        keep_latest_k=config.train.keep_checkpoints,
                     )
 
                 # ── Base Model Merge (SFA: anti-forgetting) ───────────

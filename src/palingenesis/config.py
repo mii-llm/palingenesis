@@ -199,6 +199,9 @@ class TrainConfig:
 
     seed: int = 42
     save_steps: int = 500
+    # Step checkpoints kept on disk (the oldest are deleted after each save; best/ and final/ are never deleted).
+    # 0 keeps all. A full checkpoint holds the weights and the optimizer state (about 3x the fp32 weights for AdamW).
+    keep_checkpoints: int = 5
     save_final: bool = True  # write the final model at the end (off for dry runs such as `pgs profile --measure`)
     logging_steps: int = 1
     bf16: bool = True
@@ -525,6 +528,8 @@ class Config:
         ]:
             if tags and not valid_think_tags(tags):
                 errors.append(f"{where} must be two different non-empty strings [open, close], got {tags!r}.")
+        if self.train.keep_checkpoints < 0:
+            errors.append(f"train.keep_checkpoints must be >= 0 (0 keeps all), got {self.train.keep_checkpoints}.")
         if self.memory.gradient_release:
             if self.train.gradient_accumulation_steps > 1:
                 errors.append(

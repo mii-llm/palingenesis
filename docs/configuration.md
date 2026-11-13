@@ -122,6 +122,7 @@ grep "STATUS: experimental" src/palingenesis/config.py
 | `lr_scheduler` | str | `cosine` | Schedule type: `cosine`, `linear`, `constant` |
 | `seed` | int | `42` | Random seed (offset per rank for diversity) |
 | `save_steps` | int | `500` | Checkpoint every N optimizer steps |
+| `keep_checkpoints` | int | `5` | Step checkpoints kept on disk (oldest deleted after each save; `best/` and `final/` never); `0` keeps all |
 | `logging_steps` | int | `1` | Log metrics every N optimizer steps |
 | `bf16` | bool | `true` | Enable bf16 mixed precision |
 | `gradient_checkpointing` | str | `selective` | AC mode: `selective`, `full`, `none` |

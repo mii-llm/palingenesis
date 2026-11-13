@@ -271,3 +271,11 @@ def test_every_shipped_config_loads():
             RLConfig.from_yaml(path).validate()
         else:
             (OPDConfig if path.name.startswith("distill_") else Config).from_yaml(path)
+
+
+def test_keep_checkpoints_must_be_non_negative():
+    cfg = Config()
+    assert cfg.train.keep_checkpoints == 5
+    cfg.train.keep_checkpoints = -1
+    with pytest.raises(ConfigError, match="train.keep_checkpoints"):
+        cfg.validate()
