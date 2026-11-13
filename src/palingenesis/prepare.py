@@ -597,6 +597,11 @@ def save_prepared(
     with out_file.open("w") as f:
         for s in samples:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    # A parquet from a previous run (or the partial file of the failed write above) would win:
+    # find_prepared_dataset prefers parquet
+    stale = output_path / f"{basename}.parquet"
+    if stale.exists():
+        stale.unlink()
     return out_file
 
 
@@ -912,7 +917,10 @@ def _compute_single_hes(
     except Exception:
         text = "\n".join(m.get("content", "") for m in messages)
 
-    encoding = tokenizer(text, return_tensors="pt", max_length=max_seq_length, truncation=True)
+    # the render already holds the template's special tokens (BOS): the tokenizer must not add its own
+    encoding = tokenizer(
+        text, return_tensors="pt", max_length=max_seq_length, truncation=True, add_special_tokens=False
+    )
     input_ids = encoding["input_ids"].to(model.device)
     seq_len = input_ids.shape[1]
 

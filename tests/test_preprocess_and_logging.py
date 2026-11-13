@@ -302,6 +302,48 @@ def test_parquet_replaces_stale_jsonl():
     print("✓ test_parquet_replaces_stale_jsonl PASSED")
 
 
+def test_jsonl_replaces_stale_parquet():
+    """find_prepared_dataset prefers parquet: a jsonl save (asked for, or the fallback of a failed parquet write)
+    must not leave an older parquet for training to pick up."""
+    from palingenesis.data import _load_dataset_source
+    from palingenesis.prepare import find_prepared_dataset, save_prepared
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        save_prepared(_sample_conversations(3), tmpdir, output_format="parquet")
+        out = save_prepared(_sample_conversations(6), tmpdir, output_format="jsonl")
+        found = find_prepared_dataset(tmpdir)
+        assert found == out and found.suffix == ".jsonl"
+        assert not (Path(tmpdir) / "scored_data.parquet").exists()
+        assert len(list(_load_dataset_source(tmpdir, "train", streaming=False))) == 6
+    print("✓ test_jsonl_replaces_stale_parquet PASSED")
+
+
+def test_hes_tokenises_the_render_without_a_second_bos():
+    """HES scores the rendered conversation: the template already wrote BOS, the tokenizer must not add another."""
+    import types
+
+    import torch
+    from test_fallback_offsets import _bos_tok
+
+    from palingenesis.prepare import _compute_single_hes
+
+    tok = _bos_tok()
+    seen = {}
+
+    class Model:
+        device = torch.device("cpu")
+
+        def __call__(self, input_ids):
+            seen["ids"] = input_ids[0].tolist()
+            return types.SimpleNamespace(logits=torch.zeros(1, input_ids.shape[1], len(tok)))
+
+    sample = {"messages": [{"role": "user", "content": "hi there"}, {"role": "assistant", "content": "hello to you"}]}
+    assert _compute_single_hes(Model(), tok, sample, "messages", 256, 50.0) > 0
+    want = tok.apply_chat_template(sample["messages"], tokenize=True, return_dict=True)["input_ids"]
+    assert seen["ids"] == want and seen["ids"].count(tok.bos_token_id) == 1
+    print("✓ test_hes_tokenises_the_render_without_a_second_bos PASSED")
+
+
 def test_prepare_writes_manifest():
     from palingenesis.prepare import PREPARED_META, save_prepared
 
@@ -540,6 +582,8 @@ if __name__ == "__main__":
     test_save_prepared_parquet_roundtrip()
     test_save_prepared_jsonl()
     test_parquet_replaces_stale_jsonl()
+    test_jsonl_replaces_stale_parquet()
+    test_hes_tokenises_the_render_without_a_second_bos()
     test_prepare_writes_manifest()
     test_tracker_disabled_backends_noop()
     test_tracker_run_id_persistence()
