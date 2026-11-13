@@ -1564,8 +1564,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             if cp is not None:
                 cp.deactivate()
 
-            # MONA: augment gradients with curvature-aware acceleration (before optimizer step)
-            if _mona is not None:
+            # MONA: augment gradients with curvature-aware acceleration, once per optimizer step on the
+            # accumulated gradient (per micro-batch it would difference and augment partial sums)
+            if _mona is not None and is_last_micro:
                 _mona.apply()
 
             accum_loss += loss_val
