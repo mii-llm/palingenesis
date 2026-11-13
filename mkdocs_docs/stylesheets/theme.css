@@ -373,14 +373,14 @@ body {
 .md-typeset .md-button:hover,
 .md-typeset .md-button:focus-visible,
 .md-typeset .md-button--primary {
-  border-color: var(--pg-text);
-  background: var(--pg-text);
+  border-color: var(--pg-signal);
+  background: var(--pg-signal);
   color: var(--pg-bg);
 }
 .md-typeset .md-button--primary:hover,
 .md-typeset .md-button--primary:focus-visible {
-  border-color: var(--pg-signal);
-  background: var(--pg-signal);
+  border-color: var(--pg-text);
+  background: var(--pg-text);
   color: var(--pg-bg);
 }
 

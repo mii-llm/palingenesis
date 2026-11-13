@@ -83,9 +83,9 @@
 }
 .pg-hero__actions a.pg-hero__go {
   padding: 0.5rem 0.9rem;
-  border: 1px solid var(--pg-text);
+  border: 1px solid var(--pg-signal);
   border-radius: var(--pg-radius);
-  background: var(--pg-text);
+  background: var(--pg-signal);
   color: var(--pg-bg);
   font-weight: 500;
   text-decoration: none;
@@ -95,8 +95,8 @@
   margin-left: 0.5em;
 }
 .pg-hero__actions a.pg-hero__go:is(:hover, :focus-visible) {
-  border-color: var(--pg-signal);
-  background: var(--pg-signal);
+  border-color: var(--pg-text);
+  background: var(--pg-text);
   color: var(--pg-bg);
 }
 
@@ -131,7 +131,7 @@
 .pg-console {
   display: none;
   margin: 2rem 0 0;
-  border: 1px solid var(--pg-border-strong);
+  border: 1px solid var(--pg-text);
   border-radius: var(--pg-radius);
   background: var(--pg-bg);
   color: var(--pg-text);
@@ -276,12 +276,12 @@
   color: var(--pg-text);
 }
 .pg-opt[aria-selected="true"] {
-  background: var(--pg-text);
+  background: var(--pg-signal);
   color: var(--pg-bg);
 }
 .pg-opt[aria-selected="true"] :is(.pg-opt__tag, .pg-opt__hint) {
   color: inherit;
-  opacity: 0.7;
+  opacity: 0.85;
 }
 
 .pg-console__view {
