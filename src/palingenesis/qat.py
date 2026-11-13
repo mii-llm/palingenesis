@@ -314,7 +314,13 @@ class TernaryQAT(TrainerPlugin):
         self._set_strength(ctx)
         for name, m in self.modules.items():
             _, _, codes = _local_codes(m.weight, m.group_size)
-            self._initial_codes[name] = codes.to(torch.int8).cpu()
+            # A resumed run has loaded the codes it started from (load_state_dict runs before
+            # this hook): keep them, so codes_changed continues instead of restarting at 0.
+            # Several ranks each hold their own shard and only the main rank's codes are
+            # saved, so they start again from the resumed weights.
+            restored = self._initial_codes.get(name)
+            if ctx.world_size > 1 or restored is None or restored.shape != codes.shape:
+                self._initial_codes[name] = codes.to(torch.int8).cpu()
 
     def _set_strength(self, ctx: PluginContext) -> None:
         value = float(self.strength(ctx.progress))

@@ -77,7 +77,11 @@ def test_ramp():
     assert r(0.0) == 0.0 and r(0.4) == pytest.approx(0.5) and r(1.0) == 1.0
     assert Ramp(0.0, 1.0, shape="cosine")(0.5) == pytest.approx(0.5)
     assert Ramp(0.5, 0.5, 1.0, 2.0, "step")(0.49) == 1.0 and Ramp(0.5, 0.5, 1.0, 2.0, "step")(0.5) == 2.0
-    assert Ramp.parse(0.3)(0.9) == 0.3
+    for shape in ("linear", "cosine", "step"):  # a zero-length ramp jumps at its point, in every shape
+        jump = Ramp(0.3, 0.3, 1.0, 2.0, shape)
+        assert [jump(p) for p in (0.0, 0.1, 0.3, 0.9)] == [1.0, 1.0, 2.0, 2.0]
+    assert Ramp.parse({"start": 0.2, "end": 0.2})(0.1) == 0.0
+    assert Ramp.parse(0.3)(0.9) == 0.3 and Ramp.parse(0.3)(0.0) == 0.3
     with pytest.raises(ValueError):
         Ramp(0.6, 0.2)
 
@@ -141,6 +145,44 @@ def test_param_groups_and_metrics():
         for m in plugin.modules.values():
             m.weight.neg_()
     assert plugin.metrics(model, _ctx(0.5))["codes_changed"] > 0.5
+
+
+def test_codes_changed_continues_across_a_resume():
+    """The trainer loads the plugin state before on_train_start: the codes the run started
+    from are kept, so codes_changed after a resume still counts from the start of the run."""
+
+    def build():
+        plugin = TernaryQAT(group_size=16)
+        return plugin, plugin.transform_model(H.tiny_llama(64, hidden=32), _ctx())
+
+    plugin, model = build()
+    plugin.on_train_start(model, _ctx())
+    with torch.no_grad():
+        for m in plugin.modules.values():
+            m.weight.neg_()
+    before = plugin.metrics(model, _ctx(0.5))["codes_changed"]
+    assert before > 0.5
+    state, weights = plugin.state_dict(), model.state_dict()
+
+    resumed, resumed_model = build()
+    resumed_model.load_state_dict(weights)
+    resumed.load_state_dict(state)
+    resumed.on_train_start(resumed_model, _ctx(0.5))
+    assert resumed.metrics(resumed_model, _ctx(0.5))["codes_changed"] == before
+
+    # codes of another layout (a changed group size) or of another rank's shard are not kept
+    stale, stale_model = build()
+    stale_model.load_state_dict(weights)
+    stale.load_state_dict({"initial_codes": {name: codes[:1] for name, codes in state["initial_codes"].items()}})
+    stale.on_train_start(stale_model, _ctx(0.5))
+    assert stale.metrics(stale_model, _ctx(0.5))["codes_changed"] == 0.0
+    ranks, ranks_model = build()
+    ranks_model.load_state_dict(weights)
+    ranks.load_state_dict(state)
+    ctx = _ctx(0.5)
+    ctx.world_size = 2
+    ranks.on_train_start(ranks_model, ctx)
+    assert ranks.metrics(ranks_model, ctx)["codes_changed"] == 0.0
 
 
 def test_apply_param_groups_moves_parameters():

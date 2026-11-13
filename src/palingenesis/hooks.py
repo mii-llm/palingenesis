@@ -256,7 +256,8 @@ class Ramp:
             raise ValueError(f"Ramp needs 0 <= start <= end <= 1, got start={self.start} end={self.end}")
 
     def __call__(self, progress: float) -> float:
-        if progress <= self.start and self.end > self.start:
+        # start == end is a jump at that point whatever the shape (nothing to interpolate over)
+        if progress <= self.start and progress < self.end:
             return self.start_value
         if progress >= self.end:
             return self.end_value
