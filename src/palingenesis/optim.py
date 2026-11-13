@@ -501,7 +501,7 @@ class Hyperball:
                         p.grad = None
                 for p in live:
                     p.grad = grads[id(p)]
-                before = [p.detach().to(_math_dtype(p)).clone() for p in live]
+                before = [p.detach().to(_math_dtype(p), copy=True) for p in live]  # one copy, also when upcast
                 self.optimizer.step()
                 for p, w0 in zip(live, before):
                     self._project(p, w0)
@@ -533,7 +533,8 @@ class Hyperball:
             else:
                 self._eta[key] = float(step_norm / radius.clamp_min(1e-30)) / self._schedule(p)
         eta = self._eta[key] * self._schedule(p)
-        trial = before.add_(delta, alpha=float(eta * radius / step_norm.clamp_min(1e-30)))
+        # scaled on the device: a Python float here would sync the host once per matrix per step
+        trial = before.add_(delta.mul_(eta * radius / step_norm.clamp_min(1e-30)))
         p.copy_(trial.mul_(radius / trial.norm().clamp_min(1e-30)))
 
 
@@ -630,11 +631,13 @@ class MONAAcceleration:
                 # A_k = β_a · A_{k-1} + (1-β_a) · D_k
                 accel_buf.mul_(self.beta_a).add_(diff.to(accel_buf.dtype), alpha=(1.0 - self.beta_a))
 
+            # Store the raw gradient for the next step (streaming: overwrite prev) before it is
+            # augmented: D_{k+1} is a difference of gradients, not of accelerated gradients.
+            prev_grad.copy_(grad)
+
+            if self._step_count > 1:
                 # G̃_k = G_k + α · A_k (augment gradient in-place)
                 grad.add_(accel_buf.to(grad.dtype), alpha=self.alpha)
-
-            # Store current gradient for next step (streaming: overwrite prev)
-            self._prev_gradients[pid].copy_(grad.to(self._prev_gradients[pid].dtype))
 
 
 # ==============================================================================
@@ -839,7 +842,10 @@ class AdamCCorrection:
         self._group_peak_lrs: list[float] = []
         self._base_weight_decays: list[float] = []
         for group in optimizer.param_groups:
-            self._group_peak_lrs.append(group.get("lr", peak_lr))
+            # A scheduler built before this object has already scaled "lr" (to 0 under warmup,
+            # which would switch the correction off for the whole run); it keeps the peak
+            # as "initial_lr".
+            self._group_peak_lrs.append(group.get("initial_lr", group.get("lr", peak_lr)))
             self._base_weight_decays.append(group.get("weight_decay", 0.0))
 
     def step(self):

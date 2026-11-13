@@ -24,7 +24,6 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -265,14 +264,9 @@ def test_full_optimizer_stack():
     assert reduction > 0.1, f"Should converge >10%, got {reduction * 100:.1f}%"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MONA (arxiv:2605.26842) makes this task diverge even on plain AdamW without Hyperball "
-        "(measured: AdamW +15.3% loss reduction, AdamW+MONA -19.4%); not yet investigated."
-    ),
-)
 def test_mona_converges_on_adamw():
+    """Diverged while MONA differenced against its own augmented gradient (the acceleration fed
+    back into itself); with the raw previous gradient the task converges as on plain AdamW."""
     from palingenesis.optim import MONAAcceleration
 
     torch.manual_seed(42)

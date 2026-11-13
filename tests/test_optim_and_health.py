@@ -327,6 +327,28 @@ def test_hyperball_calibrated_step_equals_adam_first_relative_step():
     assert abs(hb._eta[id(W)] - 1e-4 / rms) / (1e-4 / rms) < 1e-3
 
 
+def test_hyperball_bf16_weights_step_in_fp32_and_match_the_paper_update():
+    """Half-precision weights: the update is computed in fp32 from one fp32 snapshot of the
+    matrix, and what is stored is that fp32 result rounded to bf16."""
+    from palingenesis.optim import Hyperball
+
+    torch.manual_seed(4)
+    W = nn.Parameter(torch.randn(24, 12).bfloat16())
+    start = W.detach().clone()
+    R = start.float().norm()
+    hb = Hyperball(torch.optim.SGD([W], lr=0.5), [W], angular_lr=0.05)
+    g = torch.randn(24, 12).bfloat16()
+    W.grad = g.clone()
+    hb.step()
+    # SGD moves W by -lr * g in bf16; its normalised direction is what Hyperball keeps
+    delta = (start - 0.5 * g).float() - start.float()
+    trial = start.float() + 0.05 * R * delta / delta.norm()
+    expected = (R * trial / trial.norm()).bfloat16()
+    assert W.dtype == torch.bfloat16
+    assert (W.detach().float() - expected.float()).abs().max() <= 2 * torch.finfo(torch.bfloat16).eps * 4
+    assert torch.equal(W.grad, g)  # the gradient is handed back untouched
+
+
 def test_hyperball_buckets_bound_memory_and_match_one_bucket():
     from palingenesis.optim import Hyperball
 
@@ -430,6 +452,60 @@ def test_mona_lite_bf16():
 
     print("  All acceleration buffers in bf16 ✓")
     print("✓ test_mona_lite_bf16 PASSED\n")
+
+
+def test_mona_differences_raw_gradients():
+    """D_k = G_k - G_{k-1} over the gradients the model produced: the stored previous gradient
+    is the raw one, not the one MONA augmented."""
+    from palingenesis.optim import MONAAcceleration
+
+    torch.manual_seed(0)
+    model = nn.Linear(6, 4, bias=False)
+    beta, alpha = 0.9, -2.0
+    mona = MONAAcceleration(model, beta_a=beta, alpha=alpha, lite=False)
+    g1, g2, g3 = (torch.randn(4, 6) for _ in range(3))
+    out = []
+    for g in (g1, g2, g3):
+        model.weight.grad = g.clone()
+        mona.apply()
+        out.append(model.weight.grad.clone())
+        assert torch.equal(mona._prev_gradients[id(model.weight)], g)
+
+    a2 = (1 - beta) * (g2 - g1)
+    a3 = beta * a2 + (1 - beta) * (g3 - g2)
+    assert torch.equal(out[0], g1)  # nothing to difference against yet
+    torch.testing.assert_close(out[1], g2 + alpha * a2)
+    torch.testing.assert_close(out[2], g3 + alpha * a3)
+
+
+# ==============================================================================
+# ADAMC
+# ==============================================================================
+
+
+@pytest.mark.parametrize("warmup_ratio", [0.0, 0.1])
+def test_adamc_scales_weight_decay_when_built_after_a_warmup_scheduler(warmup_ratio):
+    """The trainer builds the scheduler first, which sets every group's lr to its step-0 value
+    (0 under warmup): the peak the correction divides by is still the configured lr."""
+    from palingenesis.optim import AdamCCorrection, build_scheduler
+
+    w, b = nn.Parameter(torch.zeros(4, 4)), nn.Parameter(torch.zeros(4))
+    groups = [
+        {"params": [w], "lr": 1e-3, "weight_decay": 0.1},
+        {"params": [b], "lr": 5e-4, "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(groups, lr=1e-3)
+    scheduler = build_scheduler(optimizer, "cosine", 100, warmup_ratio, 0.0)
+    adamc = AdamCCorrection(optimizer, 1e-3)
+    assert adamc._group_peak_lrs == [1e-3, 5e-4]
+    for _ in range(90):
+        optimizer.step()
+        scheduler.step()
+        adamc.step()
+    decayed, untouched = optimizer.param_groups
+    assert 0 < decayed["lr"] < 1e-4
+    assert decayed["weight_decay"] == pytest.approx(0.1 * decayed["lr"] / 1e-3)
+    assert untouched["weight_decay"] == 0.0
 
 
 # ==============================================================================
