@@ -149,6 +149,14 @@ def test_data_by_context_mesh_trains_like_data_parallel(setup):
     _assert_same(got, ref)
 
 
+def test_data_parallel_ranks_log_the_global_loss(setup):
+    # each rank's loss is its share of the global per-token loss: the logged value is the ranks' sum, close
+    # to a one-process run's on the same data (the rows per step differ, so not equal; a share would be half)
+    ref = _run(_config(setup, "one_loss", cp=False, fsdp=False), world=1)
+    got = _run(_config(setup, "dp2_loss", cp=False, fsdp=True), world=2)
+    assert got["loss"] == pytest.approx(ref["loss"], rel=0.2)
+
+
 @pytest.mark.parametrize("checkpointing", ["none", "full"])
 def test_hybrid_linear_attention_model_trains_like_one_process(setup, checkpointing):
     ref = _run(_config(setup, f"hybrid_one_{checkpointing}", cp=False, fsdp=False, student="hybrid"), world=1)

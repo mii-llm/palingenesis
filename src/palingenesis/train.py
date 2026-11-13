@@ -1969,7 +1969,7 @@ def _teacher_packed_inputs(distiller, input_ids, position_ids, student_flatten: 
     out = {}
     for name, teacher in distiller.online.items():
         attn = teacher.spec.attn_implementation or config.model.attn_implementation
-        flatten = attn == "flash_attention_2" or has_linear_attention(teacher.model)
+        flatten = accelerator.is_flash_varlen(attn) or has_linear_attention(teacher.model)
         if flatten != student_flatten:
             packed = PackedBatch.build(input_ids, torch.zeros_like(input_ids), position_ids, flatten, attn)
             out[name] = (packed.input_ids, packed.forward_kwargs)
