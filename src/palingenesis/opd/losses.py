@@ -143,8 +143,11 @@ def chunked_head(
             loss, slice_stats = fn(_upcast(head(hidden[a:b])), a, b)
             total += loss
             _accumulate(stats, slice_stats)
+        _to_host(stats)
         return total, stats
-    return _ChunkedHead.apply(hidden, head, fn, bounds, stats, *head.parameters()), stats
+    total = _ChunkedHead.apply(hidden, head, fn, bounds, stats, *head.parameters())
+    _to_host(stats)
+    return total, stats
 
 
 def _upcast(logits: Tensor) -> Tensor:
@@ -152,9 +155,16 @@ def _upcast(logits: Tensor) -> Tensor:
     return logits.to(torch.promote_types(logits.dtype, torch.float32))
 
 
-def _accumulate(stats: dict[str, float], new: dict) -> None:
+def _accumulate(stats: dict, new: dict) -> None:
+    """Add a slice's statistics to the running sums, on the device (no host sync per slice)."""
     for k, v in new.items():
-        stats[k] = stats.get(k, 0.0) + float(v)
+        stats[k] = stats.get(k, 0.0) + (v.detach() if isinstance(v, Tensor) else v)
+
+
+def _to_host(stats: dict) -> None:
+    """The summed statistics as floats, in place: the call's host sync."""
+    for k, v in stats.items():
+        stats[k] = float(v)
 
 
 def _log1mexp(x: Tensor) -> Tensor:

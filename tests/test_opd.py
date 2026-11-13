@@ -1045,3 +1045,32 @@ def test_vllm_greedy_duplicates_share_one_sample():
     sent.clear()
     out = eng.generate([[1, 2], [1, 2]], [4, 4], 1.0)  # sampling: one request with n=2, two different samples
     assert len(sent) == 1 and sent[0].n == 2 and out[0].completion_ids != out[1].completion_ids
+
+
+def test_split_pool_hashes_each_row_once(monkeypatch):
+    from palingenesis.opd import pool
+
+    rows = [{"question": f"Question number {i % 40}?"} for i in range(60)]  # 20 duplicated rows
+    expected = pool.split_pool(rows, dev_size=10)
+    calls = []
+    hash_one = pool.question_hash
+    monkeypatch.setattr(pool, "question_hash", lambda q: (calls.append(q), hash_one(q))[1])
+    assert pool.split_pool(rows, dev_size=10) == expected and len(calls) == len(rows)
+    train, dev = expected
+    held = {r["question"] for r in dev}
+    assert len(held) == 10 and train == [r for r in rows if r["question"] not in held]  # duplicates leave too
+
+
+def test_vllm_server_close_closes_its_log(tmp_path):
+    pytest.importorskip("torch")
+    from palingenesis.opd.rollout import VLLMServer
+
+    server = VLLMServer.__new__(VLLMServer)
+    server.process, server._log = None, open(tmp_path / "vllm.log", "w")
+    log = server._log
+    server.close()
+    server.close()  # idempotent (close() is also registered with atexit)
+    assert log.closed
+    remote = VLLMServer.__new__(VLLMServer)  # a server reached at a url opened no log
+    remote.process = None
+    remote.close()

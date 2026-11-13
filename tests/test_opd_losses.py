@@ -379,3 +379,34 @@ def test_token_entropy():
     hidden, head, _, _ = make(softcap=True)
     lp = F.log_softmax(head(hidden), -1)
     torch.testing.assert_close(losses.token_entropy(hidden, head), -(lp.exp() * lp).sum(-1).detach())
+
+
+@pytest.mark.parametrize("grad", [True, False])
+def test_slice_statistics_reach_the_host_once(grad):
+    """Statistics are summed over the slices where they are (on the device) and converted once per call."""
+
+    class Stat:
+        conversions = 0
+
+        def __init__(self, value):
+            self.value = value
+
+        def __add__(self, other):
+            return Stat(self.value + (other.value if isinstance(other, Stat) else other))
+
+        __radd__ = __add__
+
+        def __float__(self):
+            Stat.conversions += 1
+            return float(self.value)
+
+    hidden, head, _, _ = make()
+
+    def fn(logits, a, b):
+        return logits.sum(), {"rows": Stat(b - a), "count": 1, "sum": logits.detach().sum()}
+
+    with torch.set_grad_enabled(grad):
+        total, stats = losses.chunked_head(hidden, head, fn)
+    assert stats["rows"] == N and stats["count"] == 4 and Stat.conversions == 1  # 11 rows in slices of 3
+    assert all(type(v) is float for v in stats.values())
+    torch.testing.assert_close(torch.tensor(stats["sum"]), total.detach().float(), check_dtype=False)

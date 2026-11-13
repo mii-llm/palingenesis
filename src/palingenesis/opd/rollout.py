@@ -589,6 +589,10 @@ class VLLMServer:
             except subprocess.TimeoutExpired:
                 self.process.kill()
         self.process = None
+        log = getattr(self, "_log", None)  # a server reached at `url` has none
+        if log is not None:
+            log.close()
+            self._log = None
 
 
 class VLLMServerRollout:

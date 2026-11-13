@@ -93,10 +93,12 @@ def split_pool(rows: list[dict[str, Any]], dev_size: int = 500, seed: int = 0):
     neither fill dev with copies of one question nor leak a dev question
     into train through its duplicates.
     """
+    hashes = [question_hash(r["question"]) for r in rows]  # once per row: the normalization is the cost
     by_hash: dict[str, dict[str, Any]] = {}
-    for r in rows:
-        by_hash.setdefault(question_hash(r["question"]), r)
+    for h, r in zip(hashes, rows):
+        by_hash.setdefault(h, r)
     dev_hashes = sorted(by_hash)[:dev_size]
     dev = [by_hash[h] for h in dev_hashes]
-    train = [r for r in rows if question_hash(r["question"]) not in set(dev_hashes)]
+    held = set(dev_hashes)
+    train = [r for h, r in zip(hashes, rows) if h not in held]
     return train, dev
