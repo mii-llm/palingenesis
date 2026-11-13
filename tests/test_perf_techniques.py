@@ -13,6 +13,7 @@ sys.path.insert(0, "src")
 
 import math
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -468,3 +469,101 @@ def test_spike_detector_accepts_a_permanent_change_of_gradient_scale():
     assert sum(skipped) == 10  # ten spikes skipped, then the new scale is accepted
     assert det.regime_changes == 1
     assert not any(skipped[11:])
+
+
+def test_spike_detector_flags_non_finite_norms_without_learning_from_them():
+    """A NaN norm compares False with the threshold and used to pass as a normal step (the
+    optimizer then wrote NaN into the weights). NaN and inf are flagged, in warmup too, and
+    leave the running statistics and the regime-change counter alone."""
+    from palingenesis.perf import SpikeDetector
+
+    for seen in (3, 60):  # during warmup, and after it
+        detector = SpikeDetector(z_threshold=3.0, warmup=50, max_consecutive=2)
+        for i in range(seen):
+            detector.check(1.0 + 0.01 * (i % 5))
+        state = (detector.count, detector.mean, detector.var, detector.consecutive)
+        for bad in (float("nan"), float("inf"), float("-inf"), float("nan")):
+            assert detector.check(bad) is True
+        assert (detector.count, detector.mean, detector.var, detector.consecutive) == state
+        assert (detector.spikes_detected, detector.regime_changes) == (4, 0)
+        assert detector.check(1.02) is False
+        assert math.isfinite(detector.mean) and math.isfinite(detector.var)
+
+
+def _adagc_reference(named_grads, ema, step, warmup_steps, lambda_rel, beta, global_max_norm):
+    """AdaGC.clip written per tensor (fp32 norm of each gradient): the returned global norm,
+    the clipped gradients and the per-tensor EMAs the batched implementation must reproduce."""
+    norms = {n: g.float().norm().item() for n, g in named_grads.items()}
+    total = math.sqrt(sum(v * v for v in norms.values()))
+    out = {}
+    if step < warmup_steps:
+        for n, v in norms.items():
+            ema[n] = max(ema[n], v) if n in ema else v
+        coef = min(1.0, global_max_norm / (total + 1e-6))
+        return total, {n: g * coef for n, g in named_grads.items()}
+    for n, g in named_grads.items():
+        v = norms[n]
+        if v < 1e-12:
+            out[n] = g
+            continue
+        e = ema.get(n, v)
+        threshold = lambda_rel * e
+        out[n] = g * (threshold / v) if v > threshold else g
+        ema[n] = beta * e + (1 - beta) * min(v, threshold)
+    return total, out
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_adagc_matches_the_per_tensor_reference(dtype, monkeypatch):
+    """One stacked norm read once gives the same norms, clips and EMAs as a norm per tensor,
+    in warmup and after it, and never concatenates the gradients into one tensor."""
+    from palingenesis.perf import AdaGC
+
+    def no_cat(*args, **kwargs):
+        raise AssertionError("AdaGC must not concatenate all gradients")
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(12, 8), nn.Linear(8, 4)).to(dtype)
+    kw = dict(lambda_rel=1.5, beta=0.9, warmup_steps=3, global_max_norm=0.5)
+    adagc = AdaGC(model, **kw)
+    ema: dict[str, float] = {}
+    tol = dict(rtol=1e-5, atol=1e-7) if dtype == torch.float32 else dict(rtol=2e-2, atol=1e-3)
+    for step in range(8):
+        scale = 20.0 if step == 5 else 1.0  # a spike after warmup: per-tensor clips
+        grads = {}
+        for name, p in model.named_parameters():
+            p.grad = (torch.randn(p.shape) * scale).to(dtype)
+            grads[name] = p.grad.clone()
+        if step == 6:
+            model[1].bias.grad.zero_()  # a zero gradient is skipped
+            grads["1.bias"] = model[1].bias.grad.clone()
+        expected_norm, expected = _adagc_reference(grads, ema, step, **kw)
+        with monkeypatch.context() as m:
+            m.setattr(torch, "cat", no_cat)
+            norm = adagc.clip(step=step)
+        assert isinstance(norm, float) and norm == pytest.approx(expected_norm, rel=1e-5)
+        assert adagc._ema == pytest.approx(ema, rel=1e-5)
+        for name, p in model.named_parameters():
+            torch.testing.assert_close(p.grad.float(), expected[name].float(), **tol)
+    assert adagc.total_clips > 0
+
+
+def test_ema_half_precision_weights_keep_an_fp32_shadow():
+    """The shadow of bf16 weights is fp32 on the CPU and follows the EMA formula exactly
+    (bf16 -> fp32 is exact, so where the upcast happens does not change the result)."""
+    from palingenesis.perf import ModelEMA
+
+    torch.manual_seed(0)
+    model = nn.Linear(16, 8).bfloat16()
+    ema = ModelEMA(model, decay=0.9)
+    expected = model.weight.detach().float().clone()
+    for step in range(1, 6):
+        with torch.no_grad():
+            model.weight.add_(torch.randn(8, 16).bfloat16() * 0.1)
+        ema.update()
+        decay = min(0.9, 1 - 1 / (step + 1))
+        expected = expected.lerp(model.weight.detach().float(), 1 - decay)
+    shadow = ema._shadow["weight"]
+    assert shadow.dtype == torch.float32 and shadow.device.type == "cpu"
+    assert torch.equal(shadow, expected)
+    assert model.weight.dtype == torch.bfloat16

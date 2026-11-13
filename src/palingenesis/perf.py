@@ -6,6 +6,7 @@ Each is independently useful and composes with the rest of the system.
 
 import gc
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -382,8 +383,10 @@ class ModelEMA:
 
         for name, p in self._model.named_parameters():
             if name in self._shadow and p.requires_grad:
-                # Move current weights to CPU, lerp with shadow, keep on CPU
-                current = p.data.float().cpu()
+                # Move current weights to CPU, lerp with shadow, keep on CPU. Transfer first, upcast
+                # there: .float() on the device would allocate an fp32 copy of a half-precision
+                # weight on the GPU and send twice the bytes.
+                current = p.data.cpu().float()
                 self._shadow[name].lerp_(current, 1 - decay)
 
     @torch.no_grad()
@@ -564,23 +567,17 @@ class AdaGC:
         if not params:
             return 0.0
 
-        # Compute global norm (for logging and warmup)
-        # NOTE: During warmup, we compute but DON'T clip yet (clip after EMA init)
-        # After warmup: we pass inf to skip global clip (per-tensor handles it)
-        if t >= self.warmup_steps:
-            global_norm = torch.nn.utils.clip_grad_norm_(
-                [p for _, p in params],
-                float("inf"),  # no global clip after warmup (per-tensor handles it)
-            )
-        else:
-            # During warmup: compute norm without clipping first
-            global_norm = torch.cat([p.grad.data.float().flatten() for _, p in params]).norm()
+        # Every tensor's raw (pre-clip) norm, accumulated in fp32, read with ONE host sync: a
+        # .float().norm().item() per tensor was an fp32 copy of each gradient and a sync each.
+        norms_t = torch.stack([torch.linalg.vector_norm(p.grad, dtype=torch.float32) for _, p in params])
+        if hasattr(norms_t, "full_tensor"):  # FSDP2: gradients are DTensors
+            norms_t = norms_t.full_tensor()
+        norms = norms_t.tolist()
+        global_norm = math.sqrt(sum(n * n for n in norms))
 
         if t < self.warmup_steps:
             # Warmup: use global clip + initialize EMAs from RAW norms (pre-clip)
-            # IMPORTANT: capture raw norms BEFORE global clip modifies gradients
-            for name, p in params:
-                grad_norm = p.grad.data.float().norm().item()
+            for (name, _), grad_norm in zip(params, norms):
                 if name not in self._ema:
                     self._ema[name] = grad_norm
                 else:
@@ -589,15 +586,11 @@ class AdaGC:
                     self._ema[name] = max(self._ema[name], grad_norm)
 
             # Now apply global clip (after EMA init from raw norms)
-            global_norm = torch.nn.utils.clip_grad_norm_(
-                [p for _, p in params],
-                self.global_max_norm,
-            )
+            torch.nn.utils.clip_grad_norm_([p for _, p in params], self.global_max_norm)
         else:
-            # Main phase: per-tensor adaptive clipping
-            for name, p in params:
+            # Main phase: per-tensor adaptive clipping (no global clip)
+            for (name, p), grad_norm in zip(params, norms):
                 grad = p.grad.data
-                grad_norm = grad.float().norm().item()
 
                 if grad_norm < 1e-12:
                     continue
@@ -617,7 +610,7 @@ class AdaGC:
                 # Update EMA with clipped norm
                 self._ema[name] = self.beta * ema + (1 - self.beta) * clipped_norm
 
-        return global_norm.item() if torch.is_tensor(global_norm) else global_norm
+        return global_norm
 
     @property
     def total_clips(self) -> int:
@@ -676,6 +669,13 @@ class SpikeDetector:
 
         Returns True if spike detected (caller should skip update).
         """
+        # NaN compares False with every threshold and would pass as "not a spike" (the step then
+        # writes NaN into the weights); NaN or inf in the running statistics would stay there.
+        # Flagged without touching the statistics or the regime-change counter.
+        if not math.isfinite(grad_norm):
+            self.spikes_detected += 1
+            return True
+
         self.count += 1
 
         # During warmup: just accumulate statistics, never flag
