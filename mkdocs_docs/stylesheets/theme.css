@@ -2,9 +2,10 @@
    palingenesis documentation: design layer
 
    Principles
-     - Ink on paper. Greys for hierarchy, and one colour (a dark red) that
-       marks state: where you are, what is focused, what warns. A blue and a
-       green join it in code, and nowhere else.
+     - Ink on cool paper. Greys for hierarchy, and one
+       colour, a muted ink blue, that marks state: where you are, what is
+       focused, what warns. A green joins it in code and in the title
+       piece, and nowhere else.
      - Structure comes from hairlines, alignment and type size. No cards,
        no shadows, no gradients, corners only slightly rounded.
      - Three typefaces, each with one job: Newsreader for titles, Geist for
@@ -68,37 +69,35 @@
 [data-md-color-scheme="default"] {
   color-scheme: light;
 
-  --pg-bg: #f5f1e6;
-  --pg-raised: #ebe6d8;
-  --pg-border: #d9d3c2;
-  --pg-border-strong: #b5ae9b;
-  --pg-text: #17150f;
-  --pg-text-2: #403c33;
-  --pg-text-3: #5d584c;
-  --pg-signal: #a31504;
-  --pg-signal-soft: #a3150414;
-  --pg-hue-blue: #1f4a82;
-  --pg-hue-green: #1f5a36;
+  --pg-bg: #eeeee9;
+  --pg-raised: #e3e4de;
+  --pg-border: #d2d4cc;
+  --pg-border-strong: #a9ada4;
+  --pg-text: #101316;
+  --pg-text-2: #383d42;
+  --pg-text-3: #565c62;
+  --pg-signal: #2c4a7c;
+  --pg-signal-soft: #2c4a7c1f;
+  --pg-hue-green: #1c6642;
 
-  --md-code-hl-keyword-color: #8f1d12;
+  --md-code-hl-keyword-color: var(--pg-signal);
 }
 
 [data-md-color-scheme="slate"] {
   color-scheme: dark;
 
-  --pg-bg: #141413;
-  --pg-raised: #1c1c1a;
-  --pg-border: #2d2d2a;
-  --pg-border-strong: #4a4943;
-  --pg-text: #e8e3da;
-  --pg-text-2: #b8b2a7;
-  --pg-text-3: #938d82;
-  --pg-signal: #e58a72;
-  --pg-signal-soft: #e58a721c;
-  --pg-hue-blue: #a3bbd6;
-  --pg-hue-green: #a9c9a4;
+  --pg-bg: #0f1215;
+  --pg-raised: #171b1f;
+  --pg-border: #292e34;
+  --pg-border-strong: #454c54;
+  --pg-text: #e3e6e8;
+  --pg-text-2: #aeb4ba;
+  --pg-text-3: #8a9199;
+  --pg-signal: #8ea6dc;
+  --pg-signal-soft: #8ea6dc26;
+  --pg-hue-green: #9fd0b0;
 
-  --md-code-hl-keyword-color: #e89a84;
+  --md-code-hl-keyword-color: var(--pg-signal);
 }
 
 /* The theme's own variables, mapped once onto the tokens above */
@@ -138,9 +137,9 @@
   --md-code-hl-color: var(--pg-signal);
   --md-code-hl-color--light: var(--pg-signal-soft);
   --md-code-hl-string-color: var(--pg-hue-green);
-  --md-code-hl-number-color: var(--pg-hue-blue);
-  --md-code-hl-function-color: var(--pg-hue-blue);
-  --md-code-hl-constant-color: var(--pg-hue-blue);
+  --md-code-hl-number-color: var(--pg-signal);
+  --md-code-hl-function-color: var(--pg-text);
+  --md-code-hl-constant-color: var(--pg-signal);
   --md-code-hl-special-color: var(--md-code-hl-keyword-color);
   --md-code-hl-variable-color: var(--pg-hue-green);
   --md-code-hl-name-color: var(--pg-text);
@@ -572,8 +571,8 @@ body {
 
 /* -- 8. Admonitions, details, tabs ----------------------------------------- */
 
-/* A rule on the left and a title. Neutral by default; the red marks the ones
-   that warn. */
+/* A rule on the left and a title. Neutral by default; the signal colour marks
+   the ones that warn. */
 .md-typeset :is(.admonition, details)[class],
 .md-typeset details {
   --adm: var(--pg-text);

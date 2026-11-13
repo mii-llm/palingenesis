@@ -88,9 +88,9 @@
       colors = {
         ink: style.getPropertyValue("--pg-text").trim() || "#111",
         hues: [
-          style.getPropertyValue("--pg-signal").trim() || "#a00000",
-          style.getPropertyValue("--pg-hue-blue").trim() || "#2c4f7c",
-          style.getPropertyValue("--pg-hue-green").trim() || "#2d5f3a",
+          style.getPropertyValue("--pg-signal").trim() || "#2c4a7c",
+          style.getPropertyValue("--pg-signal").trim() || "#2c4a7c",
+          style.getPropertyValue("--pg-hue-green").trim() || "#1c6642",
           style.getPropertyValue("--pg-text-3").trim() || "#696964",
         ],
       };

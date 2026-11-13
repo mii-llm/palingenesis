@@ -278,12 +278,12 @@
   color: var(--pg-text);
 }
 .pg-opt[aria-selected="true"] {
-  background: var(--pg-signal);
-  color: var(--pg-bg);
+  background: var(--pg-signal-soft);
+  box-shadow: inset 2px 0 0 var(--pg-signal);
+  color: var(--pg-text);
 }
-.pg-opt[aria-selected="true"] :is(.pg-opt__tag, .pg-opt__hint) {
-  color: inherit;
-  opacity: 0.85;
+.pg-opt[aria-selected="true"] .pg-opt__tag {
+  color: var(--pg-signal);
 }
 
 .pg-console__view {
