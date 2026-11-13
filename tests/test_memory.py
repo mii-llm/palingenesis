@@ -204,6 +204,35 @@ def test_selective_diff_correctness():
     print("✓ test_selective_diff_correctness PASSED\n")
 
 
+def test_selective_diff_under_autocast_matches_standard():
+    """fp32 weights under bf16 autocast (model.torch_dtype: float32 + train.bf16): the backward of a
+    frozen layer meets a bf16 upstream gradient and an fp32 weight, and gives the standard gradients."""
+    from palingenesis.memory import apply_selective_diff_v2
+
+    torch.manual_seed(0)
+    model_std = SimpleModel(hidden=32, layers=4)
+    model_sd = SimpleModel(hidden=32, layers=4)
+    model_sd.load_state_dict(model_std.state_dict())
+    for m in (model_std, model_sd):
+        for layer in m.layers[:2]:
+            for p in layer.parameters():
+                p.requires_grad = False
+    assert apply_selective_diff_v2(model_sd) == 2
+
+    x = torch.randint(0, 1000, (2, 8))
+    target = torch.randint(0, 1000, (2, 8))
+    for m in (model_std, model_sd):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = m(x)
+        nn.functional.cross_entropy(out.float().view(-1, 1000), target.view(-1)).backward()
+
+    for (name, p_std), (_, p_sd) in zip(model_std.named_parameters(), model_sd.named_parameters()):
+        if p_std.requires_grad:
+            assert torch.equal(p_std.grad, p_sd.grad), name
+        else:
+            assert p_sd.grad is None, name
+
+
 def test_combined_memory_savings():
     """Test using both techniques together."""
     from palingenesis.memory import GradientRelease, apply_selective_diff_v2

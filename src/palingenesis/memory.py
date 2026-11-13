@@ -327,13 +327,14 @@ class SelectiveDiffLinear(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (weight,) = ctx.saved_tensors
 
-        # dx = grad_output @ weight (input gradient — needed for upstream layers)
-        grad_input = grad_output.matmul(weight)
+        # dx = grad_output @ weight (input gradient — needed for upstream layers). Backward runs
+        # outside autocast: a bf16 grad_output meets the fp32 weight, and matmul does not promote.
+        grad_input = grad_output.matmul(weight.to(grad_output.dtype)) if ctx.needs_input_grad[0] else None
 
         # dW = None (weight is frozen, no gradient needed)
-        # db = None or sum of grad_output (bias might be trainable in some configs)
+        # db = sum of grad_output, only when the bias is trainable
         grad_bias = None
-        if ctx.has_bias:
+        if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_bias = grad_output.sum(dim=tuple(range(grad_output.ndim - 1)))
 
         return grad_input, None, grad_bias
