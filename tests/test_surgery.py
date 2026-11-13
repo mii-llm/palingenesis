@@ -406,3 +406,14 @@ def test_cpu_master_applies_full_step_on_cuda():
     step = [torch.full((1 << 20,), 0.5, device="cuda")]
     ed.apply(step, 1.0)
     assert torch.allclose(ed.master[0], torch.full((1 << 20,), 0.5))
+
+
+def test_output_dir_that_is_an_input_checkpoint_is_refused(tmp_path):
+    model = tmp_path / "runs" / "model"
+    model.mkdir(parents=True)
+    (model / "model.safetensors").write_bytes(b"weights")
+    for out in (model, tmp_path / "runs"):  # the checkpoint itself, or a directory that holds it
+        with pytest.raises(surgery.SurgeryConfigError, match="input"):
+            surgery._prepare_out(str(out), True, [str(model), None])
+    assert (model / "model.safetensors").exists()
+    assert surgery._prepare_out(str(tmp_path / "out"), True, ["org/hub-model", None]).is_dir()  # a Hub id is not a path

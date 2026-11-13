@@ -976,8 +976,16 @@ def _empty_cache(device) -> None:
         torch.cuda.empty_cache()
 
 
-def _prepare_out(path: str, overwrite: bool) -> Path:
+def _prepare_out(path: str, overwrite: bool, inputs: Sequence[str | None] = ()) -> Path:
+    """The (emptied) output directory. An output that is, or contains, a local input checkpoint is refused: replacing
+    it would delete the model before it is loaded."""
     out = Path(path)
+    target = out.resolve()
+    for src in inputs:
+        if src and Path(src).exists():  # a Hub id is not a local directory
+            src_dir = Path(src).resolve()
+            if src_dir == target or target in src_dir.parents:
+                raise SurgeryConfigError(f"output_dir {out} is (or contains) the input {src}: use another directory")
     if out.exists() and any(out.iterdir()):
         if not overwrite:
             raise SurgeryConfigError(f"{out} exists and is not empty (overwrite: true to replace it)")
@@ -1000,7 +1008,7 @@ def run_surgery(config: SurgeryConfig) -> dict:
         raise SurgeryConfigError("; ".join(errors))
     t_start = time.time()
     timings: dict[str, float] = {}
-    out = _prepare_out(config.output_dir, config.overwrite)
+    out = _prepare_out(config.output_dir, config.overwrite, [config.model, config.reference])
     device = torch.device(config.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     tok = AutoTokenizer.from_pretrained(config.model)
 

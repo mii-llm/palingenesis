@@ -248,3 +248,27 @@ def test_ram_unique_kept_shared_averaged(tmp_path):
     assert (
         M.main(["ram", "--base", str(base), str(tmp_path / "a"), str(tmp_path / "b"), "-o", str(tmp_path / "c")]) == 0
     )
+
+
+def test_output_that_is_an_input_is_refused_before_anything_is_deleted(tmp_path):
+    a, b = make(tmp_path / "runs" / "a", 0), make(tmp_path / "runs" / "b", 1)
+    before = weights(a)
+    for out in (a, b, tmp_path / "runs"):  # an input itself, or a directory that holds one
+        with pytest.raises(M.MergeError, match="input"):
+            M.interpolate(a, b, 0.3, out, overwrite=True)
+    with pytest.raises(M.MergeError, match="input"):
+        M.task_arithmetic(a, [b], [1.0], a, template=b, overwrite=True)  # the base counts as an input
+    assert M.main(["soup", str(a), str(b), "-o", str(a), "--overwrite"]) == 1
+    after = weights(a)
+    assert (b / "model.safetensors").exists() and all(torch.equal(before[n], after[n]) for n in NAMES)
+    M.interpolate(a, b, 0.3, a / "merged")  # a new directory inside an input deletes nothing
+
+
+def test_model_stock_with_one_model_fails_before_the_output_is_replaced(tmp_path):
+    base, a = make(tmp_path / "base", 0), make(tmp_path / "a", 1)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "keep.txt").write_text("previous result")
+    with pytest.raises(M.MergeError, match="at least two"):
+        M.model_stock(base, [a], out, overwrite=True)
+    assert (out / "keep.txt").exists()

@@ -164,8 +164,15 @@ def _parse_dtype(dtype) -> torch.dtype | None:
     return DTYPES[str(dtype)]
 
 
-def _prepare_out(out: str | Path, overwrite: bool) -> Path:
+def _prepare_out(out: str | Path, overwrite: bool, inputs: Iterable[Path] = ()) -> Path:
+    """The (emptied) output directory. An output that is, or contains, one of `inputs` is refused: replacing it
+    would delete a source before its tensors are read."""
     out = Path(out)
+    target = out.resolve()
+    for src in inputs:
+        src = Path(src).resolve()
+        if src == target or target in src.parents:
+            raise MergeError(f"{out} is (or contains) the input {src}: write the result to another directory")
     if out.exists() and any(out.iterdir()):
         if not overwrite:
             raise MergeError(f"{out} exists and is not empty (overwrite=True to replace it)")
@@ -214,7 +221,8 @@ def _combine(
             f"{len(extra_names)} tensors are not in the template (e.g. {extra_names[:3]}); "
             "extra='drop' to leave them out"
         )
-    out = _prepare_out(out, overwrite)
+    sources = [c.dir for c, _ in terms] + [template.dir] + ([base.dir] if base is not None else [])
+    out = _prepare_out(out, overwrite, sources)
     from_template, written = 0, 0
     meter = SurvivalMeter()
     narrow_nearest = rounding == "nearest"
@@ -445,6 +453,8 @@ def model_stock(
     (mean pairwise cosine of their task vectors): agreeing models (c -> 1) give their average, disagreeing ones (c -> 0)
     stay near the base, so shared improvements are kept and run-specific noise is averaged out. Needs >= 2 fine-tunes
     of the same base. merge_config.json records the per-tensor t. Template: the first model."""
+    if len(models) < 2:  # before the output directory is touched
+        raise MergeError("model_stock needs at least two models besides the base")
     cks = _checkpoints(models)
     b = base if isinstance(base, Checkpoint) else Checkpoint(base)
     tpl = Checkpoint(template) if template is not None else cks[0]
