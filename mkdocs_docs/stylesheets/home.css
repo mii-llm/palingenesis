@@ -1,0 +1,606 @@
+/* ==========================================================================
+   palingenesis documentation: landing page
+
+   1. Hero        the name (drawn by the artwork in site.js), one sentence
+   2. Console     one input that answers from the docs (javascripts/site.js)
+   3. Sections    a title in the margin, the text beside it, a rule above
+   4. Small screens, print
+
+   Same rules as the rest of the site: ink, hairlines, no boxes around text.
+   The only frame on the page is the console, because it is a tool.
+   ========================================================================== */
+
+/* -- 1. Hero --------------------------------------------------------------- */
+
+.pg-hero {
+  color: var(--pg-text);
+  font-family: var(--pg-font-sans);
+  animation: pg-arrive var(--pg-slow) ease-out both;
+}
+.pg-hero__body {
+  padding: 1.8rem 0.8rem 0;
+}
+/* The plain heading: what is shown until, or instead of, the artwork */
+.pg-hero__title {
+  margin: 0 0 1rem -0.03em;
+  font-family: var(--pg-font-sans);
+  font-size: clamp(2.6rem, 15.5vw, 13rem);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.045em;
+  white-space: nowrap;
+}
+.pg-hero.has-art .pg-hero__title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.pg-art {
+  display: none;
+  width: 100%;
+  margin: 0 0 0.9rem;
+}
+.pg-hero.has-art .pg-art {
+  display: block;
+}
+.pg-hero__intro {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 3rem;
+  align-items: end;
+  justify-content: space-between;
+}
+.pg-hero__lead {
+  max-width: 36rem;
+  margin: 0;
+  color: var(--pg-text-2);
+  font-family: var(--pg-font-serif);
+  font-size: 1.16rem;
+  line-height: 1.42;
+  text-wrap: pretty;
+}
+.pg-hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.4rem;
+  align-items: center;
+  margin: 0;
+  font-size: 0.76rem;
+}
+.pg-hero__actions a {
+  color: var(--pg-text);
+  text-decoration: underline;
+  text-decoration-color: var(--pg-border-strong);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.3em;
+  transition: color var(--pg-fast), background-color var(--pg-fast), border-color var(--pg-fast);
+}
+.pg-hero__actions a:is(:hover, :focus-visible) {
+  color: var(--pg-signal);
+  text-decoration-color: currentColor;
+}
+.pg-hero__actions a.pg-hero__go {
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--pg-text);
+  border-radius: var(--pg-radius);
+  background: var(--pg-text);
+  color: var(--pg-bg);
+  font-weight: 500;
+  text-decoration: none;
+}
+.pg-hero__actions a.pg-hero__go::after {
+  content: "\2192";
+  margin-left: 0.5em;
+}
+.pg-hero__actions a.pg-hero__go:is(:hover, :focus-visible) {
+  border-color: var(--pg-signal);
+  background: var(--pg-signal);
+  color: var(--pg-bg);
+}
+
+/* Facts: a label, a value, a rule */
+.pg-specs {
+  margin: 0;
+  border-top: 1px solid var(--pg-text);
+}
+.pg-specs > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.42rem 0;
+  border-bottom: 1px solid var(--pg-border);
+}
+.pg-specs dt {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.6rem;
+}
+.pg-specs dd {
+  margin: 0;
+  font-family: var(--pg-font-serif);
+  font-size: 1rem;
+  font-variant-numeric: lining-nums;
+}
+
+/* -- 2. Console ------------------------------------------------------------ */
+
+/* Without JavaScript the console is absent and its recipes are rows below */
+.pg-console {
+  display: none;
+  margin: 2rem 0 0;
+  border: 1px solid var(--pg-text);
+  border-radius: var(--pg-radius);
+  background: var(--pg-bg);
+  color: var(--pg-text);
+  text-align: left;
+}
+.pg-js .pg-console {
+  display: block;
+}
+.pg-js .pg-home .pg-source {
+  display: none;
+}
+
+.pg-console__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0 0.9rem;
+  border-bottom: 1px solid var(--pg-border);
+}
+.pg-console__ps {
+  flex: none;
+  color: var(--pg-signal);
+  font-family: var(--pg-font-mono);
+  font-size: 0.9rem;
+  line-height: 1;
+}
+.pg-console__input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.8rem 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--pg-text);
+  caret-color: var(--pg-signal);
+  font-family: var(--pg-font-sans);
+  font-size: 0.86rem;
+}
+.pg-console__input::placeholder {
+  color: var(--pg-text-3);
+  opacity: 1;
+}
+.pg-console__keys,
+.pg-console__try {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.58rem;
+}
+.pg-console__keys {
+  flex: none;
+}
+
+.pg-console__try {
+  display: flex;
+  gap: 1.1rem;
+  padding: 0.5rem 0.9rem;
+  border-bottom: 1px solid var(--pg-border);
+  overflow-x: auto;
+  scrollbar-width: none;
+  white-space: nowrap;
+}
+.pg-console__try::-webkit-scrollbar {
+  display: none;
+}
+.pg-console__try button {
+  flex: none;
+  padding: 0;
+  color: var(--pg-text-2);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--pg-border-strong);
+  text-underline-offset: 0.3em;
+  cursor: pointer;
+  transition: color var(--pg-fast);
+}
+.pg-console__try button:is(:hover, :focus-visible) {
+  color: var(--pg-signal);
+  text-decoration-color: currentColor;
+}
+
+.pg-console__panes {
+  display: grid;
+  grid-template-columns: 19rem minmax(0, 1fr);
+  height: 15rem;
+}
+.pg-console__list {
+  padding: 0 0 0.6rem;
+  border-right: 1px solid var(--pg-border);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--pg-border-strong) transparent;
+}
+.pg-group {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.7rem 0.9rem 0.3rem;
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.58rem;
+  text-transform: lowercase;
+}
+.pg-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 0.7rem;
+  padding: 0.3rem 0.9rem;
+  color: var(--pg-text-2);
+  font-size: 0.72rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.pg-opt__tag {
+  flex: none;
+  width: 1.5rem;
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.56rem;
+}
+.pg-opt__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg-opt--option .pg-opt__label {
+  font-family: var(--pg-font-mono);
+  font-size: 0.64rem;
+}
+.pg-opt__hint {
+  flex: none;
+  max-width: 42%;
+  overflow: hidden;
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.56rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg-opt:hover {
+  color: var(--pg-text);
+}
+.pg-opt[aria-selected="true"] {
+  background: var(--pg-text);
+  color: var(--pg-bg);
+}
+.pg-opt[aria-selected="true"] :is(.pg-opt__tag, .pg-opt__hint) {
+  color: inherit;
+  opacity: 0.7;
+}
+
+.pg-console__view {
+  padding: 1.3rem 1.6rem 1.4rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--pg-border-strong) transparent;
+  font-size: 0.76rem;
+  outline: 0;
+}
+.pg-console__view.is-fresh > * {
+  animation: pg-arrive 200ms ease-out both;
+}
+.pg-console__view h3 {
+  margin: 0 0 0.5rem;
+  font-family: var(--pg-font-serif);
+  font-size: 1.6rem;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+  line-height: 1.15;
+}
+.pg-console__view h3 code {
+  font-family: var(--pg-font-mono);
+  font-size: 1rem;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+.pg-console__view h3 .headerlink {
+  display: none;
+}
+.pg-console__view p {
+  max-width: 34rem;
+  margin: 0 0 0.7rem;
+  color: var(--pg-text-2);
+}
+.pg-console__view .highlight {
+  margin: 0.9rem 0;
+}
+.pg-console__view mark {
+  background: none;
+  color: var(--pg-signal);
+}
+.pg-view__crumb {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.4rem;
+  margin: 0 0 0.5rem !important;
+  color: var(--pg-text-3) !important;
+  font-family: var(--pg-font-mono);
+  font-size: 0.58rem;
+  text-transform: lowercase;
+}
+.pg-view__crumb span + span::before {
+  content: "/";
+  margin-right: 0.4rem;
+}
+.pg-answer__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1.4rem;
+  color: var(--pg-text-3) !important;
+  font-family: var(--pg-font-mono);
+  font-size: 0.62rem;
+}
+.pg-answer__meta code {
+  padding: 0;
+  background: none;
+  color: var(--pg-text);
+  font-size: 1em;
+}
+.pg-answer__cli {
+  font-size: 0.7rem;
+}
+.pg-view__none {
+  display: grid;
+  place-content: center;
+  height: 100%;
+  text-align: center;
+}
+.pg-view__none p:first-child {
+  color: var(--pg-text);
+  font-family: var(--pg-font-serif);
+  font-size: 1.2rem;
+}
+
+/* Symptom facts: a label and a value */
+.pg-fact {
+  position: relative;
+  margin: 0 0 0.4rem !important;
+  padding-left: 5rem;
+}
+.pg-fact > span {
+  position: absolute;
+  top: 0.3em;
+  left: 0;
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.58rem;
+  text-transform: lowercase;
+}
+
+/* Links out of an answer */
+.pg-more {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1.4rem;
+  max-width: none !important;
+  margin: 1rem 0 0 !important;
+  font-size: 0.74rem;
+}
+.pg-more a::after,
+.pg-cols a::after,
+.pg-ways a::after,
+.pg-prose > p:last-child > a:only-child::after {
+  content: "\00a0\2192";
+}
+
+.pg-console__status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+/* -- 3. Sections ----------------------------------------------------------- */
+
+/* The landing page uses the whole grid: no side rails */
+.md-container:has(> .pg-hero) .md-content__inner {
+  margin: 0 0.8rem;
+  padding: 0 0 4rem;
+}
+.md-container:has(> .pg-hero) .md-content__inner::before {
+  display: none;
+}
+.md-container:has(> .pg-hero) .md-sidebar {
+  display: none;
+}
+@media screen and (max-width: 76.2344em) {
+  /* the primary sidebar is the mobile drawer: keep it reachable */
+  .md-container:has(> .pg-hero) .md-sidebar--primary {
+    display: block;
+  }
+}
+
+.pg-home .pg-section {
+  display: grid;
+  grid-template-columns: 13rem minmax(0, 1fr);
+  gap: 1rem 3rem;
+  margin: 4rem 0 0;
+  padding: 1.3rem 0 0;
+  border-top: 1px solid var(--pg-text);
+}
+.pg-home .pg-section > h2 {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-size: 1.3rem;
+  line-height: 1.2;
+}
+.pg-home .headerlink {
+  display: none;
+}
+.pg-home .pg-body > :first-child,
+.pg-home .pg-body > div > :first-child {
+  margin-top: 0;
+}
+.pg-home h3 {
+  margin: 0 0 0.4rem;
+  font-family: var(--pg-font-serif);
+  font-size: 1.2rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+
+/* Recipes without JavaScript: one per row */
+.pg-home .pg-rows > .pg-recipe {
+  padding: 1.1rem 0;
+  border-top: 1px solid var(--pg-border);
+}
+.pg-home .pg-rows > .pg-recipe:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* Three statements side by side, divided by rules */
+.pg-home .pg-cols {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.pg-home .pg-cols > div {
+  padding: 0 1.6rem;
+  border-left: 1px solid var(--pg-border);
+  color: var(--pg-text-2);
+  font-size: 0.76rem;
+}
+.pg-home .pg-cols > div:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+.pg-home .pg-cols > div:last-child {
+  padding-right: 0;
+}
+.pg-home .pg-cols h3 {
+  color: var(--pg-text);
+  font-size: 1.5rem;
+}
+.pg-home .pg-cols > div > :last-child,
+.pg-home .pg-ways > div > :last-child {
+  margin-bottom: 0;
+}
+
+.pg-home .pg-prose {
+  max-width: 36rem;
+}
+.pg-home .pg-pull {
+  margin: 0 0 1.2rem;
+  font-family: var(--pg-font-serif);
+  font-size: 1.7rem;
+  font-style: italic;
+  font-weight: 300;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+  text-wrap: balance;
+}
+
+/* Ways in: a question, an answer, a link, one per row */
+.pg-home .pg-ways > div {
+  display: grid;
+  grid-template-columns: 13rem minmax(0, 1fr) auto;
+  gap: 0.2rem 2rem;
+  align-items: baseline;
+  padding: 0.8rem 0;
+  border-top: 1px solid var(--pg-border);
+  font-size: 0.76rem;
+}
+.pg-home .pg-ways > div:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.pg-home .pg-ways h3,
+.pg-home .pg-ways p {
+  margin: 0;
+}
+.pg-home .pg-ways p {
+  color: var(--pg-text-2);
+}
+
+/* -- 4. Small screens -------------------------------------------------------- */
+
+@media screen and (max-width: 59.9844em) {
+  .pg-home .pg-section {
+    grid-template-columns: minmax(0, 1fr);
+    margin-top: 3rem;
+  }
+  .pg-home .pg-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pg-home .pg-cols > div {
+    padding: 1.2rem 0 0;
+    margin-top: 1.2rem;
+    border-top: 1px solid var(--pg-border);
+    border-left: 0;
+  }
+  .pg-home .pg-cols > div:first-child {
+    padding-top: 0;
+    margin-top: 0;
+    border-top: 0;
+  }
+  .pg-home .pg-ways > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media screen and (max-width: 44.9844em) {
+  .pg-hero__body {
+    padding-top: 2rem;
+  }
+  .pg-hero__lead {
+    font-size: 1.02rem;
+  }
+  .pg-console {
+    margin-top: 2rem;
+  }
+  .pg-console__keys {
+    display: none;
+  }
+  .pg-console__input {
+    font-size: 0.8rem; /* 16px: no zoom on focus in iOS */
+  }
+  .pg-console__panes {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+  }
+  .pg-console__list {
+    max-height: 12rem;
+    border-right: 0;
+    border-bottom: 1px solid var(--pg-border);
+  }
+  .pg-console__view {
+    min-height: 11rem;
+    padding: 1.1rem 0.9rem 1.2rem;
+    scroll-margin-top: 6rem;
+  }
+  .pg-console__view h3 {
+    font-size: 1.35rem;
+  }
+}
+
+/* -- Print: the name and the sections; the console is an on-screen tool ------ */
+
+@media print {
+  .pg-hero {
+    animation: none;
+  }
+  .pg-hero__actions,
+  .pg-js .pg-console {
+    display: none;
+  }
+}

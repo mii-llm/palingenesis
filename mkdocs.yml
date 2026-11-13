@@ -6,40 +6,52 @@ repo_name: mii-llm/palingenesis
 repo_url: https://github.com/mii-llm/palingenesis
 
 docs_dir: mkdocs_docs
+# Theme templates live inside the docs tree; they are not pages.
+exclude_docs: |
+  /overrides/
 
 theme:
   name: material
   custom_dir: mkdocs_docs/overrides
+  favicon: assets/favicon.svg
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
       primary: custom
+      accent: custom
       toggle:
         icon: material/weather-night
-        name: Dark mode
+        name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       primary: custom
+      accent: custom
       toggle:
         icon: material/weather-sunny
-        name: Light mode
+        name: Switch to light mode
+  # Fonts are self-hosted (mkdocs_docs/assets/fonts, declared in stylesheets/theme.css).
   font: false
   icon:
     repo: fontawesome/brands/github
-    logo: material/fire
+    logo: pgs/logo
   features:
     - navigation.instant
+    - navigation.instant.prefetch
     - navigation.instant.progress
     - navigation.tracking
     - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
+    - navigation.path
     - navigation.top
     - navigation.footer
     - search.suggest
     - search.highlight
+    - search.share
     - content.code.copy
     - content.code.annotate
     - content.tabs.link
+    - content.tooltips
     - toc.follow
 
 plugins:
@@ -81,7 +93,11 @@ extra:
   generator: false
 
 extra_css:
-  - stylesheets/extra.css
+  - stylesheets/theme.css
+  - stylesheets/home.css
+
+extra_javascript:
+  - javascripts/site.js
 
 nav:
   - Home: index.md

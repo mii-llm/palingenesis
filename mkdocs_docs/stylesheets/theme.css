@@ -1,0 +1,945 @@
+/* ==========================================================================
+   palingenesis documentation: design layer
+
+   Principles
+     - Ink on paper. Greys for hierarchy, and one colour (a dark red) that
+       marks state: where you are, what is focused, what warns. A blue and a
+       green join it in code, and nowhere else.
+     - Structure comes from hairlines, alignment and type size. No cards,
+       no shadows, no gradients, square corners.
+     - Three typefaces, each with one job: Newsreader for titles, Geist for
+       text and interface, JetBrains Mono for code and small labels.
+     - Motion is a short fade when a page arrives, and nothing else.
+
+   1. Fonts            5. Links, lists, rules     9. Navigation
+   2. Design tokens    6. Code                   10. Footer
+   3. Base + motion    7. Tables                 11. Search
+   4. Typography       8. Admonitions, tabs      12. Print
+   ========================================================================== */
+
+/* -- 1. Fonts (self-hosted, see assets/fonts/LICENSE.txt) ------------------ */
+
+@font-face {
+  font-family: "Newsreader";
+  src: url("../assets/fonts/newsreader-latin-wght.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Newsreader";
+  src: url("../assets/fonts/newsreader-latin-wght-italic.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist";
+  src: url("../assets/fonts/geist-latin-wght.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("../assets/fonts/jetbrains-mono-regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* -- 2. Design tokens ------------------------------------------------------ */
+
+:root {
+  --pg-font-serif: "Newsreader", "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+  --pg-font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --pg-font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  --pg-radius: 2px;
+  --pg-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --pg-fast: 120ms;
+  --pg-slow: 360ms;
+
+  --md-text-font: var(--pg-font-sans);
+  --md-code-font: var(--pg-font-mono);
+}
+
+[data-md-color-scheme="default"] {
+  color-scheme: light;
+
+  --pg-bg: #fffff8;
+  --pg-raised: #f6f6ec;
+  --pg-border: #e3e3d7;
+  --pg-border-strong: #c6c6b8;
+  --pg-text: #111111;
+  --pg-text-2: #434340;
+  --pg-text-3: #696964;
+  --pg-signal: #a00000;
+  --pg-signal-soft: #a0000012;
+  --pg-hue-blue: #2c4f7c;
+  --pg-hue-green: #2d5f3a;
+
+  --md-code-hl-keyword-color: #8f1d12;
+}
+
+[data-md-color-scheme="slate"] {
+  color-scheme: dark;
+
+  --pg-bg: #141413;
+  --pg-raised: #1c1c1a;
+  --pg-border: #2d2d2a;
+  --pg-border-strong: #4a4943;
+  --pg-text: #e8e3da;
+  --pg-text-2: #b8b2a7;
+  --pg-text-3: #938d82;
+  --pg-signal: #e58a72;
+  --pg-signal-soft: #e58a721c;
+  --pg-hue-blue: #a3bbd6;
+  --pg-hue-green: #a9c9a4;
+
+  --md-code-hl-keyword-color: #e89a84;
+}
+
+/* The theme's own variables, mapped once onto the tokens above */
+[data-md-color-scheme] {
+  --md-default-bg-color: var(--pg-bg);
+  --md-default-fg-color: var(--pg-text);
+  --md-default-fg-color--light: var(--pg-text-2);
+  --md-default-fg-color--lighter: var(--pg-text-3);
+  --md-default-fg-color--lightest: var(--pg-border);
+  --md-primary-fg-color: var(--pg-bg);
+  --md-primary-fg-color--light: var(--pg-bg);
+  --md-primary-fg-color--dark: var(--pg-raised);
+  --md-primary-bg-color: var(--pg-text);
+  --md-primary-bg-color--light: var(--pg-text-3);
+  --md-accent-fg-color: var(--pg-signal);
+  --md-accent-fg-color--transparent: var(--pg-signal-soft);
+  --md-accent-bg-color: var(--pg-bg);
+  --md-typeset-color: var(--pg-text);
+  --md-typeset-a-color: var(--pg-text);
+  --md-typeset-mark-color: var(--pg-signal-soft);
+  --md-typeset-kbd-color: var(--pg-raised);
+  --md-typeset-kbd-accent-color: var(--pg-border);
+  --md-typeset-kbd-border-color: var(--pg-border-strong);
+  --md-typeset-table-color: var(--pg-border);
+  --md-typeset-table-color--light: var(--pg-raised);
+  --md-footer-bg-color: var(--pg-bg);
+  --md-footer-bg-color--dark: var(--pg-bg);
+  --md-footer-fg-color: var(--pg-text);
+  --md-footer-fg-color--light: var(--pg-text-2);
+  --md-footer-fg-color--lighter: var(--pg-text-3);
+  --md-shadow-z1: none;
+  --md-shadow-z2: none;
+  --md-shadow-z3: none;
+
+  --md-code-bg-color: var(--pg-raised);
+  --md-code-fg-color: var(--pg-text);
+  --md-code-hl-color: var(--pg-signal);
+  --md-code-hl-color--light: var(--pg-signal-soft);
+  --md-code-hl-string-color: var(--pg-hue-green);
+  --md-code-hl-number-color: var(--pg-hue-blue);
+  --md-code-hl-function-color: var(--pg-hue-blue);
+  --md-code-hl-constant-color: var(--pg-hue-blue);
+  --md-code-hl-special-color: var(--md-code-hl-keyword-color);
+  --md-code-hl-variable-color: var(--pg-hue-green);
+  --md-code-hl-name-color: var(--pg-text);
+  --md-code-hl-operator-color: var(--pg-text-2);
+  --md-code-hl-punctuation-color: var(--pg-text-2);
+  --md-code-hl-comment-color: var(--pg-text-3);
+  --md-code-hl-generic-color: var(--pg-text-2);
+}
+
+/* -- 3. Base + motion ------------------------------------------------------ */
+
+html {
+  scroll-padding-top: 5rem;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+.md-grid {
+  max-width: 66rem;
+}
+
+::selection {
+  background: var(--pg-text);
+  color: var(--pg-bg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--pg-signal);
+  outline-offset: 2px;
+}
+
+/* A page arrives with one short fade, on first load and on instant navigation.
+   Opacity only: a transform here would make the container the offset parent of
+   the title and confuse the header's title swap. */
+@keyframes pg-arrive {
+  from { opacity: 0; }
+}
+.md-content__inner {
+  animation: pg-arrive var(--pg-slow) ease-out both;
+}
+
+/* Reading progress (filled by javascripts/site.js) */
+.pg-progress {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 5;
+  height: 2px;
+  transform: scaleX(var(--pg-read, 0));
+  transform-origin: 0 50%;
+  background: var(--pg-signal);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* -- 4. Typography --------------------------------------------------------- */
+
+.md-typeset {
+  font-size: 0.8rem;
+  line-height: 1.7;
+}
+
+.md-typeset h1,
+.md-typeset h2 {
+  color: var(--pg-text);
+  font-family: var(--pg-font-serif);
+  font-weight: 400;
+  text-wrap: balance;
+}
+
+.md-typeset h1 {
+  margin: 0 0 1rem;
+  font-size: 2.5rem;
+  font-weight: 350;
+  line-height: 1.08;
+  letter-spacing: -0.022em;
+}
+
+.md-typeset h2 {
+  margin: 3rem 0 0.8rem;
+  padding-top: 1.3rem;
+  border-top: 1px solid var(--pg-border);
+  font-size: 1.55rem;
+  line-height: 1.2;
+  letter-spacing: -0.014em;
+}
+/* A rule followed by a heading would draw two lines: keep the rule */
+.md-typeset hr + h2 {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.md-typeset h3 {
+  margin: 2rem 0 0.6rem;
+  color: var(--pg-text);
+  font-size: 0.94rem;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.012em;
+}
+
+.md-typeset h4 {
+  margin: 1.6rem 0 0.5rem;
+  color: var(--pg-text);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.md-typeset h5,
+.md-typeset h6 {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.62rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* The italic one-liner many pages open with becomes a standfirst */
+.md-typeset h1 + p:has(> em:only-child) {
+  max-width: 36rem;
+  margin: -0.2rem 0 1.2rem;
+  color: var(--pg-text-2);
+  font-family: var(--pg-font-serif);
+  font-size: 1.14rem;
+  line-height: 1.45;
+}
+.md-typeset h1 + p:has(> em:only-child) code {
+  font-size: 0.72em;
+}
+
+.md-typeset .headerlink {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-sans);
+  font-weight: 400;
+}
+.md-typeset .headerlink:hover,
+.md-typeset :target > .headerlink {
+  color: var(--pg-signal);
+}
+
+.md-typeset strong {
+  font-weight: 600;
+}
+
+.md-typeset blockquote {
+  margin: 1.4rem 0;
+  padding: 0 0 0 1rem;
+  border-left: 1px solid var(--pg-text);
+  color: var(--pg-text-2);
+  font-family: var(--pg-font-serif);
+  font-size: 1.1em;
+  font-style: italic;
+}
+
+/* -- 5. Links, lists, rules ------------------------------------------------ */
+
+.md-typeset a {
+  color: var(--pg-text);
+  text-decoration: underline;
+  text-decoration-color: var(--pg-signal);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
+  transition: color var(--pg-fast);
+}
+.md-typeset a:hover,
+.md-typeset a:focus-visible {
+  color: var(--pg-signal);
+}
+.md-typeset a.headerlink,
+.md-typeset a.md-button,
+.md-typeset .tabbed-labels a,
+.md-typeset a.footnote-ref,
+.md-typeset a.md-annotation__index {
+  text-decoration: none;
+}
+
+.md-typeset ul > li::marker {
+  color: var(--pg-text-3);
+}
+.md-typeset ol > li::marker {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.85em;
+}
+
+.md-typeset hr {
+  height: 1px;
+  margin: 2rem 0;
+  border: 0;
+  background: var(--pg-border);
+}
+/* The rule under a page title */
+.md-typeset h1 + hr,
+.md-typeset h1 + p + hr {
+  margin: 1.3rem 0 1.8rem;
+  background: var(--pg-text);
+}
+
+.md-typeset kbd {
+  border: 1px solid var(--pg-border-strong);
+  border-radius: var(--pg-radius);
+  box-shadow: none;
+  font-family: var(--pg-font-mono);
+}
+
+.md-typeset .md-button {
+  padding: 0.5em 1em;
+  border: 1px solid var(--pg-text);
+  border-radius: var(--pg-radius);
+  color: var(--pg-text);
+  font-weight: 500;
+  transition: background-color var(--pg-fast), color var(--pg-fast), border-color var(--pg-fast);
+}
+.md-typeset .md-button:hover,
+.md-typeset .md-button:focus-visible,
+.md-typeset .md-button--primary {
+  border-color: var(--pg-text);
+  background: var(--pg-text);
+  color: var(--pg-bg);
+}
+.md-typeset .md-button--primary:hover,
+.md-typeset .md-button--primary:focus-visible {
+  border-color: var(--pg-signal);
+  background: var(--pg-signal);
+  color: var(--pg-bg);
+}
+
+/* -- 6. Code --------------------------------------------------------------- */
+
+.md-typeset code {
+  padding: 0.1em 0.32em;
+  border-radius: var(--pg-radius);
+  font-size: 0.84em;
+  font-variant-ligatures: none;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+.md-typeset a code {
+  color: inherit;
+}
+.md-typeset h1 code,
+.md-typeset h2 code,
+.md-typeset h3 code {
+  padding: 0;
+  background: none;
+  font-size: 0.78em;
+  letter-spacing: -0.02em;
+}
+
+.md-typeset .highlight {
+  position: relative;
+  margin: 1.1rem 0;
+  border: 1px solid var(--pg-border);
+  border-radius: var(--pg-radius);
+  background: var(--md-code-bg-color);
+  overflow: clip;
+}
+.md-typeset .highlight pre {
+  margin: 0;
+}
+.md-typeset pre > code {
+  padding: 0.8rem 0.9rem;
+  border-radius: 0;
+  font-size: 0.68rem;
+  line-height: 1.7;
+  overflow-wrap: normal;
+  scrollbar-width: thin;
+  scrollbar-color: var(--pg-border-strong) transparent;
+}
+
+/* Header strip: the language, or the title when the block has one */
+.md-typeset .highlight[class*="language-"]::before,
+.md-typeset .highlight span.filename {
+  display: block;
+  margin: 0;
+  padding: 0.4rem 0.9rem;
+  border: 0;
+  border-bottom: 1px solid var(--pg-border);
+  border-radius: 0;
+  background: var(--pg-bg);
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.58rem;
+  font-weight: 400;
+  line-height: 1.3;
+}
+.md-typeset .highlight span.filename {
+  color: var(--pg-text);
+}
+.md-typeset .highlight[class*="language-"]::before { content: "code"; }
+.md-typeset .highlight.language-text::before { content: "text"; }
+.md-typeset .highlight.language-bash::before,
+.md-typeset .highlight.language-sh::before,
+.md-typeset .highlight.language-shell::before,
+.md-typeset .highlight.language-console::before { content: "shell"; }
+.md-typeset .highlight.language-yaml::before,
+.md-typeset .highlight.language-yml::before { content: "yaml"; }
+.md-typeset .highlight.language-python::before,
+.md-typeset .highlight.language-py::before { content: "python"; }
+.md-typeset .highlight.language-json::before,
+.md-typeset .highlight.language-jsonl::before { content: "json"; }
+.md-typeset .highlight.language-toml::before { content: "toml"; }
+.md-typeset .highlight.language-dockerfile::before { content: "dockerfile"; }
+.md-typeset .highlight.language-diff::before { content: "diff"; }
+.md-typeset .highlight.language-ini::before { content: "ini"; }
+.md-typeset .highlight.language-html::before { content: "html"; }
+.md-typeset .highlight.language-css::before { content: "css"; }
+.md-typeset .highlight.language-javascript::before,
+.md-typeset .highlight.language-js::before { content: "javascript"; }
+.md-typeset .highlight:has(> span.filename)::before {
+  content: none;
+}
+
+/* Copy / select buttons sit in the strip */
+.md-typeset .highlight .md-code__nav {
+  top: -1.45rem;
+  right: 0.25rem;
+  padding: 0;
+  background: transparent;
+}
+.md-typeset .highlight .md-code__button {
+  color: var(--pg-text-3);
+}
+.md-typeset .highlight .md-code__button:hover,
+.md-typeset .highlight .md-code__button:focus-visible {
+  color: var(--pg-text);
+}
+
+.md-typeset .highlight .hll {
+  box-shadow: inset 2px 0 0 var(--pg-signal);
+}
+.md-typeset .highlight :is(.c, .c1, .ch, .cm, .cs) {
+  font-style: normal;
+}
+.md-typeset .highlighttable .linenos {
+  background: transparent;
+  color: var(--pg-text-3);
+}
+
+.md-typeset .mermaid {
+  --md-mermaid-font-family: var(--pg-font-sans);
+  --md-mermaid-edge-color: var(--pg-text-3);
+  --md-mermaid-node-bg-color: var(--pg-bg);
+  --md-mermaid-node-fg-color: var(--pg-text);
+  --md-mermaid-label-bg-color: var(--pg-bg);
+  --md-mermaid-label-fg-color: var(--pg-text);
+  margin: 1.4rem 0;
+}
+
+/* -- 7. Tables: rules, no boxes -------------------------------------------- */
+
+.md-typeset__scrollwrap {
+  margin: 1.2rem 0;
+}
+.md-typeset__table {
+  display: block;
+  padding: 0;
+}
+.md-typeset table:not([class]) {
+  display: table;
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--pg-text);
+  border-bottom: 1px solid var(--pg-border);
+  border-radius: 0;
+  background: none;
+  font-size: 0.7rem;
+  line-height: 1.55;
+}
+.md-typeset table:not([class]) th {
+  min-width: 0;
+  padding: 0.5rem 1rem 0.5rem 0;
+  border-bottom: 1px solid var(--pg-border);
+  background: none;
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.6rem;
+  font-weight: 400;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+.md-typeset table:not([class]) td {
+  padding: 0.55rem 1rem 0.55rem 0;
+  border-top: 1px solid var(--pg-border);
+  vertical-align: top;
+}
+.md-typeset table:not([class]) :is(th, td):last-child {
+  padding-right: 0;
+}
+.md-typeset table:not([class]) tbody tr:first-child td {
+  border-top: 0;
+}
+.md-typeset table:not([class]) tbody tr:hover {
+  background: var(--pg-raised);
+  box-shadow: none;
+}
+/* Option and parameter names stay on one line; prose columns keep a readable measure */
+.md-typeset table:not([class]) td:first-child code {
+  overflow-wrap: normal;
+  white-space: nowrap;
+}
+.md-typeset table:not([class]) td:last-child:not(:first-child) {
+  min-width: 13rem;
+}
+.md-typeset table:not([class]) code {
+  padding: 0;
+  background: none;
+  font-size: 0.9em;
+  /* break inside a long value only when the column cannot grow */
+  overflow-wrap: break-word;
+}
+
+/* -- 8. Admonitions, details, tabs ----------------------------------------- */
+
+/* A rule on the left and a title. Neutral by default; the red marks the ones
+   that warn. */
+.md-typeset :is(.admonition, details)[class],
+.md-typeset details {
+  --adm: var(--pg-text);
+  margin: 1.4rem 0;
+  padding: 0 0 0 1rem;
+  border: 0;
+  border-left: 1px solid var(--adm);
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--pg-text);
+  font-size: 0.76rem;
+}
+.md-typeset :is(.admonition, details):focus-within {
+  box-shadow: none;
+}
+.md-typeset :is(.admonition, details)[class]:is(.warning, .caution, .attention, .danger, .error, .failure, .fail, .missing, .bug) {
+  --adm: var(--pg-signal);
+}
+.md-typeset :is(.admonition, details) > :is(.admonition-title, summary) {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--adm);
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+.md-typeset :is(.admonition, details) > :is(.admonition-title, summary)::before {
+  display: none;
+}
+.md-typeset details > summary {
+  padding-right: 1.6rem;
+}
+.md-typeset details > summary::after {
+  top: 0.1rem;
+  right: 0;
+  color: var(--pg-text-3);
+}
+.md-typeset :is(.admonition, details) > :last-child {
+  margin-bottom: 0;
+}
+.md-typeset :is(.admonition, details) > .admonition-title + * {
+  margin-top: 0.3rem;
+}
+
+/* Content tabs: text with an underline on the open one */
+.md-typeset .tabbed-set {
+  margin: 1.3rem 0;
+}
+.md-typeset .tabbed-labels {
+  box-shadow: inset 0 -1px 0 var(--pg-border);
+}
+html .md-typeset .tabbed-set .tabbed-labels > label {
+  padding: 0;
+  margin-right: 1.4rem;
+  border-bottom: 1px solid transparent;
+  color: var(--pg-text-3);
+  font-size: 0.72rem;
+  font-weight: 500;
+  transition: color var(--pg-fast);
+}
+html .md-typeset .tabbed-set .tabbed-labels > label:hover {
+  color: var(--pg-text);
+}
+.md-typeset .tabbed-labels::before,
+.js .md-typeset .tabbed-labels::before {
+  height: 1px;
+  background: var(--pg-text);
+}
+.md-typeset .tabbed-set > input:nth-child(1):checked ~ .tabbed-labels > :nth-child(1),
+.md-typeset .tabbed-set > input:nth-child(2):checked ~ .tabbed-labels > :nth-child(2),
+.md-typeset .tabbed-set > input:nth-child(3):checked ~ .tabbed-labels > :nth-child(3),
+.md-typeset .tabbed-set > input:nth-child(4):checked ~ .tabbed-labels > :nth-child(4),
+.md-typeset .tabbed-set > input:nth-child(5):checked ~ .tabbed-labels > :nth-child(5),
+.md-typeset .tabbed-set > input:nth-child(6):checked ~ .tabbed-labels > :nth-child(6) {
+  border-bottom-color: var(--pg-text);
+  color: var(--pg-text);
+}
+/* the label text is a link when tabs are linked, plain text otherwise */
+html .md-typeset .tabbed-set .tabbed-labels > label:not(:has(> [href])),
+html .md-typeset .tabbed-set .tabbed-labels > label > [href]:first-child {
+  padding: 0.45rem 0 0.5rem;
+  color: inherit;
+}
+
+/* -- 9. Navigation --------------------------------------------------------- */
+
+.md-header {
+  border-bottom: 1px solid var(--pg-border);
+  background: var(--pg-bg);
+  box-shadow: none;
+  color: var(--pg-text);
+}
+.md-header--shadow {
+  box-shadow: none;
+}
+.md-header__title {
+  font-family: var(--pg-font-serif);
+  font-size: 1rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+.md-header__topic:first-child {
+  font-weight: 400;
+}
+.md-header__button.md-logo {
+  padding: 0.3rem;
+}
+.md-header__button.md-logo :is(img, svg) {
+  width: 1.3rem;
+  height: 1.3rem;
+}
+.md-header__button:hover {
+  opacity: 1;
+  color: var(--pg-signal);
+}
+.md-source {
+  font-size: 0.62rem;
+}
+
+.md-tabs {
+  border-bottom: 1px solid var(--pg-border);
+  background: var(--pg-bg);
+  color: var(--pg-text);
+}
+.md-tabs__item {
+  height: 2.1rem;
+}
+.md-tabs__link {
+  margin-top: 0.6rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid transparent;
+  color: var(--pg-text-3);
+  font-size: 0.7rem;
+  font-weight: 450;
+  opacity: 1;
+  transition: color var(--pg-fast), border-color var(--pg-fast);
+}
+.md-tabs__link:hover,
+.md-tabs__item--active .md-tabs__link {
+  color: var(--pg-text);
+}
+.md-tabs__item--active .md-tabs__link {
+  border-bottom-color: var(--pg-signal);
+}
+
+.md-nav {
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+.md-nav__title {
+  color: var(--pg-text-3);
+}
+.md-nav__link {
+  color: var(--pg-text-2);
+  transition: color var(--pg-fast);
+}
+.md-nav__link:is(:hover, :focus-visible),
+.md-nav__link[for]:is(:hover, :focus-visible) {
+  color: var(--pg-text);
+}
+.md-nav__item .md-nav__link--active,
+.md-nav__item .md-nav__link--active code {
+  color: var(--pg-signal);
+}
+.md-nav__item--section > .md-nav__link,
+.md-nav__item--section > .md-nav__link[for] {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.6rem;
+  font-weight: 400;
+}
+
+@media screen and (min-width: 60em) {
+  /* Right rail: a hairline with a moving mark */
+  .md-nav--secondary .md-nav__title {
+    background: transparent;
+    box-shadow: none;
+    font-family: var(--pg-font-mono);
+    font-size: 0.6rem;
+    font-weight: 400;
+  }
+  .md-nav--secondary > .md-nav__list {
+    border-left: 1px solid var(--pg-border);
+  }
+  .md-nav--secondary .md-nav__link {
+    margin-left: -1px;
+    padding-left: 0.7rem;
+    border-left: 1px solid transparent;
+  }
+  .md-nav--secondary .md-nav__item .md-nav__link--active {
+    border-left-color: var(--pg-signal);
+  }
+  .md-nav--secondary .md-nav__list .md-nav__list {
+    padding-left: 0.6rem;
+  }
+}
+
+.md-path {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.6rem;
+}
+.md-path__link:hover {
+  color: var(--pg-text);
+}
+
+.md-top {
+  border: 1px solid var(--pg-text);
+  border-radius: var(--pg-radius);
+  background: var(--pg-bg);
+  box-shadow: none;
+  color: var(--pg-text);
+}
+.md-top:is(:hover, :focus-visible) {
+  background: var(--pg-text);
+  color: var(--pg-bg);
+}
+
+/* -- 10. Footer ------------------------------------------------------------ */
+
+.md-footer {
+  border-top: 1px solid var(--pg-border);
+  background: var(--pg-bg);
+  color: var(--pg-text);
+}
+.md-footer__inner {
+  padding: 0.4rem 0.8rem;
+}
+.md-footer__link {
+  margin: 0;
+  padding: 1rem 0;
+  opacity: 1;
+  transition: color var(--pg-fast);
+}
+.md-footer__link:is(:hover, :focus-visible) {
+  color: var(--pg-signal);
+  opacity: 1;
+}
+.md-footer__title {
+  font-family: var(--pg-font-serif);
+  font-size: 1rem;
+  font-weight: 400;
+}
+.md-footer__direction {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.58rem;
+  opacity: 1;
+}
+.md-footer-meta {
+  border-top: 1px solid var(--pg-border);
+  background: var(--pg-bg);
+}
+.md-footer-meta,
+html .md-footer-meta.md-typeset a {
+  color: var(--pg-text-3);
+}
+html .md-footer-meta.md-typeset a:is(:hover, :focus-visible) {
+  color: var(--pg-text);
+}
+.md-copyright {
+  color: var(--pg-text-3);
+  font-size: 0.62rem;
+}
+.md-social__link svg {
+  fill: currentcolor;
+}
+
+/* -- 11. Search ------------------------------------------------------------ */
+
+@media screen and (min-width: 60em) {
+  .md-search__form {
+    border: 1px solid var(--pg-border);
+    border-radius: var(--pg-radius);
+    background: var(--pg-bg);
+    transition: border-color var(--pg-fast);
+  }
+  .md-search__form:hover {
+    border-color: var(--pg-border-strong);
+    background: var(--pg-bg);
+  }
+  [data-md-toggle="search"]:checked ~ .md-header .md-search__form {
+    border-color: var(--pg-text);
+    border-radius: var(--pg-radius) var(--pg-radius) 0 0;
+    background: var(--pg-bg);
+  }
+  .md-search__input {
+    font-size: 0.7rem;
+  }
+  .md-search__input,
+  .md-search__input::placeholder,
+  .md-search__input + .md-search__icon {
+    color: var(--pg-text-3);
+  }
+  .md-search__output {
+    border: 1px solid var(--pg-text);
+    border-top: 0;
+    border-radius: 0 0 var(--pg-radius) var(--pg-radius);
+    box-shadow: none;
+  }
+}
+.md-search__scrollwrap,
+.md-search-result__meta {
+  background: var(--pg-bg);
+}
+.md-search-result__meta {
+  color: var(--pg-text-3);
+  font-family: var(--pg-font-mono);
+  font-size: 0.6rem;
+}
+.md-search-result__link:is(:hover, :focus) {
+  background: var(--pg-raised);
+}
+.md-search-result mark,
+.md-search-result .md-typeset mark {
+  background: none;
+  color: var(--pg-signal);
+}
+.md-search-result .md-typeset h1 {
+  font-size: 1rem;
+}
+.md-search-result .md-typeset h2 {
+  margin: 0.4rem 0;
+  padding: 0;
+  border: 0;
+  font-size: 0.86rem;
+}
+
+/* -- 12. Print ------------------------------------------------------------- */
+
+@media print {
+  [data-md-color-scheme] {
+    --pg-bg: #fff;
+    --pg-raised: #f6f6f6;
+    --pg-border: #d0d0d0;
+    --pg-border-strong: #a0a0a0;
+    --pg-text: #000;
+    --pg-text-2: #222;
+    --pg-text-3: #555;
+    --pg-signal: #000;
+  }
+  .pg-progress,
+  .md-top,
+  .md-path,
+  .md-code__nav {
+    display: none !important;
+  }
+  .md-content__inner {
+    animation: none;
+  }
+  .md-typeset {
+    font-size: 10.5pt;
+  }
+  .md-typeset pre > code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .md-typeset .highlight,
+  .md-typeset :is(.admonition, details),
+  .md-typeset table:not([class]) tr {
+    break-inside: avoid;
+  }
+  .md-typeset h1,
+  .md-typeset h2,
+  .md-typeset h3 {
+    break-after: avoid;
+  }
+}

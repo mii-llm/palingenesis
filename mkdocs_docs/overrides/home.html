@@ -1,0 +1,71 @@
+{#-
+  Landing page.
+
+  The name is drawn by a small generative piece (letters that arrange
+  themselves; javascripts/site.js), with the plain heading underneath for
+  readers without JavaScript and for assistive technology.
+
+  The hero also holds the docs console: one input that answers with a training
+  recipe, a fix for a symptom, a configuration option or a page of the docs.
+  Its recipes and fixes are ordinary Markdown in index.md (so the build checks
+  their links, and they read as plain rows without JavaScript); option lookups
+  read the configuration reference page; page results read the search index.
+  Behaviour: javascripts/site.js. Styles: stylesheets/home.css.
+-#}
+{% extends "main.html" %}
+
+{% block hero %}
+<section class="pg-hero" aria-labelledby="pg-hero-title">
+  <div class="pg-hero__body md-grid">
+    <div class="pg-hero__head">
+      <h1 class="pg-hero__title" id="pg-hero-title">{{ config.site_name }}</h1>
+      <canvas class="pg-art" data-word="{{ config.site_name }}" aria-hidden="true"></canvas>
+      <div class="pg-hero__intro">
+        <p class="pg-hero__lead">
+          Post-train LLMs and agents from one config: SFT, multi-turn RL in tool environments,
+          on-policy distillation, DPO and merging, with state-of-the-art defaults.
+        </p>
+        <p class="pg-hero__actions">
+          <a class="pg-hero__go" href="{{ 'getting-started/quickstart/' | url }}">Quickstart</a>
+          <a href="{{ 'getting-started/install/' | url }}">Installation</a>
+          <a href="{{ config.repo_url }}">GitHub</a>
+        </p>
+      </div>
+    </div>
+
+    <div class="pg-console"
+         data-config="{{ 'reference/configuration/' | url }}"
+         data-index="{{ 'search/search_index.json' | url }}">
+      <div class="pg-console__bar">
+        <label class="pg-console__ps" for="pg-console-input" aria-hidden="true">›</label>
+        <input class="pg-console__input" id="pg-console-input" type="text" role="combobox"
+               aria-expanded="true" aria-controls="pg-console-list" aria-autocomplete="list"
+               aria-label="Ask the docs: a task, a symptom, a configuration option or any word"
+               placeholder="Ask the docs: a task, a symptom, an option…"
+               autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go">
+        <span class="pg-console__keys" aria-hidden="true">↑↓ move &nbsp; ↵ open &nbsp; esc clear</span>
+      </div>
+      <div class="pg-console__try">
+        <span>try</span>
+        <button type="button" data-q="out of memory">out of memory</button>
+        <button type="button" data-q="packing">packing</button>
+        <button type="button" data-q="tool calls">tool calls</button>
+        <button type="button" data-q="learning rate">learning rate</button>
+        <button type="button" data-q="distill">distill</button>
+        <button type="button" data-q="SLURM">SLURM</button>
+      </div>
+      <div class="pg-console__panes">
+        <div class="pg-console__list" id="pg-console-list" role="listbox" aria-label="Answers"></div>
+        <div class="pg-console__view md-typeset" tabindex="-1"></div>
+      </div>
+      <p class="pg-console__status" role="status" aria-live="polite"></p>
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block content %}
+<div class="pg-home">
+  {{ page.content }}
+</div>
+{% endblock %}
