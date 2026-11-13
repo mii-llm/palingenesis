@@ -85,7 +85,7 @@ from palingenesis.hooks import (
     load_plugins,
 )
 from palingenesis.kernels import apply_activation_checkpointing, apply_liger_kernel, model_type_of
-from palingenesis.logging import Tracker, setup_logging
+from palingenesis.logging import Tracker, _will_resume, setup_logging
 from palingenesis.logits import (
     PostProcessedHead,
     backbone_of,
@@ -918,7 +918,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         return plugin_mgr.export_state_dict(state, model) if plugin_mgr else state
 
     _best_tracker = (
-        BestModelTracker(config.train.output_dir, export=_export)
+        BestModelTracker(config.train.output_dir, export=_export, resume=_will_resume(config))
         if (config.data.eval_dataset or config.data.eval_sources)
         else None
     )

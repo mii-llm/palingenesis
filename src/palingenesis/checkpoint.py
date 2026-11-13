@@ -12,6 +12,7 @@ For single GPU: uses sharded safetensors via HF save_pretrained.
 
 import json
 import logging
+import math
 import re
 import shutil
 from pathlib import Path
@@ -737,11 +738,27 @@ class BestModelTracker:
                 logger.info(f"New best model at step {step} (eval_loss={eval_loss:.4f})")
     """
 
-    def __init__(self, output_dir: str, export=None):
+    def __init__(self, output_dir: str, export=None, resume: bool = False):
+        """resume: continue from the best recorded in output_dir/best/best_meta.json (a run that
+        resumes from a checkpoint). Without it the first evaluation after a resume replaces
+        best/ whatever its loss. Off for a fresh run: a best/ left in output_dir by an earlier
+        run must not shadow this one's."""
         self.output_dir = output_dir
         self.export = export  # see save_final
         self.best_loss = float("inf")
         self.best_step = -1
+        if resume:
+            self._restore()
+
+    def _restore(self) -> None:
+        meta_file = Path(self.output_dir) / "best" / "best_meta.json"
+        try:
+            meta = json.loads(meta_file.read_text())
+            loss, step = float(meta["eval_loss"]), int(meta["step"])
+        except (OSError, ValueError, KeyError, TypeError):  # no best yet, or an unreadable record
+            return
+        if math.isfinite(loss):
+            self.best_loss, self.best_step = loss, step
 
     def update(
         self,
@@ -757,7 +774,9 @@ class BestModelTracker:
         Only rank 0 performs the actual save. Other ranks participate
         in the FSDP gather if needed.
         """
-        if eval_loss >= self.best_loss:
+        # A NaN compares False with everything: it would replace best/ and then let every later
+        # evaluation replace it too.
+        if not math.isfinite(eval_loss) or eval_loss >= self.best_loss:
             return False
 
         self.best_loss = eval_loss

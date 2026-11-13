@@ -132,3 +132,54 @@ def test_hyperball_moves_weights_after_a_zero_lr_warmup_step():
         opt.zero_grad()
     assert (lin.weight - w0).norm() > 0.1
     torch.testing.assert_close(lin.weight.norm(), w0.norm())
+
+
+def _tracker(tmp_path, monkeypatch, **kwargs):
+    """A BestModelTracker whose model save only records the call (the bookkeeping is under test)."""
+    from palingenesis import checkpoint
+
+    saves = []
+
+    def save(model, tokenizer, path, is_fsdp, export=None):
+        path.mkdir(parents=True, exist_ok=True)
+        saves.append(path)
+
+    monkeypatch.setattr(checkpoint, "_save_gathered_or_local", save)
+    return checkpoint.BestModelTracker(str(tmp_path), **kwargs), saves
+
+
+def test_best_tracker_never_takes_a_non_finite_loss(tmp_path, monkeypatch):
+    """A NaN (or infinite) evaluation is not a new best: it compares False with the current best,
+    which replaced best/ and made every later evaluation replace it again."""
+    tracker, saves = _tracker(tmp_path, monkeypatch)
+    assert tracker.update(1.0, 10, None, None)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert not tracker.update(bad, 20, None, None)
+    assert not tracker.update(5.0, 30, None, None)  # worse than the best, still refused
+    assert tracker.update(0.5, 40, None, None)
+    assert (tracker.best_loss, tracker.best_step, len(saves)) == (0.5, 40, 2)
+    assert json.loads((tmp_path / "best" / "best_meta.json").read_text()) == {"step": 40, "eval_loss": 0.5}
+
+    first, _ = _tracker(tmp_path / "fresh", monkeypatch)
+    assert not first.update(float("nan"), 1, None, None) and not first.has_best
+
+
+def test_best_tracker_resume_continues_from_the_recorded_best(tmp_path, monkeypatch):
+    """A resumed run keeps the best it had: a worse evaluation after the resume does not replace
+    best/. A fresh run in the same output_dir ignores what an earlier run left there."""
+    tracker, _ = _tracker(tmp_path, monkeypatch)
+    assert tracker.update(1.25, 100, None, None)
+
+    resumed, saves = _tracker(tmp_path, monkeypatch, resume=True)
+    assert (resumed.best_loss, resumed.best_step, resumed.has_best) == (1.25, 100, True)
+    assert not resumed.update(2.0, 200, None, None) and not saves
+    assert resumed.update(1.0, 300, None, None) and resumed.best_step == 300
+
+    fresh, saves = _tracker(tmp_path, monkeypatch)
+    assert not fresh.has_best
+    assert fresh.update(2.0, 10, None, None) and len(saves) == 1
+
+    # nothing recorded, or an unreadable record: start without a best
+    assert not _tracker(tmp_path / "empty", monkeypatch, resume=True)[0].has_best
+    (tmp_path / "best" / "best_meta.json").write_text("{not json")
+    assert not _tracker(tmp_path, monkeypatch, resume=True)[0].has_best
