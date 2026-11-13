@@ -76,7 +76,8 @@ def test_train_without_cuda_raises_the_friendly_error(monkeypatch):
 
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="No usable CUDA GPU"):
+    # worded for the installed torch build: a CUDA build without a usable GPU, or a CPU-only build
+    with pytest.raises(RuntimeError, match="No usable CUDA GPU|No GPU: torch"):
         train_mod.train(Config())
 
 
