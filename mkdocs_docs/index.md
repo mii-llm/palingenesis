@@ -258,64 +258,97 @@ This shows you exactly what the model sees: tokenized text, which tokens have lo
 
 <section class="pg-section" markdown>
 
-## Memory, quality, scale
+## What you can rely on
 
-<div class="pg-body pg-cols" markdown>
+<div class="pg-body pg-ways" markdown>
+
+<div markdown>
+
+### Correct by construction
+
+The loss path is checked step by step against a plain reference loop; packed conversations never see each other; multi-GPU gradients equal single-GPU ones; saved models load with plain `from_pretrained`.
+
+[Architecture](architecture/overview.md)
+
+</div>
+
+<div markdown>
+
+### Masking from the chat template
+
+Whole assistant turns are trained as the template renders them, tool calls and end-of-turn tokens included; `tools` are rendered into the prompt; `"loss": false` keeps a message as context only.
+
+[Agentic training](guides/agentic-training.md)
+
+</div>
+
+<div markdown>
+
+### Token-exact RL
+
+What the trainer scores is exactly what the sampler produced, tool results included; nothing is re-tokenized. Rewards are checked answers, hidden tests, LLM judges or any Python function.
+
+[RL guide](guides/rl.md)
+
+</div>
 
 <div markdown>
 
 ### Memory
 
-A Qwen3.5-4B fine-tune (its attention pathway, 36% of the weights) trains in about 16 GiB, without LoRA. Chunked losses, gradient release, Lion 8-bit and selective checkpointing each remove a different kind of memory.
+Chunked losses (the full logits are never materialised), selective activation checkpointing, gradient release, 8-bit optimizers. A Qwen3.5-4B fine-tune (attention pathway, 36% of the weights) fits in about 16 GiB.
 
-[How it works](guides/single-gpu.md)
+[Single GPU](guides/single-gpu.md)
 
 </div>
 
 <div markdown>
 
-### Quality
+### Long sequences on one GPU
 
-Correctness first: the loss path matches a plain reference loop step by step, assistant turns are masked from the chat template itself (tool calls included), packed conversations never see each other. On top, research options (DEFT, Hyperball, power-decay) implemented to their papers' definitions, with their papers' claims clearly labelled as such.
+SeCO: chunk-by-chunk training with a cache gives the exact gradient, verified against full backpropagation on 27 architectures, including the Qwen3.5 and LFM2 hybrids.
+
+[Long sequences](guides/long-sequences.md)
+
+</div>
+
+<div markdown>
+
+### Training you can inspect
+
+wandb and trackio with grad norm, spike and clip counters, gradient noise scale, entropy and the generalisation gap on one step axis; best-checkpoint tracking on eval loss.
+
+[Health monitoring](reference/health.md)
+
+</div>
+
+<div markdown>
+
+### Crash-safe
+
+Re-run the same command to resume from the last complete checkpoint, in the same tracker run.
+
+</div>
+
+<div markdown>
+
+### Scale out
+
+FSDP across GPUs, multi-node SLURM with sharded checkpoints, and a container image for Kubernetes.
+
+[Multi-GPU](guides/multi-gpu.md)
+
+</div>
+
+<div markdown>
+
+### Research options, one line each
+
+DEFT / DFT / InfoSFT token weighting, Hyperball, power-decay schedules: implemented to their papers' definitions; the benefits are as reported by the papers, not reproduced here.
 
 [The research](architecture/research.md)
 
 </div>
-
-<div markdown>
-
-### Scale
-
-Single RTX 4090 to 32-node SLURM clusters. Same config file, same code path. FSDP2, Ring Attention, sharded checkpoints.
-
-[Multi-node guide](guides/multi-node.md)
-
-</div>
-
-</div>
-
-</section>
-
-<section class="pg-section" markdown>
-
-## The thesis
-
-<div class="pg-body pg-prose" markdown>
-
-<p class="pg-pull">Fine-tuning that reads the research so you don't have to.</p>
-
-Most fine-tuning tools give you knobs. Hundreds of options, each requiring expertise to set correctly. The implicit message: "you figure it out."
-
-Palingenesis takes the opposite stance. We read the papers, ran the ablations, found what works. The defaults are the result. You override them when you have a specific reason, not because you have to.
-
-This means:
-
-- The masking is right without you writing a template-specific rule: turns are located from the chat template itself.
-- Memory is handled: chunked losses, checkpointing and `pgs profile` (static estimate, or a measured real step).
-- The learning rate can be found for you: **Autopilot** sweeps it.
-- Research options (DEFT, Hyperball, power-decay) are one line each, documented with what their papers claim.
-
-When you *do* want control, it's all there. Every parameter, every plugin, every optimization is configurable. But the base case is: it just works.
 
 </div>
 

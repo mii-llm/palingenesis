@@ -46,6 +46,7 @@ A two-stage search informed by scaling-law research (arxiv:2409.19913, 2503.0471
 The winner is selected by final loss, penalized for curvature (risk of early plateau).
 
 Then: **adaptive horizon correction**. A sweep at 100 steps overestimates the optimal LR for 5000 steps. The correction factor is `(sweep_steps / full_steps)^α`:
+
 - Base α = 0.088 (from arxiv:2409.19913, Table 5)
 - Attenuated ×0.7 for SFT (pretrained model → weaker horizon dependence, arxiv:2606.05610)
 - Adjusted by loss curvature: flattening curve → raise α; still-dropping → lower α
@@ -92,6 +93,7 @@ center_lr = C × model_size^(-0.5) × surge_factor(batch_tokens)
 ```
 
 Where `surge_factor` models the Adam-specific non-monotone batch-size relationship:
+
 - Below B_crit (100K tokens): noisy gradients → factor < 1 → lower center
 - At B_crit: factor = 1.0 (peak, reference point)
 - Above B_crit: saturation → factor < 1 → lower center

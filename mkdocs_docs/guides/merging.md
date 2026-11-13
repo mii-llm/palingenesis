@@ -1,6 +1,7 @@
 # Model Merging
 
 `palingenesis.merge` combines checkpoints that share an architecture, in weight space, without training. Use it for:
+
 - **partial interpolation back:** pull an SFT, RL or distillation endpoint that overshot back toward its start;
 - **adding an expert:** add what an expert learned on top of a shared base to another model (task arithmetic);
 - **soups:** average same-origin checkpoints;

@@ -131,7 +131,7 @@
 .pg-console {
   display: none;
   margin: 2rem 0 0;
-  border: 1px solid var(--pg-text);
+  border: 1px solid var(--pg-border-strong);
   border-radius: var(--pg-radius);
   background: var(--pg-bg);
   color: var(--pg-text);
@@ -441,6 +441,7 @@
   margin: 0;
   padding: 0;
   border: 0;
+  color: var(--pg-signal);
   font-size: 1.3rem;
   line-height: 1.2;
 }

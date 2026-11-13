@@ -94,6 +94,7 @@ data:
 Only assistant tokens (content + reasoning + tool calls) receive loss. Tool responses are context — they inform the next assistant turn but the model isn't trained to predict them.
 
 This is correct for most scenarios. The model learns:
+
 - *How to reason* (from reasoning)
 - *When to call tools* (from tool_calls)
 - *How to use results* (from seeing tool responses as context, then producing the next action)

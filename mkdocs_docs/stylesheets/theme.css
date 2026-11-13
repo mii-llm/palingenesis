@@ -67,17 +67,17 @@
 [data-md-color-scheme="default"] {
   color-scheme: light;
 
-  --pg-bg: #fffff8;
-  --pg-raised: #f6f6ec;
-  --pg-border: #e3e3d7;
-  --pg-border-strong: #c6c6b8;
-  --pg-text: #111111;
-  --pg-text-2: #434340;
-  --pg-text-3: #696964;
-  --pg-signal: #a00000;
-  --pg-signal-soft: #a0000012;
-  --pg-hue-blue: #2c4f7c;
-  --pg-hue-green: #2d5f3a;
+  --pg-bg: #f5f1e6;
+  --pg-raised: #ebe6d8;
+  --pg-border: #d9d3c2;
+  --pg-border-strong: #b5ae9b;
+  --pg-text: #17150f;
+  --pg-text-2: #403c33;
+  --pg-text-3: #5d584c;
+  --pg-signal: #a31504;
+  --pg-signal-soft: #a3150414;
+  --pg-hue-blue: #1f4a82;
+  --pg-hue-green: #1f5a36;
 
   --md-code-hl-keyword-color: #8f1d12;
 }

@@ -34,6 +34,7 @@ design decision.*
 
 **Hewitt & Liang 2019**, *Designing and Interpreting Probes with Control Tasks*, EMNLP
 ([arXiv:1909.03368](https://arxiv.org/abs/1909.03368)).
+
 - A control task gives each word type a fixed random label. Only a probe that memorises can solve it.
 - Selectivity = task accuracy − control accuracy.
 - The most accurate layer is not necessarily the most selective. Linear, regularised probes are the most selective.
@@ -42,6 +43,7 @@ design decision.*
 
 **Belinkov 2022**, *Probing Classifiers: Promises, Shortcomings, and Advances*, Computational Linguistics
 ([arXiv:2102.12452](https://arxiv.org/abs/2102.12452)).
+
 - Probes need baselines: input embeddings, controls, and dataset shortcuts such as length or template.
 - Decodable is not the same as used.
 - Effect on the design: the embedding layer is in every sweep, there is a length-only AUROC, and there is a separate
@@ -49,6 +51,7 @@ design decision.*
 
 **Ravichander et al. 2021**, *Probing the Probing Paradigm* ([arXiv:2005.00719](https://arxiv.org/abs/2005.00719)), and
 **Elazar et al. 2021**, *Amnesic Probing* ([arXiv:2006.00995](https://arxiv.org/abs/2006.00995)).
+
 - Properties are encoded whether or not the task needs them.
 - Removing a decodable property may barely change behaviour.
 - Effect on the design: every probe gets an ablation test against random directions.
@@ -57,12 +60,14 @@ design decision.*
 
 **Kadavath et al. 2022**, *Language Models (Mostly) Know What They Know*
 ([arXiv:2207.05221](https://arxiv.org/abs/2207.05221)).
+
 - P(IK) is read at the last token of the question.
 - Labels are the share correct among 30 samples at T = 1, so soft labels are supported.
 - Out of distribution, AUROC partly transfers but Brier scores degrade badly. Calibration is therefore per domain, and
   AUROC and Brier are reported separately.
 
 **Kossen et al. 2024**, *Semantic Entropy Probes* ([arXiv:2406.15927](https://arxiv.org/abs/2406.15927)).
+
 - The "token before generation" (our `last_prompt`) works with one forward pass and no generation, which allows
   abstaining before answering. It is slightly weaker than reading after the answer.
 - The probe is logistic regression.
@@ -70,6 +75,7 @@ design decision.*
   target.
 
 **Orgad et al. 2024**, *LLMs Know More Than They Show* ([arXiv:2410.02707](https://arxiv.org/abs/2410.02707)).
+
 - The exact-answer tokens carry the strongest signal.
 - Cross-task transfer is weak and only works between tasks that share a skill.
 - The test set is bootstrapped.
@@ -77,12 +83,14 @@ design decision.*
   baselines from the model's own logits should be compared on the same split.
 
 **Marks & Tegmark 2023**, *The Geometry of Truth* (COLM 2024, [arXiv:2310.06824](https://arxiv.org/abs/2310.06824)).
+
 - The mass-mean probe is θ = μ⁺ − μ⁻. Its covariance-adjusted variant Σ⁻¹θ (our `lda`) is for classification.
 - Adding the mass-mean direction moves outputs far more than adding the logistic direction, in 7 of 8 conditions.
 - The source of the split between the classify and intervene directions.
 
 **Burns et al. 2022** (CCS, [arXiv:2212.03827](https://arxiv.org/abs/2212.03827)) and **Farquhar et al. 2023**,
 *Challenges with Unsupervised LLM Knowledge Discovery* ([arXiv:2312.10029](https://arxiv.org/abs/2312.10029)).
+
 - Arbitrary binary features satisfy CCS's consistency structure.
 - Unsupervised methods find the most prominent feature, not necessarily knowledge.
 - Not implemented.
@@ -91,12 +99,14 @@ design decision.*
 
 **Turner et al. 2023**, *Steering Language Models With Activation Engineering* (ActAdd,
 [arXiv:2308.10248](https://arxiv.org/abs/2308.10248)).
+
 - The steering vector is a difference of activations, added at one layer.
 - Adding at only the last position breaks syntax, and single-concept vectors do little.
 - Our default adds at all positions.
 
 **Panickssery (Rimsky) et al. 2024**, *Steering Llama 2 via Contrastive Activation Addition* (ACL 2024,
 [arXiv:2312.06681](https://arxiv.org/abs/2312.06681)).
+
 - The vector is a mean difference, added at all positions after the prompt.
 - The best layers are at about 40 % of depth, with multipliers of ±1 to 2.
 - Residual norms grow with depth, so a coefficient does not transfer across layers. We express doses in units of
@@ -104,6 +114,7 @@ design decision.*
 
 **Arditi et al. 2024**, *Refusal in Language Models Is Mediated by a Single Direction* (NeurIPS 2024,
 [arXiv:2406.11717](https://arxiv.org/abs/2406.11717)).
+
 - Candidate directions are differences of means at post-instruction positions and layers. They are selected by causal
   filters: ablation must bypass the behaviour, addition must induce it, KL on unrelated prompts must stay below 0.1,
   and the layer must be below 80 % of depth.
@@ -112,27 +123,32 @@ design decision.*
   palingenesis.margins.
 
 **Li et al. 2023**, *Inference-Time Intervention* (NeurIPS 2023, [arXiv:2306.03341](https://arxiv.org/abs/2306.03341)).
+
 - The mass-mean shift beats the probe-weight direction and random directions.
 - Strength is scaled by the activation spread along the direction.
 
 **Im & Li 2025**, *A Unified Understanding and Evaluation of Steering Methods*
 ([arXiv:2502.02716](https://arxiv.org/abs/2502.02716)).
+
 - The mean of differences is the optimal steering vector in their model, and it beats PCA- and classifier-based
   vectors on most tasks.
 
 **Zou et al. 2023**, *Representation Engineering* ([arXiv:2310.01405](https://arxiv.org/abs/2310.01405)).
+
 - Reading vectors from PCA of differences. Superseded for our purposes by the mean difference (Im & Li).
 
 ## Lenses
 
 **nostalgebraist 2020**, *interpreting GPT: the logit lens*
 ([LessWrong](https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens)).
+
 - Apply the final norm and the unembedding to an intermediate residual.
 - It fails on some models: early layers decode the input token.
 
 **Belrose et al. 2023**, *Eliciting Latent Predictions from Transformers with the Tuned Lens*
 ([arXiv:2303.08112](https://arxiv.org/abs/2303.08112)) and the
 [tuned-lens code](https://github.com/AlignmentResearch/tuned-lens).
+
 - One affine translator per layer, applied residually (h + Ah + b) with zero initialisation, so it starts as the
   logit lens and weight decay pulls toward it.
 - The objective is KL(final ‖ lens), and no translator is needed for the last layer.
@@ -141,6 +157,7 @@ design decision.*
 
 **Paulo et al. 2024**, *Does Transformer Interpretability Transfer to RNNs?* (AAAI 2025,
 [arXiv:2404.05971](https://arxiv.org/abs/2404.05971)).
+
 - On Mamba and RWKV, CAA steering works with middle layers best, and the tuned lens beats the logit lens at every
   layer.
 - With tied embeddings the early logit lens decodes the input.
@@ -148,6 +165,7 @@ design decision.*
 - They also show that steering the recurrent state works, which we have not implemented.
 
 **Wendler et al. 2024**, *Do Llamas Work in English?* ([arXiv:2402.10588](https://arxiv.org/abs/2402.10588)).
+
 - Through the logit lens, non-English prompts pass through middle layers that decode the concept in English, then
   switch to the input language late.
 - This motivates the decision-token readout per layer for language switching, and the expectation that cross-lingual
@@ -157,12 +175,14 @@ design decision.*
 
 **Zhang & Nanda 2023**, *Towards Best Practices of Activation Patching* (ICLR 2024,
 [arXiv:2309.16042](https://arxiv.org/abs/2309.16042)).
+
 - Prefer symmetric token replacement to Gaussian noise, which pushes activations off distribution.
 - Prefer logit differences to probabilities.
 - Sliding windows of layers inflate effects, so start with single layers.
 
 **Heimersheim & Nanda 2024**, *How to use and interpret activation patching*
 ([arXiv:2404.15255](https://arxiv.org/abs/2404.15255)).
+
 - Denoising (clean into corrupt) tests sufficiency; noising tests necessity. They disagree on AND / OR structures.
 - Watch for effects above 1 and backup behaviour.
 - Hence `--mode denoise|noise` and the normalised effect.
@@ -171,6 +191,7 @@ design decision.*
 ([blog](https://www.neelnanda.io/mechanistic-interpretability/attribution-patching)); Syed et al. 2023
 ([arXiv:2310.10348](https://arxiv.org/abs/2310.10348)); Kramár et al. 2024, AtP\*
 ([arXiv:2403.00745](https://arxiv.org/abs/2403.00745)).
+
 - A first-order approximation for screening many components, with known false negatives.
 - Not implemented: we patch whole residuals at a few positions, where exact patching is affordable.
 
@@ -178,20 +199,24 @@ design decision.*
 
 **Kornblith et al. 2019**, *Similarity of Neural Network Representations Revisited* (ICML 2019,
 [arXiv:1905.00414](https://arxiv.org/abs/1905.00414)).
+
 - Linear CKA is invariant to orthogonal transforms and isotropic scaling, but not to arbitrary invertible maps.
 
 **Nguyen et al. 2021**, *Do Wide and Deep Networks Learn the Same Things?* (ICLR 2021,
 [arXiv:2010.15327](https://arxiv.org/abs/2010.15327)).
+
 - Uses the unbiased HSIC estimator of Song et al. 2012. We compute it from d × d products without an n × n Gram matrix.
 
 **Murphy et al. 2024**, *Correcting Biased Centered Kernel Alignment Measures*
 ([arXiv:2405.01012](https://arxiv.org/abs/2405.01012)).
+
 - Biased CKA can reach its maximum on independent data when n ≪ d, so debiased CKA is the default. A test checks
   both behaviours.
 
 **Davari et al. 2022**, *Reliability of CKA as a Similarity Measure in Deep Learning*
 ([arXiv:2210.16156](https://arxiv.org/abs/2210.16156)), and **Ding et al. 2021**, *Grounding Representation Similarity
 Through Statistical Testing* ([arXiv:2108.01661](https://arxiv.org/abs/2108.01661)).
+
 - CKA is sensitive to outliers and can be manipulated without changing function.
 - It is dominated by the top principal components and insensitive to low-variance directions that probes rely on.
 - Hence probe transfer and direction cosines next to CKA.
@@ -200,30 +225,35 @@ Through Statistical Testing* ([arXiv:2108.01661](https://arxiv.org/abs/2108.0166
 
 **Bailey et al. 2024**, *Obfuscated Activations Bypass LLM Latent-Space Defenses*
 ([arXiv:2412.09565](https://arxiv.org/abs/2412.09565)).
+
 - Fine-tuning against latent monitors (logistic, MLP and diff-of-means probes, SAE probes) drives recall to near 0
   while the behaviour is kept.
 - Obfuscating many layers at once is costlier, which argues for multi-layer monitors.
 
 **Cundy & Gleave 2025**, *Preference Learning with Lie Detectors can Induce Honesty or Evasion* (NeurIPS 2025,
 [arXiv:2505.13787](https://arxiv.org/abs/2505.13787)).
+
 - With a detector-labelled reward, GRPO learned to evade unless the detector's TPR was very high and the KL to the
   reference strong.
 - Off-policy DPO stayed mostly honest.
 - Hence "labels and gates first" and a held-out monitor.
 
 **Taufeeque et al. 2026**, *The Obfuscation Atlas* ([arXiv:2602.15515](https://arxiv.org/abs/2602.15515)).
+
 - In RLVR, representations drift enough to break frozen probes even with the detector's coefficient at 0.
 - Never backpropagate through the probe.
 - Hence the scorer's warning when weights differ, and `compare`'s transfer columns before a probe is reused.
 
 **Goldowsky-Dill et al. 2025**, *Detecting Strategic Deception Using Linear Probes*
 ([arXiv:2502.03407](https://arxiv.org/abs/2502.03407)).
+
 - Logistic regression on standardised activations.
 - Thresholds are set at 1 % FPR on a control distribution.
 - Recall at low FPR is fragile across layers, even where AUROC holds. Hence the stored `fpr_*` thresholds and their
   TPR / FPR on every test set.
 
 **Fine-tuning and mechanisms**:
+
 - Prakash et al. 2024 ([arXiv:2402.14811](https://arxiv.org/abs/2402.14811)): fine-tuning enhances existing
   mechanisms.
 - Kissane et al. 2024, *SAEs (usually) transfer between base and chat models* (Alignment Forum).

@@ -15,11 +15,13 @@ LoRA was essential when fine-tuning a 7B model required 80+ GB of GPU memory. Th
 But the memory problem is largely solvable without a low-rank adapter. Gradient release eliminates the gradient buffer. Lion 8-bit reduces optimizer state 8×. Selective checkpointing trades a little compute for activation memory. Freezing the linear-attention layers of a hybrid model (`freeze_non_attention`) keeps the trainable set to its attention pathway. Together they fit a Qwen3.5-4B fine-tune (36% of the weights trainable) in about 16 GiB (`pgs profile` on `configs/qwen35_4b/a100_40gb.yaml`).
 
 What you lose with LoRA:
+
 - Rank-limited representations (the delta can only express rank-16 or rank-64 perturbations)
 - Interference between adapter and base weights (the "intruder dimension" phenomenon)
 - Inability to fully restructure attention patterns for new tasks
 
 What you gain with full fine-tune:
+
 - The complete parameter space is available for learning
 - The model can reorganize its internals to suit your task
 - No merge step, no adapter management, no serving complexity

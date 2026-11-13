@@ -5,7 +5,8 @@
   themselves; javascripts/site.js), with the plain heading underneath for
   readers without JavaScript and for assistive technology.
 
-  The hero also holds the docs console: one input that answers with a training
+  The hero also holds the docs console (night-coloured in both schemes: it
+  declares the dark scheme, so the dark tokens apply inside it): one input that answers with a training
   recipe, a fix for a symptom, a configuration option or a page of the docs.
   Its recipes and fixes are ordinary Markdown in index.md (so the build checks
   their links, and they read as plain rows without JavaScript); option lookups
@@ -33,7 +34,7 @@
       </div>
     </div>
 
-    <div class="pg-console"
+    <div class="pg-console" data-md-color-scheme="slate"
          data-config="{{ 'reference/configuration/' | url }}"
          data-index="{{ 'search/search_index.json' | url }}">
       <div class="pg-console__bar">

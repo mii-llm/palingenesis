@@ -235,7 +235,9 @@
         if (settled) {
           glyph = to > 0.5 ? q.line : q.glyph;
           /* now and then one of them thinks again */
-          color = !still && ((i * 7919 + Math.floor(t * 3)) % 389 === 0) ? colors.hues[0] : colors.ink;
+          /* a few keep their tint for good; now and then one thinks again */
+          color = q.key < 0.09 ? colors.hues[q.hue % 3]
+            : !still && ((i * 7919 + Math.floor(t * 3)) % 389 === 0) ? colors.hues[0] : colors.ink;
         } else {
           glyph = NOISE[(((q.seed * 9973) | 0) + tick + i) % NOISE.length];
           color = colors.hues[q.hue];

@@ -293,6 +293,7 @@ data:
 ```
 
 Without it:
+
 - No best-model tracking (you get the last checkpoint, which may be overtrained)
 - No early stopping signal
 - No MSFT source-level monitoring
