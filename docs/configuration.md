@@ -159,7 +159,7 @@ grep "STATUS: experimental" src/palingenesis/config.py
 | `chunked_loss` | bool | `true` | Chunk CE loss along sequence dim |
 | `loss_num_chunks` | int | `8` | Number of chunks (higher = less memory, tiny overhead) |
 | `float32_matmul_precision` | str | `high` | Matmul precision: `highest`, `high`, `medium` |
-| `seco` | bool | `false` | SeCO chunk-wise training for long sequences (exact gradients, single GPU) |
+| `seco` | bool | `false` | SeCO chunk-wise training for long sequences (exact gradients, single GPU; with `packing`, every packed document on its own) |
 | `seco_chunk_size` | int | `4096` | Tokens per SeCO chunk |
 | `seco_kv_offload` | bool | `false` | K/V (and recurrent start states) in pinned CPU memory, streamed per block; exact |
 | `spaco_budget` | int | `0` | SpaCO: backprop only N random chunks (stochastic estimate); 0 = exact SeCO |

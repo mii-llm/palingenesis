@@ -10,7 +10,7 @@ Backpropagation keeps every layer's activations for the whole sequence until the
 
 ## The idea
 
-Transformers already process long inputs in chunks at inference time: prefill with a KV cache. SeCO does the same for training. The idea comes from [Li et al., arXiv:2505.16710](https://arxiv.org/abs/2505.16710); the implementation and its validation are palingenesis'.
+Transformers already process long inputs in chunks at inference time: prefill with a KV cache. SeCO does the same for training. The idea comes from [Li et al., arXiv:2505.16710](https://arxiv.org/abs/2505.16710); [ChunkFlow (Yuan et al., arXiv:2503.02356)](https://arxiv.org/abs/2503.02356) describes the same scheme, and is where packing short sequences into chunks and not recomputing the last chunk come from. The implementation and its validation are palingenesis'.
 
 <figure class="pg-figure">
 <div class="pg-figure__canvas">
@@ -74,10 +74,21 @@ Transformers already process long inputs in chunks at inference time: prefill wi
 <figcaption>SeCO on four chunks. Stage 1 fills the cache without gradients; stage 2 recomputes one chunk at a time from the end, backpropagating its loss plus the gradient later chunks already sent into its K/V (or its boundary state), and adding its own attention gradient into the prefix's buffer.</figcaption>
 </figure>
 
-1. **Stage 1:** a no-grad pass over all chunks with a cache.
-2. **Stage 2:** a reverse sweep. Each chunk is recomputed with gradients from the cache, its loss is backpropagated, and the gradient that later chunks sent into its cache entries is relayed backwards.
+1. **Stage 1:** a no-grad pass over the chunks with a cache. It stops before the last chunk: nothing reads what that chunk would add to the cache.
+2. **Stage 2:** a reverse sweep, starting with the last chunk. Each chunk is run with gradients from the cache, its loss is backpropagated, and the gradient that later chunks sent into its cache entries is relayed backwards.
 
-Chunks run in reverse, so every relayed gradient is complete when its chunk is recomputed. The result equals full backpropagation, and the only cost is one extra no-grad forward.
+Chunks run in reverse, so every relayed gradient is complete when its chunk is recomputed. The result equals full backpropagation.
+
+**What it costs.** Counting a forward as 1 and a backward as 2, per chunk:
+
+| Schedule | Work per chunk | Against the same checkpointing without SeCO, k chunks |
+|---|---|---|
+| Backpropagation without checkpointing | 3 | |
+| Backpropagation with full activation checkpointing | 4 | |
+| SeCO, no checkpointing inside the chunk | 3, plus 1 for every chunk but the last | (4k − 1) / 3k: 1.33× for long sequences, 1× for one chunk |
+| SeCO with `gradient_checkpointing: full` inside the chunk | 4, plus 1 for every chunk but the last | (5k − 1) / 4k: 1.25× for long sequences, 1× for one chunk |
+
+This is a count of operations, not a measurement: the one measured point is in the [`pgs fit` example](single-gpu.md), where SeCO with 8k chunks ran 22% slower than full checkpointing at 16k tokens (two chunks; measured when stage 1 still ran the last chunk). A sequence that fits in one chunk costs what plain backpropagation costs. Where full activation checkpointing fits your sequences, it is the cheaper choice; SeCO is for the lengths where it does not.
 
 ## Quickstart
 
@@ -88,7 +99,7 @@ model:
 
 data:
   max_seq_length: 300000        # as long as your data needs
-  packing: false
+  packing: false                # true: several documents per step, each trained on its own (see Packing below)
 
 memory:
   seco: true
@@ -100,6 +111,22 @@ train:
 ```
 
 At start-up the trainer checks, on your actual model, that running it chunk by chunk with a cache gives the same logits as one full forward. That is the only assumption SeCO rests on. The trainer refuses to train if the check fails.
+
+## Rows of very different lengths: packing
+
+Agent traces range from a few hundred tokens to hundreds of thousands. Without packing, one row is one step: the number of tokens per optimizer step varies by orders of magnitude, a short row uses a small part of the GPU, and with `per_device_batch_size` above 1 every row is padded to the longest and the padding is run through every chunk.
+
+With `data.packing: true`, the data pipeline fills blocks of up to `max_seq_length` tokens with whole documents, as it does without SeCO. SeCO then takes each block apart again:
+
+- **A document longer than a chunk** runs as its own chunk sequence, exactly as an unpacked row would.
+- **Shorter documents** run in batches of right-padded rows, similar lengths together, each batch of at most `seco_chunk_size` padded tokens (rows × the longest row), in one forward and one backward. A batch holds no more activations than a chunk.
+- **Tokens after a document's last trained position** are not run: under causal attention they reach no loss. A trace that ends with a long tool result loses it for free; so does the block's padding.
+
+Every document is a row of its own, from position 0 with a fresh cache. There is no attention across documents, no recurrent or convolution state carried over, and positions restart, whatever the layers are. This does not rely on the kernels that packing otherwise needs for linear-attention hybrids (the `hybrid` extra), and it also works for the architectures that plain packing refuses. The gradient is the sum of the documents' own full backpropagations, which the test suite checks on every architecture above, and against the trainer's ordinary packed forward.
+
+The price is the padding inside the batches of short documents. It depends on how many short documents a block holds: grouping random length mixes the way SeCO does (a simulation, log-uniform lengths) gave 2–8% padding with 64 or more short documents per block and up to 30% with 4 to 16. `ChunkwiseResult.padding` reports it, and `scripts/bench_seco.py` prints it. The time per token of packed against unpacked SeCO has not been measured on a GPU yet.
+
+Not with packing: SpaCO, off-policy distillation, and MoE router balancing (the balancing losses need every token's routing before the first backward; set `moe.balance: false` or leave packing off).
 
 ## Which models
 
@@ -131,10 +158,11 @@ Dropout and router jitter are replayed: each chunk's RNG state is saved in stage
 - **Grouped-query attention.** K/V heads go to the kernel as they are, never expanded to all query heads.
 - **Cache precision.** K/V are cached in the autocast dtype, exactly as attention consumes them.
 - **Logits.** The loss per chunk is the chunked cross-entropy, so logits never exist for more than one slice at a time.
+- **The last chunk runs once.** Stage 1 stops before it, and the K/V stores end where it starts. That saves one forward per sequence: a fifth to a quarter of the work for a sequence of one chunk, a few percent at eight chunks (see the cost table above; counted, not measured).
 
 ### Measured on one A100 80GB
 
-fp32 weights, bf16 autocast, full activation checkpointing, 4k chunks, real text, one forward+backward per row. Times in seconds, peak memory in GiB.
+fp32 weights, bf16 autocast, full activation checkpointing, 4k chunks, real text, one forward+backward per row. Times in seconds, peak memory in GiB. These runs predate packing and the single run of the last chunk; neither changes the memory that grows with length, and the times are at most one chunk's forward lower now.
 
 **Qwen3.5-0.8B** (hybrid: only 6 of 24 layers keep a K/V cache):
 
@@ -190,15 +218,28 @@ The startup check then allows 2e-3 instead of 1e-4 in fp32. The first step of a 
 - **With `gradient_checkpointing: full`**, only one layer's recomputation is ever materialised, so larger chunks become affordable.
 - **With full checkpointing, 2k–4k chunks** are a good default. 4k is faster; 2k uses about 7 GB less.
 - **Without checkpointing, keep chunks around 1k.** Each chunk's full activations stay alive (about 8 GB per 1k tokens here). This was the fastest setting at 524k.
-- **Rule of thumb:** memory ≈ model + optimizer + one chunk's activations + ~60 KB per token (Qwen3.5-0.8B; it scales with the model's K/V width and recurrent-state size).
+- **Rule of thumb:** memory ≈ model + optimizer + one chunk's activations + ~30 KB per token (Qwen3.5-0.8B, from the table above: 7 GiB more from 262k to 524k tokens, 15 GiB more from 524k to 1M; it scales with the model's K/V width and recurrent-state size).
+- **With packing**, the chunk size is also the size of a batch of short documents: larger chunks batch more of them per forward.
 
 ## SpaCO (approximate, faster)
 
 `memory.spaco_budget: t` recomputes only `t` random chunks per sequence instead of all `k`. Each visited chunk's loss and relayed gradients are scaled by `k/t`. The paper's pseudocode scales only the relayed gradients. We measured that this leaves the expected gradient shrunk by `t/k`, and with both scaled the expectation matches the true gradient (scale 0.92–0.99, cosine 0.98–0.9999). It is a stochastic estimate, not the exact gradient. Use it only when backward compute, not memory, is the bottleneck.
 
+## Measured and not measured
+
+Measured (the tables above, one A100 80GB): memory and time against length for two models, exactness against fp64, the K/V accounting. Checked by the CPU test suite on tiny random models: that every path gives the gradient of full backpropagation (every architecture, packed rows, offload, activation checkpointing, dropout replay).
+
+Not measured on a GPU yet, and stated above as counts or estimates only: the time saved by running the last chunk once, the throughput of packed against unpacked SeCO on a real length mix, and how much of a small chunk's time is spent outside the kernels. `scripts/bench_seco.py` measures all three (its header lists the configurations), and SeCO against full backpropagation at the same length:
+
+```bash
+python scripts/bench_seco.py --model Qwen/Qwen3.5-0.8B --documents 64 --min-length 256 --max-length 131072 \
+    --block 131072 --modes rows,packed,full --trained-share 0.1 --chunks 4096,8192 --json seco.jsonl
+```
+
 ## Limits
 
 - **Single GPU only.** Multi-GPU SeCO is not validated. For multi-GPU long context use `parallel.context_parallel`.
-- **No packing.** SeCO works on whole sequences. Rows may be right-padded.
+- **Packing** takes the documents apart again (see above); it is not combined with SpaCO, off-policy distillation or MoE router balancing. Without packing, rows may be right-padded, and the padding is run.
+- **The K/V gradient stays on the GPU**, also with `seco_kv_offload`: for dense models it is what limits the length.
 - **Incompatible features.** Plugins that need full-sequence logits (DFT, DEFT, InfoSFT, pre-RL), `rl_readiness`, `sym_noise`, `gradient_release`, and DPO. `Config.validate()` rejects them.
 - **`torch.compile` is not validated with SeCO.**

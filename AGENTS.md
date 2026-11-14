@@ -81,7 +81,7 @@ Training issue?
 │   │   in both thinking modes; during SFT watch train/repeat_p and train/stop_p
 │   ├── Likely cause: exposure bias: teacher-forced data never shows the student its own failure states
 │   ├── SFT fix (removes enumerated loop forms): data.loop_recovery, data.reasoning_loop_recovery,
-│   │   data.repeat_unlikelihood, data.stop_unlikelihood (need memory.seco; no packing / pretokenize)
+│   │   data.repeat_unlikelihood, data.stop_unlikelihood (need memory.seco; no pretokenize)
 │   ├── Root-cause fix: OPD on the student's own episodes (agent_traces source) with onset_branches,
 │   │   error_patterns / error_weight / first_error_weight, cutoff_logp (see the distillation guide)
 │   └── Stopgap at inference: presence_penalty (sampling)

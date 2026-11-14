@@ -51,7 +51,7 @@ pgs fit --config my.yaml --gpu 24   # budget: 24 GiB
 Each setting runs the real trainer for a few steps on worst-case rows (every row at `data.max_seq_length`) in its own process; the report gives the peak and the throughput of each, and recommends the fastest one under the budget with the options to set. The settings it measures:
 
 - the config as it is, then the three activation-checkpointing modes, `none`, `selective` and `full`;
-- SeCO at chunk sizes of 8192, 4096, 2048 and 1024 tokens (those shorter than `data.max_seq_length`), then the smallest chunk with its K/V cache offloaded (`memory.seco_kv_offload`). Settings the config cannot take (SeCO with packing or DPO, for example) are listed as skipped.
+- SeCO at chunk sizes of 8192, 4096, 2048 and 1024 tokens (those shorter than `data.max_seq_length`), then the smallest chunk with its K/V cache offloaded (`memory.seco_kv_offload`). Settings the config cannot take (SeCO with DPO, for example) are listed as skipped.
 
 | Option | Default | Meaning |
 |---|---|---|
