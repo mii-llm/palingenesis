@@ -1542,7 +1542,7 @@ def test_save_frees_gpu_memory_before_any_barrier_and_marks_the_checkpoint(tmp_p
     trainer.opt = torch.optim.AdamW(trainer.model.parameters())
     trainer.sampler = SimpleNamespace(state=lambda: {})
     trainer.rng = random.Random(0)
-    trainer.stale_groups, trainer.wandb_id = 0, None
+    trainer.stale_groups, trainer.tracker = 0, SimpleNamespace(run_id=None)
 
     trainer.save("step_4", step=4)
     assert (tmp_path / "step_4" / "rank0.pt").exists() and (tmp_path / "step_4" / TRAINER_STATE_FILE).exists()
@@ -1593,7 +1593,12 @@ def test_wandb_logging_survives_a_resume_that_redoes_steps(trainer_kind):
     assert (WANDB_STEP_METRIC, {}) in run.defined
     assert WANDB_STEP_METRIC == "train/global_step"
 
-    trainer.wandb = run
+    from palingenesis.logging import Tracker
+
+    trainer.tracker = Tracker.for_run(
+        SimpleNamespace(use_wandb=False, use_trackio=False, trackers=[], project="p", run_name=""), {}, "", None
+    )
+    trainer.tracker._wandb = run  # what wandb.init returned
     for step in range(1, 6):  # the first life: steps 1..5, an eval at step 4
         trainer._log("step", {"loss": 1.0 / step}, step)
         if step == 4:
@@ -1602,7 +1607,7 @@ def test_wandb_logging_survives_a_resume_that_redoes_steps(trainer_kind):
         trainer._log("step", {"loss": 0.5 / step}, step)
     trainer._log("eval", {"reward": 0.7}, 6)
 
-    assert trainer.wandb is run, "a log call failed and disabled wandb"
+    assert trainer.tracker._wandb is run and trainer.tracker._wandb_errors == 0, "a log call failed"
     assert all(kwargs == {} for _, kwargs in run.logs), "wandb.log must never get step="
     assert all(WANDB_STEP_METRIC in row for row, _ in run.logs)
     steps = [row[WANDB_STEP_METRIC] for row, _ in run.logs if "loss" in row]

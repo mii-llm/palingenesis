@@ -43,8 +43,10 @@ field carries that name (gen_ai.*), so an exporter is a mapping; everything else
 import atexit
 import contextlib
 import gzip
+import itertools
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -212,6 +214,12 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _masked_mean(values: list[float], mask: list[bool]) -> float | None:
+    """The mean of the values where the mask is set (C-level loops: trajectories run to 10^5 tokens)."""
+    count = sum(mask)
+    return math.fsum(itertools.compress(values, mask)) / count if count else None
+
+
 def chat_turns(messages: list[dict], timings: list[dict], logprobs: list[float | None], content: bool) -> list[dict]:
     """Per-turn records of the messages after the prompt: an assistant message opens a turn, and the
     messages up to the next one are its tool results (matched to their calls by id) and observations.
@@ -278,7 +286,7 @@ def _turn_logprobs(trajectory) -> list[float | None]:
     for part in (*trajectory.segments, trajectory):  # context rewrites close segments; turns keep their order
         ends = part.turn_starts[1:] + [len(part.tokens)]
         for start, end in zip(part.turn_starts, ends):
-            out.append(_mean([lp for lp, sampled in zip(part.logprobs[start:end], part.mask[start:end]) if sampled]))
+            out.append(_masked_mean(part.logprobs[start:end], part.mask[start:end]))
     return out
 
 
@@ -300,7 +308,7 @@ def rl_record(item: tuple[bool, Any], content: bool = True) -> dict:
     calls = [
         json.dumps(c.get("function"), sort_keys=True, default=str) for m in answers for c in m.get("tool_calls") or []
     ]
-    sampled = [lp for part in (*t.segments, t) for lp, mask in zip(part.logprobs, part.mask) if mask]
+    parts = (*t.segments, t)
     extras = {k: v for k, v in info.items() if k not in ("timing", "prompt", "raw_contents") and not k.startswith("_")}
     if not content:
         extras = {k: v for k, v in extras.items() if isinstance(v, bool | int | float)}
@@ -322,7 +330,10 @@ def rl_record(item: tuple[bool, Any], content: bool = True) -> dict:
         "version": t.version,
         "start_s": timing.get("start"),
         "duration_s": timing["end"] - timing["start"] if "end" in timing and "start" in timing else None,
-        "logprob_mean": _mean(sampled),
+        "logprob_mean": _masked_mean(
+            list(itertools.chain.from_iterable(p.logprobs for p in parts)),
+            list(itertools.chain.from_iterable(p.mask for p in parts)),
+        ),
         **loop_flags([m.get("content") or "" for m in answers if isinstance(m.get("content"), str)], calls),
         "turns": turns,
         "info": extras,
