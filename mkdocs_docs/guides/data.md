@@ -1,11 +1,11 @@
 # Data Preparation
 
-*Which samples you train on decides what the model gains and what it loses. `pgs prepare` measures every sample with the model you will train, so you can choose instead of guessing.*
+*`pgs prepare` cleans a dataset before training: it removes the rows training would drop and exact duplicates, holds out an eval set that shares no prompt with the training data, caps sources, and reports every row it removed and why. It can also score every row with the model; nothing selected by that score has beaten a random subset.*
 
 ---
 
 !!! abstract "What this page covers"
-    - **Data selection** with `pgs prepare`: [the pipeline](#the-pipeline), [strategies](#strategies) and [what the measurements say](#what-the-measurements-say) (short version: `random` is the default because nothing measured beat it).
+    - **Cleaning** with `pgs prepare`: [what it does](#what-preparation-does), [the pipeline](#the-pipeline), [scoring with the model](#scoring-with-the-model-experimental) (experimental) and [what the measurements say](#what-the-measurements-say) (short version: nothing selected by the score beat a random subset).
     - **Mixing sources** (`data.sources`): [multi-source mixing](#multi-source-mixing).
     - **What gets loss**: [SFT masking](#what-gets-loss-sft-masking), [reasoning fields and tags](#reasoning-in-the-data-fields-baked-blocks-tags); agent traces and tool calls are in the [agentic guide](agentic-training.md).
     - **Run length, streaming and the [pre-tokenized cache](#pre-tokenized-cache)**.
@@ -13,11 +13,34 @@
 
     Check the masking of any config with `pgs inspect --config <cfg> --num_samples 3` before training. Every key is in the [configuration reference](../reference/configuration.md); every command in the [CLI reference](../reference/cli.md).
 
-## What preparation measures
+## What preparation does
 
-For every sample, `pgs prepare` runs the model you are about to fine-tune over the conversation and records the perplexity of the tokens training will put loss on (the assistant turns). A low value means the model already writes this response almost verbatim; a high value means the response is far from what the model would write. It is a property of the (model, response) pair, not of the problem: a correct but unusual solution to an easy problem can score "hard".
+By default `pgs prepare` needs only the tokenizer, no GPU and no forward pass:
 
-What to select is an empirical question. The [measured results](#what-the-measurements-say) below are for post-trained Qwen3.5 models; compare any selection against a random subset of the same size on your own eval battery.
+1. **Render** every row with the trainer's own pipeline (chat template, tools, truncation at turn boundaries, masking). Rows training would drop are removed and named: `nothing_to_train_on` (no messages, or no assistant turn that gets loss), `no_trained_turn_fits` (the first trained turn already exceeds `data.max_seq_length`), `unrenderable` (the template rejects the row). Rows that are kept but cut to `max_seq_length` are counted.
+2. **Deduplicate**: exact duplicates (same messages and tool definitions, whitespace runs collapsed) keep their first row. `max_per_prompt: N` also keeps at most N rows that share a system prompt and first user turn, for example several trajectories of one task.
+3. **Hold out** (`eval_holdout: N`): about N rows, drawn as whole prompts, so the eval set never holds a task the model trained on under another answer.
+4. **Cap** (`group_field: source` with `max_per_group` / `max_tokens_per_group`): at most that many rows or tokens per source, drawn at random inside the source.
+5. **Select** (`budget` rows, `token_budget` tokens): a seeded random subset.
+6. **Write** `scored_data.parquet`, `prepared_meta.json` and `dropped.jsonl`.
+
+What you get back:
+
+| File | Content |
+|------|---------|
+| `scored_data.parquet` | The kept rows, with `_row` (index in the raw data), `_score_length` (tokens as training sees the row) and `_score_response_token_count` (tokens that get loss). |
+| `eval_data.parquet` | The held-out rows (`eval_holdout > 0`). |
+| `prepared_meta.json` | Rows loaded, removed per reason, cut to `max_seq_length`; total and trained tokens, length percentiles; per-group rows and tokens before and after caps and selection; every setting used. |
+| `dropped.jsonl` | One line per removed row: `row`, `reason`, and `duplicate_of` or `group`. |
+
+Read the report before training. A large `no_trained_turn_fits` or cut count means `max_seq_length` is too small for the data; a large `nothing_to_train_on` usually means the wrong `messages_field`; many duplicates in a public mixture are common.
+
+### When not to use it
+
+- **To pick the "best" samples.** There is no setting here that finds them. See [Scoring with the model](#scoring-with-the-model-experimental).
+- **To fix forgetting or a regression.** In the [measurements](#what-the-measurements-say) the source of the responses and the learning rate moved results; selection did not.
+- **To judge correctness.** Nothing here checks that an answer is right or that a trajectory solved its task. Filter on outcomes (tests passed, verifier reward) before preparing; for tool calls, `validate_data.validate_dataset` checks names and arguments against the declared tools.
+- **For `data.sources` mixes** use `pgs prepare-multi` (below), or prepare each source and point `data.sources` at the outputs.
 
 ---
 
@@ -25,7 +48,7 @@ What to select is an empirical question. The [measured results](#what-the-measur
 
 === "Config-driven (recommended)"
 
-    One YAML drives everything. `pgs prepare` reads the **same config** you train with — the scoring model is `model.name_or_path`, the raw data is `data.dataset`, and the `preprocess:` section controls selection:
+    One YAML drives everything. `pgs prepare` reads the **same config** you train with: the tokenizer is `model.name_or_path`'s, the raw data is `data.dataset`, rows are rendered and masked with the `data` options, and the `preprocess:` section controls cleaning and selection:
 
     ```bash
     pgs prepare --config configs/qwen35_4b/a100_80gb.yaml
@@ -40,31 +63,25 @@ What to select is an empirical question. The [measured results](#what-the-measur
     The same `--section.field` overrides work here too:
 
     ```bash
-    pgs prepare --config cfg.yaml --preprocess.budget 5000 --preprocess.strategy curriculum
+    pgs prepare --config cfg.yaml --preprocess.eval_holdout 200 --preprocess.max_per_prompt 2
     ```
 
 === "Standalone flags"
 
-    The classic mode, no config file needed:
+    No config file needed:
 
     ```bash
     pgs prepare \
         --model Qwen/Qwen2.5-3B-Instruct \
         --data my_data.jsonl \
         --output prepared/ \
-        --budget 10000 \
-        --format parquet
+        --eval_holdout 200 \
+        --group_field source --max_tokens_per_group 20000000
     ```
 
-What this does, step by step:
+Lengths and masks are the trainer's: a row's `_score_length` is the number of tokens it will occupy in a batch, and its trained tokens are the ones that get loss with your `data` options (`train_on_reasoning`, `include_observations`, `last_turn_only`, `think_tags`, `chat_template_kwargs`, per-message `loss: false`).
 
-1. **Score**: runs each sample through the target model, computes per-token perplexity using the model's own chat template to identify exactly which tokens are assistant responses
-2. **Bucket**: assigns each sample to familiar / typical / unfamiliar by response-perplexity percentile (bottom 25% / middle / top 25% of *your* dataset under *your* model)
-3. **Filter**: drops outliers by response perplexity, below `min_ppl` (1.5: near-verbatim answers) and above `max_ppl` (500: usually broken or wrong-language samples). Both are tunable defaults, not research findings
-4. **Select**: keeps `budget` samples with the chosen `strategy` (see [Strategies](#strategies))
-5. **Dump**: writes `scored_data.parquet` (order-preserving, fast to load) plus a `prepared_meta.json` manifest recording exactly which model, dataset, and strategy produced it
-
-The scoring uses the *exact same masking* as training: only assistant tokens are measured. System prompts and user turns don't count. A long system prompt therefore cannot make a short, familiar answer look unfamiliar.
+Cost: rendering and tokenizing on one CPU core. Measured on a laptop: under 20 ms per row for agent traces of about 2,000 tokens, most of them cut to fit, so about half an hour per 100,000 such rows; longer rows cost proportionally more. The rows are held in memory.
 
 ---
 
@@ -76,15 +93,16 @@ The preparation → training loop is fully wired through a single YAML. There is
 <div class="pg-figure__canvas">
 <svg class="pg-fig" viewBox="0 0 700 170" role="img" aria-labelledby="fig-prep-title fig-prep-desc">
 <title id="fig-prep-title">Two ways from a config to training: prepare once, or prepare inside pgs train</title>
-<desc id="fig-prep-desc">The same config.yaml, with model, data and preprocess sections, feeds two paths. pgs prepare --config writes a prepared directory with scored_data.parquet and prepared_meta.json, which training then reads. Or pgs train --config with preprocess.enabled true trains from the prepared output.</desc>
+<desc id="fig-prep-desc">The same config.yaml, with model, data and preprocess sections, feeds two paths. pgs prepare --config writes a prepared directory with scored_data.parquet, prepared_meta.json and dropped.jsonl, which training then reads. Or pgs train --config with preprocess.enabled true trains from the prepared output.</desc>
 <defs><marker id="fig-prep-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker><marker id="fig-prep-arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head-accent" d="M0,0 L10,5 L0,10 z"/></marker></defs>
 <rect class="box" x="10" y="56" width="170" height="62" rx="4"/>
 <text class="" x="22" y="76">config.yaml</text>
 <text class="t-muted t-small" x="22" y="92">model + data + preprocess</text>
-<rect class="box" x="300" y="10" width="190" height="62" rx="4"/>
+<rect class="box" x="300" y="6" width="190" height="76" rx="4"/>
 <text class="" x="312" y="30">prepared/</text>
 <text class="t-muted t-small t-mono" x="312" y="46">scored_data.parquet</text>
 <text class="t-muted t-small t-mono" x="312" y="60">prepared_meta.json</text>
+<text class="t-muted t-small t-mono" x="312" y="74">dropped.jsonl</text>
 <rect class="box-accent" x="560" y="56" width="130" height="62" rx="4"/>
 <text class="" x="572" y="76">training</text>
 <text class="t-muted t-small" x="572" y="92">pgs train</text>
@@ -95,57 +113,65 @@ The preparation → training loop is fully wired through a single YAML. There is
 <text class="t-mono t-muted" x="370" y="146" text-anchor="middle">pgs train --config  (preprocess.enabled: true)</text>
 </svg>
 </div>
-<figcaption>Preparation reads the same config as training: the same model and the same truncation score the data and then train on it.</figcaption>
+<figcaption>Preparation reads the same config as training: the same tokenizer, chat template and truncation clean the data that training then reads.</figcaption>
 </figure>
 
 ```yaml title="config.yaml (excerpt)"
 model:
-  name_or_path: Qwen/Qwen3.5-4B     # used for BOTH scoring and training
+  name_or_path: Qwen/Qwen3.5-4B     # its tokenizer and chat template render the rows
 
 data:
   dataset: your-org/agentic-traces  # the RAW dataset to prepare
-  max_seq_length: 16384             # same truncation in scoring and training
+  max_seq_length: 16384             # same truncation in prepare and training
 
 preprocess:
   enabled: true                     # training uses the prepared output
   output_dir: ./prepared/qwen35_4b
-  format: parquet                   # parquet (default) or jsonl
-  budget: 10000                     # samples to keep (0 = all)
-  strategy: random                  # default; see Strategies below
-  eval_holdout: 100                 # reserve a held-out eval set (never trained on)
+  eval_holdout: 200                 # held-out eval set, no prompt shared with training
+  max_per_prompt: 2                 # at most 2 trajectories per task
+  group_field: source               # row column naming the source
+  max_tokens_per_group: 20000000    # no source above 20M tokens
+  budget: 10000                     # rows to keep (0 = all); token_budget counts tokens instead
 ```
 
-!!! tip "Free held-out eval set"
-    Set `eval_holdout: N` and prepare reserves N random samples (drawn **after** outlier filtering, **before** budget selection) into `eval_data.parquet`. They are guaranteed disjoint from the training data. If `data.eval_dataset` is left empty, training picks this file up automatically — giving you a genuine same-distribution eval, so `eval/loss`, `eval/ppl` and `eval/gap` actually measure generalization instead of memorization.
+!!! tip "Held-out eval set"
+    Set `eval_holdout: N` and prepare reserves about N rows from the cleaned pool, before caps and selection, into `eval_data.parquet`. Rows that share a prompt stay on one side, and exact duplicates are already gone, so nothing in the eval set was trained on. If `data.eval_dataset` is left empty, training picks this file up automatically, so `eval/loss`, `eval/ppl` and `eval/gap` measure generalization on your own distribution. When a few prompts hold most rows the set can come out smaller than N (a warning says so).
 
 !!! tip "Provenance travels with the data"
-    Every prepare run writes `prepared_meta.json` next to the data: scoring model, source dataset, strategy, sample count, perplexity statistics, the familiarity distribution and, with `group_field: source`, a per-source profile before and after selection (public mixtures differ a lot per source, and any perplexity-based selection mostly changes the source mix). Training logs this manifest at startup, so every run records exactly which preparation produced its data.
+    Every prepare run writes `prepared_meta.json` next to the data, and training logs it at startup, so every run records which preparation produced its data.
 
 !!! warning "No silent fallback"
     If `preprocess.enabled: true` but nothing has been prepared yet, training **fails immediately** with the exact command to run. It will never silently fall back to the raw dataset.
 
-Two details worth knowing:
-
-- **Curriculum ordering survives.** With `strategy: curriculum`, samples are stored familiar→unfamiliar and training skips shuffling so the ordering reaches the model intact. Every other strategy shuffles normally.
-- **Parquet is the default** because it preserves sample order, loads far faster than JSONL, and is consumed directly by the training data loader (you can point `data.dataset` at any `.parquet` file or prepared directory manually, too). If your samples have a schema Arrow can't unify, the writer falls back to JSONL automatically.
+**Parquet is the default** because it preserves sample order, loads far faster than JSONL, and is consumed directly by the training data loader (you can point `data.dataset` at any `.parquet` file or prepared directory manually, too). If your samples have a schema Arrow can't unify, the writer falls back to JSONL automatically.
 
 ---
 
-## Strategies
+## Scoring with the model (experimental)
 
-`strategy` only matters when `budget` is set (below the pool size). Buckets are percentiles of response perplexity *of your dataset under your model*: familiar (bottom 25%), typical, unfamiliar (top 25%).
+`preprocess.score: true` (or `--score`) adds one forward pass with the model you will fine-tune and records, per row, the perplexity of the tokens training puts loss on (`_score_response_ppl`, `_score_response_nll`) and a familiarity bucket (bottom 25% / middle / top 25% of *your* dataset under *your* model). A low value means the model already writes this response almost verbatim; a high value means the response is far from what the model would write. It is a property of the (model, response) pair, not of the problem: a correct but unusual solution to an easy problem scores "unfamiliar".
 
-| Strategy | What it does | Evidence |
-|----------|--------------|----------|
-| `random` (default) | Uniform random subset (seeded) | The baseline every other strategy must beat. |
-| `optimal` | J-shaped mix: 20% familiar / 50% typical / 25% unfamiliar / 5% most unfamiliar above 10K samples; 25/50/20/5 from 2K to 10K; 35/50/15/0 below 2K | A heuristic of ours, loosely after two papers that test neither mixtures nor these thresholds (2605.12906: single-difficulty subsets of base math models; FLOW, 2502.02797: loss re-weighting). **Measured below `random`** (see below). |
-| `flow` | The lowest-perplexity (most familiar) samples | Named after FLOW, which *re-weights* the loss by $\exp(-\ell/\tau)$; palingenesis records that weight as `_score_flow_weight` but training does not use it, so this is plain "most familiar N" selection. |
-| `curriculum` | A random subset, ordered familiar→unfamiliar; training keeps the order | Not measured. |
-| `balanced` | Equal thirds of familiar / typical / unfamiliar | Not measured. |
-| `medium_focus` | The samples closest to the median perplexity | Not measured. |
-| `hard_focus` | The highest-perplexity samples | Not measured. |
+Scoring also runs when an option needs it: `min_ppl` / `max_ppl` above 0, `hes`, or any `strategy` other than `random`.
 
-Within a bucket samples are drawn at random, never in file order (concatenated datasets are grouped by source, so a first-N pick would silently select sources). If a bucket is short, the shortfall is backfilled from the others so you always get the full budget.
+**What the evidence says.** Selecting or ordering training data by this score has not beaten a random subset of the same size:
+
+- Our [measurements](#what-the-measurements-say) on Qwen3.5-0.8B: no strategy beat random, the J-shaped mix was worse, and the score had no correlation with whether the model solves the problem.
+- arXiv:2410.09335 (Oct 2024) re-ran loss-, perplexity- and gradient-based selectors on pools of 0.4M–1M instruction examples for Llama3-8B and Qwen2-7B: most fell inside the range of five random draws, and perplexity scores tracked response length. arXiv:2410.15225 (Oct 2024) and arXiv:2503.01807 (Mar 2025, pools up to 5.8M) report that selectors often fail to beat random across sources, budgets and pool sizes.
+- Easy-to-hard ordering: arXiv:2012.03107 found curricula help little outside short training budgets and noisy labels; the LLM instruction-tuning papers that report gains report small ones (about one point) and none orders by the model's own perplexity.
+- HES (arXiv:2605.22389, May 2026) reports top-20% selection matching the full set on long math/STEM reasoning for one base model; its authors did not test agentic or tool-use data.
+
+So use the score to **look** at a dataset (per-source perplexity in `prepared_meta.json`, the tail of very high values, which is often broken or wrong-language text), not to choose what to train on, unless you have compared against `strategy: random` on your own eval battery.
+
+| Option | What it does | Status |
+|--------|--------------|--------|
+| `min_ppl` / `max_ppl` | Drop rows whose response perplexity is below / above the bound (0 = off, the default) | Absolute perplexity depends on model, domain and language; short tool calls and templated answers score very low. Read the distribution first. |
+| `strategy: optimal` | J-shaped mix: 20% familiar / 50% typical / 25% unfamiliar / 5% most unfamiliar above 10K samples; 25/50/20/5 from 2K to 10K; 35/50/15/0 below 2K | A heuristic of ours. **Measured below `random`.** |
+| `strategy: flow` | The lowest-perplexity samples | Named after FLOW (arXiv:2502.02797), which *re-weights* the loss by exp(−loss/τ) to reduce forgetting and reports slightly lower target accuracy; palingenesis records that weight as `_score_flow_weight`, training does not use it. Measured: no gain over random. |
+| `strategy: curriculum` | A random subset stored familiar→unfamiliar; training keeps that order (no shuffling, no length grouping) in every epoch | Not measured. Batches stop being a random draw of the data, and the run ends on its highest-perplexity rows. |
+| `strategy: balanced` / `medium_focus` / `hard_focus` | Equal thirds / closest to the median / highest perplexity | Not measured. |
+| `hes` | Also writes `_score_hes` (sum of the top `hes_top_k_pct`% token entropies of the response, from the same forward) and `_score_hes_mean` | No strategy reads it. The sum grows with response length; compare rows of different length with the mean. |
+
+Every strategy other than `random` logs a warning. Within a bucket samples are drawn at random, never in file order. Cost of scoring: 20,000 math conversations (10M tokens) took 7 minutes for Qwen3.5-0.8B on one A100; time grows with model size and token count, so 100,000 traces of 8K tokens are hours on a 4B model. A run that stops halfway starts over.
 
 ## What the measurements say
 
@@ -167,7 +193,7 @@ Standard errors of a single cell are about 1.3 (GSM8K, MMLU-Pro), 2.1 (MATH-500)
 
 What this supports:
 
-- **Selection by perplexity did not help.** No strategy beat a random subset on the target skill, and `optimal` was worse than random on GSM8K (−2.4 ± 1.1) and HumanEval+ (−4.0 ± 1.8), consistently across both seeds. Hence `random` is the default.
+- **Selection by perplexity did not help.** No strategy beat a random subset on the target skill, and `optimal` was worse than random on GSM8K (−2.4 ± 1.1) and HumanEval+ (−4.0 ± 1.8), consistently across both seeds. Hence `random` is the default and scoring is off unless asked for.
 - **The score is not difficulty.** On 20,000 NuminaMath problems, the Spearman correlation between the model's pass rate (4 samples) and the response perplexity of the reference solution was 0.009. Selecting the problems the model solves sometimes (pass rate between 0 and 1) did not help either.
 - **Where the responses come from matters more than which samples you pick.** On identical prompts, the model's own verified solutions (sample 4 answers, keep a correct one) beat the dataset's solutions by +8.6 ± 1.7 on MATH-500, +11.0 ± 1.8 on IFEval and +2.7 ± 1.1 on MMLU-Pro (two seeds each). They did not *raise* math above the untouched model, though: at this scale they preserve the skill rather than improve it. The dataset solutions are much shorter than what the model writes, and the model learns that: its MATH-500 answers shrink from ~1,250 to ~460 tokens and its accuracy drops. The price: the model keeps its habit of long answers that sometimes never terminate (chat sanity −7.5 ± 1.6 and MBPP+ −3.4 ± 1.8 vs dataset solutions).
 - **Forgetting is the main effect, and data selection does not fix it.** Every run lost 11–29 points of IFEval. A 5× lower learning rate halved the IFEval loss (−11.3 vs −23.2) but still gave no math gain; mixing in an equal amount of general chat data recovered only +4.3 ± 1.7, because that chat data itself costs IFEval when trained alone (−20.9).
@@ -185,7 +211,7 @@ TFP (Threshold Filtering Packing, Dong et al. 2024) orders samples so that relat
 
 ## Multi-source mixing
 
-Real projects have multiple data sources: agentic traces, general instruction-following, code, reasoning. Each overfits at a different rate.
+Real projects have multiple data sources: agentic traces, general instruction-following, code, reasoning.
 
 ```yaml title="sources.yaml"
 - dataset: ./agentic_traces.jsonl
@@ -204,6 +230,8 @@ Real projects have multiple data sources: agentic traces, general instruction-fo
 ```bash
 pgs prepare-multi --model Qwen/Qwen3.5-4B --sources sources.yaml --output prepared/
 ```
+
+Each source is prepared on its own (same cleaning as `pgs prepare`, duplicates removed inside a source, not across sources) into `prepared/<name>/scored_data.jsonl`, and `prepared/manifest.json` lists per source the rows, tokens, what cleaning removed, and what the weights amount to: `normalized_weight` (share of examples) and `token_share` (share of tokens). The two differ whenever sources differ in length, which is the usual case with agentic traces next to chat data. Point `data.sources` at the per-source files to train on them. Raw-text sources (`mode: pretrain`) are skipped. `--score`, `--min_ppl`, `--max_ppl`, `--strategy` and `--hes` behave as in `pgs prepare` and are [experimental](#scoring-with-the-model-experimental).
 
 How the mix behaves in training (`data.sources`):
 

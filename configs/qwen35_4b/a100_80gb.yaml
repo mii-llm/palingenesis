@@ -82,22 +82,23 @@ plugins:
   sym_noise_alpha: 5.0
 
 # Offline data preparation — run `pgs prepare --config <this file>` first.
-# Scores data.dataset with model.name_or_path perplexity, filters, selects,
-# and dumps parquet to output_dir. With enabled=true, training automatically
-# uses the prepared parquet instead of the raw dataset.
+# Renders data.dataset as training will, drops the rows training would drop and
+# exact duplicates, reports what it removed, and dumps parquet to output_dir.
+# With enabled=true, training automatically uses the prepared parquet instead
+# of the raw dataset. No model forward unless `score` (experimental) is set.
 preprocess:
   enabled: false                 # set true after running `pgs prepare`
   output_dir: ./prepared/qwen35_4b
   format: parquet                # parquet (fast, order-preserving) or jsonl
-  budget: 0                      # samples to keep after scoring (0 = all)
-  strategy: optimal              # optimal | curriculum | balanced | flow | ...
+  budget: 0                      # rows to keep after cleaning (0 = all), a random subset
   eval_holdout: 100              # reserve N samples as a held-out eval set
-                                  # (eval_data.parquet, never trained on; training
-                                  # auto-uses it when data.eval_dataset is empty)
-  batch_size: 64                 # max samples per scoring forward (length-sorted,
+                                  # (eval_data.parquet, shares no prompt with the
+                                  # training data; training auto-uses it when
+                                  # data.eval_dataset is empty)
+  score: false                   # also score rows with the model (response perplexity)
+  batch_size: 64                 # scoring: max samples per forward (length-sorted,
                                  # padded batches; token cap below bounds memory)
-  max_batch_tokens: 32768        # padded tokens per forward (~10GB bf16 logits @150K vocab)
-  hes: false                     # HES reasoning-quality scoring (slower)
+  max_batch_tokens: 32768        # scoring: padded tokens per forward (~10GB bf16 logits @150K vocab)
 
 logging:
   rl_readiness: true             # NEW: monitor output entropy for RL handoff

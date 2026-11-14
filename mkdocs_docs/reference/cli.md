@@ -169,15 +169,15 @@ pgs autopilot --model Qwen/Qwen3.5-4B --dataset my_data.jsonl --output ./out
 
 ### prepare
 
-Score, filter, and select training data by difficulty. Dumps parquet (default) or jsonl, plus a `prepared_meta.json` provenance manifest.
+Clean training data with the tokenizer alone: drop the rows training would drop and exact duplicates, hold out an eval set that shares no prompt with the training data, cap sources, select a row or token budget. Dumps parquet (default) or jsonl, a `prepared_meta.json` report and `dropped.jsonl` (every removed row with its reason).
 
 === "Config-driven (recommended)"
 
-    Reads the **same YAML as training** — scoring model, dataset, and the `preprocess:` section all come from one file, and the usual `--section.field` overrides apply:
+    Reads the **same YAML as training** — tokenizer, dataset, masking options and the `preprocess:` section all come from one file, and the usual `--section.field` overrides apply:
 
     ```bash
     pgs prepare --config configs/qwen35_4b/a100_80gb.yaml
-    pgs prepare --config cfg.yaml --preprocess.budget 5000 --preprocess.strategy curriculum
+    pgs prepare --config cfg.yaml --preprocess.eval_holdout 200 --preprocess.budget 5000
     ```
 
     Afterwards, training consumes the output automatically:
@@ -190,14 +190,23 @@ Score, filter, and select training data by difficulty. Dumps parquet (default) o
 
     ```bash
     pgs prepare --model Qwen/Qwen3.5-4B --data raw.jsonl --output prepared/ \
-        --strategy optimal --format parquet --split train
+        --eval_holdout 200 --max_per_prompt 2 --group_field source --max_per_group 20000
     ```
+
+    | Flag | Meaning |
+    |------|---------|
+    | `--no_dedupe` | Keep exact duplicates |
+    | `--max_per_prompt N` | At most N rows that share a prompt |
+    | `--group_field F`, `--max_per_group N`, `--max_tokens_per_group N` | Caps per value of column `F` |
+    | `--eval_holdout N` | Held-out eval set |
+    | `--budget N`, `--token_budget N` | Random subset of N rows / N tokens |
+    | `--score`, `--min_ppl`, `--max_ppl`, `--strategy`, `--hes` | Scoring with the model: [experimental](../guides/data.md#scoring-with-the-model-experimental), off by default |
 
 See the [Data Preparation guide](../guides/data.md) for the full workflow.
 
 ### prepare-multi
 
-Multi-source preparation with per-source scoring.
+Prepares each source of a sources file on its own and writes `manifest.json` with every source's rows, tokens and share of examples and of tokens at its weight.
 
 ```bash
 pgs prepare-multi --model Qwen/Qwen3.5-4B --sources sources.yaml --output prepared/

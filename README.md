@@ -47,7 +47,7 @@ AMD GPUs (ROCm): [Training on AMD GPUs](https://mii-llm.github.io/palingenesis/g
 | **Preference optimization**: DPO, IPO, SLiC-HF, robust and length-normalised DPO, SFT anchor | `pgs train --config configs/dpo_qwen35_08b.yaml` | [DPO](https://mii-llm.github.io/palingenesis/guides/dpo/) |
 | **LoRA** (plugin): frozen base, rank-r adapters (rsLoRA, DoRA, LoRA+), merged export and PEFT adapter; full fine-tuning stays the default | `pgs init lora && pgs train --config lora.yaml` | [LoRA](https://mii-llm.github.io/palingenesis/guides/lora/) |
 | **Model merging**: interpolation, soups, task arithmetic | `pgs merge interpolate START END --lam 0.3 -o OUT` | [Merging](https://mii-llm.github.io/palingenesis/guides/merging/) |
-| **Data preparation**: score, filter and select with the same config you train with | `pgs prepare --config configs/qwen35_4b/a100_80gb.yaml` | [Data](https://mii-llm.github.io/palingenesis/guides/data/) |
+| **Data preparation**: drop broken rows and duplicates, hold out an eval set, with the same config you train with | `pgs prepare --config configs/qwen35_4b/a100_80gb.yaml` | [Data](https://mii-llm.github.io/palingenesis/guides/data/) |
 | **Autopilot**: profiles the GPU, sweeps the learning rate, trains to completion | `pgs autopilot --model Qwen/Qwen3.5-4B --dataset data.jsonl` | [Autopilot](https://mii-llm.github.io/palingenesis/guides/autopilot/) |
 
 ## Highlights

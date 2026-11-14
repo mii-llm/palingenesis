@@ -101,7 +101,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 | `logging` | wandb, trackio | You want experiment tracking dashboards |
 | `loss` | Cut Cross-Entropy (Triton kernel) | Training models with 256K+ vocabulary (Gemma) |
 | `optim` | ScheduleFree | Using schedule-free mode |
-| `prepare` | sentence-transformers | Running TFP semantic packing during data prep |
+| `prepare` | sentence-transformers | The standalone `palingenesis.tfp` ordering utility (not used by `pgs prepare`) |
 
 ---
 
@@ -162,6 +162,6 @@ Multi-turn conversations (any number of user/assistant/system turns) are fully s
 
 ## What if I don't have a GPU?
 
-Data preparation (`pgs prepare`) works on CPU but is very slow (~10× slower than GPU). Training requires a GPU — there's no CPU training mode because it would take weeks and produce an inferior result.
+Data preparation (`pgs prepare`) runs on CPU; only its optional model scoring wants a GPU. Training requires a GPU — there's no CPU training mode because it would take weeks and produce an inferior result.
 
 For GPU access without buying hardware: [Lambda Cloud](https://lambdalabs.com/), [RunPod](https://www.runpod.io/), or [Vast.ai](https://vast.ai/) offer A100/H100 instances at $1-3/hour.

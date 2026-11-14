@@ -69,15 +69,15 @@ Your data should be JSONL with chat messages:
 {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
 
-!!! tip "Better data in two commands"
-    Before training on raw data, let palingenesis score and filter it with your target model — same config, one extra command:
+!!! tip "Clean data in two commands"
+    Before training on raw data, let palingenesis drop broken rows and duplicates and report what your data holds — same config, one extra command, no GPU:
 
     ```bash
     pgs prepare --config configs/quickstart.yaml
     pgs train --config configs/quickstart.yaml --preprocess.enabled true
     ```
 
-    See the [Data Preparation guide](../guides/data.md) — it's the single highest-leverage step.
+    See the [Data Preparation guide](../guides/data.md).
 
 ## 4. What happened?
 

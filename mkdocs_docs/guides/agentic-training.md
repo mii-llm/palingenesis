@@ -271,7 +271,7 @@ From the research on reasoning-trace SFT:
 
 Quality matters enormously. One well-annotated trace with clear reasoning > 10 traces where the assistant stumbles to an answer by luck.
 
-Use `pgs prepare --strategy optimal` to select the highest-value traces from a larger pool.
+`pgs prepare` removes duplicate and unusable traces, caps the trajectories per task (`--max_per_prompt`) and reports how many traces are cut to `max_seq_length`. It does not rank traces by value: filter on outcome (tests passed, task solved) before preparing.
 
 
 ---

@@ -81,7 +81,7 @@ Most practitioners dump their entire dataset into training and hope for the best
 
 What the evidence supports is narrower than "train on medium difficulty": which samples help depends on the model, the data budget and where the responses come from (see the [data guide](../guides/data.md#what-the-measurements-say) for our measurements on Qwen3.5).
 
-Palingenesis's `prepare` command scores every sample with the model you will train (on exactly the tokens training will use) records how familiar each response is to the model, drops outliers and selects a subset. In our measurements the most useful lever was not selection but the *source* of the responses: on the same prompts, the model's own verified answers kept its math and instruction following far better than the dataset's answers, and replaying its own answers to general prompts forgot less than replaying a chat dataset. Compare any selection against a random subset of the same size on your task.
+Palingenesis's `prepare` command cleans the data (rows training would drop, duplicates, a held-out split) and can score every sample with the model you will train, on exactly the tokens training will use. Scoring is off by default: in our measurements, and in published replications, selecting by that score did not beat a random subset. In our measurements the most useful lever was not selection but the *source* of the responses: on the same prompts, the model's own verified answers kept its math and instruction following far better than the dataset's answers, and replaying its own answers to general prompts forgot less than replaying a chat dataset. Compare any selection against a random subset of the same size on your task.
 
 ---
 

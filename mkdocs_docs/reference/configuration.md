@@ -201,25 +201,31 @@
 
 ## preprocess
 
-Offline data preparation, driven by the **same config** as training (see the [Data Preparation guide](../guides/data.md)). `pgs prepare --config <file>` reuses `model.name_or_path`, `data.dataset`, `data.dataset_split`, `data.messages_field`, and `data.max_seq_length` — this section only controls selection and output.
+Offline data preparation, driven by the **same config** as training (see the [Data Preparation guide](../guides/data.md)). `pgs prepare --config <file>` reuses `model.name_or_path`, `data.dataset`, `data.dataset_split`, `data.messages_field`, `data.max_seq_length` and the masking options of `data` — this section controls cleaning, selection and output. Nothing here runs the model unless `score` is set or a perplexity option needs it.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `enabled` | bool | `false` | Train on the prepared output in `output_dir` instead of the raw `data.dataset`. Fails loudly if nothing was prepared yet. Incompatible with `data.sources` (use `prepare-multi` for that). |
-| `output_dir` | str | `./prepared` | Where `pgs prepare` writes `scored_data.parquet` + `prepared_meta.json`, and where training looks for them. |
+| `output_dir` | str | `./prepared` | Where `pgs prepare` writes `scored_data.parquet`, `prepared_meta.json` and `dropped.jsonl`, and where training looks for the data. |
 | `format` | str | `parquet` | Output format. `parquet` (order-preserving, fast; falls back to jsonl if the sample schema can't be unified) or `jsonl`. |
-| `max_samples` | int | `0` | Cap on samples read from the raw dataset before scoring. 0 = all. |
-| `budget` | int | `0` | Samples to keep after scoring and filtering. 0 = keep all. |
-| `strategy` | str | `random` | How `budget` samples are chosen: `random` (uniform, seeded), `optimal` (heuristic J-shaped familiarity mix; measured below `random`, see the [data guide](../guides/data.md#what-the-measurements-say)), `curriculum` (random subset ordered familiar→unfamiliar, order kept at train time), `balanced`, `medium_focus`, `hard_focus`, `flow` (lowest perplexity). Unknown names are an error. |
-| `group_field` | str | `""` | Row column (e.g. `source`) to profile in `prepared_meta.json`: per group, count, median response NLL, mean response tokens and familiarity buckets, before and after selection. |
-| `eval_holdout` | int | `0` | Reserve N random samples as a held-out eval set (`eval_data.parquet`), excluded from the training selection. Training auto-uses it when `data.eval_dataset` is empty — a true same-distribution holdout, so `eval/loss` and `eval/gap` are trustworthy. |
-| `min_ppl` | float | `1.5` | Drop samples whose response perplexity is below this (already known). |
-| `max_ppl` | float | `500.0` | Drop samples above this (noise, wrong language); `<= 0` disables. |
+| `max_samples` | int | `0` | Cap on samples read from the raw dataset. 0 = all. |
+| `dedupe` | bool | `true` | Drop exact duplicate conversations (same messages and tool definitions; whitespace runs collapsed). The first row is kept. |
+| `max_per_prompt` | int | `0` | Keep at most N rows that share a system prompt and first user turn (a seeded random draw). 0 = no cap. |
+| `group_field` | str | `""` | Row column that names a row's group (e.g. `source`). The group caps apply per value, and `prepared_meta.json` profiles each group (rows, tokens, mean response tokens; when scored, median response NLL and familiarity buckets) before and after caps and selection. |
+| `max_per_group` | int | `0` | Keep at most N rows per `group_field` value. 0 = no cap. |
+| `max_tokens_per_group` | int | `0` | Keep at most N tokens per `group_field` value. 0 = no cap. |
+| `eval_holdout` | int | `0` | Reserve about N rows as a held-out eval set (`eval_data.parquet`), excluded from training and sharing no prompt with it. Training auto-uses it when `data.eval_dataset` is empty. |
+| `budget` | int | `0` | Rows to keep after cleaning and caps. 0 = keep all. |
+| `token_budget` | int | `0` | Tokens to keep: a random subset whose rows add up to at most this many tokens. 0 = no limit. Only with `strategy: random`. |
+| `score` | bool | `false` | Score every row with the model (response perplexity, familiarity bucket). One forward pass over the data. [Experimental](../guides/data.md#scoring-with-the-model-experimental). |
+| `strategy` | str | `random` | How `budget` rows are chosen: `random` (uniform, seeded). Experimental, each turns scoring on and logs a warning: `optimal` (heuristic J-shaped familiarity mix; measured below `random`), `curriculum` (random subset ordered familiar→unfamiliar, order kept at train time), `balanced`, `medium_focus`, `hard_focus`, `flow` (lowest perplexity). Unknown names are an error. |
+| `min_ppl` | float | `0.0` | Drop samples whose response perplexity is below this. 0 = off; above 0 turns scoring on. |
+| `max_ppl` | float | `0.0` | Drop samples above this. 0 = off; above 0 turns scoring on. |
 | `filter_score` | str | `response` | Perplexity the filters use: `response` (trained tokens only) or `full` (whole conversation). |
 | `batch_size` | int | `4` | Max samples per scoring forward pass. Scoring is length-sorted and padded-batch, so large values (64–256) are safe — `max_batch_tokens` bounds memory, not this. |
 | `max_batch_tokens` | int | `16384` | Padded-token cap per scoring forward. Logits are batch×seq×vocab, so this is what bounds memory: 16K ≈ 5GB bf16 logits at 150K vocab. On an 80GB GPU with a ≤8B model, `32768` is safe and noticeably faster. |
-| `hes` | bool | `false` | Also compute High-Entropy Sum reasoning-quality scores. Slower (second forward pass). |
-| `hes_top_k_pct` | float | `0.5` | Top-k% highest-entropy tokens summed for HES. |
+| `hes` | bool | `false` | Also write High-Entropy Sum scores of the response (`_score_hes`, `_score_hes_mean`) from the scoring forward. Turns scoring on. No selection strategy reads them. |
+| `hes_top_k_pct` | float | `0.5` | Top-k% highest-entropy response tokens summed for HES. |
 
 ---
 

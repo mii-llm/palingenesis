@@ -114,7 +114,7 @@ pgs merge interpolate START END --lam 0.3 -o OUT
 
 ### Data preparation
 
-Score, filter and select with the same config you train with.
+Drop broken rows and duplicates, hold out an eval set, with the same config you train with.
 
 ```bash
 pgs prepare --config configs/qwen35_4b/a100_80gb.yaml

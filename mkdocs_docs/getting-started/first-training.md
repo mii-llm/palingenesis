@@ -13,7 +13,7 @@ This depends on your goal. A rule of thumb (not a measured result; general chat 
 | 500–2,000 samples | 3–5 | Format learning. Model follows your template but capabilities are limited. |
 | 2,000–10,000 samples | 2–3 | Skill acquisition. Model learns specific behaviors (tool-calling patterns, coding style). |
 | 10,000–50,000 samples | 1–2 | Deep specialization. Model becomes genuinely competent at the domain. |
-| 50,000+ samples | 1 | Diminishing returns unless data is highly diverse. Consider `pgs prepare` to select the best subset. |
+| 50,000+ samples | 1 | Diminishing returns unless data is highly diverse. |
 
 Repetition can beat new data at a fixed number of updates: Kopiczko et al. (2026, arXiv:2602.11149) trained base Qwen3/Olmo3 models on long chain-of-thought data and found 400 random samples for 128 epochs beat 51,200 samples for one epoch on AIME/GPQA, with gains saturating at 32–64 epochs. It is a result about repetition in long-CoT SFT of base models, not about quality versus quantity; for an instruct model, watch your regression evals when you repeat data.
 
@@ -29,7 +29,7 @@ JSONL with chat messages:
 
 Multi-turn is supported. Only assistant tokens get loss.
 
-## (Optional) Score, filter and hold out an eval set
+## (Optional) Clean the data and hold out an eval set
 
 Point your config's `data.dataset` at the raw data, add a `preprocess:` section, and run:
 
@@ -41,11 +41,11 @@ pgs prepare --config configs/qwen35_4b/a100_80gb.yaml
 preprocess:
   enabled: true          # training will auto-use the prepared output
   output_dir: ./prepared
-  budget: 5000           # a random subset of 5,000 (strategy: random, the default)
-  eval_holdout: 200      # held-out eval set, never trained on
+  eval_holdout: 200      # held-out eval set, shares no prompt with the training data
+  budget: 5000           # a random subset of 5,000 (0 = keep everything)
 ```
 
-One forward pass over the data with the model you will train: 20,000 math conversations (10M tokens) took 7 minutes for Qwen3.5-0.8B on one A100, and the time grows with model size and token count. It drops outliers, records how familiar each response is to the model, and dumps `prepared/scored_data.parquet` plus a provenance manifest. It does not know which samples will teach the model most: no familiarity-based selection beat a random subset in our [measurements](../guides/data.md#what-the-measurements-say). With `enabled: true`, training picks it up automatically — no path editing needed. (The flag-based `pgs prepare --model ... --data ...` mode still exists; see the [Data guide](../guides/data.md).)
+No GPU needed: the rows are rendered and tokenized as training will, the ones training would drop and exact duplicates are removed, and `prepared/prepared_meta.json` reports what was removed and why, how many rows are cut to `max_seq_length`, and the token counts. It does not know which samples will teach the model most: scoring rows with the model is available but off by default, because no selection by that score beat a random subset in our [measurements](../guides/data.md#what-the-measurements-say). With `enabled: true`, training picks the output up automatically — no path editing needed. (The flag-based `pgs prepare --model ... --data ...` mode still exists; see the [Data guide](../guides/data.md).)
 
 ## Choose your config
 
@@ -201,6 +201,6 @@ model = AutoModelForCausalLM.from_pretrained("output/best/model")
 | Symptom | Fix |
 |---------|-----|
 | Loss NaN | Reduce `learning_rate` by 3× |
-| Loss stuck | Run `pgs prepare` to filter bad data |
+| Loss stuck | Check the masking (`pgs inspect`) and the learning rate; read the `pgs prepare` report for dropped and cut rows |
 | OOM | Reduce `per_device_batch_size` |
 | Slow | Set `model.compile: true` |

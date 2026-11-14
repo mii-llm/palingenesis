@@ -213,7 +213,7 @@ Healthy training: loss decreases smoothly, grad_norm is stable, tok/s is constan
 |------|------|------|
 | Loss=NaN on step 1 | LR way too high | Divide `learning_rate` by 10 |
 | Loss decreases then spikes | Bad batch hit | Normal (<1% of steps). If >5%, filter data. |
-| Loss flat for 100+ steps early on | LR too low or all data is easy | Increase LR 2× or run `pgs prepare` (a slow decrease after the initial drop is normal) |
+| Loss flat for 100+ steps early on | LR too low or all data is easy | Increase LR 2× (a slow decrease after the initial drop is normal) |
 | OOM crash | Batch too big or seq too long | Reduce `per_device_batch_size` by 1, or run `pgs fit` for the fastest setting that fits |
 | Very slow (~1K tok/s) | Compile disabled | Set `model.compile: true` |
 | "SPIKE SKIPPED" in logs | Anomalous gradient detected | Palingenesis handled it. Investigate if frequent. |

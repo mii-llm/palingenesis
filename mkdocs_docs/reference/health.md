@@ -20,7 +20,7 @@ Core training dynamics, logged under `train/` and `eval/` on every `logging_step
 | `train/tokens_per_sec_global` | Throughput × world size | Cluster-level throughput |
 | `train/tokens_total` | Cumulative trained tokens (this process) | Compare runs by tokens, not steps |
 | `train/step_time_s` | Wall time per optimizer step | Spikes → GC, checkpointing, or dataloader stalls |
-| `train/spikes_skipped` | Cumulative steps skipped by spike detection | > 5% of steps → run `pgs prepare` to filter data |
+| `train/spikes_skipped` | Cumulative steps skipped by spike detection | > 5% of steps → inspect the data (`pgs inspect`, the `pgs prepare` report) |
 | `train/adagc_clips` | Cumulative per-tensor clips by AdaGC (if enabled) | Steady growth is fine; explosive growth → reduce LR |
 | `train/epoch` | Current epoch | — |
 | `eval/loss` | Validation loss (every `data.eval_every` steps) | The number that matters. Drives best-model tracking |
@@ -221,7 +221,7 @@ Reports: convergence rate, spike count, plateau detection, recommended next step
 | **Layer imbalance** | One layer learns 10× faster than others | `health/gw_ratio/layer_X` >> others | `llrd_decay: 0.9` |
 | **Representation collapse** | Model outputs become repetitive | `health/stable_rank_min < 3` | Reduce LR, enable `sym_noise` |
 | **Entropy collapse (RL)** | Output diversity disappearing | `health/output_entropy < 1.5` | `pre_rl: true`, stop early |
-| **Data quality issues** | Loss noisy, frequent spikes | `SPIKE SKIPPED` > 5% of steps | `pgs prepare` to filter |
+| **Data quality issues** | Loss noisy, frequent spikes | `SPIKE SKIPPED` > 5% of steps | Inspect the rows (`pgs inspect`); `pgs prepare` drops broken rows and duplicates |
 | **Packing cross-contamination** | Loss differs from the unpacked run on the same data | Compare a few steps with `data.packing: false` | Report it: packed conversations are isolated by design (palingenesis.packing) |
 | **Memory pressure** | OOM or CUDA malloc fails | `health/cuda_utilization_pct > 95%` | Reduce `per_device_batch_size`, increase `loss_num_chunks` |
 | **Slow throughput** | tok/s below expected | `health/cuda_utilization_pct` low | `model.compile: true`, increase batch, `num_workers` |
