@@ -110,6 +110,48 @@ class ChatFormat:
             raise ValueError(f"the chat template does not close an assistant turn with {self.eot_text!r}")
         return self.tok.encode(text[end + len(self.eot_text) :], add_special_tokens=False)
 
+    def image_wrapper(self, image_token_id: int) -> tuple[list[int], list[int]]:
+        """The control tokens the template writes right before and after an image placeholder
+        (Qwen: <|vision_start|>, <|vision_end|>), from its own rendering of an image part."""
+        cached = self.__dict__.get("_image_wrapper")
+        if cached is not None:
+            return cached
+        text = self.tok.apply_chat_template(
+            [{"role": "user", "content": [{"type": "image"}]}], tokenize=False, **self.kwargs
+        )
+        ids = self.tok.encode(text, add_special_tokens=False)
+        added = set(getattr(self.tok, "added_tokens_decoder", None) or {})
+        before: list[int] = []
+        after: list[int] = []
+        if image_token_id in ids:
+            k = ids.index(image_token_id)
+            if k > 0 and ids[k - 1] in added:
+                before = [ids[k - 1]]
+            if k + 1 < len(ids) and ids[k + 1] in added:
+                after = [ids[k + 1]]
+        self._image_wrapper = (before, after)
+        return before, after
+
+    def drop_images(self, ids: list[int], image_token_id: int, keep: int, placeholder: str) -> list[int]:
+        """`ids` with every image but the last `keep` replaced by `placeholder` text: the image's
+        placeholder token and the control tokens that wrap it go, the text takes their place, as when
+        a harness swaps an old screenshot for a note. Nothing else is re-rendered or re-tokenized."""
+        where = [i for i, t in enumerate(ids) if t == image_token_id]
+        drop = where[: max(len(where) - keep, 0)]
+        if not drop:
+            return list(ids)
+        before, after = self.image_wrapper(image_token_id)
+        text = self.tok.encode(placeholder, add_special_tokens=False) if placeholder else []
+        out: list[int] = []
+        cursor = 0
+        for i in drop:
+            start, end = i, i + 1
+            if before and ids[i - len(before) : i] == before and after and ids[end : end + len(after)] == after:
+                start, end = i - len(before), end + len(after)
+            out += ids[cursor:start] + text
+            cursor = end
+        return out + ids[cursor:]
+
     def sanitize(self, text: str) -> str:
         """Break special-token strings (<|im_start|>, <tool_call>, ...) in untrusted text, so a tool
         result tokenizes as plain text and cannot open turns or fake calls."""

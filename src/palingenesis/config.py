@@ -609,6 +609,14 @@ class Config:
                     errors.append(f"multimodal.{name} must be a positive number of pixels, got {value}.")
             if mm.min_pixels and mm.max_pixels and mm.min_pixels > mm.max_pixels:
                 errors.append(f"multimodal.min_pixels ({mm.min_pixels}) is above max_pixels ({mm.max_pixels}).")
+            if self.distill.enabled:
+                for name, teacher in (self.distill.teachers or {}).items():
+                    if isinstance(teacher, dict) and teacher.get("cache"):
+                        errors.append(
+                            f"multimodal.enabled with a cached teacher (distill.teachers.{name}.cache) is not "
+                            "supported: cached targets are keyed by the tokens, and the same tokens with other "
+                            "pixels have other targets. Use an online teacher (model: ...)."
+                        )
         elif self.multimodal.train_vision_tower or self.multimodal.train_projector:
             errors.append("multimodal.train_vision_tower / train_projector need multimodal.enabled: true.")
         if self.train.keep_checkpoints < 0:

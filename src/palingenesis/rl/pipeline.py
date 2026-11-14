@@ -26,12 +26,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from palingenesis.accelerator import on_current_device
+from palingenesis.multimodal import MultimodalError, has_image_parts, load_image, split_images, vision_of
 from palingenesis.opd.orchestrator import PublishedWeights
 from palingenesis.opd.rollout import RolloutEngine
 from palingenesis.rl.chat import ChatFormat, ToolCall, encode_prompt, parse_assistant
 from palingenesis.rl.config import RLConfig
 from palingenesis.rl.data import PromptSampler, prompt_messages, row_limit
-from palingenesis.rl.env import EnvPool, call_sync_or_async, row_tools, run_tool
+from palingenesis.rl.env import EnvPool, ToolOutput, call_sync_or_async, row_tools, run_tool
 from palingenesis.rl.generation import GenerationClient
 from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample, load_object, whitespace_defects
 from palingenesis.rl.trajectory import Trajectory, group_is_informative
@@ -47,6 +48,9 @@ class RLBatch:
 
 
 class RLPipeline:
+    vision = None  # a multimodal policy's image processor (palingenesis.multimodal), from the tokenizer
+    _warned_images = False
+
     def __init__(
         self,
         tok,
@@ -69,6 +73,7 @@ class RLPipeline:
             sandbox,
         )
         self.stop_ids = set(stop_ids)
+        self.vision = vision_of(tok)
         self.group_shaping = load_object(config.loss.group_shaping) if config.loss.group_shaping else None
         # n-sample merging only helps when a group's rollouts are one turn each
         self.client = GenerationClient(engine, merge=env_pool is None)
@@ -318,7 +323,11 @@ class RLPipeline:
                 (getattr(env, "episode_info", None) or {}).get("chat_template_kwargs") if env is not None else None
             )
             chat = self.chat.with_kwargs({**(episode or {}), **(row.get("chat_template_kwargs") or {})})
-            trajectory.prompt_ids = encode_prompt(self.tok, messages, schemas, chat.kwargs)
+            rendered, shown = self._split_images(messages)
+            trajectory.prompt_ids = encode_prompt(self.tok, rendered, schemas, chat.kwargs)
+            self._add_images(trajectory, trajectory.prompt_ids, shown)
+            vision = self.vision
+            image_results = (getattr(env, "episode_info", None) or {}).get("image_results") or e.image_results
             # a row's own limits: positive integers (row_limit raises on anything else; the trainer checks at load)
             budget = row_limit(row, "max_completion_tokens") or config.completion_budget
             row_new_tokens = row_limit(row, "max_new_tokens") or r.max_new_tokens
@@ -332,7 +341,22 @@ class RLPipeline:
                 forced = self.tok.encode(r.think_skip_prefix, add_special_tokens=False)
                 trajectory.info["think_skip"] = True
             for turn in range(max_turns):
-                context = len(trajectory.prompt_ids) + len(trajectory.tokens)
+                if e.max_images and len(trajectory.images) > e.max_images + e.image_prune_slack:
+                    # old screenshots leave the context; what was sampled so far stays trained on what it saw
+                    kept = chat.drop_images(
+                        trajectory.prompt_ids + trajectory.tokens,
+                        vision.image_token_id,
+                        e.max_images,
+                        e.image_placeholder,
+                    )
+                    trajectory.rewrite_context(
+                        kept,
+                        trajectory.images[-e.max_images :],
+                        trajectory.image_tokens[-e.max_images :],
+                        vision.image_token_id,
+                    )
+                    trajectory.info["context_rewrites"] = len(trajectory.segments)
+                context = trajectory.context_tokens
                 room = min(
                     row_new_tokens,
                     budget - trajectory.sampled_tokens,
@@ -349,7 +373,15 @@ class RLPipeline:
                 # stop resampling (evaluation only): a turn that would stop the episode is sampled again
                 resamples = 0 if training or env is None or turn == max_turns - 1 else r.stop_resample
                 for attempt in range(resamples + 1):
-                    out = await self.client.generate(trajectory.prompt_ids + trajectory.tokens, room, temperature)
+                    out = await self.client.generate(
+                        trajectory.prompt_ids + trajectory.tokens,
+                        room,
+                        temperature,
+                        *([trajectory.images] if trajectory.images else []),  # only multimodal engines take images
+                    )
+                    if vision is not None and vision.image_token_id in out.ids:
+                        # an image placeholder is an input; sampled, it has no image to stand for
+                        raise MultimodalError("the policy sampled an image placeholder token")
                     text = self.tok.decode(
                         prefix + [t for t in out.ids if t not in self.stop_ids],
                         skip_special_tokens=True,
@@ -396,6 +428,9 @@ class RLPipeline:
                     )
                 )
                 turn_timing["tools_s"] = clock() - t_tools
+                # a tool may return images next to its text (rl.env.ToolOutput)
+                texts = [out.text if isinstance(out, ToolOutput) else out for out, _ in results]
+                pictures = [list(out.images) if isinstance(out, ToolOutput) else [] for out, _ in results]
                 observations = [
                     {
                         "role": "tool",
@@ -403,32 +438,38 @@ class RLPipeline:
                         "name": c.name,
                         "content": text,
                     }
-                    for c, (text, _) in zip(parsed.calls, results)
+                    for c, text in zip(parsed.calls, texts)
                 ]
                 observations += [{"role": "tool", "content": error} for error in parsed.errors]
                 if text_protocol:  # one user turn with the results, in the environment's own format
                     render = getattr(env, "observation_text", None)
                     body = (
-                        render([(c.name, out_text) for c, (out_text, _) in zip(parsed.calls, results)])
+                        render([(c.name, out_text) for c, out_text in zip(parsed.calls, texts)])
                         if render
-                        else "\n\n".join(out_text for out_text, _ in results)
+                        else "\n\n".join(texts)
                     )
                     observations = [{"role": "user", "content": body}]
                 for o in observations:
                     o["content"] = self.chat.truncate(self.chat.sanitize(o["content"]), e.max_tool_output_tokens)
+                if any(pictures):
+                    self._attach_images(observations, pictures, image_results, text_protocol)
                 trajectory.tool_calls += len(parsed.calls)
                 trajectory.tool_errors += sum(failed for _, failed in results) + len(parsed.errors)
                 if getattr(env, "done", False):  # the environment ended the episode (e.g. a submit tool)
                     trajectory.messages.extend(observations)
                     trajectory.finish = "env_done"
                     break
-                context_ids = chat.continuation_ids(observations, schemas, None if text_protocol else parsed.calls)
+                rendered, shown = self._split_images(observations)
+                context_ids = chat.continuation_ids(rendered, schemas, None if text_protocol else parsed.calls)
                 if out.ids and out.ids[-1] != self.chat.eot_id:  # the turn ended on another stop token
                     context_ids = [self.chat.eot_id] + context_ids
-                if len(trajectory.prompt_ids) + len(trajectory.tokens) + len(context_ids) >= r.max_model_len - 1:
+                shown, image_tokens = self._measure_images(context_ids, shown)
+                added = len(context_ids) + sum(n - 1 for n in image_tokens)
+                if trajectory.context_tokens + added >= r.max_model_len - 1:
                     trajectory.finish = "length"
                     break
                 trajectory.append_context(context_ids)
+                trajectory.append_images(shown, image_tokens)
                 trajectory.messages.extend(observations)
         except asyncio.CancelledError:  # shutdown with the rollout in flight
             if env is not None and self.env_pool is not None:
@@ -448,6 +489,66 @@ class RLPipeline:
             timing["end"] = clock() - self.rollout_start
             self.client.exit()
         return trajectory, env
+
+    # ------------------------------------------------------------------ images
+
+    def _split_images(self, messages: list[dict]) -> tuple[list[dict], list[Any]]:
+        """(messages for the chat template, their images in rendering order). A text-only policy
+        cannot take images: they are an error in the prompt."""
+        if self.vision is None:
+            if has_image_parts(messages):
+                raise MultimodalError(
+                    "the conversation has images but the policy is text-only: set model.multimodal: true"
+                )
+            return messages, []
+        return split_images(messages)
+
+    def _measure_images(self, ids: list[int], images: list[Any]) -> tuple[list[Any], list[int]]:
+        """The images loaded, and the tokens each expands to. The template must have written one
+        placeholder per image into `ids`."""
+        if not images:
+            return [], []
+        rendered = self.vision.count_images(ids)
+        if rendered != len(images):
+            raise MultimodalError(
+                f"the chat template rendered {rendered} placeholder(s) for {len(images)} image(s): it does not "
+                'render images in this role. For images returned by tools, set env.image_results: "user".'
+            )
+        loaded = [load_image(image) for image in images]
+        return loaded, [self.vision.num_tokens(image.height, image.width) for image in loaded]
+
+    def _add_images(self, trajectory: Trajectory, ids: list[int], images: list[Any]) -> None:
+        trajectory.append_images(*self._measure_images(ids, images))
+
+    def _attach_images(self, observations: list[dict], pictures: list[list], mode: str, text_protocol: bool) -> None:
+        """Put the tools' images into the observation messages (in place). A text-only policy gets
+        the text alone. Text-protocol environments answer in one user message: the images follow its
+        text. Native tool calls: env.image_results."""
+        if self.vision is None:
+            if not self._warned_images:
+                self._warned_images = True
+                logger.warning("tools returned images but the policy is text-only: the images are dropped")
+            return
+        e = self.config.env
+
+        def parts(images: list) -> list[dict]:
+            return [{"type": "image", "image": image} for image in images]
+
+        def with_text(text: str, images: list) -> list[dict]:
+            return ([{"type": "text", "text": text}] if text else []) + parts(images)
+
+        flat = [image for images in pictures for image in images]
+        if text_protocol:
+            observations[0]["content"] = with_text(observations[0]["content"], flat)
+        elif mode == "tool":
+            for message, images in zip(observations, pictures):
+                if images:
+                    message["content"] = with_text(message["content"], images)
+        else:
+            for message, images in zip(observations, pictures):
+                if images and not message["content"]:
+                    message["content"] = e.image_tool_note
+            observations.append({"role": "user", "content": with_text(e.image_user_note, flat)})
 
     def _dump(self, groups: list[list[Trajectory]], step: int) -> None:
         """Every trajectory of the batch (kept and zero-variance) and the engine's concurrency

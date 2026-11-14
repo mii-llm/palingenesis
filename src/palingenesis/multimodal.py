@@ -453,6 +453,34 @@ def forward_kwargs(batch: dict, kwargs: dict, flatten: bool = False) -> dict:
     return out
 
 
+def batch_sequences(
+    vision: VisionProcessor, sequences: list[list[int]], images: list[list[Any]], pad_id: int, device
+) -> tuple[torch.Tensor, dict, list[list[int]]]:
+    """Rollout sequences as a training batch: (right-padded expanded ids, forward kwargs with pixels
+    and positions, per sequence the index of each of its tokens in the expanded row). `sequences`
+    hold one placeholder per image; images[i] are sequence i's, in order. An image shown in several
+    sequences (a group's shared prompt) is processed once."""
+    encoded: dict[int, ImageInput] = {}
+    built = []
+    for ids, shown in zip(sequences, images):
+        for image in shown:
+            if id(image) not in encoded:
+                encoded[id(image)] = image if isinstance(image, ImageInput) else vision.encode(image)
+        built.append(vision.sequence(ids, [encoded[id(image)] for image in shown]))
+    width = max(b.input_ids.numel() for b in built)
+    input_ids = torch.full((len(built), width), pad_id, dtype=torch.long)
+    items = []
+    for row, b in enumerate(built):
+        input_ids[row, : b.input_ids.numel()] = b.input_ids
+        item = {"input_ids": b.input_ids, POSITION_FIELD: b.positions}
+        if b.images:
+            item["pixel_values"] = torch.cat([im.pixel_values for im in b.images])
+            item["image_grid_thw"] = torch.tensor([im.grid for im in b.images], dtype=torch.long)
+        items.append(item)
+    batch = {k: v.to(device) for k, v in collate_images(items, width).items()}
+    return input_ids.to(device), forward_kwargs(batch, {}), [b.index for b in built]
+
+
 def mask_image_labels(labels: torch.Tensor, input_ids: torch.Tensor, vision: VisionProcessor) -> torch.Tensor:
     """Image placeholders are inputs, never targets, whatever the masking mode trains."""
     labels[input_ids == vision.image_token_id] = IGNORE_INDEX
@@ -466,7 +494,15 @@ def load_model(name_or_path: str, **kwargs):
     """The checkpoint in its multimodal architecture (language model, vision tower, projector)."""
     from transformers import AutoModelForImageTextToText
 
-    return AutoModelForImageTextToText.from_pretrained(name_or_path, **kwargs)
+    try:
+        return AutoModelForImageTextToText.from_pretrained(name_or_path, **kwargs)
+    except ValueError as e:
+        if "Unrecognized configuration class" not in str(e):
+            raise
+        raise MultimodalError(
+            f"{name_or_path} is not a vision-language checkpoint (it has no multimodal architecture): it "
+            "cannot take the images in the data"
+        ) from e
 
 
 def disable_cache(model: torch.nn.Module) -> None:

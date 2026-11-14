@@ -5,11 +5,36 @@ the policy saw it: the tokens it sampled (trained, with the sampler's log-probs)
 the context appended between turns (tool results and the chat template's glue; not
 trained). Tokens are appended verbatim and never re-tokenized, so what the trainer
 scores is exactly what the sampler produced (token-in, token-out).
+
+Images. The tokens hold one placeholder per image (what the chat template writes and what vLLM
+takes next to the raw images); `images` are the pictures in placeholder order. The trainer expands
+the placeholders with the model's own image processor (palingenesis.multimodal).
+
+Context rewrites. Dropping old screenshots changes tokens the policy has already read, so the
+sequence is no longer append-only. A rewrite closes the current segment (its prompt and the turns
+sampled on it) and starts a new one whose prompt is the rewritten context. Every sampled token
+belongs to exactly one segment and is trained on the context it was sampled from: `training_views`.
 """
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass
+class Segment:
+    """A closed stretch of a trajectory: the context as it was, and the turns sampled on it."""
+
+    prompt_ids: list[int]
+    tokens: list[int]
+    mask: list[bool]
+    logprobs: list[float]
+    first_versions: list[int]
+    turn_starts: list[int]
+    forced: list[int]
+    images: list[Any]
+    image_tokens: list[int]
 
 
 @dataclass
@@ -37,6 +62,9 @@ class Trajectory:
     trained: bool = True  # False: out of the loss (unscored, or a masked truncation)
     forced: list[int] = field(default_factory=list)  # token indices trained with a forcing probability (think-skip)
     info: dict[str, Any] = field(default_factory=dict)  # environment / reward extras, logged
+    images: list[Any] = field(default_factory=list)  # the context's images, in placeholder order
+    image_tokens: list[int] = field(default_factory=list)  # tokens each image expands to
+    segments: list[Segment] = field(default_factory=list)  # closed by context rewrites (image pruning)
 
     def append_generated(
         self, ids: list[int], logprobs: list[float], version: int, first_version: int | None = None
@@ -67,9 +95,72 @@ class Trajectory:
         self.mask += [False] * len(ids)
         self.logprobs += [0.0] * len(ids)
 
+    def append_images(self, images: list[Any], tokens: list[int]) -> None:
+        """Images of the context just appended (one placeholder token each), and their token counts."""
+        self.images += images
+        self.image_tokens += tokens
+
+    @property
+    def context_tokens(self) -> int:
+        """Tokens the policy reads now: the sequence with every image placeholder expanded."""
+        return len(self.prompt_ids) + len(self.tokens) + sum(n - 1 for n in self.image_tokens)
+
+    def rewrite_context(
+        self, prompt_ids: list[int], images: list[Any], image_tokens: list[int], image_token_id: int | None = None
+    ) -> None:
+        """Replace what the policy reads from now on (old screenshots dropped): the turns sampled so
+        far stay with the context they were sampled from, as a closed segment. The segment ends at
+        its last sampled token: the context after it (and its images, counted by `image_token_id`)
+        conditions nothing that is trained."""
+        end = max((j + 1 for j, sampled in enumerate(self.mask) if sampled), default=0)
+        shown = len(self.images)
+        if image_token_id is not None:
+            shown = sum(1 for token in self.prompt_ids + self.tokens[:end] if token == image_token_id)
+        self.segments.append(
+            Segment(
+                self.prompt_ids,
+                self.tokens[:end],
+                self.mask[:end],
+                self.logprobs[:end],
+                self.first_versions,
+                self.turn_starts,
+                self.forced,
+                self.images[:shown],
+                self.image_tokens[:shown],
+            )
+        )
+        self.prompt_ids, self.images, self.image_tokens = list(prompt_ids), list(images), list(image_tokens)
+        self.tokens, self.mask, self.logprobs = [], [], []
+        self.first_versions, self.turn_starts, self.forced = [], [], []
+
+    def training_views(self) -> list["Trajectory"]:
+        """The sequences to train on: the trajectory itself, or one per segment when its context was
+        rewritten (each with the context its tokens were sampled from; reward, advantage and group
+        are the trajectory's). Segments without sampled tokens are left out."""
+        if not self.segments:
+            return [self]
+        views = [
+            dataclasses.replace(
+                self,
+                segments=[],
+                prompt_ids=segment.prompt_ids,
+                tokens=segment.tokens,
+                mask=segment.mask,
+                logprobs=segment.logprobs,
+                first_versions=segment.first_versions,
+                turn_starts=segment.turn_starts,
+                forced=segment.forced,
+                images=segment.images,
+                image_tokens=segment.image_tokens,
+            )
+            for segment in self.segments
+        ]
+        views.append(dataclasses.replace(self, segments=[]))
+        return [v for v in views if any(v.mask)]
+
     @property
     def sampled_tokens(self) -> int:
-        return sum(self.mask)
+        return sum(self.mask) + sum(sum(segment.mask) for segment in self.segments)
 
     def token_versions(self) -> list[int]:
         """Per token of `tokens`, the oldest policy version that sampled any token of its assistant turn (a turn

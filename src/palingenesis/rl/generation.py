@@ -20,6 +20,7 @@ returns when its longest sequence ends, so multi-turn trajectories advance in ro
 """
 
 import asyncio
+import functools
 import itertools
 import queue
 import threading
@@ -67,7 +68,7 @@ class GenerationClient:
             self.executor = ThreadPoolExecutor(
                 1, thread_name_prefix="pgs-generate", initializer=on_current_device(lambda: None)
             )
-            self.pending: list[tuple[list[int], int, float, asyncio.Future]] = []
+            self.pending: list[tuple[list[int], int, float, asyncio.Future, list | None]] = []
             self._arrived: asyncio.Event | None = None
             self._flusher: asyncio.Task | None = None
 
@@ -79,13 +80,18 @@ class GenerationClient:
         if not self.streaming:
             self._signal()  # one fewer to wait for
 
-    async def generate(self, prompt_ids: list[int], max_new_tokens: int, temperature: float) -> Generation:
+    async def generate(
+        self, prompt_ids: list[int], max_new_tokens: int, temperature: float, images: list | None = None
+    ) -> Generation:
+        """`images`: the prompt's images, one per placeholder token of `prompt_ids`, in order
+        (a multimodal policy; the engine expands the placeholders)."""
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        images = list(images) if images else None
         if self.streaming:
-            self.inbox.put((prompt_ids, max_new_tokens, temperature, future, loop))
+            self.inbox.put((prompt_ids, max_new_tokens, temperature, future, loop, images))
             return await future
-        self.pending.append((prompt_ids, max_new_tokens, temperature, future))
+        self.pending.append((prompt_ids, max_new_tokens, temperature, future, images))
         if self._arrived is None:
             self._arrived = asyncio.Event()
         self._signal()
@@ -124,15 +130,23 @@ class GenerationClient:
         """Add the arrived requests, then one engine step: its finished requests (None when
         nothing is in flight)."""
         groups: dict[tuple, list] = {}
-        for i, (prompt, budget, temperature, future, loop) in enumerate(items):
+        pictures: dict[tuple, list] = {}
+        for i, (prompt, budget, temperature, future, loop, *images) in enumerate(items):
+            images = images[0] if images else None  # a text request may come without the field
             # greedy requests stay separate: vLLM refuses n > 1 without sampling
             merge = self.merge and samplings(temperature, 1)[0].temperature > 0
-            key = (tuple(prompt), budget, temperature) if merge else (tuple(prompt), budget, temperature, i)
+            # the same tokens with other pictures are another prompt (a group's rollouts share the objects)
+            seen = tuple(id(image) for image in images or ())
+            key = (tuple(prompt), budget, temperature, seen) + (() if merge else (i,))
             groups.setdefault(key, []).append((future, loop))
-        for (prompt, budget, temperature, *_), waiters in groups.items():
+            if images:
+                pictures[key] = images
+        for key, waiters in groups.items():
+            prompt, budget, temperature = key[:3]
             request_id = str(next(self.ids))
+            extra = {"images": pictures[key]} if key in pictures else {}
             try:
-                self.engine.stream_add(request_id, list(prompt), budget, temperature, len(waiters))
+                self.engine.stream_add(request_id, list(prompt), budget, temperature, len(waiters), **extra)
             except BaseException as e:  # noqa: BLE001 — the waiting trajectories see the failure
                 self._resolve(waiters, error=e)
                 continue
@@ -195,10 +209,13 @@ class GenerationClient:
             batch, self.pending = self.pending, []
             for temperature in sorted({b[2] for b in batch}):
                 part = [b for b in batch if b[2] == temperature]
+                call = self.engine.generate
+                if any(b[4] for b in part):  # only multimodal engines take images
+                    call = functools.partial(call, images=[b[4] for b in part])
                 try:
                     rollouts = await loop.run_in_executor(
                         self.executor,
-                        self.engine.generate,
+                        call,
                         [b[0] for b in part],
                         [b[1] for b in part],
                         temperature,

@@ -47,6 +47,15 @@ class RLModelConfig:
     # once, as vLLM's RMSNormGated and flash-linear-attention's fused kernel do. transformers' pure-torch fallback
     # (used without flash-linear-attention) rounds to bf16 after the norm, after the weight and after the gate.
     match_vllm_norm: bool = True
+    # Images (palingenesis.multimodal, Qwen-VL family): load the policy in its multimodal architecture.
+    # Prompts may carry image parts and tools may return images (rl.env.ToolOutput). The vision tower
+    # and the projector are frozen unless trained here. min_pixels / max_pixels bound the image
+    # processor's resize (null: the checkpoint's); the rollout engine must use the same bounds.
+    multimodal: bool = False
+    train_vision_tower: bool = False
+    train_projector: bool = False
+    min_pixels: int | None = None
+    max_pixels: int | None = None
 
 
 @dataclass(slots=True)
@@ -173,6 +182,25 @@ class RLEnvConfig:
     # for any environment, MCP servers and remote ones included. Empty: all of them (or the
     # environment class's own `tools` pin).
     allowed_tools: list = field(default_factory=list)
+    # Where a tool's images go (multimodal policies). "tool": inside the tool message, after its text
+    # (Anthropic tool_result, Responses function_call_output; the Qwen3.5 and Qwen3-VL templates render
+    # it). "user": the tool message keeps its text and one user message after the turn's tool results
+    # carries the images (what OpenAI-style chat completions allow: opencode, qwen-code). An
+    # environment's episode_info["image_results"] overrides it per episode (a harness profile's).
+    image_results: str = "tool"
+    # "user" mode: the tool message's text when the tool returned only images, and the text that opens
+    # the user message with the images (qwen-code: "[media attached in following user message]" and
+    # "(attached media from previous tool call)"; opencode: none).
+    image_tool_note: str = ""
+    image_user_note: str = ""
+    # Keep at most this many images in the context (0 = all). Older ones are replaced by
+    # image_placeholder; the turns sampled before stay trained on the context they saw (a context
+    # rewrite: rl.trajectory). image_prune_slack: let that many extra images accumulate before
+    # dropping back to max_images, so the context (and the engine's prefix cache) is rewritten once
+    # every slack + 1 images instead of at every image.
+    max_images: int = 0
+    image_prune_slack: int = 0
+    image_placeholder: str = "[image omitted]"
     # Keyword arguments for the environment's constructor.
     args: dict = field(default_factory=dict)
 
@@ -640,6 +668,27 @@ class RLConfig:
             errors.append(f"loss.truncation must be one of {TRUNCATION}, got {loss.truncation!r}.")
         if loss.kl_coef < 0 or loss.kl_ref_reset < 0:
             errors.append("loss.kl_coef and loss.kl_ref_reset must be >= 0.")
+        if e.image_results not in ("tool", "user"):
+            errors.append(f'env.image_results must be "tool" or "user", got {e.image_results!r}.')
+        if e.max_images < 0 or e.image_prune_slack < 0:
+            errors.append("env.max_images and env.image_prune_slack must be >= 0.")
+        if m.multimodal:
+            if r.backend == "vllm_server":
+                errors.append(
+                    "model.multimodal with rollout.backend vllm_server is not supported: the server is driven "
+                    "through /v1/completions, which takes no images. Use backend vllm (in-process) or hf."
+                )
+            if loss.kl_ref:
+                errors.append(
+                    "model.multimodal with loss.kl_ref is not supported yet (the reference reads tokens only)."
+                )
+            if t.prompt_sharing == "on":
+                errors.append("model.multimodal with train.prompt_sharing on is not supported: use auto or off.")
+            for name in ("min_pixels", "max_pixels"):
+                if getattr(m, name) is not None and getattr(m, name) <= 0:
+                    errors.append(f"model.{name} must be a positive number of pixels.")
+        elif m.train_vision_tower or m.train_projector or e.max_images:
+            errors.append("model.train_vision_tower / train_projector and env.max_images need model.multimodal: true.")
         if (loss.kl_coef > 0 or loss.kl_ref_reset > 0) and not loss.kl_ref:
             errors.append('loss.kl_coef / kl_ref_reset need loss.kl_ref ("start" or a checkpoint).')
         # FSDP2 shards the policy with train.fsdp, with train.cpu_offload and under torchrun (rl.parallel)

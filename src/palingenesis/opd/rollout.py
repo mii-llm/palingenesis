@@ -103,7 +103,9 @@ class RolloutEngine(Protocol):
     version: int  # optimizer steps reflected in the engine's weights (-1: none loaded)
 
     def generate(self, prompts: list[list[int]], max_new_tokens: list[int], temperature) -> list[Rollout]:
-        """One completion per prompt; `temperature`: a float (0 = greedy), a Sampling or one per prompt."""
+        """One completion per prompt; `temperature`: a float (0 = greedy), a Sampling or one per prompt.
+        Multimodal engines also take images=[per prompt: its images or None]: one image per
+        placeholder token of the prompt, in order; the engine expands the placeholders."""
 
     def update_weights(self, named_tensors: Iterable[tuple[str, Tensor]], version: int) -> None:
         """Load the student's current weights (checkpoint-format names)."""
@@ -171,12 +173,13 @@ class _RecordLogprobs:
 class HFRollout:
     """Batched model.generate on the trainer's model (bf16 autocast), left-padded."""
 
-    def __init__(self, model: nn.Module, stop_ids: tuple[int, ...], pad_id: int, micro_seqs: int):
+    def __init__(self, model: nn.Module, stop_ids: tuple[int, ...], pad_id: int, micro_seqs: int, vision=None):
         self.model = model
         self.stop_ids = stop_ids
         self.pad_id = pad_id
         self.micro_seqs = micro_seqs
         self.version = 0
+        self.vision = vision  # palingenesis.multimodal.VisionProcessor of a multimodal policy
 
     def update_weights(self, named_tensors, version: int) -> None:
         self.version = version  # it generates with the trained model itself
@@ -187,10 +190,20 @@ class HFRollout:
     def wake(self) -> None:
         pass
 
+    def _expand(self, prompts, images):
+        """Prompts with their image placeholders expanded, and per prompt its pixel inputs."""
+        if not images or not any(images):
+            return prompts, None
+        if self.vision is None:
+            raise ValueError("images were passed to a text-only rollout engine (model.multimodal is off)")
+        sequences = [self.vision.sequence(p, im or []) for p, im in zip(prompts, images)]
+        return [s.input_ids.tolist() for s in sequences], sequences
+
     @torch.no_grad()
-    def generate(self, prompts, max_new_tokens, temperature):
+    def generate(self, prompts, max_new_tokens, temperature, images=None):
         from transformers import GenerationConfig, LogitsProcessorList
 
+        prompts, sequences = self._expand(prompts, images)
         device = next(self.model.parameters()).device
         out: list[Rollout | None] = [None] * len(prompts)
         per_prompt = samplings(temperature, len(prompts))
@@ -220,12 +233,21 @@ class HFRollout:
                         **sample_kwargs,
                     )
                     recorder = _RecordLogprobs(sampling, width) if temperature > 0 else None
+                    pixels = {}
+                    shown = [im for i in chunk for im in sequences[i].images] if sequences else []
+                    if shown:  # in row order, the order the model fills the placeholders in
+                        pixels = {
+                            "pixel_values": torch.cat([im.pixel_values for im in shown]).to(device),
+                            "image_grid_thw": torch.tensor([im.grid for im in shown], device=device),
+                            "mm_token_type_ids": (ids == self.vision.image_token_id).long().to(device),
+                        }
                     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                         seqs = self.model.generate(
                             ids.to(device),
                             attention_mask=mask.to(device),
                             generation_config=config,
                             logits_processor=LogitsProcessorList([recorder] if recorder else []),
+                            **pixels,
                         )
                     generated = seqs[:, width:]
                     logprobs = recorder.finish(seqs).tolist() if recorder else None
@@ -401,24 +423,39 @@ class VLLMColocateRollout:
         torch.cuda.empty_cache()
         self.llm.wake_up(tags=[tag])
 
-    def generate(self, prompts, max_new_tokens, temperature):
+    @staticmethod
+    def _request(prompt, images=None) -> dict:
+        """A vLLM tokens prompt. Images go next to the un-expanded tokens (one placeholder each):
+        vLLM runs the model's processor on them and expands the placeholders itself."""
+        request = {"prompt_token_ids": list(prompt)}
+        if images:
+            from palingenesis.multimodal import load_image
+
+            request["multi_modal_data"] = {"image": [load_image(image) for image in images]}
+        return request
+
+    def generate(self, prompts, max_new_tokens, temperature, images=None):
         """One completion per prompt. Identical requests (a GRPO group's rollouts) become one
         request with n samples: the prompt is prefilled once and its KV cache forked, instead
         of relying on the prefix cache to find it n times."""
         unique: dict[tuple, list[int]] = {}
+        pictures: dict[tuple, list] = {}
+        images = images or [None] * len(prompts)
         for i, (prompt, budget, sampling) in enumerate(
             zip(prompts, max_new_tokens, samplings(temperature, len(prompts)))
         ):
-            unique.setdefault((tuple(prompt), budget, sampling), []).append(i)
+            key = (tuple(prompt), budget, sampling, tuple(id(image) for image in images[i] or ()))
+            unique.setdefault(key, []).append(i)
+            pictures[key] = images[i]
         requests = list(unique.items())
         # greedy decoding is deterministic and vLLM refuses n > 1 without sampling: one sample, shared by the duplicates
-        greedy = [samplings(sampling, 1)[0].temperature <= 0 for (_, _, sampling), _ in requests]
+        greedy = [samplings(sampling, 1)[0].temperature <= 0 for (_, _, sampling, _), _ in requests]
         params = [
             self._params(1 if g else len(indices), budget, sampling)
-            for g, ((_, budget, sampling), indices) in zip(greedy, requests)
+            for g, ((_, budget, sampling, _), indices) in zip(greedy, requests)
         ]
         outputs = self.llm.generate(
-            [{"prompt_token_ids": list(prompt)} for (prompt, _, _), _ in requests], params, use_tqdm=False
+            [self._request(key[0], pictures[key]) for key, _ in requests], params, use_tqdm=False
         )
         rollouts: list[Rollout | None] = [None] * len(prompts)
         for g, (_, indices), out in zip(greedy, requests, outputs):
@@ -459,9 +496,11 @@ class VLLMColocateRollout:
     # Streaming (continuous batching across calls): requests join the running batch the moment
     # they are added and come back the step they finish. One thread must own these calls.
 
-    def stream_add(self, request_id: str, prompt: list[int], max_new_tokens: int, temperature, n: int) -> None:
+    def stream_add(
+        self, request_id: str, prompt: list[int], max_new_tokens: int, temperature, n: int, images=None
+    ) -> None:
         params = self._params(n, max_new_tokens, temperature, final_only=True)
-        self.llm.llm_engine.add_request(request_id, {"prompt_token_ids": list(prompt)}, params)
+        self.llm.llm_engine.add_request(request_id, self._request(prompt, images), params)
         self.started[request_id] = self.version  # when added, not at the first token: an upper bound on staleness
 
     def stream_pending(self) -> bool:
