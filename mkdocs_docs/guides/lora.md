@@ -70,6 +70,18 @@ LoRA removes the base weights' **gradients and optimizer state**. With AdamW tha
 
 LoRA does **not** shrink activations. Each adapted layer still keeps its input for the backward, because `A` needs it. A long sequence costs about what it costs with full fine-tuning. For that, use `train.gradient_checkpointing`, `memory.seco` ([Long Sequences](long-sequences.md)) or `pgs fit`.
 
+Measured on an H100 with Qwen3.5-0.8B on agentic traces of up to 16,384 tokens (one row per micro-batch, rank 16 on every projection, bf16), steady-state throughput and peak allocated memory:
+
+| | Checkpointing | Tokens/s | Peak |
+|---|---|:---:|:---:|
+| Full fine-tuning | `selective` | 23,500 | 16.8 GiB |
+| LoRA | `selective` | 18,700 | 20.0 GiB |
+| LoRA | `full` | 19,100 | 8.0 GiB |
+| LoRA | `none` | 23,400 | 27.3 GiB |
+| DoRA | `selective` | 13,900 | 27.0 GiB |
+
+On a small model with long sequences LoRA is not the cheaper option by default: the adapters add operations and saved activations to every layer, and the weights it stops updating were a small share of the memory. With `gradient_checkpointing: full` it halves the peak of full fine-tuning at about 80% of its speed, and that is the setting to use for LoRA on long sequences (`pgs fit` measures it for your config). DoRA recomputes every adapted weight's row norms at each forward: budget about 25% less throughput and more memory.
+
 ## Export
 
 `final/` (and `best/model/` with an eval set) holds a plain model of the original architecture, loadable anywhere. Each adapter is folded into its weight in float32 (`W + scaling·BA`; DoRA: rows rescaled to `m`) and rounded to nearest in the weight's dtype:
@@ -134,10 +146,11 @@ Verified on CPU (`tests/test_lora.py`, tiny Llama and Qwen3.5 hybrid models):
 - full and selective activation checkpointing give the same adapter gradients as the plain forward
 - `freeze_non_attention` and the Gated DeltaNet layers work as described above
 - a DPO run completes
+- on one GPU under bf16 autocast (Qwen3.5-0.8B, 16k-token rows, LoRA and DoRA, every checkpointing mode): the loss falls as with full fine-tuning; the numbers above
 - PEFT loads the exported adapter and reproduces the merged model (when peft is installed)
 
 Not verified:
 
-- runs on GPU, under bf16 autocast, with `model.compile`, `memory.seco`, context parallel or FSDP across several ranks
+- runs with `model.compile`, `memory.seco`, context parallel or FSDP across several ranks
 - quality on real models and datasets: the learning-rate guidance above comes from the cited studies, not from our own runs
 - the RL and on-policy distillation trainers do not load trainer plugins, so LoRA is not available there yet

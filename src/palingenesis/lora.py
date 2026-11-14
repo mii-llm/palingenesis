@@ -74,6 +74,9 @@ DEFAULT_TARGETS = (
     "out_proj",
 )
 ADAPTER_KEYS = ("lora_A", "lora_B", "lora_magnitude")
+# DoRA divides by each row's norm: an all-zero row of the base (unused outputs exist in released weights)
+# has magnitude 0 and norm 0, and 0 / 0 made the whole forward NaN.
+ROW_NORM_FLOOR = 1e-12
 
 
 # ─────────────────────────────────────────────────────────────── the adapted layer
@@ -85,7 +88,7 @@ def fold_weight(
     """The adapted weight in float32: W + scaling B A, with DoRA's rows rescaled to the magnitude m."""
     w = weight.float() + scaling * (lora_B.float() @ lora_A.float())
     if magnitude is not None:
-        w = w * (magnitude.float() / torch.linalg.vector_norm(w, dim=1)).unsqueeze(1)
+        w = w * (magnitude.float() / torch.linalg.vector_norm(w, dim=1).clamp_min(ROW_NORM_FLOOR)).unsqueeze(1)
     return w
 
 
@@ -125,14 +128,18 @@ class LoRALinear(nn.Module):
 
     def delta(self, x: Tensor) -> Tensor:
         """scaling * dropout(x) A^T B^T, computed against the float32 adapters (under autocast: in its dtype)."""
-        h = self.lora_dropout(x).to(self.lora_A.dtype)
+        h = self.lora_dropout(x)
+        if not torch.is_autocast_enabled(x.device.type):
+            # under autocast the matmuls cast both sides themselves: a float32 copy of every adapted
+            # layer's input would only cost memory and time
+            h = h.to(self.lora_A.dtype)
         return F.linear(F.linear(h, self.lora_A), self.lora_B) * self.scaling
 
     def dora_scale(self) -> Tensor:
         """m / ||W + scaling B A||_row: the norm in float32 outside autocast, detached (DoRA, section 4.3)."""
         with torch.no_grad(), torch.autocast(self.weight.device.type, enabled=False):
             w = self.weight.float() + self.scaling * (self.lora_B.float() @ self.lora_A.float())
-            norm = torch.linalg.vector_norm(w, dim=1)
+            norm = torch.linalg.vector_norm(w, dim=1).clamp_min(ROW_NORM_FLOOR)
         return self.lora_magnitude / norm
 
     def forward(self, x: Tensor) -> Tensor:

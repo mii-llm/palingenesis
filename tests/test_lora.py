@@ -553,3 +553,18 @@ def test_peft_loads_the_exported_adapter(tmp_path):
             torch.testing.assert_close(
                 with_adapter(input_ids=ids).logits, merged(input_ids=ids).logits, rtol=1e-4, atol=1e-4
             )
+
+
+def test_dora_survives_an_all_zero_row_of_the_base():
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(6, 4, bias=False)
+    with torch.no_grad():
+        linear.weight[2].zero_()
+    layer = LoRALinear(linear, rank=2, alpha=4, dora=True)
+    x = torch.randn(3, 6)
+    out = layer(x)
+    assert torch.isfinite(out).all() and out[:, 2].abs().sum() == 0  # the dead output stays dead, not NaN
+    torch.testing.assert_close(out, torch.nn.functional.linear(x, linear.weight))
+    assert torch.isfinite(
+        fold_weight(layer.weight, layer.lora_A, layer.lora_B, layer.scaling, layer.lora_magnitude)
+    ).all()
