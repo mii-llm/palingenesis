@@ -50,12 +50,12 @@ class RLModelConfig:
     # Images (palingenesis.multimodal, Qwen-VL family): load the policy in its multimodal architecture.
     # Prompts may carry image parts and tools may return images (rl.env.ToolOutput). The vision tower
     # and the projector are frozen unless trained here. min_pixels / max_pixels bound the image
-    # processor's resize (null: the checkpoint's); the rollout engine must use the same bounds.
+    # processor's resize (0: the checkpoint's); the rollout engine must use the same bounds.
     multimodal: bool = False
     train_vision_tower: bool = False
     train_projector: bool = False
-    min_pixels: int | None = None
-    max_pixels: int | None = None
+    min_pixels: int = 0
+    max_pixels: int = 0
 
 
 @dataclass(slots=True)
@@ -685,8 +685,8 @@ class RLConfig:
             if t.prompt_sharing == "on":
                 errors.append("model.multimodal with train.prompt_sharing on is not supported: use auto or off.")
             for name in ("min_pixels", "max_pixels"):
-                if getattr(m, name) is not None and getattr(m, name) <= 0:
-                    errors.append(f"model.{name} must be a positive number of pixels.")
+                if getattr(m, name) < 0:
+                    errors.append(f"model.{name} must be a number of pixels (0: the checkpoint's own).")
         elif m.train_vision_tower or m.train_projector or e.max_images:
             errors.append("model.train_vision_tower / train_projector and env.max_images need model.multimodal: true.")
         if (loss.kl_coef > 0 or loss.kl_ref_reset > 0) and not loss.kl_ref:

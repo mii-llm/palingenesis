@@ -429,10 +429,10 @@ class MultimodalConfig:
     # Frozen modules still run forward on every image; they take no optimizer state.
     train_vision_tower: bool = False
     train_projector: bool = False
-    # Bounds of the image processor's resize, in pixels (null: the checkpoint's own). They set each
+    # Bounds of the image processor's resize, in pixels (0: the checkpoint's own). They set each
     # image's token count: (pixels / patch^2) / merge^2. Serve the model with the same bounds.
-    min_pixels: int | None = None
-    max_pixels: int | None = None
+    min_pixels: int = 0
+    max_pixels: int = 0
 
 
 @dataclass(slots=True)
@@ -604,9 +604,8 @@ class Config:
                 if name:
                     errors.append(f"multimodal.enabled with {name} is not supported: {why}.")
             for name in ("min_pixels", "max_pixels"):
-                value = getattr(mm, name)
-                if value is not None and value <= 0:
-                    errors.append(f"multimodal.{name} must be a positive number of pixels, got {value}.")
+                if getattr(mm, name) < 0:
+                    errors.append(f"multimodal.{name} must be a number of pixels (0: the checkpoint's own).")
             if mm.min_pixels and mm.max_pixels and mm.min_pixels > mm.max_pixels:
                 errors.append(f"multimodal.min_pixels ({mm.min_pixels}) is above max_pixels ({mm.max_pixels}).")
             if self.distill.enabled:

@@ -284,8 +284,8 @@ Images in the training data, for the Qwen-VL family (Qwen2-VL, Qwen2.5-VL, Qwen3
 | `enabled` | bool | `false` | Load the checkpoint in its multimodal architecture and feed the images in the data's content parts to its vision tower. `false`: the language model alone is trained, image parts are ignored (with a warning) and exports copy the vision tower unchanged. Not supported with `memory.seco`, `parallel.context_parallel`, `data.pretokenize`, cached teachers or teacher views |
 | `train_vision_tower` | bool | `false` | Train the vision encoder (frozen otherwise) |
 | `train_projector` | bool | `false` | Train the projector that maps vision features into the language model (Qwen: the patch merger) |
-| `min_pixels` | int | `null` | Lower bound of the image processor's resize, in pixels (`null`: the checkpoint's) |
-| `max_pixels` | int | `null` | Upper bound of the resize. An image takes at most `max_pixels / (patch · merge)²` tokens. Serve the model with the same bounds; exports record them in `preprocessor_config.json` |
+| `min_pixels` | int | `0` | Lower bound of the image processor's resize, in pixels (0: the checkpoint's) |
+| `max_pixels` | int | `0` | Upper bound of the resize. An image takes at most `max_pixels / (patch · merge)²` tokens. Serve the model with the same bounds; exports record them in `preprocessor_config.json` |
 
 ---
 
