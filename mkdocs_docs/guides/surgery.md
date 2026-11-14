@@ -99,7 +99,7 @@ iterations: 6
 cutoff: 1.0e-2                     # drop Gram eigenvalues < cutoff * lambda_max
 trust: 0.1                         # per-step |Δ| <= trust * |θ0 - θ_ref| (trust_ref: absolute -> absolute norm)
 cap: 0.25                          # cumulative |θ - θ0| <= cap * |θ0 - θ_ref|
-min_gap: 0.5                       # stop when |mean gap| < max(min_gap, stop_se * SE of the mean gap)
+min_gap: 0.5                       # stop when every family's |mean gap| < max(min_gap, stop_se * its SE)
 doses: [1, 2, 3]
 params: {include: [".*"], exclude: []}   # regexes on parameter names
 gram: auto                         # auto | device | cpu | recompute
@@ -165,11 +165,12 @@ The step is scaled to the trust radius (`trust`) and the cumulative cap (`cap`),
 loop stops when
 
 $$
-\lvert \overline{\text{gap}} \rvert < \max\big(\texttt{min\_gap},\ \texttt{stop\_se} \cdot \mathrm{SE}(\overline{\text{gap}})\big)
+\lvert \overline{\text{gap}}_f \rvert < \max\big(\texttt{min\_gap},\ \texttt{stop\_se} \cdot \mathrm{SE}(\overline{\text{gap}}_f)\big)
 $$
 
-over the equality rows with no hinge active, or after `iterations` steps; $\overline{\text{gap}}$ is the mean gap and
-$\mathrm{SE}$ its standard error.
+for every family $f$ of equality rows with no hinge active, or after `iterations` steps; $\overline{\text{gap}}_f$ is the
+family's mean gap and $\mathrm{SE}$ its standard error. The rule is per family: in a mean over all equality rows, gaps
+of opposite sign in two families would cancel and a `hold` family would dilute the others.
 
 ## Choosing the dose
 
@@ -244,7 +245,7 @@ needs `cpu` (128 GB host) or `recompute` on one 80 GB GPU.
 - `output_dir/surgery_report.json`:
   - precision plan (source / work / save dtype, rounding), edited tensor and parameter counts, dropped sides;
   - memory: chosen `gram` mode, estimated bytes;
-  - per iteration: mean gap, SE, threshold, per-group gaps, active hinges, rows, Gram spectrum (top 8, relative),
+  - per iteration: mean gap, SE, threshold, per-family and per-group gaps, active hinges, rows, Gram spectrum (top 8, relative),
     kept eigenvalues, $\lVert c \rVert$, step norm (measured and predicted $\sqrt{c^\top A c}$), scale, edit relative to
     $\lVert \theta_0 - \theta_{\text{ref}} \rVert$, mean group cosine, seconds;
   - stop reason, edit norm relative to $\lVert \theta_0 - \theta_{\text{ref}} \rVert$ and to $\lVert \theta_0 \rVert$;

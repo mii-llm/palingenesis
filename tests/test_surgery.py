@@ -419,3 +419,120 @@ def test_output_dir_that_is_an_input_checkpoint_is_refused(tmp_path):
             surgery._prepare_out(str(out), True, [str(model), None])
     assert (model / "model.safetensors").exists()
     assert surgery._prepare_out(str(tmp_path / "out"), True, ["org/hub-model", None]).is_dir()  # a Hub id is not a path
+
+
+# ------------------------------------------------------------------ regressions
+
+
+def test_survival_of_an_fp32_source_saved_in_bf16(setup):
+    """The edit is measured against the stored θ0. Against θ0's bf16 cast, θ0's own rounding error counted as part of
+    the intended edit and a surviving sub-ulp edit was reported as lost (projection near 0, norm ratio below 1)."""
+    cfg = _config(
+        setup,
+        "fp32_to_bf16",
+        reference=None,
+        trust_ref="absolute",
+        trust=1e-3,
+        cap=1e-3,
+        params={"include": ["mlp"], "exclude": []},
+        iterations=1,
+        save_dtype="bf16",
+        families={"pos": FamilyConfig(path=setup["train"], side="pos", target=-30.0, groups=2, group_size=4)},
+        serving_formats=["fp8_e4m3"],
+        seed=7,
+    )
+    rep = surgery.run_surgery(cfg)
+    assert rep["source_dtype"] == "float32" and rep["save_dtype"] == "bfloat16" and rep["rounding"] == "stochastic"
+    survival = rep["doses"][0]["edit_survival"]
+    assert 0.7 < survival["projection"] < 1.3
+    assert survival["norm_ratio"] > 2  # whole-ulp jumps of an off-grid source dominate the norm
+    assert rep["doses"][0]["edit_survival_served"]["fp8_e4m3"]["norm_ratio"] > 2
+
+
+def test_gradient_checkpointing_gradients_have_no_dropout(setup, tmp_path):
+    """Checkpointing needs training mode, which must not switch dropout on: the gradients are those of the measured
+    (evaluation-mode) margins."""
+    model = _load(setup["shifted"])
+    model.config.attention_dropout = 0.5
+    model.save_pretrained(tmp_path / "dropout")
+    model = _load(tmp_path / "dropout").eval()
+    tok = setup["tok"]
+    params = list(model.parameters())
+    groups = _groups(setup, 2, 4)
+    plain = surgery.gram_matrix(model, tok, groups, params, micro_batch=4)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    with surgery._mode(model, True):
+        on = [m for m in model.modules() if m.training]
+        assert on and all(getattr(m, "gradient_checkpointing", False) for m in on)
+    assert not any(m.training for m in model.modules())  # restored
+    checkpointed = surgery.gram_matrix(model, tok, groups, params, micro_batch=4, train=True)
+    assert torch.allclose(checkpointed, plain, rtol=1e-4)
+
+
+def test_stop_rule_is_per_family():
+    def g(family, gap):
+        return Group(family, 0, [[1], [2]], [0], "equal", 0.0, torch.tensor([gap, gap], dtype=torch.float64))
+
+    m = torch.zeros(2, dtype=torch.float64)
+    st = surgery.constraint_rows([g("up", 3.0), g("down", -3.0)], [m, m])
+    assert st["mean"] == 0.0 and st["families"] == {"up": {"mean": 3.0, "se": 0.0}, "down": {"mean": -3.0, "se": 0.0}}
+    assert not surgery.gaps_closed(st, 0.5, 2.0)  # opposite gaps do not cancel
+    st = surgery.constraint_rows([g("moved", 0.9), g("held", 0.0)], [m, m])
+    assert abs(st["mean"]) < 0.5 and not surgery.gaps_closed(st, 0.5, 2.0)  # a held family does not dilute
+    assert surgery.gaps_closed(surgery.constraint_rows([g("a", 0.4), g("b", -0.4)], [m, m]), 0.5, 2.0)
+    hinge = Group("h", 0, [[1], [2]], [0], "hinge_below", 0.0, torch.tensor([-1.0, -1.0], dtype=torch.float64))
+    assert not surgery.gaps_closed(surgery.constraint_rows([g("a", 0.0), hinge], [m, m]), 0.5, 2.0)  # active hinge
+
+
+def test_opposite_gaps_in_two_families_are_not_converged(setup):
+    model = _load(setup["shifted"]).eval()
+    means = {}
+    for side in ("pos", "neg"):
+        ids, _ = surgery.load_sides(setup["tok"], setup["train"], side)
+        groups = surgery.make_groups(side, ids, setup["tid"], 2, 4)
+        means[side] = float(torch.cat(surgery.group_margins(model, setup["tok"], groups)).mean())
+    cfg = _config(
+        setup,
+        "opposite",
+        reference=None,
+        trust_ref="absolute",
+        iterations=1,
+        families={
+            side: FamilyConfig(path=setup["train"], side=side, target=means[side] + shift, groups=2, group_size=4)
+            for side, shift in (("pos", 3.0), ("neg", -3.0))
+        },
+        eval={},
+    )
+    rep = surgery.run_surgery(cfg)
+    first = rep["iterations"][0]
+    assert abs(first["gap_mean"]) < 0.5 and first["family_gaps"]["pos"] > 2 and first["family_gaps"]["neg"] < -2
+    assert rep["stop_reason"] != "converged" and rep["edit"]["norm"] > 0
+
+
+def test_numbers_yaml_reads_as_strings(setup):
+    cfg = _config(setup, "v")
+    cfg.apply_overrides(["cutoff=1e-3", "trust=2e-1", "doses=[1, 2e0]", "families.pos.target=-3e0"])  # no dot: str
+    assert cfg.cutoff == 1e-3 and cfg.trust == 0.2 and cfg.doses == [1, 2.0] and cfg.families["pos"].target == -3.0
+    assert cfg.validate() == []
+    cfg.apply_overrides(["families.pos.target=hold", "min_gap=small"])
+    assert cfg.families["pos"].target == "hold"
+    assert any("min_gap must be a number" in e for e in cfg.validate())  # an error, not a TypeError
+    assert any("same output directory" in e for e in _config(setup, "v", doses=[1.0, 1.0000001]).validate())
+
+
+def test_failed_run_keeps_the_previous_output(setup):
+    cfg = _config(setup, "kept", iterations=0, eval={})
+    rep = surgery.run_surgery(cfg)
+    report = setup["tmp"] / "kept" / "surgery_report.json"
+    # a zero edit has no survival (nan in the returned report): null in the file, which must be strict JSON
+    assert rep["edit"]["norm"] == 0.0
+    saved = json.loads(report.read_text(), parse_constant=lambda name: pytest.fail(f"{name} in the report"))
+    assert saved["doses"][0]["edit_survival"]["projection"] is None
+    cfg.families["pos"].decision = "call the tool now"  # refused once the tokenizer is loaded
+    with pytest.raises(ValueError, match="one"):
+        surgery.run_surgery(cfg)
+    assert report.exists() and (setup["tmp"] / "kept" / "dose_1" / "config.json").exists()
+    cfg.families["pos"].decision = "<tool_call>"
+    (setup["tmp"] / "kept" / "stale.txt").write_text("x")
+    surgery.run_surgery(cfg)
+    assert report.exists() and not (setup["tmp"] / "kept" / "stale.txt").exists()  # replaced by a run that finishes
