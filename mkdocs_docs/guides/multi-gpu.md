@@ -113,6 +113,15 @@ Now every rank's loss contributes proportionally to how many real tokens it proc
 
 ---
 
+## Mixture-of-Experts models
+
+FSDP gathers every layer's weights on every rank, and in a MoE model most of them are experts a token never uses.
+`parallel.expert_parallel: true` keeps each rank's share of the experts in place and exchanges tokens instead
+(experimental). Router balancing measures the expert load over all ranks either way. See
+[Mixture-of-Experts Models](moe.md).
+
+---
+
 ## Context Parallel
 
 Context parallelism helps when one sequence's activations do not fit on one GPU (more than about 32K tokens on 80 GB). It splits every sequence over a group of GPUs:

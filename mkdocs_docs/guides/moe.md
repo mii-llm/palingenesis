@@ -87,6 +87,9 @@ global counts as the loss.
 | Qwen3-MoE, Qwen3.5-MoE, Qwen3-Next, Mixtral, GPT-OSS (softmax routers) | on, coefficient `router_aux_loss_coef` of the model config (0.001 in these families) | not available |
 | DeepSeek-V3 family (sigmoid routers with a selection bias) | off (no coefficient in the config; set `balance_loss_coef`, DeepSeek-V3 used 0.0001) | on, rate 0.001 |
 
+With LoRA the selection bias belongs to the frozen base model: set `bias_update_rate: 0` unless you export merged
+weights, or the adapter alone will not reproduce the routing it was trained with.
+
 A model config's coefficient above 0.01 (the largest published value, Switch Transformer's) is treated as a
 placeholder and capped, with a warning; set `balance_loss_coef` explicitly to use more. `moe.balance: false` removes
 the hooks altogether.
