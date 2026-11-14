@@ -38,6 +38,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from palingenesis import accelerator
 from palingenesis.checkpoint import (
+    TRAINING_META_FILE,
     BestModelTracker,
     find_latest_checkpoint,
     load_checkpoint,
@@ -61,9 +62,12 @@ from palingenesis.data import (
 from palingenesis.distributed import (
     _find_transformer_layers,
     apply_fsdp,
+    barrier,
     build_mesh,
     cleanup_distributed,
     is_main,
+    main_value,
+    rank_values,
     setup_distributed,
 )
 from palingenesis.dpo import (
@@ -555,34 +559,30 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         # change to tokenizer/template/seqlen/sources/masking rebuilds it.
         cache_dir = config.data.pretokenize_path
         fingerprint = pretokenize_fingerprint(config, tokenizer)
-        valid, reason = pretokenized_cache_valid(cache_dir, fingerprint)
-        if valid:
-            logger.info(f"  Pre-tokenized cache: reusing {cache_dir} (fingerprint match)")
-        else:
-            if rank == 0:
-                logger.info(f"  Pre-tokenizing dataset → {cache_dir} (reason: {reason})…")
-                bs = config.train.per_device_batch_size
-                if config.data.sources:
 
-                    def _factory():
-                        # world_size=1 → materialize the COMPLETE stream; sharding
-                        # happens at load time across ranks/workers.
-                        return build_dataset(config.data, tokenizer, config.data, 0, 1, bs)
-                else:
-                    src = _load_dataset_source(config.data.dataset, config.data.dataset_split, config.data.streaming)
-                    src = (
-                        src.shuffle(seed=config.train.seed, buffer_size=10_000)
-                        if config.data.streaming
-                        else src.shuffle(seed=config.train.seed)
-                    )
+        def _materialize(reason: str) -> None:
+            logger.info(f"  Pre-tokenizing dataset → {cache_dir} (reason: {reason})…")
+            if config.data.sources:
 
-                    def _factory():
-                        return build_dataset(src, tokenizer, config.data, 0, 1, bs)
+                def _factory():
+                    # world_size=1 → materialize the COMPLETE stream; sharding
+                    # happens at load time across ranks/workers.
+                    return build_dataset(config.data, tokenizer, config.data, 0, 1, bs)
+            else:
+                src = _load_dataset_source(config.data.dataset, config.data.dataset_split, config.data.streaming)
+                src = (
+                    src.shuffle(seed=config.train.seed, buffer_size=10_000)
+                    if config.data.streaming
+                    else src.shuffle(seed=config.train.seed)
+                )
 
-                n = materialize_pretokenized(_factory, cache_dir, fingerprint, config, tokenizer)
-                logger.info(f"  Pre-tokenized {n} sequence(s) → {cache_dir}")
-            if world_size > 1 and dist.is_available() and dist.is_initialized():
-                dist.barrier()
+                def _factory():
+                    return build_dataset(src, tokenizer, config.data, 0, 1, bs)
+
+            n = materialize_pretokenized(_factory, cache_dir, fingerprint, config, tokenizer)
+            logger.info(f"  Pre-tokenized {n} sequence(s) → {cache_dir}")
+
+        _ensure_pretokenized(cache_dir, fingerprint, _materialize)
 
         def _make_dataloader():
             return build_pretokenized_dataloader(
@@ -1037,13 +1037,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     start_epoch = 0
     start_micro = 0
 
-    resume_path = config.train.resume_from
-    if resume_path == "auto":
-        resume_path = find_latest_checkpoint(config.train.output_dir)
-        if resume_path:
-            logger.info(f"Auto-resume: found checkpoint at {resume_path}")
-        else:
-            logger.info("Auto-resume: no checkpoint found, starting fresh")
+    resume_path = _resolve_resume(config)
 
     if resume_path:
         meta = load_checkpoint(model, optimizer, scheduler, resume_path, is_fsdp, device)
@@ -1052,6 +1046,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         # The checkpoint records the index of the LAST micro-batch it trained on: the
         # run continues with the next one, at the start of an accumulation window.
         start_micro = meta["micro_step"] + 1 if start_step > 0 and "micro_step" in meta else 0
+        start_micro = _rescale_resume_position(start_micro, meta.get("data_ranks"), data_world)
         logger.info(f"Resumed: step={start_step}, epoch={start_epoch}")
         if plugin_mgr:
             _load_plugin_state(plugin_mgr, resume_path)
@@ -1816,6 +1811,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         epoch=epoch,
                         micro_step=micro_step,
                         keep_latest_k=config.train.keep_checkpoints,
+                        data_ranks=data_world,
                     )
 
                 # ── Base Model Merge (SFA: anti-forgetting) ───────────
@@ -1888,6 +1884,79 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _ensure_pretokenized(cache_dir, fingerprint: str, materialize, wait_s: float = 60.0) -> None:
+    """The pre-tokenized cache, valid and readable on every rank when this returns. Rank 0 builds it with
+    `materialize(reason)` when it is missing or stale.
+
+    Rank 0 alone decides, and every rank waits at the same barrier. Ranks reach this point at different
+    times (model loading), so a rank checking for itself could arrive after rank 0 finished building,
+    find a valid cache and skip the barrier the others are in: every later collective would then pair
+    up one step out of line. The other ranks check after the barrier (retrying for `wait_s` seconds: a
+    network filesystem can show a new file on another node late); a rank that still cannot read the
+    cache means the path is not shared between the nodes, and every rank raises together."""
+    main = is_main()
+    if main:
+        valid, reason = pretokenized_cache_valid(cache_dir, fingerprint)
+        if valid:
+            logger.info(f"  Pre-tokenized cache: reusing {cache_dir} (fingerprint match)")
+        else:
+            materialize(reason)
+    barrier()
+    readable = True
+    if not main:
+        deadline = time.monotonic() + wait_s
+        while not (readable := pretokenized_cache_valid(cache_dir, fingerprint)[0]) and time.monotonic() < deadline:
+            time.sleep(1.0)
+    seen = rank_values(readable)
+    if not all(seen):
+        missing = [r for r, ok in enumerate(seen) if not ok]
+        raise ConfigError(
+            f"The pre-tokenized cache {cache_dir} written by rank 0 is not readable on rank(s) "
+            f"{missing[:8]}{' ...' if len(missing) > 8 else ''}: data.pretokenize_path must be on a filesystem "
+            "shared by every node."
+        )
+
+
+def _resolve_resume(config: Config) -> str | None:
+    """The checkpoint to resume from (train.resume_from; "auto": the latest complete one), the same on
+    every rank: rank 0 picks it, and every rank must see what rank 0 sees. A rank that looked for itself and
+    found another checkpoint, or none (an output directory that is not shared between the nodes), would
+    start from another step and run other collectives than the rest."""
+    resume_path = config.train.resume_from
+    if resume_path == "auto" and is_main():
+        resume_path = find_latest_checkpoint(config.train.output_dir)
+        if resume_path:
+            logger.info(f"Auto-resume: found checkpoint at {resume_path}")
+        else:
+            logger.info("Auto-resume: no checkpoint found, starting fresh")
+    resume_path = main_value(resume_path) or None
+    if resume_path:
+        seen = rank_values((Path(resume_path) / TRAINING_META_FILE).exists())
+        if len(set(seen)) > 1:
+            missing = [r for r, ok in enumerate(seen) if not ok]
+            raise ConfigError(
+                f"Checkpoint {resume_path} is not visible on rank(s) {missing[:8]}{' ...' if len(missing) > 8 else ''}: "
+                "train.output_dir (and train.resume_from) must be on a filesystem shared by every node."
+            )
+    return resume_path
+
+
+def _rescale_resume_position(start_micro: int, saved_ranks: int | None, data_ranks: int) -> int:
+    """The micro-batches to skip in the resumed epoch when the number of data-parallel ranks changed since
+    the checkpoint: each rank now reads another share of the data, so the same position in the epoch is
+    another count per rank."""
+    if not saved_ranks or saved_ranks == data_ranks:
+        return start_micro
+    rescaled = round(start_micro * saved_ranks / data_ranks)
+    logger.warning(
+        f"The checkpoint was saved with {saved_ranks} data-parallel rank(s) and resumes on {data_ranks}: the "
+        f"position in the epoch is rescaled ({start_micro} -> {rescaled} micro-batches per rank), the ranks read "
+        "other shards than before (some rows repeat, some are skipped this epoch), and the effective batch size "
+        "changes with the rank count unless train.gradient_accumulation_steps is adjusted."
+    )
+    return rescaled
 
 
 def _log_prepared_meta(output_dir: str):

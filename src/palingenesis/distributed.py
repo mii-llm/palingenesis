@@ -1,6 +1,7 @@
 """Distributed training: FSDP2, Context Parallel, process group management."""
 
 import gc
+import logging
 import os
 
 import torch
@@ -8,6 +9,8 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from palingenesis.config import ParallelConfig
+
+logger = logging.getLogger(__name__)
 
 # NOTE: FSDP2 symbols (fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy,
 # FSDPModule) are imported lazily inside the functions that use them. Those
@@ -29,6 +32,7 @@ def setup_distributed() -> tuple[int, int, int]:
         world_size = int(os.environ["WORLD_SIZE"])
     else:
         rank, local_rank, world_size = 0, 0, 1
+        _warn_unlaunched_tasks()
 
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
@@ -36,8 +40,38 @@ def setup_distributed() -> tuple[int, int, int]:
     # Without a usable GPU the caller raises its own, explanatory error (set_device would fail first with a
     # less helpful one).
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+        torch.cuda.set_device(local_device_index(local_rank, torch.cuda.device_count()))
     return rank, local_rank, world_size
+
+
+def local_device_index(local_rank: int, visible: int) -> int:
+    """The index of this process's GPU among the `visible` ones: its local rank.
+
+    The launcher must leave every GPU of the node visible to each of its processes (torchrun's default), or
+    give each process exactly one and LOCAL_RANK=0 (torchrun --virtual-local-rank). A scheduler that binds
+    one GPU per process while LOCAL_RANK still counts them (srun --gpus-per-task=1 around the workers) makes
+    cuda:{local_rank} point past the visible devices."""
+    if local_rank < visible:
+        return local_rank
+    raise RuntimeError(
+        f"LOCAL_RANK={local_rank} but this process sees {visible} GPU(s) "
+        f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}). Start one process per visible "
+        "GPU (torchrun --nproc_per_node), keep every GPU of the node visible to each process (no per-task GPU "
+        "binding around the workers), or launch with torchrun --virtual-local-rank."
+    )
+
+
+def _warn_unlaunched_tasks() -> None:
+    """Without torchrun's RANK / WORLD_SIZE this process trains alone. Several tasks of one Slurm step started
+    that way (srun python -m palingenesis.train) would each train a full copy into the same output directory."""
+    tasks = os.environ.get("SLURM_STEP_NUM_TASKS", "")
+    if tasks.isdigit() and int(tasks) > 1:
+        logger.warning(
+            "This process is 1 of %s tasks of a Slurm step, started without torchrun: every task trains on its "
+            "own (no process group). Launch one torchrun per node instead: srun --ntasks-per-node=1 torchrun "
+            "--nnodes=$SLURM_NNODES --nproc_per_node=<GPUs per node> ... (see scripts/train_slurm.sh).",
+            tasks,
+        )
 
 
 _skip_cleanup = False
@@ -76,6 +110,32 @@ def barrier() -> None:
         dist.barrier(device_ids=[torch.cuda.current_device()])
     else:
         dist.barrier()
+
+
+def main_value(value):
+    """Rank 0's `value` on every rank (one collective); `value` itself without a process group or with one rank.
+
+    For what every rank must agree on but each would otherwise work out by itself, from a filesystem it may see
+    differently or later than rank 0 (which checkpoint to resume, whether a cache has to be built), or from
+    its own floating-point result (a new best evaluation loss): ranks that decide differently run different
+    collectives next, and the run hangs. `value` must be picklable and small."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return value
+    box = [value if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(box, src=0)  # NCCL: through the current device (set_device in setup_distributed)
+    return box[0]
+
+
+def rank_values(value) -> list:
+    """Every rank's `value`, in rank order (one collective); [value] without a process group or with one rank.
+
+    For a local check the ranks must act on together (can this rank read the file rank 0 wrote?): a rank
+    raising alone leaves the others waiting in their next collective. `value` must be picklable and small."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return [value]
+    values: list = [None] * dist.get_world_size()
+    dist.all_gather_object(values, value)
+    return values
 
 
 def release_cuda_memory() -> None:

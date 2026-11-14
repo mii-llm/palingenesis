@@ -22,7 +22,7 @@ import torch.distributed as dist
 from safetensors.torch import load_file as safetensors_load
 from safetensors.torch import save_file as safetensors_save
 
-from palingenesis.distributed import barrier, release_cuda_memory
+from palingenesis.distributed import barrier, main_value, release_cuda_memory
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +215,7 @@ def save_checkpoint(
     epoch: int = 0,
     micro_step: int = 0,
     keep_latest_k: int = DEFAULT_KEEP_LATEST_K,
+    data_ranks: int = 1,
 ):
     """Save a full training checkpoint, then purge old ones.
 
@@ -223,13 +224,16 @@ def save_checkpoint(
 
     Auto-purge: after saving, removes checkpoints older than the latest K.
     Set keep_latest_k=0 to disable purging (keep all checkpoints).
+
+    data_ranks: the ranks that read different data (recorded: `micro_step` counts each one's
+    micro-batches, so a resume with another number of them rescales it).
     """
     path = Path(output_dir) / f"step-{step}"
 
     if is_fsdp and dist.is_initialized() and dist.get_world_size() > 1:
-        _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path)
+        _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks)
     else:
-        _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path)
+        _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks)
 
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(f"Checkpoint saved: step {step} -> {path}")
@@ -238,7 +242,7 @@ def save_checkpoint(
             _purge_old_checkpoints(output_dir, keep_latest_k)
 
 
-def _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path):
+def _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks=1):
     """Single-GPU save: sharded safetensors for model, torch for optimizer."""
     path.mkdir(parents=True, exist_ok=True)
 
@@ -249,14 +253,14 @@ def _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step
     # We split into per-group files if state is large
     _save_optimizer_sharded(optimizer, path / "optimizer")
 
-    # Metadata
-    _save_meta(scheduler, step, epoch, micro_step, path)
-
     # RNG states
     _save_rng(path)
 
+    # Metadata, last: it marks the checkpoint complete (find_latest_checkpoint)
+    _save_meta(scheduler, step, epoch, micro_step, path, data_ranks)
 
-def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path):
+
+def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks=1):
     """FSDP2 save via Distributed Checkpoint (sharded, no gathering).
 
     Each rank saves only its local shard — zero extra memory, scales to any model size.
@@ -285,14 +289,18 @@ def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, 
     # Zero extra memory — each rank only serializes what it already has.
     dcp_save(state, checkpoint_id=str(path / "dcp"))
 
-    # Only rank 0 saves non-distributed state (metadata, tokenizer, RNG)
-    if dist.get_rank() == 0:
-        tokenizer.save_pretrained(path / "tokenizer")
-        _save_meta(scheduler, step, epoch, micro_step, path)
-        _save_rng(path)
+    # Every rank's own random state: the ranks draw different streams (seed + rank), and restoring
+    # rank 0's on all of them would make every rank draw the same numbers after a resume.
+    _save_rng(path, dist.get_rank())
 
     del state
     release_cuda_memory()
+    barrier()  # every rank's files are written before rank 0 marks the checkpoint complete
+
+    # Only rank 0 saves non-distributed state (tokenizer, metadata)
+    if dist.get_rank() == 0:
+        tokenizer.save_pretrained(path / "tokenizer")
+        _save_meta(scheduler, step, epoch, micro_step, path, data_ranks)
     barrier()
 
 
@@ -341,23 +349,33 @@ def _save_optimizer_sharded(optimizer, path: Path):
             torch.save(shard_meta, path / f"shard_{shard_idx:04d}_meta.pt")
 
 
-def _save_meta(scheduler, step, epoch, micro_step, path):
+def _save_meta(scheduler, step, epoch, micro_step, path, data_ranks=1):
     meta = {
         "step": step,
         "epoch": epoch,
         "micro_step": micro_step,
+        "data_ranks": data_ranks,
         "scheduler_state": scheduler.state_dict() if scheduler is not None else {},
     }
-    with open(path / TRAINING_META_FILE, "w") as f:
+    # Written whole, then renamed: the file's presence marks a complete checkpoint, also for a
+    # reader on another node and after the process is stopped in the middle of the write.
+    tmp = path / (TRAINING_META_FILE + ".tmp")
+    with open(tmp, "w") as f:
         json.dump(meta, f, indent=2, default=str)
+    tmp.replace(path / TRAINING_META_FILE)
 
 
-def _save_rng(path):
+def _rng_file(path: Path, rank: int = 0) -> Path:
+    """rng_state.safetensors for rank 0 (and a single process), rng_state.rank<r>.safetensors for the others."""
+    return path / ("rng_state.safetensors" if rank == 0 else f"rng_state.rank{rank}.safetensors")
+
+
+def _save_rng(path, rank: int = 0):
     rng = {
         "cpu_rng": torch.random.get_rng_state().to(torch.float32),
         "cuda_rng": torch.cuda.get_rng_state().to(torch.float32) if torch.cuda.is_available() else torch.zeros(1),
     }
-    safetensors_save(rng, str(path / "rng_state.safetensors"))
+    safetensors_save(rng, str(_rng_file(path, rank)))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -390,17 +408,31 @@ def load_checkpoint(
     with open(meta_path) as f:
         meta = json.load(f)
 
+    # The two layouts do not load into each other; skipping the weights would continue the saved step
+    # count on the pretrained model.
     if is_fsdp and dist.is_initialized() and dist.get_world_size() > 1:
+        if not (path / "dcp").exists():
+            raise RuntimeError(
+                f"{path} has no sharded (DCP) state: it was saved by a single-process run and cannot be resumed "
+                "on several ranks. Resume it with one process, or start a new run from its weights "
+                f"(model.name_or_path: {path / 'model'})."
+            )
         _load_fsdp(model, optimizer, path)
     else:
+        if (path / "dcp").exists() and not (path / "model").exists():
+            raise RuntimeError(
+                f"{path} holds sharded (DCP) state, saved by a multi-GPU run: resume it with torchrun on two or "
+                "more ranks and parallel.fsdp: true (any number of them), not with one process."
+            )
         _load_single(model, optimizer, path, device)
 
     # Scheduler
     if scheduler is not None and meta.get("scheduler_state"):
         scheduler.load_state_dict(meta["scheduler_state"])
 
-    # RNG
-    rng_path = path / "rng_state.safetensors"
+    # RNG: this rank's own. A rank without a saved state (more ranks than the checkpoint's run had)
+    # keeps the one it was seeded with.
+    rng_path = _rng_file(path, dist.get_rank() if dist.is_initialized() else 0)
     if rng_path.exists():
         rng = safetensors_load(str(rng_path))
         torch.random.set_rng_state(rng["cpu_rng"].to(torch.uint8))
@@ -571,9 +603,6 @@ def _load_fsdp(model, optimizer, path):
     )
 
     dcp_path = path / "dcp"
-    if not dcp_path.exists():
-        logger.warning(f"DCP path {dcp_path} not found")
-        return
 
     # Sharded load: each rank gets empty state dict containers,
     # DCP fills them with the correct shard for this rank.
@@ -774,6 +803,10 @@ class BestModelTracker:
         Only rank 0 performs the actual save. Other ranks participate
         in the FSDP gather if needed.
         """
+        # Rank 0's loss and record decide for every rank: the save below is a collective, and each
+        # rank evaluated on its own GPU and read best_meta.json by itself. A loss that differs in the
+        # last bit, or a record one rank could not read, would send some ranks into the gather alone.
+        eval_loss, self.best_loss, self.best_step = main_value((eval_loss, self.best_loss, self.best_step))
         # A NaN compares False with everything: it would replace best/ and then let every later
         # evaluation replace it too.
         if not math.isfinite(eval_loss) or eval_loss >= self.best_loss:
