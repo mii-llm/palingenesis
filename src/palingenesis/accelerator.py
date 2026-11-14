@@ -9,6 +9,11 @@ The build is told apart with ``torch.version.hip`` (a version string on ROCm, No
 otherwise), as PyTorch's HIP notes recommend; the GPU generation with the device's
 ``gcnArchName`` (e.g. "gfx942:sramecc+:xnack-").
 
+Also here: integrated GPUs that allocate from the host's RAM (NVIDIA GB10 in DGX Spark,
+Jetson): ``is_unified_memory``, ``memory_info`` and ``memory_budget_bytes``. There the
+device's "total" is the host's RAM and CUDA's "free" figure leaves out page cache the
+kernel would reclaim, so neither is what a job can plan with.
+
 Also here: keeping the *current* device right (``device_scope``, ``on_current_device``).
 Triton kernels (Liger's, flash-linear-attention's, vLLM's, palingenesis's own) launch on
 the current device, not on their tensors' device; the current device is per thread and a
@@ -32,12 +37,15 @@ import torch
 
 _T = TypeVar("_T")
 
-# FP8 training (torchao float8). NVIDIA: SM89+ (Ada, Hopper, Blackwell), validated.
+# FP8 training (torchao float8). NVIDIA: SM89+ (Ada, Hopper, Blackwell), validated on
+# discrete GPUs. GB10 (DGX Spark, sm_121) passes torch's capability test for scaled
+# matmuls, but no palingenesis run has validated it: treated like the AMD GPUs below.
 # ROCm: torchao picks e4m3fnuz on MI300 (gfx942) and OCP e4m3fn on MI350 (gfx950)
 # (torchao.float8.config), but no palingenesis run has validated it: allowed when the
 # config asks for it, with a warning, and never turned on automatically. Every other
 # AMD GPU (gfx90a / MI250 included) has no FP8 matrix cores.
 _FP8_MIN_CUDA_CAPABILITY = (8, 9)
+_CUDA_FP8_UNVALIDATED = {(12, 1): "GB10, DGX Spark"}
 _ROCM_FP8_ARCHS = {"gfx942": "MI300, float8 e4m3fnuz", "gfx950": "MI350, float8 e4m3fn"}
 
 # Cut Cross-Entropy's Triton kernels call tl.dot(input_precision="tf32") when
@@ -73,6 +81,55 @@ def gpu_arch(device: int = 0) -> str | None:
     if arch:
         return arch.split(":")[0]  # drop feature flags (":sramecc+:xnack-")
     return f"sm_{props.major}{props.minor}"
+
+
+def is_unified_memory(device: int | torch.device = 0) -> bool:
+    """True when the GPU is integrated and allocates from the host's RAM (NVIDIA GB10 in
+    DGX Spark, Jetson): CUDA's ``integrated`` device property. False without a GPU."""
+    if not torch.cuda.is_available():
+        return False
+    return bool(getattr(torch.cuda.get_device_properties(device), "is_integrated", False))
+
+
+def host_available_bytes(meminfo: str = "/proc/meminfo") -> int | None:
+    """The kernel's MemAvailable: RAM a new allocation can get without swapping, reclaimable
+    page cache included. None where it cannot be read (not Linux)."""
+    try:
+        with open(meminfo) as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def memory_info(device: int | torch.device = 0) -> tuple[int, int]:
+    """(free, total) bytes of GPU memory, like ``torch.cuda.mem_get_info``.
+
+    On a unified-memory GPU the CUDA figure counts the host's page cache as used (after
+    reading a model or a dataset it is tens of GB too low), while the kernel gives that
+    memory back on demand: there, free is the host's MemAvailable when that is larger.
+    """
+    free, total = torch.cuda.mem_get_info(device)
+    if is_unified_memory(device):
+        available = host_available_bytes()
+        if available is not None:
+            free = min(max(free, available), total)
+    return int(free), int(total)
+
+
+def memory_budget_bytes(device: int | torch.device = 0) -> int:
+    """What one job can plan to allocate on `device` when no budget is given: the whole
+    device on a discrete GPU, and on a unified-memory GPU only what the host has available
+    now, since the operating system, this process's own RAM and every other process draw on
+    the same pool."""
+    total = int(torch.cuda.get_device_properties(device).total_memory)
+    if is_unified_memory(device):
+        available = host_available_bytes()
+        if available is not None:
+            return min(total, available)
+    return total
 
 
 def device_scope(device: str | torch.device) -> contextlib.AbstractContextManager:
@@ -115,7 +172,10 @@ def describe() -> str:
             return f"not available (torch built for {platform_name()})"
         props = torch.cuda.get_device_properties(0)
         count = torch.cuda.device_count()
-        return f"{count}x {props.name} ({props.total_memory / 2**30:.0f} GB), {platform_name()}, arch {gpu_arch()}"
+        memory = f"{props.total_memory / 2**30:.0f} GB"
+        if is_unified_memory():
+            memory += ", shared with the host"
+        return f"{count}x {props.name} ({memory}), {platform_name()}, arch {gpu_arch()}"
     except Exception as e:  # noqa: BLE001 - diagnostics never break a command
         return f"unknown ({e})"
 
@@ -169,8 +229,8 @@ def check_visible_devices(environ=None) -> None:
 def fp8_support() -> tuple[str, str]:
     """(status, reason) for FP8 training on device 0.
 
-    status: "supported" (validated: NVIDIA SM89+), "unvalidated" (AMD MI300/MI350: torchao
-    has the path, palingenesis has not validated it) or "unsupported".
+    status: "supported" (validated: NVIDIA SM89+), "unvalidated" (AMD MI300/MI350 and NVIDIA
+    GB10: torchao has the path, palingenesis has not validated it) or "unsupported".
     """
     if not torch.cuda.is_available():
         return "unsupported", "no GPU"
@@ -180,6 +240,8 @@ def fp8_support() -> tuple[str, str]:
             return "unvalidated", f"{arch} ({_ROCM_FP8_ARCHS[arch]}) through torchao; not validated on ROCm yet"
         return "unsupported", f"AMD {arch} has no FP8 matrix cores (FP8 needs MI300 gfx942 or MI350 gfx950)"
     capability = tuple(torch.cuda.get_device_capability())
+    if capability in _CUDA_FP8_UNVALIDATED:
+        return "unvalidated", f"NVIDIA {arch} ({_CUDA_FP8_UNVALIDATED[capability]}) through torchao; not validated yet"
     if capability >= _FP8_MIN_CUDA_CAPABILITY:
         return "supported", f"NVIDIA {arch}"
     return "unsupported", f"NVIDIA {arch}: FP8 needs SM89+ (L40S, H100, B200)"

@@ -23,7 +23,10 @@ GPUS = {
     "mi355": ("7.2.53211", None, (9, 5), "gfx950:sramecc+:xnack-", "AMD Instinct MI355X"),
     "a100": (None, "12.9", (8, 0), None, "NVIDIA A100-SXM4-80GB"),
     "h100": (None, "12.9", (9, 0), None, "NVIDIA H100 80GB HBM3"),
+    # DGX Spark: an integrated GPU (CUDA's `integrated` property) that allocates from the host's RAM
+    "gb10": (None, "13.0", (12, 1), None, "NVIDIA GB10"),
 }
+UNIFIED_MEMORY = {"gb10"}
 
 
 @pytest.fixture
@@ -34,6 +37,7 @@ def gpu(monkeypatch):
         if name is not None:
             hip, cuda, capability, arch, device = GPUS[name]
             props = types.SimpleNamespace(name=device, major=capability[0], minor=capability[1], total_memory=64 << 30)
+            props.is_integrated = int(name in UNIFIED_MEMORY)
             if arch:
                 props.gcnArchName = arch
             monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *a, **k: props)
@@ -64,7 +68,8 @@ def train_mod(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "name,rocm,arch", [("mi250", True, "gfx90a"), ("mi300", True, "gfx942"), ("h100", False, "sm_90")]
+    "name,rocm,arch",
+    [("mi250", True, "gfx90a"), ("mi300", True, "gfx942"), ("h100", False, "sm_90"), ("gb10", False, "sm_121")],
 )
 def test_platform_and_arch(gpu, name, rocm, arch):
     gpu(name)
@@ -72,6 +77,88 @@ def test_platform_and_arch(gpu, name, rocm, arch):
     assert accelerator.gpu_arch() == arch  # gfx feature flags stripped
     line = accelerator.describe()
     assert GPUS[name][4] in line and arch in line and ("ROCm" if rocm else "CUDA") in line
+    assert ("shared with the host" in line) is (name in UNIFIED_MEMORY)
+
+
+# ------------------------------------------------------------- unified memory
+
+GIB = 1 << 30
+
+
+@pytest.fixture
+def memory(monkeypatch):
+    """memory(cuda_free, host_available): what CUDA and the kernel report, in GiB, on the fake 64 GiB device."""
+
+    def use(cuda_free, host_available):
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (cuda_free * GIB, 64 * GIB))
+        monkeypatch.setattr(
+            accelerator, "host_available_bytes", lambda: None if host_available is None else host_available * GIB
+        )
+
+    return use
+
+
+def test_host_available_reads_meminfo(tmp_path):
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:       127582240 kB\nMemFree:  1000 kB\nMemAvailable:   121634816 kB\nCached: 5 kB\n")
+    assert accelerator.host_available_bytes(str(meminfo)) == 121634816 * 1024
+    meminfo.write_text("MemTotal:       127582240 kB\n")
+    assert accelerator.host_available_bytes(str(meminfo)) is None
+    assert accelerator.host_available_bytes(str(tmp_path / "missing")) is None
+
+
+@pytest.mark.parametrize(
+    "name,cuda_free,host,free",
+    [
+        ("gb10", 30, 58, 58),  # page cache: CUDA says 30 GiB free, the kernel would hand out 58
+        ("gb10", 30, 100, 64),  # never more than the device
+        ("gb10", 30, 12, 30),  # CUDA's own figure when it is the larger one
+        ("gb10", 30, None, 30),  # MemAvailable unreadable
+        ("h100", 30, 500, 30),  # discrete GPU: host RAM is another pool
+    ],
+)
+def test_memory_info_counts_reclaimable_host_memory_on_unified_memory(gpu, memory, name, cuda_free, host, free):
+    gpu(name)
+    memory(cuda_free, host)
+    assert accelerator.is_unified_memory() is (name in UNIFIED_MEMORY)
+    assert accelerator.memory_info() == (free * GIB, 64 * GIB)
+
+
+@pytest.mark.parametrize(
+    "name,host,budget", [("gb10", 40, 40), ("gb10", 100, 64), ("gb10", None, 64), ("h100", 40, 64), ("a100", 500, 64)]
+)
+def test_memory_budget_is_what_the_host_leaves_on_unified_memory(gpu, memory, name, host, budget):
+    gpu(name)
+    memory(1, host)
+    assert accelerator.memory_budget_bytes() == budget * GIB
+
+
+def test_unified_memory_needs_a_gpu(gpu):
+    gpu(None)
+    assert accelerator.is_unified_memory() is False
+
+
+@pytest.mark.parametrize("name,mode", [("gb10", "device"), ("h100", "cpu")])
+def test_surgery_gram_mode_sees_reclaimable_memory(gpu, memory, name, mode):
+    from palingenesis import surgery
+
+    gpu(name)
+    memory(10, 60)  # 10 GiB free by CUDA's count, 60 GiB available on the host
+    # 2 * K * P_edit = 16 GiB of stored gradients, 9.6 GiB + 8 GiB of headroom
+    chosen, info = surgery.choose_gram_mode("auto", 8, GIB, "cuda:0")
+    assert chosen == mode
+    assert info["device_free_bytes"] == (60 if name == "gb10" else 10) * GIB
+
+
+@pytest.mark.parametrize("name,warned", [("gb10", True), ("h100", False)])
+def test_rl_cpu_offload_warns_on_unified_memory(gpu, memory, caplog, name, warned):
+    from palingenesis.rl import trainer
+
+    gpu(name)
+    memory(60, 60)
+    with caplog.at_level(logging.WARNING, logger="palingenesis.rl.trainer"):
+        trainer._check_host_memory(nn.Linear(4, 4), world=1)
+    assert ("saves no memory" in caplog.text) is warned
 
 
 def test_no_gpu(gpu):
@@ -332,7 +419,7 @@ def test_cce_gate_logs_in_train(gpu, caplog):
 @pytest.mark.parametrize(
     "name,status",
     [("mi250", "unsupported"), ("mi300", "unvalidated"), ("mi355", "unvalidated"), ("a100", "unsupported")]
-    + [("h100", "supported")],
+    + [("h100", "supported"), ("gb10", "unvalidated")],
 )
 def test_fp8_support_by_arch(gpu, name, status):
     gpu(name)
@@ -360,7 +447,8 @@ def fake_torchao(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "name,converted", [("mi250", False), ("a100", False), ("mi300", True), ("mi355", True), ("h100", True)]
+    "name,converted",
+    [("mi250", False), ("a100", False), ("mi300", True), ("mi355", True), ("h100", True), ("gb10", True)],
 )
 def test_float8_training_gate(gpu, fake_torchao, caplog, name, converted):
     from palingenesis.float8 import apply_float8_training
@@ -371,11 +459,11 @@ def test_float8_training_gate(gpu, fake_torchao, caplog, name, converted):
     assert bool(fake_torchao) is converted
     if name == "mi250":
         assert "gfx90a has no FP8" in caplog.text
-    if name == "mi300":
+    if name in ("mi300", "gb10"):
         assert "not validated" in caplog.text
 
 
-@pytest.mark.parametrize("name,auto", [("mi250", False), ("mi300", False), ("h100", True)])
+@pytest.mark.parametrize("name,auto", [("mi250", False), ("mi300", False), ("h100", True), ("gb10", False)])
 def test_autopilot_turns_on_fp8_only_where_validated(gpu, name, auto):
     from palingenesis.autopilot.profile import profile_hardware
 
@@ -386,7 +474,9 @@ def test_autopilot_turns_on_fp8_only_where_validated(gpu, name, auto):
 # ----------------------------------------------------------------------- Muon
 
 
-@pytest.mark.parametrize("name,tried", [("mi250", False), ("mi300", False), ("a100", False), ("h100", True)])
+@pytest.mark.parametrize(
+    "name,tried", [("mi250", False), ("mi300", False), ("a100", False), ("h100", True), ("gb10", True)]
+)
 def test_quack_muon_backend_only_on_nvidia_hopper(gpu, monkeypatch, name, tried):
     from palingenesis import muon
 
