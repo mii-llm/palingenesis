@@ -28,9 +28,11 @@ What to measure with it (none of this has been measured on a GPU yet):
      stage 1 no longer runs the last chunk, so the time should scale like (5k - 1) / 5k of the previous
      schedule with full checkpointing, (4k - 1) / 4k without (k chunks): 20-25% at one chunk, 3% at eight.
   3. Small chunks. --lengths 131072 --chunks 1024,2048,4096,8192,16384 --checkpointing full and none, with
-     --profile: the share of time outside the attention / linear-attention / GEMM kernels says whether the
-     block-by-block prefix attention (one flash call per 8192 prefix tokens plus an fp32 merge) matters;
-     only then is a single call over a contiguous [prefix; chunk] worth building.
+     --profile: the share of time outside the attention / linear-attention / GEMM kernels. The prefix is
+     attended block by block (one flash call per 8192 prefix tokens plus an fp32 merge of the outputs;
+     by a count of operations the merges are 10-25% of the forward attention time, a few percent of a
+     step). --kv-block 65536 or 1048576 runs the prefix in fewer calls or one: if that is not faster,
+     a single call over a contiguous [prefix; chunk] is not worth building.
   4. SeCO against full backpropagation with checkpointing: --modes rows,full at 16k-262k, both models.
   5. --kv-offload at 262k-1M (dense model): the cost of the transfers, and whether the K/V gradient that
      stays on the GPU is what limits the length.
@@ -217,6 +219,7 @@ def main() -> None:
     parser.add_argument("--chunks", default="4096", help="memory.seco_chunk_size values, comma separated")
     parser.add_argument("--checkpointing", default="full", choices=["none", "selective", "full"])
     parser.add_argument("--kv-offload", action="store_true", help="memory.seco_kv_offload")
+    parser.add_argument("--kv-block", type=int, help="prefix tokens per attention block (default: seco.KV_BLOCK)")
     parser.add_argument("--trained-share", type=float, default=1.0, help="share of positions with a label")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
@@ -229,6 +232,10 @@ def main() -> None:
     if args.tiny and not args.lengths:
         args.documents, args.min_length, args.max_length, args.block, args.chunks = 12, 8, 400, 512, "64"
 
+    if args.kv_block:
+        import palingenesis.seco
+
+        palingenesis.seco.KV_BLOCK = args.kv_block
     model = load(args)
     vocab = model.get_output_embeddings().weight.shape[0]
     docs = documents(args, vocab)
@@ -244,10 +251,16 @@ def main() -> None:
             row = measure(model, mode, docs, packed, args, vocab)
             print(json.dumps(row))
             if args.json:
+                settings = {
+                    "model": args.model or "tiny",
+                    "checkpointing": args.checkpointing,
+                    "kv_offload": args.kv_offload,
+                    "kv_block": args.kv_block,
+                    "trained_share": args.trained_share,
+                    "block": args.block,
+                }
                 with open(args.json, "a") as f:
-                    f.write(
-                        json.dumps({**row, "model": args.model or "tiny", "checkpointing": args.checkpointing}) + "\n"
-                    )
+                    f.write(json.dumps({**row, **settings}) + "\n")
             if args.profile and "error" not in row:
                 profile_pass(model, mode, docs, packed, args, vocab)
 
