@@ -36,6 +36,7 @@ from palingenesis.rl.env import EnvPool, ToolOutput, call_sync_or_async, row_too
 from palingenesis.rl.generation import GenerationClient
 from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample, load_object, whitespace_defects
 from palingenesis.rl.trajectory import Trajectory, group_is_informative
+from palingenesis.rollouts import pick
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,10 @@ class RLBatch:
     samples: list[list[Trajectory]]  # groups (the orchestrator counts len(samples) when it drops a batch)
     version: int
     stats: dict[str, float] = field(default_factory=dict)
+    # logging.dump_trajectories: the trajectories to dump as (kept, trajectory), zero-variance groups included, and
+    # the engine's concurrency timeline. The trainer hands them to the writer once the advantages are assigned.
+    dump: list[tuple[bool, Trajectory]] | None = None
+    timeline: list | None = None
 
 
 class RLPipeline:
@@ -118,8 +123,15 @@ class RLPipeline:
             stats["engine/prefill_tokens"] = prompt - (self.engine.cached_tokens - prefill[1])
             stats["engine/prefix_hit"] = (self.engine.cached_tokens - prefill[1]) / max(prompt, 1)
         every = self.config.logging.dump_trajectories
+        dump = timeline = None
         if every and self.batches % every == 0:
-            self._dump(groups, self.batches)
+            sampled = pick(
+                [(True, g) for g in groups] + [(False, g) for g in self.dropped],
+                self.config.logging.dump_groups,
+                self.batches,
+            )
+            dump = [(kept, t) for kept, group in sampled for t in group]
+            timeline = list(self.client.timeline)
         trajectories = [t for g in groups for t in g]
         tokens = sum(t.sampled_tokens for t in trajectories) + stats.pop("_dropped_tokens", 0)
         stats.update(
@@ -133,7 +145,7 @@ class RLPipeline:
         # The newest group's version: carried groups may be older, and the trainer drops those
         # beyond max_staleness one by one instead of the orchestrator dropping the batch.
         version = max((t.version for t in trajectories), default=self.weights.version)
-        return RLBatch(groups, version, stats)
+        return RLBatch(groups, version, stats, dump, timeline)
 
     async def _collect(self, target: int, temperature: float) -> tuple[list[list[Trajectory]], dict[str, float]]:
         """Run groups until `target` informative ones are collected.
@@ -405,7 +417,12 @@ class RLPipeline:
                     if out.finish == "length" or parsed.calls or parsed.errors or attempt == resamples:
                         break
                     trajectory.info.setdefault("stop_resamples", []).append({"turn": turn, "message": parsed.message()})
-                turn_timing = {"generate_s": clock() - t_generate, "tokens": len(out.ids), "context": context}
+                turn_timing = {
+                    "generate_s": clock() - t_generate,
+                    "tokens": len(out.ids),
+                    "context": context,
+                    "finish": out.finish,
+                }
                 timing["turns"].append(turn_timing)
                 logprobs = out.logprobs if out.logprobs or training else [0.0] * len(out.ids)
                 trajectory.append_generated(out.ids, logprobs, out.version, out.first_version)
@@ -423,16 +440,21 @@ class RLPipeline:
                     trajectory.finish = "turns"
                     break
                 t_tools = clock()
-                results = await asyncio.gather(  # text-protocol actions are validated by the environment itself
-                    *(
-                        run_tool(env, c.name, c.arguments, e.tool_timeout, None if text_protocol else set(by_name))
-                        for c in parsed.calls
-                    )
-                )
+                exposed = None if text_protocol else set(by_name)  # text-protocol actions: the environment validates
+
+                async def timed(call: ToolCall, exposed=exposed, started=t_tools) -> tuple[Any, bool, float]:
+                    result, failed = await run_tool(env, call.name, call.arguments, e.tool_timeout, exposed)
+                    return result, failed, clock() - started  # the calls run at once: seconds to its own result
+
+                results = await asyncio.gather(*(timed(c) for c in parsed.calls))
                 turn_timing["tools_s"] = clock() - t_tools
+                turn_timing["tools"] = [
+                    {"name": c.name, "s": seconds, "failed": failed}
+                    for c, (_, failed, seconds) in zip(parsed.calls, results)
+                ]
                 # a tool may return images next to its text (rl.env.ToolOutput)
-                texts = [out.text if isinstance(out, ToolOutput) else out for out, _ in results]
-                pictures = [list(out.images) if isinstance(out, ToolOutput) else [] for out, _ in results]
+                texts = [out.text if isinstance(out, ToolOutput) else out for out, _, _ in results]
+                pictures = [list(out.images) if isinstance(out, ToolOutput) else [] for out, _, _ in results]
                 observations = [
                     {
                         "role": "tool",
@@ -456,7 +478,7 @@ class RLPipeline:
                 if any(pictures):
                     self._attach_images(observations, pictures, image_results, text_protocol)
                 trajectory.tool_calls += len(parsed.calls)
-                trajectory.tool_errors += sum(failed for _, failed in results) + len(parsed.errors)
+                trajectory.tool_errors += sum(failed for _, failed, _ in results) + len(parsed.errors)
                 if getattr(env, "done", False):  # the environment ended the episode (e.g. a submit tool)
                     trajectory.messages.extend(observations)
                     trajectory.finish = "env_done"
@@ -551,38 +573,6 @@ class RLPipeline:
                 if images and not message["content"]:
                     message["content"] = e.image_tool_note
             observations.append({"role": "user", "content": with_text(e.image_user_note, flat)})
-
-    def _dump(self, groups: list[list[Trajectory]], step: int) -> None:
-        """Every trajectory of the batch (kept and zero-variance) and the engine's concurrency
-        timeline, to <output_dir>/rollouts/step_<n>.jsonl: to read what the policy does."""
-        import json
-        from pathlib import Path
-
-        path = Path(self.config.train.output_dir) / "rollouts"
-        path.mkdir(parents=True, exist_ok=True)
-        with open(path / f"step_{step}.jsonl", "w") as f:
-            for kept, batch in ((True, groups), (False, self.dropped)):
-                for group in batch:
-                    for t in group:
-                        record = {
-                            "group": t.group,
-                            "kept": kept,
-                            "finish": t.finish,
-                            "reward": t.reward,
-                            "rewards": t.rewards,
-                            "turns": t.turns,
-                            "tool_calls": t.tool_calls,
-                            "tool_errors": t.tool_errors,
-                            "prompt_tokens": len(t.prompt_ids),
-                            "sampled_tokens": t.sampled_tokens,
-                            "context_tokens": len(t.tokens) - t.sampled_tokens,
-                            "version": t.version,
-                            "messages": t.messages,
-                            "info": t.info,
-                        }
-                        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        with open(path / f"step_{step}.timeline.json", "w") as f:
-            json.dump(self.client.timeline, f)
 
     async def _score(self, group: list[Trajectory], envs: list[Any]) -> None:
         """Rewards of a group, their weighted sum, and the length shaping and masking."""

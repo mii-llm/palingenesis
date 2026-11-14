@@ -16,6 +16,7 @@ Launch:
 """
 
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -32,7 +33,7 @@ from transformers import AutoTokenizer
 
 from palingenesis.accelerator import check_visible_devices
 from palingenesis.kernels import apply_liger_kernel, model_type_of
-from palingenesis.logging import wandb_define_step_axis, wandb_row
+from palingenesis.logging import Tracker
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.memory import trim_host_memory
 from palingenesis.moe import RouterBalancer
@@ -53,6 +54,7 @@ from palingenesis.opd.teachers import (
     right_pad,
 )
 from palingenesis.opd.token_bridge import TokenBridge, TokenBridgeError, check_compatible
+from palingenesis.rollouts import DROPPED_METRIC, RolloutSink, completion_record, flush_on_signal, pick
 from palingenesis.seco import use_chunk_attention
 
 logger = logging.getLogger(__name__)
@@ -301,24 +303,15 @@ class OPDTrainer:
         self.start_step, wandb_id = 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
-        self.wandb, self.wandb_id = None, wandb_id
-        if config.logging.use_wandb:
-            try:
-                import wandb
-
-                run = wandb.init(
-                    project=config.logging.project,
-                    name=config.logging.run_name or None,
-                    config=dataclasses.asdict(config),
-                    dir=config.train.output_dir,
-                    id=wandb_id,
-                    resume="allow" if wandb_id else None,
-                )
-                wandb_define_step_axis(run)  # x-axis = the training step, a resumed run included
-                self.wandb_id = run.id
-                self.wandb = wandb
-            except Exception as e:  # noqa: BLE001 — a metrics backend must never kill a training run
-                logger.warning("wandb init failed (%s); continuing without it", e)
+        # metrics: wandb, trackio, logging.trackers; the run id is saved with each checkpoint
+        self.tracker = Tracker.for_run(config.logging, dataclasses.asdict(config), config.train.output_dir, wandb_id)
+        self.dumps = None  # logging.dump_trajectories: the completions' writer (palingenesis.rollouts)
+        if config.logging.dump_trajectories:
+            self.dumps = RolloutSink(
+                Path(config.train.output_dir) / "rollouts",
+                "opd",
+                functools.partial(_dump_record, self.tok, config.logging.dump_content),
+            )
 
     def _make_pipeline(self, engine, overlap: bool):
         """The rollout pipeline (a subclass for other data shapes, e.g. agent traces)."""
@@ -611,12 +604,18 @@ class OPDTrainer:
     # ------------------------------------------------------------------- train
 
     def train(self) -> None:
+        with flush_on_signal(self.dumps):  # SIGTERM writes the queued dumps before the process ends
+            self._train()
+
+    def _train(self) -> None:
         config = self.config
         stop_at = config.train.stop_at
         end = stop_at if 0 < stop_at < config.train.steps else config.train.steps
         if self.start_step >= end:
             logger.warning("the checkpoint is at step %d, the run stops at %d: nothing to train", self.start_step, end)
         self.orchestrator.start(end=end)
+        failed = True  # until the run ends normally
+        dumps = self.dumps
         try:
             if config.train.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)
@@ -636,6 +635,9 @@ class OPDTrainer:
                 self.student.train()
                 if self.cmr is not None:  # its own forward / backward on the twins; grads cleared before the task's
                     self.cmr.pre_step()
+                every = config.logging.dump_trajectories
+                if dumps is not None and (step + 1) % every == 0:  # plain values: the batch's tensors are not kept
+                    dumps.submit(step + 1, self._dump_items(batch, step + 1))
                 stats = self._scores(batch, train=True)
                 with self.weights.lock:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), config.train.max_grad_norm)
@@ -667,6 +669,8 @@ class OPDTrainer:
                         **trim_host_memory(),  # after the step: frees what the batch held, then reads the RSS
                     }
                 )
+                if dumps is not None:
+                    metrics[DROPPED_METRIC] = dumps.dropped
                 if step % config.logging.log_every == 0:
                     self._log("step", metrics, step + 1)
                 if (
@@ -687,10 +691,14 @@ class OPDTrainer:
                 if config.train.eval_every:
                     self._log("eval", self.evaluate(), config.train.steps)
                 self.save("final")
+            failed = False
         finally:
             self.orchestrator.stop()
             for server in self.servers:
                 server.close()
+            if dumps is not None:
+                dumps.close()
+            self.tracker.finish(1 if failed else 0)
 
     def _summarize(self, stats: dict[str, float], batch: Batch) -> dict[str, float]:
         metrics = {k: v for k, v in batch.stats.items()}
@@ -796,15 +804,33 @@ class OPDTrainer:
 
     def _log(self, kind: str, metrics: dict[str, float], step: int) -> None:
         logger.info("%s %d | %s", kind, step, " ".join(f"{k}={v:.4g}" for k, v in sorted(metrics.items())))
-        if self.wandb:
-            try:
-                # No step=: wandb drops rows below its history step, i.e. every step a resume
-                # from an older checkpoint redoes. The training step rides in the row instead.
-                row = {(f"eval/{k}" if kind == "eval" else k): v for k, v in metrics.items()}
-                self.wandb.log(wandb_row(row, step))
-            except Exception as e:  # noqa: BLE001 — a metrics backend must never kill training
-                logger.warning("wandb.log failed (%s); disabling wandb", e)
-                self.wandb = None
+        self.tracker.log({(f"eval/{k}" if kind == "eval" else k): v for k, v in metrics.items()}, step)
+
+    def _dump_items(self, batch: Batch, step: int) -> list[dict]:
+        """The batch's completions to dump (logging.dump_groups prompts, all their rollouts), as plain
+        values: the writer thread decodes and encodes them, and keeps no tensor alive."""
+        groups: dict[int, list[Sample]] = {}
+        for s in batch.samples:
+            groups.setdefault(id(s.request), []).append(s)  # a prompt's group_size rollouts share their request
+        items = []
+        for group, samples in enumerate(pick(list(groups.values()), self.config.logging.dump_groups, step)):
+            for s in samples:
+                item = {
+                    "ids": list(s.completion),
+                    "logprobs": list(s.behaviour_lp),
+                    "finish": s.finish,
+                    "prompt_tokens": len(s.request.prompt_ids),
+                    "prompt": s.request.messages,
+                    "meta": s.request.meta,
+                    "fields": {"group": group, "source": s.request.source, "teacher": s.teacher, "version": s.version},
+                }
+                token_lp = s.scores.token_lp if s.scores is not None else None
+                if token_lp is not None and len(token_lp) == len(s.behaviour_lp):  # same tokenizer: per-token k1
+                    teacher = float(token_lp.mean())
+                    item["fields"]["teacher_logprob_mean"] = teacher
+                    item["fields"]["k1_mean"] = sum(s.behaviour_lp) / max(len(s.behaviour_lp), 1) - teacher
+                items.append(item)
+        return items
 
     def save(self, name: str, step: int | None = None) -> None:
         """The student in Hugging Face format; with `step`, also the state to resume from.
@@ -828,7 +854,7 @@ class OPDTrainer:
                 "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state_all() if self.device == "cuda" else None,
                 "dropped_samples": self.orchestrator.dropped,
-                "wandb_id": self.wandb_id,
+                "wandb_id": self.tracker.run_id,  # the tracker's run id (key kept for older checkpoints)
             }
             torch.save(state, path / (TRAINER_STATE_FILE + ".tmp"))
             os.replace(path / (TRAINER_STATE_FILE + ".tmp"), path / TRAINER_STATE_FILE)
@@ -965,3 +991,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _dump_record(tok, content: bool, item: dict) -> dict:
+    """A dumped completion (OPDTrainer._dump_items) as a palingenesis.rollouts record (writer thread)."""
+    text = tok.decode(item["ids"], skip_special_tokens=True)  # without dump_content, still judged for loops
+    meta = {k: v for k, v in (item.get("meta") or {}).items() if isinstance(v, bool | int | float | str)}
+    fields = {**item["fields"], **({"meta": meta} if meta else {})}
+    return completion_record(
+        text, item["finish"], item["prompt_tokens"], item["logprobs"], item.get("prompt"), content, **fields
+    )

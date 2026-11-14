@@ -77,6 +77,7 @@ class Sample:
     version: int  # policy version that generated it
     view: TeacherView
     scores: TeacherScores | None = None
+    finish: str = ""  # the rollout's finish reason: stop | length
 
     @property
     def teacher(self) -> str:
@@ -253,6 +254,7 @@ class Pipeline:
                             rollout.logprobs[: len(completion)],
                             rollout.policy_version,
                             route.aligner.view(request.teacher_prompt_ids, completion),
+                            finish=rollout.finish_reason,
                         )
                     )
             stats["time/align"] = time.perf_counter() - start

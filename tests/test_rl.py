@@ -2080,3 +2080,24 @@ def test_docker_sandbox_restarts_a_dead_container_once(monkeypatch):
 
     container, results = asyncio.run(main())
     assert container.starts == 1 and [r.status for r in results] == ["ok"] * 4
+
+
+def test_vllm_server_backend_without_ray_fails_at_startup(monkeypatch, tmp_path):
+    """vLLM's CUDA IPC weight transfer into a server the trainer launches imports ray: a clear error before any
+    server starts or weights load (a running server, rollout.url, is not checked)."""
+    import importlib.util
+
+    from palingenesis.rl.trainer import RLTrainer
+
+    tokenizer("Qwen/Qwen3-0.6B")  # skips offline without the tokenizer
+    find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "ray" else find_spec(name, *a))
+    config = RLConfig()
+    for key, value in {
+        "model.policy": "Qwen/Qwen3-0.6B",
+        "rollout.backend": "vllm_server",
+        "train.output_dir": str(tmp_path),
+    }.items():
+        config.set(key, value)
+    with pytest.raises(RLConfigError, match="needs ray"):
+        RLTrainer(config, rewards=[lambda completion, **row: 0.0], dataset=[{"prompt": "2+2?"}] * 4)
