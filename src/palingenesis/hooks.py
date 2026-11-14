@@ -72,6 +72,8 @@ class PluginContext:
     output_dir: str = ""
     # set by the trainer once the teachers exist (off-policy distillation), else None
     distiller: Any = None
+    # during export_state_dict: the directory the exported model is written to (final/, best/model/), else ""
+    export_dir: str = ""
     _logged: dict[str, float] = field(default_factory=dict)
 
     @property
@@ -204,7 +206,8 @@ class TrainerPlugin:
     def export_state_dict(self, state: dict, model: nn.Module, ctx: PluginContext) -> dict | None:
         """Change the state dict of an exported model (final / best; not the resume checkpoints):
         fold quantised weights, drop training-only tensors. `state` is a full (gathered) state dict
-        under the architecture's names. Return the new dict or None (changed in place)."""
+        under the architecture's names. Return the new dict or None (changed in place). Under FSDP it
+        runs on rank 0 only; files written next to the model go under `ctx.export_dir`."""
 
     def state_dict(self) -> dict:
         """Plugin state to save with each checkpoint (picklable)."""

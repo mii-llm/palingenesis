@@ -29,6 +29,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -912,13 +913,28 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
     # ── Best Model Tracker (saves best eval-loss checkpoint) ──────────────
     # Driven by either the single eval_dataset OR the multi-source composite score.
-    def _export(state: dict) -> dict:
-        """An exported model's state: without distillation projections, then the plugins' export hooks."""
-        state = {k: v for k, v in state.items() if not _is_aux(k)}
-        return plugin_mgr.export_state_dict(state, model) if plugin_mgr else state
+    def _export_to(path: Path):
+        """The export function of a model saved at `path`: without distillation projections, then the
+        plugins' export hooks (which see `path` as ctx.export_dir)."""
+
+        def export(state: dict) -> dict:
+            state = {k: v for k, v in state.items() if not _is_aux(k)}
+            if not plugin_mgr:
+                return state
+            plugin_ctx.export_dir = str(path)
+            try:
+                return plugin_mgr.export_state_dict(state, model)
+            finally:
+                plugin_ctx.export_dir = ""
+
+        return export
 
     _best_tracker = (
-        BestModelTracker(config.train.output_dir, export=_export, resume=_will_resume(config))
+        BestModelTracker(
+            config.train.output_dir,
+            export=_export_to(Path(config.train.output_dir) / "best" / "model"),
+            resume=_will_resume(config),
+        )
         if (config.data.eval_dataset or config.data.eval_sources)
         else None
     )
@@ -1849,7 +1865,13 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     if plugin_mgr:
         plugin_mgr.on_train_end(model)
     if config.train.save_final:
-        save_final(model, tokenizer, config.train.output_dir, is_fsdp, export=_export)
+        save_final(
+            model,
+            tokenizer,
+            config.train.output_dir,
+            is_fsdp,
+            export=_export_to(Path(config.train.output_dir) / "final"),
+        )
     tracker.log(
         {"train/total_steps": global_step, "train/total_time_s": total_time, "train/tokens_total": tokens_total},
         step=global_step,
@@ -2159,12 +2181,13 @@ def _freeze_non_attention_layers(model: torch.nn.Module):
     except its input/post-attention layer norms; full-attention layers, embeddings,
     the final norm and the head stay trainable. Without `layer_types`, parameters of
     submodules named like a recurrent block (linear_attn, mamba, ssm, ...) are frozen.
+    It only freezes: a parameter frozen earlier (a plugin's frozen base weights) stays frozen.
     """
     config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
     layer_types = list(getattr(config, "layer_types", None) or [])
     attention_types = {"full_attention", "sliding_attention", "chunked_attention", "attention"}
 
-    frozen_count = trainable_count = 0
+    frozen_count = trainable_count = matched = 0
     for name, param in model.named_parameters():
         match = re.search(r"layers\.(\d+)\.([^.]+)", name)
         if match and layer_types and int(match.group(1)) < len(layer_types):
@@ -2172,14 +2195,17 @@ def _freeze_non_attention_layers(model: torch.nn.Module):
             freeze = layer_types[idx] not in attention_types and not submodule.endswith("norm")
         else:
             freeze = any(k in name.lower() for k in _RECURRENT_KEYWORDS)
-        param.requires_grad = not freeze
         if freeze:
+            param.requires_grad = False
             frozen_count += param.numel()
-        else:
+            matched += 1
+        elif param.requires_grad:
             trainable_count += param.numel()
+        else:
+            frozen_count += param.numel()
 
     total = frozen_count + trainable_count
-    if frozen_count == 0:
+    if matched == 0:
         logger.warning(
             "train.freeze_non_attention: this model has no linear-attention or recurrent layers; nothing was frozen."
         )
