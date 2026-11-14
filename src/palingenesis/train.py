@@ -152,10 +152,12 @@ def _dynamic_num_chunks(batch_tokens: int, vocab_size: int, target_gb: float = L
     """Loss chunks for the ACTUAL batch, not the max_seq_length worst case.
 
     Each chunk materializes [tokens/chunks, vocab] fp32 logits; keep that under
-    target_gb. Fewer chunks = fewer sequential lm_head fwd+bwd passes = faster.
+    target_gb. Fewer chunks = fewer sequential lm_head fwd+bwd passes = faster, but
+    the count is not capped: a cap let one slice grow with the sequence (at 1M tokens
+    and a 248k vocabulary, 64 chunks were 16k rows, ~16 GB of fp32 logits each).
     """
     logit_gb = batch_tokens * vocab_size * 4 / 1e9
-    return max(1, min(64, math.ceil(logit_gb / target_gb)))
+    return max(1, math.ceil(logit_gb / target_gb))
 
 
 def _lockstep(batches, group):

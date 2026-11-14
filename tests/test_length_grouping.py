@@ -85,10 +85,14 @@ def test_dynamic_num_chunks_follows_batch():
     assert _dynamic_num_chunks(16 * 4096, vocab) == 20
     # Length-grouped short batch 16×512: ~5GB → 3 chunks
     assert _dynamic_num_chunks(16 * 512, vocab) == 3
+    # a very long row keeps slices at the target instead of growing them (no cap on the count)
+    tokens = 1 << 20
+    chunks = _dynamic_num_chunks(tokens, 248_320)
+    assert chunks > 64 and tokens / chunks * 248_320 * 4 / 1e9 <= 2.0
     # Tiny batch: no chunking at all
     assert _dynamic_num_chunks(2 * 128, vocab) == 1
-    # Never explodes past 64
-    assert _dynamic_num_chunks(64 * 32768, vocab) == 64
+    # No cap: a slice stays at the target whatever the batch (each still a few thousand rows, a large matmul)
+    assert _dynamic_num_chunks(64 * 32768, vocab) == 638
     print("✓ test_dynamic_num_chunks_follows_batch PASSED")
 
 

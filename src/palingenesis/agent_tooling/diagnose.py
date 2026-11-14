@@ -157,8 +157,9 @@ def _check_config_sanity(config: Config) -> list[str]:
     # Very long sequences: SeCO (one GPU) or Context Parallel (several)
     if config.data.max_seq_length > 32768 and not (config.parallel.context_parallel or config.memory.seco):
         issues.append(
-            f"Sequence length is {config.data.max_seq_length}: consider memory.seco (single GPU, exact "
-            "chunk-wise training) or parallel.context_parallel (multi-GPU)."
+            f"Sequence length is {config.data.max_seq_length}: run `pgs fit` to measure the options. Full "
+            "activation checkpointing is cheaper than memory.seco until it stops fitting; memory.seco (single "
+            "GPU, exact) is for longer rows and hybrid models; parallel.context_parallel splits rows across GPUs."
         )
 
     # Chunked loss for long sequences

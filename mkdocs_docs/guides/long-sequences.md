@@ -10,7 +10,7 @@ Backpropagation keeps every layer's activations for the whole sequence until the
 
 ## The idea
 
-Transformers already process long inputs in chunks at inference time: prefill with a KV cache. SeCO does the same for training. The idea comes from [Li et al., arXiv:2505.16710](https://arxiv.org/abs/2505.16710); the implementation and its validation are palingenesis'.
+Transformers already process long inputs in chunks at inference time: prefill with a KV cache. SeCO does the same for training. The idea comes from [Li et al., arXiv:2505.16710](https://arxiv.org/abs/2505.16710). ChunkFlow ([Yuan et al., arXiv:2503.02356](https://arxiv.org/abs/2503.02356), two months earlier) schedules long sequences the same way: a forward over the chunks in order that keeps the attention K/V as state, then backward in reverse order, earlier chunks receiving the gradients of their K/V from later ones. It also packs short sequences into chunks and can keep the activations of the last chunks instead of recomputing them. The implementation here and its validation are palingenesis'.
 
 <figure class="pg-figure">
 <div class="pg-figure__canvas">
@@ -77,7 +77,7 @@ Transformers already process long inputs in chunks at inference time: prefill wi
 1. **Stage 1:** a no-grad pass over all chunks with a cache.
 2. **Stage 2:** a reverse sweep. Each chunk is recomputed with gradients from the cache, its loss is backpropagated, and the gradient that later chunks sent into its cache entries is relayed backwards.
 
-Chunks run in reverse, so every relayed gradient is complete when its chunk is recomputed. The result equals full backpropagation, and the only cost is one extra no-grad forward.
+Chunks run in reverse, so every relayed gradient is complete when its chunk is recomputed. The result equals full backpropagation. The extra cost is one no-grad forward: about +33% against training without activation checkpointing, but against full activation checkpointing (which also recomputes a forward) it is +0% to +25% depending on the checkpointing inside each chunk.
 
 ## Quickstart
 
@@ -134,6 +134,9 @@ Dropout and router jitter are replayed: each chunk's RNG state is saved in stage
 
 ### Measured on one A100 80GB
 
+!!! note "Read these against a strong baseline"
+    "Full backprop" below is the trainer's full-checkpointing path as it was, not a tuned one: it has no sequence-tiled MLP and no offload of the checkpointed layer inputs, and the Qwen3.5 rows use transformers' pure-torch linear attention. Its time gap to SeCO is larger than the extra work explains (SeCO does as much or more computation), so do not read it as a general speedup. At moderate lengths full checkpointing is the cheaper option: at 16k tokens on Qwen3.5-0.8B it used 11.5 GiB at 16.6k tok/s against SeCO's 15.9 GiB at 13.0k (8k chunks). SeCO pays off where full checkpointing stops fitting, on hybrid models (only the attention layers keep K/V), and on long agentic traces. Measure your case with `pgs fit`.
+
 fp32 weights, bf16 autocast, full activation checkpointing, 4k chunks, real text, one forward+backward per row. Times in seconds, peak memory in GiB.
 
 **Qwen3.5-0.8B** (hybrid: only 6 of 24 layers keep a K/V cache):
@@ -145,7 +148,7 @@ fp32 weights, bf16 autocast, full activation checkpointing, 4k chunks, real text
 | 524k | not run | 857 s · 53 GiB | 809 s · 38 GiB | 1079 s · 30 GiB |
 | **1M** | not run | out of memory | **2154 s · 53 GiB** | **3124 s · 36 GiB** |
 
-**Qwen3-0.6B** (dense: every one of its 28 layers keeps K/V, like 4B–8B dense models):
+**Qwen3-0.6B** (dense: every one of its 28 layers keeps K/V). Its K/V per token is twice its residual stream, so it is the least favourable case for SeCO against full checkpointing; do not extrapolate it to 4B–8B dense models, whose K/V is a smaller share:
 
 | Tokens | SeCO, before this | **SeCO** | **SeCO + `seco_kv_offload`** |
 |---|---|---|---|
@@ -190,7 +193,7 @@ The startup check then allows 2e-3 instead of 1e-4 in fp32. The first step of a 
 - **With `gradient_checkpointing: full`**, only one layer's recomputation is ever materialised, so larger chunks become affordable.
 - **With full checkpointing, 2k–4k chunks** are a good default. 4k is faster; 2k uses about 7 GB less.
 - **Without checkpointing, keep chunks around 1k.** Each chunk's full activations stay alive (about 8 GB per 1k tokens here). This was the fastest setting at 524k.
-- **Rule of thumb:** memory ≈ model + optimizer + one chunk's activations + ~60 KB per token (Qwen3.5-0.8B; it scales with the model's K/V width and recurrent-state size).
+- **Rule of thumb:** memory ≈ model + optimizer + one chunk's activations + ~30 KB per token (Qwen3.5-0.8B, as measured above between 524k and 1M; it scales with the model's K/V width and recurrent-state size).
 
 ## SpaCO (approximate, faster)
 

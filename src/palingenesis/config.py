@@ -319,7 +319,8 @@ class MemoryConfig:
     # then backprop chunk by chunk in reverse, relaying gradients through the
     # cache. Only one chunk's activations are alive, so activation memory is set
     # by the chunk size, not the sequence length. Exact gradients (tested equal to
-    # full backprop, incl. Qwen3.5 hybrids) for one extra no-grad forward (~+33%).
+    # full backprop, incl. Qwen3.5 hybrids) for one extra no-grad forward (~+33% against no checkpointing,
+    # +0-25% against full activation checkpointing, which is cheaper until it stops fitting).
     seco: bool = False
     seco_chunk_size: int = 4096
     # Keep the full-attention K/V (and recurrent start states) in pinned CPU memory,
