@@ -68,6 +68,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from palingenesis.multimodal import refuse_images
 from palingenesis.validate_data import THINK_TAGS, normalize_messages, normalize_tools, restore_baked_think
 
 logger = logging.getLogger(__name__)
@@ -437,6 +438,7 @@ class TracePlanner:
         self.think_tags = detect_think_tags(probe_render) or THINK_TAGS
 
     def render(self, messages: list[dict], tools: list[dict] | None, turn: int) -> str:
+        refuse_images(messages[:turn], "on-policy distillation on agent traces")
         return self.tok.apply_chat_template(
             messages[:turn], tools=tools or None, add_generation_prompt=True, tokenize=False, **self.kwargs
         )

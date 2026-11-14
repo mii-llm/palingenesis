@@ -126,6 +126,7 @@ nav:
     - Off-Policy Distillation: guides/offpolicy-distillation.md
     - Preference Optimization (DPO): guides/dpo.md
     - LoRA: guides/lora.md
+    - Multimodal (Images): guides/multimodal.md
     - Reinforcement Learning: guides/rl.md
     - Harbor Environments: guides/harbor.md
     - Harness Profiles: guides/harness-profiles.md

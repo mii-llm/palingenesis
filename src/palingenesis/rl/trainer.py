@@ -34,6 +34,7 @@ from typing import Any, Callable
 import torch
 from transformers import AutoTokenizer
 
+from palingenesis import multimodal
 from palingenesis.accelerator import check_visible_devices
 from palingenesis.kernels import (
     apply_activation_checkpointing,
@@ -45,6 +46,7 @@ from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.memory import trim_host_memory
 from palingenesis.moe import RouterBalancer, config_is_moe
+from palingenesis.multimodal import VisionProcessor
 from palingenesis.opd.orchestrator import Orchestrator, PublishedWeights
 from palingenesis.opd.rollout import (
     HFRollout,
@@ -142,6 +144,12 @@ class RLTrainer:
 
         # Tokenizer, data, rewards and environment first: mistakes surface before any weights load.
         self.tok = AutoTokenizer.from_pretrained(m.policy)
+        # a multimodal policy: the tokenizer carries its image processor (palingenesis.multimodal), which the
+        # rollout pipeline, the HF engine and the train step all expand and position images with
+        self.vision = None
+        if m.multimodal:
+            self.vision = VisionProcessor.from_pretrained(m.policy, self.tok, m.min_pixels, m.max_pixels)
+            multimodal.attach(self.tok, self.vision)
         kwargs = m.chat_template_kwargs
         self.stop_ids = student_stop_ids(self.tok, m.policy, m.stop_tokens, kwargs)
         self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.stop_ids[0]
@@ -233,7 +241,12 @@ class RLTrainer:
             ", FSDP2" if fsdp else "",
             "cpu, then sharded" if fsdp else self.device,
         )
-        self.model = load_causal_lm(self.resume_path or m.policy, torch.float32)
+        if self.vision is not None:  # the checkpoint's own architecture: language model, vision tower, projector
+            self.model = multimodal.load_model(self.resume_path or m.policy, dtype=torch.float32)
+            multimodal.check_model(self.model, self.vision, "the policy")
+            multimodal.set_vision_trainable(self.model, m.train_vision_tower, m.train_projector)
+        else:
+            self.model = load_causal_lm(self.resume_path or m.policy, torch.float32)
         if self.resume_path:
             # exports follow the layout of the checkpoint the model was loaded from (checkpoint.save_hf_model,
             # source_layout): after a resume that would be a step_* dir, which checkpoint rotation deletes
@@ -247,6 +260,14 @@ class RLTrainer:
         # MoE: router balancing over the global batch, routing statistics, routing replay
         self.router_balancer = RouterBalancer.attach(self.model, config.moe, replay=self.routing_replay)
         self.routing_replay = self.routing_replay and self.router_balancer is not None
+        if self.routing_replay and self.vision is not None:
+            # the engine records routing per expanded position, the trajectory stores one placeholder per image
+            if r.routing_replay == "on":
+                raise RLConfigError(
+                    "rollout.routing_replay is not supported with a multimodal policy (model.multimodal)."
+                )
+            logger.warning("multimodal MoE policy: no routing replay (router balancing stays on)")
+            self.routing_replay = False
         if not fsdp:
             self.model.to(self.device)
         checkpointing = m.gradient_checkpointing
@@ -290,10 +311,15 @@ class RLTrainer:
             )
 
         if r.backend == "hf":
-            self.engine = HFRollout(self.model, self.stop_ids, self.pad_id, r.micro_seqs)
+            self.engine = HFRollout(self.model, self.stop_ids, self.pad_id, r.micro_seqs, vision=self.vision)
             self.engine.record_routing = self.routing_replay
         elif r.backend == "vllm":
             extra = {k: v for k, v in (("kv_cache_dtype", r.kv_cache_dtype), ("quantization", r.quantization)) if v}
+            if self.vision is not None:  # vLLM's processor must resize as the trainer's does
+                extra["mm_processor_kwargs"] = {
+                    "min_pixels": self.vision.min_pixels,
+                    "max_pixels": self.vision.max_pixels,
+                }
             extra.update(r.vllm_args)
             extra.update(precision)
 
@@ -460,10 +486,10 @@ class RLTrainer:
         powers of two do it a handful of times. Similar lengths share a micro-batch, so padding
         stays small."""
         budget = self.config.train.micro_tokens
-        ordered = sorted(trajectories, key=lambda t: len(t.prompt_ids) + len(t.tokens), reverse=True)
+        ordered = sorted(trajectories, key=lambda t: t.context_tokens, reverse=True)  # images expanded
         batches, i = [], 0
         while i < len(ordered):
-            width = len(ordered[i].prompt_ids) + len(ordered[i].tokens) - 1
+            width = ordered[i].context_tokens - 1
             rows = min(len(ordered) - i, max(1, budget // width))
             rows = 1 << (rows.bit_length() - 1)
             batches.append(ordered[i : i + rows])
@@ -486,6 +512,15 @@ class RLTrainer:
             reduce=reduce,
         )
         trajectories = [t for g in groups for t in g if id(t) in weights]
+        if any(t.segments for t in trajectories):
+            # a trajectory whose context was rewritten (old images dropped) trains as its segments, each on
+            # the context its tokens were sampled from, with the trajectory's advantage and token weight
+            views = []
+            for t in trajectories:
+                for view in t.training_views():
+                    weights[id(view)] = weights[id(t)]
+                    views.append(view)
+            trajectories = views
         totals: dict[str, torch.Tensor] = {}
         reference = getattr(self, "reference", None)
         self.ref_lp = reference.logprobs(trajectories) if reference is not None and trajectories else {}
@@ -514,7 +549,18 @@ class RLTrainer:
                 if balancer is not None:
                     balancer.end()
                 continue
-            ids, real = right_pad([t.prompt_ids + t.tokens[:-1] for t in micro], self.pad_id, device)
+            sequences = [t.prompt_ids + t.tokens[:-1] for t in micro]
+            image_kwargs, index = {}, None
+            if any(t.images for t in micro):
+                # placeholders expanded with the processor the engine used; the pixels are processed again here
+                ids, image_kwargs, index = multimodal.batch_sequences(
+                    self.vision, sequences, [t.images for t in micro], self.pad_id, device
+                )
+                # a row's real positions end at its last token's expanded position
+                positions = torch.arange(ids.shape[1], device=device)
+                real = torch.stack([positions <= rows[-1] for rows in index])
+            else:
+                ids, real = right_pad(sequences, self.pad_id, device)
             if balancer is not None:
                 replay = _routing_batch(micro, ids.shape[1]) if self.routing_replay else None
                 balancer.begin(real, grad_accum=count, replay=replay)
@@ -524,7 +570,8 @@ class RLTrainer:
             for row, t in enumerate(micro):
                 sampled = [j for j, trained in enumerate(t.mask) if trained]
                 forced += [j in t.forced for j in sampled] if t.forced else [False] * len(sampled)
-                positions[row, [len(t.prompt_ids) + j - 1 for j in sampled]] = True
+                before = [len(t.prompt_ids) + j - 1 for j in sampled]  # the token whose output predicts j
+                positions[row, [index[row][p] for p in before] if index else before] = True
                 completion_pos += sampled
                 sampled_by += _sampled_by(t, sampled, current)
                 targets += [t.tokens[j] for j in sampled]
@@ -539,7 +586,9 @@ class RLTrainer:
             seq_len = torch.tensor([float(t.sampled_tokens) for t in micro]).to(device, non_blocking=True)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 # right-padded rows need no mask: padding comes after every position scored
-                hidden = final_hidden_states(self.model, ids, None)[positions.to(device, non_blocking=True)]
+                hidden = final_hidden_states(self.model, ids, None, **image_kwargs)[
+                    positions.to(device, non_blocking=True)
+                ]
             inv_t = getattr(self, "inv_temperature", 1.0)  # applied to the fp32 logits
             lp, entropy = target_logprobs(
                 hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight, scale=inv_t
@@ -594,7 +643,12 @@ class RLTrainer:
     def _share_prompts(self, groups: list[list[Trajectory]]) -> bool:
         mode = self.config.train.prompt_sharing
         # routing replay: the recorded routing is per row, the tree computes a group's prompt once
-        if mode == "off" or self.parallel.fsdp or getattr(self, "routing_replay", False):
+        if (
+            mode == "off"
+            or self.parallel.fsdp
+            or getattr(self, "routing_replay", False)
+            or getattr(self, "vision", None) is not None
+        ):
             return False
         if mode == "on":
             return True

@@ -94,6 +94,13 @@ def save_hf_model(
         _set_config_dtype(path / "config.json", dtype)
     if tokenizer is not None:
         tokenizer.save_pretrained(path)
+        # a multimodal model: the image processor files its architecture is served with (the bounds
+        # trained with included), so the directory loads in transformers and vLLM as the source does
+        from palingenesis.multimodal import vision_of
+
+        vision = vision_of(tokenizer)
+        if vision is not None:
+            vision.save_pretrained(path)
 
 
 def _set_config_dtype(config_file: Path, dtype: torch.dtype) -> None:

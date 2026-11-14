@@ -138,6 +138,7 @@ Use `--json` flag (where available) for structured output suitable for programma
 | Slow throughput | `model.compile: true`, `data.packing: true`, increase `data.num_workers` |
 | Long seq OOM | `parallel.context_parallel: true` (multi-GPU, with `parallel.fsdp: true`; `parallel.cp_degree` GPUs per sequence), `memory.loss_num_chunks: 16`; one GPU: `memory.seco: true` |
 | Context parallel refused (recurrent layers other than Gated DeltaNet, e.g. Mamba) | `memory.seco: true` for long sequences, or FSDP without context parallel (Qwen3.5 / Qwen3-Next are supported) |
+| Images in the data are ignored (Qwen-VL family) | `multimodal.enabled: true` (+ `multimodal.max_pixels` to bound tokens per image; not with SeCO, context parallel, `data.pretokenize`, cached teachers); RL: `model.multimodal: true`, tools return `ToolOutput(text, images=[...])`, `env.image_results: tool`/`user`, `env.max_images` (see the multimodal guide) |
 | Repetition loops after SFT | `data.loop_recovery: 0.2`, `data.reasoning_loop_recovery: 0.2`, `data.repeat_unlikelihood: 20`, `data.stop_unlikelihood: 5` (with `memory.seco: true`) |
 | Agent drifts on its own errors | OPD `sources.<name>.format: agent_traces` on the student's episodes + `onset_branches`, `error_patterns`, `cutoff_logp` |
 | Off-policy KD: teacher too large | `distill.teachers.<name>.placement: shard` (FSDP), or `pgs distill-cache` once and `cache: <dir>` |

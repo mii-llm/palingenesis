@@ -86,6 +86,7 @@ from torch.utils.data import IterableDataset
 
 from palingenesis.data import IGNORE_INDEX, ChatDataset, _collate_fn, _Epochs, _shard_then_shuffle
 from palingenesis.loss import _BackwardBridge, shift_labels
+from palingenesis.multimodal import forward_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,9 @@ class PreferenceDataset(_Epochs, IterableDataset):
             return None
         if rejected["input_ids"].numel() > self.max_seq_length:
             if not self.truncate_rejected:
+                self.stats["dropped_rejected_too_long"] += 1
+                return None
+            if "pixel_values" in rejected:  # cutting tokens could cut an image
                 self.stats["dropped_rejected_too_long"] += 1
                 return None
             rejected = {k: v[: self.max_seq_length] for k, v in rejected.items()}
@@ -632,9 +636,11 @@ def reference_logps(
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
     num_chunks: int = 1,
+    forward_kwargs: dict | None = None,
 ) -> torch.Tensor:
-    """Per-token reference log-probs [2P, S] for a collated preference batch."""
-    hidden = get_hidden(ref_model, input_ids, attention_mask, None)
+    """Per-token reference log-probs [2P, S] for a collated preference batch. `forward_kwargs`: the
+    batch's images (palingenesis.multimodal.forward_kwargs)."""
+    hidden = get_hidden(ref_model, input_ids, attention_mask, **(forward_kwargs or {}))
     return token_logps(hidden, shift_labels(labels), get_lm_head(ref_model), num_chunks)
 
 
@@ -672,7 +678,8 @@ class PreferenceEvaluator:
         mask = batch["attention_mask"].to(device)
         shifted = shift_labels(batch["labels"].to(device))
         num_pairs = ids.shape[0] // 2
-        hidden = get_hidden(model, ids, mask, None)
+        images = {k: v.to(device) for k, v in forward_kwargs(batch, {}).items()}
+        hidden = get_hidden(model, ids, mask, **images)
         logps = token_logps(hidden, shifted, lm_head, self.num_chunks_for(ids.numel()))
         a = score_weights(shifted, num_pairs, self.ld_alpha)
         return (logps * a).sum(dim=1), a.sum(dim=1)

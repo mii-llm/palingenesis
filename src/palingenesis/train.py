@@ -36,7 +36,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from palingenesis import accelerator
+from palingenesis import accelerator, multimodal
 from palingenesis.checkpoint import (
     TRAINING_META_FILE,
     BestModelTracker,
@@ -110,6 +110,7 @@ from palingenesis.loss import (
 )
 from palingenesis.moe import RouterBalancer
 from palingenesis.moe_experts import ExpertParallel, set_experts_implementation
+from palingenesis.multimodal import VisionProcessor
 from palingenesis.optim import AdamCCorrection, build_optimizer, build_scheduler
 from palingenesis.packing import (
     PackedBatch,
@@ -293,7 +294,7 @@ def _per_source_eval(metrics: dict) -> str:
     """' eval_sources=name:loss,...' for the log line when per-source eval sets are configured (eval_sources), so
     forgetting on one source shows in the plain log, not only in the tracker."""
     parts = [
-        f"{k[len('eval/'):-len('/loss')]}:{v:.4f}"
+        f"{k[len('eval/') : -len('/loss')]}:{v:.4f}"
         for k, v in sorted(metrics.items())
         if k.startswith("eval/") and k.endswith("/loss") and k.count("/") == 2
     ]
@@ -390,6 +391,23 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # ── Images (palingenesis.multimodal): the tokenizer carries the model's vision processor, so
+    # every reader built from it (training, evaluation, DPO pairs) expands and positions images alike ──
+    vision = None
+    if config.multimodal.enabled:
+        vision = VisionProcessor.from_pretrained(
+            config.model.name_or_path,
+            tokenizer,
+            min_pixels=config.multimodal.min_pixels,
+            max_pixels=config.multimodal.max_pixels,
+            trust_remote_code=config.model.trust_remote_code,
+        )
+        multimodal.attach(tokenizer, vision)
+        logger.info(
+            f"Multimodal: {vision.model_type} images, {vision.patch_size * vision.merge_size} px per token side, "
+            f"{vision.min_pixels}..{vision.max_pixels} pixels per image"
+        )
+
     # ── Model ─────────────────────────────────────────────────────────────
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     model_dtype = dtype_map[config.model.torch_dtype]
@@ -401,15 +419,19 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # flash_attention_2 / Hub kernels: a clear error now, not an ImportError deep in from_pretrained
     accelerator.check_attn_implementation(config.model.attn_implementation)
     logger.info(f"Loading model: {config.model.name_or_path}")
-    model = AutoModelForCausalLM.from_pretrained(
+    # multimodal: the checkpoint's own architecture (language model + vision tower + projector)
+    load_model = multimodal.load_model if vision is not None else AutoModelForCausalLM.from_pretrained
+    model = load_model(
         config.model.name_or_path,
         torch_dtype=model_dtype,
         attn_implementation=config.model.attn_implementation,
         trust_remote_code=config.model.trust_remote_code,
         low_cpu_mem_usage=True,  # Load shard-by-shard, no 2x RAM spike
     )
-    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
+    if vision is not None:
+        multimodal.check_model(model, vision)
+        multimodal.set_vision_trainable(model, config.multimodal.train_vision_tower, config.multimodal.train_projector)
+    multimodal.disable_cache(model)
     if plugin_mgr:
         model = plugin_mgr.transform_model(model)
     # ── MoE: expert compute, router balancing over the global batch, routing statistics ──
@@ -440,6 +462,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             mesh=mesh if is_fsdp else None,
             extra_features=plugin_mgr.feature_requests() if plugin_mgr else None,
         )
+        if vision is not None and distiller.caches:
+            raise ConfigError(
+                f"multimodal.enabled with cached teachers ({', '.join(distiller.caches)}) is not supported: cached "
+                "targets are keyed by the tokens, and the same tokens with other pixels have other targets. Use "
+                "an online teacher (distill.teachers.<name>.model)."
+            )
         distiller.attach_features(model, next(model.parameters()).device)
         plugin_ctx.distiller = distiller
         if config.data.packing:
@@ -463,17 +491,18 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     if dpo is not None:
         ref_path = dpo.reference_model or config.model.name_or_path
         logger.info(f"DPO: loading frozen reference model: {ref_path}")
-        ref_model = AutoModelForCausalLM.from_pretrained(
+        ref_model = load_model(
             ref_path,
             torch_dtype=model_dtype,
             attn_implementation=config.model.attn_implementation,
             trust_remote_code=config.model.trust_remote_code,
             low_cpu_mem_usage=True,
         )
-        if hasattr(ref_model, "config") and hasattr(ref_model.config, "use_cache"):
-            ref_model.config.use_cache = False
+        multimodal.disable_cache(ref_model)
         ref_model.requires_grad_(False)
         ref_model.eval()
+        if vision is not None:
+            multimodal.check_model(ref_model, vision, "the DPO reference model")
         if dpo.disable_dropout:
             n = disable_dropout(model)
             if n:
@@ -1304,6 +1333,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         "position_ids": cp.position_ids(seq_len, input_ids.shape[0], input_ids.device),
                     }
                     cp.activate(seq_len, input_ids.device)
+            # images: pixels in row order and M-RoPE positions (per document under packing)
+            fwd_kwargs = multimodal.forward_kwargs(batch, fwd_kwargs, position_ids is not None and flatten_packed)
 
             # ── Gradient sync control for accumulation ────────────────
             # Dynamic GA: ramp from ga_ramp_start to grad_accum over training
@@ -1360,7 +1391,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             with torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16 and device.type == "cuda"):
                 if distiller is not None:
                     teacher_inputs = (
-                        _teacher_packed_inputs(distiller, raw_input_ids, position_ids, flatten_packed, config)
+                        _teacher_packed_inputs(distiller, raw_input_ids, position_ids, flatten_packed, config, batch)
                         if position_ids is not None
                         else None
                     )
@@ -1443,6 +1474,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         dist.all_reduce(global_chosen, op=dist.ReduceOp.SUM)
                     else:
                         global_chosen = local_chosen
+                    image_kwargs = multimodal.forward_kwargs(batch, {})
                     ref_logps = reference_logps(
                         ref_model,
                         _get_hidden_states,
@@ -1451,8 +1483,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         attention_mask,
                         raw_labels,
                         num_chunks,
+                        forward_kwargs=image_kwargs,
                     )
-                    hidden = _get_hidden_states(model, input_ids, attention_mask, None)
+                    hidden = _get_hidden_states(model, input_ids, attention_mask, **image_kwargs)
                     step_out = preference_step(
                         hidden,
                         raw_labels,
@@ -2095,17 +2128,19 @@ def _flatten_rows(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(1, -1, *t.shape[2:])
 
 
-def _teacher_packed_inputs(distiller, input_ids, position_ids, student_flatten: bool, config: Config) -> dict:
+def _teacher_packed_inputs(
+    distiller, input_ids, position_ids, student_flatten: bool, config: Config, batch: dict | None = None
+) -> dict:
     """Per online teacher whose packed layout differs from the student's (a flattened row for one, not
     the other): its own (input_ids, forward kwargs). Flattening keeps the token order, so the trained
-    rows' flat indices are the same."""
+    rows' flat indices are the same. `batch`: for its images (palingenesis.multimodal)."""
     out = {}
     for name, teacher in distiller.online.items():
         attn = teacher.spec.attn_implementation or config.model.attn_implementation
         flatten = accelerator.is_flash_varlen(attn) or has_linear_attention(teacher.model)
         if flatten != student_flatten:
             packed = PackedBatch.build(input_ids, torch.zeros_like(input_ids), position_ids, flatten, attn)
-            out[name] = (packed.input_ids, packed.forward_kwargs)
+            out[name] = (packed.input_ids, multimodal.forward_kwargs(batch or {}, packed.forward_kwargs, flatten))
     return out
 
 
@@ -2146,7 +2181,7 @@ def _compile_layers(model: torch.nn.Module, backend: str = "inductor", mode: str
     # In place (nn.Module.compile): the module tree and parameter names stay those of
     # the architecture. Wrapping each layer in torch.compile's OptimizedModule would
     # add "_orig_mod." to every name in the state dict.
-    for attr_path in ("model.layers", "transformer.h", "transformer.layers"):
+    for attr_path in ("model.language_model.layers", "model.layers", "transformer.h", "transformer.layers"):
         obj = model
         try:
             for part in attr_path.split("."):
@@ -2252,7 +2287,8 @@ def _compute_eval_loss(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = shift_labels(batch["labels"].to(device))
-        kwargs = {}
+        # images (never with context parallel: Config.validate)
+        kwargs = {k: v.to(device) for k, v in multimodal.forward_kwargs(batch, {}).items()}
         right_padded = not bool((attention_mask[:, 1:] > attention_mask[:, :-1]).any())
         if cp is not None and right_padded:
             seq_len = input_ids.shape[1]
@@ -2263,7 +2299,9 @@ def _compute_eval_loss(
         try:
             # Logits only at scored positions, in slices (palingenesis.logits): the
             # model's own forward would materialise the full [B, S, V] logits.
-            loss, valid = scored_ce_sum(model, input_ids, attention_mask, labels, dtype, autocast=bf16, **kwargs)
+            loss, valid = scored_ce_sum(
+                model, input_ids, attention_mask, labels, dtype, autocast=bf16, forward_kwargs=kwargs
+            )
         finally:
             if cp is not None:
                 cp.deactivate()

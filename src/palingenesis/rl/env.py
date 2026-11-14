@@ -10,7 +10,9 @@ An environment is any class. Per trajectory, the trainer takes an instance from 
         Their JSON schemas come from type hints and a Google-style docstring, as in
         transformers. A tool's return value (str, or anything JSON-serializable) goes back
         to the policy; an exception goes back as "Error: ..." (the policy's mistake, not
-        a crash).
+        a crash). A tool that shows something (a screenshot, a rendered page, an image file)
+        returns ToolOutput(text, images=[...]): the images reach a multimodal policy the way
+        env.image_results says (inside the tool message, or in a user message after it).
     get_reward(self[, messages]) -> float | dict | None  optional, sync or async
         An environment-owned reward, logged as "env" and added with weight 1 (a dict of
         components is logged as env/<name>, each added; a component named "metric/<name>"
@@ -80,6 +82,7 @@ import fnmatch
 import inspect
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from palingenesis.rl.chat import tool_schema
@@ -98,6 +101,15 @@ _LIFECYCLE = (
     "observation_text",
     "unknown_tool",
 )
+
+
+@dataclass
+class ToolOutput:
+    """A tool result with images: PIL images, bytes, file paths or data URLs
+    (palingenesis.multimodal.load_image), in the order the policy should see them."""
+
+    text: str = ""
+    images: list = field(default_factory=list)
 
 
 class ToolFailed(Exception):
@@ -256,8 +268,9 @@ class EnvPool:
 
 async def run_tool(
     env: Any, name: str, arguments: dict[str, Any], timeout: float, exposed: set[str] | None = None
-) -> tuple[str, bool]:
-    """(result text, failed): the tool's output for the policy, or the error it caused.
+) -> tuple["str | ToolOutput", bool]:
+    """(result, failed): the tool's output for the policy (text, or a ToolOutput with images), or
+    the error it caused.
     `exposed`: the episode's tools; anything else is refused before reaching the environment."""
     if exposed is not None and name not in exposed:
         if hasattr(env, "unknown_tool"):  # the environment words it (a harness's own message, or an alias it runs)
@@ -285,7 +298,7 @@ async def run_tool(
         return f"Error: {e}", True
     except Exception as e:  # noqa: BLE001 — the tool failed on the policy's input: that is the observation
         return f"Error: {type(e).__name__}: {e}", True
-    if isinstance(result, str):
+    if isinstance(result, (str, ToolOutput)):
         return result, False
     try:
         return json.dumps(result, ensure_ascii=False, default=str), False

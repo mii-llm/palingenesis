@@ -200,7 +200,7 @@ def _selective_policy():
 
 def _find_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
     """Find transformer layers for checkpointing."""
-    for attr_path in ("model.layers", "transformer.h", "transformer.layers"):
+    for attr_path in ("model.language_model.layers", "model.layers", "transformer.h", "transformer.layers"):
         obj = model
         try:
             for part in attr_path.split("."):
@@ -214,7 +214,7 @@ def _find_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
 
 def _replace_layer(model: nn.Module, layer_id: str, new_module: nn.Module):
     """Replace a layer in the model's layer list."""
-    for attr_path in ("model.layers", "transformer.h", "transformer.layers"):
+    for attr_path in ("model.language_model.layers", "model.layers", "transformer.h", "transformer.layers"):
         obj = model
         try:
             for part in attr_path.split("."):

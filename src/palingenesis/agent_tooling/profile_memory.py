@@ -44,10 +44,16 @@ def _model_config(config: Config):
 
 
 def _meta_model(config: Config, model_config):
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
+    # multimodal: the whole architecture (vision tower and projector count, frozen or trained)
+    auto = AutoModelForImageTextToText if config.multimodal.enabled else AutoModelForCausalLM
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(model_config, trust_remote_code=config.model.trust_remote_code)
+        model = auto.from_config(model_config, trust_remote_code=config.model.trust_remote_code)
+    if config.multimodal.enabled:
+        from palingenesis.multimodal import set_vision_trainable
+
+        set_vision_trainable(model, config.multimodal.train_vision_tower, config.multimodal.train_projector)
     if config.train.freeze_non_attention:
         from palingenesis.train import _freeze_non_attention_layers
 
@@ -86,6 +92,32 @@ def _text_dims(model_config):
     return hidden, layers, text.vocab_size, kv_heads, head_dim, full_layers
 
 
+def _vision_memory(config: Config, model_config, model, rows: int, seq: int, act_bytes: int) -> tuple[float, int]:
+    """(GiB, parameters) of the vision side of a micro-batch, at worst: every token of every row an
+    image token. The language model's share of those tokens is in the activations already (image
+    tokens count against data.max_seq_length); this is the tower's own: the pixel patches (fp32,
+    merge^2 patches per token) and its activations, kept for the backward only when the tower trains
+    (a frozen tower holds one block's worth at a time; a trained projector alone keeps its input)."""
+    from palingenesis.multimodal import vision_parameters
+
+    vision = getattr(model_config, "vision_config", None)
+    if not config.multimodal.enabled or vision is None:
+        return 0.0, 0
+    tower, projector = vision_parameters(model)
+    merge = int(getattr(vision, "spatial_merge_size", 2))
+    patches = rows * seq * merge**2
+    patch_values = (
+        int(getattr(vision, "in_channels", 3))
+        * int(getattr(vision, "temporal_patch_size", 1))
+        * int(getattr(vision, "patch_size", 14)) ** 2
+    )
+    per_block = patches * int(vision.hidden_size) * act_bytes * 10  # as for the language model's layers
+    blocks = int(getattr(vision, "depth", None) or getattr(vision, "num_hidden_layers", 1))
+    kept = blocks if config.multimodal.train_vision_tower else 1
+    total = patches * patch_values * 4 + kept * per_block
+    return total / GB, sum(p.numel() for p in tower.values()) + sum(p.numel() for p in projector.values())
+
+
 def _distill_memory(config: Config, rows: int, seq: int, act_bytes: int) -> tuple[float, float]:
     """Off-policy distillation: (online teachers' weights, per-micro-batch teacher buffers) in GiB.
 
@@ -95,7 +127,7 @@ def _distill_memory(config: Config, rows: int, seq: int, act_bytes: int) -> tupl
     top-k ids and log-probs per position."""
     import os
 
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 
     from palingenesis.distill.chunked import SLICE_ELEMENTS
     from palingenesis.distill.config import parse_teachers
@@ -109,8 +141,9 @@ def _distill_memory(config: Config, rows: int, seq: int, act_bytes: int) -> tupl
             buffers += rows * seq * (spec.top_k * (4 + 2) + 5)
             continue
         cfg = AutoConfig.from_pretrained(spec.model, trust_remote_code=config.model.trust_remote_code)
+        auto = AutoModelForImageTextToText if config.multimodal.enabled else AutoModelForCausalLM
         with torch.device("meta"):
-            teacher = AutoModelForCausalLM.from_config(cfg, trust_remote_code=config.model.trust_remote_code)
+            teacher = auto.from_config(cfg, trust_remote_code=config.model.trust_remote_code)
         n = sum(p.numel() for p in teacher.parameters())
         shards = world if spec.placement == "shard" or (spec.placement == "auto" and world > 1) else 1
         weights += n * (torch.finfo(_DTYPES[spec.dtype]).bits // 8) / shards
@@ -166,8 +199,10 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         copies = 1 if config.memory.seco_kv_offload else (2 if config.model.attn_implementation == "sdpa" else 3)
         kv_gb = copies * rows * seq * full_layers * 2 * kv_heads * head_dim * act_bytes / GB
 
+    vision_gb, vision_params = _vision_memory(config, model_config, model, rows, seq, act_bytes)
+
     exact_gb = params_gb + optimizer_gb + grads_gb + reference_gb + teacher_gb
-    total_gb = (exact_gb + activations_gb + logits_gb + kv_gb + teacher_buffers_gb) * 1.10
+    total_gb = (exact_gb + activations_gb + logits_gb + kv_gb + teacher_buffers_gb + vision_gb) * 1.10
     return {
         "model": config.model.name_or_path,
         "total_params_B": params / 1e9,
@@ -180,6 +215,8 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         "reference_memory_gb": reference_gb,
         "teacher_memory_gb": teacher_gb,
         "teacher_buffers_gb": teacher_buffers_gb,
+        "vision_memory_gb": vision_gb,
+        "vision_params_B": vision_params / 1e9,
         "activation_memory_gb": activations_gb,
         "ce_peak_gb": logits_gb,
         "kv_memory_gb": kv_gb,
@@ -300,6 +337,11 @@ def print_report(est: dict):
         print(f"    SeCO K/V cache:       {est['kv_memory_gb']:6.1f} GiB")
     if est.get("teacher_buffers_gb"):
         print(f"    Teacher targets:      {est['teacher_buffers_gb']:6.1f} GiB  [per micro-batch]")
+    if est.get("vision_memory_gb"):
+        print(
+            f"    Vision tower (rough): {est['vision_memory_gb']:6.1f} GiB  [pixels + activations if every token "
+            f"were an image; its {est['vision_params_B'] * 1e3:.0f}M parameters are in the weights above]"
+        )
     print(f"    Activations (rough):  {est['activation_memory_gb']:6.1f} GiB  [checkpointing: {est['ac_mode']}]")
     print(f"    {'─' * 50}")
     print(
