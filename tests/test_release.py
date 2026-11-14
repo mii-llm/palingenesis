@@ -16,11 +16,18 @@ from palingenesis.examples import main as init_main
 @pytest.mark.parametrize("name", sorted(EXAMPLES))
 def test_shipped_examples_load_with_their_config_class(name, tmp_path):
     path = write_example(name, tmp_path / f"{name}.yaml")
-    if name in ("sft", "dpo", "kd"):
+    if name in ("sft", "dpo", "kd", "lora"):
         config = Config.from_yaml(str(path))
         assert config.dpo.enabled == (name == "dpo")
         assert config.distill.enabled == (name == "kd")
         config.validate()
+        if name == "lora":
+            from palingenesis.hooks import load_object
+            from palingenesis.lora import LoRA
+
+            [entry] = config.plugins.custom
+            assert load_object(entry["class"]) is LoRA
+            LoRA(**entry["args"])
     elif name == "rl":
         from palingenesis.rl.config import RLConfig
 

@@ -17,6 +17,7 @@ EXAMPLES = {
     "dpo": ("pgs train", "preference optimization (DPO) on top of an SFT checkpoint"),
     "distill": ("pgs distill", "on-policy distillation from a larger teacher (needs the vllm extra)"),
     "kd": ("pgs train", "off-policy distillation: train on data against a larger teacher's distributions"),
+    "lora": ("pgs train", "supervised fine-tuning with LoRA adapters (frozen base, merged export)"),
     "rl": ("pgs rl", "RL with a verifiable math reward (needs the rl and vllm extras)"),
 }
 

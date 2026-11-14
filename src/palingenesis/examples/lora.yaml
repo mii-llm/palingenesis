@@ -1,0 +1,60 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# LoRA — supervised fine-tuning with low-rank adapters (palingenesis.lora)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#   pgs train --config lora.yaml          (written by `pgs init lora`)
+#
+# The base weights stay frozen in bf16; rank-16 adapters on every attention, MLP and
+# Gated DeltaNet projection train in fp32. final/ (and best/model/ with an eval set)
+# is a plain model with the adapters folded in; final/adapter/ is the adapter alone
+# in the PEFT layout. Guide: https://mii-llm.github.io/palingenesis/guides/lora/
+#
+# LoRA removes the gradients and optimizer state of the base weights, not the
+# activations: long sequences still need gradient_checkpointing / memory.seco.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+model:
+  name_or_path: Qwen/Qwen3-0.6B  # Change to your model
+  trust_remote_code: true
+  torch_dtype: bfloat16          # the frozen base: no fp32 master copy needed, the adapters are fp32
+  attn_implementation: sdpa
+
+data:
+  dataset: HuggingFaceH4/ultrachat_200k   # Change to your dataset
+  dataset_split: train_sft
+  max_seq_length: 4096
+  messages_field: messages
+  streaming: true
+
+train:
+  output_dir: ./output-lora
+  max_steps: 500
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 8   # effective batch = 16: LoRA tolerates very large batches less well
+  learning_rate: 2e-4              # ~10x a full fine-tune's rate; tune it, it matters more than the variant
+  weight_decay: 0.0                # decay on the factors also shrinks A (random at the start), not just the update
+  warmup_ratio: 0.05
+  lr_scheduler: cosine
+  optimizer: adamw
+  gradient_checkpointing: selective
+  save_steps: 200
+  bf16: true
+
+memory:
+  chunked_loss: true
+  loss_num_chunks: 4
+
+plugins:
+  custom:
+    - class: palingenesis.lora:LoRA   # or its entry point name: lora
+      args:
+        rank: 16
+        alpha: 32                  # scaling alpha / rank = 2; with alpha fixed the best LR moves little with rank
+        dropout: 0.0
+        dora: false                # weight-decomposed LoRA: small, consistent gains, extra compute per step
+        lr_ratio: 1.0              # LoRA+ (B at lr_ratio x learning_rate); 1 = plain LoRA
+        save_adapter: true
+
+logging:
+  use_wandb: false
+  use_trackio: false
