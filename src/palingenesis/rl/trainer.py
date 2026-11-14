@@ -932,10 +932,15 @@ def _check_host_memory(model: torch.nn.Module, world: int) -> None:
     parameter (fp32 parameters and gradients, pinned, and AdamW's two moments), split over the
     ranks; pinned staging and load-time copies add more (a 4B policy on one A100 held 83 GB,
     about 21 bytes per parameter, when the kernel killed it), so budget 24."""
-    try:
-        with open("/proc/meminfo") as f:
-            available = next(int(line.split()[1]) * 1024 for line in f if line.startswith("MemAvailable:"))
-    except (OSError, StopIteration):
+    from palingenesis.accelerator import host_available_bytes, is_unified_memory
+
+    if is_unified_memory():
+        logger.warning(
+            "train.cpu_offload on a GPU that shares the host's RAM (unified memory) saves no memory: the offloaded "
+            "state comes out of the same pool. Turn it off."
+        )
+    available = host_available_bytes()
+    if available is None:
         return
     local = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     need = sum(p.numel() for p in model.parameters()) * 24 * local / world

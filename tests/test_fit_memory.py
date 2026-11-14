@@ -99,3 +99,30 @@ def test_report_recommends_within_the_budget(tmp_path, monkeypatch, capsys, budg
     report = json.loads(capsys.readouterr().out)
     assert report["recommended"] == expected
     assert report["limit_gb"] == pytest.approx(budget * 0.92)
+
+
+@pytest.mark.parametrize("integrated, budget", [(1, 50), (0, 120)])
+def test_unified_memory_default_budget_is_the_available_host_memory(tmp_path, monkeypatch, capsys, integrated, budget):
+    """A GPU that allocates from the host's RAM (DGX Spark) reports all of it as its own: the
+    default budget is the host memory available when pgs fit starts, not the device total."""
+    import torch
+
+    from palingenesis import accelerator
+
+    measured = {"measured_peak_gb": 60.0, "tokens_per_sec": 1000.0}
+    monkeypatch.setattr(fit_memory, "measure_in_subprocess", lambda *a: dict(measured))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    props = types.SimpleNamespace(total_memory=120 * 2**30, is_integrated=integrated)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: props)
+    monkeypatch.setattr(accelerator, "host_available_bytes", lambda: 50 * 2**30)
+    path = tmp_path / "c.yaml"
+    path.write_text("data:\n  max_seq_length: 16384\nmodel:\n  compile: false\n")
+    code = fit_memory.main(["--config", str(path), "--json"])
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report["budget_gb"] == pytest.approx(budget)
+    assert (code, report["recommended"] is None) == ((1, True) if integrated else (0, False))
+    assert ("Unified memory" in captured.err) is bool(integrated)
+    # an explicit budget is taken as given on both
+    assert fit_memory.main(["--config", str(path), "--gpu", "100", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["budget_gb"] == 100

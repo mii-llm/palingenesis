@@ -764,7 +764,9 @@ def choose_gram_mode(mode: str, k: int, p_edit: int, device) -> tuple[str, dict]
         "host_available_bytes": _host_available(),
     }
     if device.type == "cuda":
-        free, total = torch.cuda.mem_get_info(device)
+        from palingenesis.accelerator import memory_info
+
+        free, total = memory_info(device)  # unified memory: reclaimable page cache counts as free
         headroom = max(4 << 30, int(0.15 * total)) + 8 * p_edit
         info.update(device_free_bytes=int(free), device_headroom_bytes=headroom)
         fits_device = need + headroom <= free

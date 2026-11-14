@@ -257,7 +257,7 @@ pgs fit --config config.yaml --first-fit  # stop at the first setting that fits
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--gpu` | this GPU's memory | budget in GiB |
+| `--gpu` | this GPU's memory (on a GPU that shares the host's RAM, such as DGX Spark: the host memory available now) | budget in GiB |
 | `--headroom` | `0.92` | share of the budget the measured peak may use |
 | `--steps` | `3` | optimizer steps per setting (the last one is timed) |
 | `--first-fit` | off | stop at the first setting that fits |

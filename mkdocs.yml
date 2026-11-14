@@ -109,6 +109,7 @@ nav:
   - Getting Started:
     - Installation: getting-started/install.md
     - AMD GPUs: getting-started/amd.md
+    - DGX Spark: getting-started/dgx-spark.md
     - Quickstart: getting-started/quickstart.md
     - Your First Training: getting-started/first-training.md
     - Training from a Notebook: getting-started/notebook.md

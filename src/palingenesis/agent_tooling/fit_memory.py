@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         dest="gpu_memory_gb",
-        help="budget in GiB (default: this GPU)",
+        help="budget in GiB (default: this GPU; on a GPU that shares the host's RAM, the host memory available now)",
     )
     parser.add_argument(
         "--headroom",
@@ -198,10 +198,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if not torch.cuda.is_available():
         raise SystemExit("pgs fit measures on a GPU: none is available")
-    total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
-    budget_gb = args.gpu_memory_gb or total_gb
+    from palingenesis.accelerator import is_unified_memory, memory_budget_bytes
+
+    budget_gb = args.gpu_memory_gb or memory_budget_bytes() / 2**30
     limit_gb = budget_gb * args.headroom
     progress = sys.stderr if args.json else sys.stdout
+    if is_unified_memory() and not args.gpu_memory_gb:
+        print(
+            "Unified memory: the GPU allocates from the host's RAM, so the budget is the host memory available "
+            "now (--gpu overrides it). The training process's own host memory is not in the measured peaks.",
+            file=progress,
+        )
     print(
         f"Budget {budget_gb:.0f} GiB (peak allowed: {limit_gb:.1f} GiB) | {config.model.name_or_path} | "
         f"{config.train.per_device_batch_size} x {config.data.max_seq_length} tokens per micro-batch",
