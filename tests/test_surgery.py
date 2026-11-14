@@ -469,6 +469,46 @@ def test_gradient_checkpointing_gradients_have_no_dropout(setup, tmp_path):
     assert torch.allclose(checkpointed, plain, rtol=1e-4)
 
 
+def test_stop_rule_is_per_family():
+    def g(family, gap):
+        return Group(family, 0, [[1], [2]], [0], "equal", 0.0, torch.tensor([gap, gap], dtype=torch.float64))
+
+    m = torch.zeros(2, dtype=torch.float64)
+    st = surgery.constraint_rows([g("up", 3.0), g("down", -3.0)], [m, m])
+    assert st["mean"] == 0.0 and st["families"] == {"up": {"mean": 3.0, "se": 0.0}, "down": {"mean": -3.0, "se": 0.0}}
+    assert not surgery.gaps_closed(st, 0.5, 2.0)  # opposite gaps do not cancel
+    st = surgery.constraint_rows([g("moved", 0.9), g("held", 0.0)], [m, m])
+    assert abs(st["mean"]) < 0.5 and not surgery.gaps_closed(st, 0.5, 2.0)  # a held family does not dilute
+    assert surgery.gaps_closed(surgery.constraint_rows([g("a", 0.4), g("b", -0.4)], [m, m]), 0.5, 2.0)
+    hinge = Group("h", 0, [[1], [2]], [0], "hinge_below", 0.0, torch.tensor([-1.0, -1.0], dtype=torch.float64))
+    assert not surgery.gaps_closed(surgery.constraint_rows([g("a", 0.0), hinge], [m, m]), 0.5, 2.0)  # active hinge
+
+
+def test_opposite_gaps_in_two_families_are_not_converged(setup):
+    model = _load(setup["shifted"]).eval()
+    means = {}
+    for side in ("pos", "neg"):
+        ids, _ = surgery.load_sides(setup["tok"], setup["train"], side)
+        groups = surgery.make_groups(side, ids, setup["tid"], 2, 4)
+        means[side] = float(torch.cat(surgery.group_margins(model, setup["tok"], groups)).mean())
+    cfg = _config(
+        setup,
+        "opposite",
+        reference=None,
+        trust_ref="absolute",
+        iterations=1,
+        families={
+            side: FamilyConfig(path=setup["train"], side=side, target=means[side] + shift, groups=2, group_size=4)
+            for side, shift in (("pos", 3.0), ("neg", -3.0))
+        },
+        eval={},
+    )
+    rep = surgery.run_surgery(cfg)
+    first = rep["iterations"][0]
+    assert abs(first["gap_mean"]) < 0.5 and first["family_gaps"]["pos"] > 2 and first["family_gaps"]["neg"] < -2
+    assert rep["stop_reason"] != "converged" and rep["edit"]["norm"] > 0
+
+
 def test_numbers_yaml_reads_as_strings(setup):
     cfg = _config(setup, "v")
     cfg.apply_overrides(["cutoff=1e-3", "trust=2e-1", "doses=[1, 2e0]", "families.pos.target=-3e0"])  # no dot: str

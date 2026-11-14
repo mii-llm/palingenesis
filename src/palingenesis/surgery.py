@@ -21,8 +21,8 @@ The method (validated at 0.8B: a 2.2% edit restored parallel calling with every 
   (truncated pseudo-inverse, c = V_k diag(1/λ_k) V_kᵀ gap). The step is scaled to a trust radius per iteration and a
   cumulative cap, both fractions of ‖θ0 − θ_ref‖ over the edited parameters (the size of the stage that caused the
   shift) or absolute norms.
-- **Loop.** Re-measure, repeat until |mean gap| < max(min_gap, stop_se·SE of the mean gap) over the equality rows and
-  no hinge is active, or `iterations` steps.
+- **Loop.** Re-measure, repeat until |mean gap| < max(min_gap, stop_se·SE of the mean gap) over the equality rows of
+  every family and no hinge is active, or `iterations` steps.
 - **Doses.** θ(α) = θ0 + α(θ_final − θ0) for each α in `doses`. The twin target is a proxy for behaviour (our 0.8B case
   needed α = 3): choose α on a behavioural split, not on the twins.
 
@@ -847,21 +847,46 @@ def solve_coefficients(A: torch.Tensor, gap: torch.Tensor, cutoff: float = 1e-2)
 def constraint_rows(groups: list[Group], margins: list[torch.Tensor]) -> dict:
     """Gaps (target − margin, paired per side), the active rows and the stop statistics. An equality group is always a
     row; hinge_below is a row only while its mean margin is above the target (gap < 0), hinge_above only while below
-    (gap > 0). mean / se are over the equality rows (SE of the mean gap from the per-side spread in each group)."""
+    (gap > 0). mean / se are over the equality rows (SE of the mean gap from the per-side spread in each group);
+    families holds the same two per equality family, which is what the stop rule reads (see gaps_closed)."""
     gaps, rows, active, ses = [], [], [], []
+    members: dict[str, list[int]] = {}
     for i, (g, m) in enumerate(zip(groups, margins)):
         d = g.targets.to(m.dtype) - m
         gi = float(d.mean())
         gaps.append(gi)
         if g.constraint == "equal":
+            members.setdefault(g.family, []).append(len(rows))
             rows.append(i)
             ses.append(float(d.var(unbiased=True)) / len(d) if len(d) > 1 else 0.0)
         elif (g.constraint == "hinge_below" and gi < 0) or (g.constraint == "hinge_above" and gi > 0):
             active.append(i)
-    eq = [gaps[i] for i in rows]
-    mean = sum(eq) / len(eq) if eq else 0.0
-    se = math.sqrt(sum(ses)) / len(eq) if eq else 0.0
-    return {"gaps": gaps, "rows": rows + active, "equality": rows, "active": active, "mean": mean, "se": se}
+
+    def mean_se(which: list[int]) -> tuple[float, float]:
+        if not which:
+            return 0.0, 0.0
+        return sum(gaps[rows[r]] for r in which) / len(which), math.sqrt(sum(ses[r] for r in which)) / len(which)
+
+    mean, se = mean_se(list(range(len(rows))))
+    families = {name: dict(zip(("mean", "se"), mean_se(which))) for name, which in members.items()}
+    return {
+        "gaps": gaps,
+        "rows": rows + active,
+        "equality": rows,
+        "active": active,
+        "mean": mean,
+        "se": se,
+        "families": families,
+    }
+
+
+def gaps_closed(stats: dict, min_gap: float, stop_se: float) -> bool:
+    """The stop rule on constraint_rows' statistics: every equality family's |mean gap| is below
+    max(min_gap, stop_se·SE of that mean) and no hinge is active. Per family, not over all equality rows: gaps of
+    opposite sign in two families would cancel in a pooled mean, and a family that is held in place would dilute it."""
+    return not stats["active"] and all(
+        abs(f["mean"]) < max(min_gap, stop_se * f["se"]) for f in stats["families"].values()
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------- editing
@@ -1210,12 +1235,13 @@ def run_surgery(config: SurgeryConfig) -> dict:
             "gap_mean": st["mean"],
             "se": st["se"],
             "threshold": threshold,
+            "family_gaps": {name: round(f["mean"], 4) for name, f in st["families"].items()},
             "gaps": [round(x, 4) for x in st["gaps"]],
             "active_hinges": [groups[i].name for i in st["active"]],
             "rows": len(st["rows"]),
             "edit_rel": math.sqrt(edit_sq) / R if R else None,
         }
-        converged = (not st["equality"] or abs(st["mean"]) < threshold) and not st["active"]
+        converged = gaps_closed(st, config.min_gap, config.stop_se)
         if converged:
             stop_reason = "converged" if it else ("nothing_to_do" if not st["equality"] else "converged")
         elif it == config.iterations:
