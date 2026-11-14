@@ -33,7 +33,8 @@ class StepInfo:
 
 
 def parse_training_log(text: str) -> list[StepInfo]:
-    """The trainer's step lines (SFT, DEFT, DPO formats alike), one StepInfo per step."""
+    """The trainer's step lines (SFT, DEFT, DPO, RL and on-policy distillation formats alike), one
+    StepInfo per step. RL / OPD log no tok/s or dt: their rollout throughput and step time stand in."""
     from palingenesis.agent_tooling._logparse import parse_steps
 
     return [
@@ -41,9 +42,9 @@ def parse_training_log(text: str) -> list[StepInfo]:
             step=f["step"],
             loss=f["loss"],
             lr=f.get("lr", 0.0),
-            tokens_per_sec=f.get("tok/s", 0.0),
+            tokens_per_sec=f.get("tok/s", f.get("rollout_tok_s", 0.0)),
             grad_norm=f.get("grad_norm", 0.0),
-            step_time=f.get("dt", 0.0),
+            step_time=f.get("dt", f.get("time/step", 0.0)),
         )
         for f in parse_steps(text)
     ]
@@ -52,7 +53,10 @@ def parse_training_log(text: str) -> list[StepInfo]:
 def analyze_run(steps: list[StepInfo], max_steps: int | None = None) -> dict:
     """Analyze training run health from step data."""
     if not steps:
-        return {"status": "NO_DATA", "issues": ["No training step lines (step=N loss=X ...) found in the log."]}
+        return {
+            "status": "NO_DATA",
+            "issues": ["No training step lines (step=N loss=X ... or step N | loss=X ...) found in the log."],
+        }
 
     latest = steps[-1]
     first = steps[0]
@@ -182,6 +186,10 @@ def print_full(result: dict):
     print(f"  Gradient norm: {result['current_grad_norm']}")
     print(f"  Throughput: {result['tokens_per_sec']:.0f} tok/s ({result['step_time_s']:.2f}s/step)")
     print(f"  ETA: {result['eta_human']}")
+    if "latest_eval" in result:
+        latest = result["latest_eval"]
+        shown = " ".join(f"{k}={v:.4g}" for k, v in sorted(latest.items()) if k != "step")
+        print(f"  Latest eval (step {latest['step']}): {shown}")
     print()
     for issue in result["issues"]:
         prefix = "  ✓" if "normally" in issue else "  ⚠"
@@ -213,6 +221,11 @@ def main():
         steps = steps[-args.last :]
 
     result = analyze_run(steps, max_steps=args.max_steps)
+    from palingenesis.agent_tooling._logparse import parse_evals
+
+    evals = parse_evals(text)
+    if evals and result["status"] != "NO_DATA":
+        result["latest_eval"] = evals[-1]
 
     if args.brief:
         print_brief(result)
