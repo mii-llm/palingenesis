@@ -681,11 +681,19 @@ html .md-typeset .tabbed-set .tabbed-labels > label > [href]:first-child {
   font-weight: 400;
 }
 .md-header__button.md-logo {
+  margin-right: 0;
   padding: 0.3rem;
 }
+/* the arch stands on the name's baseline and reaches its ascenders */
 .md-header__button.md-logo :is(img, svg) {
-  width: 1.3rem;
-  height: 1.3rem;
+  width: 1.05rem;
+  height: 1.05rem;
+  transform: translateY(-0.1rem);
+}
+@media screen and (min-width: 76.25em) {
+  [dir="ltr"] .md-header__title {
+    margin-left: 0.4rem;
+  }
 }
 .md-header__button:hover {
   opacity: 1;

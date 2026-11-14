@@ -30,6 +30,18 @@
   letter-spacing: -0.045em;
   white-space: nowrap;
 }
+/* With JavaScript the artwork takes the heading's place: the heading keeps its space but is not painted while the
+   letterforms load, so the plain word never flashes first. If the artwork has not started after a moment (no
+   canvas, the fonts failed), the heading shows. */
+.pg-js .pg-hero:not(.has-art) .pg-hero__title {
+  visibility: hidden;
+  animation: pg-title-fallback 0s linear 1.5s forwards;
+}
+@keyframes pg-title-fallback {
+  to {
+    visibility: visible;
+  }
+}
 .pg-hero.has-art .pg-hero__title {
   position: absolute;
   width: 1px;

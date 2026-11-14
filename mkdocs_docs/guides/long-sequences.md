@@ -45,17 +45,17 @@ Transformers already process long inputs in chunks at inference time: prefill wi
 <line class="rule" x1="10" y1="168" x2="690" y2="168"/>
 <!-- Stage 2 -->
 <text class="t-label" x="10" y="192">Stage 2 · with grad · right to left</text>
-<path class="line-quiet" d="M190,136 C190,190 430,170 452,206" marker-end="url(#seco-arrow)"/>
-<path class="line-quiet" d="M330,136 C330,180 440,180 460,206" marker-end="url(#seco-arrow)"/>
-<text class="t-muted t-small" x="548" y="198">reads the cached prefix</text>
+<path class="line-quiet" d="M190,136 V150 H450 V206" marker-end="url(#seco-arrow)"/>
+<path class="line-quiet" d="M330,136 V150"/>
+<text class="t-muted t-small" x="442" y="194" text-anchor="end">reads the cached prefix</text>
 <text class="t-muted t-small" x="10" y="232">chunks</text>
 <rect class="box" x="130" y="208" width="120" height="44" rx="4"/><text class="t-muted" x="190" y="228" text-anchor="middle">chunk 1</text><text class="t-muted t-small" x="190" y="243" text-anchor="middle">waiting</text>
 <rect class="box" x="270" y="208" width="120" height="44" rx="4"/><text class="t-muted" x="330" y="228" text-anchor="middle">chunk 2</text><text class="t-muted t-small" x="330" y="243" text-anchor="middle">waiting</text>
 <rect class="box-accent" x="410" y="208" width="120" height="44" rx="4"/><text x="470" y="228" text-anchor="middle">chunk 3</text><text class="t-small" x="470" y="243" text-anchor="middle">recompute, backward</text>
 <rect class="box-quiet" x="550" y="208" width="120" height="44" rx="4"/><text class="t-muted" x="610" y="228" text-anchor="middle">chunk 4</text><text class="t-muted t-small" x="610" y="243" text-anchor="middle">done, freed</text>
 <path class="line-accent" d="M550,230 H532" marker-end="url(#seco-arrow-a)" stroke-dasharray="4 3"/>
-<text class="t-accent t-small" x="610" y="272" text-anchor="middle">state gradient at</text>
-<text class="t-accent t-small" x="610" y="286" text-anchor="middle">the chunk boundary</text>
+<text class="t-accent t-small" x="610" y="188" text-anchor="middle">state gradient at</text>
+<text class="t-accent t-small" x="610" y="201" text-anchor="middle">the chunk boundary</text>
 <!-- gradient buffer -->
 <text class="t-muted t-small" x="10" y="326">∂L / ∂(K/V)</text>
 <text class="t-muted t-small" x="10" y="341">gradient buffer</text>
@@ -63,10 +63,11 @@ Transformers already process long inputs in chunks at inference time: prefill wi
 <rect class="box-plain" x="270" y="308" width="120" height="30" rx="3"/><text class="t-mono" x="330" y="327" text-anchor="middle">∂ K/V 2</text>
 <rect class="box-accent" x="410" y="308" width="120" height="30" rx="3"/><text class="t-mono" x="470" y="327" text-anchor="middle">∂ K/V 3</text>
 <rect class="box-plain" x="550" y="308" width="120" height="30" rx="3"/><text class="t-mono" x="610" y="327" text-anchor="middle">∂ K/V 4</text>
-<path class="line-accent" d="M440,252 C420,290 220,280 196,306" marker-end="url(#seco-arrow-a)"/>
-<path class="line-accent" d="M450,252 C440,286 350,284 336,306" marker-end="url(#seco-arrow-a)"/>
+<path class="line-accent" d="M440,252 V282 H190 V306" marker-end="url(#seco-arrow-a)"/>
+<path class="line-accent" d="M330,282 V306" marker-end="url(#seco-arrow-a)"/>
+<text class="t-accent t-small" x="198" y="276">adds its attention gradient</text>
 <path class="line-accent" d="M500,306 V254" marker-end="url(#seco-arrow-a)"/>
-<text class="t-accent t-small" x="508" y="290">relayed in</text>
+<text class="t-accent t-small" x="508" y="284">relayed in</text>
 <text class="t-muted t-small" x="130" y="362">Kept throughout: the K/V cache and its gradient, plus the activations of the one chunk being recomputed.</text>
 </svg>
 </div>
