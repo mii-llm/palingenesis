@@ -9,7 +9,10 @@ on one side. Every dropped row is recorded with its reason (CleanReport).
 import hashlib
 import json
 import logging
+import math
+import os
 import random
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -152,40 +155,170 @@ def prompt_key(sample: dict, messages_field: str = "messages") -> str:
     return conversation_key(sample, messages_field)
 
 
-def tokenize_rows(samples: list[dict], chat, report: CleanReport, keep_tokens: bool = False):
+# Rows per worker below which tokenize_rows stays in one process (starting workers costs more).
+MIN_ROWS_PER_WORKER = 256
+# Rows a worker takes at a time: small enough to balance rows of very different lengths.
+MAX_SHARD_ROWS = 256
+
+
+def default_workers() -> int:
+    """Processes tokenize_rows uses when none is asked for: the CPUs this process may run on, at most 8."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    return max(1, min(cpus, 8))
+
+
+def _tokenize_one(chat, sample: dict, keep_tokens: bool) -> tuple:
+    """One row through the trainer's ChatDataset: ("drop", reason, detail) or ("keep", length,
+    trained tokens, truncated), plus the input_ids (int32) and trained-mask arrays when keep_tokens."""
+    import torch
+
+    from palingenesis.data import IGNORE_INDEX
+
+    before = chat.stats.copy()
+    try:
+        processed = chat._process(sample)
+    except Exception as exc:
+        return ("drop", "unrenderable", {"error": repr(exc)[:200]})
+    if processed is None or processed["input_ids"].numel() < 2:
+        too_long = chat.stats["dropped_too_long"] > before["dropped_too_long"]
+        return ("drop", "no_trained_turn_fits" if too_long else "nothing_to_train_on", {})
+    input_ids = processed["input_ids"]
+    trained = processed["labels"] != IGNORE_INDEX
+    outcome = ("keep", int(input_ids.numel()), int(trained.sum()), chat.stats["truncated"] > before["truncated"])
+    if keep_tokens:  # arrays, not tensors: a worker sends them back pickled, without shared-memory handles
+        outcome += (input_ids.to(torch.int32).numpy(), trained.numpy())
+    return outcome
+
+
+_worker_chat = None  # the ChatDataset of a tokenize_rows worker process
+
+
+def _init_worker(chat, log_level: int) -> None:
+    global _worker_chat
+    import torch
+
+    torch.set_num_threads(1)  # one core per worker: the workers already use them all
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
+    _worker_chat = chat
+
+
+def _tokenize_shard(shard: list[dict], keep_tokens: bool) -> tuple[list[tuple], Counter]:
+    """A worker's rows, in order, and what they added to its ChatDataset's counters."""
+    chat = _worker_chat
+    before = chat.stats.copy()
+    outcomes = [_tokenize_one(chat, sample, keep_tokens) for sample in shard]
+    delta = chat.stats.copy()
+    delta.subtract(before)
+    return outcomes, +delta
+
+
+def _start_method() -> str:
+    """fork where it is safe (Linux, CUDA not initialized): workers inherit the ChatDataset and its
+    tokenizer without a copy or a reload. spawn elsewhere: the ChatDataset is pickled once per worker."""
+    import multiprocessing as mp
+
+    import torch
+
+    if sys.platform.startswith("linux") and "fork" in mp.get_all_start_methods() and not torch.cuda.is_initialized():
+        return "fork"
+    return "spawn"
+
+
+def _tokenize_parallel(samples: list[dict], chat, keep_tokens: bool, workers: int) -> list[tuple]:
+    """Outcomes of every row in input order, from `workers` processes that each hold their own
+    ChatDataset. Contiguous shards keep the order; what the workers add to their ChatDataset's
+    counters is added to `chat.stats`."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
+
+    shard_rows = max(1, min(MAX_SHARD_ROWS, math.ceil(len(samples) / (4 * workers))))
+    method = _start_method()
+    logger.info(f"  Tokenizing {len(samples)} rows in {workers} processes ({method})")
+    # Rust tokenizers warn in a forked child once their thread pool has run in the parent; a worker is
+    # meant to use one thread. The variable is set while the workers start, then restored.
+    parallelism = os.environ.get("TOKENIZERS_PARALLELISM")
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    def restore() -> None:
+        if parallelism is None:
+            os.environ.pop("TOKENIZERS_PARALLELISM", None)
+        else:
+            os.environ["TOKENIZERS_PARALLELISM"] = parallelism
+
+    executor = ProcessPoolExecutor(
+        workers,
+        mp_context=mp.get_context(method),
+        initializer=_init_worker,
+        initargs=(chat, logging.getLogger().getEffectiveLevel()),
+    )
+    outcomes: list[tuple] = []
+    try:
+        futures = [
+            executor.submit(_tokenize_shard, samples[i : i + shard_rows], keep_tokens)
+            for i in range(0, len(samples), shard_rows)
+        ]
+        restore()  # every worker has started
+        for future in futures:
+            shard_outcomes, counts = future.result()
+            chat.stats.update(counts)
+            previous = len(outcomes)
+            outcomes += shard_outcomes
+            if len(outcomes) // 5000 > previous // 5000:
+                logger.info(f"  Tokenized {len(outcomes)}/{len(samples)}")
+    except BrokenProcessPool as exc:
+        raise RuntimeError(
+            "a tokenization worker died (out of memory?); run again with fewer processes "
+            "(preprocess.num_workers / --num_workers; 1 tokenizes in this process)"
+        ) from exc
+    finally:
+        restore()
+        executor.shutdown(wait=True, cancel_futures=True)
+    return outcomes
+
+
+def tokenize_rows(
+    samples: list[dict], chat, report: CleanReport, keep_tokens: bool = False, num_workers: int = 1
+):
     """Run every row through the trainer's own ChatDataset (template, tools, truncation at
     turn boundaries, masking) and drop the ones training would drop.
 
     Kept rows get LENGTH and TRAINED_TOKENS. Returns (kept rows, entries): entries are
     (position in kept, input_ids int32, trained mask) per kept row when keep_tokens, for
     scoring; else empty.
+
+    num_workers: processes to tokenize in (0 = default_workers()). Fewer are used when there
+    are fewer than MIN_ROWS_PER_WORKER rows per process; 1 runs in this process. The result,
+    the report and chat.stats are the same whatever the number of processes.
     """
     import torch
 
-    from palingenesis.data import IGNORE_INDEX
+    workers = num_workers if num_workers > 0 else default_workers()
+    workers = min(workers, len(samples) // MIN_ROWS_PER_WORKER)
+    if workers > 1:
+        outcomes = _tokenize_parallel(samples, chat, keep_tokens, workers)
+    else:
+        outcomes = (_tokenize_one(chat, sample, keep_tokens) for sample in samples)
 
     kept, entries = [], []
-    for i, sample in enumerate(samples):
-        before = chat.stats.copy()
-        try:
-            processed = chat._process(sample)
-        except Exception as exc:
-            logger.debug(f"row {i} cannot be rendered: {exc!r}")
-            report.drop(sample, "unrenderable", error=repr(exc)[:200])
+    for i, (sample, outcome) in enumerate(zip(samples, outcomes)):
+        if outcome[0] == "drop":
+            _, reason, detail = outcome
+            if reason == "unrenderable":
+                logger.debug(f"row {i} cannot be rendered: {detail['error']}")
+            report.drop(sample, reason, **detail)
             continue
-        if processed is None or processed["input_ids"].numel() < 2:
-            too_long = chat.stats["dropped_too_long"] > before["dropped_too_long"]
-            report.drop(sample, "no_trained_turn_fits" if too_long else "nothing_to_train_on")
-            continue
-        if chat.stats["truncated"] > before["truncated"]:
+        if outcome[3]:
             report.truncated += 1
-        trained = processed["labels"] != IGNORE_INDEX
-        sample[LENGTH] = int(processed["input_ids"].numel())
-        sample[TRAINED_TOKENS] = int(trained.sum())
+        sample[LENGTH] = outcome[1]
+        sample[TRAINED_TOKENS] = outcome[2]
         if keep_tokens:
-            entries.append((len(kept), processed["input_ids"].to(torch.int32), trained))
+            entries.append((len(kept), torch.from_numpy(outcome[4]), torch.from_numpy(outcome[5])))
         kept.append(sample)
-        if i and i % 5000 == 0:
+        if workers <= 1 and i and i % 5000 == 0:
             logger.info(f"  Tokenized {i}/{len(samples)}")
     return kept, entries
 

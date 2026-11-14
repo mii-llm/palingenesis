@@ -185,6 +185,7 @@ Offline data preparation driven by the same config as training (`pgs prepare --c
 | `batch_size` | int | `4` | Scoring batch size (inference only) |
 | `hes` | bool | `false` | Also compute HES reasoning-quality scores (slower) |
 | `hes_top_k_pct` | float | `0.5` | Top-k% highest-entropy tokens summed for HES |
+| `num_workers` | int | `0` | Processes that tokenize the rows (0 = the CPUs available, at most 8; 1 = in this process). The output is identical whatever the number |
 
 **Workflow**:
 ```bash
