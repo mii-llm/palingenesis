@@ -37,6 +37,10 @@ class Trajectory:
     trained: bool = True  # False: out of the loss (unscored, or a masked truncation)
     forced: list[int] = field(default_factory=list)  # token indices trained with a forcing probability (think-skip)
     info: dict[str, Any] = field(default_factory=dict)  # environment / reward extras, logged
+    # MoE routing replay: the experts the rollout engine routed each position of prompt_ids + tokens to, as far as
+    # it forwarded them: an integer array [positions, MoE layers, top_k] (one byte per choice up to 256 experts), or
+    # None (not recorded).
+    routing: Any = field(default=None, compare=False, repr=False)
 
     def append_generated(
         self, ids: list[int], logprobs: list[float], version: int, first_version: int | None = None
@@ -53,6 +57,28 @@ class Trajectory:
         self.logprobs += [lp if math.isfinite(lp) else 0.0 for lp in logprobs]
         self.versions.append(version)
         self.turns += 1
+
+    def extend_routing(self, routed) -> None:
+        """Record a turn's routing, after append_generated. `routed` covers the positions the engine forwarded for
+        the turn: the whole context and the turn's tokens but the last, one row each. Positions recorded by earlier
+        turns keep their record (their tokens were sampled under that routing; a later turn may re-prefill them with
+        other weights); the positions of a turn without routing (None) take a later turn's record of them."""
+        if routed is None or len(routed) == 0:
+            return
+        import numpy as np
+
+        routed = np.asarray(routed)
+        positions = len(self.prompt_ids) + len(self.tokens) - 1
+        have = 0 if self.routing is None else len(self.routing)
+        if len(routed) != positions or (have and self.routing.shape[1:] != routed.shape[1:]):
+            # not the layout this was written for (one row per forwarded position): a record that does not line
+            # up would route tokens through other tokens' experts, so the trajectory goes without replay
+            self.routing = None
+            self.info["routing_dropped"] = [int(len(routed)), positions]
+            return
+        if "routing_dropped" in self.info or positions <= have:
+            return
+        self.routing = routed.copy() if not have else np.concatenate([self.routing, routed[have:]])
 
     def append_forced(self, ids: list[int], logprob: float) -> None:
         """A prefix the sampler was made to write (think-skip): its first token is trained with the given behaviour

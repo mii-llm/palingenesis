@@ -62,6 +62,7 @@ from transformers import cache_utils as cu
 
 from palingenesis.logits import output_head, verify_output_head
 from palingenesis.loss import chunked_cross_entropy_loss, shift_labels
+from palingenesis.moe import sync_routing, token_window
 from palingenesis.seco_attention import KVStore, check_host_budget, chunk_attention, reset_host_budget
 
 logger = logging.getLogger(__name__)
@@ -464,7 +465,8 @@ def _chunkwise(
             )
             rng_states.append(_rng_state(devices))
             _attach_stores(cache, in_store, stores, seq_len, lo, write=True, offload=kv_offload)
-            hidden = _run(backbone, input_ids[:, lo:hi], cache)
+            with token_window(lo, hi):
+                hidden = _run(backbone, input_ids[:, lo:hi], cache)
             if sparse:  # skipped chunks are not recomputed; report their loss from here
                 logged += float(chunk_loss(hidden, lo, hi, with_repeat=False))
             del hidden
@@ -478,6 +480,7 @@ def _chunkwise(
     del cache
     for store in stores.values():
         store.start_gradients()
+    sync_routing()  # MoE: every token is routed; the routers' balancing gradients need the global counts
 
     # ── Stage 2: reverse sweep with gradient relay ─────────────────────────
     if sparse:
@@ -504,7 +507,7 @@ def _chunkwise(
             leaves.append(state)
         before = [_snapshot(layer) for layer in cache.layers]
 
-        with torch.random.fork_rng(devices=devices):
+        with torch.random.fork_rng(devices=devices), token_window(lo, hi, scale):
             _set_rng_state(rng_states[i], devices)  # same dropout masks as stage 1
             hidden = _run(backbone, input_ids[:, lo:hi], cache)
         loss = chunk_loss(hidden, lo, hi, weight=scale)  # SpaCO: J_i scaled by k/t (module doc)

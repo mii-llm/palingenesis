@@ -65,6 +65,7 @@ from palingenesis.distributed import (
     barrier,
     build_mesh,
     cleanup_distributed,
+    fsdp_mesh,
     is_main,
     main_value,
     rank_values,
@@ -107,6 +108,8 @@ from palingenesis.loss import (
     shift_labels,
     shift_weights,
 )
+from palingenesis.moe import RouterBalancer
+from palingenesis.moe_experts import ExpertParallel, set_experts_implementation
 from palingenesis.optim import AdamCCorrection, build_optimizer, build_scheduler
 from palingenesis.packing import (
     PackedBatch,
@@ -409,6 +412,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         model.config.use_cache = False
     if plugin_mgr:
         model = plugin_mgr.transform_model(model)
+    # ── MoE: expert compute, router balancing over the global batch, routing statistics ──
+    set_experts_implementation(model, config.moe.experts_implementation)
+    router_balancer = RouterBalancer.attach(model, config.moe)
 
     # ── Device mesh (FSDP2 / context parallel); sharded teachers use it too ──
     mesh = build_mesh(world_size, config.parallel)
@@ -509,10 +515,29 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # ── FSDP2 ─────────────────────────────────────────────────────────────
     if is_fsdp:
         logger.info("Applying FSDP2 (fully_shard)")
-        model = apply_fsdp(model, mesh, config.parallel, bf16=config.train.bf16)
+        # Expert parallel: the experts stay on their rank, sharded on the same mesh, outside FSDP's gathers
+        expert_parallel = None
+        if config.parallel.expert_parallel:
+            expert_parallel = ExpertParallel.apply(
+                model,
+                fsdp_mesh(mesh),
+                compute_dtype=compute_dtype if config.train.bf16 else None,
+                padded=config.moe.experts_implementation == "padded",
+            )
+            if expert_parallel is not None and router_balancer is not None:
+                router_balancer.expert_ranks = expert_parallel.world
+        model = apply_fsdp(
+            model,
+            mesh,
+            config.parallel,
+            bf16=config.train.bf16,
+            ignored_params=expert_parallel.parameters if expert_parallel is not None else None,
+        )
         if ref_model is not None:
             ref_model = apply_fsdp(ref_model, mesh, config.parallel, bf16=config.train.bf16)
     else:
+        if config.parallel.expert_parallel:
+            logger.warning("parallel.expert_parallel: one process (or no FSDP), nothing to split; training without it")
         model = model.to(device)
         if ref_model is not None:
             ref_model = ref_model.to(device)
@@ -1325,6 +1350,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             student_features = None
             if plugin_mgr:
                 plugin_mgr.on_forward_start(model, batch)
+            if router_balancer is not None:  # real tokens of this forward (under context parallel, of this slice)
+                router_balancer.begin(
+                    attention_mask if cp is not None and attention_mask is not None else batch["attention_mask"],
+                    grad_accum=current_ga,
+                )
             # a flattened packed row: variable-length attention over its documents (seco.PACKED_VARLEN)
             _varlen = PACKED_VARLEN.set(position_ids is not None and flatten_packed)
             with torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16 and device.type == "cuda"):
@@ -1575,6 +1605,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             # micro-loss, while `loss` carries the 1/GA gradient scaling.
             if loss_val is None:
                 loss_val = loss.detach().float().item() * current_ga
+            if router_balancer is not None:
+                router_balancer.sync()  # the ranks' expert counts, before the routers' backward (SeCO: done inside)
             if not backward_done:
                 loss.backward()
             if cp is not None:
@@ -1660,6 +1692,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
                 dt = time.perf_counter() - t_step
                 plugin_ctx.step = global_step
+                if router_balancer is not None:
+                    router_balancer.step()
 
                 # GC: run every 100 steps to prevent stalls
                 gc_ctrl.step(global_step)
@@ -1734,6 +1768,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         metrics.update(distiller.pop_metrics())
                     if plugin_mgr:
                         metrics.update(plugin_mgr.metrics(model))
+                    if router_balancer is not None:
+                        metrics.update(router_balancer.metrics())
                     if _spike_detector is not None:
                         metrics["train/spikes_skipped"] = _spike_detector.spikes_detected
                     if _adagc is not None:
@@ -1785,7 +1821,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                             )
                         logger.info(
                             f"step={global_step} loss={step_loss:.4f}{ce_str} lr={lr:.2e} "
-                            f"tok/s={tok_s:.0f} grad_norm={gn:.3f} dt={dt:.2f}s{entropy_str}{eval_str}"
+                            f"tok/s={tok_s:.0f} grad_norm={gn:.3f} dt={dt:.2f}s{entropy_str}{RouterBalancer.summary(metrics)}{eval_str}"
                         )
 
                 # Deferred gradient zeroing: AFTER health/logging (which inspect

@@ -160,6 +160,26 @@
 | `cp_rotate_method` | str | `allgather` | How K/V reach the other ranks: `allgather`, the only method implemented. |
 | `cpu_offload` | bool | `false` | Offload FSDP parameters to CPU. Extreme memory savings but very slow. |
 | `reshard_after_forward` | bool | `true` | Reshard parameters after forward. `false` = keep unsharded (more memory, less communication). |
+| `expert_parallel` | bool | `false` | MoE models: every rank keeps `experts / ranks` experts of each layer and the tokens are sent to the rank that owns their experts (all-to-all), instead of FSDP gathering all expert weights on every rank. Needs `fsdp: true` and a number of ranks that divides the number of experts; not with context parallelism, SeCO or CPU offload. Experimental: gradients tested equal to one process on CPU ranks, not measured on several GPUs. See [Mixture-of-Experts Models](../guides/moe.md#expert-parallelism). |
+
+---
+
+## moe
+
+Mixture-of-Experts models (ignored for dense models). The same section exists in RL (`pgs rl`) and distillation
+(`pgs distill`) configs. See [Mixture-of-Experts Models](../guides/moe.md).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `balance` | bool | `true` | Router balancing and routing statistics (`moe/...` metrics). `false`: the routers train on the task loss alone. |
+| `balance_loss_coef` | float | `-1` | Coefficient of the load-balancing loss (Switch Transformer), with the expert loads measured over the global batch: every rank and every micro-batch of the optimizer step. `-1`: the model config's `router_aux_loss_coef`, at most 0.01. `0`: off. |
+| `z_loss_coef` | float | `0.0` | Coefficient of the router z-loss (ST-MoE used 0.001). `0`: off. |
+| `bias_update_rate` | float | `-1` | Auxiliary-loss-free balancing: step of the routers' selection bias after every optimizer step, against the step's loads. Only for routers with a selection bias in their checkpoint (DeepSeek-V3 family). `-1`: 0.001 for those models, off for the others. `0`: off. |
+| `log_layers` | bool | `false` | Also log the loads and router entropy of every MoE layer (`moe/layer_<i>/...`). |
+| `experts_implementation` | str | `auto` | Expert compute: `auto` (transformers' default, a grouped GEMM where torch has one), `grouped` or `padded` (this library's forwards), or a transformers name (`eager`, `grouped_mm`, `batched_mm`). `pgs train`. Measure with `scripts/bench_moe_experts.py`. |
+
+RL configs also have `rollout.routing_replay` (`auto` / `on` / `off`, default `auto`): train each token through the
+experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.md#rl-routing-replay).
 
 ---
 

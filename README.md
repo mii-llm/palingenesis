@@ -63,6 +63,9 @@ AMD GPUs (ROCm): [Training on AMD GPUs](https://mii-llm.github.io/palingenesis/g
   `pgs fit` measures which memory settings are the fastest that fit your GPU.
 - **Long sequences on one GPU (SeCO).** Chunk-by-chunk training with a cache gives the exact gradient, verified against full
   backpropagation on 27 architectures, including the Qwen3.5 and LFM2 hybrids.
+- **Mixture-of-Experts models.** Routers are balanced in every trainer (load-balancing loss with the expert load measured
+  over the global batch, router z-loss, DeepSeek-V3's selection-bias update), with per-layer load and entropy in the log;
+  RL replays the experts the rollout engine chose. Gradients tested against the written-out losses on five families.
 - **Training you can inspect.** wandb and trackio with grad norm, spike and clip counters, gradient noise scale, entropy and
   the generalisation gap on one step axis; best-checkpoint tracking on eval loss.
 - **Crash-safe.** Re-run the same command to resume from the last complete checkpoint, in the same tracker run.

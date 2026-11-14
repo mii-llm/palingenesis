@@ -252,6 +252,49 @@ class ParallelConfig:
     cp_rotate_method: Literal["allgather"] = "allgather"
     cpu_offload: bool = False
     reshard_after_forward: bool = True
+    # MoE models: every rank keeps experts / ranks experts of each layer and the tokens are sent to
+    # the rank that owns their experts (all-to-all), instead of FSDP gathering every layer's expert
+    # weights on every rank (palingenesis.moe_experts). Needs fsdp: true and a number of ranks that
+    # divides the number of experts. STATUS: experimental (gradients tested equal to one process on
+    # CPU ranks; not measured on several GPUs).
+    expert_parallel: bool = False
+
+
+@dataclass(slots=True)
+class MoEConfig:
+    """Mixture-of-Experts models (palingenesis.moe); ignored for models without MoE layers."""
+
+    # Router balancing and routing statistics. false: the routers train on the task loss alone.
+    balance: bool = True
+    # Coefficient of the load-balancing loss, measured over the global batch (every rank and
+    # micro-batch of the optimizer step). -1: the model config's router_aux_loss_coef, at most
+    # 0.01; 0: off.
+    balance_loss_coef: float = -1.0
+    # Coefficient of the router z-loss (ST-MoE used 0.001); 0: off.
+    z_loss_coef: float = 0.0
+    # Auxiliary-loss-free balancing: step size of the selection bias, for routers that have one in
+    # their checkpoint (DeepSeek-V3 family). -1: 0.001 for those models, off for the others; 0: off.
+    bias_update_rate: float = -1.0
+    # Also log the per-layer loads and router entropies (moe/layer_<i>/...).
+    log_layers: bool = False
+    # Expert compute: "auto" (transformers' default: grouped GEMM where available), "grouped" (this
+    # library's sort-free dispatch and grouped GEMM), or a transformers name (eager, grouped_mm, batched_mm).
+    experts_implementation: str = "auto"
+
+    def validate(self) -> list[str]:
+        """Errors in the section (shared by the pgs train, pgs rl and pgs distill configs)."""
+        errors = []
+        if self.balance_loss_coef < 0 and self.balance_loss_coef != -1:
+            errors.append(
+                f"moe.balance_loss_coef must be >= 0, or -1 for the model config's value (got {self.balance_loss_coef})."
+            )
+        if self.bias_update_rate < 0 and self.bias_update_rate != -1:
+            errors.append(
+                f"moe.bias_update_rate must be >= 0, or -1 for the model's default (got {self.bias_update_rate})."
+            )
+        if self.z_loss_coef < 0:
+            errors.append(f"moe.z_loss_coef must be >= 0 (got {self.z_loss_coef}).")
+        return errors
 
 
 @dataclass(slots=True)
@@ -443,6 +486,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    moe: MoEConfig = field(default_factory=MoEConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     dpo: DPOConfig = field(default_factory=DPOConfig)
@@ -650,6 +694,7 @@ class Config:
             )
 
         errors += self._context_parallel_errors()
+        errors += self.moe.validate()
 
         if self.data.packing and self.parallel.context_parallel:
             errors.append(
@@ -892,6 +937,16 @@ class Config:
                 "parallel.context_parallel needs parallel.fsdp: true (FSDP sums the gradients of the ranks that "
                 "split a sequence)."
             )
+        if p.expert_parallel:
+            unsupported = {
+                "parallel.fsdp: false (the other parameters stay under FSDP)": not p.fsdp,
+                "parallel.context_parallel": p.context_parallel,
+                "memory.seco (ranks run different numbers of chunks; the token exchange is a collective)": (
+                    self.memory.seco
+                ),
+                "parallel.cpu_offload": p.cpu_offload,
+            }
+            errors += [f"parallel.expert_parallel does not support {name}." for name, on in unsupported.items() if on]
         return errors
 
     def _seco_errors(self) -> list[str]:

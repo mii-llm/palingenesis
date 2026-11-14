@@ -44,6 +44,7 @@ from palingenesis.kernels import (
 from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.memory import trim_host_memory
+from palingenesis.moe import RouterBalancer, config_is_moe
 from palingenesis.opd.orchestrator import Orchestrator, PublishedWeights
 from palingenesis.opd.rollout import (
     HFRollout,
@@ -187,6 +188,15 @@ class RLTrainer:
                 precision = precision_options(r.fp32_head, r.ssm_state_dtype, overrides)
             except ValueError as e:
                 raise RLConfigError(str(e)) from None
+        # MoE routing replay: the engine returns the experts it routed every token to (palingenesis.moe)
+        self.routing_replay = r.routing_replay != "off" and config_is_moe(m.policy)
+        if r.routing_replay == "on" and not self.routing_replay:
+            raise RLConfigError(f"rollout.routing_replay: on, but {m.policy} has no MoE layers.")
+        if self.routing_replay and r.backend != "hf" and not r.prefix_caching:
+            if r.routing_replay == "on":
+                raise RLConfigError("rollout.routing_replay with a vLLM backend needs rollout.prefix_caching: true.")
+            logger.warning("MoE policy without rollout.prefix_caching: vLLM cannot return routing; no routing replay")
+            self.routing_replay = False
         if r.backend == "vllm_server":
             self.server = VLLMServer(
                 m.policy,
@@ -206,6 +216,7 @@ class RLTrainer:
                     *(["--max-num-seqs", str(r.max_num_seqs)] if r.max_num_seqs else []),
                     *(["--kv-cache-dtype", r.kv_cache_dtype] if r.kv_cache_dtype else []),
                     *(["--quantization", r.quantization] if r.quantization else []),
+                    *(["--enable-return-routed-experts"] if self.routing_replay else []),
                     *serve_flags(precision),
                 ),
             )
@@ -233,6 +244,9 @@ class RLTrainer:
         for model_config in (self.model.config, getattr(self.model.config, "text_config", None)):
             if model_config is not None and hasattr(model_config, "use_cache"):
                 model_config.use_cache = False
+        # MoE: router balancing over the global batch, routing statistics, routing replay
+        self.router_balancer = RouterBalancer.attach(self.model, config.moe, replay=self.routing_replay)
+        self.routing_replay = self.routing_replay and self.router_balancer is not None
         if not fsdp:
             self.model.to(self.device)
         checkpointing = m.gradient_checkpointing
@@ -277,25 +291,40 @@ class RLTrainer:
 
         if r.backend == "hf":
             self.engine = HFRollout(self.model, self.stop_ids, self.pad_id, r.micro_seqs)
+            self.engine.record_routing = self.routing_replay
         elif r.backend == "vllm":
             extra = {k: v for k, v in (("kv_cache_dtype", r.kv_cache_dtype), ("quantization", r.quantization)) if v}
             extra.update(r.vllm_args)
             extra.update(precision)
-            self.engine = VLLMColocateRollout(
-                m.policy,
-                self.stop_ids,
-                r.gpu_memory_utilization,
-                r.max_model_len,
-                r.enforce_eager,
-                t.seed + rank,
-                sleep_mode=r.sleep and r.max_staleness == 0,
-                prefix_caching=r.prefix_caching,
-                max_num_seqs=max(256, max_num_seqs(config) // world),
-                # under torchrun (any world size) vLLM must join the launcher's rendezvous: its own
-                # tcp:// init would wait on the agent store torchrun tells every process to use
-                external_launcher=world > 1 or "TORCHELASTIC_RUN_ID" in os.environ,
-                engine_kwargs=extra,
-            )
+
+            def colocated(engine_kwargs):
+                return VLLMColocateRollout(
+                    m.policy,
+                    self.stop_ids,
+                    r.gpu_memory_utilization,
+                    r.max_model_len,
+                    r.enforce_eager,
+                    t.seed + rank,
+                    sleep_mode=r.sleep and r.max_staleness == 0,
+                    prefix_caching=r.prefix_caching,
+                    max_num_seqs=max(256, max_num_seqs(config) // world),
+                    # under torchrun (any world size) vLLM must join the launcher's rendezvous: its own
+                    # tcp:// init would wait on the agent store torchrun tells every process to use
+                    external_launcher=world > 1 or "TORCHELASTIC_RUN_ID" in os.environ,
+                    engine_kwargs=engine_kwargs,
+                )
+
+            if self.routing_replay and r.routing_replay == "auto":
+                try:  # a vLLM without the option, or a setup it refuses it for: train without replay
+                    self.engine = colocated({**extra, "enable_return_routed_experts": True})
+                except (TypeError, ValueError, NotImplementedError) as e:
+                    logger.warning("vLLM cannot return the routed experts (%s): no routing replay", e)
+                    self.routing_replay = False
+                    self.engine = colocated(extra)
+            else:
+                self.engine = colocated(
+                    {**extra, "enable_return_routed_experts": True} if self.routing_replay else extra
+                )
         else:
             self.engine = VLLMServerRollout(self.server, self.stop_ids)
         self.weights = PublishedWeights(self.model)
@@ -468,17 +497,27 @@ class RLTrainer:
         device = self.device
         current = self._current_version()
         self.model.train()
+        balancer = getattr(self, "router_balancer", None)
         for i, micro in enumerate(micro_batches):
             self.parallel.gradient_sync(self.model, i == count - 1)
             if micro is None:  # this rank ran out: a zero-weight pass keeps the collectives in step
+                if balancer is not None:  # no real token; the count all-reduce stays in step too
+                    balancer.begin(torch.zeros(1, 2, dtype=torch.bool), grad_accum=count)
                 with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                     hidden = final_hidden_states(self.model, torch.full((1, 2), self.pad_id, device=device), None)
                 lp, _ = target_logprobs(
                     hidden[0, -1:], self.head, torch.tensor([self.pad_id], device=device), low=self.head_weight
                 )
+                if balancer is not None:
+                    balancer.sync()
                 (lp.sum() * 0.0).backward()
+                if balancer is not None:
+                    balancer.end()
                 continue
-            ids, _ = right_pad([t.prompt_ids + t.tokens[:-1] for t in micro], self.pad_id, device)
+            ids, real = right_pad([t.prompt_ids + t.tokens[:-1] for t in micro], self.pad_id, device)
+            if balancer is not None:
+                replay = _routing_batch(micro, ids.shape[1]) if self.routing_replay else None
+                balancer.begin(real, grad_accum=count, replay=replay)
             positions = torch.zeros(ids.shape, dtype=torch.bool)
             targets, behaviour, advantage, weight, seq, forced = [], [], [], [], [], []
             completion_pos, sampled_by = [], []
@@ -512,7 +551,11 @@ class RLTrainer:
             stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], forced_t))
             if self.ref_lp:
                 loss = self._kl_term(loss, stats, lp, torch.cat([self.ref_lp[id(t)] for t in micro]), floats[2])
+            if balancer is not None:
+                balancer.sync()  # the ranks' expert counts, before the routers' backward
             loss.backward()
+            if balancer is not None:
+                balancer.end()
             _accumulate(totals, stats, loss, entropy)
         if not totals:
             return {}
@@ -550,7 +593,8 @@ class RLTrainer:
 
     def _share_prompts(self, groups: list[list[Trajectory]]) -> bool:
         mode = self.config.train.prompt_sharing
-        if mode == "off" or self.parallel.fsdp:
+        # routing replay: the recorded routing is per row, the tree computes a group's prompt once
+        if mode == "off" or self.parallel.fsdp or getattr(self, "routing_replay", False):
             return False
         if mode == "on":
             return True
@@ -610,6 +654,10 @@ class RLTrainer:
                 _accumulate(totals, stats, loss, entropy)
                 return loss
 
+            balancer = getattr(self, "router_balancer", None)
+            if balancer is not None:  # averaged over the group's tokens, loads from the trunk
+                tree_tokens = trunk.shape[1] + sum(b.input_ids.shape[1] for b in branches)
+                balancer.begin(None, grad_accum=len(groups), tokens=tree_tokens)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 tree_forward_backward(
                     self.model,
@@ -619,6 +667,8 @@ class RLTrainer:
                     chunk_size=max(len(prompt), 1),
                     branch_tokens=self.config.train.micro_tokens,
                 )
+            if balancer is not None:
+                balancer.end()
         return rest
 
     def _current_version(self) -> int:
@@ -679,6 +729,9 @@ class RLTrainer:
                         if self.master is not None:
                             self.master.publish()
                     self.opt.zero_grad(set_to_none=True)
+                    if self.router_balancer is not None:
+                        metrics.update(self.router_balancer.metrics())
+                        self.router_balancer.step()
                     if self.reference is not None and t_loss.kl_ref_reset and (step + 1) % t_loss.kl_ref_reset == 0:
                         self.reference.reset_to(self.model)
                         logger.info("KL reference reset to the policy at step %d", step + 1)
@@ -906,6 +959,22 @@ class RLTrainer:
 def _plain_linear(head) -> bool:
     """A bias-free nn.Linear head whose logits the model uses as they are (scaling its input scales its logits)."""
     return isinstance(head, torch.nn.Linear) and head.bias is None
+
+
+def _routing_batch(micro: list[Trajectory], width: int) -> torch.Tensor | None:
+    """The rollout engine's expert choices for a micro-batch's rows, [rows, width, MoE layers, top_k] (int64), -1
+    where a position has none (padding, positions the engine never forwarded, trajectories without routing); None
+    when no row has any."""
+    recorded = [t.routing for t in micro]
+    shape = next((r.shape[1:] for r in recorded if r is not None and len(r)), None)
+    if shape is None:
+        return None
+    out = torch.full((len(micro), width, *shape), -1, dtype=torch.long)
+    for row, r in enumerate(recorded):
+        if r is not None and len(r) and r.shape[1:] == shape:
+            n = min(len(r), width)
+            out[row, :n] = torch.from_numpy(r[:n].astype("int64"))
+    return out
 
 
 def _sampled_by(t: Trajectory, sampled: list[int], current: int) -> list[int]:
