@@ -232,6 +232,13 @@ def apply_fsdp(
         reshard_after_forward=config.reshard_after_forward,
     )
 
+    # A multimodal model's vision blocks are shards of their own (frozen or trained): otherwise the
+    # whole tower would sit in the root group, gathered for the entire step.
+    from palingenesis.multimodal import vision_layers
+
+    for block in vision_layers(model):
+        fully_shard(block, **fsdp_kwargs)
+
     # Find and shard transformer layers bottom-up
     layers = _find_transformer_layers(model)
     for i, layer in enumerate(layers):
@@ -260,7 +267,9 @@ def apply_fsdp(
 
 def _find_transformer_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
     """Find repeated transformer layers in HF models."""
-    for attr_path in ("model.layers", "transformer.h", "transformer.layers"):
+    # model.language_model.layers: a multimodal model's language model (its vision tower's blocks
+    # are palingenesis.multimodal.vision_layers)
+    for attr_path in ("model.language_model.layers", "model.layers", "transformer.h", "transformer.layers"):
         obj = model
         try:
             for part in attr_path.split("."):

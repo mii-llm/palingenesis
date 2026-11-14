@@ -18,6 +18,7 @@ import logging
 import torch
 from torch import Tensor, nn
 
+from palingenesis import multimodal
 from palingenesis.distill.config import TeacherSpec
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 
@@ -76,19 +77,23 @@ class OnlineTeacher:
             tokenizer = AutoTokenizer.from_pretrained(spec.tokenizer or spec.model, trust_remote_code=trust_remote_code)
         self.tokenizer = tokenizer
         self.bridge = shared_vocabulary(student_tok, tokenizer, spec)
+        vision = multimodal.vision_of(student_tok)
         if model is None:
             logger.info("Loading teacher %s: %s (%s, frozen)", spec.name, spec.model, spec.dtype)
-            model = AutoModelForCausalLM.from_pretrained(
+            # a multimodal student: the teacher reads the same pixels, in its multimodal architecture
+            load = multimodal.load_model if vision is not None else AutoModelForCausalLM.from_pretrained
+            model = load(
                 spec.model,
                 dtype=DTYPES[spec.dtype],
                 attn_implementation=spec.attn_implementation or attn_implementation,
                 trust_remote_code=trust_remote_code,
                 low_cpu_mem_usage=True,
             )
-        if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
+        multimodal.disable_cache(model)
         model.requires_grad_(False)
         model.eval()
+        if vision is not None:  # same image tokens, patches and merge as the student's processor writes
+            multimodal.check_model(model, vision, f"teacher {spec.name}")
         placement = spec.placement
         if placement == "auto":
             placement = "shard" if mesh is not None else "replicate"

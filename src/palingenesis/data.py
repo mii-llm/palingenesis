@@ -53,6 +53,17 @@ from torch.utils.data import DataLoader, IterableDataset
 from transformers import PreTrainedTokenizerBase
 
 from palingenesis.config import DataConfig
+from palingenesis.multimodal import (
+    PIXEL_FIELDS,
+    POSITION_FIELD,
+    MultimodalError,
+    collate_images,
+    has_image_parts,
+    image_fields,
+    mask_image_labels,
+    split_images,
+    vision_of,
+)
 from palingenesis.validate_data import THINK_TAGS
 
 logger = logging.getLogger(__name__)
@@ -602,8 +613,18 @@ class ChatDataset(_Epochs, IterableDataset):
         reasoning_loop_recovery: float = 0.0,
         repeat_targets: bool = False,
         teacher_views: list | None = None,
+        vision=None,
     ):
         self.dataset = dataset
+        # Images (palingenesis.multimodal): the model's VisionProcessor, by default the one attached to
+        # the tokenizer. None: text only, image parts are not rendered into pixels.
+        self.vision = vision if vision is not None else vision_of(tokenizer)
+        self._row_images: list = []  # the current row's images (ImageInput), in rendering order
+        if self.vision is not None and teacher_views:
+            raise MultimodalError(
+                "teacher views (distill.teachers.<name>.view) are not supported with multimodal training: a "
+                "view renders the row again for the teacher, without the images"
+            )
         # Off-policy distillation with a teacher view (palingenesis.distill.views): [(view, teacher
         # ChatDataset)]; each kept row also gets the teacher's rendering and the position alignment.
         self.teacher_views = list(teacher_views or [])
@@ -677,8 +698,17 @@ class ChatDataset(_Epochs, IterableDataset):
 
     def _render_chat(self, messages: list[dict], **kwargs):
         """apply_chat_template with the current row's template kwargs. Explicit keyword
-        arguments win, so a call site can still force e.g. add_generation_prompt."""
-        return self.tokenizer.apply_chat_template(messages, **{**self._template_kwargs, **kwargs})
+        arguments win, so a call site can still force e.g. add_generation_prompt. A row with
+        images renders to text with every image placeholder expanded to its image's tokens,
+        so token counts, truncation and the offset masker all see the real sequence."""
+        merged = {**self._template_kwargs, **kwargs}
+        if not self._row_images:
+            return self.tokenizer.apply_chat_template(messages, **merged)
+        if merged.get("tokenize", True):
+            raise TypeError("rows with images are tokenized from their expanded render")
+        text = self.tokenizer.apply_chat_template(messages, **merged)
+        rendered = text.count(self.vision.image_token)  # a prefix of the row renders its first images
+        return self.vision.expand_text(text, [im.tokens for im in self._row_images[:rendered]])
 
     def __iter__(self):
         dataset = _shard_then_shuffle(
@@ -791,6 +821,57 @@ class ChatDataset(_Epochs, IterableDataset):
         return self._has_generation_span
 
     def _process(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
+        """One row tokenized and masked; with images, also their pixels and positions."""
+        self._row_images = []
+        result = self._process_row(example)
+        if result is None or self.vision is None:
+            return result
+        return self._attach_images(result)
+
+    def _attach_images(self, result: dict[str, torch.Tensor]) -> dict[str, torch.Tensor] | None:
+        """The row's multimodal fields (palingenesis.multimodal.image_fields). Truncation keeps whole
+        turns, so the kept tokens hold the first images whole; a row cut inside an image is dropped."""
+        input_ids = result["input_ids"]
+        kept = int((input_ids == self.vision.image_token_id).sum())
+        images, total = [], 0
+        for image in self._row_images:
+            if total >= kept:
+                break
+            images.append(image)
+            total += image.tokens
+        if total != kept:
+            self.stats["dropped_image_cut"] += 1
+            return None
+        mask_image_labels(result["labels"], input_ids, self.vision)
+        if (result["labels"] != IGNORE_INDEX).sum() == 0:
+            return None
+        result.update(image_fields(input_ids, images, self.vision))
+        self.stats["images"] += len(images)
+        return result
+
+    def _split_images(self, messages: list[dict]) -> list[dict]:
+        """Image parts out of the messages (the template renders one placeholder each) and
+        processed into `_row_images`. The template must render every image: a count mismatch is a
+        configuration error (e.g. images in tool messages under a template that drops them)."""
+        if self.vision is None:
+            if has_image_parts(messages) and not self.__dict__.get("_warned_images"):
+                self._warned_images = True
+                logger.warning(
+                    "the data has image parts but multimodal training is off (multimodal.enabled: false): "
+                    "the images are ignored and only the text is trained on"
+                )
+            return messages
+        messages, refs = split_images(messages)
+        if refs:
+            images = [self.vision.encode(ref) for ref in refs]
+            text = self.tokenizer.apply_chat_template(
+                messages, **{**self._template_kwargs, "tokenize": False, "add_generation_prompt": False}
+            )
+            self.vision.expand_text(text, [im.tokens for im in images])  # raises on a count mismatch
+            self._row_images = images
+        return messages
+
+    def _process_row(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
         from palingenesis.validate_data import (
             is_trained_message,
             normalize_messages,
@@ -825,6 +906,7 @@ class ChatDataset(_Epochs, IterableDataset):
         elif not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
             return None  # unparseable: dropped (counted), not a crash
         # If normalization returns None, use raw messages (may still work with some templates)
+        messages = self._split_images(messages)
 
         # Masking part of a turn needs the offset masker (fast tokenizers); without it the copies would be trained.
         fast = getattr(self.tokenizer, "is_fast", False)
@@ -858,6 +940,7 @@ class ChatDataset(_Epochs, IterableDataset):
         )
         if (
             per_turn_flags
+            or self._row_images  # tokenized from the render with expanded image placeholders
             or self.repeat_targets
             or self.turn_scaling != "uniform"
             or not self._template_has_generation_span()
@@ -1651,6 +1734,7 @@ class ChatDataset(_Epochs, IterableDataset):
         tools = self._template_kwargs.get("tools")
         if tools:
             payload += len(json.dumps(tools, ensure_ascii=False, default=str).encode())
+        payload += sum(image.tokens for image in self._row_images)
         if payload + 64 * len(messages) + 2048 <= self.max_seq_length:
             return messages
 
@@ -1901,8 +1985,15 @@ class PackedDataset(_Epochs, IterableDataset):
     def _doc(self, ex: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # Oversized documents are cut to max_len (the chat pipeline already keeps whole
         # turns within max_seq_length; this only guards other sources).
-        keys = ["input_ids", "labels"] + [k for k in ("loss_weights", "source_ids") if k in ex]
-        return {k: ex[k][: self.max_len] for k in keys}
+        keys = ["input_ids", "labels"] + [k for k in ("loss_weights", "source_ids", POSITION_FIELD) if k in ex]
+        doc = {k: ex[k][: self.max_len] for k in keys}
+        pixels = {k: ex[k] for k in PIXEL_FIELDS if k in ex}
+        if pixels and ex["input_ids"].numel() > self.max_len:
+            raise MultimodalError(
+                f"a document with images has {ex['input_ids'].numel()} tokens, more than the packed block "
+                f"({self.max_len}): it cannot be cut without cutting an image"
+            )
+        return {**doc, **pixels}
 
     @staticmethod
     def _block(docs: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -1912,7 +2003,23 @@ class PackedDataset(_Epochs, IterableDataset):
             docs = [
                 d if "loss_weights" in d else {**d, "loss_weights": (d["labels"] != IGNORE_INDEX).float()} for d in docs
             ]
-        block = {k: torch.cat([d[k] for d in docs]) for k in docs[0]}
+        multimodal = any(POSITION_FIELD in d for d in docs)
+        block = {k: torch.cat([d[k] for d in docs]) for k in docs[0] if k not in PIXEL_FIELDS and k != POSITION_FIELD}
+        if multimodal:
+            # Every document keeps the positions it has on its own (text documents: 0, 1, 2, ... on the
+            # three axes) and its images follow in document order, the order of their placeholders.
+            block[POSITION_FIELD] = torch.cat(
+                [
+                    d[POSITION_FIELD]
+                    if POSITION_FIELD in d
+                    else torch.arange(d["input_ids"].numel())[:, None].expand(-1, 3)
+                    for d in docs
+                ]
+            )
+            for k in PIXEL_FIELDS:
+                parts = [d[k] for d in docs if k in d]
+                if parts:
+                    block[k] = torch.cat(parts)
         n = block["input_ids"].numel()
         block["attention_mask"] = torch.ones(n, dtype=torch.long)
         block["position_ids"] = torch.cat([torch.arange(d["input_ids"].numel()) for d in docs])
@@ -2068,6 +2175,7 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
             out[k].append(torch.cat([t, torch.full((pad_len,), IGNORE_INDEX, dtype=torch.long)]))
 
     result = {k: torch.stack(v) for k, v in out.items()}
+    result.update(collate_images(batch, max_len))  # images: positions per token, pixels in row order
     for k in per_token:
         rows = [x[k] if k in x else torch.full_like(x["input_ids"], -1) for x in batch]
         result[k] = torch.stack([torch.cat([r, torch.full((max_len - r.size(0),), -1, dtype=r.dtype)]) for r in rows])

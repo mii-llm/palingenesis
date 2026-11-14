@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from palingenesis.logits import scored_ce_sum
 from palingenesis.loss import shift_labels
+from palingenesis.multimodal import forward_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +217,9 @@ class MultiEvaluator:
 
                 # Logits only at scored positions, in slices: the full [B, S, V]
                 # logits of model(...) dominated peak memory (palingenesis.logits).
-                loss, valid = scored_ce_sum(model, input_ids, attention_mask, labels, dtype)
+                loss, valid = scored_ce_sum(
+                    model, input_ids, attention_mask, labels, dtype, forward_kwargs=forward_kwargs(batch_device, {})
+                )
                 source_loss += loss
                 source_tokens += valid
 

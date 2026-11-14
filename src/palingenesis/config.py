@@ -418,6 +418,24 @@ class DPOConfig:
 
 
 @dataclass(slots=True)
+class MultimodalConfig:
+    """Images in the training data (palingenesis.multimodal; the multimodal guide)."""
+
+    # Load the checkpoint in its multimodal architecture and feed the images in the data's content
+    # parts ({"type": "image", "image": ...}) to its vision tower. false: the language model alone is
+    # loaded and trained, image parts are ignored, and exports copy the vision tower unchanged.
+    enabled: bool = False
+    # Train the vision encoder / the projector (Qwen: the patch merger) or keep them frozen.
+    # Frozen modules still run forward on every image; they take no optimizer state.
+    train_vision_tower: bool = False
+    train_projector: bool = False
+    # Bounds of the image processor's resize, in pixels (null: the checkpoint's own). They set each
+    # image's token count: (pixels / patch^2) / merge^2. Serve the model with the same bounds.
+    min_pixels: int | None = None
+    max_pixels: int | None = None
+
+
+@dataclass(slots=True)
 class LoggingConfig:
     project: str = "palingenesis"
     run_name: str | None = None
@@ -447,6 +465,7 @@ class Config:
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     dpo: DPOConfig = field(default_factory=DPOConfig)
     distill: DistillConfig = field(default_factory=DistillConfig)
+    multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     @classmethod
@@ -566,6 +585,32 @@ class Config:
         ]:
             if tags and not valid_think_tags(tags):
                 errors.append(f"{where} must be two different non-empty strings [open, close], got {tags!r}.")
+        if self.multimodal.enabled:
+            mm = self.multimodal
+            for name, why in (
+                (
+                    "parallel.context_parallel" if self.parallel.context_parallel else "",
+                    "an image's tokens and its M-RoPE positions cannot be split across the ranks of a sequence",
+                ),
+                (
+                    "memory.seco" if self.memory.seco else "",
+                    "the chunked forward runs the language model on token ids, without the vision tower",
+                ),
+                (
+                    "data.pretokenize" if self.data.pretokenize else "",
+                    "the cache stores token tensors, not pixels",
+                ),
+            ):
+                if name:
+                    errors.append(f"multimodal.enabled with {name} is not supported: {why}.")
+            for name in ("min_pixels", "max_pixels"):
+                value = getattr(mm, name)
+                if value is not None and value <= 0:
+                    errors.append(f"multimodal.{name} must be a positive number of pixels, got {value}.")
+            if mm.min_pixels and mm.max_pixels and mm.min_pixels > mm.max_pixels:
+                errors.append(f"multimodal.min_pixels ({mm.min_pixels}) is above max_pixels ({mm.max_pixels}).")
+        elif self.multimodal.train_vision_tower or self.multimodal.train_projector:
+            errors.append("multimodal.train_vision_tower / train_projector need multimodal.enabled: true.")
         if self.train.keep_checkpoints < 0:
             errors.append(f"train.keep_checkpoints must be >= 0 (0 keeps all), got {self.train.keep_checkpoints}.")
         if self.train.stable_softmax:

@@ -182,6 +182,7 @@ def scored_ce_sum(
     ignore_index: int = -100,
     chunk_bytes: float = 1e9,
     position_ids: torch.Tensor | None = None,
+    forward_kwargs: dict | None = None,
 ) -> tuple[float, int]:
     """Summed cross-entropy over the scored positions, and their count, for evaluation.
 
@@ -190,9 +191,12 @@ def scored_ce_sum(
     of fp32 at a time. The model's forward would materialise [B, S, V] logits
     (8 GB in bf16 for 4 x 4096 tokens at a 248k vocabulary, twice that once
     upcast), which dominated the trainer's peak memory at evaluation time.
-    `position_ids` (optional) go to the forward (a context-parallel slice of the rows).
+    `position_ids` (optional) go to the forward (a context-parallel slice of the rows), as do
+    `forward_kwargs` (a multimodal batch's pixels and positions).
     """
-    kwargs = {} if position_ids is None else {"position_ids": position_ids}
+    kwargs = dict(forward_kwargs or {})
+    if position_ids is not None:
+        kwargs["position_ids"] = position_ids
     valid = shifted_labels != ignore_index
     count = int(valid.sum())
     if count == 0 and position_ids is None:  # a context-parallel slice still runs: the group's attention needs it
