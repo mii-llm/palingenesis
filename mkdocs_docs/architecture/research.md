@@ -29,28 +29,28 @@ Implemented does not mean reproduced: unless a page says otherwise, the gains be
 | Technique | Paper | Key insight | Our implementation |
 |-----------|-------|-------------|-------------------|
 | Hyperball | Wen et al., Stanford, Jun 2026 | Scale-invariant layers only care about weight *direction*. Fix the norm, optimize the angle. | `optim.Hyperball` — wraps any base optimizer; projection after each step (Algorithm 1) |
-| MONA | Li et al., Meituan, May 2026 | EMA of gradient differences ≈ Hessian·Δθ. Augments gradients with curvature before orthogonalization. | `optim.MONAAcceleration` — bf16 buffers, streaming computation |
+| MONA | Li et al., Meituan, May 2026 | EMA of gradient differences $\approx H\,\Delta\theta$ (Hessian times the parameter step). Augments gradients with curvature before orthogonalization. | `optim.MONAAcceleration` — bf16 buffers, streaming computation |
 | Muon | Jordan et al., 2024 | Newton-Schulz polar decomposition on momentum = steepest descent under spectral norm. | PyTorch native `torch.optim.Muon` |
 | Lion 8-bit | Chen et al., 2023 + bitsandbytes | Sign-based update, one momentum buffer. 4 bytes/param. | `bitsandbytes.optim.Lion8bit` |
-| AdamC | Defazio, 2025 | Weight decay × (γ_t/γ_max) prevents gradient explosion at end of training. | `optim.AdamCCorrection` |
-| SAGE | Lee & Kim, Apr 2026 | O(d) adaptive damper for embeddings. Bounded ≤ 1.0. Fixes Lion/Muon on sparse gradients. | `optim.SAGE` |
+| AdamC | Defazio, 2025 | Weight decay $\times\, \gamma_t / \gamma_{\max}$ (current over peak learning rate) prevents gradient explosion at end of training. | `optim.AdamCCorrection` |
+| SAGE | Lee & Kim, Apr 2026 | $O(d)$ adaptive damper for embeddings. Bounded $\le 1$. Fixes Lion/Muon on sparse gradients. | `optim.SAGE` |
 
 ### Schedulers
 
 | Technique | Paper | Key insight |
 |-----------|-------|-------------|
-| Power-decay | Li et al., Peking, Feb 2026 | η(z) = η_peak·(1-z/N)^γ with γ≈4, derived as better than cosine in a functional-scaling-law model of pretraining (capacity β > 3). |
+| Power-decay | Li et al., Peking, Feb 2026 | $\eta(z) = \eta_{\text{peak}}\,(1 - z/N)^{\gamma}$ at step $z$ of $N$, with $\gamma \approx 4$, derived as better than cosine in a functional-scaling-law model of pretraining (capacity $\beta > 3$). |
 | WSD | Hu et al., 2024 | Maintain peak LR for 80% of training, decay only at end. Optimal for hard tasks. |
 
 ### Loss
 
 | Technique | Paper | Key insight |
 |-----------|-------|-------------|
-| DEFT | Wang et al., Feb 2026 (arXiv:2602.11424) | CE gated by `p^α`, α = Σp² (Rényi-2 collision probability), stop-gradient. Parameter-free; NLL and DFT are its α→0 and α=1 ends. Reports math-reasoning gains from base models; not reproduced here. |
-| DFT | Wu et al., 2025 | CE weighted by the (stop-gradient) target probability `p`. |
-| InfoSFT | Sabbaghi et al., May 2025 (arXiv:2605.14967) | Weight `q·[logit(p̄) − logit(q)]₊`, stop-gradient, p̄ = 0.93 (palingenesis also normalises it to mean 1 per batch). |
-| Chunked CE | Aligned with torchtitan | Split [B,S,V] logit computation into N chunks. FSDP-aware reshard management. |
-| Cut Cross-Entropy | Apple, ICLR 2025 | Computes CE without materializing logits. O(1) memory. Triton kernel. |
+| DEFT | Wang et al., Feb 2026 (arXiv:2602.11424) | CE gated by $p^{\alpha}$, $\alpha = \sum_v p_v^2$ (Rényi-2 collision probability), stop-gradient. Parameter-free; NLL and DFT are its $\alpha \to 0$ and $\alpha = 1$ ends. Reports math-reasoning gains from base models; not reproduced here. |
+| DFT | Wu et al., 2025 | CE weighted by the (stop-gradient) target probability $p$. |
+| InfoSFT | Sabbaghi et al., May 2025 (arXiv:2605.14967) | Weight $q\,\big[\operatorname{logit}(\bar p) - \operatorname{logit}(q)\big]_+$ with $q$ the target probability, stop-gradient, $\bar p = 0.93$ (palingenesis also normalises it to mean 1 per batch). |
+| Chunked CE | Aligned with torchtitan | Split the $[B, S, V]$ logit computation into $N$ chunks. FSDP-aware reshard management. |
+| Cut Cross-Entropy | Apple, ICLR 2025 | Computes CE without materializing logits. $O(1)$ memory. Triton kernel. |
 
 ### Memory
 

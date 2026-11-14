@@ -4,6 +4,24 @@
 It leaves the model's ability to tell when the decision is right free to change. It is experimental: available in
 `pgs rl` and the OPD trainer, single GPU.
 
+!!! info "When to use it"
+    Use CMR when a run you are about to start (agentic [RL](rl.md), [on-policy distillation](distillation.md)) is
+    likely to drag a decision such as "call a tool" up or down across the board, and you want only the model's
+    *discrimination* of that decision to change. You need twin prompts for the decision. To repair a shift that already
+    happened, without training, use [Margin Surgery](surgery.md) instead.
+
+The minimal setup is one twin file and one decision token, added to an RL or OPD config:
+
+```yaml
+cmr:
+  enabled: true
+  families:
+    fc: data/twins_fc.jsonl
+  decision_token: "<tool_call>"
+```
+
+The full option list is under [Configuration](#configuration).
+
 ## The problem it targets
 
 Agentic RL changes when a model calls tools, and the change tends to move along one axis. Needed calls and unneeded
@@ -15,17 +33,28 @@ they act only after the drift has happened.
 
 ## What it does
 
-You provide **twins**: the same request in two versions, one where the decision is right (x⁺, e.g. a matching tool is
-available) and one where it is not (x⁻, e.g. the tool set swapped for irrelevant tools). The decision margin at the
+You provide **twins**: the same request in two versions, one where the decision is right ($x^+$, e.g. a matching tool is
+available) and one where it is not ($x^-$, e.g. the tool set swapped for irrelevant tools). The decision margin at the
 first assistant token is
 
-    m(x) = log p(d | x) − log(1 − p(d | x)),   d = the decision token, e.g. <tool_call>
+$$
+m(x) = \log p(d \mid x) - \log\big(1 - p(d \mid x)\big)
+$$
 
-- **Common mode**, m(x⁺) + m(x⁻): the overall propensity.
-- **Differential mode**, m(x⁺) − m(x⁻): the discrimination.
+where $d$ is the decision token (`decision_token`, e.g. `<tool_call>`) and $p$ the model's next-token probability.
+{: .pg-where }
 
-Each step, CMR estimates the common-mode direction u_f = mean ∇[m(x⁺) + m(x⁻)] for each family of twins. The families
-are orthonormalized. After the optimizer step, CMR removes the parameter update's component along each u_f.
+- **Common mode**, $m(x^+) + m(x^-)$: the overall propensity.
+- **Differential mode**, $m(x^+) - m(x^-)$: the discrimination.
+
+Each step, CMR estimates the common-mode direction of each family $f$ of twins,
+
+$$
+u_f = \operatorname{mean}_{(x^+,\,x^-) \in f}\ \nabla_\theta \big[m(x^+) + m(x^-)\big],
+$$
+
+over `pairs_per_refresh` twins. The families' directions are orthonormalized. After the optimizer step, CMR removes the
+parameter update's component along each $u_f$.
 
 CMR corrects the update rather than the gradient. An adaptive optimizer rescales a projected gradient back off the
 subspace, and momentum carries the old common mode forward. To first order the common margins stay where they were,
@@ -58,6 +87,21 @@ cmr:
 Each step logs `cmr/component/<family>` (the update's raw common-mode component), `cmr/correction/<family>`,
 `cmr/common/<family>` (the mean common margin of the refresh batch) and `cmr/u_norm/<family>`.
 
+## Check that it worked
+
+- With `mode: hold`, `cmr/common/<family>` stays near its starting value while the run trains; with `mode: target` it
+  moves toward the target.
+- `cmr/residual/<family>` (what is left of the step along $u_f$ after the correction) stays near 0 with `mode: hold`;
+  `cmr/component/<family>` shows how much common-mode change the optimizer tried to make.
+- On held-out twins and on your decision benchmark, the needed and the unneeded rate no longer move together.
+
+| Problem | Fix |
+|---|---|
+| refused at startup with FSDP | CMR is single-GPU only |
+| the decision token is not one token | pick a `decision_token` that is a single token of the student's tokenizer |
+| margins look meaningless with thinking on | use non-thinking twins: with thinking, the first assistant token is inside the think block |
+| out of memory | each family keeps an fp32 copy of the parameters (about 3 GB per family at 0.8B): use fewer families |
+
 ## Cost and limits
 
 - **Cost:** one forward and backward per family per refresh, on the twins' prompts, using the last position only. The
@@ -68,3 +112,7 @@ Each step logs `cmr/component/<family>` (the update's raw common-mode component)
   calls, check how often its sampled calls open with the decision token before relying on the margin.
 - **Status:** experimental. The mechanism (gradient projection) is old; the common / differential split of twin
   margins as a training constraint is, as far as we know, new. Evaluate it on your own decision benchmarks.
+
+The twin format is shared with [Margin Surgery](surgery.md) (`pgs surgery margins` measures common and differential
+margins of any checkpoint). The surrounding run is configured as in [Reinforcement Learning](rl.md) or
+[On-Policy Distillation](distillation.md).

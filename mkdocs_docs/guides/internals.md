@@ -7,6 +7,12 @@ its outputs.
 !!! note "Status"
     New in this release. Validated on CPU and on small models; large-model runs are pending, so expect follow-up fixes.
 
+!!! info "When to use it"
+    Use it when an output metric moved after a training stage and you want to know *why*: whether the model lost a
+    piece of information, still has it but stopped acting on it, or now reads it in another place. It is also the way
+    to build a cheap probe (one prefill, no generation) to use as a data label, a deployment gate or a monitored reward.
+    It needs labelled prompts (JSONL, see [Data](#data)) and the checkpoints to compare.
+
 - **Capture** the residual stream of every decoder layer at positions taken from the chat template (the last prompt
   token, the assistant / answer / reasoning tokens training puts loss on), streamed to sharded files on disk.
 - **Probe** each layer with a linear classifier: grouped splits, a control task, calibrated probabilities, AUROC with
@@ -36,11 +42,11 @@ Every tool names a residual by `r`:
 
 | r | what |
 |---|---|
-| 0 | the input of decoder layer 0 (the embeddings, including any embedding scale, e.g. Gemma's √d) |
-| i + 1 | the output of decoder layer i |
+| 0 | the input of decoder layer 0 (the embeddings, including any embedding scale, e.g. Gemma's $\sqrt{d}$) |
+| $i + 1$ | the output of decoder layer $i$ |
 | n (the number of layers) | the output of the last layer, **before** the final norm |
 
-This matches `output_hidden_states` for every r < n. It does not for r = n: transformers 5 returns the final norm's
+This matches `output_hidden_states` for every $r < n$. It does not for $r = n$: transformers 5 returns the final norm's
 output as the last entry of `hidden_states`, so a logit lens built on `hidden_states` normalises the last layer twice
 and a probe "at the last layer" reads a different object than at every other layer. Here every residual is raw, and
 the lenses apply the final norm themselves.
@@ -135,7 +141,7 @@ with `sweep.json` next to them.
 ### The probe file
 
 One `.safetensors` file: tensors `weight` (the classifier, raw residual units, standardisation folded in) and
-`mean_diff` (μ⁺ − μ⁻), and in the header the kind, residual, position, bias, Platt (a, b), thresholds, mean residual
+`mean_diff` ($\mu^+ - \mu^-$, the difference of the class means of the residual), and in the header the kind, residual, position, bias, Platt (a, b), thresholds, mean residual
 norm, the model fingerprint, chat template kwargs, label name, fit strength, train / validation sizes and every metric
 of the sweep. `Probe.load(path)` gives `logit(x)`, `proba(x)`, `flag(x, at="fpr_0.05")` and `direction`.
 
@@ -162,7 +168,7 @@ Per residual:
 - `cka_biased`: the biased estimator, for reference.
 - `cosine`: the mean cosine of a row's residual in A and in B. Fine-tuning keeps the coordinate basis, so this is
   meaningful between checkpoints of one lineage.
-- `norm_ratio`: the mean of |B| / |A|.
+- `norm_ratio`: the mean of $\lVert h_B \rVert / \lVert h_A \rVert$ over rows, with $h_A$, $h_B$ a row's residual in A and in B.
 - `transfer`: A's probe on A's held-out rows, A's probe on B's rows, B's own probe, and the cosine between their
   diff-of-means directions.
 
@@ -198,7 +204,8 @@ on a wrong norm, a missing logit transform or the wrong submodule). The head inc
 
 With tied embeddings, early logit-lens layers mostly decode the input token: use the tuned lens there. The tuned lens
 has one affine translator per residual r < n, zero-initialised as a residual map (it starts as the logit lens; weight
-decay pulls it back toward it), trained with AdamW to minimise KL(final ‖ lens) on the post-training distribution
+decay pulls it back toward it), trained with AdamW to minimise $\mathrm{KL}(p_{\text{final}} \,\Vert\, p_{\text{lens}})$
+(the model's final next-token distribution against the lens's) on the post-training distribution
 (assistant tokens by default), one backward per layer.
 
 Language switching: give `--decision` a set of first tokens of Italian replies against the rest, on prompts in Italian,
@@ -223,11 +230,17 @@ slope 1.446 vs random 0.031 ± 0.052 (z 27.2)
 ablation: margin change -0.884 vs random 0.004 ± 0.011
 ```
 
-(Illustrative numbers.) The probe's diff-of-means vector is added at its residual with each `alpha`, in units of
-|μ⁺ − μ⁻| (alpha = 1 moves the negative-class mean onto the positive one). The decision margin is measured at each
+(Illustrative numbers.) The probe's diff-of-means vector is added at its residual with each `alpha`: the residual
+becomes $h + \alpha\,(\mu^+ - \mu^-)$, so the dose is in units of $\lVert \mu^+ - \mu^- \rVert$ ($\alpha = 1$ moves the
+negative-class mean onto the positive one). The decision margin is measured at each
 row's decision position. The same is done for random directions of the same norm, which are the null, since any large
-push moves margins a little. Then the direction is ablated at every residual (h ← h − (h·û)û) and compared with
-ablating random directions. A probe whose direction moves the decision far beyond the random null, in the expected
+push moves margins a little. Then the direction is ablated at every residual,
+
+$$
+h \leftarrow h - (h \cdot \hat u)\, \hat u, \qquad \hat u = \frac{\mu^+ - \mu^-}{\lVert \mu^+ - \mu^- \rVert},
+$$
+
+and compared with ablating random directions. A probe whose direction moves the decision far beyond the random null, in the expected
 sign, is used. One that does not is only decodable.
 
 Steering adds at every position, the prompt included. In hybrid models a decision is carried by the recurrent state
@@ -245,8 +258,17 @@ pgs internals patch --model runs/sft/final --twins tool_twins.jsonl --decision "
 ```
 
 `denoise` puts the `pos` side's residual into the `neg` side's run and tests sufficiency. `noise` does the reverse and
-tests necessity. The effect is normalised as (patched − base) / (source − base): 1 means that this residual at this
-position carries the whole difference. Positions count from the end of each prompt (−1 is the decision position).
+tests necessity. The effect is normalised as
+
+$$
+\text{effect} = \frac{m_{\text{patched}} - m_{\text{base}}}{m_{\text{source}} - m_{\text{base}}}
+$$
+
+where $m$ is the decision margin of the run being patched, before ($m_{\text{base}}$) and after ($m_{\text{patched}}$)
+the patch, and $m_{\text{source}}$ that of the side the residual is taken from.
+{: .pg-where }
+
+1 means that this residual at this position carries the whole difference. Positions count from the end of each prompt (−1 is the decision position).
 Twins that differ by a minimal token replacement are the right corruption; noise-based corruptions push activations off
 distribution. Start with single layers: windows of layers inflate effects.
 
@@ -329,7 +351,7 @@ Output: `acts/<model>/<dataset>/` (stores, reused when they already exist with t
 The question: before answering, does the model's residual stream at the last prompt token say whether it knows the
 answer? At which depth? Did a training stage change that representation, or only the way the model acts on it?
 
-**1. Labels from the model's own answers.** For each question, sample k answers at T = 1 from the checkpoint you probe
+**1. Labels from the model's own answers.** For each question, sample $k$ answers at $T = 1$ from the checkpoint you probe
 and grade them. Then `label` = the share correct (a soft label; it is binarised at 0.5 for evaluation) and `group` = the
 question id. A translated question keeps the group of its original. Label each checkpoint with its own answers: after
 a stage, what a model knows is a property of that model.
@@ -401,7 +423,7 @@ in eval mode (activation checkpointing in train mode runs a layer's forward twic
 - **Probes are linear and read one residual.** Per-head probes (ITI), the Gated DeltaNet recurrent state, multi-layer
   windows and ensembles are not implemented. Multi-layer ensembles are the recommended next step for a probe used as a
   reward, since evasion is costlier across many layers.
-- **No attribution patching.** Patching is exact and costs layers × positions forwards per batch; use it on a few
+- **No attribution patching.** Patching is exact and costs $\text{layers} \times \text{positions}$ forwards per batch; use it on a few
   dozen twins.
 - **No sparse autoencoders.** On supervised concepts, linear probes and the difference of means match or beat them,
   and an SAE must be retrained after each stage.
@@ -410,3 +432,16 @@ in eval mode (activation checkpointing in train mode runs a layer's forward twic
 - **Calibration does not transfer** across domains or languages; a threshold is valid where it was chosen.
 - **The causal check needs a decision token.** Behaviours that are not a single-token decision at a known position need
   `steer` and reading the generations.
+
+## Common failures
+
+| Symptom | Cause and fix |
+|---|---|
+| the control AUROC is far from 0.5 | groups leak across splits: give every paraphrase, translation and repeated sample of one question the same `group` |
+| residual 0 (the embeddings) or the length baseline already scores high | the label is lexical or follows prompt length: rebalance the data before reading deeper layers |
+| the lens fails its readout check | `head(norm(residual n))` does not reproduce the logits: a wrong norm, a missing logit transform or the wrong submodule ([Lenses](#lenses)) |
+| early logit-lens layers only decode the input token | tied embeddings: train and use the tuned lens there |
+| `ProbeScorer` warns that weights or chat template differ | the probe was fitted on another checkpoint: run `compare`, refit if `A->B` drops |
+| `validate()` refuses the config | unknown keys, `*_all` positions for probes, comparisons of unlisted models, invalid fractions, dtypes or sizes |
+
+[Margin Surgery](surgery.md) and [Common-Mode Rejection](cmr.md) act on the same decision margins this page measures.

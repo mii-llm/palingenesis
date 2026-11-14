@@ -20,8 +20,8 @@ design decision.*
 | Intervene with the diff-of-means, never the classifier weights | the mean difference is the causally used direction | Marks & Tegmark 2023; Li et al. 2023 (ITI); Im & Li 2025; Arditi et al. 2024 |
 | Group-level control task, selectivity, embedding layer and length baselines | high probe accuracy alone says nothing | Hewitt & Liang 2019; Belinkov 2022 |
 | Platt calibration on validation, per domain; thresholds at fixed FPR | discrimination transfers out of distribution, calibration does not; gates need low-FPR operating points | Kadavath et al. 2022; Goldowsky-Dill et al. 2025 |
-| Debiased linear CKA, always next to probe transfer | biased CKA inflates when n is not ≫ d; CKA misses low-variance directions probes use | Kornblith et al. 2019; Nguyen et al. 2021; Murphy et al. 2024; Davari et al. 2022; Ding et al. 2021 |
-| Steering at every position, prompt included; dose in units of μ⁺ − μ⁻ | hybrid models carry decisions in the recurrent state from the prefill; absolute coefficients do not transfer across layers | Yap 2026; Panickssery et al. 2024 (CAA); nnsight steering notes |
+| Debiased linear CKA, always next to probe transfer | biased CKA inflates when $n$ (rows) is not $\gg d$ (hidden size); CKA misses low-variance directions probes use | Kornblith et al. 2019; Nguyen et al. 2021; Murphy et al. 2024; Davari et al. 2022; Ding et al. 2021 |
+| Steering at every position, prompt included; dose in units of $\mu^+ - \mu^-$ | hybrid models carry decisions in the recurrent state from the prefill; absolute coefficients do not transfer across layers | Yap 2026; Panickssery et al. 2024 (CAA); nnsight steering notes |
 | Causal check against random directions of the same norm, plus directional ablation | any large push moves outputs; ablation tests necessity | Arditi et al. 2024; Elazar et al. 2021 |
 | Patching between minimal twins, logit-difference metric, single layers, denoise and noise | Gaussian-noise corruption creates spurious effects; probabilities saturate; windows inflate | Zhang & Nanda 2023; Heimersheim & Nanda 2024 |
 | Probe as a reward only through a frozen scorer, with warnings; labels and gates preferred | RL against a detector learns to evade it | Bailey et al. 2024; Cundy & Gleave 2025; Taufeeque et al. 2026 |
@@ -84,7 +84,8 @@ design decision.*
 
 **Marks & Tegmark 2023**, *The Geometry of Truth* (COLM 2024, [arXiv:2310.06824](https://arxiv.org/abs/2310.06824)).
 
-- The mass-mean probe is θ = μ⁺ − μ⁻. Its covariance-adjusted variant Σ⁻¹θ (our `lda`) is for classification.
+- The mass-mean probe is $\theta = \mu^+ - \mu^-$, the difference of the class means. Its covariance-adjusted variant
+  $\Sigma^{-1}\theta$ (our `lda`; $\Sigma$ the within-class covariance) is for classification.
 - Adding the mass-mean direction moves outputs far more than adding the logistic direction, in 7 of 8 conditions.
 - The source of the split between the classify and intervene directions.
 
@@ -108,9 +109,9 @@ design decision.*
 [arXiv:2312.06681](https://arxiv.org/abs/2312.06681)).
 
 - The vector is a mean difference, added at all positions after the prompt.
-- The best layers are at about 40 % of depth, with multipliers of ±1 to 2.
+- The best layers are at about 40 % of depth, with multipliers of $\pm 1$ to 2.
 - Residual norms grow with depth, so a coefficient does not transfer across layers. We express doses in units of
-  |μ⁺ − μ⁻| at the probe's own layer.
+  $\lVert \mu^+ - \mu^- \rVert$ at the probe's own layer.
 
 **Arditi et al. 2024**, *Refusal in Language Models Is Mediated by a Single Direction* (NeurIPS 2024,
 [arXiv:2406.11717](https://arxiv.org/abs/2406.11717)).
@@ -149,9 +150,9 @@ design decision.*
 ([arXiv:2303.08112](https://arxiv.org/abs/2303.08112)) and the
 [tuned-lens code](https://github.com/AlignmentResearch/tuned-lens).
 
-- One affine translator per layer, applied residually (h + Ah + b) with zero initialisation, so it starts as the
+- One affine translator per layer, applied residually ($h + Ah + b$) with zero initialisation, so it starts as the
   logit lens and weight decay pulls toward it.
-- The objective is KL(final ‖ lens), and no translator is needed for the last layer.
+- The objective is $\mathrm{KL}(p_{\text{final}} \,\Vert\, p_{\text{lens}})$, and no translator is needed for the last layer.
 - The code trains with SGD-Nesterov or Adam (lr 1e-3).
 - Rogue high-variance dimensions and drift across layers explain logit-lens failures.
 
@@ -205,7 +206,7 @@ design decision.*
 **Nguyen et al. 2021**, *Do Wide and Deep Networks Learn the Same Things?* (ICLR 2021,
 [arXiv:2010.15327](https://arxiv.org/abs/2010.15327)).
 
-- Uses the unbiased HSIC estimator of Song et al. 2012. We compute it from d × d products without an n × n Gram matrix.
+- Uses the unbiased HSIC estimator of Song et al. 2012. We compute it from $d \times d$ products without an $n \times n$ Gram matrix ($n$ rows, hidden size $d$).
 
 **Murphy et al. 2024**, *Correcting Biased Centered Kernel Alignment Measures*
 ([arXiv:2405.01012](https://arxiv.org/abs/2405.01012)).

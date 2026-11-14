@@ -7,6 +7,10 @@
 - **soups:** average same-origin checkpoints;
 - **materializing:** make a partial training checkpoint loadable.
 
+Merging costs seconds and no GPU; evaluating the result is the real cost. Use it after training, when you have
+checkpoints to combine; use [Margin Surgery](surgery.md) when one decision moved, and the
+[`pgs merge` reference](../reference/cli.md#merge) for every flag.
+
 ```bash
 pgs merge interpolate runs/start/final runs/rl/final --lam 0.3 -o runs/rl_interp_0.3
 pgs merge task-arithmetic --base Qwen/Qwen3.5-0.8B runs/agent/final:1 runs/expert/final:0.3 -o runs/agent_plus_expert
@@ -26,18 +30,31 @@ print(report)            # soup: 488 tensors -> runs/soup
 
 ## Operations
 
+In the formulas, $W_i$ are the source models' weights (one tensor at a time), $W_{\text{base}}$ the shared base, $k$
+the number of models, and $\lambda$, $a_i$, $l_i$ the coefficients you pass (`lam`, the weights).
+
 | Operation | Formula | Typical use |
 |---|---|---|
-| `interpolate(start, end, lam)` | `W = start + lam * (end - start)` | keep part of a fine-tuning's gain and drop its side effects (lam .3–.5); lam outside [0, 1] extrapolates |
-| `linear(models, weights)` | `W = sum_i a_i * W_i`, `sum_i a_i = 1` | weighted mixes of siblings (`unnormalized=True` allows other sums) |
-| `soup(models)` | `W = mean_i W_i` | averaging same-origin runs (seeds, sibling stages) |
-| `task_arithmetic(base, models, weights)` | `W = base + sum_i l_i * (W_i - base)` | add each model's change from a shared base; with weights `[1, lam]`, model A keeps all of its own training and gains lam of B's |
-| `model_stock(base, models)` | `W = base + t * (mean_i W_i - base)`, per tensor `t = k c / (1 + (k - 1) c)`, `c` = mean pairwise cosine of the task vectors `W_i - base` (clamped to [0, 1]) | several fine-tunes of one base: keeps what they agree on and shrinks toward the base where they disagree ([Model Stock](https://arxiv.org/abs/2403.19522)); `filter_wise=True` gives one `t` per output row |
-| `ram(base, models, eps)` | per element: a change (`|W_i - base| > eps`) made by one model is kept whole; changes made by several are averaged | combining RL-trained experts, whose task vectors are sparse and nearly orthogonal ([RAM](https://arxiv.org/abs/2601.13572)): averaging would dilute each one's unique changes by `1/k` |
+| `interpolate(start, end, lam)` | $W = W_{\text{start}} + \lambda\,(W_{\text{end}} - W_{\text{start}})$ | keep part of a fine-tuning's gain and drop its side effects ($\lambda$ = .3–.5); $\lambda$ outside $[0, 1]$ extrapolates |
+| `linear(models, weights)` | $W = \sum_i a_i W_i$, with $\sum_i a_i = 1$ | weighted mixes of siblings (`unnormalized=True` allows other sums) |
+| `soup(models)` | $W = \frac{1}{k}\sum_i W_i$ | averaging same-origin runs (seeds, sibling stages) |
+| `task_arithmetic(base, models, weights)` | $W = W_{\text{base}} + \sum_i l_i\,(W_i - W_{\text{base}})$ | add each model's change from a shared base; with weights `[1, lam]`, model A keeps all of its own training and gains $\lambda$ of B's |
+| `model_stock(base, models)` | $W = W_{\text{base}} + t\,\big(\tfrac{1}{k}\sum_i W_i - W_{\text{base}}\big)$, with $t$ per tensor (below) | several fine-tunes of one base: keeps what they agree on and shrinks toward the base where they disagree ([Model Stock](https://arxiv.org/abs/2403.19522)); `filter_wise=True` gives one $t$ per output row |
+| `ram(base, models, eps)` | per element: a change ($\lvert W_i - W_{\text{base}} \rvert > \varepsilon$, $\varepsilon$ = `eps`) made by one model is kept whole; changes made by several are averaged | combining RL-trained experts, whose task vectors are sparse and nearly orthogonal ([RAM](https://arxiv.org/abs/2601.13572)): averaging would dilute each one's unique changes by $1/k$ |
 | `materialize(checkpoint, template)` | the checkpoint's tensors + the template's other tensors and files | intermediate training saves that hold only the trained (text) weights and a training config |
 
-Why task arithmetic for adding an expert rather than a linear merge: `a * A + (1 - a) * B` also pulls A back toward the base
-by `1 - a`, undoing part of A's training. `A + lam * (B - base)` adds only what B learned.
+Model Stock's ratio, per tensor (per output row with `filter_wise=True`):
+
+$$
+t = \frac{k\,c}{1 + (k - 1)\,c}
+$$
+
+where $c$ is the mean pairwise cosine of the task vectors $W_i - W_{\text{base}}$ (clamped to $[0, 1]$): $c \to 1$
+gives the plain average, $c \to 0$ keeps the base.
+{: .pg-where }
+
+Why task arithmetic for adding an expert rather than a linear merge: $a A + (1 - a) B$ also pulls A back toward the base
+by $1 - a$, undoing part of A's training. $A + \lambda\,(B - W_{\text{base}})$ adds only what B learned.
 
 ### Which method for which situation
 
@@ -51,8 +68,8 @@ changes are. On our 0.8B RL runs from one base (LR 1e-6, 100–250 steps):
 
 | Situation | Suited | Not suited, and why |
 |---|---|---|
-| A run overshot (general skills drifted) | `interpolate` toward the start (WiSE-FT); `soup` or `model_stock` of its checkpoints (Model Stock reduces to a mild shrink of the checkpoint average, `t` ≈ .9) | `ram` and TIES: checkpoints share signs, so there is nothing to disentangle |
-| Combining experts trained separately from one base | `task_arithmetic` (keeps each whole; interference is low when the vectors are orthogonal); `ram` (also averages the overlapping elements) | `linear`, `soup`, `model_stock`: they divide each expert by about `k` (Model Stock gave `t` = .20 for three experts). TIES sign election at ~50% agreement is a coin flip. DARE's random drop + rescale adds noise to already sparse vectors |
+| A run overshot (general skills drifted) | `interpolate` toward the start (WiSE-FT); `soup` or `model_stock` of its checkpoints (Model Stock reduces to a mild shrink of the checkpoint average, $t \approx .9$) | `ram` and TIES: checkpoints share signs, so there is nothing to disentangle |
+| Combining experts trained separately from one base | `task_arithmetic` (keeps each whole; interference is low when the vectors are orthogonal); `ram` (also averages the overlapping elements) | `linear`, `soup`, `model_stock`: they divide each expert by about $k$ (Model Stock gave $t = .20$ for three experts). TIES sign election at ~50% agreement is a coin flip. DARE's random drop + rescale adds noise to already sparse vectors |
 
 A merge cannot remove a regression that an expert already has: check each expert alone before merging.
 
@@ -78,15 +95,15 @@ A merge cannot remove a regression that an expert already has: check each expert
 ## Precision of small edits
 
 Public checkpoints are stored in bf16, so their weights already sit on the bf16 grid. bf16 keeps 8 significant bits:
-one ulp is 2^-7 to 2^-8 of a weight's magnitude. An edit far smaller than that, such as a merge with a small `lam`
-between close siblings or a margin-surgery step (‖Δ‖ around 1e-3 to 1e-5 of ‖W‖), is computed correctly in float32. Saving it
+one ulp is $2^{-7}$ to $2^{-8}$ of a weight's magnitude. An edit far smaller than that, such as a merge with a small `lam`
+between close siblings or a margin-surgery step ($\lVert \Delta \rVert$ around $10^{-3}$ to $10^{-5}$ of $\lVert W \rVert$), is computed correctly in float32. Saving it
 with round-to-nearest then sends almost every element back to its original value, so the edit vanishes: in simulation
 1–6% of it survives.
 
 **Stochastic rounding** (SR) rounds each element up with probability equal to the fraction of an ulp it has moved, so the
-saved value is unbiased: `E[SR(w + d)] = w + d`. A few elements move by a whole ulp and the rest stay. Summed over
-millions of elements, the saved change points along the intended edit and has its size (projection ≈ 1). It is
-noisier element by element (`norm_ratio` > 1). Edits computed from fp32 weights that are off the grid survive
+saved value is unbiased: $\mathbb{E}\big[\mathrm{SR}(w + d)\big] = w + d$. A few elements move by a whole ulp and the rest stay. Summed over
+millions of elements, the saved change points along the intended edit and has its size (projection $\approx 1$). It is
+noisier element by element (`norm_ratio` $> 1$). Edits computed from fp32 weights that are off the grid survive
 round-to-nearest only on average. With bf16 sources nothing dithers them.
 
 ```bash
@@ -103,7 +120,9 @@ save_hf_model(model, tok, out, source_layout=True, dtype=torch.bfloat16, roundin
   reproducible and does not depend on tensor order or sharding. SR applies when the output dtype is bf16 or fp16.
   Casts to fp32 are exact anyway.
 - **Measured survival:** every merge records `edit_survival` against the first model in `merge_config.json`:
-  `projection` = ⟨saved − W₀, Δ⟩/‖Δ‖², `norm_ratio` and `changed_frac`. It is computed per tensor while merging, which
+  `projection` $= \langle W_{\text{saved}} - W_0,\ \Delta \rangle / \lVert \Delta \rVert^2$, `norm_ratio`
+  $= \lVert W_{\text{saved}} - W_0 \rVert / \lVert \Delta \rVert$ and `changed_frac`, where $W_0$ is the first model and
+  $\Delta$ the intended edit. It is computed per tensor while merging, which
   adds one float64 pass per tensor. With nearest rounding to a 16-bit dtype, a projection below 0.5 logs a warning. Use
   `--rounding stochastic` then.
 - `save_hf_model(..., dtype=, rounding=, seed=)` casts the saved state the same way (`palingenesis.precision.cast_state_dict`).
@@ -116,6 +135,11 @@ save_hf_model(model, tok, out, source_layout=True, dtype=torch.bfloat16, roundin
   than bf16. A sub-ulp edit survives fp8 serving of off-grid (fp32 or bf16) weights only on average, through the weights'
   own offsets on the fp8 grid, so check large enough tensors. GPTQ / AWQ int4 are not simulated: their rounding depends on
   calibration data and error feedback.
+
+!!! check "How to check a merge"
+    Read `merge_config.json` in the output: `edit_survival.projection` near 1 means the edit was written (below 0.5 with
+    nearest rounding, a warning is logged: re-run with `--rounding stochastic`). Then evaluate the merge on the same
+    battery as its sources, as below.
 
 ## Choosing lam and adopting a merge
 
