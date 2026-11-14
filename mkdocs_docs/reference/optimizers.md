@@ -125,10 +125,10 @@ Available as a standalone optimizer class (`palingenesis.optim.SAGE`); no traini
 ### power_decay
 
 $$
-\eta(p) = \eta_{\text{peak}} \cdot (1 - p)^{\gamma}, \qquad \gamma = 4
+\eta(p) = \eta_{\min} + (\eta_{\text{peak}} - \eta_{\min}) \cdot (1 - p)^{\gamma}, \qquad \gamma = 4
 $$
 
-where $p \in [0, 1]$ is the progress through the steps after warmup.
+where $p \in [0, 1]$ is the progress through the steps after warmup, $\eta_{\text{peak}}$ is `train.learning_rate` and $\eta_{\min}$ is `train.min_learning_rate`.
 {: .pg-where }
 
 Motivated by a functional-scaling-law analysis (arXiv:2602.06797) that finds power decay better than cosine in its model of pretraining; not benchmarked here for fine-tuning.
