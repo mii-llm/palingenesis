@@ -489,6 +489,7 @@ def test_trainer_end_to_end_and_resume(tmp_path, fsdp, monkeypatch):
     trainer.train()
     after = [local(p) for p in trainer.model.parameters()]
     assert any(not torch.equal(a, b) for a, b in zip(before, after))
+    assert trainer.pipeline.batches == 2  # one batch per step: none generated after the last one
     assert (tmp_path / "run" / "step_2" / TRAINER_STATE_FILE).exists() and (tmp_path / "run" / "final").exists()
 
     resumed = make(3, resume="auto")

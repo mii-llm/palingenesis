@@ -22,6 +22,14 @@ batch is at most max_staleness versions old when it is trained on:
 
 A batch older than max_staleness when it reaches the trainer is dropped and
 counted; with the gating above that only happens if the trainer skips versions.
+The producer then generates a replacement for the same training step (the gate
+counts batches the trainer keeps, not batches produced), so a drop never leaves
+the trainer waiting for a version it has yet to publish.
+
+End of the run. start(end) tells the producer the last training step: it stops
+after the batch of step end - 1 (plus one per dropped batch) instead of
+generating one more that nobody trains on, which would hold the pipeline lock
+while the final evaluation waits for it.
 """
 
 import contextlib
@@ -115,10 +123,19 @@ class PublishedWeights:
 
     def wait_for(self, version: int, stop: threading.Event) -> bool:
         """Block until `version` is published; False if `stop` was set first."""
+        return self.wait_until(lambda: self.version >= version, stop)
+
+    def wait_until(self, ready: Callable[[], bool], stop: threading.Event) -> bool:
+        """Block until `ready()` holds, checked at every publish and notify(); False if `stop` was set first."""
         with self._changed:
-            while self.version < version and not stop.is_set():
+            while not ready() and not stop.is_set():
                 self._changed.wait(timeout=1.0)
         return not stop.is_set()
+
+    def notify(self) -> None:
+        """Wake the waiters to check their condition again (something other than the version changed)."""
+        with self._changed:
+            self._changed.notify_all()
 
     def sync(self, engine: RolloutEngine) -> float:
         """Load the newest weights into `engine` if it is behind; seconds spent."""
@@ -274,9 +291,13 @@ class Orchestrator:
         self.queue: queue.Queue = queue.Queue(maxsize=max_staleness + 1)
         self.stop_event = threading.Event()
         self.dropped = 0
+        self.end: int | None = None  # the producer serves training steps below this (None = until stopped)
+        self.replaced = 0  # batches dropped as stale: each one is produced again for the same step
         self.thread = threading.Thread(target=on_current_device(self._produce), name="opd-orchestrator", daemon=True)
 
-    def start(self) -> None:
+    def start(self, end: int | None = None) -> None:
+        """`end`: the trainer takes batches for the steps below it and no more (None = until stop())."""
+        self.end = end
         self.thread.start()
 
     def stop(self) -> None:
@@ -284,12 +305,20 @@ class Orchestrator:
         self.thread.join(timeout=600)
 
     def _produce(self) -> None:
-        k = self.pipeline.weights.version  # > 0 when the trainer resumed from a checkpoint
+        weights = self.pipeline.weights
+        k = weights.version  # > 0 when the trainer resumed from a checkpoint
+
+        def step() -> int:  # the training step batch k serves: a replacement serves the step of the batch dropped
+            return k - self.replaced
+
         try:
             while not self.stop_event.is_set():
+                # every batch the trainer will take exists: wait for a drop (one more) or the stop
+                if not weights.wait_until(lambda: self.end is None or step() < self.end, self.stop_event):
+                    return
                 requests = self.draw()
                 waited = time.perf_counter()
-                if not self.pipeline.weights.wait_for(k - self.max_staleness, self.stop_event):
+                if not weights.wait_until(lambda: weights.version >= step() - self.max_staleness, self.stop_event):
                     return
                 waited = time.perf_counter() - waited
                 batch = self.pipeline.run(requests, self.temperature)
@@ -312,6 +341,8 @@ class Orchestrator:
                 raise RuntimeError("rollout producer failed") from item
             if version - item.version > self.max_staleness:
                 self.dropped += len(item.samples)
+                self.replaced += 1
+                self.pipeline.weights.notify()  # the producer generates a replacement for this step
                 logger.warning(
                     "dropped a batch %d versions old (max_staleness %d)", version - item.version, self.max_staleness
                 )

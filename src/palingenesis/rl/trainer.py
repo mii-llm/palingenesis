@@ -648,7 +648,7 @@ class RLTrainer:
         if self.parallel.fsdp and self.engine.version < self.weights.version:
             self._push_weights(self.weights.version)  # resumed: the engine holds the initial weights
         previous = {sig: signal.signal(sig, self._request_stop) for sig in (signal.SIGUSR1, signal.SIGTERM)}
-        self.orchestrator.start()
+        self.orchestrator.start(end=t.steps)
         try:
             if t.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)

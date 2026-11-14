@@ -114,3 +114,62 @@ def test_weight_sync_waits_for_the_optimizer():
     assert done.wait(60) and engine.version == 1  # (the first sync imports transformers)
     assert [n for n, _ in engine.seen] == ["weight", "bias"]
     assert weights.sync(engine) == 0.0  # up to date: nothing to do
+
+
+def test_producer_stops_at_the_last_training_step():
+    """With start(end), no batch is generated past the last step: the final evaluation would wait behind it."""
+    for max_staleness in (0, 1, 2):
+        pipeline = FakePipeline()
+        orch = Orchestrator(pipeline, lambda: ["request"], temperature=1.0, max_staleness=max_staleness)
+        orch.start(end=3)
+        try:
+            for _ in range(3):
+                orch.next(pipeline.weights.version)
+                pipeline.weights.publish()
+            time.sleep(0.1)  # version 3 is published: an unbounded producer would generate batch 3 now
+            assert len(pipeline.generated) == 3 and orch.queue.empty()
+            assert orch.thread.is_alive()  # idle, not exited: a drop would still be replaced
+        finally:
+            orch.stop()
+        assert not orch.thread.is_alive()
+
+
+def test_resumed_producer_counts_steps_from_the_checkpoint():
+    pipeline = FakePipeline()
+    pipeline.weights.version = 5  # resumed at step 5 of 7
+    orch = Orchestrator(pipeline, lambda: ["request"], temperature=1.0, max_staleness=1)
+    orch.start(end=7)
+    try:
+        for _ in range(2):
+            orch.next(pipeline.weights.version)
+            pipeline.weights.publish()
+        time.sleep(0.1)
+        assert len(pipeline.generated) == 2
+    finally:
+        orch.stop()
+
+
+def test_a_dropped_batch_is_replaced_at_the_same_step():
+    """A stale batch dropped by next() must not starve the trainer: the producer generates one more for the same
+    step, also when it had already produced the run's last batch (end=2)."""
+    for end in (2, 6):
+        pipeline = FakePipeline()
+        orch = Orchestrator(pipeline, lambda: ["request"], temperature=1.0, max_staleness=0)
+        orch.start(end=end)
+        try:
+            orch.next(pipeline.weights.version)
+            pipeline.weights.publish()
+            wait_until(lambda: len(pipeline.generated) == 2)
+            pipeline.weights.version = 3  # the trainer skipped versions: the queued batch (version 1) is stale
+            got = {}
+            taker = threading.Thread(target=lambda: got.update(batch=orch.next(3)), daemon=True)
+            taker.start()
+            taker.join(timeout=10)
+            assert not taker.is_alive(), "the trainer starved after a dropped batch"
+            assert got["batch"].version == 3 and orch.dropped == 1 and orch.replaced == 1
+            assert pipeline.generated[:3] == [0, 1, 3]
+            if end == 2:  # one replacement, nothing after it
+                time.sleep(0.1)
+                assert pipeline.generated == [0, 1, 3]
+        finally:
+            orch.stop()

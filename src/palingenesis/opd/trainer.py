@@ -599,7 +599,7 @@ class OPDTrainer:
         end = stop_at if 0 < stop_at < config.train.steps else config.train.steps
         if self.start_step >= end:
             logger.warning("the checkpoint is at step %d, the run stops at %d: nothing to train", self.start_step, end)
-        self.orchestrator.start()
+        self.orchestrator.start(end=end)
         try:
             if config.train.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)
