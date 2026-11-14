@@ -4,6 +4,16 @@
 
 ---
 
+!!! abstract "When to use this guide"
+    Your SFT data has reasoning, tool calls and tool results (multi-turn agent traces). The short path:
+
+    1. Put the traces in the [data format](#data-format) below (`messages` + `tools`); other layouts are [normalised](#role-mapping-non-standard-formats).
+    2. Start from the [example config](#example-config-for-agentic-traces) (SeCO for long traces).
+    3. [Check the masking](#debugging-masking) with `pgs inspect` and [validate the tool calls](#data-validation) before training.
+    4. If the trained model loops or never stops calling tools, see [Repetition loops](#repetition-loops-and-runaway-episodes).
+
+    Related: [Data Preparation](data.md), [Long Sequences (SeCO)](long-sequences.md), [On-Policy Distillation](distillation.md), [Reinforcement Learning](rl.md) with [Harbor](harbor.md) environments.
+
 ## What makes agentic data different
 
 Standard SFT data is simple: user asks, assistant answers. The loss is on the answer.
@@ -151,8 +161,8 @@ Options:
 | Mode | Effect | Best for |
 |------|--------|----------|
 | `uniform` | All turns equal weight | Short conversations (1-3 turns) |
-| `progressive` | Weight = √(turn_idx / total_turns) | Agentic traces (iterative refinement) |
-| `last_heavy` | Final turn gets 2× weight, others 1× | Task completion (answer quality matters most) |
+| `progressive` | Weight $w_k = \sqrt{k / K}$ for the $k$-th of $K$ trained turns | Agentic traces (iterative refinement) |
+| `last_heavy` | Final turn gets weight 2, others 1 | Task completion (answer quality matters most) |
 
 The default is `uniform`. The case for `progressive`: in a 10-turn trace, the early turns are often exploration (trying things, getting errors) and the later turns produce the real solution. This is a heuristic, not a result from a paper; measure it on your eval set. Weights are normalised to mean 1 per conversation, so the loss scale is unchanged. They are applied by the cross-entropy losses (plain, chunked, Cut Cross-Entropy) and by chunked DEFT; other objectives, SeCO and DPO reject a non-uniform `turn_scaling`.
 
@@ -240,6 +250,14 @@ This shows you exactly which tokens have loss (highlighted) and which are masked
 - Turns flagged `"loss": false`: **masked**
 
 If anything looks wrong (e.g., user tokens getting loss, or thinking tokens masked), the chat template isn't matching your data format. Check your `messages_field` and ensure roles are spelled correctly.
+
+| What you see | Likely cause | Fix |
+|---|---|---|
+| User or system tokens have loss | roles not recognised | spell the roles as in [Role mapping](#role-mapping-non-standard-formats), or extend `ROLE_MAP` |
+| Thinking tokens masked or missing | the reasoning is not in `reasoning` (or `reasoning_content` / `think`) | move it into one of those fields |
+| Tool responses have loss | `data.include_observations: true` | that is [ECHO mode](#echo-mode-observation-loss); set it to `false` for standard masking |
+| A whole turn masked | the message carries `"loss": false` or `"weight": 0` | [per-message flags](#per-message-training-flags) |
+| Tool definitions missing from the system prompt | the tools are in another column | set `data.tools_field` |
 
 ---
 

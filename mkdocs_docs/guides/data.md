@@ -4,6 +4,15 @@
 
 ---
 
+!!! abstract "What this page covers"
+    - **Data selection** with `pgs prepare`: [the pipeline](#the-pipeline), [strategies](#strategies) and [what the measurements say](#what-the-measurements-say) (short version: `random` is the default because nothing measured beat it).
+    - **Mixing sources** (`data.sources`): [multi-source mixing](#multi-source-mixing).
+    - **What gets loss**: [SFT masking](#what-gets-loss-sft-masking), [reasoning fields and tags](#reasoning-in-the-data-fields-baked-blocks-tags); agent traces and tool calls are in the [agentic guide](agentic-training.md).
+    - **Run length, streaming and the [pre-tokenized cache](#pre-tokenized-cache)**.
+    - **[Validation data](#validation-data)**, including per-source eval losses (`eval_sources`).
+
+    Check the masking of any config with `pgs inspect --config <cfg> --num_samples 3` before training. Every key is in the [configuration reference](../reference/configuration.md); every command in the [CLI reference](../reference/cli.md).
+
 ## What preparation measures
 
 For every sample, `pgs prepare` runs the model you are about to fine-tune over the conversation and records the perplexity of the tokens training will put loss on (the assistant turns). A low value means the model already writes this response almost verbatim; a high value means the response is far from what the model would write. It is a property of the (model, response) pair, not of the problem: a correct but unusual solution to an easy problem can score "hard".
@@ -63,12 +72,31 @@ The scoring uses the *exact same masking* as training: only assistant tokens are
 
 The preparation → training loop is fully wired through a single YAML. There is no way for the scoring model and the training model to drift apart, because they are the same field.
 
-```mermaid
-flowchart LR
-    A[config.yaml<br/>model + data + preprocess] -->|pgs prepare --config| B[prepared/<br/>scored_data.parquet<br/>prepared_meta.json]
-    A -->|pgs train --config<br/>preprocess.enabled: true| C[Training]
-    B --> C
-```
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 170" role="img" aria-labelledby="fig-prep-title fig-prep-desc">
+<title id="fig-prep-title">Two ways from a config to training: prepare once, or prepare inside pgs train</title>
+<desc id="fig-prep-desc">The same config.yaml, with model, data and preprocess sections, feeds two paths. pgs prepare --config writes a prepared directory with scored_data.parquet and prepared_meta.json, which training then reads. Or pgs train --config with preprocess.enabled true trains from the prepared output.</desc>
+<defs><marker id="fig-prep-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker><marker id="fig-prep-arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head-accent" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box" x="10" y="56" width="170" height="62" rx="4"/>
+<text class="" x="22" y="76">config.yaml</text>
+<text class="t-muted t-small" x="22" y="92">model + data + preprocess</text>
+<rect class="box" x="300" y="10" width="190" height="62" rx="4"/>
+<text class="" x="312" y="30">prepared/</text>
+<text class="t-muted t-small t-mono" x="312" y="46">scored_data.parquet</text>
+<text class="t-muted t-small t-mono" x="312" y="60">prepared_meta.json</text>
+<rect class="box-accent" x="560" y="56" width="130" height="62" rx="4"/>
+<text class="" x="572" y="76">training</text>
+<text class="t-muted t-small" x="572" y="92">pgs train</text>
+<path class="line" d="M180,72 C230,72 240,41 298,41" marker-end="url(#fig-prep-arrow)"/>
+<text class="t-mono t-muted" x="196" y="22">pgs prepare</text><text class="t-mono t-muted" x="196" y="36">--config</text>
+<path class="line" d="M490,41 C530,41 530,72 558,74" marker-end="url(#fig-prep-arrow)"/>
+<path class="line" d="M180,104 C300,140 450,140 558,104" marker-end="url(#fig-prep-arrow)"/>
+<text class="t-mono t-muted" x="370" y="146" text-anchor="middle">pgs train --config  (preprocess.enabled: true)</text>
+</svg>
+</div>
+<figcaption>Preparation reads the same config as training: the same model and the same truncation score the data and then train on it.</figcaption>
+</figure>
 
 ```yaml title="config.yaml (excerpt)"
 model:
@@ -111,7 +139,7 @@ Two details worth knowing:
 |----------|--------------|----------|
 | `random` (default) | Uniform random subset (seeded) | The baseline every other strategy must beat. |
 | `optimal` | J-shaped mix: 20% familiar / 50% typical / 25% unfamiliar / 5% most unfamiliar above 10K samples; 25/50/20/5 from 2K to 10K; 35/50/15/0 below 2K | A heuristic of ours, loosely after two papers that test neither mixtures nor these thresholds (2605.12906: single-difficulty subsets of base math models; FLOW, 2502.02797: loss re-weighting). **Measured below `random`** (see below). |
-| `flow` | The lowest-perplexity (most familiar) samples | Named after FLOW, which *re-weights* the loss by exp(−loss/τ); palingenesis records that weight as `_score_flow_weight` but training does not use it, so this is plain "most familiar N" selection. |
+| `flow` | The lowest-perplexity (most familiar) samples | Named after FLOW, which *re-weights* the loss by $\exp(-\ell/\tau)$; palingenesis records that weight as `_score_flow_weight` but training does not use it, so this is plain "most familiar N" selection. |
 | `curriculum` | A random subset, ordered familiar→unfamiliar; training keeps the order | Not measured. |
 | `balanced` | Equal thirds of familiar / typical / unfamiliar | Not measured. |
 | `medium_focus` | The samples closest to the median perplexity | Not measured. |
@@ -250,7 +278,7 @@ Training starts at once, streaming included: the LR schedule's horizon (the numb
 - **What a row yields** (examples after filters, their tokens, packed sequences, kept preference pairs) is measured on a uniform random sample of rows run through the real pipeline, mixture weights included.
 - **Stratified by row size.** The scan that counts a JSONL's rows also records every row's size (Arrow data: string sizes, computed column-wise), and sizes predict most of a row's fate: whether it fits `max_seq_length`, how many tokens it holds. The sample is used per size bin, weighted by that bin's share of *all* rows, so length-driven effects (the long tail that filters drop) are known for every row; only what length does not explain is left to sampling.
 - **Sequential.** Rows are drawn in rounds until the reported error reaches 0.5% (`PALINGENESIS_SIZE_PRECISION`; 2,000 rows a round, `PALINGENESIS_SIZE_SAMPLE`), without sampling more than a quarter of a dataset; a dataset smaller than a round is read whole (exact).
-- **Packing** is sized as tokens ÷ (`max_seq_length` × the packer's fill rate): the tokens from the stratified estimate, only the fill rate (a stable ratio, ±0.03%) from running the real packer on a synthetic stream.
+- **Packing** is sized as $\text{tokens} / (\texttt{max\_seq\_length} \times \text{fill rate})$, the fill rate being the packer's: the tokens from the stratified estimate, only the fill rate (a stable ratio, ±0.03%) from running the real packer on a synthetic stream.
 
 Measured: 60,000 conversations with packing, 1,895 micro-batches estimated in 3 s against 1,894 counted in 28 s (reported ±0.1%). Preference pairs with 12–30% dropped: errors of about ±0.5% (1 sigma, and the reported error matches it), against ±1.2% for a plain random sample. The log reports the estimate and its error, and at each epoch's end how many micro-batches it actually had. If the data outlasts the estimate the LR stays at its floor; if it ends a little sooner the decay stops a little early. `train.exact_steps: true` scans the whole pipeline instead; `train.max_steps` skips both.
 
@@ -327,6 +355,14 @@ data:
       weight: 0.6
       samples: 100
 ```
+
+Every evaluation also prints the per-source losses on the plain log line, after the composite, so forgetting on one source shows without a tracker:
+
+```
+step=… eval=<composite> eval_sources=lm:<loss>,mcqa:<loss>
+```
+
+The baseline evaluation before the first step is printed the same way, marked `(before training)`.
 
 Per-source keys: `name`, `dataset`, `split`, `weight` (composite importance), `samples` (subset size), `regression_floor` (optional alarm), and **`mode`**:
 

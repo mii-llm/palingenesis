@@ -4,6 +4,13 @@
 
 ---
 
+!!! abstract "When to use it"
+    - You have a larger teacher **with the same vocabulary** as the student and a corpus to compress it on (chat data, teacher-written text, pretraining text).
+    - You want quantisation-aware training against the full-precision model, or context distillation of a system prompt or document.
+    - The student loops or drifts on its own mistakes: that is exposure bias, which off-policy training cannot see. Use [on-policy distillation](distillation.md) for it, after or instead of this.
+
+    Jump to: [Quickstart](#quickstart) · [Teachers](#teachers) · [Losses](#losses) · [How to check it worked](#how-to-check-it-worked) · [Common failures](#common-failures) · [Configuration reference](#configuration-reference)
+
 ## Off-policy or on-policy?
 
 | | Off-policy (`pgs train` + `distill.enabled`) | On-policy ([`pgs distill`](distillation.md)) |
@@ -45,13 +52,16 @@ pgs train --config kd.yaml
 torchrun --nproc_per_node 8 -m palingenesis.train --config kd.yaml     # student and teacher sharded
 ```
 
-The loss of each trained token t is
+The loss of each trained token $t$ is
 
-```
-kd_weight · Σ_i w_i · D(p_i(·|t) ‖ q(·|t)) / Σ_i w_i  +  ce_weight · −log q(gold_t)
-```
+$$
+\ell_t = \texttt{kd\_weight} \cdot \frac{\sum_i w_i \, D\big(p_i(\cdot \mid t) \,\Vert\, q(\cdot \mid t)\big)}{\sum_i w_i} \; + \; \texttt{ce\_weight} \cdot \big(-\log q(\text{gold}_t)\big)
+$$
 
-over the teachers i that cover t, weighted by the data's per-token weights and divided by the global trained-token count, exactly like the SFT loss (so gradient accumulation and data parallelism average correctly). Feature-matching and plugin terms are added on top.
+where $i$ runs over the teachers that cover $t$, $w_i$ is teacher $i$'s `weight`, $p_i$ its next-token distribution, $q$ the student's, $D$ the divergence chosen by `distill.divergence` ([Losses](#losses); multiplied by $T^2$ when `temperature_scale` is on) and $\text{gold}_t$ the token in the data.
+{: .pg-where }
+
+The per-token losses are weighted by the data's per-token weights and divided by the global trained-token count, exactly like the SFT loss (so gradient accumulation and data parallelism average correctly). Feature-matching and plugin terms are added on top.
 
 ## Teachers
 
@@ -111,16 +121,18 @@ Token-level KD compares the two distributions id by id, so the teacher must shar
 
 ## Losses
 
-| `distill.divergence` | D(p ‖ q), p = teacher, q = student | Source |
+| `distill.divergence` | $D(p \,\Vert\, q)$, $p$ = teacher, $q$ = student | Source |
 |---|---|---|
-| `forward_kl` | Σ p (log p − log q): mode-covering, the classic KD objective | Hinton et al., arXiv:1503.02531 |
-| `reverse_kl` | Σ q (log q − log p): mode-seeking | MiniLLM, arXiv:2306.08543 |
-| `jsd` | β KL(p‖m) + (1−β) KL(q‖m), m = βp + (1−β)q | generalized JSD, GKD, arXiv:2306.13649 |
-| `skew_forward_kl` | KL(p ‖ βp + (1−β)q) | DistiLLM, arXiv:2402.03898 |
-| `skew_reverse_kl` | KL(q ‖ βq + (1−β)p) | DistiLLM, arXiv:2402.03898 |
-| `tvd` | ½ Σ \|p − q\|: bounded, robust to a teacher that is confidently wrong | |
+| `forward_kl` | $\sum_v p_v (\log p_v - \log q_v)$: mode-covering, the classic KD objective | Hinton et al., arXiv:1503.02531 |
+| `reverse_kl` | $\sum_v q_v (\log q_v - \log p_v)$: mode-seeking | MiniLLM, arXiv:2306.08543 |
+| `jsd` | $\beta\,\mathrm{KL}(p \,\Vert\, m) + (1-\beta)\,\mathrm{KL}(q \,\Vert\, m)$, with $m = \beta p + (1-\beta) q$ | generalized JSD, GKD, arXiv:2306.13649 |
+| `skew_forward_kl` | $\mathrm{KL}\big(p \,\Vert\, \beta p + (1-\beta) q\big)$ | DistiLLM, arXiv:2402.03898 |
+| `skew_reverse_kl` | $\mathrm{KL}\big(q \,\Vert\, \beta q + (1-\beta) p\big)$ | DistiLLM, arXiv:2402.03898 |
+| `tvd` | $\tfrac{1}{2} \sum_v \lvert p_v - q_v \rvert$: bounded, robust to a teacher that is confidently wrong | |
 
-- `temperature` softens both distributions; with `temperature_scale: true` (default) the divergence is multiplied by T², which keeps gradient magnitudes comparable across temperatures (Hinton et al.).
+$v$ runs over the vocabulary (for a cached teacher: its top-k, the gold token and the tail bucket) and $\beta$ is `distill.beta`.
+
+- `temperature` $T$ softens both distributions; with `temperature_scale: true` (default) the divergence is multiplied by $T^2$, which keeps gradient magnitudes comparable across temperatures (Hinton et al.).
 - `ce_weight` mixes in cross-entropy on the gold token; `kd_weight: 0` turns distillation into plain SFT plus whatever features / plugins add.
 - The data's per-token weights apply (`data.turn_scaling`), and only trained tokens are distilled: chat masking decides what the teacher supervises (assistant turns, `include_observations`, `train_on_reasoning`, per-message `"loss": false`). Pretraining-mode sources (`mode: pretrain`) distill every token.
 - `train/kd_loss` (per covered token), `train/gold_ce` (cross-entropy on the gold tokens, always reported), `train/kd_coverage`, `train/kd/<teacher>`.
@@ -203,16 +215,39 @@ What it does, hook by hook:
 | Hook | Effect |
 |---|---|
 | `transform_model` | every matching `nn.Linear` becomes a `TernaryLinear` (same Parameter, same name: checkpoints, resume and tied embeddings unchanged); optional `TernaryEmbedding` / ternary head |
-| forward | `W_q = s · clip(round(W/s), −1, 1)` with s = mean \|W\| per group (absmean, BitNet b1.58, arXiv:2402.17764), straight-through estimator, optional int8 per-token activations |
-| `on_forward_start` | sets the quantisation `strength` (a buffer, so torch.compile does not recompile): `W + strength · (W_q − W)` |
+| forward | $W_q = s \cdot \operatorname{clip}\big(\operatorname{round}(W/s), -1, 1\big)$ with $s$ = the mean of $\lvert W \rvert$ per group (absmean, BitNet b1.58, arXiv:2402.17764), straight-through estimator, optional int8 per-token activations |
+| `on_forward_start` | sets the quantisation `strength` (a buffer, so torch.compile does not recompile): $W + \texttt{strength} \cdot (W_q - W)$ |
 | `feature_requests` | hidden-state targets from the full-precision teacher |
 | `param_groups` | the latent weights in their own optimizer group (learning rate, Adam eps, no weight decay) |
-| `on_before_optimizer_step` | adds the gradient of `grid_weight · Σ (W − W_q)²`, pulling latents to their grid points (elementwise on each rank's shard: exact under FSDP) |
-| `on_after_optimizer_step` | clamps latents to `±clamp · s` |
+| `on_before_optimizer_step` | adds the gradient of $\texttt{grid\_weight} \cdot \sum (W - W_q)^2$, pulling latents to their grid points (elementwise on each rank's shard: exact under FSDP) |
+| `on_after_optimizer_step` | clamps latents to $\pm\,\texttt{clamp} \cdot s$ |
 | `metrics` | `codes_changed` (share of codes different from the start), `zero_share`, `strength`, `grid_reg` |
 | `export_state_dict` | `folded`: the exported model holds `W_q` in the original layout (any loader reads it); `latent`: the latents as trained |
 
 The plugin is also registered as the entry point `ternary-qat` (`plugins.custom: [ternary-qat]` runs it with its defaults). The defaults are a starting point, not a tuned recipe. Write your own plugin for other quantisers (learned scales, LSQ, 2-/4-bit grids, Hessian-weighted rounding), inserted modules (extra norms before output projections), calibration passes before training, or per-block reconstruction targets.
+
+## How to check it worked
+
+| Signal | Healthy |
+|---|---|
+| `train/kd_loss` | falls over the run (per covered token) |
+| `train/kd_coverage` | `1.0`: every trained token has a teacher target (below 1 only with `distill.missing: skip`) |
+| `train/topk_mass/<teacher>` | cached teachers: how much of the teacher's mass the top-k holds; above ~0.9 (usually above 0.95 with k = 64) |
+| `train/gold_ce` | the student's cross-entropy on the data, always reported; compare it with a plain SFT run |
+| `train/kd/<teacher>` | one curve per teacher when several are mixed |
+
+Before a large run, `pgs profile --config kd.yaml` counts the teachers' weights and targets ([memory estimate](#long-contexts-and-many-gpus)). Evaluation (`data.eval_dataset`) reports the student's cross-entropy, not the divergence.
+
+## Common failures
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Startup error about the vocabulary | the teacher does not share the student's vocabulary | a teacher that shares the vocabulary (identical, or a prefix with an end-of-turn mapping), or on-policy distillation's `xtok` ([guide](distillation.md#across-tokenizers)) |
+| "... trained tokens ... have no teacher target" | the cache was built from other data or other masking | rebuild the cache from the training config, or `distill.missing: skip` with a `ce_weight` (uncovered tokens train on cross-entropy only, scaled by `ce_weight`) |
+| Out of memory from the teacher | the teacher's weights and hidden states next to the student | `teachers.<name>.placement: shard` (multi-GPU), `dtype: bfloat16`, or [cache it](#cached-teachers-precomputed-top-k) |
+| The student copies the teacher's tail or rambles | forward KL is mode-covering | `distill.divergence: reverse_kl` or `jsd`, and add `distill.ce_weight` |
+| A cached teacher at another temperature is refused | `topk_mode: tail` is exact only at the cache's temperature | `topk_mode: renorm`, or rebuild the cache |
+| A combination is refused by validation | see **Not combinable** below | |
 
 ## Configuration reference
 
@@ -223,9 +258,9 @@ The plugin is also registered as the entry point `ternary-qat` (`plugins.custom:
 | `enabled` | bool | `false` | Off-policy distillation in `pgs train` |
 | `teachers` | dict | `{}` | name → teacher settings (next table); `{name: model_id}` is a shorthand |
 | `divergence` | str | `forward_kl` | `forward_kl`, `reverse_kl`, `jsd`, `skew_forward_kl`, `skew_reverse_kl`, `tvd` |
-| `beta` | float | `0.5` | `jsd`: the teacher's weight in the mixture; `skew_*`: the skew α. In (0, 1) |
+| `beta` | float | `0.5` | `jsd`: the teacher's weight in the mixture; `skew_*`: the skew $\alpha$. In $(0, 1)$ |
 | `temperature` | float | `1.0` | Softmax temperature of both sides |
-| `temperature_scale` | bool | `true` | Multiply the divergence by temperature² |
+| `temperature_scale` | bool | `true` | Multiply the divergence by $T^2$ |
 | `kd_weight` | float | `1.0` | Weight of the divergence |
 | `ce_weight` | float | `0.0` | Weight of cross-entropy on the gold tokens |
 | `topk_mode` | str | `tail` | Cached teachers: `tail` (top-k + gold + a tail bucket) or `renorm` |
@@ -260,7 +295,7 @@ The plugin is also registered as the entry point `ternary-qat` (`plugins.custom:
 | `view_fn` | str | `""` | View: `module:function` (row, messages) → messages |
 | `max_seq_length` | int | `0` | View token limit (0 = 2 × `data.max_seq_length`) |
 
-Command-line overrides reach named teachers: `--distill.teachers.big.placement shard`, `--distill.teachers.cached.cache caches/big`.
+Command-line overrides reach named teachers (see the [CLI reference](../reference/cli.md) and the [configuration reference](../reference/configuration.md)): `--distill.teachers.big.placement shard`, `--distill.teachers.cached.cache caches/big`.
 
 **Not combinable** (refused by validation): `dpo.enabled`, the gated SFT objectives (`plugins.deft`, `dft`, `cadft`, `info_sft`, `pre_rl`), `memory.gradient_release`; feature matching with `memory.seco`; an online teacher view with `parallel.context_parallel`; an online teacher view with packing or pretokenize; teacher views with loop-recovery augmentation; `sources` routing of an online teacher with pretokenize.
 

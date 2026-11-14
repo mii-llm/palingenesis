@@ -21,6 +21,9 @@ env:
     profile_chat_kwargs: {opencode: {enable_thinking: true}}  # optional, per profile
 ```
 
+!!! abstract "When to use it"
+    Your model will be run by users inside agent harnesses you do not control. Mix the profiles of those harnesses in RL (above), [evaluate under each profile](#evaluating-under-a-profile) on held-out tasks, and watch the per-profile reward curves (`env/metric/profile/<name>/reward`, [below](#how-a-profile-is-chosen-one-per-grpo-group)): a profile whose reward lags is a dialect the model has not learned. For a harness that is not built in, [write a profile](#writing-your-own-profile) or [record the real harness](#recording-a-real-harness-pgs-harness). Tasks and verifiers are set up as in [Harbor Environments](harbor.md); the trainer is [Reinforcement Learning](rl.md).
+
 `profile: opencode` runs a single profile. Without `profile`/`profiles`, HarborEnv behaves exactly as it always has (the `palingenesis-default@1` dialect, tested byte-identical). `pgs harness profiles` lists the built-in profiles with the sources each one was written from.
 
 ## How a profile is chosen: one per GRPO group

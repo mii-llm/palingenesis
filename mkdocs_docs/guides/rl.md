@@ -2,6 +2,13 @@
 
 `pgs rl` trains a model against rewards: a checked math answer, code that passes hidden tests, an LLM judge, or any Python function. The policy samples groups of rollouts with vLLM on the same GPU, each group is scored, and one policy-gradient step follows. Rollouts can be multi-turn: the policy calls tools (a Python sandbox, your functions, your environment) between turns.
 
+!!! abstract "When to use it"
+    - The task has a reward you can compute (a verifier, tests, a judge) and the model already solves it some of the time: groups where every rollout gets the same reward carry no gradient.
+    - Start from an SFT checkpoint that still has output diversity: see [SFT → RL Transition](sft-to-rl.md).
+    - To imitate a stronger model on the student's own samples instead of a reward, use [on-policy distillation](distillation.md); for preference pairs, [DPO](dpo.md).
+
+    Jump to: [Data](#data) · [Rewards](#rewards) · [Tools and environments](#tools-and-environments) · [The objective](#the-objective) (what to watch) · [Sampler/trainer agreement](#samplertrainer-agreement) · [Speed](#speed) · [Multi-GPU](#multi-gpu-clusters-and-memory) · [Resuming](#resuming)
+
 ```bash
 pgs rl --config configs/rl_math.yaml
 pgs rl --config configs/rl_math.yaml --rollout.group_size 16 --train.learning_rate 1e-6
@@ -33,8 +40,10 @@ A JSONL, JSON or parquet file, or a Hugging Face dataset id. The prompt is the f
 | `data.revisit_partial_max_share` | `0.875` | A group solved at least this share (7/8) is not queued (little left to learn) |
 | `data.revisit_share` | `0.5` | At most this share of all draws are revisits, so prompts never tried keep flowing |
 
-With the queue on, success is the raw task reward (before `loss.group_shaping` and the overlong penalty) at or above `data.success_threshold`; a group where the environment reported `metric/verifier_failed` for most rollouts is not judged (`groups/verifier_failed` counts them). A row is never served twice at the same policy version, from the queue or the epoch order, nor while a group of it is still generating. The log adds `sampler/*` counters (rows tried, ever solved, `rows_solved_after_fail`: compare it with a no-learning null, since a row with p = 0.1 fails a group of 8 four times in ten; the sampler state keeps each row's (version, solved share) history for that), `sampler/revisit_share_drawn`, and `outcome/pass@1_fresh` / `outcome/pass@1_revisit`: the queue changes the prompt mix, so only fresh draws and the held-out evaluation compare with a run without it.
+With the queue on, success is the raw task reward (before `loss.group_shaping` and the overlong penalty) at or above `data.success_threshold`; a group where the environment reported `metric/verifier_failed` for most rollouts is not judged (`groups/verifier_failed` counts them). A row is never served twice at the same policy version, from the queue or the epoch order, nor while a group of it is still generating. The log adds `sampler/*` counters (rows tried, ever solved, `rows_solved_after_fail`: compare it with a no-learning null, since a row with $p = 0.1$ fails a group of 8 four times in ten; the sampler state keeps each row's (version, solved share) history for that), `sampler/revisit_share_drawn`, and `outcome/pass@1_fresh` / `outcome/pass@1_revisit`: the queue changes the prompt mix, so only fresh draws and the held-out evaluation compare with a run without it.
 
+| Option | Default | |
+|---|---|---|
 | `data.format` | `auto` | `chat` (palingenesis rows) or `nemo_gym` (NVIDIA NeMo Gym / Nemotron-RL rows, prompt in `responses_create_params`), detected |
 | `data.tools_field` | `tools` | A column of per-row tool schemas (OpenAI or Responses-API form), used when the environment has none |
 
@@ -220,9 +229,18 @@ Text and embedded text resources reach the policy as text; images and audio beco
 
 ## The objective
 
-Rewards become group-relative advantages (reward minus the group mean, divided by the batch's standard deviation). Groups whose rollouts all got the same reward carry no gradient, so they are replaced by fresh prompts before the step (`rollout.max_refill`).
+Rewards become group-relative advantages (reward minus the group mean, divided by the batch's standard deviation):
 
-The default loss, `masked_is`, is a policy gradient anchored to the sampler's own log-probabilities: the importance ratio π_θ/μ covers both staleness and the numerical difference between vLLM and the trainer, capped at `loss.is_cap`, with PPO's asymmetric clip (`eps_low` 0.2, `eps_high` 0.28) applied as a mask, and a sequence mask (`loss.seq_mask`) that drops a trajectory whose tokens drift too far. No reference model and no KL term, as in current recipes (DAPO, Magistral, ScaleRL, Olmo 3). The other objectives are one option away (below). Losses are aggregated per prompt by default (`loss.aggregation`).
+$$
+A_{g,j} = \frac{r_{g,j} - \bar r_g}{\sigma_{\text{batch}} + \epsilon}
+$$
+
+where $r_{g,j}$ is the reward of rollout $j$ of group $g$, $\bar r_g$ the mean over the group and $\sigma_{\text{batch}}$ the standard deviation of the centred rewards $r_{g,j} - \bar r_g$ over the whole batch, all ranks included (`loss.advantage_std: batch`, the default; `group` divides by each group's own, `none` not at all). $\epsilon = 10^{-6}$.
+{: .pg-where }
+
+ Groups whose rollouts all got the same reward carry no gradient, so they are replaced by fresh prompts before the step (`rollout.max_refill`).
+
+The default loss, `masked_is`, is a policy gradient anchored to the sampler's own log-probabilities: the importance ratio $\pi_\theta / \mu$ (trainer over sampler probability of each sampled token) covers both staleness and the numerical difference between vLLM and the trainer, capped at `loss.is_cap`, with PPO's asymmetric clip (`eps_low` 0.2, `eps_high` 0.28, i.e. the band $[1 - 0.2,\ 1 + 0.28]$) applied as a mask, and a sequence mask (`loss.seq_mask`) that drops a trajectory whose tokens drift too far. No reference model and no KL term, as in current recipes (DAPO, Magistral, ScaleRL, Olmo 3). `cispo`, `icepop` and `gspo` are one option away. Losses are aggregated per prompt by default (`loss.aggregation`).
 
 ### Choosing the algorithm
 
@@ -264,17 +282,26 @@ Every step logs what to watch: `reward` and `rewards/*`, `policy/abs_ratio_dev` 
 
 ## Sampler/trainer agreement
 
-vLLM and the trainer compute the same policy with different kernels, so the log-probability of a sampled token differs slightly between them even with identical weights. The importance ratio ρ = π_θ/μ absorbs the difference, but every unit of it is noise in the gradient, and it grows on long sequences and recurrent layers. `policy/mismatch_k3` is the per-token k3 estimate of KL(μ ‖ π_θ), E[ρ - 1 - log ρ]; `policy/abs_ratio_dev` is E[|ρ - 1|]. Every step also logs them split by bucket, for the buckets that had tokens:
+vLLM and the trainer compute the same policy with different kernels, so the log-probability of a sampled token differs slightly between them even with identical weights. The importance ratio $\rho = \pi_\theta / \mu$ absorbs the difference, but every unit of it is noise in the gradient, and it grows on long sequences and recurrent layers. The two agreement metrics are, over the trained tokens,
+
+$$
+\texttt{mismatch\_k3} = \mathbb{E}\big[\rho - 1 - \log \rho\big] \approx \mathrm{KL}(\mu \,\Vert\, \pi_\theta), \qquad \texttt{abs\_ratio\_dev} = \mathbb{E}\big[\lvert \rho - 1 \rvert\big]
+$$
+
+where $\mu$ is the sampler's (vLLM's) probability of the sampled token and $\pi_\theta$ the trainer's: the first is the per-token k3 estimate of the KL divergence. Both are 0 when the two agree exactly.
+{: .pg-where }
+
+Every step also logs them split by bucket, for the buckets that had tokens:
 
 | Metric | Tokens |
 |---|---|
 | `policy/mismatch_k3/pos_0_1k`, `pos_1k_4k`, `pos_4k_plus` | by position in the completion (tokens after the prompt, tool results included): [0, 1024), [1024, 4096), 4096 and beyond |
 | `policy/mismatch_k3/current` | sampled by the policy being trained: the numerical mismatch alone |
 | `policy/mismatch_k3/stale` | sampled by an older policy version (`rollout.max_staleness > 0`): staleness on top. A turn whose request was added before a weight update (partial rollouts) counts as stale, so this is an upper bound: a request still queued at the update counts too |
-| `policy/abs_ratio_dev/<bucket>` | the same buckets for E[\|ρ - 1\|] |
+| `policy/abs_ratio_dev/<bucket>` | the same buckets for $\mathbb{E}\big[\lvert \rho - 1 \rvert\big]$ |
 | `policy/stale_tokens` | share of the trained tokens whose request started under an older version (an upper bound, as above) |
 
-Tokens forced by think-skip (`rollout.think_skip`) carry an intended importance weight and are left out of the buckets. At step 0 of a fresh run the batch was sampled by the initial weights and is scored by the same weights before any update, so its mismatch is the two implementations' numerics alone: it is logged as `policy/mismatch_k3_step0`, and the trainer warns when it exceeds 1e-2 (`MISMATCH_K3_STEP0_WARN` in `palingenesis.rl.trainer`). bf16 rounding differences stay well below that; above it the engine and the trainer compute different distributions (weights not loaded, a chat template, stop token or temperature difference, FP8 rollouts, kernels that disagree).
+Tokens forced by think-skip (`rollout.think_skip`) carry an intended importance weight and are left out of the buckets. At step 0 of a fresh run the batch was sampled by the initial weights and is scored by the same weights before any update, so its mismatch is the two implementations' numerics alone: it is logged as `policy/mismatch_k3_step0`, and the trainer warns when it exceeds $10^{-2}$ (`MISMATCH_K3_STEP0_WARN` in `palingenesis.rl.trainer`). bf16 rounding differences stay well below that; above it the engine and the trainer compute different distributions (weights not loaded, a chat template, stop token or temperature difference, FP8 rollouts, kernels that disagree).
 
 Options that bring the two closer:
 
@@ -323,6 +350,20 @@ Every rank owns a GPU, its shard of the prompts and a colocated vLLM engine; the
 | `train.cpu_offload` | FSDP2 offload: parameters, gradients and optimizer state in CPU memory (also on one GPU), for the largest model a GPU can train. Budget about 24 bytes of host RAM per parameter per node: 16 for the fp32 parameters, gradients and AdamW moments, plus pinned staging (a 4B policy on one GPU needs about 96 GB; tmpfs files count against it); the trainer warns at startup when it will not fit |
 
 **Host memory.** After each optimizer step the trainer calls glibc's `malloc_trim(0)` (Linux with glibc only) and logs the process's resident memory as `memory/host_rss_gb` (OPD trainers too). Agentic runs allocate large transient buffers (tool outputs, verifier copies, a batch's trajectories) on many threads, and glibc gives each thread its own heap arena, up to 8 per CPU, keeping their pages after the buffers are freed: without a limit the RSS ratchets up at every new peak. For RL runs with many concurrent containers launch with `MALLOC_ARENA_MAX=4` (e.g. `MALLOC_ARENA_MAX=4 python -m palingenesis.rl.trainer --config ...`); a `memory/host_rss_gb` that keeps climbing after the first steps is worth a look.
+
+## Common failures
+
+| Symptom | What to check |
+|---|---|
+| `groups/zero_variance` near 1, reward flat | every rollout of a group gets the same reward: prompts too hard or too easy for the policy, or a reward that cannot tell rollouts apart; `data.retire_above` and the [retry queue](#data) change the prompt mix |
+| `policy/mismatch_k3_step0` above 1e-2 (startup warning) | the engine and the trainer compute different distributions: weights, chat template, stop token, temperature, FP8 rollouts; see [Sampler/trainer agreement](#samplertrainer-agreement) |
+| `policy/mismatch_k3` rising during the run | a rise precedes collapse; the options in [Sampler/trainer agreement](#samplertrainer-agreement) bring the two closer |
+| Many `skipped` samples | sandbox, judge or environment outages (`SkipSample`, a sandbox failure); they are kept out of the loss |
+| `format/whitespace` above 0.02 | add the [`whitespace` reward](#rewards) |
+| Slow steps on agentic tasks | size `rollout.max_completion_tokens` and turn budgets ([How it is made fast](#how-it-is-made-fast)); read `logging.dump_trajectories` before tuning |
+| `memory/host_rss_gb` keeps climbing | launch with `MALLOC_ARENA_MAX=4` ([Host memory](#multi-gpu-clusters-and-memory)) |
+
+See also: [Harbor Environments](harbor.md) and [Harness Profiles](harness-profiles.md) for agent tasks, the [CLI reference](../reference/cli.md) for `pgs rl`, and the [configuration reference](../reference/configuration.md).
 
 ## Resuming
 

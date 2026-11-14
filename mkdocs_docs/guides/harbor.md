@@ -2,18 +2,54 @@
 
 `HarborEnv` trains and evaluates agents on **Harbor tasks**: one directory per task, a Docker container per episode, and the task's own tests as the reward. palingenesis runs the tasks itself: no Harbor installation, no external agent, no HTTP endpoint. The policy being trained is the agent, through the ordinary [environment protocol](rl.md#tools-and-environments), so every rollout is token-exact. The trainer scores exactly the tokens the sampler produced, tool calls and tool results included.
 
+!!! abstract "When to use it"
+    You train or evaluate an agent on tasks that need a real machine (a shell, files, services) and a verifier that checks the result. For stateless tools, or an existing MCP / OpenEnv / NeMo Gym server, use the other [environments](rl.md#tools-and-environments). The path: write task directories, [`pgs harbor check`](#checking-tasks) them, [calibrate](#evaluating-and-calibrating-outside-training) on the starting checkpoint, then `pgs rl`.
+
 The same task directories also run under the [Harbor CLI](https://harborframework.com) with external agents (opencode, mini-swe-agent, OpenHands, ...), as long as they use upstream Harbor features only (see [Harbor CLI compatibility](#harbor-cli-compatibility)). To train a model that works well inside those real agents, see [Harness Profiles](harness-profiles.md): `HarborEnv` can reproduce each agent's prompt, tools, result wording and stop rule.
 
-```mermaid
-flowchart LR
-    R[row: task_dir + messages] --> E[HarborEnv.reset]
-    E --> C[fresh container<br/>limits, no network,<br/>workdir/ + setup.sh]
-    C --> L{policy turn}
-    L -- tool calls --> T[bash / read / write / edit<br/>in the container]
-    T --> L
-    L -- submit or stop rule --> V[verify: capture, copy workdir<br/>to a clean container, tests/test.sh]
-    V --> W[reward.txt / reward.json]
-```
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 232" role="img" aria-labelledby="fig-harbor-title fig-harbor-desc">
+<title id="fig-harbor-title">One Harbor episode: a fresh container, tool calls until submit, a verifier in a clean container, a reward</title>
+<desc id="fig-harbor-desc">A dataset row with a task directory and messages goes to HarborEnv.reset, which starts a fresh container with resource limits, no network, the task's workdir files and its setup script. The policy then takes turns: each tool call, bash, read, write or edit, runs in the container and its result returns to the policy. When the policy submits or a stop rule fires, the verifier captures the work, copies the working directory into a clean container and runs tests/test.sh, which writes reward.txt or reward.json.</desc>
+<defs><marker id="fig-harbor-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker><marker id="fig-harbor-arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head-accent" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box" x="10" y="20" width="140" height="50" rx="4"/>
+<text class="" x="22" y="40">row</text>
+<text class="t-muted t-small t-mono" x="22" y="56">task_dir + messages</text>
+<path class="line" d="M150,45 H176" marker-end="url(#fig-harbor-arrow)"/>
+<rect class="box" x="178" y="20" width="150" height="50" rx="4"/>
+<text class="" x="190" y="40">HarborEnv.reset</text>
+<text class="t-muted t-small" x="190" y="56"></text>
+<path class="line" d="M328,45 H354" marker-end="url(#fig-harbor-arrow)"/>
+<rect class="box" x="356" y="10" width="170" height="70" rx="4"/>
+<text class="" x="368" y="30">fresh container</text>
+<text class="t-muted t-small" x="368" y="46">limits, no network,</text>
+<text class="t-muted t-small t-mono" x="368" y="60">workdir/ + setup.sh</text>
+<path class="line" d="M526,45 H560 V110" marker-end="url(#fig-harbor-arrow)"/>
+<rect class="box-accent" x="480" y="112" width="150" height="48" rx="4"/>
+<text class="" x="492" y="132">policy turn</text>
+<text class="t-muted t-small" x="492" y="148">the model being trained</text>
+<rect class="box" x="180" y="112" width="200" height="48" rx="4"/>
+<text class="" x="192" y="132">tool call in the container</text>
+<text class="t-muted t-small t-mono" x="192" y="148">bash / read / write / edit</text>
+<path class="line" d="M478,128 H382" marker-end="url(#fig-harbor-arrow)"/>
+<path class="line" d="M382,148 H478" marker-end="url(#fig-harbor-arrow)"/>
+<text class="t-muted t-small" x="430" y="122" text-anchor="middle">call</text>
+<text class="t-muted t-small" x="430" y="163" text-anchor="middle">result</text>
+<path class="line-accent" d="M555,160 V196 H442" marker-end="url(#fig-harbor-arrow-a)"/>
+<text class="t-accent t-small" x="564" y="186">submit or stop rule</text>
+<rect class="box" x="180" y="176" width="260" height="52" rx="4"/>
+<text class="" x="192" y="196">verify</text>
+<text class="t-muted t-small" x="192" y="212">capture, copy workdir to a clean container,</text>
+<text class="t-muted t-small t-mono" x="192" y="226">tests/test.sh</text>
+<path class="line" d="M180,202 H130" marker-end="url(#fig-harbor-arrow)"/>
+<rect class="box" x="10" y="182" width="118" height="40" rx="4"/>
+<text class="" x="22" y="202">reward</text>
+<text class="t-muted t-small t-mono" x="22" y="218">reward.txt / .json</text>
+</svg>
+</div>
+<figcaption>One episode in a Harbor environment: the policy loops through tool calls inside its own container until it submits or a stop rule ends the episode; the verifier then grades a copy of the working directory in a clean container.</figcaption>
+</figure>
 
 ## Quick start
 
@@ -184,7 +220,7 @@ for row, group in zip(rows, groups):        # group: the k trajectories of the r
 
 `engine` is any rollout engine (`VLLMColocateRollout` for vLLM in the same process, or anything with `generate(prompts, max_new_tokens, temperature)`). The `k` samples of a row share the per-group choices (the harness profile), as in training.
 
-**Calibrate before you train.** Run the starting checkpoint with `k = 4–8` on every task and keep the tasks with `0 < pass@k < k`. Tasks that always pass or always fail give zero GRPO advantage. Run a strong model with `k = 1` on every task too, and read the per-family pass rate: a family a strong model systematically fails usually has a broken task or verifier, not a hard one.
+**Calibrate before you train.** Run the starting checkpoint with $k = 4$ to $8$ samples on every task and keep the tasks that pass in some but not all of them ($0 < \text{passes} < k$). Tasks that always pass or always fail give zero GRPO advantage. Run a strong model with $k = 1$ on every task too, and read the per-family pass rate: a family a strong model systematically fails usually has a broken task or verifier, not a hard one.
 
 ## Checking tasks
 
@@ -211,6 +247,17 @@ The palingenesis extensions behave differently there:
 
 To publish such a task set for the CLI, convert it to Harbor's single-step `[[steps]]` layout: `steps/main/instruction.md`, `workdir/` with `workdir/setup.sh`, `solution/`, `tests/`. That layout stages the files and runs the setup. Have reply-graded tasks ask the agent to write its answer to a file the tests read, such as `/workdir/answer.txt`. Then check the converted set with the CLI itself (oracle and nop agents) before publishing. `HarborEnv` does not read the `[[steps]]` layout, so keep both: the native layout for training, `[[steps]]` for the CLI.
 
+## Common failures
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `pgs harbor check` reports a task invalid: the nop passes | the verifier accepts an untouched working directory: a free reward RL will find | make the tests check the requested change |
+| `env/metric/verifier_failed` | `tests/test.sh` wrote no `reward.txt` / `reward.json`, or crashed | run the task's oracle with `pgs harbor check` and read the verifier's output |
+| Reply-graded tasks score 0 with an empty reply | the model called `submit` before writing its answer | a profile that ends on a reply without tool calls ([above](#harborenv)) |
+| Episode start fails | `environment/setup.sh` failed (never scored as the agent's failure) | fix the setup script; check the image builds |
+| First episodes of a new task set are slow | images are built once and cached | build the shared image ahead of the run |
+| Every episode of a task scores 0 under the Harbor CLI | palingenesis extensions (`workdir/`, `setup.sh`, `final_message.md`) | convert to the `[[steps]]` layout ([compatibility](#harbor-cli-compatibility)) |
+
 ## Tips
 
 - **One shared image** for a large task set: build it once, give it a versioned tag (`my-base:1`), and never retag a version while jobs use it. To change the verifier, build `my-base:2` and point the tasks at it.
@@ -218,3 +265,5 @@ To publish such a task set for the CLI, convert it to Harbor's single-step `[[st
 - **`env.max_tool_output_tokens`** caps every observation after the tool's own truncation. With harness profiles, set it above the profiles' own limits so the policy sees the harness's wording.
 - **Thinking**: `model.chat_template_kwargs: {enable_thinking: false}` for non-thinking runs. A row's own `chat_template_kwargs` wins, and with harness profiles the order is model < profile < row.
 - **Held-out tasks**: split by task family and parameters, not by random rows. Near-duplicate tasks in train and dev inflate the evaluation.
+
+See also: [Reinforcement Learning](rl.md) for the trainer, [Harness Profiles](harness-profiles.md) to train inside real agent harnesses, and the [CLI reference](../reference/cli.md) for `pgs harbor`.

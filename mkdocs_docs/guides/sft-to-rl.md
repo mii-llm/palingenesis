@@ -4,6 +4,9 @@
 
 ---
 
+!!! abstract "When to read this"
+    You are running SFT now and plan [reinforcement learning](rl.md) (GRPO) or [DPO](dpo.md) on the result. In short: turn on [entropy monitoring](#detection-entropy-monitoring), [stop early](#1-stop-early), keep the SFT and RL data disjoint, and hand RL the [EMA checkpoint](#4-use-the-ema-checkpoint-for-rl). A complete config is at the [end of the page](#the-full-config).
+
 ## The mechanism of failure
 
 Here's what happens inside the model during SFT:
@@ -87,8 +90,17 @@ plugins:
 
 The `pre_rl` plugin splits tokens by entropy and KL from a stale reference snapshot. "Safe" tokens (low entropy, low KL) get normal cross-entropy. "Unsafe" tokens — where the distribution is still wide or already drifting — are excluded from imitation and instead get:
 
-- **Entropy bonus**: `+H(p_θ)` — directly rewards output diversity
-- **KL anchor**: `-KL(p_θ || p_ref)` — penalizes drift from the base model's distribution
+- **Entropy bonus**: $+H(p_\theta)$ — directly rewards output diversity
+- **KL anchor**: $-\mathrm{KL}(p_\theta \,\Vert\, p_{\text{ref}})$ — penalizes drift from the base model's distribution
+
+As a loss to minimise, each term averaged over its own tokens:
+
+$$
+L = \mathrm{CE}_{\text{safe}} \;-\; c_H \, \overline{H(p_\theta)}_{\text{unsafe}} \;+\; c_{\mathrm{KL}} \, \overline{\mathrm{KL}(p_\theta \,\Vert\, p_{\text{ref}})}_{\text{unsafe}}
+$$
+
+where $p_\theta$ is the model's next-token distribution, $p_{\text{ref}}$ the reference snapshot's, $c_H$ is `pre_rl_entropy_coeff` and $c_{\mathrm{KL}}$ is `pre_rl_kl_coeff`.
+{: .pg-where }
 
 Together, these slow the entropy collapse while still allowing the model to learn the task format.
 
@@ -120,11 +132,11 @@ If entropy has collapsed but you need an RL-viable checkpoint:
 
 **Option 1: Model fusion.** Interpolate the overtrained model with the base:
 
-```python
-# θ_new = 0.7 × θ_sft + 0.3 × θ_base
-```
+$$
+\theta_{\text{new}} = 0.7\,\theta_{\text{SFT}} + 0.3\,\theta_{\text{base}}
+$$
 
-This partially restores the base model's diverse distribution. SLERP (spherical interpolation) is better than LERP here — it preserves weight norms. Palingenesis's `base_merge` feature does exactly this.
+This partially restores the base model's diverse distribution. SLERP (spherical interpolation) is better than LERP here — it preserves weight norms. Palingenesis's `base_merge` feature does exactly this (`base_merge_method: slerp`); [Model Merging](merging.md) covers merging finished checkpoints.
 
 **Option 2: Use an earlier checkpoint.** The periodic checkpoints saved during training each have different entropy levels. Pick the one closest to your target entropy (2.0-3.0 range) rather than the "best loss" one.
 
@@ -159,3 +171,5 @@ logging:
 ```
 
 This produces a checkpoint that: (1) has learned the task format on the tokens that are safe to imitate, (2) retains enough output diversity for GRPO to explore, (3) is anchored near the base model's distribution so RL doesn't drift too far.
+
+**Next:** [Reinforcement Learning](rl.md) to train it, [Health Monitoring](../reference/health.md) for the other `health/*` metrics, and the [configuration reference](../reference/configuration.md) for every key above.

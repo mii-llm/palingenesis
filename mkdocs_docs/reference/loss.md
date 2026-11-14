@@ -4,6 +4,15 @@
 
 ---
 
+| Loss | How it is enabled | Use it when |
+|---|---|---|
+| [Standard cross-entropy](#standard-cross-entropy) | the default: no `plugins` objective enabled | always, unless you have measured something better on your model |
+| [Chunked cross-entropy](#chunked-cross-entropy) | `memory.chunked_loss: true` (the default) | large vocabularies or long sequences: the full logits never exist |
+| [Cut Cross-Entropy](#cut-cross-entropy-apple) | automatic when `cut-cross-entropy` is installed and no plugin needs full logits | the same, with a fused kernel |
+| [DEFT](#deft) | `plugins.deft: true` | experiments on base models; read the measurement below first |
+
+The token-weighting objectives (`deft`, `dft`, `cadft`, `info_sft`, `pre_rl`) are exclusive: enabling more than one is a configuration error. All of them are normalised the same way ([Loss normalization](#loss-normalization)). Off-policy distillation and DPO have their own objectives: see [Off-Policy Distillation](../guides/offpolicy-distillation.md#losses) and [DPO](../guides/dpo.md#objectives).
+
 ## DEFT
 
 Dynamic Entropy Fine-Tuning (arXiv:2602.11424). Each token's cross-entropy is weighted by the model's own confidence: where the model's prediction is concentrated and disagrees with the target, the token's weight shrinks; where the prediction is diffuse, the token keeps (almost) its full cross-entropy weight.
@@ -13,7 +22,7 @@ plugins:
   deft: true
 ```
 
-No hyperparameters. Standard CE (α→0) and DFT (α=1) are its two ends. The paper reports large gains fine-tuning **base** math models on NuminaMath (Qwen2.5-Math-1.5B, MATH-500: 41.7 with CE, 61.4 with DEFT).
+No hyperparameters. Standard CE ($\alpha \to 0$) and DFT ($\alpha = 1$) are its two ends. The paper reports large gains fine-tuning **base** math models on NuminaMath (Qwen2.5-Math-1.5B, MATH-500: 41.7 with CE, 61.4 with DEFT).
 
 !!! warning "Measured here: it hurt when refining a post-trained model"
     Qwen3-0.6B (post-trained, non-thinking), 30k NuminaMath-CoT conversations, the paper's recipe (1 epoch, LR 5e-5, cosine, warmup 0.1, fp32 master weights), greedy evaluation:
@@ -27,17 +36,33 @@ No hyperparameters. Standard CE (α→0) and DFT (α=1) are its two ends. The pa
 
     All three degraded a model that is already good at math at this learning rate, and the token-weighted ones more. Measure on your own model and data before enabling them.
 
-The mechanism: each token's cross-entropy is multiplied by a trust gate `p_t^α_t`, where `p_t` is the model's probability of the target token and `α_t = Σ_v p_v²` (the collision probability, i.e. exponentiated Rényi-2 entropy) measures how concentrated the prediction is; the gate is a stop-gradient weight, so the gradient on the target logit is `-p^α (1 - p)`. A diffuse prediction (α near 0) keeps the full cross-entropy gradient; a confident one (α near 1) behaves like DFT's `p_t` gate, suppressing tokens the model confidently disagrees with.
+The mechanism: each token's cross-entropy is multiplied by a trust gate,
+
+$$
+\ell_t = -\operatorname{sg}\!\big(p_t^{\alpha_t}\big)\,\log p_t, \qquad \alpha_t = \sum_v p_v^2
+$$
+
+where $p_t$ is the model's probability of the target token, $p_v$ its probability of vocabulary entry $v$, and $\operatorname{sg}$ a stop-gradient.
+{: .pg-where }
+
+$\alpha_t$ (the collision probability, i.e. exponentiated Rényi-2 entropy) measures how concentrated the prediction is. Because the gate is a stop-gradient weight, the gradient on the target logit is $-p_t^{\alpha_t}(1 - p_t)$. A diffuse prediction ($\alpha_t$ near 0) keeps the full cross-entropy gradient; a confident one ($\alpha_t$ near 1) behaves like DFT's $p_t$ gate, suppressing tokens the model confidently disagrees with.
 
 ### Chunked token-gated objectives
 
-With `memory.chunked_loss: true` (the default), DEFT, DFT, InfoSFT and CADFT are computed chunk by chunk along the sequence, never materializing the full [B, S, V] logits; the result equals the full-logit definitions (tests/test_chunked_gated_losses.py). InfoSFT and CADFT need batch statistics (InfoSFT's mean weight, CADFT's per-sequence NLL z-scores), which one extra no-grad pass over the chunks provides.
+With `memory.chunked_loss: true` (the default), DEFT, DFT, InfoSFT and CADFT are computed chunk by chunk along the sequence, never materializing the full `[B, S, V]` logits; the result equals the full-logit definitions (tests/test_chunked_gated_losses.py). InfoSFT and CADFT need batch statistics (InfoSFT's mean weight, CADFT's per-sequence NLL z-scores), which one extra no-grad pass over the chunks provides.
 
 ---
 
 ## Standard cross-entropy
 
-The baseline. `loss = -log(p_correct) / num_valid_tokens`, averaged across the sequence.
+The baseline:
+
+$$
+L = -\frac{1}{N} \sum_t \log p_\theta(y_t)
+$$
+
+where $y_t$ is the target token at trained position $t$ and $N$ the number of trained (valid) tokens.
+{: .pg-where }
 
 Active when no plugin is enabled. Uses `sum` reduction + global valid-token normalization for correct distributed training.
 
@@ -47,7 +72,7 @@ Active when no plugin is enabled. Uses `sum` reduction + global valid-token norm
 
 Computes CE without ever materializing the logit tensor. Custom Triton kernel that computes only: (1) the dot product for the correct token, (2) the log-sum-exp over all vocab entries on-the-fly in SRAM.
 
-Memory: O(1) instead of O(B×S×V). For Gemma (262K vocab, seq 8K, batch 4): saves 16 GB.
+Memory: $O(1)$ instead of $O(B \cdot S \cdot V)$. For Gemma (262K vocab, seq 8K, batch 4): saves 16 GB.
 
 ```bash
 pip install cut-cross-entropy
@@ -75,11 +100,14 @@ memory:
 
 All loss functions use `sum` reduction divided by `global_valid_tokens`:
 
-```python
-loss = sum(per_token_losses) / global_valid_tokens
-```
+$$
+L = \frac{\sum_t \ell_t}{N_{\text{global}}}
+$$
 
-Where `global_valid_tokens` is all-reduced across DP ranks. This is critical for distributed correctness — without it, ranks with more padding get inflated gradients.
+where $\ell_t$ is the per-token loss and $N_{\text{global}}$ (`global_valid_tokens`) the trained-token count all-reduced across data-parallel ranks.
+{: .pg-where }
+
+ This is critical for distributed correctness — without it, ranks with more padding get inflated gradients.
 
 
 ---
