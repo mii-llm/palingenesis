@@ -74,7 +74,8 @@ Training issue?
 ├── OOM error
 │   ├── Check: python -m palingenesis.agent_tooling.profile_memory --config ... --gpu_memory_gb 80
 │   ├── Likely causes: Seq too long, batch too big, no checkpointing
-│   └── Fix: Enable chunked_loss, selective AC, reduce seq/batch, add FSDP/CP
+│   ├── Fix: Enable chunked_loss, selective AC, reduce seq/batch, add FSDP/CP
+│   └── Fastest settings that fit: pgs fit --config ... --gpu 80 (measures checkpointing modes and SeCO, real steps)
 ├── Trained model loops, rambles to the token limit, or never stops calling tools
 │   ├── Measure: the loop share and how episodes end (stop / length limit / turn limit) at deployment sampling,
 │   │   in both thinking modes; during SFT watch train/repeat_p and train/stop_p

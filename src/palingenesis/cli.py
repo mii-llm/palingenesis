@@ -46,6 +46,7 @@ Commands:
   inspect     Visualize tokenization and masking
   validate    Validate masking across many samples
   profile     Estimate GPU memory usage
+  fit         Measure the fastest memory settings (checkpointing, SeCO) that fit a GPU memory budget
   monitor     Check status of a running training
   loss        Analyze loss curve from log file
   version     Show version info
@@ -163,6 +164,11 @@ def main():
         case "profile":
             # Translate --gpu to --gpu_memory_gb for the tool
             _run_agent_tool("palingenesis.agent_tooling.profile_memory")
+
+        case "fit":
+            from palingenesis.agent_tooling.fit_memory import main as fit_main
+
+            sys.exit(fit_main())
 
         case "monitor":
             _run_agent_tool("palingenesis.agent_tooling.monitor_run")

@@ -222,6 +222,13 @@ pgs profile --config config.yaml --gpu 80
 pgs profile --config config.yaml --measure
 ```
 
+`pgs fit` measures the fastest memory settings (activation checkpointing mode, SeCO chunk size) that fit a memory budget, with the real trainer on worst-case rows; exit code 1 when none fits. `--first-fit` stops at the first setting that fits, `--json` prints the report as JSON.
+
+```bash
+pgs fit --config config.yaml              # budget: this GPU
+pgs fit --config config.yaml --gpu 24     # budget: 24 GiB
+```
+
 ### monitor
 
 Check status of a running training from its log file.

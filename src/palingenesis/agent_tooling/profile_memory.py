@@ -258,11 +258,15 @@ def measure_memory(config: Config, steps: int = 2) -> dict:
         cfg.train.save_steps, cfg.train.save_final, cfg.train.resume_from = 0, False, None
         cfg.train.output_dir = f"{tmp}/out"
         cfg.logging.use_wandb = cfg.logging.use_trackio = False
+        # the health monitor's periodic memory report resets torch's peak counter
+        cfg.logging.health_tier2_every = cfg.logging.health_tier3_every = 10**9
         torch.cuda.reset_peak_memory_stats()
-        train(cfg)
+        result = train(cfg)
     # GiB: GPUs are sold by GiB ("80 GB" A100 = 80 GiB), so the numbers match the card
     return {
         "measured_peak_gb": torch.cuda.max_memory_allocated() / 2**30,
+        # of the last optimizer step: the first ones carry compilation and allocator warm-up
+        "tokens_per_sec": result.metrics.get("train/tokens_per_sec"),
         "gpu_total_gb": torch.cuda.get_device_properties(0).total_memory / 2**30,
         "rows": config.train.per_device_batch_size * (2 if config.dpo.enabled else 1),
         "micro_batches": config.train.gradient_accumulation_steps,

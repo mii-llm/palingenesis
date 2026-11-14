@@ -26,6 +26,28 @@ Palingenesis takes a different path: eliminate the waste.
 
 `pgs profile --measure` runs two real optimizer steps and reports the measured peak for your config.
 
+### Trading speed for memory: `pgs fit`
+
+Activation memory grows with the sequence, and every setting that lowers it costs speed: activation checkpointing recomputes part (`selective`) or all (`full`) of each layer in the backward, and SeCO (`memory.seco`) runs the sequence chunk by chunk. Which one is the fastest that still fits depends on the model, the sequence length and the GPU, so measure it:
+
+```bash
+pgs fit --config my.yaml            # budget: this GPU
+pgs fit --config my.yaml --gpu 24   # budget: 24 GiB
+```
+
+Each setting runs the real trainer for a few steps on worst-case rows (every row at `data.max_seq_length`) in its own process; the report gives the peak and the throughput of each, and recommends the fastest one under the budget with the options to set. Qwen3.5-0.8B, one 16,384-token row per micro-batch, on an H100:
+
+| Setting | Peak | Tokens/s |
+|---|:---:|:---:|
+| `gradient_checkpointing: none` | 34.9 GiB | 19,900 |
+| `selective` (default) | 19.4 GiB | 18,100 |
+| `full` | 11.5 GiB | 16,600 |
+| SeCO, 8192-token chunks | 15.9 GiB | 13,000 |
+| SeCO, 4096-token chunks | 14.0 GiB | 10,500 |
+| SeCO, 1024-token chunks | 10.3 GiB | 2,800 |
+
+With memory to spare, `none` is the fastest; `full` gives up 17% of the speed for a third of the memory. On this model and length SeCO is slower than full checkpointing at a higher peak: it pays off on sequences that full checkpointing cannot hold.
+
 ---
 
 ## The optimization stack
