@@ -341,7 +341,7 @@ class RLPipeline:
                 forced = self.tok.encode(r.think_skip_prefix, add_special_tokens=False)
                 trajectory.info["think_skip"] = True
             for turn in range(max_turns):
-                if e.max_images and len(trajectory.images) > e.max_images + e.image_prune_slack:
+                if vision is not None and 0 < e.max_images < len(trajectory.images) - e.image_prune_slack:
                     # old screenshots leave the context; what was sampled so far stays trained on what it saw
                     kept = chat.drop_images(
                         trajectory.prompt_ids + trajectory.tokens,

@@ -622,8 +622,9 @@ class ChatDataset(_Epochs, IterableDataset):
         self._row_images: list = []  # the current row's images (ImageInput), in rendering order
         if self.vision is not None and teacher_views:
             raise MultimodalError(
-                "teacher views (distill.teachers.<name>.view) are not supported with multimodal training: a "
-                "view renders the row again for the teacher, without the images"
+                "teacher views (a distill teacher with its own rendering: system_prompt, privileged_field, "
+                "prefix_messages, ...) are not supported with multimodal training: the row is rendered again "
+                "for the teacher, without the images"
             )
         # Off-policy distillation with a teacher view (palingenesis.distill.views): [(view, teacher
         # ChatDataset)]; each kept row also gets the teacher's rendering and the position alignment.
