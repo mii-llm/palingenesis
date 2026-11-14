@@ -197,8 +197,12 @@ def apply_fsdp(
     mesh: DeviceMesh,
     config: ParallelConfig,
     bf16: bool = True,
+    ignored_params: set | None = None,
 ) -> torch.nn.Module:
     """Apply FSDP2 (fully_shard) bottom-up to transformer layers then root.
+
+    `ignored_params`: parameters FSDP leaves alone (expert parallelism keeps each rank's own
+    experts: palingenesis.moe_experts).
 
     Inspired by torchtitan: shard each layer individually for communication
     overlap, then shard the root model.
@@ -231,6 +235,8 @@ def apply_fsdp(
         offload_policy=offload_policy,
         reshard_after_forward=config.reshard_after_forward,
     )
+    if ignored_params:
+        fsdp_kwargs["ignored_params"] = set(ignored_params)
 
     # Find and shard transformer layers bottom-up
     layers = _find_transformer_layers(model)

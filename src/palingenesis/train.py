@@ -65,6 +65,7 @@ from palingenesis.distributed import (
     barrier,
     build_mesh,
     cleanup_distributed,
+    fsdp_mesh,
     is_main,
     main_value,
     rank_values,
@@ -108,6 +109,7 @@ from palingenesis.loss import (
     shift_weights,
 )
 from palingenesis.moe import RouterBalancer
+from palingenesis.moe_experts import ExpertParallel, set_experts_implementation
 from palingenesis.optim import AdamCCorrection, build_optimizer, build_scheduler
 from palingenesis.packing import (
     PackedBatch,
@@ -410,7 +412,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         model.config.use_cache = False
     if plugin_mgr:
         model = plugin_mgr.transform_model(model)
-    # ── MoE: router balancing over the global batch, routing statistics (palingenesis.moe) ──
+    # ── MoE: expert compute, router balancing over the global batch, routing statistics ──
+    set_experts_implementation(model, config.moe.experts_implementation)
     router_balancer = RouterBalancer.attach(model, config.moe)
 
     # ── Device mesh (FSDP2 / context parallel); sharded teachers use it too ──
@@ -512,10 +515,29 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # ── FSDP2 ─────────────────────────────────────────────────────────────
     if is_fsdp:
         logger.info("Applying FSDP2 (fully_shard)")
-        model = apply_fsdp(model, mesh, config.parallel, bf16=config.train.bf16)
+        # Expert parallel: the experts stay on their rank, sharded on the same mesh, outside FSDP's gathers
+        expert_parallel = None
+        if config.parallel.expert_parallel:
+            expert_parallel = ExpertParallel.apply(
+                model,
+                fsdp_mesh(mesh),
+                compute_dtype=compute_dtype if config.train.bf16 else None,
+                padded=config.moe.experts_implementation == "padded",
+            )
+            if expert_parallel is not None and router_balancer is not None:
+                router_balancer.expert_ranks = expert_parallel.world
+        model = apply_fsdp(
+            model,
+            mesh,
+            config.parallel,
+            bf16=config.train.bf16,
+            ignored_params=expert_parallel.parameters if expert_parallel is not None else None,
+        )
         if ref_model is not None:
             ref_model = apply_fsdp(ref_model, mesh, config.parallel, bf16=config.train.bf16)
     else:
+        if config.parallel.expert_parallel:
+            logger.warning("parallel.expert_parallel: one process (or no FSDP), nothing to split; training without it")
         model = model.to(device)
         if ref_model is not None:
             ref_model = ref_model.to(device)

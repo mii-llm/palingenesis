@@ -252,6 +252,12 @@ class ParallelConfig:
     cp_rotate_method: Literal["allgather"] = "allgather"
     cpu_offload: bool = False
     reshard_after_forward: bool = True
+    # MoE models: every rank keeps experts / ranks experts of each layer and the tokens are sent to
+    # the rank that owns their experts (all-to-all), instead of FSDP gathering every layer's expert
+    # weights on every rank (palingenesis.moe_experts). Needs fsdp: true and a number of ranks that
+    # divides the number of experts. STATUS: experimental (gradients tested equal to one process on
+    # CPU ranks; not measured on several GPUs).
+    expert_parallel: bool = False
 
 
 @dataclass(slots=True)
@@ -915,6 +921,16 @@ class Config:
                 "parallel.context_parallel needs parallel.fsdp: true (FSDP sums the gradients of the ranks that "
                 "split a sequence)."
             )
+        if p.expert_parallel:
+            unsupported = {
+                "parallel.fsdp: false (the other parameters stay under FSDP)": not p.fsdp,
+                "parallel.context_parallel": p.context_parallel,
+                "memory.seco (ranks run different numbers of chunks; the token exchange is a collective)": (
+                    self.memory.seco
+                ),
+                "parallel.cpu_offload": p.cpu_offload,
+            }
+            errors += [f"parallel.expert_parallel does not support {name}." for name, on in unsupported.items() if on]
         return errors
 
     def _seco_errors(self) -> list[str]:
