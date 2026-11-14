@@ -605,6 +605,10 @@ def test_trajectories_keep_the_routing_their_tokens_were_sampled_under():
     assert (batch[0, :9] >= 0).all() and (batch[0, 9:] == -1).all() and (batch[1] == -1).all()
     assert _routing_batch([other], width=4) is None
 
+    t.append_generated([11], [-0.1], version=1)
+    t.extend_routing(routed(7, 3))  # not one row per forwarded position: it cannot be lined up
+    assert t.routing is None and t.info["routing_dropped"] == [7, 10]
+
     import base64
     import io
 
@@ -943,6 +947,29 @@ def test_compiled_layers_keep_the_router_gradient():
         torch._dynamo.reset()
     _assert_same(_grads(model), ref, rtol=1e-3, atol=1e-6)
     assert balancer.metrics()["moe/balance_loss"] == pytest.approx(ref_balance, rel=1e-5)
+
+
+@pytest.mark.parametrize("path", ["packing", "seco", "accumulation"])
+def test_trainer_paths_keep_the_token_mask_aligned(tmp_path, caplog, path):
+    """The trainer's own batches through its memory paths: the real-token mask it hands the balancer
+    lines up with what the model routes (packed rows, SeCO chunks, padded rows), so nothing is
+    counted blind, and the balancing loss is at its floor or above."""
+    import logging
+
+    student, data = _saved_student(tmp_path)
+    config = H.cpu_config(tmp_path, student, data, steps=2)
+    if path == "packing":
+        config.data.packing = True
+        config.data.max_seq_length = 96
+    elif path == "seco":
+        config.memory.seco = True
+        config.memory.seco_chunk_size = 16
+        config.train.gradient_accumulation_steps = 1
+    with caplog.at_level(logging.WARNING, logger="palingenesis.moe"):
+        result = H.run_cpu(config)
+    assert not [r for r in caplog.records if "token mask" in r.getMessage()], caplog.text
+    assert result.metrics["moe/balance_loss"] >= 2.0 - 1e-6 and result.metrics["moe/load_max"] >= 1.0
+    assert 0.0 < result.metrics["moe/router_entropy"] <= 1.0
 
 
 # ── the RL trainer ──────────────────────────────────────────────────────────────

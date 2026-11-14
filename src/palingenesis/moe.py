@@ -55,6 +55,7 @@ import contextlib
 import contextvars
 import logging
 import math
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -270,6 +271,7 @@ class RouterBalancer:
         self._logits: dict[int, Tensor] = {}
         self._active = False
         self._synced = False
+        self._thread = 0
         self._mask: Tensor | None = None
         self._replay: Tensor | None = None
         self._grad_accum = 1
@@ -383,6 +385,7 @@ class RouterBalancer:
         self._batch = None
         self._logits.clear()
         self._active, self._synced = True, False
+        self._thread = threading.get_ident()
         self._token = _ACTIVE.set(self)
 
     def sync(self) -> None:
@@ -419,7 +422,10 @@ class RouterBalancer:
         self._mask = self._replay = None
         self._logits.clear()
         if self._token is not None:
-            _ACTIVE.reset(self._token)
+            try:
+                _ACTIVE.reset(self._token)
+            except ValueError:  # ended from another context than it began in
+                _ACTIVE.set(None)
             self._token = None
 
     @contextlib.contextmanager
@@ -459,7 +465,7 @@ class RouterBalancer:
 
     def _router_hook(self, layer: MoELayer):
         def hook(module, args, output):
-            if self._active:
+            if self._active and threading.get_ident() == self._thread:
                 self._logits[layer.index] = output[0] if isinstance(output, (tuple, list)) else output
 
         # under model.compile the hooks stay Python (a graph break): they keep state between calls
@@ -490,8 +496,11 @@ class RouterBalancer:
 
     def _experts_hook(self, layer: MoELayer):
         def hook(module, args):
+            # only the thread that trains: a rollout thread may run the same model between micro-batches
+            if not self._active or threading.get_ident() != self._thread or len(args) < 3:
+                return None
             logits = self._logits.pop(layer.index, None)
-            if not self._active or logits is None or len(args) < 3:
+            if logits is None:
                 return None
             hidden, index, weights = args[:3]
             flat_logits = logits.reshape(-1, logits.shape[-1])

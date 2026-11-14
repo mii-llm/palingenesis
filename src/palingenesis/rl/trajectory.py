@@ -60,20 +60,23 @@ class Trajectory:
 
     def extend_routing(self, routed) -> None:
         """Record a turn's routing, after append_generated. `routed` covers the positions the engine forwarded for
-        the turn: the whole context and the turn's tokens but the last. Positions recorded by earlier turns keep
-        their record (their tokens were sampled under that routing; a later turn may re-prefill them with other
-        weights); a turn without routing (None) leaves a gap the trainer routes by itself."""
+        the turn: the whole context and the turn's tokens but the last, one row each. Positions recorded by earlier
+        turns keep their record (their tokens were sampled under that routing; a later turn may re-prefill them with
+        other weights); the positions of a turn without routing (None) take a later turn's record of them."""
         if routed is None or len(routed) == 0:
             return
         import numpy as np
 
         routed = np.asarray(routed)
         positions = len(self.prompt_ids) + len(self.tokens) - 1
-        routed = routed[:positions]
         have = 0 if self.routing is None else len(self.routing)
-        if len(routed) <= have:
+        if len(routed) != positions or (have and self.routing.shape[1:] != routed.shape[1:]):
+            # not the layout this was written for (one row per forwarded position): a record that does not line
+            # up would route tokens through other tokens' experts, so the trajectory goes without replay
+            self.routing = None
+            self.info["routing_dropped"] = [int(len(routed)), positions]
             return
-        if have and self.routing.shape[1:] != routed.shape[1:]:
+        if "routing_dropped" in self.info or positions <= have:
             return
         self.routing = routed.copy() if not have else np.concatenate([self.routing, routed[have:]])
 
