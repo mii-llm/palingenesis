@@ -29,7 +29,12 @@ python -m palingenesis.agent_tooling.monitor_run --log_file outputs/train.log --
 
 # Detailed report
 python -m palingenesis.agent_tooling.monitor_run --log_file outputs/train.log --max_steps 5000
+
+# RL / on-policy distillation: what the rollouts do (needs logging.dump_trajectories: N in the config)
+python -m palingenesis.agent_tooling.rollouts --dir outputs/rl --json
 ```
+
+`monitor_run` and `check_loss` read the logs of `pgs train`, `pgs rl` and `pgs distill` alike.
 
 ### 3. Post-Training Analysis
 
@@ -85,6 +90,13 @@ Training issue?
 │   ├── Root-cause fix: OPD on the student's own episodes (agent_traces source) with onset_branches,
 │   │   error_patterns / error_weight / first_error_weight, cutoff_logp (see the distillation guide)
 │   └── Stopgap at inference: presence_penalty (sampling)
+├── RL / on-policy distillation: reward flat, steps slow, or the policy misbehaves (truncation, tool errors, loops)
+│   ├── Dump: logging.dump_trajectories: 10 (+ logging.dump_groups: 8 to sample groups; off the training thread)
+│   ├── Check: pgs rollouts --dir <output_dir> --json (finish shares stop / length / turns, reward components,
+│   │   zero-variance share, tool error rate and latency per tool, loop share, slowest turns, worst trajectories)
+│   ├── Alarms (exit 1): length_share > 0.2 (budget or rambling), turns_share > 0.2 (never finishes),
+│   │   tool_error_rate > 0.3 (schemas / arguments / timeouts), loop_share > 0.1, zero_variance_share > 0.5
+│   └── Rollout engine latency: vLLM OTLP traces via rollout.vllm_args (see the Observability guide)
 ├── Distilling a larger teacher on fixed data (off-policy KD in pgs train), or QAT while distilling
 │   ├── Setup: distill.enabled + distill.teachers.<name>: {model: ...} (online) or {cache: ...} (pgs distill-cache)
 │   ├── Check before: pgs profile --config ... (counts teacher weights and targets); the teacher must share

@@ -586,6 +586,8 @@ A source is any object with `sample()` (messages, max_new_tokens, meta), `evalua
 
 Accuracy gains typically saturate before the KL stops falling. Keep `train.save_steps` small when checkpoint selection matters.
 
+To read what the student samples, `logging.dump_trajectories: N` writes every Nth batch's completions (text, finish reason, the sampler's and the teacher's log-probs, the sampled KL per completion; `logging.dump_groups` samples prompts) to `<output_dir>/rollouts/`, and `pgs rollouts --dir <output_dir>` reports finish reasons, loops, and the completions furthest from the teacher ([Observability](observability.md)).
+
 ## Checkpoints and resume
 
 Every `train.save_steps` steps the trainer writes `output_dir/step_N`: the student in Hugging Face format (loadable and servable as is) plus `trainer_state.pt` with the optimizer, the policy version and the random states. `final` is the model only. To continue an interrupted run, rerun the same command with `--train.resume_from auto` (the newest complete checkpoint in `output_dir`; a fresh start if there is none) or a checkpoint path. The student reloads from the checkpoint, the rollout engine syncs to it before its first rollout, the learning-rate schedule and wandb run continue where they were. Prompts continue from the sampler's saved state; the few drawn ahead of training when the checkpoint was written are skipped, not repeated.
