@@ -255,6 +255,29 @@ def renders_reasoning(render) -> bool:
     return _PROBE_REASONING in text
 
 
+def renders_turns_as_prefixes(render) -> bool:
+    """Whether a chat template renders the first turns of a conversation with one user turn as a
+    prefix of the whole conversation's render, on a probe with reasoning, a tool call and a tool
+    result. Templates that rewrite earlier turns as the conversation goes on (reasoning shown on the
+    last turn only, markers on the last message) do not."""
+    reasoning = {"reasoning_content": _PROBE_REASONING, "reasoning": _PROBE_REASONING}
+    call = {"type": "function", "function": {"name": _PROBE_FN, "arguments": {_PROBE_ARG: _PROBE_VALUE}}}
+    messages = [
+        {"role": "system", "content": _PROBE_USER2},
+        {"role": "user", "content": _PROBE_USER},
+        {"role": "assistant", "content": _PROBE_ANSWER, "tool_calls": [call], **reasoning},
+        {"role": "tool", "content": _PROBE_VALUE},
+        {"role": "assistant", "content": _PROBE_ANSWER2, **reasoning},
+        {"role": "tool", "content": _PROBE_VALUE},
+        {"role": "assistant", "content": _PROBE_ANSWER, **reasoning},
+    ]
+    try:
+        full = render(messages)
+        return all(full.startswith(render(messages[:k])) for k in (3, 5))
+    except Exception:
+        return False
+
+
 def detect_think_tags(render) -> tuple[str, str] | None:
     """The delimiters a chat template puts around an assistant turn's reasoning, read off a
     probe render: the text between the reasoning and the answer is the closing tag, and the
@@ -824,6 +847,7 @@ class ChatDataset(_Epochs, IterableDataset):
     def _process(self, example: dict[str, Any]) -> dict[str, torch.Tensor] | None:
         """One row tokenized and masked; with images, also their pixels and positions."""
         self._row_images = []
+        self._encodings = {}
         result = self._process_row(example)
         if result is None or self.vision is None:
             return result
@@ -1702,17 +1726,68 @@ class ChatDataset(_Epochs, IterableDataset):
 
         return labels
 
+    # Encodings kept per row: truncation tokenizes the candidate cuts with offsets, and the masker
+    # reuses the chosen one (one of the last two tokenized).
+    _ENCODINGS_KEPT = 4
+
     def _encode(self, text: str):
-        """Tokenize a render with offsets, remembering the last one: truncation and
-        masking both need the full conversation's encoding."""
-        cached = self._last_encoding
-        if cached is not None and cached[0] == text:
-            return cached[1]
-        enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        self._last_encoding = (text, enc)
+        """Tokenize a render with offsets, remembering the last few of the current row:
+        truncation and masking both need the encoding of the conversation as it is trained."""
+        cache = self.__dict__.setdefault("_encodings", {})
+        enc = cache.get(text)
+        if enc is None:
+            enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+            if len(cache) >= self._ENCODINGS_KEPT:
+                del cache[next(iter(cache))]
+            cache[text] = enc
         return enc
 
-    _last_encoding: tuple[str, Any] | None = None
+    def _renders_turns_as_prefixes(self) -> bool:
+        """renders_turns_as_prefixes for the current row's template kwargs (cached per kwargs)."""
+        cache = self.__dict__.setdefault("_prefix_cache", {})
+        kwargs = {k: v for k, v in self._template_kwargs.items() if k != "tools"}
+        key = json.dumps(kwargs, sort_keys=True, default=str)
+        if key not in cache:
+            cache[key] = renders_turns_as_prefixes(
+                lambda m: self.tokenizer.apply_chat_template(
+                    m, **{**kwargs, "tokenize": False, "add_generation_prompt": False}
+                )
+            )
+        return cache[key]
+
+    def _chars_per_token_over_limit(self, messages: list[dict], full: str) -> float | None:
+        """Characters per token of a prefix of the render `full` that already exceeds
+        max_seq_length, or None (then `full` is tokenized whole).
+
+        The prefix is about 8 characters per allowed token, cut after a line break followed by
+        text: pre-tokenizers split there, so its tokens are the first tokens of `full` (a margin
+        covers tokenizers that may merge across it). Used only where the cut does not depend on
+        the full render's exact count: rows with one user turn, under a template that renders
+        their first turns as a prefix of the whole. Token counts then grow with the turns, and
+        the cut is the last trained turn that fits whichever estimate starts the search."""
+        limit = 8 * self.max_seq_length
+        if (
+            len(full) <= limit
+            or not getattr(self.tokenizer, "is_fast", False)  # slow tokenizers keep the plain path
+            or sum(m.get("role") == "user" for m in messages) > 1
+        ):
+            return None
+        end = limit
+        while True:
+            end = full.rfind("\n", 0, end)
+            if end < limit // 2:
+                return None
+            if not full[end + 1].isspace():
+                break
+        if not self._renders_turns_as_prefixes():
+            return None
+        try:
+            n_prefix = len(self.tokenizer(full[: end + 1], add_special_tokens=False)["input_ids"])
+        except Exception:
+            return None
+        if n_prefix <= self.max_seq_length + self.max_seq_length // 8 + 64:
+            return None
+        return (end + 1) / n_prefix
 
     def _smart_truncate(self, messages: list[dict]) -> list[dict] | None:
         """Cut an over-long conversation after the last trained assistant turn that fits.
@@ -1725,9 +1800,10 @@ class ChatDataset(_Epochs, IterableDataset):
         Cheap for the common case: a token is at least one UTF-8 byte, so a conversation
         whose serialized messages and tools, plus a margin for template text, fit in
         max_seq_length bytes fits in max_seq_length tokens. Otherwise the full render is
-        tokenized once; if it is too long, the cut is searched on renders alone (token
-        counts estimated from the full render's characters per token) and only the
-        candidates next to the limit are tokenized.
+        tokenized once, or only a prefix of it when that prefix is already too long (see
+        _chars_per_token_over_limit); if it is too long, the cut is searched on renders alone (token
+        counts estimated from characters per token) and only the candidates next to the
+        limit are tokenized, with offsets, so the masker reuses the chosen one.
         """
         from palingenesis.validate_data import is_trained_message
 
@@ -1744,17 +1820,21 @@ class ChatDataset(_Epochs, IterableDataset):
 
         try:
             full = render(len(messages))
-            n_full = len(self._encode(full)["input_ids"])
         except Exception:
             return messages  # the masker reports templates that cannot render this row
-        if n_full <= self.max_seq_length:
-            return messages
-
-        chars_per_token = len(full) / max(n_full, 1)
+        chars_per_token = self._chars_per_token_over_limit(messages, full)
+        if chars_per_token is None:
+            try:
+                n_full = len(self._encode(full)["input_ids"])
+            except Exception:
+                return messages
+            if n_full <= self.max_seq_length:
+                return messages
+            chars_per_token = len(full) / max(n_full, 1)
 
         def fits(k: int) -> bool:
             try:
-                return len(self.tokenizer(render(k), add_special_tokens=False)["input_ids"]) <= self.max_seq_length
+                return len(self._encode(render(k))["input_ids"]) <= self.max_seq_length
             except Exception:
                 return False
 
