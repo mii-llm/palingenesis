@@ -7,6 +7,8 @@
  *        Train / Fix   the recipe cards written in index.md
  *        Options       rows of the configuration reference, read from that page
  *        Pages         sections of the docs, read from the search index
+ *   4. Math: formulas written as $...$ / $$...$$ (pymdownx.arithmatex) are
+ *      typeset by the KaTeX copy in assets/katex, loaded only on pages with math.
  *
  * No dependencies and no network beyond this site. The pages are complete
  * without it: with JavaScript off the recipes are ordinary rows of text.
@@ -773,6 +775,45 @@
     };
   }
 
+  /* -- 4. Math ---------------------------------------------------------------- */
+
+  var here = document.currentScript && document.currentScript.src;
+  var katexUrl = here ? here.replace(/javascripts\/site\.js(\?.*)?$/, "assets/katex/katex.min.js") : null;
+  var katexReady = null;
+
+  function loadKatex() {
+    if (window.katex) return Promise.resolve(window.katex);
+    if (!katexReady) {
+      katexReady = new Promise(function (resolve, reject) {
+        var script = document.createElement("script");
+        script.src = katexUrl;
+        script.async = true;
+        script.onload = function () { resolve(window.katex); };
+        script.onerror = function () { katexReady = null; reject(new Error("KaTeX did not load")); };
+        document.head.appendChild(script);
+      });
+    }
+    return katexReady;
+  }
+
+  function typesetMath() {
+    var nodes = document.querySelectorAll(".arithmatex:not(.is-rendered)");
+    if (!nodes.length || !katexUrl) return;
+    loadKatex().then(function (katex) {
+      nodes.forEach(function (node) {
+        var source = node.textContent.trim();
+        var display = node.tagName === "DIV";
+        var tex = source.replace(/^\\[(\[]/, "").replace(/\\[)\]]$/, "");
+        katex.render(tex, node, { displayMode: display, throwOnError: false, strict: "ignore" });
+        node.setAttribute("data-tex", tex);
+        node.classList.add("is-rendered");
+      });
+    }).catch(function () {
+      /* Without KaTeX the source stays readable. */
+      nodes.forEach(function (node) { node.classList.add("is-rendered"); });
+    });
+  }
+
   /* -- Wiring: once now, and again after each instant navigation ------------- */
 
   var stopConsole = null;
@@ -785,6 +826,7 @@
     if (root && !root.classList.contains("is-live")) stopConsole = startConsole(root);
     var hero = document.querySelector(".pg-hero");
     if (hero && !hero.classList.contains("has-art")) stopArt = startArt(hero);
+    typesetMath();
     requestProgress();
   }
 

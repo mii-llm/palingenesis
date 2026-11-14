@@ -77,6 +77,10 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - pymdownx.keys
+  # Math: $...$ inline, $$...$$ display. Rendered in the browser by the
+  # self-hosted KaTeX in assets/katex (loaded by javascripts/site.js on pages with math).
+  - pymdownx.arithmatex:
+      generic: true
   - pymdownx.mark
   - attr_list
   - md_in_html
@@ -93,6 +97,7 @@ extra:
   generator: false
 
 extra_css:
+  - assets/katex/katex.min.css
   - stylesheets/theme.css
   - stylesheets/home.css
 

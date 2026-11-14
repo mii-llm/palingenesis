@@ -15,7 +15,8 @@
    1. Fonts            5. Links, lists, rules     9. Navigation
    2. Design tokens    6. Code                   10. Footer
    3. Base + motion    7. Tables                 11. Search
-   4. Typography       8. Admonitions, tabs      12. Print
+   4. Typography       8. Admonitions, tabs      12. Math, figures
+                                                 13. Print
    ========================================================================== */
 
 /* -- 1. Fonts (self-hosted, see assets/fonts/LICENSE.txt) ------------------ */
@@ -903,7 +904,130 @@ html .md-footer-meta.md-typeset a:is(:hover, :focus-visible) {
   font-size: 0.86rem;
 }
 
-/* -- 12. Print ------------------------------------------------------------- */
+/* -- 12. Math and figures ------------------------------------------------ */
+
+/* Math (KaTeX, rendered by javascripts/site.js) takes the ink of the text
+   around it. Before it renders, the source is kept out of sight. */
+.md-typeset .arithmatex {
+  color: var(--pg-text);
+}
+.pg-js .md-typeset .arithmatex:not(.is-rendered) {
+  visibility: hidden;
+}
+.md-typeset .katex {
+  font-size: 1.08em;
+}
+.md-typeset div.arithmatex {
+  margin: 1.1em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2em 0;
+}
+.md-typeset div.arithmatex .katex-display {
+  margin: 0;
+}
+.md-typeset .katex-error {
+  color: var(--pg-signal);
+}
+/* A "where" line after a display formula */
+.md-typeset .pg-where {
+  margin-top: -0.4em;
+  color: var(--pg-text-2);
+  font-size: 0.92em;
+}
+
+/* Figures: inline SVG drawn with the same tokens as the text. Shapes take
+   classes, not colours, so both schemes follow from the variables. */
+.md-typeset .pg-figure {
+  margin: 1.6em 0 1.8em;
+  max-width: 100%;
+}
+.md-typeset .pg-figure__canvas {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2rem 0;
+}
+.md-typeset .pg-figure svg {
+  display: block;
+  width: 100%;
+  min-width: 34rem;
+  height: auto;
+  margin: 0 auto;
+  font-family: var(--pg-font-sans);
+}
+.md-typeset .pg-figure figcaption {
+  max-width: none;
+  margin: 0.7em 0 0;
+  color: var(--pg-text-2);
+  font-size: 0.82rem;
+  font-style: normal;
+  text-align: left;
+}
+.pg-fig text {
+  fill: var(--pg-text);
+  font-size: 13px;
+}
+.pg-fig .t-small { font-size: 11.5px; }
+.pg-fig .t-label {
+  font-family: var(--pg-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  fill: var(--pg-text-3);
+  text-transform: uppercase;
+}
+.pg-fig .t-muted { fill: var(--pg-text-2); }
+.pg-fig .t-accent { fill: var(--pg-signal); }
+.pg-fig .t-mono { font-family: var(--pg-font-mono); font-size: 11.5px; }
+.pg-fig .box {
+  fill: var(--pg-raised);
+  stroke: var(--pg-border-strong);
+  stroke-width: 1;
+}
+.pg-fig .box-plain {
+  fill: none;
+  stroke: var(--pg-border-strong);
+  stroke-width: 1;
+}
+.pg-fig .box-quiet {
+  fill: none;
+  stroke: var(--pg-border-strong);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+.pg-fig .box-accent {
+  fill: var(--pg-signal-soft);
+  stroke: var(--pg-signal);
+  stroke-width: 1.2;
+}
+.pg-fig .fill-accent { fill: var(--pg-signal); }
+.pg-fig .fill-soft { fill: var(--pg-signal-soft); }
+.pg-fig .fill-raised { fill: var(--pg-raised); }
+.pg-fig .fill-border { fill: var(--pg-border); }
+.pg-fig .fill-ink { fill: var(--pg-text-3); }
+.pg-fig .line {
+  fill: none;
+  stroke: var(--pg-text-2);
+  stroke-width: 1.2;
+}
+.pg-fig .line-accent {
+  fill: none;
+  stroke: var(--pg-signal);
+  stroke-width: 1.5;
+}
+.pg-fig .line-quiet {
+  fill: none;
+  stroke: var(--pg-border-strong);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+.pg-fig .rule {
+  stroke: var(--pg-border);
+  stroke-width: 1;
+}
+.pg-fig marker .head { fill: var(--pg-text-2); }
+.pg-fig marker .head-accent { fill: var(--pg-signal); }
+
+/* -- 13. Print ------------------------------------------------------------- */
 
 @media print {
   [data-md-color-scheme] {
