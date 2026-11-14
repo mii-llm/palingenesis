@@ -35,15 +35,55 @@ sbatch --nodes=4 scripts/train_slurm.sh configs/qwen35_4b/a100_80gb_multigpu.yam
 
 ### What happens when you submit
 
-```
-sbatch → SLURM queues the job
-       → SLURM allocates N nodes with exclusive access
-       → srun launches 1 task per node
-       → each task runs torchrun which spawns 8 worker processes
-       → c10d rendezvous connects all N×8 workers via TCP to MASTER_ADDR
-       → FSDP2 shards the model across all workers
-       → training begins
-```
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 300" role="img" aria-labelledby="fig-slurm-title fig-slurm-desc">
+<title id="fig-slurm-title">What happens when you submit a multi-node job</title>
+<desc id="fig-slurm-desc">sbatch hands the job to SLURM, which queues it and allocates N nodes with exclusive access. On every node srun launches one task, which runs torchrun; torchrun spawns 8 worker processes, one per GPU. A c10d rendezvous connects all N times 8 workers over TCP to MASTER_ADDR. FSDP2 then shards the model across all workers and training begins.</desc>
+<defs><marker id="slurm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box" x="10" y="14" width="120" height="40" rx="4"/><text class="t-mono" x="70" y="38" text-anchor="middle">sbatch</text>
+<path class="line" d="M130,34 H166" marker-end="url(#slurm-arrow)"/>
+<rect class="box" x="168" y="14" width="300" height="40" rx="4"/><text x="180" y="31">SLURM queues the job</text><text class="t-muted t-small" x="180" y="46">then allocates N nodes with exclusive access</text>
+<rect class="box-plain" x="10" y="78" width="330" height="128" rx="6"/>
+<text class="t-label" x="22" y="96">node 0</text>
+<rect class="box" x="22" y="106" width="140" height="34" rx="4"/><text x="32" y="121">srun: 1 task</text><text class="t-muted t-small" x="32" y="134">per node</text>
+<path class="line" d="M162,123 H184" marker-end="url(#slurm-arrow)"/>
+<rect class="box" x="186" y="106" width="142" height="34" rx="4"/><text class="t-mono" x="196" y="121">torchrun</text><text class="t-muted t-small" x="196" y="134">spawns 8 workers</text>
+<rect class="box-accent" x="22" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="38.5" y="180" text-anchor="middle">0</text>
+<rect class="box-accent" x="61" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="77.5" y="180" text-anchor="middle">1</text>
+<rect class="box-accent" x="100" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="116.5" y="180" text-anchor="middle">2</text>
+<rect class="box-accent" x="139" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="155.5" y="180" text-anchor="middle">3</text>
+<rect class="box-accent" x="178" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="194.5" y="180" text-anchor="middle">4</text>
+<rect class="box-accent" x="217" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="233.5" y="180" text-anchor="middle">5</text>
+<rect class="box-accent" x="256" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="272.5" y="180" text-anchor="middle">6</text>
+<rect class="box-accent" x="295" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="311.5" y="180" text-anchor="middle">7</text>
+<path class="line" d="M257,140 V148 H38 V158" />
+<path class="line" d="M257,148 H310 V158" />
+<path class="line" d="M250,54 V64 H180 V76" marker-end="url(#slurm-arrow)"/>
+<rect class="box-plain" x="360" y="78" width="330" height="128" rx="6"/>
+<text class="t-label" x="372" y="96">node 1</text>
+<rect class="box" x="372" y="106" width="140" height="34" rx="4"/><text x="382" y="121">srun: 1 task</text><text class="t-muted t-small" x="382" y="134">per node</text>
+<path class="line" d="M512,123 H534" marker-end="url(#slurm-arrow)"/>
+<rect class="box" x="536" y="106" width="142" height="34" rx="4"/><text class="t-mono" x="546" y="121">torchrun</text><text class="t-muted t-small" x="546" y="134">spawns 8 workers</text>
+<rect class="box-accent" x="372" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="388.5" y="180" text-anchor="middle">8</text>
+<rect class="box-accent" x="411" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="427.5" y="180" text-anchor="middle">9</text>
+<rect class="box-accent" x="450" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="466.5" y="180" text-anchor="middle">10</text>
+<rect class="box-accent" x="489" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="505.5" y="180" text-anchor="middle">11</text>
+<rect class="box-accent" x="528" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="544.5" y="180" text-anchor="middle">12</text>
+<rect class="box-accent" x="567" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="583.5" y="180" text-anchor="middle">13</text>
+<rect class="box-accent" x="606" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="622.5" y="180" text-anchor="middle">14</text>
+<rect class="box-accent" x="645" y="160" width="33" height="32" rx="3"/><text class="t-mono t-small" x="661.5" y="180" text-anchor="middle">15</text>
+<path class="line" d="M607,140 V148 H388 V158" />
+<path class="line" d="M607,148 H660 V158" />
+<path class="line" d="M400,54 V64 H530 V76" marker-end="url(#slurm-arrow)"/>
+<text class="t-muted t-small" x="345" y="148" text-anchor="middle">…</text>
+<rect class="box" x="10" y="222" width="680" height="30" rx="4"/><text x="22" y="241">c10d rendezvous: all N × 8 workers connect over TCP to MASTER_ADDR</text>
+<path class="line" d="M350,252 V266" marker-end="url(#slurm-arrow)"/>
+<rect class="box-accent" x="10" y="268" width="680" height="28" rx="4"/><text x="22" y="287">FSDP2 shards the model across all workers, and training begins</text>
+</svg>
+</div>
+<figcaption>Launch path of a multi-node job, two of the N nodes shown: one <code>srun</code> task per node runs <code>torchrun</code>, which starts one worker per GPU; every worker then joins one rendezvous.</figcaption>
+</figure>
 
 The critical detail: `srun` launches torchrun, not Python directly. Torchrun handles per-node process spawning and local GPU assignment. The `--rdzv_id=$SLURM_JOB_ID` flag ensures multiple concurrent jobs on the same cluster don't interfere with each other's rendezvous.
 

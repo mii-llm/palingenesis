@@ -12,15 +12,66 @@ Backpropagation keeps every layer's activations for the whole sequence until the
 
 Transformers already process long inputs in chunks at inference time: prefill with a KV cache. SeCO does the same for training. The idea comes from [Li et al., arXiv:2505.16710](https://arxiv.org/abs/2505.16710); the implementation and its validation are palingenesis'.
 
-```
-Stage 1 (no grad)      chunk 1 ──▶ chunk 2 ──▶ … ──▶ chunk k        builds the cache
-                          │           │                 │
-                        K/V₁        K/V₂              K/Vₖ          (+ recurrent states)
-
-Stage 2 (backward)     chunk k ◀── … ◀── chunk 2 ◀── chunk 1         one chunk's graph at a time
-                        recompute with grad, backprop its loss,
-                        relay ∂L/∂(its K/V) into the chunks it attended to
-```
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 372" role="img" aria-labelledby="fig-seco-title fig-seco-desc">
+<title id="fig-seco-title">SeCO: a no-grad pass that fills the cache, then a reverse sweep that recomputes one chunk at a time</title>
+<desc id="fig-seco-desc">Stage 1 runs chunks 1 to 4 left to right without gradients and stores each chunk's K/V in a cache. Stage 2 runs from chunk 4 back to chunk 1. The chunk being processed, here chunk 3, is recomputed with gradients from the cached prefix, backpropagates its own loss plus the gradient that chunk 4 already sent into its K/V, and adds the gradient of its attention into the gradient buffer of the K/V of chunks 1 and 2. Bounded-state layers relay the gradient of the state at each chunk boundary instead.</desc>
+<defs>
+<marker id="seco-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="seco-arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head-accent" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<!-- Stage 1 -->
+<text class="t-label" x="10" y="20">Stage 1 · no grad · left to right</text>
+<text class="t-muted t-small" x="10" y="60">chunks</text>
+<rect class="box" x="130" y="36" width="120" height="40" rx="4"/><text x="190" y="61" text-anchor="middle">chunk 1</text>
+<rect class="box" x="270" y="36" width="120" height="40" rx="4"/><text x="330" y="61" text-anchor="middle">chunk 2</text>
+<rect class="box" x="410" y="36" width="120" height="40" rx="4"/><text x="470" y="61" text-anchor="middle">chunk 3</text>
+<rect class="box" x="550" y="36" width="120" height="40" rx="4"/><text x="610" y="61" text-anchor="middle">chunk 4</text>
+<path class="line" d="M250,56 H268" marker-end="url(#seco-arrow)"/>
+<path class="line" d="M390,56 H408" marker-end="url(#seco-arrow)"/>
+<path class="line" d="M530,56 H548" marker-end="url(#seco-arrow)"/>
+<path class="line" d="M190,76 V104" marker-end="url(#seco-arrow)"/>
+<path class="line" d="M330,76 V104" marker-end="url(#seco-arrow)"/>
+<path class="line" d="M470,76 V104" marker-end="url(#seco-arrow)"/>
+<path class="line" d="M610,76 V104" marker-end="url(#seco-arrow)"/>
+<!-- K/V cache -->
+<text class="t-muted t-small" x="10" y="122">K/V cache</text>
+<text class="t-muted t-small" x="10" y="137">kept to the end</text>
+<rect class="box-accent" x="130" y="106" width="120" height="30" rx="3"/><text class="t-mono" x="190" y="125" text-anchor="middle">K/V 1</text>
+<rect class="box-accent" x="270" y="106" width="120" height="30" rx="3"/><text class="t-mono" x="330" y="125" text-anchor="middle">K/V 2</text>
+<rect class="box-accent" x="410" y="106" width="120" height="30" rx="3"/><text class="t-mono" x="470" y="125" text-anchor="middle">K/V 3</text>
+<rect class="box-accent" x="550" y="106" width="120" height="30" rx="3"/><text class="t-mono" x="610" y="125" text-anchor="middle">K/V 4</text>
+<line class="rule" x1="10" y1="168" x2="690" y2="168"/>
+<!-- Stage 2 -->
+<text class="t-label" x="10" y="192">Stage 2 · with grad · right to left</text>
+<path class="line-quiet" d="M190,136 C190,190 430,170 452,206" marker-end="url(#seco-arrow)"/>
+<path class="line-quiet" d="M330,136 C330,180 440,180 460,206" marker-end="url(#seco-arrow)"/>
+<text class="t-muted t-small" x="548" y="198">reads the cached prefix</text>
+<text class="t-muted t-small" x="10" y="232">chunks</text>
+<rect class="box" x="130" y="208" width="120" height="44" rx="4"/><text class="t-muted" x="190" y="228" text-anchor="middle">chunk 1</text><text class="t-muted t-small" x="190" y="243" text-anchor="middle">waiting</text>
+<rect class="box" x="270" y="208" width="120" height="44" rx="4"/><text class="t-muted" x="330" y="228" text-anchor="middle">chunk 2</text><text class="t-muted t-small" x="330" y="243" text-anchor="middle">waiting</text>
+<rect class="box-accent" x="410" y="208" width="120" height="44" rx="4"/><text x="470" y="228" text-anchor="middle">chunk 3</text><text class="t-small" x="470" y="243" text-anchor="middle">recompute, backward</text>
+<rect class="box-quiet" x="550" y="208" width="120" height="44" rx="4"/><text class="t-muted" x="610" y="228" text-anchor="middle">chunk 4</text><text class="t-muted t-small" x="610" y="243" text-anchor="middle">done, freed</text>
+<path class="line-accent" d="M550,230 H532" marker-end="url(#seco-arrow-a)" stroke-dasharray="4 3"/>
+<text class="t-accent t-small" x="610" y="272" text-anchor="middle">state gradient at</text>
+<text class="t-accent t-small" x="610" y="286" text-anchor="middle">the chunk boundary</text>
+<!-- gradient buffer -->
+<text class="t-muted t-small" x="10" y="326">∂L / ∂(K/V)</text>
+<text class="t-muted t-small" x="10" y="341">gradient buffer</text>
+<rect class="box-plain" x="130" y="308" width="120" height="30" rx="3"/><text class="t-mono" x="190" y="327" text-anchor="middle">∂ K/V 1</text>
+<rect class="box-plain" x="270" y="308" width="120" height="30" rx="3"/><text class="t-mono" x="330" y="327" text-anchor="middle">∂ K/V 2</text>
+<rect class="box-accent" x="410" y="308" width="120" height="30" rx="3"/><text class="t-mono" x="470" y="327" text-anchor="middle">∂ K/V 3</text>
+<rect class="box-plain" x="550" y="308" width="120" height="30" rx="3"/><text class="t-mono" x="610" y="327" text-anchor="middle">∂ K/V 4</text>
+<path class="line-accent" d="M440,252 C420,290 220,280 196,306" marker-end="url(#seco-arrow-a)"/>
+<path class="line-accent" d="M450,252 C440,286 350,284 336,306" marker-end="url(#seco-arrow-a)"/>
+<path class="line-accent" d="M500,306 V254" marker-end="url(#seco-arrow-a)"/>
+<text class="t-accent t-small" x="508" y="290">relayed in</text>
+<text class="t-muted t-small" x="130" y="362">Kept throughout: the K/V cache and its gradient, plus the activations of the one chunk being recomputed.</text>
+</svg>
+</div>
+<figcaption>SeCO on four chunks. Stage 1 fills the cache without gradients; stage 2 recomputes one chunk at a time from the end, backpropagating its loss plus the gradient later chunks already sent into its K/V (or its boundary state), and adding its own attention gradient into the prefix's buffer.</figcaption>
+</figure>
 
 1. **Stage 1:** a no-grad pass over all chunks with a cache.
 2. **Stage 2:** a reverse sweep. Each chunk is recomputed with gradients from the cache, its loss is backpropagated, and the gradient that later chunks sent into its cache entries is relayed backwards.

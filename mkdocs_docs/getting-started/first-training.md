@@ -79,6 +79,110 @@ output/
 
 Packing (`packing: true`, off by default) places several whole conversations in one sequence of up to `max_seq_length` tokens. A conversation is never split across two sequences, and each one only attends to itself: `position_ids` restart at every conversation and the trainer passes the arguments that make every attention and linear-attention layer respect them.
 
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 250" role="img" aria-labelledby="fig-pack-title fig-pack-desc">
+<title id="fig-pack-title">Packing: three whole conversations in one sequence, each attending only to itself</title>
+<desc id="fig-pack-desc">One packed sequence holds conversations A, B and C back to back, followed by padding. Position ids restart at 0 at the start of each conversation. Only the assistant tokens carry a training label. The attention mask is block-diagonal: each token attends causally to earlier tokens of its own conversation and never to another conversation.</desc>
+<text class="t-label" x="10" y="20">one packed sequence (max_seq_length)</text>
+<text class="t-muted t-small" x="10" y="61">conversation</text>
+<text class="t-muted t-small" x="10" y="95">position_ids</text>
+<text class="t-muted t-small" x="10" y="129">role</text>
+<text class="t-muted t-small" x="10" y="163">trained</text>
+<rect class="box" x="120" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="131.5" y="60" text-anchor="middle">A</text>
+<text class="t-mono" x="131.5" y="95" text-anchor="middle">0</text>
+<text class="t-mono t-muted" x="131.5" y="129" text-anchor="middle">u</text>
+<rect class="box-quiet" x="120" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="146" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="157.5" y="60" text-anchor="middle">A</text>
+<text class="t-mono" x="157.5" y="95" text-anchor="middle">1</text>
+<text class="t-mono t-muted" x="157.5" y="129" text-anchor="middle">u</text>
+<rect class="box-quiet" x="146" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="172" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="183.5" y="60" text-anchor="middle">A</text>
+<text class="t-mono" x="183.5" y="95" text-anchor="middle">2</text>
+<text class="t-mono t-muted" x="183.5" y="129" text-anchor="middle">a</text>
+<rect class="box-accent" x="172" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="198" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="209.5" y="60" text-anchor="middle">A</text>
+<text class="t-mono" x="209.5" y="95" text-anchor="middle">3</text>
+<text class="t-mono t-muted" x="209.5" y="129" text-anchor="middle">a</text>
+<rect class="box-accent" x="198" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="224" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="235.5" y="60" text-anchor="middle">A</text>
+<text class="t-mono" x="235.5" y="95" text-anchor="middle">4</text>
+<text class="t-mono t-muted" x="235.5" y="129" text-anchor="middle">a</text>
+<rect class="box-accent" x="224" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="250" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="261.5" y="60" text-anchor="middle">B</text>
+<text class="t-mono" x="261.5" y="95" text-anchor="middle">0</text>
+<text class="t-mono t-muted" x="261.5" y="129" text-anchor="middle">u</text>
+<rect class="box-quiet" x="250" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="276" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="287.5" y="60" text-anchor="middle">B</text>
+<text class="t-mono" x="287.5" y="95" text-anchor="middle">1</text>
+<text class="t-mono t-muted" x="287.5" y="129" text-anchor="middle">u</text>
+<rect class="box-quiet" x="276" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="302" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="313.5" y="60" text-anchor="middle">B</text>
+<text class="t-mono" x="313.5" y="95" text-anchor="middle">2</text>
+<text class="t-mono t-muted" x="313.5" y="129" text-anchor="middle">a</text>
+<rect class="box-accent" x="302" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="328" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="339.5" y="60" text-anchor="middle">B</text>
+<text class="t-mono" x="339.5" y="95" text-anchor="middle">3</text>
+<text class="t-mono t-muted" x="339.5" y="129" text-anchor="middle">a</text>
+<rect class="box-accent" x="328" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="354" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="365.5" y="60" text-anchor="middle">C</text>
+<text class="t-mono" x="365.5" y="95" text-anchor="middle">0</text>
+<text class="t-mono t-muted" x="365.5" y="129" text-anchor="middle">u</text>
+<rect class="box-quiet" x="354" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="380" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="391.5" y="60" text-anchor="middle">C</text>
+<text class="t-mono" x="391.5" y="95" text-anchor="middle">1</text>
+<text class="t-mono t-muted" x="391.5" y="129" text-anchor="middle">a</text>
+<rect class="box-accent" x="380" y="148" width="23" height="22" rx="2"/>
+<rect class="box" x="406" y="44" width="23" height="24" rx="2"/><text class="t-mono" x="417.5" y="60" text-anchor="middle">C</text>
+<text class="t-mono" x="417.5" y="95" text-anchor="middle">2</text>
+<text class="t-mono t-muted" x="417.5" y="129" text-anchor="middle">a</text>
+<rect class="box-accent" x="406" y="148" width="23" height="22" rx="2"/>
+<rect class="box-quiet" x="432" y="44" width="23" height="24" rx="2"/><text class="t-mono t-muted" x="443.5" y="60" text-anchor="middle">·</text>
+<rect class="box-quiet" x="432" y="148" width="23" height="22" rx="2"/>
+<rect class="box-quiet" x="458" y="44" width="23" height="24" rx="2"/><text class="t-mono t-muted" x="469.5" y="60" text-anchor="middle">·</text>
+<rect class="box-quiet" x="458" y="148" width="23" height="22" rx="2"/>
+<text class="t-muted t-small" x="10" y="200">u: user, system or tool result · a: assistant (trained)</text>
+<text class="t-muted t-small" x="10" y="215">padding (·) carries no label</text>
+<text class="t-label" x="500" y="20">attention mask</text>
+<rect class="box-plain" x="500" y="44" width="154" height="154"/>
+<rect class="fill-accent" x="500.5" y="44.5" width="10" height="10"/>
+<rect class="fill-accent" x="500.5" y="55.5" width="10" height="10"/>
+<rect class="fill-accent" x="511.5" y="55.5" width="10" height="10"/>
+<rect class="fill-accent" x="500.5" y="66.5" width="10" height="10"/>
+<rect class="fill-accent" x="511.5" y="66.5" width="10" height="10"/>
+<rect class="fill-accent" x="522.5" y="66.5" width="10" height="10"/>
+<rect class="fill-accent" x="500.5" y="77.5" width="10" height="10"/>
+<rect class="fill-accent" x="511.5" y="77.5" width="10" height="10"/>
+<rect class="fill-accent" x="522.5" y="77.5" width="10" height="10"/>
+<rect class="fill-accent" x="533.5" y="77.5" width="10" height="10"/>
+<rect class="fill-accent" x="500.5" y="88.5" width="10" height="10"/>
+<rect class="fill-accent" x="511.5" y="88.5" width="10" height="10"/>
+<rect class="fill-accent" x="522.5" y="88.5" width="10" height="10"/>
+<rect class="fill-accent" x="533.5" y="88.5" width="10" height="10"/>
+<rect class="fill-accent" x="544.5" y="88.5" width="10" height="10"/>
+<rect class="fill-accent" x="555.5" y="99.5" width="10" height="10"/>
+<rect class="fill-accent" x="555.5" y="110.5" width="10" height="10"/>
+<rect class="fill-accent" x="566.5" y="110.5" width="10" height="10"/>
+<rect class="fill-accent" x="555.5" y="121.5" width="10" height="10"/>
+<rect class="fill-accent" x="566.5" y="121.5" width="10" height="10"/>
+<rect class="fill-accent" x="577.5" y="121.5" width="10" height="10"/>
+<rect class="fill-accent" x="555.5" y="132.5" width="10" height="10"/>
+<rect class="fill-accent" x="566.5" y="132.5" width="10" height="10"/>
+<rect class="fill-accent" x="577.5" y="132.5" width="10" height="10"/>
+<rect class="fill-accent" x="588.5" y="132.5" width="10" height="10"/>
+<rect class="fill-accent" x="599.5" y="143.5" width="10" height="10"/>
+<rect class="fill-accent" x="599.5" y="154.5" width="10" height="10"/>
+<rect class="fill-accent" x="610.5" y="154.5" width="10" height="10"/>
+<rect class="fill-accent" x="599.5" y="165.5" width="10" height="10"/>
+<rect class="fill-accent" x="610.5" y="165.5" width="10" height="10"/>
+<rect class="fill-accent" x="621.5" y="165.5" width="10" height="10"/>
+<text class="t-muted t-small" x="500" y="214">rows: queries · columns: keys</text>
+<text class="t-muted t-small" x="500" y="229">causal, inside each conversation only</text>
+</svg>
+</div>
+<figcaption>Packing three conversations into one sequence: position ids restart at every conversation, only assistant tokens are trained, and attention is block-diagonal, so no conversation sees another.</figcaption>
+</figure>
+
 Without packing, batches are already cut to the length of their longest row, and length-grouped batching (`length_group_buffer`, on by default) puts rows of similar length together, so little compute goes to padding. On short chat data (Qwen3-0.6B, perfectblend) the two measured about the same (packing somewhat slower with `sdpa`, which needs an explicit block-diagonal mask), so packing is not a free speedup. It pays off when rows are few and of very different lengths, or with `attn_implementation: flash_attention_2`, whose variable-length kernel needs no mask.
 
 Qwen3.5 and other linear-attention hybrids need the `hybrid` extra to pack (see [Installation](install.md)); the trainer refuses otherwise.

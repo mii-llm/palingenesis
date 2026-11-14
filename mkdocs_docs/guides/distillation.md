@@ -10,13 +10,53 @@ The usual way to distill is offline: the teacher generates a dataset, the studen
 
 On-policy distillation (OPD) flips the sampling. Every step the student samples completions with its current weights, the teacher scores exactly those tokens, and the loss is the reverse KL from the student to the teacher on the student's own states:
 
-```
- sources ──prompts──▶ rollout engine ──completions──▶ aligner ──teacher view──▶ teacher
- (per-source          (student's current weights:      (same vocabulary: ids;    (log-probs of the
-  teacher)             HF generate or vLLM)             else byte chunks)          student's text)
-                                      ▲                                                  │
-                                      └──────── new weights ◀── loss (reverse KL) ◀──────┘
-```
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 266" role="img" aria-labelledby="fig-opd-title fig-opd-desc">
+<title id="fig-opd-title">On-policy distillation: the student samples, the teacher scores the student's tokens, the loss pulls the student toward the teacher</title>
+<desc id="fig-opd-desc">Prompt sources, each with its own teacher, feed a rollout engine that samples completions with the student's current weights, through Hugging Face generate or vLLM. An aligner maps the completion into the teacher's view: token ids when the vocabulary is shared, byte chunks otherwise. The teacher returns log-probabilities of the student's text. The trainer scores the same completions with the student, the only forward with gradient, and the loss is the reverse KL from student to teacher on those tokens. After the optimizer step the new weights are published to the rollout engine, closing the loop.</desc>
+<defs>
+<marker id="opd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="opd-arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head-accent" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<text class="t-label" x="10" y="16">sampling side</text>
+<rect class="box" x="10" y="28" width="128" height="58" rx="4"/>
+<text x="22" y="50">sources</text><text class="t-muted t-small" x="22" y="68">prompts, each with</text><text class="t-muted t-small" x="22" y="81">its teacher</text>
+<path class="line" d="M138,57 H176" marker-end="url(#opd-arrow)"/>
+<rect class="box-accent" x="178" y="28" width="150" height="58" rx="4"/>
+<text x="190" y="50">rollout engine</text><text class="t-small" x="190" y="68">student's current weights</text><text class="t-muted t-small" x="190" y="81">HF generate or vLLM</text>
+<path class="line" d="M328,57 H366" marker-end="url(#opd-arrow)"/>
+<text class="t-muted t-small" x="347" y="48" text-anchor="middle">text</text>
+<rect class="box" x="368" y="28" width="148" height="58" rx="4"/>
+<text x="380" y="50">aligner</text><text class="t-muted t-small" x="380" y="68">shared vocabulary: ids</text><text class="t-muted t-small" x="380" y="81">otherwise: byte chunks</text>
+<path class="line" d="M516,57 H554" marker-end="url(#opd-arrow)"/>
+<rect class="box-quiet" x="556" y="28" width="134" height="58" rx="4"/>
+<text x="568" y="50">teacher <tspan class="t-muted t-small">(no grad)</tspan></text><text class="t-muted t-small" x="568" y="68">log-probs of the</text><text class="t-muted t-small" x="568" y="81">student's tokens</text>
+<line class="rule" x1="10" y1="118" x2="690" y2="118"/>
+<text class="t-label" x="10" y="140">training side</text>
+<path class="line" d="M253,86 V158" marker-end="url(#opd-arrow)"/>
+<text class="t-muted t-small" x="260" y="128">same completions</text>
+<rect class="box-accent" x="178" y="160" width="150" height="58" rx="4"/>
+<text x="190" y="182">student forward</text><text class="t-small" x="190" y="200">the only one with grad</text><text class="t-muted t-small" x="190" y="213">log-probs of its tokens</text>
+<path class="line" d="M328,189 H554" marker-end="url(#opd-arrow)"/>
+<path class="line" d="M623,86 V158" marker-end="url(#opd-arrow)"/>
+<rect class="box" x="556" y="160" width="134" height="58" rx="4"/>
+<text x="568" y="182">loss</text><text class="t-small" x="568" y="200">reverse KL,</text><text class="t-muted t-small" x="568" y="213">student → teacher</text>
+<path class="line-accent" d="M623,218 V240 H158 V78 H176" marker-end="url(#opd-arrow-a)" stroke-dasharray="4 3"/>
+<text class="t-accent t-small" x="400" y="258" text-anchor="middle">optimizer step, then the new weights are published to the rollout engine</text>
+</svg>
+</div>
+<figcaption>One OPD step. The student samples with its current weights, the teacher scores exactly those tokens, and the per-token reverse KL is backpropagated through the student's own forward; the updated weights go back to the rollout engine for the next batch.</figcaption>
+</figure>
+
+With the default loss, `full_rkl`, the step minimises the exact reverse KL over the shared vocabulary, averaged over the batch's completion tokens:
+
+$$
+\mathcal{L} = \frac{1}{N} \sum_{t} \sum_{v} p_S(v \mid y_{<t}) \big(\log p_S(v \mid y_{<t}) - \log p_T(v \mid y_{<t})\big)
+$$
+
+where $y$ is the student's own completion, $t$ runs over its tokens, $N$ is the number of completion tokens in the batch, $v$ runs over the vocabulary, and $p_S$, $p_T$ are the student's and the teacher's next-token distributions given the same prefix. With `loss.length_norm: true` the average is per sequence instead of per token.
+{: .pg-where }
 
 ## Quickstart
 
@@ -86,8 +126,8 @@ A teacher is `hf` (in-process, frozen bf16, full distribution) or `vllm` (a vLLM
 | `full_rkl` | hf teacher, shared vocabulary | exact reverse KL over the shared vocabulary at every completion token | hf teacher, shared vocabulary |
 | `rs_kd` | hf teacher, shared vocabulary | forward KL to tokens drawn from the teacher's distribution, importance-weighted (Random Sampling KD, arXiv 2503.16870): unbiased, `loss.rs_rounds` ids per token | — |
 | `topk_kl` | shared vocabulary | KL between coarse distributions: the teacher's top-k plus the realized token, and one tail bucket holding the rest of each side's mass (`loss.beta`: 1 reverse, 0 forward) | vllm teacher, shared vocabulary |
-| `sampled_rkl` | shared vocabulary | REINFORCE on the per-token reward log p_T(y) − log p_S(y) (the sampled reverse KL), with an importance ratio to the rollout policy | — |
-| `xtok` | any tokenizers | REINFORCE on text chunks: reward log p_T(chunk) − log p_S(chunk); optional top-k KL where a chunk is one token on each side | teacher with another tokenizer |
+| `sampled_rkl` | shared vocabulary | REINFORCE on the per-token reward $\log p_T(y) - \log p_S(y)$ (the sampled reverse KL), with an importance ratio to the rollout policy | — |
+| `xtok` | any tokenizers | REINFORCE on text chunks: reward $\log p_T(c) - \log p_S(c)$ for chunk $c$; optional top-k KL where a chunk is one token on each side | teacher with another tokenizer |
 
 Asking for a shared-vocabulary loss with a teacher whose tokenizer differs is an error at startup, before any weights load.
 
@@ -97,19 +137,108 @@ A **shared vocabulary** means the teacher's vocabulary is a prefix of the studen
 
 When the tokenizers differ, the completion's text is re-tokenized by the teacher and both token sequences are cut into **chunks** at the byte offsets where both end a token:
 
-```
-student (Qwen3)     |Un|belie|vably|,| |1|2|5|0| ducks|.|
-teacher (SmolLM2)   |Un|belie|v|ably|,| |1|2|5|0| ducks|.|
-chunks              [Un][belie][vably][,][ ][1][2][5][0][ ducks][.]      "vably" = "v" + "ably": one chunk
-```
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 204" role="img" aria-labelledby="fig-xtok-title fig-xtok-desc">
+<title id="fig-xtok-title">Cross-tokenizer chunks: cut where both tokenizers end a token</title>
+<desc id="fig-xtok-desc">The text "Unbelievably, 1250 ducks." tokenized by the student, Qwen3, and by the teacher, SmolLM2. The two agree everywhere except "vably", one student token that the teacher splits into "v" and "ably". Chunks are cut at the byte offsets where both sides end a token, so "vably" becomes one chunk holding one student token and two teacher tokens; every other chunk is a single token on both sides.</desc>
+<line class="line-quiet" x1="150" y1="14" x2="150" y2="150"/>
+<line class="line-quiet" x1="190" y1="14" x2="190" y2="150"/>
+<line class="line-quiet" x1="290" y1="14" x2="290" y2="150"/>
+<line class="line-quiet" x1="390" y1="14" x2="390" y2="150"/>
+<line class="line-quiet" x1="410" y1="14" x2="410" y2="150"/>
+<line class="line-quiet" x1="430" y1="14" x2="430" y2="150"/>
+<line class="line-quiet" x1="450" y1="14" x2="450" y2="150"/>
+<line class="line-quiet" x1="470" y1="14" x2="470" y2="150"/>
+<line class="line-quiet" x1="490" y1="14" x2="490" y2="150"/>
+<line class="line-quiet" x1="510" y1="14" x2="510" y2="150"/>
+<line class="line-quiet" x1="630" y1="14" x2="630" y2="150"/>
+<line class="line-quiet" x1="650" y1="14" x2="650" y2="150"/>
+<text x="10" y="37">student</text><text class="t-muted t-small" x="74" y="37">Qwen3</text>
+<rect class="box" x="151" y="20" width="38" height="26" rx="3"/>
+<text class="t-mono" x="170.0" y="37" text-anchor="middle">Un</text>
+<rect class="box" x="191" y="20" width="98" height="26" rx="3"/>
+<text class="t-mono" x="240.0" y="37" text-anchor="middle">belie</text>
+<rect class="box" x="291" y="20" width="98" height="26" rx="3"/>
+<text class="t-mono" x="340.0" y="37" text-anchor="middle">vably</text>
+<rect class="box" x="391" y="20" width="18" height="26" rx="3"/>
+<text class="t-mono" x="400.0" y="37" text-anchor="middle">,</text>
+<rect class="box" x="411" y="20" width="18" height="26" rx="3"/>
+<text class="t-mono" x="420.0" y="37" text-anchor="middle">␣</text>
+<rect class="box" x="431" y="20" width="18" height="26" rx="3"/>
+<text class="t-mono" x="440.0" y="37" text-anchor="middle">1</text>
+<rect class="box" x="451" y="20" width="18" height="26" rx="3"/>
+<text class="t-mono" x="460.0" y="37" text-anchor="middle">2</text>
+<rect class="box" x="471" y="20" width="18" height="26" rx="3"/>
+<text class="t-mono" x="480.0" y="37" text-anchor="middle">5</text>
+<rect class="box" x="491" y="20" width="18" height="26" rx="3"/>
+<text class="t-mono" x="500.0" y="37" text-anchor="middle">0</text>
+<rect class="box" x="511" y="20" width="118" height="26" rx="3"/>
+<text class="t-mono" x="570.0" y="37" text-anchor="middle">␣ducks</text>
+<rect class="box" x="631" y="20" width="18" height="26" rx="3"/>
+<text class="t-mono" x="640.0" y="37" text-anchor="middle">.</text>
+<text x="10" y="81">teacher</text><text class="t-muted t-small" x="74" y="81">SmolLM2</text>
+<rect class="box" x="151" y="64" width="38" height="26" rx="3"/>
+<text class="t-mono" x="170.0" y="81" text-anchor="middle">Un</text>
+<rect class="box" x="191" y="64" width="98" height="26" rx="3"/>
+<text class="t-mono" x="240.0" y="81" text-anchor="middle">belie</text>
+<rect class="box" x="291" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="300.0" y="81" text-anchor="middle">v</text>
+<rect class="box" x="311" y="64" width="78" height="26" rx="3"/>
+<text class="t-mono" x="350.0" y="81" text-anchor="middle">ably</text>
+<rect class="box" x="391" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="400.0" y="81" text-anchor="middle">,</text>
+<rect class="box" x="411" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="420.0" y="81" text-anchor="middle">␣</text>
+<rect class="box" x="431" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="440.0" y="81" text-anchor="middle">1</text>
+<rect class="box" x="451" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="460.0" y="81" text-anchor="middle">2</text>
+<rect class="box" x="471" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="480.0" y="81" text-anchor="middle">5</text>
+<rect class="box" x="491" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="500.0" y="81" text-anchor="middle">0</text>
+<rect class="box" x="511" y="64" width="118" height="26" rx="3"/>
+<text class="t-mono" x="570.0" y="81" text-anchor="middle">␣ducks</text>
+<rect class="box" x="631" y="64" width="18" height="26" rx="3"/>
+<text class="t-mono" x="640.0" y="81" text-anchor="middle">.</text>
+<text x="10" y="135">chunks</text>
+<rect class="box-plain" x="151" y="118" width="38" height="26" rx="3"/>
+<text class="t-mono" x="170.0" y="135" text-anchor="middle">Un</text>
+<rect class="box-plain" x="191" y="118" width="98" height="26" rx="3"/>
+<text class="t-mono" x="240.0" y="135" text-anchor="middle">belie</text>
+<rect class="box-accent" x="291" y="118" width="98" height="26" rx="3"/>
+<text class="t-mono" x="340.0" y="135" text-anchor="middle">vably</text>
+<rect class="box-plain" x="391" y="118" width="18" height="26" rx="3"/>
+<text class="t-mono" x="400.0" y="135" text-anchor="middle">,</text>
+<rect class="box-plain" x="411" y="118" width="18" height="26" rx="3"/>
+<text class="t-mono" x="420.0" y="135" text-anchor="middle">␣</text>
+<rect class="box-plain" x="431" y="118" width="18" height="26" rx="3"/>
+<text class="t-mono" x="440.0" y="135" text-anchor="middle">1</text>
+<rect class="box-plain" x="451" y="118" width="18" height="26" rx="3"/>
+<text class="t-mono" x="460.0" y="135" text-anchor="middle">2</text>
+<rect class="box-plain" x="471" y="118" width="18" height="26" rx="3"/>
+<text class="t-mono" x="480.0" y="135" text-anchor="middle">5</text>
+<rect class="box-plain" x="491" y="118" width="18" height="26" rx="3"/>
+<text class="t-mono" x="500.0" y="135" text-anchor="middle">0</text>
+<rect class="box-plain" x="511" y="118" width="118" height="26" rx="3"/>
+<text class="t-mono" x="570.0" y="135" text-anchor="middle">␣ducks</text>
+<rect class="box-plain" x="631" y="118" width="18" height="26" rx="3"/>
+<text class="t-mono" x="640.0" y="135" text-anchor="middle">.</text>
+<text class="t-accent t-small" x="340.0" y="164" text-anchor="middle">"vably" = "v" + "ably": one chunk</text>
+<text class="t-muted t-small" x="10" y="194">dashed lines: byte offsets where both sides end a token · ␣ is a space</text>
+</svg>
+</div>
+<figcaption>Chunking a completion across tokenizers. Each chunk is the same text on both sides, so the student's and the teacher's log-probabilities of a chunk can be compared.</figcaption>
+</figure>
 
-A chunk is the same text on both sides, so its total log-probability is comparable: the reward of chunk c is A_c = log p_T(c) − log p_S(c) (the sum of each side's token log-probabilities in the chunk), and the rewards of a completion add up to its log-likelihood ratio between the two models. Details that matter:
+A chunk is the same text on both sides, so its total log-probability is comparable: the reward of chunk $c$ is $A_c = \log p_T(c) - \log p_S(c)$ (the sum of each side's token log-probabilities in the chunk), and the rewards of a completion add up to its log-likelihood ratio between the two models. Details that matter:
 
 - The student's byte offsets come from the **sampled token ids** (each token's bytes), never from re-encoding the decoded text: a sampled sequence is often not the tokenizer's canonical encoding of its own text.
 - The student's end-of-turn token pairs with the teacher's as the last chunk.
 - Whitespace-only chunks carry no loss (`loss.mask_whitespace`): tokenizers disagree most on whitespace runs, and supervising them hurt code models badly in published work.
 - Bytes after the last complete UTF-8 character (a completion cut inside an emoji) and special tokens inside a completion are left out.
-- `loss.xtok_spread: chunk` gives every token of a chunk the chunk's advantage; `proportional` gives each token the share log p_S(t) / log p_S(c) of it.
+- `loss.xtok_spread: chunk` gives every token of a chunk the chunk's advantage; `proportional` gives each token $t$ the share $\log p_S(t) / \log p_S(c)$ of it.
 - `loss.xtok_dense_weight > 0` adds a top-k KL at chunks of exactly one token on each side, over the teacher's top-k tokens mapped to student tokens that spell the same bytes (a tail bucket holds the rest).
 
 ### Several teachers
@@ -186,7 +315,7 @@ What the numbers say:
 
 The fused `full_rkl` (`opd/fused_rkl.py`, used automatically for plain linear output heads and a shared vocabulary without end-of-turn remapping) computes both models' logits in fp32 straight from bf16 GEMMs, then makes two streaming passes over them in Triton: one for both log-sum-exps, the KL and its statistics, one for the analytic gradient q·(log q − log p + 1 − KL − S). Autograd through the definition, which the generic path uses, takes about a dozen elementwise passes over the [tokens, 248k] logits and recasts the output head's weight for every slice. The fused path is also more exact: against fp64 on the same inputs its loss is within 4e-6 and its gradients within 1.3% (norm), where the autocast path's are 9e-6 and 2.9%.
 
-The fused path covers every head `logits.output_head` produces: a logit scale (Cohere, Granite, Falcon-H1) and Gemma 2's final-logit softcap are applied inside the kernels, with the softcap's derivative computed as 4σ(2x)σ(−2x) (no cancellation where the logits saturate). On real hidden states against fp64: Gemma-2-2B-it ← Gemma-2-2B (softcap 30, 256k vocabulary) loss error 2.6e-4 vs 4.8e-3 for the generic path, gradients 5–12× closer, 79 vs 197 ms; Granite-3.3-2B ← 8B (logit scales 1/8 and 1/16) 3.6e-5 vs 7.5e-5, 46 vs 61 ms.
+The fused path covers every head `logits.output_head` produces: a logit scale (Cohere, Granite, Falcon-H1) and Gemma 2's final-logit softcap are applied inside the kernels, with the softcap's derivative computed as $4\,\sigma(2x)\,\sigma(-2x)$ (no cancellation where the logits saturate). On real hidden states against fp64: Gemma-2-2B-it ← Gemma-2-2B (softcap 30, 256k vocabulary) loss error 2.6e-4 vs 4.8e-3 for the generic path, gradients 5–12× closer, 79 vs 197 ms; Granite-3.3-2B ← 8B (logit scales 1/8 and 1/16) 3.6e-5 vs 7.5e-5, 46 vs 61 ms.
 
 Rollout time is set by decoding: 512 steps for the longest completion, about 5 ms each at 64 sequences (Qwen3.5's linear-attention layers read and write a recurrent state per sequence at every step). Larger batches decode more tokens per second: 128 prompts per step give 13.5k rollout tokens/s instead of 9.7k, and 4.9k trained tokens/s instead of 4.3k, at half the optimizer steps per token.
 
@@ -197,7 +326,7 @@ Same setup (Qwen3.5-4B → 0.8B, 100 steps, one seed each; one standard error on
 | Run | GSM8K %, step 0 / 25 / 50 / 75 / 100 | dev_kl, step 100 | s / step |
 |---|---|---:|---:|
 | `full_rkl` (baseline) | 53.0 / 55.5 / 59.5 / 62.0 / 62.5 | 0.243 | 5.5 |
-| `token_weighting: sure`, α = 1 | 53.0 / 55.0 / 62.5 / 61.0 / 62.0 | 0.245 | 5.5 |
+| `token_weighting: sure`, $\alpha = 1$ | 53.0 / 55.0 / 62.5 / 61.0 / 62.0 | 0.245 | 5.5 |
 | `token_weighting: entropy`, keep 20% | 53.0 / 62.5 / 63.0 / 59.0 / 64.0 | 0.249 | 5.7 |
 | `rs_kd`, 50 draws | 53.0 / 53.5 / 59.0 / 58.5 / 56.5 | 0.284 | 7.0 |
 
@@ -374,15 +503,15 @@ failed turns) per step, `kl_error/<teacher>` (the KL on those turns) and `eval/d
 **The teacher-reliability cutoff.** Deep into a drifted episode the teacher reads a history it would never have
 written, and its targets there are least reliable (teacher perplexity on student tokens grows with the turn index,
 Guided-OPD 2606.15912). STRIDE stops a rollout once the running sum of per-turn mean teacher log-probs of the
-student's tokens falls below λ (−1 to −3 on τ²-bench), keeping the turn that crossed it, and finds the informative
-part of a turn in its first ~150 tokens. Here, per recorded turn k inside the trunk, `l_k` is the teacher's mean
-log-prob of the turn's recorded tokens (its first `cutoff_tokens`); the statistic is the sum `l_1 + ... + l_k`
+student's tokens falls below $\lambda$ ($-1$ to $-3$ on τ²-bench), keeping the turn that crossed it, and finds the informative
+part of a turn in its first ~150 tokens. Here, per recorded turn $k$ inside the trunk, $l_k$ is the teacher's mean
+log-prob of the turn's recorded tokens (its first `cutoff_tokens`); the statistic is the sum $l_1 + \dots + l_k$
 (`cutoff_window: 0`, STRIDE's; it grows with the number of turns, so on long episodes it acts partly as a turn
 budget) or the mean of the last `cutoff_window` values (a per-token scale, independent of the episode's length; e.g.
 `cutoff_window: 3, cutoff_logp: -1.5`). At the first turn where it falls below `cutoff_logp`, the turns after it,
 recorded and regenerated (their context holds it), get `cutoff_weight`: 0 drops them. The teacher computes these
 log-probs in the pass it makes anyway; turns are chosen before the teacher reads the trace, so the regenerated turns
-it then drops have cost a rollout. Screen λ on the teacher's log-probs over a sample of episodes first (the
+it then drops have cost a rollout. Screen $\lambda$ on the teacher's log-probs over a sample of episodes first (the
 `teacher_turn_logp` metric reports their mean). Reported per step as `cut_trace_share` (traces cut),
 `cut_token_share` (recorded-turn tokens after the cutoff), `cut_branch_share` (regenerated turns after it) and
 `teacher_turn_logp` (mean per-turn teacher log-prob of the recorded turns: it should rise as the student improves,
@@ -441,7 +570,7 @@ A source is any object with `sample()` (messages, max_new_tokens, meta), `evalua
 
 | Metric | Meaning |
 |--------|---------|
-| `k1/<teacher>` | sampled reverse-KL estimate per student token, sum(log p_S − log p_T) / tokens: the same scale for every loss |
+| `k1/<teacher>` | sampled reverse-KL estimate per student token, $\sum (\log p_S - \log p_T) / \text{tokens}$: the same scale for every loss |
 | `kl/<teacher>` | the loss's own KL (exact for `full_rkl`, coarse for `topk_kl`) |
 | `eval/dev_kl/<source>` | `k1` on held-out prompts, sampled on-policy: the quantity being trained, out of sample |
 | `eval/dev_kl_full/<source>` | exact per-token reverse KL (full_rkl teachers) |

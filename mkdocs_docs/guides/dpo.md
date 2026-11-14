@@ -8,15 +8,53 @@
 
 Preference training is a mode of `pgs train`, not a separate tool. Set `dpo.enabled: true` and point `data.dataset` at preference pairs. Everything else works as it does for SFT: the optimizer, LR schedule, FSDP, checkpointing, best-model tracking and, above all, the chat-template rendering and assistant masking.
 
-```
-┌────────────┐         ┌─────────────────────┐        ┌──────────────┐
-│   PAIR     │ render  │  [chosen; rejected] │ score  │   POLICY     │──┐
-│ prompt +   │────────▶│  same template and  │───────▶│  log-probs   │  │  -log σ(β·Δ)
-│ chosen /   │  (SFT   │  masking as SFT     │        ├──────────────┤  ├──────────────▶ loss
-│ rejected   │  path)  │                     │───────▶│  REFERENCE   │──┘
-└────────────┘         └─────────────────────┘        │  (frozen)    │
-                                                      └──────────────┘
-```
+<figure class="pg-figure">
+<div class="pg-figure__canvas">
+<svg class="pg-fig" viewBox="0 0 700 250" role="img" aria-labelledby="fig-dpo-title fig-dpo-desc">
+<title id="fig-dpo-title">A DPO step: one batch of chosen and rejected rows, scored by the policy and the frozen reference</title>
+<desc id="fig-dpo-desc">A preference pair, a prompt with a chosen and a rejected answer, is rendered with the same chat template and assistant masking as SFT into a micro-batch whose chosen rows come first. One policy forward and one reference forward score both sides. The summed log-probabilities of the scored tokens give Delta, the preference loss is computed from it, and the gradient reaches the policy only; the reference is frozen.</desc>
+<defs>
+<marker id="dpo-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="dpo-arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head-accent" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<!-- pair -->
+<text class="t-label" x="10" y="62">pair</text>
+<rect class="box" x="10" y="72" width="118" height="100" rx="4"/>
+<text x="22" y="96">prompt</text>
+<text x="22" y="124">chosen <tspan class="t-mono">y_w</tspan></text>
+<text x="22" y="152">rejected <tspan class="t-mono">y_l</tspan></text>
+<path class="line" d="M128,122 H160" marker-end="url(#dpo-arrow)"/>
+<!-- batch -->
+<text class="t-label" x="162" y="62">micro-batch [2P, S]</text>
+<rect class="box-plain" x="162" y="72" width="150" height="100" rx="4"/>
+<rect class="fill-soft" x="170" y="80" width="134" height="20" rx="2"/><text class="t-small" x="178" y="94">chosen rows</text>
+<rect class="fill-raised" x="170" y="104" width="134" height="20" rx="2"/><text class="t-small" x="178" y="118">rejected rows</text>
+<text class="t-muted t-small" x="170" y="146">SFT chat template</text>
+<text class="t-muted t-small" x="170" y="161">and assistant masking</text>
+<path class="line" d="M312,112 C330,112 330,60 352,60" marker-end="url(#dpo-arrow)"/>
+<path class="line" d="M312,132 C330,132 330,184 352,184" marker-end="url(#dpo-arrow)"/>
+<!-- models -->
+<rect class="box-accent" x="354" y="36" width="128" height="48" rx="4"/>
+<text x="418" y="57" text-anchor="middle">policy π</text><text class="t-small" x="418" y="73" text-anchor="middle">trained</text>
+<rect class="box-quiet" x="354" y="160" width="128" height="48" rx="4"/>
+<text x="418" y="181" text-anchor="middle">reference π_ref</text><text class="t-muted t-small" x="418" y="197" text-anchor="middle">frozen, no grad</text>
+<!-- scores -->
+<path class="line" d="M482,60 C510,60 510,110 536,114" marker-end="url(#dpo-arrow)"/>
+<path class="line" d="M482,184 C510,184 510,134 536,130" marker-end="url(#dpo-arrow)"/>
+<text class="t-muted t-small" x="494" y="44">Σ log π per side</text>
+<text class="t-muted t-small" x="494" y="216">Σ log π_ref per side</text>
+<circle class="box" cx="556" cy="122" r="18"/><text x="556" y="127" text-anchor="middle">Δ</text>
+<path class="line" d="M574,122 H594" marker-end="url(#dpo-arrow)"/>
+<rect class="box" x="596" y="100" width="96" height="44" rx="4"/>
+<text x="644" y="121" text-anchor="middle">loss</text><text class="t-mono" x="644" y="136" text-anchor="middle">−log σ(βΔ)</text>
+<!-- gradient -->
+<path class="line-accent" d="M644,100 V18 H418 V34" marker-end="url(#dpo-arrow-a)" stroke-dasharray="4 3"/>
+<text class="t-accent t-small" x="530" y="12" text-anchor="middle">gradient: policy only</text>
+<text class="t-muted t-small" x="10" y="240">Only the scored (assistant) tokens enter the sums; the full logits are never materialised.</text>
+</svg>
+</div>
+<figcaption>One DPO step. Both answers go through the SFT rendering path into one batch; the policy and the frozen reference each score both sides, and only the policy receives the gradient of the preference loss (here the default <code>sigmoid</code> objective).</figcaption>
+</figure>
 
 A DPO run therefore scores exactly the tokens an SFT run on the same conversations would train on.
 
@@ -95,15 +133,22 @@ The rejected side is truncated (its start kept) when `dpo.truncate_rejected: tru
 
 ## Objectives
 
-`Δ` is the policy's log-ratio of chosen minus that of rejected, both relative to the reference. `Δ_avg` uses per-token averages instead of sums.
+$\Delta$ is the policy's log-ratio of chosen minus that of rejected, both relative to the reference; $\Delta_{\text{avg}}$ uses per-token averages instead of sums:
+
+$$
+\Delta = \big(\log \pi(y_w) - \log \pi_{\text{ref}}(y_w)\big) - \big(\log \pi(y_l) - \log \pi_{\text{ref}}(y_l)\big)
+$$
+
+where $y_w$ is the chosen answer, $y_l$ the rejected one, $\pi$ the policy, $\pi_{\text{ref}}$ the frozen reference (log-probabilities summed over the answer's tokens), $\beta$ is `dpo.beta` and $\sigma$ the logistic function.
+{: .pg-where }
 
 | `loss_type` | Loss | Source |
 |---|---|---|
-| `sigmoid` | `-log σ(β·Δ)` | DPO ([arXiv:2305.18290](https://arxiv.org/abs/2305.18290)) |
-| `hinge` | `max(0, 1 - β·Δ)` | SLiC-HF ([arXiv:2305.10425](https://arxiv.org/abs/2305.10425)) |
-| `ipo` | `(Δ_avg - 1/(2β))²` | IPO ([arXiv:2310.12036](https://arxiv.org/abs/2310.12036)) |
-| `robust` | `((1-ε)·ℓ(Δ) - ε·ℓ(-Δ)) / (1-2ε)`, `ε = label_smoothing` | rDPO ([arXiv:2403.00409](https://arxiv.org/abs/2403.00409)) |
-| `sigmoid_norm` | `-log σ(β·Δ_avg)` | Length-normalised DPO |
+| `sigmoid` | $-\log \sigma(\beta\Delta)$ | DPO ([arXiv:2305.18290](https://arxiv.org/abs/2305.18290)) |
+| `hinge` | $\max(0,\ 1 - \beta\Delta)$ | SLiC-HF ([arXiv:2305.10425](https://arxiv.org/abs/2305.10425)) |
+| `ipo` | $\big(\Delta_{\text{avg}} - \frac{1}{2\beta}\big)^2$ | IPO ([arXiv:2310.12036](https://arxiv.org/abs/2310.12036)) |
+| `robust` | $\dfrac{(1-\varepsilon)\,\ell(\Delta) - \varepsilon\,\ell(-\Delta)}{1-2\varepsilon}$, with $\ell(x) = -\log\sigma(\beta x)$ and $\varepsilon$ = `label_smoothing` | rDPO ([arXiv:2403.00409](https://arxiv.org/abs/2403.00409)) |
+| `sigmoid_norm` | $-\log \sigma(\beta\Delta_{\text{avg}})$ | Length-normalised DPO |
 
 Two modifiers combine with any of them:
 
@@ -127,17 +172,17 @@ Compute still runs in bf16 under `train.bf16` autocast. `Config.validate()` warn
 
 ## Memory: no full logits
 
-Every objective above is a function of per-sequence scores `s_b = Σ_t a[b,t] · log π(y_t)`, where `a` is the scored-token mask, LD-weighted when enabled. By the chain rule,
+Every objective above is a function of per-sequence scores $s_b = \sum_t a_{b,t} \log \pi(y_t)$, where $a$ is the scored-token mask, LD-weighted when enabled. By the chain rule,
 
-```
-∂L / ∂log π(y_t)  =  (∂L / ∂s_b) · a[b,t]
-```
+$$
+\frac{\partial L}{\partial \log \pi(y_t)} = \frac{\partial L}{\partial s_b}\, a_{b,t}
+$$
 
-and `∂L/∂s_b` comes cheaply from a no-grad pass. The step runs in chunks along the sequence, reusing the chunked cross-entropy machinery:
+and $\partial L / \partial s_b$ comes cheaply from a no-grad pass. The step runs in chunks along the sequence, reusing the chunked cross-entropy machinery:
 
 1. **No grad:** compute per-token log-probs for the policy and the reference, chunk by chunk.
 2. **Scores:** evaluate the loss on the tiny `[2P]` score tensor and differentiate it to get per-sequence weights.
-3. **With grad:** backpropagate `Σ weight · log π` chunk by chunk, then bridge the accumulated hidden-state gradient into the backbone.
+3. **With grad:** backpropagate $\sum_t w_{b,t} \log \pi(y_t)$, with the weights $w_{b,t} = \frac{\partial L}{\partial s_b} a_{b,t}$ from step 2, chunk by chunk, then bridge the accumulated hidden-state gradient into the backbone.
 
 The `[B, S, V]` logits are never materialised, and neither is any other full-vocabulary quantity for the whole sequence. On large vocabularies (Qwen3.5: 248k) these would otherwise dominate memory. The test suite checks that loss and parameter gradients equal a naive full-logits implementation, for every objective, with and without `sft_weight` and `ld_alpha`, across chunk counts.
 
@@ -155,7 +200,7 @@ The `[B, S, V]` logits are never materialised, and neither is any other full-voc
 |---|---|
 | `train/dpo/loss` | Preference loss, mean over pairs |
 | `train/dpo/sft_nll` | Mean NLL of chosen tokens (when `sft_weight > 0`) |
-| `train/rewards/chosen`, `train/rewards/rejected` | `β · (log π - log π_ref)` for each side |
+| `train/rewards/chosen`, `train/rewards/rejected` | $\beta\,(\log \pi - \log \pi_{\text{ref}})$ for each side |
 | `train/rewards/margins` | Chosen reward minus rejected reward |
 | `train/rewards/accuracies` | Share of pairs where chosen outscores rejected |
 | `train/logps/chosen`, `train/logps/rejected` | Summed policy log-probs per sequence |
@@ -165,7 +210,7 @@ Training metrics are averaged over the accumulation window and across ranks. The
 
 ### Reading them
 
-- **Step 1:** `dpo/loss = log 2 ≈ 0.693` and a margin of exactly 0. The policy is the reference.
+- **Step 1:** `dpo/loss` $= \log 2 \approx 0.693$ and a margin of exactly 0. The policy is the reference.
 - **Accuracy at 1.0 within a few steps** means the pairs are easy, e.g. a clean answer against a long loop. The preference is learned quickly, and the margin then grows by suppressing the rejected side. Watch `logps/chosen`: if it falls, raise `sft_weight`.
 - **`eval/loss` rising while train loss falls** is ordinary overfitting. The best checkpoint is kept.
 

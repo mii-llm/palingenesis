@@ -915,6 +915,7 @@ html .md-footer-meta.md-typeset a:is(:hover, :focus-visible) {
   visibility: hidden;
 }
 .md-typeset .katex {
+  position: relative; /* keeps KaTeX's hidden MathML inside table scroll boxes */
   font-size: 1.08em;
 }
 .md-typeset div.arithmatex {
@@ -934,6 +935,13 @@ html .md-footer-meta.md-typeset a:is(:hover, :focus-visible) {
   margin-top: -0.4em;
   color: var(--pg-text-2);
   font-size: 0.92em;
+}
+
+/* A one-line pipeline written as text */
+.md-typeset .pg-flow {
+  padding: 0.6em 0.9em;
+  border-left: 2px solid var(--pg-signal);
+  color: var(--pg-text-2);
 }
 
 /* Figures: inline SVG drawn with the same tokens as the text. Shapes take
@@ -959,8 +967,9 @@ html .md-footer-meta.md-typeset a:is(:hover, :focus-visible) {
   max-width: none;
   margin: 0.7em 0 0;
   color: var(--pg-text-2);
-  font-size: 0.82rem;
+  font-size: 0.68rem;
   font-style: normal;
+  line-height: 1.5;
   text-align: left;
 }
 .pg-fig text {
