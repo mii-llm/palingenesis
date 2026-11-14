@@ -1777,6 +1777,11 @@ class MixedDataset(_Epochs, IterableDataset):
 
     A source that yields nothing at all is a misconfiguration and is dropped with a warning.
     Each source can be SFT (chat masking) or pretraining text (all-token loss).
+
+    `rank` is the data-parallel rank the sources are sharded for. Every rank and every DataLoader
+    worker draws its own sequence of sources (seed, epoch, rank, worker): with one shared sequence
+    all of them would pick the same source at the same position, and a step's global batch would
+    hold the source mix of a single micro-batch instead of averaging over ranks.
     """
 
     def __init__(
@@ -1786,6 +1791,7 @@ class MixedDataset(_Epochs, IterableDataset):
         seed: int = 42,
         names: list[str] | None = None,
         epoch_draws: int | None = None,
+        rank: int = 0,
     ):
         assert len(sources) == len(weights)
         assert all(w >= 0 for w in weights)
@@ -1795,6 +1801,7 @@ class MixedDataset(_Epochs, IterableDataset):
         self.seed = seed
         self.names = names or [f"source[{i}]" for i in range(len(sources))]
         self.epoch_draws = epoch_draws
+        self.rank = rank
 
     def _restart(self, i: int, passes: int):
         """Source i's next pass, in its own order (a seed no epoch uses)."""
@@ -1804,7 +1811,11 @@ class MixedDataset(_Epochs, IterableDataset):
         return iter(stage)
 
     def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
+        info = torch.utils.data.get_worker_info()
+        workers, wid = (info.num_workers, info.id) if info is not None else (1, 0)
+        # rank 0's first worker keeps seed + epoch (one process: the order it always had)
+        stream = self.rank * workers + wid
+        rng = random.Random(self.seed + self.epoch if stream == 0 else f"{self.seed}:{self.epoch}:{self.rank}:{wid}")
         iterators = [iter(s) for s in self.sources]
         active = list(range(len(self.sources)))
         yielded = [0] * len(self.sources)  # in the current pass
@@ -1812,8 +1823,6 @@ class MixedDataset(_Epochs, IterableDataset):
         if self.epoch_draws is None:
             draws = None
         else:
-            info = torch.utils.data.get_worker_info()
-            workers, wid = (info.num_workers, info.id) if info is not None else (1, 0)
             draws = self.epoch_draws // workers + (wid < self.epoch_draws % workers)
         try:
             while active and (draws is None or draws > 0):
@@ -2391,7 +2400,7 @@ def build_dataset(
         if rank == 0:
             _log_mixture(names, weights, rows, draws, world_size)
         final_ds: IterableDataset = MixedDataset(
-            source_datasets, weights, seed=config.seed, names=names, epoch_draws=draws
+            source_datasets, weights, seed=config.seed, names=names, epoch_draws=draws, rank=rank
         )
     elif hasattr(dataset_or_config, "__iter__") and not isinstance(dataset_or_config, DataConfig):
         # Pre-loaded HF dataset object passed directly. The caller decides whether to
@@ -2453,6 +2462,7 @@ def build_dataset(
             seed=config.seed,
             names=["target_mix", f"replay:{config.pretrain_replay_dataset} (text_field='text')"],
             epoch_draws=draws,
+            rank=rank,
         )
 
     # Optional packing
