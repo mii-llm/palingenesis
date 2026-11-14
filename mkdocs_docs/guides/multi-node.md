@@ -21,17 +21,38 @@ Multi-node training works well when you understand these constraints.
 
 ## SLURM
 
-Most HPC clusters use SLURM for job scheduling. One command:
+Most HPC clusters use SLURM for job scheduling. From the repository root:
 
 ```bash
 sbatch scripts/train_slurm.sh configs/qwen35_35b_moe/a100_80gb_multigpu.yaml
 ```
 
-Override node count:
+The log is `slurm-<jobid>.out` in the directory you submit from. (If you point `#SBATCH --output` into a directory, create it first: Slurm opens the file before the script runs, and a job whose log directory is missing fails at once without a message.)
+
+Override node count or GPUs per node (the script starts one process per allocated GPU):
 
 ```bash
 sbatch --nodes=4 scripts/train_slurm.sh configs/qwen35_4b/a100_80gb_multigpu.yaml
+sbatch --nodes=4 --gpus-per-node=4 scripts/train_slurm.sh configs/qwen35_4b/a100_80gb_multigpu.yaml
 ```
+
+Arguments after the config are config overrides:
+
+```bash
+sbatch scripts/train_slurm.sh my_config.yaml --train.resume_from auto
+```
+
+### Before you submit
+
+Every rank runs the same program and reads the same paths, so the paths must mean the same thing on every node:
+
+- **The Python environment** on a shared filesystem, active in the shell you submit from (`sbatch` passes that shell's environment to the job): every node runs `torchrun -m palingenesis.train` from it.
+- **`train.output_dir`** on a shared filesystem. Every rank writes its checkpoint shard there and reads it back on resume. The trainer checks at startup that every rank sees the checkpoint rank 0 resumes from, and stops with an error naming the ranks that do not.
+- **`data.pretokenize_path`** (with `data.pretokenize: true`) on a shared filesystem. Rank 0 builds the cache, every rank reads it; ranks that cannot read it stop the run with an error.
+- **The data** (`data.dataset`, `data.sources`, the eval sets) reachable from every node: a shared path or the Hub.
+- **The Hugging Face cache** (`HF_HOME`) shared, with the model and datasets downloaded before the job: `hf download <model>` on a login node, then `export HF_HUB_OFFLINE=1` in the job. Otherwise every rank asks the Hub for the same files at the same second: at 64 ranks expect rate limits, and on filesystems without working file locks (some Lustre and NFS mounts), concurrent downloads into one cache.
+- **CPU cores**: each rank starts `data.num_workers` loader processes. Request at least `GPUs per node × (1 + num_workers)` cores per node with `--cpus-per-task`. `srun` does not inherit `--cpus-per-task` from `sbatch` (Slurm 22.05 and later); the script exports `SRUN_CPUS_PER_TASK` so the workers are not confined to one core.
+- **Identical nodes**: the same number of GPUs on every node (`--nproc_per_node` is one number), and the same GPU model.
 
 ### What happens when you submit
 
@@ -85,26 +106,33 @@ sbatch --nodes=4 scripts/train_slurm.sh configs/qwen35_4b/a100_80gb_multigpu.yam
 <figcaption>Launch path of a multi-node job, two of the N nodes shown: one <code>srun</code> task per node runs <code>torchrun</code>, which starts one worker per GPU; every worker then joins one rendezvous.</figcaption>
 </figure>
 
-The critical detail: `srun` launches torchrun, not Python directly. Torchrun handles per-node process spawning and local GPU assignment. The `--rdzv_id=$SLURM_JOB_ID` flag ensures multiple concurrent jobs on the same cluster don't interfere with each other's rendezvous.
+The critical detail: `srun` launches torchrun, not Python directly. Torchrun handles per-node process spawning and gives every worker its `RANK`, `LOCAL_RANK` and `WORLD_SIZE`; each worker sees all of the node's GPUs and takes `cuda:<LOCAL_RANK>`. `srun python -m palingenesis.train` with several tasks does **not** work: without torchrun's variables every task trains a full copy on its own (the trainer warns). For the same reason, do not bind one GPU per worker around torchrun (`--gpus-per-task=1` with 8 tasks per node); to give each worker a single visible GPU use `torchrun --virtual-local-rank`.
+
+The `--rdzv_id=$SLURM_JOB_ID` flag and a rendezvous port derived from the job id keep concurrent jobs on the same nodes from interfering with each other's rendezvous.
 
 ### The SLURM script explained
 
-```bash title="scripts/train_slurm.sh" hl_lines="5 8 13"
+```bash title="scripts/train_slurm.sh (the essential lines)"
 #SBATCH --nodes=2              # How many machines
 #SBATCH --gpus-per-node=8      # All GPUs on each machine
 #SBATCH --ntasks-per-node=1    # One torchrun launcher per node
+#SBATCH --cpus-per-task=96     # The node's cores, shared by its workers and their data loaders
 #SBATCH --exclusive            # Don't share nodes (predictable performance)
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))      # a port per job
+export SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"   # srun does not inherit --cpus-per-task
 
-srun --kill-on-bad-exit=1 \            # Kill everything if any node crashes
+# --kill-on-bad-exit: stop every node when one node's torchrun fails
+# --rdzv_id: unique per job
+srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --kill-on-bad-exit=1 \
     torchrun \
-        --nnodes=$SLURM_NNODES \
-        --nproc_per_node=8 \
-        --rdzv_id=$SLURM_JOB_ID \      # Unique per job (no collision)
+        --nnodes="$SLURM_NNODES" \
+        --nproc_per_node="$SLURM_GPUS_ON_NODE" \
+        --rdzv_id="$SLURM_JOB_ID" \
         --rdzv_backend=c10d \
-        --rdzv_endpoint=$MASTER_ADDR:29500 \
-        -m palingenesis.train --config $CONFIG
+        --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
+        -m palingenesis.train --config "$CONFIG"
 ```
 
 ---
@@ -128,7 +156,9 @@ MASTER_ADDR=10.0.0.1 NODE_RANK=1 NNODES=4 \
 ```
 
 !!! warning "Order doesn't matter, timing does"
-    All nodes must start within ~5 minutes of each other (the rendezvous timeout). If node 3 starts 10 minutes after node 0, the rendezvous will have timed out and node 0 will have crashed.
+    Start all nodes within a few minutes of each other: the nodes that started first wait for the rest only until their rendezvous times out, then exit.
+
+Without a scheduler nothing stops the other nodes when one node's processes fail: stop the script on every node before restarting. `train.output_dir`, `data.pretokenize_path` and the data must be on a filesystem the nodes share, as under SLURM.
 
 ---
 
@@ -147,23 +177,26 @@ nc -zv $MASTER_ADDR 29500
 ```
 If this fails, check: firewall rules, `NCCL_SOCKET_IFNAME` (might need to specify the IB interface), DNS resolution of the master hostname.
 
+The trainer also opens a small CPU process group (gloo, over TCP) that the ranks use to end an epoch together. It needs every node to resolve the other nodes' hostnames to a reachable address; if startup stalls right after the model is loaded and before the first step, set `GLOO_SOCKET_IFNAME` to the interface the nodes reach each other on.
+
 ### Job hangs mid-training
 
 **Symptom**: training runs for N steps then freezes. All ranks stop logging.
 
-**Cause**: NCCL timeout during an all-reduce. One rank hit an unusually long computation (bad batch, GC stall, or the OS scheduled something on a CPU core) and the other ranks timed out waiting.
+**Cause**: a collective waits for a rank that will never join it. Usually a rank died (out of memory on the host or the GPU, a node failure) or lost its link, and the others keep waiting. A slow rank does not cause this: collectives have no deadline, the other ranks simply wait for it.
 
-**Fix**:
+**Fix**: look for the first error in the per-rank logs (`--tee=3` prefixes each line with the rank) and in `dmesg` / `sacct` for an out-of-memory kill. The launch scripts already make the survivors fail instead of waiting:
 ```bash
-export NCCL_IB_TIMEOUT=120        # Increase from default 20
-export NCCL_ASYNC_ERROR_HANDLING=1 # Fail fast instead of hanging forever
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1  # Abort on an NCCL error instead of hanging
+export NCCL_IB_TIMEOUT=22                 # InfiniBand ACK timeout exponent (4.096 us x 2^22 = 17 s per retry; valid 1-22)
 ```
+and `srun --kill-on-bad-exit=1` ends the job on every node when one node's torchrun exits with an error.
 
 ### Checkpoint save fails
 
-**Symptom**: `OSError: No such file or directory` during checkpoint save.
+**Symptom**: the save "works" but the checkpoint cannot be resumed (`Checkpoint ... is not visible on rank(s) ...` at the next start), or a rank fails with `OSError` during the save.
 
-**Cause**: `output_dir` is a local path, not on a shared filesystem. Rank 0 writes metadata, other ranks write DCP shards — all to the same directory. If the directory only exists on one machine, other machines fail.
+**Cause**: `output_dir` is a local path, not on a shared filesystem. Rank 0 writes metadata, every rank writes its own DCP shard and random state — all to the same directory. On node-local disks each node ends up with its own partial copy.
 
 **Fix**: use a shared filesystem path (NFS mount, Lustre, S3-backed FUSE, etc.):
 ```yaml
@@ -186,11 +219,13 @@ train:
 The launch scripts set these automatically:
 
 ```bash
-export CUDA_DEVICE_MAX_CONNECTIONS=1    # Required for compute/comm overlap
-export NCCL_ASYNC_ERROR_HANDLING=1      # Crash immediately on NCCL error (don't hang)
-export NCCL_IB_TIMEOUT=120              # 2 minutes before IB timeout (generous)
-export NCCL_DEBUG=WARN                  # Print NCCL warnings (INFO is very verbose)
+export CUDA_DEVICE_MAX_CONNECTIONS=1       # Required for compute/comm overlap
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1   # Abort on an NCCL error (don't hang); NCCL_ASYNC_ERROR_HANDLING is the deprecated name
+export NCCL_IB_TIMEOUT=22                  # InfiniBand ACK timeout exponent: 4.096 us x 2^22 = 17 s per retry (valid 1-22)
+export NCCL_DEBUG=WARN                     # Print NCCL warnings (INFO is very verbose)
 ```
+
+`NCCL_IB_TIMEOUT` is an exponent, not seconds: values above 22 are invalid and can make the InfiniBand connection setup fail.
 
 For InfiniBand clusters, you may additionally need:
 
@@ -207,15 +242,22 @@ export NCCL_NET_GDR_LEVEL=5             # Enable GPU Direct RDMA (if supported)
 Intermediate checkpoints use **sharded DCP** (Distributed Checkpoint). Each rank saves only its own shard to disk. Zero gathering, zero extra memory, works at any model size.
 
 ```
-output/step-500/dcp/
-├── __0_0.distcp    # Rank 0's shard
-├── __1_0.distcp    # Rank 1's shard
-├── ...
-├── __15_0.distcp   # Rank 15's shard (2 nodes × 8 GPUs)
-└── .metadata       # DCP index (written by rank 0)
+output/step-500/
+├── dcp/
+│   ├── __0_0.distcp             # Rank 0's shard
+│   ├── __1_0.distcp             # Rank 1's shard
+│   ├── ...
+│   ├── __15_0.distcp            # Rank 15's shard (2 nodes × 8 GPUs)
+│   └── .metadata                # DCP index (written by rank 0)
+├── rng_state.safetensors        # Rank 0's random state
+├── rng_state.rank1.safetensors  # ... and every other rank's own
+├── tokenizer/
+└── training_meta.json           # Written last: marks the checkpoint complete
 ```
 
-On resume, each rank loads only its own shard. No central bottleneck. Scales to any number of nodes.
+On resume, each rank loads only what it needs. No central bottleneck. Scales to any number of nodes.
+
+A sharded checkpoint resumes on another number of ranks (2 or more): DCP re-shards the model and optimizer state, and the position in the epoch is rescaled. The ranks then read other shards of the data than before, and the effective batch size (`per_device_batch_size × data-parallel ranks × gradient_accumulation_steps`) changes with the rank count unless you adjust `gradient_accumulation_steps`. A sharded checkpoint does not resume in a single process, nor a single-process checkpoint on several ranks: the trainer refuses both.
 
 The **final export** (`output/final/`) gathers the full model to rank 0 in CPU RAM and saves as standard HuggingFace safetensors. This requires 2× model size in CPU RAM on node 0 (e.g., 140 GB for a 35B model in bf16). Plan node 0's memory accordingly.
 
@@ -223,9 +265,21 @@ The **final export** (`output/final/`) gathers the full model to rank 0 in CPU R
 
 ## Fault tolerance
 
-- **Auto-resume**: `train.resume_from: auto` in your config. If a node dies, resubmit the same `sbatch` — palingenesis finds the last valid checkpoint and continues from there.
-- **Checkpoint validity**: only directories with a `.metadata` file (meaning the DCP save completed successfully) are considered valid. Half-written checkpoints from node failures are automatically ignored.
+- **Auto-resume**: `train.resume_from: auto` in your config (or `--train.resume_from auto` after the config on the `sbatch` line). If a node dies, resubmit the same `sbatch` — rank 0 finds the last complete checkpoint and every rank continues from it. With `#SBATCH --requeue`, Slurm resubmits a preempted job by itself.
+- **Checkpoint validity**: only directories with a `training_meta.json` (written last, after every rank's shard) are considered complete. Half-written checkpoints from node failures are automatically ignored.
+- **Preemption and time limits**: `pgs train` does not save on `SIGTERM`. What a preempted run loses is the work since the last `train.save_steps` checkpoint: choose `save_steps` so that this is minutes, not hours. (The RL trainer does save on `SIGUSR1` / `SIGTERM`: see `examples/rl/slurm.sbatch`.)
 - **Auto-purge**: keeps the last 5 checkpoints and deletes older ones. Even on multi-day runs, disk usage stays bounded.
+
+---
+
+## What changes at 64+ ranks
+
+- **Epoch length.** Every rank reads its own shard of the data, and the epoch ends for all of them when the first rank runs out (ranks must step together). With map-style data the shards are equal and the loss is a few batches. With a streaming dataset whose files differ a lot in size, a rank can hold much less than the others: the log line `Epoch N ended after M micro-batch(es) per rank (the LR schedule planned ~K)` shows it. Set `train.max_steps`, or re-shard the dataset into equal files.
+- **Streaming with fewer shards than ranks.** A stream whose number of shards (files) is not a multiple of the number of data-parallel ranks is split by row: every rank reads the whole stream and keeps one row in `ranks`. Use a multiple of the rank count as the number of files, or `data.pretokenize: true`.
+- **Small data.** Rows are split over `ranks × num_workers` loader shards, and each one drops its last partial batch: a dataset with fewer than `ranks × num_workers × per_device_batch_size` rows can produce no batch at all.
+- **Evaluation.** Every rank evaluates the same fixed eval set (FSDP needs all ranks for a forward), so its cost does not shrink with more ranks; rank 0's result is the one logged and the one that decides the best checkpoint. Each new best gathers the full model to rank 0: on large models keep `data.eval_every` coarse.
+- **Startup.** Every rank loads the model from the shared filesystem and builds its data pipeline at the same time. Expect minutes on a cold cache.
+- **Context parallel.** `cp_degree: 0` picks groups of 8 when 8 divides the number of ranks, and otherwise one group over all ranks, which then spans nodes. With GPUs per node other than 8, set `cp_degree` to a divisor of the GPUs per node.
 
 ---
 

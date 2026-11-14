@@ -128,9 +128,11 @@ Each node:
 ### Fault Tolerance
 
 Current: none (if one rank dies, all ranks abort). For production:
-- Use SLURM with `--requeue` for automatic restart
-- Checkpoints every N steps enable resume from last checkpoint
-- Elastic training (torchrun elastic) can handle node additions/removals
+- Use SLURM with `--requeue` for automatic restart, and `train.resume_from: auto`
+- Checkpoints every `train.save_steps` steps enable resume from the last complete one; `pgs train`
+  does not save on SIGTERM (the RL trainer does)
+- torchrun's elastic restarts (`--max_restarts`) are not supported: a restarted worker group would
+  start over without `resume_from: auto`
 
 ## Gradient Accumulation with FSDP
 
@@ -156,21 +158,32 @@ With: just `1 * reduce_scatter_per_step` collectives. Saves (N-1)/N of backward 
 
 ### Saving
 
-Uses PyTorch Distributed Checkpoint (DCP):
+Resume checkpoints (`step-N/`) use PyTorch Distributed Checkpoint (DCP), sharded:
 ```python
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+from torch.distributed.checkpoint import save as dcp_save
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, get_optimizer_state_dict
 
-options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-state = get_model_state_dict(model, options=options)
+options = StateDictOptions(full_state_dict=False)  # each rank writes its own shard: nothing is gathered
+dcp_save({"model": get_model_state_dict(model, options=options),
+          "optimizer": get_optimizer_state_dict(model, optimizer, options=options)}, checkpoint_id=path / "dcp")
 ```
 
-`full_state_dict=True`: gathers all shards to rank 0
-`cpu_offload=True`: moves gathered state to CPU (avoids GPU OOM during save)
+Every rank also writes its own random state (`rng_state.safetensors` for rank 0,
+`rng_state.rank<r>.safetensors` for the others). After a barrier, rank 0 writes the tokenizer and
+`training_meta.json`, which marks the checkpoint complete. `train.output_dir` must be on a
+filesystem shared by every node.
+
+The best and final models are gathered to rank 0's CPU memory
+(`StateDictOptions(full_state_dict=True, cpu_offload=True)`) and saved in Hugging Face format.
+Rank 0's evaluation loss decides, for every rank, whether a new best is saved.
 
 ### Loading
 
-For resuming training: load distributed checkpoint (each rank loads its shard)
-For inference: load the full state dict saved by rank 0 into any model
+For resuming training: rank 0 picks the checkpoint (`resume_from: auto`: the latest complete one), every
+rank checks that it sees it, and DCP loads each rank's shard. Another number of ranks (2 or more) is
+fine: DCP re-shards, and the position in the epoch is rescaled. A sharded checkpoint does not load in a
+single process, nor a single-process checkpoint on several ranks (both are refused).
+For inference: load `final/` (or `best/model/`) with `from_pretrained`.
 
 ### Final Model Save
 

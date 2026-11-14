@@ -56,7 +56,7 @@
 | `msft_recovery_factor` | float | `1.15` | Weight multiplier when a source improves. |
 | `msft_floor_ratio` | float | `0.1` | Minimum weight (fraction of original). Never fully excludes a source. |
 | `pretokenize` | bool | `false` | Materialize the fully-assembled stream (tokenize → mask → mix → pack) to disk once, then load the tensors directly on later runs — skips all per-step tokenization **and** gives the exact step count from the cache's row count. A fingerprint over tokenizer/template/`max_seq_length`/sources/masking auto-rebuilds a stale cache. Incompatible with `msft_tracking` (it changes the stream during training → hard error). |
-| `pretokenize_path` | str | `./pretokenized` | Directory for the pre-tokenized cache (`train.parquet` + `pretokenized_meta.json`). |
+| `pretokenize_path` | str | `./pretokenized` | Directory for the pre-tokenized cache (`train.parquet` + `pretokenized_meta.json`). Must be on a shared filesystem for multi-node: rank 0 builds it, every rank reads it. |
 
 !!! note "Reasoning / thinking modes"
     `train_on_reasoning` is the **only** training-time control for `<think>` content:

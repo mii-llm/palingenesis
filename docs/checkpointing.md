@@ -32,8 +32,13 @@ checkpoints/step-500/
 - Optimizer loaded shard-by-shard
 
 ### FSDP2 (Multi-GPU)
-- Uses PyTorch Distributed Checkpoint (DCP)
-- Each rank saves/loads its own shard
+- Uses PyTorch Distributed Checkpoint (DCP): `step-N/dcp/` holds the model and optimizer shards
+- Each rank saves/loads its own shard and its own random state (`rng_state.rank<r>.safetensors`)
+- `training_meta.json` is written last by rank 0 and marks the checkpoint complete
+- `train.output_dir` must be on a filesystem shared by every node: at startup rank 0 picks the
+  checkpoint and the run stops if a rank cannot see it
+- Resumes on another number of ranks (2 or more: DCP re-shards, the position in the epoch is
+  rescaled); not in a single process, and a single-process checkpoint not on several ranks
 - `full_state_dict=True` + `cpu_offload=True` for final model save
 
 ## Resume
