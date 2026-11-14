@@ -115,7 +115,7 @@ added to the task loss as one scalar, for every family and every path below.
 | Packing, right padding | padding tokens are left out of the loads, the losses and the statistics (tested) |
 | FSDP, several ranks | one all-reduce of the counts per micro-batch; gradients equal one process on the whole batch (tested on 2 and 3 CPU ranks) |
 | Context parallel | each rank counts its slice of the rows (not tested on GPUs) |
-| `model.compile` | the hooks stay Python (a graph break per MoE layer) |
+| `model.compile` | the hooks and the `grouped` / `padded` experts stay Python (graph breaks); gradients tested equal on CPU with the eager and `grouped` experts. transformers' `grouped_mm` compiles only with bf16 weights |
 | RL prompt-sharing trees | the load is the shared prompt's; the losses are averaged over the group's tokens |
 
 Cost: per MoE layer and micro-batch, a softmax over [tokens, experts] for the statistics and one more for the
@@ -176,6 +176,12 @@ Limits:
 - With replay on, prompt-sharing trees (`train.prompt_sharing`) are off: the record is per rollout.
 - A position without a record (an engine that returned none, a turn generated before a restart) is routed by the
   trainer itself.
+- The record costs host memory: positions x MoE layers x top_k bytes per trajectory (one byte per choice up to
+  256 experts), and every turn's request returns the routing of its whole context. For a 48-layer top-8 model that
+  is 384 bytes per token.
+- With `routing_replay: auto` a colocated vLLM that refuses the option is restarted without it (a warning is
+  logged, and no `moe/route_mismatch` appears); `on` makes that an error. A separately launched server
+  (`rollout.url`) must be started with `--enable-return-routed-experts` itself.
 - vLLM refuses `enable_return_routed_experts` with pipeline parallelism and KV connectors.
 - GSPO's sequence-level ratio ([arXiv:2507.18071](https://arxiv.org/abs/2507.18071)) was designed to make MoE RL
   stable without replay; `loss.type: gspo` and replay can be combined.

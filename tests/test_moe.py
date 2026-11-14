@@ -948,8 +948,10 @@ def test_compiled_layers_keep_the_router_gradient():
 # ── the RL trainer ──────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("replay", ["auto", "off"])
-def test_rl_trainer_balances_and_replays_a_moe_policy(tmp_path, replay):
+@pytest.mark.parametrize(
+    "replay,fsdp", [("auto", False), ("off", False), ("auto", True)], ids=["replay", "off", "fsdp2"]
+)
+def test_rl_trainer_balances_and_replays_a_moe_policy(tmp_path, replay, fsdp):
     """An RL run on a MoE policy (hf rollouts): the trajectories carry the engine's routing, the
     trainer replays it and logs the mismatch and the expert loads; with replay off it only balances."""
     import json
@@ -994,6 +996,8 @@ def test_rl_trainer_balances_and_replays_a_moe_policy(tmp_path, replay):
         "train.learning_rate": 1e-3,
         "train.warmup_steps": 1,
         "train.save_steps": 0,
+        "train.fsdp": fsdp,
+        "model.gradient_checkpointing": "full" if fsdp else "none",
         "moe.z_loss_coef": 1e-3,
     }.items():
         config.set(key, value)
@@ -1004,8 +1008,12 @@ def test_rl_trainer_balances_and_replays_a_moe_policy(tmp_path, replay):
     trainer._log = lambda kind, metrics, step: logged.append((kind, dict(metrics)))
     step = trainer._train_step
     trainer._train_step = lambda groups: (seen.extend(t for g in groups for t in g), step(groups))[1]
+
+    def local(p):  # FSDP2 parameters are DTensors; on one rank the local shard is the whole tensor
+        return p.detach().to_local() if hasattr(p, "to_local") else p.detach()
+
     router = find_moe_layers(trainer.model)[0].router.weight
-    before = router.detach().clone()
+    before = local(router).clone()
     trainer.train()
 
     steps = [m for kind, m in logged if kind == "step"]
@@ -1014,7 +1022,7 @@ def test_rl_trainer_balances_and_replays_a_moe_policy(tmp_path, replay):
         assert 1.0 <= metrics["moe/load_max"] <= 4.0 and 0.0 < metrics["moe/router_entropy"] <= 1.0
         assert metrics["moe/balance_loss"] >= 2.0 - 1e-6 and metrics["moe/z_loss"] > 0
         assert ("moe/route_mismatch" in metrics) == (replay == "auto")
-    assert not torch.equal(router.detach(), before)
+    assert not torch.equal(local(router), before)
     if replay == "auto":
         for t in seen:  # every forwarded position has its record
             assert t.routing.shape == (len(t.prompt_ids) + len(t.tokens) - 1, 2, 2)

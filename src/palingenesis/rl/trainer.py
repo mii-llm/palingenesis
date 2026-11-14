@@ -294,25 +294,37 @@ class RLTrainer:
             self.engine.record_routing = self.routing_replay
         elif r.backend == "vllm":
             extra = {k: v for k, v in (("kv_cache_dtype", r.kv_cache_dtype), ("quantization", r.quantization)) if v}
-            if self.routing_replay:
-                extra["enable_return_routed_experts"] = True
             extra.update(r.vllm_args)
             extra.update(precision)
-            self.engine = VLLMColocateRollout(
-                m.policy,
-                self.stop_ids,
-                r.gpu_memory_utilization,
-                r.max_model_len,
-                r.enforce_eager,
-                t.seed + rank,
-                sleep_mode=r.sleep and r.max_staleness == 0,
-                prefix_caching=r.prefix_caching,
-                max_num_seqs=max(256, max_num_seqs(config) // world),
-                # under torchrun (any world size) vLLM must join the launcher's rendezvous: its own
-                # tcp:// init would wait on the agent store torchrun tells every process to use
-                external_launcher=world > 1 or "TORCHELASTIC_RUN_ID" in os.environ,
-                engine_kwargs=extra,
-            )
+
+            def colocated(engine_kwargs):
+                return VLLMColocateRollout(
+                    m.policy,
+                    self.stop_ids,
+                    r.gpu_memory_utilization,
+                    r.max_model_len,
+                    r.enforce_eager,
+                    t.seed + rank,
+                    sleep_mode=r.sleep and r.max_staleness == 0,
+                    prefix_caching=r.prefix_caching,
+                    max_num_seqs=max(256, max_num_seqs(config) // world),
+                    # under torchrun (any world size) vLLM must join the launcher's rendezvous: its own
+                    # tcp:// init would wait on the agent store torchrun tells every process to use
+                    external_launcher=world > 1 or "TORCHELASTIC_RUN_ID" in os.environ,
+                    engine_kwargs=engine_kwargs,
+                )
+
+            if self.routing_replay and r.routing_replay == "auto":
+                try:  # a vLLM without the option, or a setup it refuses it for: train without replay
+                    self.engine = colocated({**extra, "enable_return_routed_experts": True})
+                except (TypeError, ValueError, NotImplementedError) as e:
+                    logger.warning("vLLM cannot return the routed experts (%s): no routing replay", e)
+                    self.routing_replay = False
+                    self.engine = colocated(extra)
+            else:
+                self.engine = colocated(
+                    {**extra, "enable_return_routed_experts": True} if self.routing_replay else extra
+                )
         else:
             self.engine = VLLMServerRollout(self.server, self.stop_ids)
         self.weights = PublishedWeights(self.model)
