@@ -157,7 +157,8 @@ pgs internals score --probe P --data rows.jsonl --out scored.jsonl [--column kno
 ```
 
 Model options: `--dtype`, `--device`, `--chat-template-kwargs '{"enable_thinking": false}'`, `--batch-size`,
-`--max-tokens`, `--limit`. Most commands take `--json`.
+`--max-tokens` (longer rows are dropped), `--limit` (the last three on every command that reads a data file). Most
+commands take `--json`.
 
 ### autopilot
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 
 import torch
@@ -37,6 +38,25 @@ def _floats(text: str) -> list[float]:
 
 def _ints(text: str) -> list[int]:
     return [int(x) for x in text.split(",") if x.strip()]
+
+
+_LIST_FLAGS = ("--alphas", "--alpha", "--offsets", "--layers")
+
+
+def _join_negative_lists(argv: list[str]) -> list[str]:
+    """`--alphas -2,-1,0,1,2` as `--alphas=-2,-1,0,1,2`: argparse reads a value that starts with "-" and is not a
+    plain number as an unknown option."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        value = argv[i + 1] if i + 1 < len(argv) else ""
+        if argv[i] in _LIST_FLAGS and re.fullmatch(r"-[0-9.][0-9eE.,+\-]*", value):
+            out.append(f"{argv[i]}={value}")
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
 
 
 def _fmt(v, width: int = 6) -> str:
@@ -60,15 +80,20 @@ def print_sweep(report: dict) -> None:
         f"best layer (validation): {report['best_layer']}   length-only AUROC: "
         + ", ".join(f"{k} {_fmt(v).strip()}" for k, v in length.items())
     )
+    excluded = {k: v for k, v in report.get("excluded_seen_groups", {}).items() if v}
+    if excluded:
+        print(
+            "left out of the test sets (rows of a group in the probe's train / validation split): "
+            + ", ".join(f"{k} {v}" for k, v in excluded.items())
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="pgs internals", description="read a model's internals (palingenesis.internals)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    def model_opts(p, model=True):
-        if model:
-            p.add_argument("--model", required=True)
+    def model_opts(p, data=True):
+        p.add_argument("--model", required=True)
         p.add_argument(
             "--dtype",
             choices=("bfloat16", "float16", "float32"),
@@ -77,9 +102,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument("--device", default=None)
         p.add_argument("--chat-template-kwargs", default=None, help="JSON, e.g. '{\"enable_thinking\": false}'")
-        p.add_argument("--batch-size", type=int, default=16)
-        p.add_argument("--max-tokens", type=int, default=None, help="drop rows longer than this")
-        p.add_argument("--limit", type=int, default=None, help="use the first N rows")
+        if data:
+            p.add_argument("--batch-size", type=int, default=16)
+            p.add_argument("--max-tokens", type=int, default=None, help="drop rows longer than this")
+            p.add_argument("--limit", type=int, default=None, help="use the first N rows")
 
     p = sub.add_parser("run", help="capture + probe sweeps + comparisons from a YAML config")
     p.add_argument("--config", required=True)
@@ -153,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("steer", help="generate with the probe's diff-of-means direction added at its layer")
-    model_opts(p)
+    model_opts(p, data=False)
     p.add_argument("--probe", required=True)
     p.add_argument("--prompt", required=True)
     p.add_argument("--alpha", default="0,1", help="multiples of |mu+ - mu-| (0 = baseline)")
@@ -170,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--device", default=None)
     p.add_argument("--batch-size", type=int, default=16)
 
-    a = ap.parse_args(argv if argv is not None else sys.argv[1:])
+    a = ap.parse_args(_join_negative_lists(list(argv if argv is not None else sys.argv[1:])))
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
@@ -213,8 +239,11 @@ def _dispatch(a) -> int:
                 raise ValueError(f"--test {item!r}: expected NAME=STORE")
             tests[name] = ActivationStore(path)
         layers = None
-        if a.layers:
-            layers = parse_layers(a.layers, max(store.layers) + 1)
+        if a.layers:  # residual indices of the model (-1 = its last layer), then those the store holds
+            depth = store.meta.get("model", {}).get("num_layers")
+            layers = parse_layers(a.layers, depth + 1 if depth else max(store.layers) + 1)
+            if not set(layers) & set(store.layers):
+                raise ValueError(f"--layers {a.layers}: {a.acts} holds residuals {store.layers}")
         report = sweep(
             store,
             layers=layers,
@@ -341,6 +370,7 @@ def _dispatch(a) -> int:
             n_random=a.n_random,
             chat_template_kwargs=kwargs or None,
             batch_size=a.batch_size,
+            max_tokens=a.max_tokens,
             seed=a.seed,
         )
         if a.json:
@@ -350,7 +380,8 @@ def _dispatch(a) -> int:
             for al, m in zip(res["alphas"], res["margins"]):
                 print(f"  alpha {al:+.2f}: margin {m:.3f}")
             rs = torch.tensor(res["random_slopes"])
-            print(f"slope {res['slope']:.3f} vs random {float(rs.mean()):.3f} ± {float(rs.std()):.3f} (z {res['z']})")
+            z = "n/a" if res["z"] is None else f"{res['z']:.1f}"
+            print(f"slope {res['slope']:.3f} vs random {float(rs.mean()):.3f} ± {float(rs.std()):.3f} (z {z})")
             if "ablation" in res:
                 ra = torch.tensor(res["ablation"]["random_deltas"])
                 print(
@@ -373,6 +404,7 @@ def _dispatch(a) -> int:
             mode=a.mode,
             chat_template_kwargs=kwargs,
             batch_size=a.batch_size,
+            max_tokens=a.max_tokens,
         )
         if a.json:
             print(json.dumps(res, indent=2))

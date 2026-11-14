@@ -11,11 +11,16 @@ residual is raw (see palingenesis.internals.sites), so the last one is normalise
 asserts that head(norm(h_n)) reproduces the model's own logits before any lens number is reported (a wrong norm, a
 missing transform or the wrong submodule would otherwise give plausible-looking garbage).
 
+A lens reads the position that PREDICTS a token. For a span position (`assistant_*`, `answer_*`, `reasoning_*`) that
+is the position before each span token: its next-token distribution is the one training puts loss on, so `ce` at
+r = n is the training loss on those tokens, and `assistant_first` is where the reply's first trained token is decided
+(on a prompt without a reply, `last_prompt`). Captures and probes read the residual AT the span tokens instead.
+
 Per layer, averaged over the selected positions (`lens_report`):
 
     kl          KL(final || lens) in nats: how far the layer's prediction is from the model's
     top1        share of positions where the lens's top token is the final top token
-    ce          cross-entropy of the actual next token (teacher forcing; positions inside the text only)
+    ce          cross-entropy of the actual next token (teacher forcing; none at `last_prompt`, which ends the text)
     margin      the exact log-odds of a decision token set (palingenesis.margins.log_odds), e.g. "<tool_call>" at the
                 decision position, or Italian vs English first tokens: at which depth the decision forms, and whether
                 a training stage moved it there or only at the end
@@ -36,7 +41,7 @@ import torch.nn as nn
 
 from palingenesis.internals.capture import _batches, model_fingerprint, run_backbone
 from palingenesis.internals.hooks import Recorder
-from palingenesis.internals.positions import Encoder, collate
+from palingenesis.internals.positions import Encoded, Encoder, collate
 from palingenesis.internals.sites import Sites, find_sites, parse_layers, text_config
 
 
@@ -108,6 +113,21 @@ class TunedLens(nn.Module):
         return lens
 
 
+def _predicting(encoder: Encoder, rows: Sequence[dict]) -> list[tuple[int, Encoded]]:
+    """(row index, Encoded) of every row that has the position, with the picks moved to the positions that predict
+    them (see the module docstring): one token earlier for a span, unchanged for last_prompt."""
+    shift = 0 if encoder.position == "last_prompt" else 1
+    items = []
+    for i, row in enumerate(rows):
+        enc = encoder.encode(row)
+        if enc is None:
+            continue
+        picks = [p - shift for p in enc.picks if p >= shift]
+        if picks:
+            items.append((i, Encoded(enc.ids, picks, enc.pool)))
+    return items
+
+
 def _kl(final_logp: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
     """KL(final || lens) per row."""
     logq = torch.log_softmax(logits, -1)
@@ -135,7 +155,7 @@ def lens_report(
     n = sites.n_layers
     rs = sorted(set(parse_layers(layers, sites.n_residuals)) | {n})
     encoder = Encoder(tok, position, chat_template_kwargs, max_tokens)
-    items = [(i, e) for i, row in enumerate(rows) if (e := encoder.encode(row)) is not None]
+    items = _predicting(encoder, rows)
     if not items:
         raise ValueError(f"internals lens: no row has anything at position {position!r} ({encoder.dropped})")
     if any(e.pool == "mean" for _, e in items):
@@ -214,8 +234,8 @@ def fit_tuned_lens(
     max_tokens: int | None = None,
     seed: int = 0,
 ) -> TunedLens:
-    """Train a tuned lens on the residuals of `rows` at `position` (default: every assistant token, the
-    post-training distribution). AdamW (the Adam setting of Belrose et al.'s code: lr 1e-3; weight decay 1e-3, toward the identity since the
+    """Train a tuned lens on the residuals of `rows` that predict the tokens of `position` (default: every assistant
+    token, the post-training distribution). AdamW (the Adam setting of Belrose et al.'s code: lr 1e-3; weight decay 1e-3, toward the identity since the
     translator is residual), gradient clipping at 1,
     one backward per layer so only one layer's [rows, vocab] logits are alive; the model stays frozen (no_grad
     capture; norm and head parameters are not given gradients). `max_rows_per_step` positions are sampled per step."""
@@ -225,7 +245,7 @@ def fit_tuned_lens(
     lens = TunedLens(n, int(text_config(model).hidden_size)).to(device)
     lens.meta = {"model": model_fingerprint(model, tok), "position": position, "steps": steps, "lr": lr}
     encoder = Encoder(tok, position, chat_template_kwargs, max_tokens)
-    items = [(i, e) for i, row in enumerate(rows) if (e := encoder.encode(row)) is not None]
+    items = _predicting(encoder, rows)
     if not items:
         raise ValueError(f"tuned lens: no row has anything at position {position!r} ({encoder.dropped})")
     opt = torch.optim.AdamW(lens.parameters(), lr=lr, weight_decay=weight_decay)  # decay toward the identity

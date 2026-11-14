@@ -120,19 +120,20 @@ class ProbeScorer:
                 "ProbeScorer: a *_all probe scores tokens, not rows; fit it at *_mean / *_last / last_prompt"
             )
         out = torch.full((len(rows),), float("nan"))
-        items = [(i, e) for i, row in enumerate(rows) if (e := self.encoder.encode(row)) is not None]
-        if not items:
-            return out
         device = next(self.model.parameters()).device
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else (self.tok.eos_token_id or 0)
-        with self._lock, Recorder(self.model, [self.probe.layer], stop=True, sites=self.sites) as rec:
-            for batch_items in _batches(items, self.batch_size, self.max_batch_tokens):
-                batch = collate([e for _, e in batch_items], pad)
-                rec.select = batch.select
-                run_backbone(self.model, batch.input_ids.to(device), batch.attention_mask.to(device))
-                z = self.probe.logit(rec.take()[self.probe.layer]).cpu()
-                for (b, _), v in zip(batch.owners, z):
-                    out[batch_items[b][0]] = v
+        with self._lock:  # the encoder keeps per-row state (its datasets, the drop counts): render under the lock too
+            items = [(i, e) for i, row in enumerate(rows) if (e := self.encoder.encode(row)) is not None]
+            if not items:
+                return out
+            with Recorder(self.model, [self.probe.layer], stop=True, sites=self.sites) as rec:
+                for batch_items in _batches(items, self.batch_size, self.max_batch_tokens):
+                    batch = collate([e for _, e in batch_items], pad)
+                    rec.select = batch.select
+                    run_backbone(self.model, batch.input_ids.to(device), batch.attention_mask.to(device))
+                    z = self.probe.logit(rec.take()[self.probe.layer]).cpu()
+                    for (b, _), v in zip(batch.owners, z):
+                        out[batch_items[b][0]] = v
         return out
 
     def probabilities(self, rows: Sequence[dict]) -> torch.Tensor:
@@ -197,8 +198,9 @@ def probe_reward(
 
     A last_prompt probe scores the prompt (the policy cannot move it: use it to condition another reward, e.g. pay for
     abstaining only where the probe says the model does not know); any other position scores the whole conversation
-    including the rollout. `invert` returns 1 - p. Read the warnings in this module's docstring before rewarding a
-    rollout with a probe.
+    including the rollout. A `tools` column of the dataset is rendered into the prompt, as the probe's own rows were.
+    The rollouts of one prompt are scored once. `invert` returns 1 - p. Read the warnings in this module's docstring
+    before rewarding a rollout with a probe.
 
         rewards:
           known: {fn: palingenesis.internals.score:probe_reward, weight: 0.0,
@@ -208,12 +210,22 @@ def probe_reward(
     if scorer.probe.position == "last_prompt":
         if prompts is None:
             raise ValueError("probe_reward: a last_prompt probe needs the prompts")
-        rows = [{"messages": list(p)} for p in prompts]
+        conversations = prompts
     else:
         if messages is None:
             raise ValueError("probe_reward: a span probe needs the conversations (messages)")
-        rows = [{"messages": list(m)} for m in messages]
-    p = scorer.probabilities(rows)
+        conversations = messages
+    tools = columns.get("tools")
+    distinct: dict[str, dict] = {}
+    keys = []
+    for i, conversation in enumerate(conversations):
+        row = {"messages": list(conversation)}
+        if tools is not None and tools[i]:
+            row["tools"] = tools[i]
+        keys.append(json.dumps(row, sort_keys=True, default=str))
+        distinct.setdefault(keys[-1], row)
+    index = {key: j for j, key in enumerate(distinct)}
+    p = scorer.probabilities(list(distinct.values()))[[index[key] for key in keys]]
     if invert:
         p = 1 - p
     return [None if v != v else float(v) for v in p.tolist()]

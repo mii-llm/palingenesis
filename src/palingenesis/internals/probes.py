@@ -345,7 +345,8 @@ def sweep(
 ) -> dict:
     """Probe every residual of `store` (an ActivationStore): fit on its grouped train split, select the layer on
     validation AUROC, report test AUROC [CI] on the held-out groups and on every extra store in `tests` (other
-    datasets, other languages: transfer), the diff-of-means AUROC next to the chosen kind, the control task, the length
+    datasets, other languages: transfer; rows whose `group` is in the train or validation split are left out and
+    counted in `excluded_seen_groups`), the diff-of-means AUROC next to the chosen kind, the control task, the length
     baseline. With save_dir, writes layer_<r>.safetensors for every layer and best.safetensors (the validation pick).
     """
     tests = tests or {}
@@ -358,8 +359,22 @@ def sweep(
             raise ValueError(f"test set {name}: position {t.position} differs from the train store's {store.position}")
         if t.meta["model"].get("weights_sha") != store.meta["model"].get("weights_sha"):
             raise ValueError(f"test set {name} was captured from another model than the train store")
+        missing = int(torch.isnan(t.labels()).sum())
+        if missing:  # NaN >= threshold is False: such rows would silently count as negatives
+            raise ValueError(f"test set {name} ({t.path}): {missing} rows have no label")
     groups = store.groups()
     split = grouped_split(groups, val, test, seed)
+    # A test set may hold other rows of the train store's groups (the translations of its questions, the store
+    # itself): those of a group the probe was fitted, selected or calibrated on are left out of its evaluation.
+    shared = store.shared_groups()
+    fitted = {shared[i] for i in torch.cat([split["train"], split["val"]]).tolist()} - {None}
+    held: dict[str, tuple] = {}
+    for name, t in tests.items():
+        keep = torch.tensor([i for i, g in enumerate(t.shared_groups()) if g not in fitted], dtype=torch.long)
+        if len(keep) == 0:
+            raise ValueError(f"test set {name}: every row is in a group of the probe's train or validation split")
+        t_groups = t.groups()
+        held[name] = (keep, t.labels()[keep], [t_groups[i] for i in keep.tolist()], len(t) - len(keep))
     yb = (y_all >= label_threshold).float()
     ctrl = control_labels(yb, groups, seed) if control else None  # one random label per group, the train base rate
     test_groups = [groups[i] for i in split["test"].tolist()]
@@ -385,9 +400,10 @@ def sweep(
         "length_auroc": {"test": stats.auroc(store.n_tokens()[split["test"]], yb[split["test"]])},
         "layers": {},
     }
+    report["excluded_seen_groups"] = {name: h[3] for name, h in held.items()}
     for name, t in tests.items():
-        ty = (t.labels() >= label_threshold).float()
-        report["length_auroc"][name] = stats.auroc(t.n_tokens(), ty)
+        keep, ty = held[name][:2]
+        report["length_auroc"][name] = stats.auroc(t.n_tokens()[keep], (ty >= label_threshold).float())
     probes = {}
     for r in layers:
         x = store.layer(r)
@@ -419,7 +435,8 @@ def sweep(
                 entry["control_test_auroc"] = float("nan")
             entry["selectivity"] = entry["test"]["auroc"] - entry["control_test_auroc"]
         for name, t in tests.items():
-            entry[name] = evaluate(probe, t.layer(r), t.labels(), t.groups(), resamples=resamples, seed=seed)
+            keep, ty, t_groups, _ = held[name]
+            entry[name] = evaluate(probe, t.layer(r)[keep], ty, t_groups, resamples=resamples, seed=seed)
         probe.meta["metrics"] = _rounded({k: v for k, v in entry.items() if k not in ("mixer",)})
         report["layers"][r] = _rounded(entry)
         probes[r] = probe

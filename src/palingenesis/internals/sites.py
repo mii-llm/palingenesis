@@ -30,7 +30,7 @@ import torch.nn as nn
 from palingenesis.logits import output_head
 
 _LIST_NAMES = ("layers", "h", "blocks", "block")
-_NORM_NAMES = ("norm", "final_layernorm", "ln_f", "final_layer_norm", "final_norm")
+_NORM_NAMES = ("norm", "final_layernorm", "ln_f", "final_layer_norm", "final_norm", "norm_f", "embedding_norm")
 _SKIP = re.compile(r"(^|\.)(visual|vision_tower|vision_model|audio_tower|mtp)(\.|$)")
 
 
