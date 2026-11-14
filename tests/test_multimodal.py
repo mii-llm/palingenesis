@@ -467,6 +467,20 @@ def test_sft_trains_and_exports_the_multimodal_layout(tmp_path, train_tower, tra
     )
 
 
+def test_sft_resumes_from_a_checkpoint(tmp_path):
+    config = _mm_config(tmp_path, steps=2)
+    config.multimodal.train_projector = True
+    config.train.save_steps = 2
+    assert run_cpu(config).global_step == 2
+    config.train.max_steps = 3  # the 12 rows hold three optimizer steps
+    config.train.resume_from = "auto"
+    result = run_cpu(config)
+    assert result.global_step == 3
+    before, after = _state(tmp_path / "model"), _state(Path(result.output_dir) / "final")
+    assert set(before) == set(after)
+    assert any(not torch.equal(before[k], after[k]) for k in before if ".visual.merger." in k)
+
+
 def test_sft_with_packing(tmp_path):
     config = _mm_config(tmp_path)
     config.data.packing = True

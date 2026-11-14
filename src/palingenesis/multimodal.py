@@ -362,10 +362,10 @@ class VisionProcessor:
             t, h, w = grids[image]
             h, w = h // self.merge_size, w // self.merge_size
             count = t * h * w
-            if not all(is_image[i : i + count]) or (i + count < n and is_image[i + count] and t * h * w == 0):
-                raise MultimodalError("image placeholder run shorter than its image's token count")
             if t != 1:
                 raise MultimodalError("video grids (t > 1) are not supported")
+            if count == 0 or i + count > n or not all(is_image[i : i + count]):
+                raise MultimodalError("image placeholder run shorter than its image's token count")
             positions[i : i + count, 0] = current
             positions[i : i + count, 1] = torch.arange(h).repeat_interleave(w) + current
             positions[i : i + count, 2] = torch.arange(w).repeat(h) + current

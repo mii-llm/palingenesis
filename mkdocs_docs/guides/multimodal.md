@@ -204,6 +204,8 @@ Everything below runs on tiny randomly initialised Qwen3.5 models on the CPU (`t
 - DPO and online-teacher distillation read the pixels on every model involved.
 - RL: tool images in both layouts, token-identical rollout and training with the HF engine, context rewrites.
 
+With the real Qwen3.5 tokenizer, chat template and image processor (no weights), the pipeline's token ids, image grids and pixel values equal `AutoProcessor`'s for a conversation with an image in the user turn and one in a tool result.
+
 Not verified yet: training on a GPU, real checkpoints, FSDP runs (beyond layer discovery), the flash and linear-attention packed kernels with images, the in-process vLLM engine with images, and serving an export with vLLM.
 
 ## Sources
