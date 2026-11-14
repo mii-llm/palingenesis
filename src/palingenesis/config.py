@@ -104,7 +104,7 @@ class DataConfig:
     # repeat, or late in a near-repeat), added to the CE sum with the same denominator (one target counts like this many
     # tokens). Distilled students fall back on copying their context at hard decision points (arxiv:2512.12895); plain
     # CE never pushes that option down. Only these few positions: legitimate copying (paths, code) is untouched,
-    # unlike token-level unlikelihood. Needs memory.seco, no packing, no pretokenize. 0 = off.
+    # unlike token-level unlikelihood. Needs memory.seco, no pretokenize. 0 = off.
     repeat_unlikelihood: float = 0.0
     # The same for stopping: at the final reply of an agent trace, the ways a tool call could start instead (the call
     # opener at the reply's first token and after paragraph breaks, the paragraph break at its end); the summed term is
@@ -319,7 +319,9 @@ class MemoryConfig:
     # then backprop chunk by chunk in reverse, relaying gradients through the
     # cache. Only one chunk's activations are alive, so activation memory is set
     # by the chunk size, not the sequence length. Exact gradients (tested equal to
-    # full backprop, incl. Qwen3.5 hybrids) for one extra no-grad forward (~+33%).
+    # full backprop, incl. Qwen3.5 hybrids) for an extra no-grad forward of every
+    # chunk but the last. With data.packing, every packed document is trained on
+    # its own: long ones chunk by chunk, short ones batched in one forward.
     seco: bool = False
     seco_chunk_size: int = 4096
     # Keep the full-attention K/V (and recurrent start states) in pinned CPU memory,
@@ -821,8 +823,8 @@ class Config:
         for knob in ("repeat_unlikelihood", "stop_unlikelihood"):
             if getattr(self.data, knob) < 0:
                 errors.append(f"data.{knob} must be >= 0, got {getattr(self.data, knob)}.")
-            elif getattr(self.data, knob) > 0 and (not self.memory.seco or self.data.packing or self.data.pretokenize):
-                errors.append(f"data.{knob} is implemented on the memory.seco path without packing or pretokenize.")
+            elif getattr(self.data, knob) > 0 and (not self.memory.seco or self.data.pretokenize):
+                errors.append(f"data.{knob} is implemented on the memory.seco path without pretokenize.")
         for knob in ("loop_recovery", "reasoning_loop_recovery"):
             if not 0.0 <= getattr(self.data, knob) <= 1.0:
                 errors.append(f"data.{knob} must be in [0, 1], got {getattr(self.data, knob)}.")
@@ -1009,7 +1011,10 @@ class Config:
         if m.spaco_budget < 0:
             errors.append(f"memory.spaco_budget must be >= 0 (got {m.spaco_budget}; 0 = exact SeCO).")
         unsupported = {
-            "data.packing (packed documents need per-document attention)": self.data.packing,
+            "data.packing with memory.spaco_budget (SpaCO samples the chunks of one sequence)": (
+                self.data.packing and m.spaco_budget > 0
+            ),
+            "data.packing with distill.enabled (not validated)": self.data.packing and self.distill.enabled,
             "parallel.context_parallel (both split the sequence)": self.parallel.context_parallel,
             "dpo.enabled": self.dpo.enabled,
             "memory.gradient_release (it steps inside every backward; SeCO runs one per chunk)": self.memory.gradient_release,

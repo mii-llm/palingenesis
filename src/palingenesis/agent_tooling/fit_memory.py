@@ -70,7 +70,7 @@ def apply_overrides(config: Config, overrides: dict[str, object]) -> Config:
 def candidates(config: Config) -> list[Candidate]:
     """The settings to measure, from the one expected to be fastest to the most frugal: the config as it is,
     the three activation-checkpointing modes, then SeCO at decreasing chunk sizes and with its K/V cache
-    offloaded. Settings the config cannot take (SeCO with packing, DPO, ...) are listed as skipped."""
+    offloaded. Settings the config cannot take (SeCO with DPO, ...) are listed as skipped."""
     out = [Candidate("as configured")]
     seco_on = config.memory.seco
     for mode in ("none", "selective", "full"):

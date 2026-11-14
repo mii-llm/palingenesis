@@ -1,14 +1,17 @@
 """SeCO / SpaCO: chunk-wise training on sequences of any length.
 
 Idea from "Training Long-Context LLMs Efficiently via Chunk-wise Optimization"
-(Li et al., arXiv:2505.16710). The sequence is split into k chunks; only ONE
+(Li et al., arXiv:2505.16710); ChunkFlow (Yuan et al., arXiv:2503.02356) describes
+the same scheme, with short sequences packed into chunks and the last chunk's
+activations kept. The sequence is split into k chunks; only ONE
 chunk's activations are alive at a time, so activation memory is set by the
 chunk size, not by the sequence length. What grows with the sequence is only
 the cache (attention K/V) and, during the backward sweep, its gradient.
 
-  Stage 1  no grad: run the chunks in order through the model with a cache and
+  Stage 1  no grad: run chunks 1..k-1 in order through the model with a cache and
            keep, per chunk, its checkpoint: the K/V it appends to full-attention
-           layers, and the state every bounded-state layer starts it from.
+           layers, and the state every bounded-state layer starts it from. The
+           last chunk is not run here: nothing reads what it would write.
   Stage 2  for i = k..1: rebuild chunk i's cache from grad-carrying leaves of
            those checkpoints, recompute the chunk with grad, and backpropagate its
            loss plus the relay terms <out, leaf.grad>: the gradient that later
@@ -31,7 +34,9 @@ GPT-OSS, ...) is covered without per-model code. Static, quantized and indexed
 caches raise.
 
 SeCO visits every chunk: exact gradients (tested equal to full backprop) for
-one extra no-grad forward. SpaCO visits t = `budget` random chunks: relayed
+an extra no-grad forward of all chunks but the last (none for a sequence of one
+chunk). SpaCO visits t = `budget` random chunks, after a stage 1 over all k
+(it reports the loss of the chunks it skips from there): relayed
 gradients are scaled by k/t as in the paper, and so is each visited chunk's
 loss. The paper's pseudocode leaves the loss unscaled, which we measured to
 give E[g] = (t/k) * grad; with it scaled, E[g] ~= grad (measured scale
@@ -46,9 +51,19 @@ chunk's RNG state is saved in stage 1 and restored for its recomputation, so
 gradients stay exact in train mode.
 
 Rows may be right-padded (padding only follows real tokens, and causality keeps
-it inert). Packed sequences are not supported.
+it inert).
+
+Packed rows (`position_ids` restarting at 0 at every document, data.packing) are
+taken apart again, so documents share nothing but the optimizer step: a document
+longer than a chunk runs as its own chunk sequence; shorter ones run in batches of
+right-padded rows, similar lengths together, of at most `chunk_size` padded tokens
+each, in one forward and backward (a sequence of one chunk). Every document is then
+a row of its own from position 0 with a fresh cache: no attention across documents
+and no state carried over, whatever the layers are, with no kernel support needed.
+The gradient equals the sum of the documents' own full backpropagations.
 """
 
+import contextlib
 import contextvars
 import logging
 import random
@@ -62,7 +77,7 @@ from transformers import cache_utils as cu
 
 from palingenesis.logits import output_head, verify_output_head
 from palingenesis.loss import chunked_cross_entropy_loss, shift_labels
-from palingenesis.moe import sync_routing, token_window
+from palingenesis.moe import routing_active, sync_routing, token_window
 from palingenesis.seco_attention import KVStore, check_host_budget, chunk_attention, reset_host_budget
 
 logger = logging.getLogger(__name__)
@@ -304,6 +319,8 @@ class ChunkwiseResult:
     # its targets, and their count
     unlikely_p: tuple = ()
     unlikely_n: tuple = ()
+    # packed rows: padding tokens run in the batched forwards of the short documents
+    padding: int = 0
 
 
 def seco_forward_backward(model, input_ids, labels, *, chunk_size: int = 4096, **kwargs) -> ChunkwiseResult:
@@ -370,6 +387,7 @@ def _chunkwise(
     unlikely: list | None = None,
     loss_fn=None,
     stable_softmax: bool = False,
+    position_ids: torch.Tensor | None = None,
 ) -> ChunkwiseResult:
     """Accumulate d(loss)/d(params) into `.grad`, chunk by chunk; the caller must
     NOT call `.backward()` afterwards.
@@ -388,8 +406,11 @@ def _chunkwise(
                 data.stop_unlikelihood).
     loss_fn:    replaces the chunk's cross-entropy: loss_fn(hidden [B, L, H], lo, hi, denom) -> the chunk's
                 loss divided by denom, with the head's gradients already accumulated (off-policy
-                distillation: palingenesis.distill.Distiller.seco_loss_fn).
+                distillation: palingenesis.distill.Distiller.seco_loss_fn). Packed rows: called per document,
+                hidden [1, L, H], with lo and hi counted in the flattened batch [1, B * S].
     stable_softmax: the chunk's cross-entropy from palingenesis.stable_softmax (train.stable_softmax).
+    position_ids: [B, S] of packed rows, restarting at 0 at every document (data.packing): every document
+                is trained on its own (module doc). Exact SeCO only.
     """
     backbone, lm_head = _backbone(model), _lm_head(model)
     if getattr(backbone, "gradient_checkpointing", False) and backbone.training:
@@ -399,43 +420,165 @@ def _chunkwise(
         )
     if budget is not None and budget < 1:
         raise ValueError(f"SpaCO budget must be >= 1 (got {budget})")
-    shifted = shift_labels(labels)
+    if position_ids is not None and budget is not None:
+        raise ValueError("SpaCO (budget) does not support packed rows (position_ids)")
+    if position_ids is not None and routing_active():
+        # the balancing losses need every token's routing before the first backward, and the
+        # documents run one after the other, each with its own backward
+        raise NotImplementedError(
+            "SeCO on packed rows does not support MoE router balancing: set data.packing: false or moe.balance: false."
+        )
+    shifted = shift_labels(labels, position_ids)
     denom = float(loss_denom if loss_denom is not None else max((shifted != IGNORE_INDEX).sum().item(), 1))
-    seq_len = input_ids.shape[1]
-    bounds = [(lo, min(lo + chunk_size, seq_len)) for lo in range(0, seq_len, chunk_size)]
-    k = len(bounds)
-    sparse = budget is not None and budget < k
     loss_chunks = num_loss_chunks or (lambda n: 1)
 
     # positions kept (a term that is off stays None), so the statistics line up with the caller's list
-    terms = [(shift_labels(t) if t is not None and w > 0 else None, w) for t, w in (unlikely or [])]
+    terms = [(shift_labels(t, position_ids) if t is not None and w > 0 else None, w) for t, w in (unlikely or [])]
     stats = [[0.0, 0, 0.0] for _ in terms]  # per term: sum of p, targets, the term's value (kept out of the logged CE)
 
-    def chunk_loss(hidden, lo, hi, weight=1.0, with_repeat=True):
-        # The weight goes into the denominator: chunked CE computes lm_head's
-        # gradients inside this call, so scaling the returned loss would miss them.
-        if loss_fn is not None:
-            loss = loss_fn(hidden, lo, hi, denom / weight)
-        else:
-            loss = chunked_cross_entropy_loss(
-                hidden,
-                shifted[:, lo:hi],
-                lm_head,
-                num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
-                global_valid_tokens=denom / weight,
-                stable=stable_softmax,
-            )
-        if with_repeat:
-            for (targets, w), st in zip(terms, stats):
-                if targets is None:
-                    continue
-                loss = loss + _repeat_unlikelihood(hidden, targets[:, lo:hi], lm_head, w * weight / denom, st)
-        return loss
+    def chunk_loss_of(view, spans=None):
+        """The chunk loss of one sweep's rows. view(t): their part of a [B, S] tensor (shifted labels,
+        unlikelihood targets). spans: per row, (its first token in loss_fn's coordinates, its length),
+        when the rows are documents of packed rows; None: the rows are the batch's own."""
+
+        def chunk_loss(hidden, lo, hi, weight=1.0, with_repeat=True):
+            # The weight goes into the denominator: chunked CE computes lm_head's
+            # gradients inside this call, so scaling the returned loss would miss them.
+            if loss_fn is None:
+                loss = chunked_cross_entropy_loss(
+                    hidden,
+                    view(shifted)[:, lo:hi],
+                    lm_head,
+                    num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
+                    global_valid_tokens=denom / weight,
+                    stable=stable_softmax,
+                )
+            elif spans is None:
+                loss = loss_fn(hidden, lo, hi, denom / weight)
+            else:
+                loss = hidden.new_zeros(())
+                for row, (first, length) in enumerate(spans):
+                    end = min(hi, length)
+                    if end > lo:
+                        loss = loss + loss_fn(
+                            hidden[row : row + 1, : end - lo], first + lo, first + end, denom / weight
+                        )
+            if with_repeat:
+                for (targets, w), st in zip(terms, stats):
+                    if targets is None:
+                        continue
+                    loss = loss + _repeat_unlikelihood(hidden, view(targets)[:, lo:hi], lm_head, w * weight / denom, st)
+            return loss
+
+        return chunk_loss
 
     # K/V are cached in the autocast dtype: attention consumes them in that dtype
     # anyway (autocast casts its inputs), so this matches the full forward exactly
     # while halving the cache and its gradient (RoPE otherwise promotes k to fp32).
     cast = torch.get_autocast_dtype("cuda") if input_ids.is_cuda and torch.is_autocast_enabled("cuda") else None
+
+    def sweep(ids, chunk_loss):
+        return _sweep(
+            backbone, ids, chunk_loss, chunk_size=chunk_size, budget=budget, rng=rng, kv_offload=kv_offload, cast=cast
+        )
+
+    padding = 0
+    if position_ids is None:
+        logged, k, backpropagated = sweep(input_ids, chunk_loss_of(lambda t: t))
+    else:
+        # Tokens after a document's last scored position reach no loss (causality): they are not run.
+        # A loss_fn's positions are its own: every document is kept whole.
+        scored = torch.ones_like(shifted, dtype=torch.bool) if loss_fn is not None else shifted != IGNORE_INDEX
+        for targets, _ in terms:
+            if targets is not None:
+                scored = scored | (targets != IGNORE_INDEX)
+        chains, groups = _packed_plan(position_ids, scored, chunk_size)
+        width = input_ids.shape[1]
+        logged, k, backpropagated = 0.0, 0, 0
+        for row, lo, hi in chains:  # a document longer than a chunk: its own chunk sequence
+
+            def view(t, row=row, lo=lo, hi=hi):
+                return t[row : row + 1, lo:hi]
+
+            out = sweep(view(input_ids), chunk_loss_of(view, [(row * width + lo, hi - lo)]))
+            logged, k, backpropagated = logged + out[0], k + out[1], backpropagated + out[2]
+        for docs in groups:  # shorter documents: the right-padded rows of one forward
+
+            def view(t, docs=docs):
+                return _rows(t, docs)
+
+            ids = _rows(input_ids, docs, pad=0)
+            out = sweep(ids, chunk_loss_of(view, [(row * width + lo, hi - lo) for row, lo, hi in docs]))
+            logged, k, backpropagated = logged + out[0], k + out[1], backpropagated + out[2]
+            padding += ids.numel() - sum(hi - lo for _, lo, hi in docs)
+    _ACTIVE.clear()
+    sparse = backpropagated < k
+    return ChunkwiseResult(
+        loss=logged - (0.0 if sparse else sum(st[2] for st in stats)),
+        num_chunks=k,
+        backpropagated=backpropagated,
+        unlikely_p=tuple(st[0] for st in stats),
+        unlikely_n=tuple(st[1] for st in stats),
+        padding=padding,
+    )
+
+
+def _packed_plan(position_ids: torch.Tensor, scored: torch.Tensor, chunk_size: int):
+    """The documents (row, lo, hi) of packed rows, each cut after its last scored position (a document
+    without one is dropped: the collator's padding, among others), as (chains, groups): the documents
+    longer than a chunk, and batches of the others, longest first, of at most `chunk_size` padded
+    tokens each (rows x the longest row), so a batch holds no more activations than a chunk."""
+    position_ids, scored = position_ids.cpu(), scored.cpu()
+    chains, short = [], []
+    for row in range(position_ids.shape[0]):
+        starts = torch.nonzero(position_ids[row] == 0).flatten().tolist()
+        if not starts or starts[0] != 0:
+            starts = [0, *starts]
+        for lo, hi in zip(starts, [*starts[1:], position_ids.shape[1]]):
+            last = torch.nonzero(scored[row, lo:hi]).flatten()
+            if last.numel():
+                doc = (row, lo, lo + int(last[-1]) + 1)
+                (chains if doc[2] - lo > chunk_size else short).append(doc)
+    short.sort(key=lambda doc: doc[2] - doc[1], reverse=True)
+    groups: list[list[tuple[int, int, int]]] = []
+    for doc in short:
+        if groups and (len(groups[-1]) + 1) * (groups[-1][0][2] - groups[-1][0][1]) <= chunk_size:
+            groups[-1].append(doc)
+        else:
+            groups.append([doc])
+    return chains, groups
+
+
+def _rows(t: torch.Tensor, docs: list[tuple[int, int, int]], pad: int = IGNORE_INDEX) -> torch.Tensor:
+    """The documents (row, lo, hi) of a [B, S] tensor as right-padded rows [len(docs), longest]."""
+    out = t.new_full((len(docs), max(hi - lo for _, lo, hi in docs)), pad)
+    for i, (row, lo, hi) in enumerate(docs):
+        out[i, : hi - lo] = t[row, lo:hi]
+    return out
+
+
+def _sweep(
+    backbone: nn.Module,
+    input_ids: torch.Tensor,
+    chunk_loss,
+    *,
+    chunk_size: int,
+    budget: int | None,
+    rng: random.Random | None,
+    kv_offload: bool,
+    cast: torch.dtype | None,
+) -> tuple[float, int, int]:
+    """The two stages (module doc) over the rows `input_ids` [B, S], whose chunk [lo, hi) has the loss
+    chunk_loss(hidden, lo, hi, weight, with_repeat). Returns the loss to report, the number of chunks
+    and how many of them were backpropagated."""
+    seq_len = input_ids.shape[1]
+    bounds = [(lo, min(lo + chunk_size, seq_len)) for lo in range(0, seq_len, chunk_size)]
+    k = len(bounds)
+    sparse = budget is not None and budget < k
+    # Exact SeCO runs the last chunk once, with grad, as the first of stage 2: no chunk reads what it
+    # adds to the cache, so stage 1 stops before it and the K/V stores end where it starts. SpaCO
+    # needs every chunk's loss from stage 1 (it reports the ones it skips) and may skip the last.
+    stored = seq_len if sparse or not bounds else bounds[-1][0]  # the tokens stage 1 runs
 
     # Full-attention K/V go to a KVStore per layer (no prefix copies, optional CPU
     # offload) whenever attention runs through `_attention`, i.e. the model is
@@ -446,41 +589,47 @@ def _chunkwise(
     if kv_offload:
         # Check the WHOLE offloaded size before allocating any of it: pinning tens
         # of GiB and only then failing already brings the host to its knees.
-        check_host_budget(_offloaded_bytes(backbone, input_ids.shape[0], seq_len, cast))
+        check_host_budget(_offloaded_bytes(backbone, input_ids.shape[0], stored, cast))
     stores: dict[int, KVStore] = {}
     reset_host_budget()
 
     # ── Stage 1: no-grad forward, keep the per-chunk checkpoints ────────────
     cache = _new_cache(backbone, cast)
     append = [_is_append_only(layer) for layer in cache.layers]
-    in_store = [app and use_stores and _storable(layer) for layer, app in zip(cache.layers, append)]
+    in_store = [app and use_stores and stored > 0 and _storable(layer) for layer, app in zip(cache.layers, append)]
     starts: list[list[dict]] = []  # starts[i][layer]: layer state chunk i starts from (bounded part)
-    rng_states = []  # RNG state each chunk starts from (dropout replay)
+    rng_states = []  # RNG state each chunk of stage 1 starts from (dropout replay)
     devices = [input_ids.device] if input_ids.device.type == "cuda" else []
     logged = 0.0
+
     with torch.no_grad():
         for lo, hi in bounds:
             starts.append(
                 [_offload(_state(layer, app, clone=True), kv_offload) for layer, app in zip(cache.layers, append)]
             )
+            if lo == stored:
+                break  # exact SeCO: the last chunk waits for stage 2
             rng_states.append(_rng_state(devices))
-            _attach_stores(cache, in_store, stores, seq_len, lo, write=True, offload=kv_offload)
+            _attach_stores(cache, in_store, stores, stored, lo, write=True, offload=kv_offload)
             with token_window(lo, hi):
                 hidden = _run(backbone, input_ids[:, lo:hi], cache)
             if sparse:  # skipped chunks are not recomputed; report their loss from here
                 logged += float(chunk_loss(hidden, lo, hi, with_repeat=False))
             del hidden
-    # Append-only checkpoints: ONE leaf per layer holding the whole sequence's K/V.
+    # Append-only checkpoints: ONE leaf per layer holding the K/V of every chunk stage 1 ran.
     # A chunk's prefix is a view of it (no copy), and every chunk's gradient
     # accumulates into a single buffer of the same size.
     kv = [
-        tuple(getattr(layer, a).detach().requires_grad_(True) for a in _KV) if app and not stored else None
-        for layer, app, stored in zip(cache.layers, append, in_store)
+        tuple(getattr(layer, a).detach().requires_grad_(True) for a in _KV)
+        if app and not stored_here and getattr(layer, "is_initialized", False)
+        else None
+        for layer, app, stored_here in zip(cache.layers, append, in_store)
     ]
     del cache
     for store in stores.values():
         store.start_gradients()
-    sync_routing()  # MoE: every token is routed; the routers' balancing gradients need the global counts
+    if sparse:
+        sync_routing()  # MoE: every token is routed; the routers' balancing gradients need the global counts
 
     # ── Stage 2: reverse sweep with gradient relay ─────────────────────────
     if sparse:
@@ -493,7 +642,7 @@ def _chunkwise(
     for i in order:
         lo, hi = bounds[i]
         cache = _new_cache(backbone, cast)
-        _attach_stores(cache, in_store, stores, seq_len, lo, write=False, offload=kv_offload)
+        _attach_stores(cache, in_store, stores, stored, lo, write=False, offload=kv_offload)
         leaves = []
         for idx, (layer, app) in enumerate(zip(cache.layers, append)):
             state = _leafify(_onto(starts[i][idx], input_ids.device)) if i > 0 else {}
@@ -505,18 +654,27 @@ def _chunkwise(
             if app and i > 0 and not in_store[idx]:
                 _seed_kv(layer, [t[..., :lo, :] for t in kv[idx]])
             leaves.append(state)
-        before = [_snapshot(layer) for layer in cache.layers]
+        before = _hold(cache, hi - lo)
 
-        with torch.random.fork_rng(devices=devices), token_window(lo, hi, scale):
-            _set_rng_state(rng_states[i], devices)  # same dropout masks as stage 1
-            hidden = _run(backbone, input_ids[:, lo:hi], cache)
+        # A chunk that stage 1 ran is replayed from its RNG state (the same dropout masks) and leaves
+        # the generators where they were. The last chunk of exact SeCO runs here for the first time
+        # and draws on from where stage 1 stopped, as it would have there.
+        replay = i < len(rng_states)
+        with torch.random.fork_rng(devices=devices) if replay else contextlib.nullcontext():
+            if replay:
+                _set_rng_state(rng_states[i], devices)
+            with token_window(lo, hi, scale):
+                hidden = _run(backbone, input_ids[:, lo:hi], cache)
+        sync_routing()  # MoE, exact SeCO: the last chunk was routed just now (a second call does nothing)
         loss = chunk_loss(hidden, lo, hi, weight=scale)  # SpaCO: J_i scaled by k/t (module doc)
         # The relay, d<out, scale * grad>/dθ for every output later chunks read, passed to
         # autograd as (root, incoming gradient) pairs next to the loss (no scalar to build).
         roots, grads = ([loss], [torch.ones_like(loss)]) if loss.requires_grad else ([], [])
         for idx, (layer, app) in enumerate(zip(cache.layers, append)):
             pairs = []
-            if in_store[idx]:
+            if i == order[0]:
+                pass  # no later chunk was backpropagated: nothing was sent into this chunk's K/V
+            elif in_store[idx]:
                 store = stores[idx]
                 chunk_k, chunk_v = layer._chunk_kv
                 pairs += [(chunk_k, store.grad_k[..., lo:hi, :]), (chunk_v, store.grad_v[..., lo:hi, :])]
@@ -543,14 +701,7 @@ def _chunkwise(
 
         next_leaves, next_chunk = leaves, i
         del cache, hidden, loss, roots, grads, before
-    _ACTIVE.clear()
-    return ChunkwiseResult(
-        loss=logged - (0.0 if sparse else sum(st[2] for st in stats)),
-        num_chunks=k,
-        backpropagated=len(order),
-        unlikely_p=tuple(st[0] for st in stats),
-        unlikely_n=tuple(st[1] for st in stats),
-    )
+    return logged, k, len(order)
 
 
 def _repeat_unlikelihood(hidden: torch.Tensor, targets: torch.Tensor, lm_head: nn.Module, scale: float, stats: list):
@@ -837,6 +988,30 @@ def _seed_kv(layer, kv) -> None:
 
 def _snapshot(layer) -> dict:
     return {k: (dict(v) if isinstance(v, dict) else v) for k, v in layer.__dict__.items()}
+
+
+def _hold(cache, tokens: int) -> list[dict]:
+    """Snapshots of the cache layers before a forward with grad, to `_restore` after it: activation
+    checkpointing re-runs layer forwards during backward and must see exactly the same cache.
+
+    A one-token forward advances the convolution state IN PLACE (transformers' decode path), which a
+    snapshot of references would follow. The layers then get copies to advance (the gradient still
+    reaches the originals), and the snapshot keeps the values the forward started from."""
+    before = [_snapshot(layer) for layer in cache.layers]
+    if tokens == 1:
+        for layer in cache.layers:
+            for name, value in layer.__dict__.items():
+                if name in _TRANSIENT or (name in _KV and _is_append_only(layer)):
+                    continue
+                if isinstance(value, dict):
+                    layer.__dict__[name] = {k: _grad_clone(v) for k, v in value.items()}
+                else:
+                    layer.__dict__[name] = _grad_clone(value)
+    return before
+
+
+def _grad_clone(value):
+    return value.clone() if torch.is_tensor(value) and value.requires_grad else value
 
 
 def _restore(layer, snapshot: dict) -> None:
