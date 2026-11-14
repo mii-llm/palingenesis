@@ -18,6 +18,13 @@ import time
 
 import torch
 
+DEVICE = "cuda"  # --device cpu runs the same code as a smoke test (its timings mean nothing)
+
+
+def _sync() -> None:
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+
 
 def experts_module(args, dtype):
     from transformers import Qwen3MoeConfig
@@ -33,12 +40,12 @@ def experts_module(args, dtype):
     module = Qwen3MoeExperts(config)
     torch.nn.init.normal_(module.gate_up_proj, std=0.02)
     torch.nn.init.normal_(module.down_proj, std=0.02)
-    return module.to("cuda", dtype)
+    return module.to(DEVICE, dtype)
 
 
 def routing(tokens: int, experts: int, top_k: int, skew: float, generator) -> torch.Tensor:
     """[tokens, top_k] distinct experts per token; skew 0 = uniform, else expert i has weight (i + 1)^-skew."""
-    weights = torch.arange(1, experts + 1, device="cuda", dtype=torch.float32) ** (-skew)
+    weights = torch.arange(1, experts + 1, device=DEVICE, dtype=torch.float32) ** (-skew)
     return torch.multinomial(weights.expand(tokens, -1), top_k, replacement=False, generator=generator)
 
 
@@ -53,36 +60,38 @@ def run(module, name, hidden, index, gates, autocast, iters):
         for p in params:
             p.grad = None
         x = hidden.detach().requires_grad_(True)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
+        with torch.autocast(DEVICE, dtype=torch.bfloat16, enabled=autocast):
             out = module(x, index, gates)
         out.float().square().mean().backward()
         return out
 
     for _ in range(3):
         out = step()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
+    _sync()
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     for _ in range(iters):
         step()
-    torch.cuda.synchronize()
+    _sync()
     ms = (time.perf_counter() - t0) / iters * 1e3
-    return ms, torch.cuda.max_memory_allocated() / 2**30, out.detach().float()
+    peak = torch.cuda.max_memory_allocated() / 2**30 if DEVICE == "cuda" else 0.0
+    return ms, peak, out.detach().float()
 
 
 def bench_layer(args, rows):
-    generator = torch.Generator("cuda").manual_seed(0)
+    generator = torch.Generator(DEVICE).manual_seed(0)
     names = ["eager", "grouped_mm", "palingenesis", "palingenesis_padded"] + (["batched_mm"] if args.batched else [])
     for weights in ("bf16", "fp32+autocast"):
         dtype = torch.bfloat16 if weights == "bf16" else torch.float32
         module = experts_module(args, dtype)
         for tokens in args.tokens:
             for skew in args.skew:
-                hidden = torch.randn(tokens, args.hidden, device="cuda", dtype=torch.bfloat16, generator=generator)
+                hidden = torch.randn(tokens, args.hidden, device=DEVICE, dtype=torch.bfloat16, generator=generator)
                 if weights != "bf16":
                     hidden = hidden.float()
                 index = routing(tokens, args.experts, args.top_k, skew, generator)
-                gates = torch.softmax(torch.randn(tokens, args.top_k, device="cuda", generator=generator), -1)
+                gates = torch.softmax(torch.randn(tokens, args.top_k, device=DEVICE, generator=generator), -1)
                 gates = gates.to(hidden.dtype)
                 reference = None
                 for name in names:
@@ -90,7 +99,8 @@ def bench_layer(args, rows):
                         ms, gib, out = run(module, name, hidden, index, gates, weights != "bf16", args.iters)
                     except (RuntimeError, ImportError, ValueError) as e:  # out of memory, a kernel this GPU lacks
                         print(f"{weights:14s} tokens={tokens:6d} skew={skew:.1f} {name:20s} failed: {str(e)[:80]}")
-                        torch.cuda.empty_cache()
+                        if DEVICE == "cuda":
+                            torch.cuda.empty_cache()
                         continue
                     reference = out if reference is None else reference
                     diff = float((out - reference).abs().max() / reference.abs().max().clamp(min=1e-9))
@@ -134,10 +144,10 @@ def bench_model(args, rows):
         head_dim=args.hidden // 16,
         norm_topk_prob=True,
     )
-    model = Qwen3MoeForCausalLM(config).to("cuda", torch.bfloat16)
+    model = Qwen3MoeForCausalLM(config).to(DEVICE, torch.bfloat16)
     for layer in find_moe_layers(model):
         torch.nn.init.normal_(layer.router.weight, std=0.02)
-    ids = torch.randint(0, 32000, (args.model_rows, args.model_tokens // args.model_rows), device="cuda")
+    ids = torch.randint(0, 32000, (args.model_rows, args.model_tokens // args.model_rows), device=DEVICE)
     for name in ("eager", "grouped_mm", "grouped", "padded"):
         set_experts_implementation(model, name)
         for balanced in (False, True):
@@ -147,7 +157,7 @@ def bench_model(args, rows):
                 model.zero_grad(set_to_none=True)
                 if balancer is not None:
                     balancer.begin(None)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast(DEVICE, dtype=torch.bfloat16):
                     hidden = final_hidden_states(model, ids, None)
                 loss = hidden.float().square().mean()
                 if balancer is not None:
@@ -158,11 +168,11 @@ def bench_model(args, rows):
 
             for _ in range(3):
                 step()
-            torch.cuda.synchronize()
+            _sync()
             t0 = time.perf_counter()
             for _ in range(args.iters):
                 step()
-            torch.cuda.synchronize()
+            _sync()
             ms = (time.perf_counter() - t0) / args.iters * 1e3
             if balancer is not None:
                 balancer.detach()
@@ -193,12 +203,16 @@ def main():
     parser.add_argument("--model-tokens", type=int, default=8192)
     parser.add_argument("--model-rows", type=int, default=4)
     parser.add_argument("--json", default="", help="append the rows to this JSON-lines file")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="cpu: a smoke test of the script")
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise SystemExit("bench_moe_experts.py measures GPU kernels: no CUDA device is visible")
-    print(
-        f"{torch.cuda.get_device_name()} (capability {torch.cuda.get_device_capability()}), torch {torch.__version__}"
-    )
+    global DEVICE
+    DEVICE = args.device
+    if DEVICE == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("bench_moe_experts.py measures GPU kernels: no CUDA device (--device cpu: a smoke test)")
+    name = "cpu"
+    if DEVICE == "cuda":
+        name = f"{torch.cuda.get_device_name()} (capability {torch.cuda.get_device_capability()})"
+    print(f"{name}, torch {torch.__version__}")
     rows: list[dict] = []
     bench_layer(args, rows)
     if args.model:
@@ -206,7 +220,7 @@ def main():
     if args.json:
         with open(args.json, "a") as f:
             for row in rows:
-                f.write(json.dumps({"gpu": torch.cuda.get_device_name(), **row}) + "\n")
+                f.write(json.dumps({"device": name, **row}) + "\n")
 
 
 if __name__ == "__main__":
