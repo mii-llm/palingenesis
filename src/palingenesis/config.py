@@ -487,6 +487,8 @@ class LoggingConfig:
     run_name: str | None = None
     use_wandb: bool = True
     use_trackio: bool = True
+    # Further metric backends: `module:Class` or `file.py:Class` (palingenesis.logging.Tracker documents the interface)
+    trackers: list = field(default_factory=list)
     log_grad_norm: bool = True
     # Health monitor cadence. Tier 2 (~10ms): grad cosine sim, GNS, CUDA memory.
     # Tier 3 (~200ms): weight norms, stable rank, weight drift.
