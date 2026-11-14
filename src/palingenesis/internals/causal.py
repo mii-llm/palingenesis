@@ -74,16 +74,23 @@ def direction_effect(
     ablation: bool = True,
     chat_template_kwargs: dict | None = None,
     batch_size: int = 16,
+    max_tokens: int | None = None,
     seed: int = 0,
 ) -> dict:
     """Dose-response of the decision margin along the probe's diff-of-means direction vs random directions of the
     same norm, plus directional ablation (see the module docstring). Rows are rendered at their decision position
-    (last_prompt); alpha is in units of |mu+ - mu-| (alpha = 1 moves the negative-class mean onto the positive one)."""
+    (last_prompt); alpha is in units of |mu+ - mu-| (alpha = 1 moves the negative-class mean onto the positive one).
+    Prompts longer than max_tokens are left out (counted in "dropped")."""
     if len(alphas) < 2:
         raise ValueError("direction_effect: at least two alphas")
     kwargs = chat_template_kwargs if chat_template_kwargs is not None else probe.meta.get("chat_template_kwargs", {})
     encoder = Encoder(tok, "last_prompt", kwargs)
     ids = [encoder.prompt_ids(r) for r in rows]
+    n_rows = len(ids)
+    if max_tokens is not None:
+        ids = [x for x in ids if len(x) <= max_tokens]
+    if not ids:
+        raise ValueError(f"direction_effect: no prompt left (max_tokens={max_tokens})")
     sites = find_sites(model)
     r = probe.layer
     if not 0 <= r < sites.n_residuals:
@@ -110,6 +117,7 @@ def direction_effect(
     out = {
         "layer": r,
         "n": len(ids),
+        "dropped": n_rows - len(ids),
         "alphas": list(alphas),
         "base_margin": float(base.mean()),
         "margins": margins,
@@ -144,10 +152,12 @@ def patching_sweep(
     mode: str = "denoise",
     chat_template_kwargs: dict | None = None,
     batch_size: int = 8,
+    max_tokens: int | None = None,
 ) -> dict:
     """Activation patching between the two sides of each twin (see the module docstring). Positions are offsets from
     each side's last prompt token (-1 = the decision position); sides of different lengths are aligned from the end.
-    Returns per layer and offset the mean normalised effect, and the mean margins of both sides."""
+    Returns per layer and offset the mean normalised effect, and the mean margins of both sides. Twins with a side
+    longer than max_tokens are left out (counted in "dropped")."""
     if mode not in ("denoise", "noise"):
         raise ValueError("mode must be denoise (pos into neg) or noise (neg into pos)")
     if any(o >= 0 for o in offsets):
@@ -158,6 +168,12 @@ def patching_sweep(
     src_key, dst_key = ("pos", "neg") if mode == "denoise" else ("neg", "pos")
     src_ids = [encoder.prompt_ids(t[src_key]) for t in twins]
     dst_ids = [encoder.prompt_ids(t[dst_key]) for t in twins]
+    n_twins = len(src_ids)
+    if max_tokens is not None:
+        fits = [i for i in range(n_twins) if max(len(src_ids[i]), len(dst_ids[i])) <= max_tokens]
+        src_ids, dst_ids = [src_ids[i] for i in fits], [dst_ids[i] for i in fits]
+    if not src_ids:
+        raise ValueError(f"patching_sweep: no twin left (max_tokens={max_tokens})")
     shortest = min(len(x) for x in src_ids + dst_ids)
     if -min(offsets) > shortest:
         raise ValueError(f"offset {min(offsets)} reaches before the start of a {shortest}-token prompt")
@@ -171,8 +187,8 @@ def patching_sweep(
     from palingenesis.margins import MarginReader, log_odds
 
     reader = MarginReader(model, tok, device=device)
-    for start in range(0, len(twins), batch_size):
-        idx = list(range(start, min(start + batch_size, len(twins))))
+    for start in range(0, len(src_ids), batch_size):
+        idx = list(range(start, min(start + batch_size, len(src_ids))))
         src = [src_ids[i] for i in idx]
         width = max(len(x) for x in src)
         ids = torch.full((len(idx), width), pad, dtype=torch.long)
@@ -196,11 +212,12 @@ def patching_sweep(
                 denom = src_m[idx] - dst_m[idx]
                 norm = torch.where(denom.abs() > 1e-6, (m - dst_m[idx]) / denom, torch.zeros_like(m))
                 effect[r][j] += norm.sum()
-    n = len(twins)
+    n = len(src_ids)
     return {
         "mode": mode,
         "offsets": list(offsets),
         "n": n,
+        "dropped": n_twins - n,
         "source_margin": float(src_m.mean()),
         "base_margin": float(dst_m.mean()),
         "layers": {r: [round(float(e / n), 4) for e in effect[r]] for r in rs},

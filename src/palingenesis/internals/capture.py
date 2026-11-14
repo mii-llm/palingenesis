@@ -7,7 +7,7 @@
 Store layout (one directory, append-only while it is written, readable layer by layer):
 
     meta.json                  model, fingerprint, position, layers, hidden size, dtype, chat_template_kwargs, shards,
-                               dropped rows by reason, the library version
+                               a hash of the source rows, dropped rows by reason, the library version
     rows.jsonl                 one line per output row: source row index, id, label, group, n_tokens, token position
     shard_00000.safetensors    {"r<k>": [rows, d]} for every captured residual k
 
@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 STORE_VERSION = 1
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+_FINGERPRINT_VALUES = 256  # values hashed per parameter
 
 
 def load_rows(path: str | Path, limit: int | None = None) -> list[dict]:
@@ -58,15 +59,17 @@ def load_rows(path: str | Path, limit: int | None = None) -> list[dict]:
 
 def model_fingerprint(model: nn.Module, tok=None) -> dict:
     """What a probe must match to be applied to another model: architecture sizes always; the name and a hash of the
-    first and last decoder layer's first parameter, to tell checkpoints apart; the chat template's hash."""
+    weights (the first values of every parameter of every decoder layer, the final norm and the output head, so a
+    checkpoint that differs in one layer or one module differs here; rounded to bfloat16, so one checkpoint hashes
+    the same loaded in bf16 on a GPU and in fp32 on a CPU), to tell checkpoints apart; the chat template's hash."""
     cfg = text_config(model)
     sites = find_sites(model)
     digest = hashlib.sha256()
-    for layer in (sites.layers[0], sites.layers[-1]):
-        p = next(layer.parameters(), None)
-        if p is not None and not p.is_meta:
-            flat = p.detach().reshape(-1)[:4096].float().cpu()
-            digest.update(flat.numpy().tobytes())
+    for module in (*sites.layers, sites.norm, sites.head):
+        for p in module.parameters() if module is not None else ():
+            if not p.is_meta:
+                head = p.detach().reshape(-1)[:_FINGERPRINT_VALUES]
+                digest.update(head.to("cpu", torch.bfloat16).float().numpy().tobytes())
     template = getattr(tok, "chat_template", None) if tok is not None else None
     return {
         "name_or_path": getattr(model.config, "_name_or_path", "") or "",
@@ -77,6 +80,15 @@ def model_fingerprint(model: nn.Module, tok=None) -> dict:
         "weights_sha": digest.hexdigest()[:16],
         "chat_template_sha": hashlib.sha256(str(template).encode()).hexdigest()[:16] if template else None,
     }
+
+
+def rows_fingerprint(rows: list[dict]) -> str:
+    """A hash of the rows' content (messages, labels, groups, ...): a store is the capture of exactly these rows."""
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(json.dumps(row, sort_keys=True, default=str).encode())
+        digest.update(b"\n")
+    return digest.hexdigest()[:16]
 
 
 def run_backbone(model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
@@ -142,6 +154,10 @@ class StoreWriter:
         self._buf, self._buffered = {}, 0
         self._rows.flush()
 
+    def abort(self) -> None:
+        """Close rows.jsonl without writing meta.json: the directory is not a store (a failed capture)."""
+        self._rows.close()
+
     def close(self) -> ActivationStore:
         self.flush()
         self._rows.close()
@@ -193,7 +209,18 @@ class ActivationStore:
     def groups(self) -> list[str]:
         """Group of each output row: the row's `group`, else its `id`, else its source row index. Every output row of
         one source row (position *_all) shares the group, so a split never separates tokens of one conversation."""
-        return [str(r["group"] if r.get("group") is not None else r.get("id", r["row"])) for r in self.rows]
+        out = []
+        for r in self.rows:
+            key = r.get("group")
+            if key is None:
+                key = r.get("id")  # rows.jsonl always has the key: None for a source row without an id
+            out.append(str(r["row"] if key is None else key))
+        return out
+
+    def shared_groups(self) -> list[str | None]:
+        """The `group` each output row was given in the data (None without one). Unlike `groups()`, these mean the
+        same thing in another store: the translations or paraphrases of one question carry one group everywhere."""
+        return [None if r.get("group") is None else str(r["group"]) for r in self.rows]
 
     def n_tokens(self) -> torch.Tensor:
         return torch.tensor([float(r["n_tokens"]) for r in self.rows])
@@ -242,6 +269,7 @@ def capture_dataset(
         "dtype": dtype,
         "chat_template_kwargs": encoder.chat_template_kwargs,
         "source_rows": len(rows),
+        "source_sha": rows_fingerprint(rows),
         "dropped": encoder.dropped,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         **(extra_meta or {}),
@@ -280,6 +308,9 @@ def capture_dataset(
         logger.info(
             "internals capture: %d rows -> %s in %.1fs (dropped %s)", done, out, time.time() - t0, encoder.dropped
         )
+    except BaseException:
+        writer.abort()
+        raise
     finally:
         model.train(was_training)
     return writer.close()

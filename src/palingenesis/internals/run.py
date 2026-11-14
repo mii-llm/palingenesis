@@ -2,7 +2,8 @@
 
 Output layout (under output_dir):
 
-    acts/<model>/<dataset>/        activation stores (reused when present and captured with the same settings)
+    acts/<model>/<dataset>/        activation stores (reused when present and captured from the same rows and weights
+                                   with the same settings)
     probes/<model>/                layer_<r>.safetensors, best.safetensors, sweep.json
     compare/<a>__<b>.json          per-layer CKA, cosine, probe transfer A -> B
     report.json                    everything above in one file, plus the config
@@ -17,7 +18,13 @@ from pathlib import Path
 
 import torch
 
-from palingenesis.internals.capture import ActivationStore, capture_dataset, load_rows, model_fingerprint
+from palingenesis.internals.capture import (
+    ActivationStore,
+    capture_dataset,
+    load_rows,
+    model_fingerprint,
+    rows_fingerprint,
+)
 from palingenesis.internals.config import InternalsConfig, InternalsConfigError
 from palingenesis.internals.probes import sweep
 from palingenesis.internals.similarity import compare_stores
@@ -71,6 +78,7 @@ def run_internals(config: InternalsConfig) -> dict:
                 "position": config.position,
                 "source": str(datasets[ds]),
                 "source_rows": len(ds_rows),
+                "source_sha": rows_fingerprint(ds_rows),  # edited rows (new labels, groups) are captured again
                 "max_tokens": config.max_tokens,
                 "chat_template_kwargs": config.chat_template_kwargs,
                 "dtype": config.store_dtype,

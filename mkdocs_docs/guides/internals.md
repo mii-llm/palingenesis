@@ -84,7 +84,8 @@ Rows are JSONL objects:
 
 `<r>` is `mean` (one row per example, averaged in float32), `first`, `last` or `all` (one row per token; for lenses
 and token-level analysis). Positions come from the same renders and masks as training, so a probe reads the same
-tokens the trainer computes losses on. Batches are right-padded: causal attention and the recurrent state of linear
+tokens the trainer computes losses on (a row longer than `max_tokens` is dropped and counted, where training would
+truncate it). Batches are right-padded: causal attention and the recurrent state of linear
 attention never see padding at a real position (a test checks that a row's residuals are identical alone and in a
 padded batch on the hybrid model).
 
@@ -99,7 +100,7 @@ A store is a directory:
 
 | file | content |
 |---|---|
-| `meta.json` | model fingerprint (path, type, hidden size, depth, layer types, a hash of the weights, a hash of the chat template), position, residuals, mixers, storage dtype, chat template kwargs, dropped rows by reason, library version |
+| `meta.json` | model fingerprint (path, type, hidden size, depth, layer types, a hash of the weights, a hash of the chat template), position, residuals, mixers, storage dtype, chat template kwargs, a hash of the source rows, dropped rows by reason, library version |
 | `rows.jsonl` | one line per output row: source row, id, label, group, token count, token position |
 | `shard_00000.safetensors` … | `{"r<k>": [rows, d]}` for every residual, one shard per 4,096 rows |
 
@@ -123,8 +124,8 @@ Per residual, on the train store's grouped split (70 / 10 / 20 % of groups by de
 | **calibration** | Platt scaling on validation. Valid for that distribution only: recalibrate per domain and language |
 | **thresholds** | logit thresholds flagging 1 %, 5 %, 10 % of validation negatives, for gates; every test set reports the TPR and FPR they give there |
 | **test** | AUROC with a 95 % cluster-bootstrap interval (groups resampled), Brier, log loss, equal-mass ECE |
-| **controls** | `control`: the same fit on random labels drawn per group (a control task); it must stay near 0.5, otherwise groups leak across splits. `selectivity` = AUROC − control AUROC. `dmean`: the diff-of-means AUROC next to the chosen fit. Residual 0 (the embeddings) is in every sweep: a high AUROC there means the label is lexical. `length-only AUROC`: the prompt length alone. |
-| **transfer** | every `--test` store (other datasets, other languages) is scored by the train-split probe |
+| **controls** | `control`: the same fit on random labels drawn per group (a control task); it must stay near 0.5, otherwise groups leak across splits. `selectivity` = AUROC − control AUROC. `dmean`: the diff-of-means AUROC next to the chosen fit. Residual 0 (the embeddings) is in every sweep: a high AUROC there means the label is lexical (at `last_prompt` every row ends with the same template token, so residual 0 is constant there and sits at 0.5: use a `*_mean` position for this check). `length-only AUROC`: the prompt length alone. |
+| **transfer** | every `--test` store (other datasets, other languages) is scored by the train-split probe. Rows whose `group` is in the probe's train or validation split (the translation of a training question) are left out and counted (`excluded_seen_groups`). Every row needs a label. |
 
 ```
   r mixer              val   test [95% CI]   dmean   ctrl    sel        popqa           it
@@ -188,10 +189,15 @@ reported without the probe measures next to it.
 
 ```bash
 pgs internals lens --model runs/sft/final --data chats.jsonl --position answer_all
-pgs internals lens --model runs/sft/final --data tool_prompts.jsonl --position assistant_first --decision "<tool_call>"
+pgs internals lens --model runs/sft/final --data tool_chats.jsonl --position assistant_first --decision "<tool_call>"
 pgs internals tuned-lens --model runs/sft/final --data chats.jsonl --out lens.safetensors && \
 pgs internals lens --model runs/sft/final --data chats.jsonl --tuned lens.safetensors
 ```
+
+A lens reads the position that predicts a token. For a span position that is the position before each span token, so
+`CE` at the last residual is the training loss on those tokens and `assistant_first` is the position where the
+reply's first trained token is decided (on a prompt without a reply, use `last_prompt`). Captures and probes read the
+residual at the span tokens themselves.
 
 Per residual, averaged over every selected position: `KL` to the model's final distribution, `top1` agreement with the
 final top token, `CE` of the actual next token, and with `--decision` the exact log-odds of the decision token set (the
@@ -343,7 +349,7 @@ The file may nest everything under `internals:`. Override keys on the command li
 parsed as YAML). `validate()` refuses unknown keys (with a suggestion), `*_all` positions for probes, comparisons of
 models that are not listed, and invalid fractions, dtypes and sizes.
 
-Output: `acts/<model>/<dataset>/` (stores, reused when they already exist with the same settings and weights),
+Output: `acts/<model>/<dataset>/` (stores, reused when they already exist with the same rows, settings and weights),
 `probes/<model>/` (one probe per layer, `best.safetensors`, `sweep.json`), `compare/<a>__<b>.json`, and `report.json`.
 
 ## Worked example: a "do I know this?" probe across layers, before and after a stage

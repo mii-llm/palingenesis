@@ -2,6 +2,7 @@
 
 import json
 import math
+import re
 import sys
 
 import pytest
@@ -578,6 +579,12 @@ def test_cli_capture_probe_compare_and_run(chat, tmp_path, capsys):
     mtime = (tmp_path / "run" / "acts" / "a" / "train" / "meta.json").stat().st_mtime
     assert main(["run", "--config", str(tmp_path / "run.yaml")]) == 0  # stores reused
     assert (tmp_path / "run" / "acts" / "a" / "train" / "meta.json").stat().st_mtime == mtime
+    # the same file with other labels is another dataset: captured again, not read from the old store
+    data.write_text("".join(json.dumps({**r, "label": 1.0 - r["label"]}) + "\n" for r in chat["rows"]))
+    assert main(["run", "--config", str(tmp_path / "run.yaml")]) == 0
+    with (tmp_path / "run" / "acts" / "a" / "train" / "rows.jsonl").open() as f:
+        stored = {r["row"]: r["label"] for r in map(json.loads, f)}
+    assert all(stored[i] == 1.0 - r["label"] for i, r in enumerate(chat["rows"]))
 
 
 def test_compare_summary_prints_an_undefined_cka(tmp_path):
@@ -607,3 +614,217 @@ def test_compare_summary_prints_an_undefined_cka(tmp_path):
     assert "dir cos" in line  # the probe-transfer part prints too (its direction is undefined on a constant layer)
     assert summarise_transfer(res["layers"][1]).startswith("cka ")
     json.dumps(res)
+
+
+# ------------------------------------------------------------------------------------------------ regressions
+
+
+def _synthetic_store(path, x, labels, groups, ids=None, sha="synthetic"):
+    n, d = x.shape
+    meta = {
+        "model": {"weights_sha": sha, "hidden_size": d, "num_layers": 1},
+        "position": "last_prompt",
+        "layers": [1],
+        "mixers": ["attention"],
+        "dtype": "float32",
+    }
+    w = StoreWriter(path, meta)
+    rows = [
+        {
+            "row": i,
+            "id": None if ids is None else ids[i],
+            "label": labels[i],
+            "group": groups[i],
+            "n_tokens": 10,
+            "token": 9,
+        }
+        for i in range(n)
+    ]
+    w.add({1: x}, rows)
+    return w.close()
+
+
+def test_rows_without_group_or_id_are_their_own_group(tmp_path):
+    """rows.jsonl always has the `id` key (None without one): such rows must not all fall into the group "None"."""
+    g = torch.Generator().manual_seed(0)
+    y = (torch.arange(80) % 2).float()
+    x = torch.randn(80, 8, generator=g) + 2 * y[:, None]
+    store = _synthetic_store(tmp_path / "s", x, y.tolist(), [None] * 80)
+    assert len(set(store.groups())) == 80
+    assert sweep(store, resamples=0)["layers"][1]["test"]["auroc"] > 0.8
+    with_ids = _synthetic_store(tmp_path / "i", x, y.tolist(), [None] * 80, ids=[f"q{i // 2}" for i in range(80)])
+    assert len(set(with_ids.groups())) == 40
+
+
+def test_test_sets_leave_out_the_groups_the_probe_was_fitted_on(tmp_path):
+    """A test store may hold rows of the train store's groups (translations; here the store itself). Labels are
+    random and d > n, so the probe memorises its train rows: scoring them as "transfer" would report it."""
+    g = torch.Generator().manual_seed(0)
+    n, d = 120, 256
+    x = torch.randn(n, d, generator=g)
+    y = (torch.rand(n, generator=g) < 0.5).float().tolist()
+    groups = [f"g{i}" for i in range(n)]
+    store = _synthetic_store(tmp_path / "train", x, y, groups)
+    copy = _synthetic_store(tmp_path / "copy", x, y, groups)
+    report = sweep(store, tests={"copy": copy}, resamples=0, control=False)
+    entry = report["layers"][1]
+    assert entry["copy"]["n"] == report["split"]["test"] == entry["test"]["n"]
+    assert entry["copy"]["auroc"] == entry["test"]["auroc"]  # the same held-out rows, nothing memorised
+    assert report["excluded_seen_groups"] == {"copy": n - report["split"]["test"]}
+    other = _synthetic_store(tmp_path / "other", x, y, [f"h{i}" for i in range(n)])  # other groups: all rows count
+    assert sweep(store, tests={"o": other}, resamples=0, control=False)["layers"][1]["o"]["n"] == n
+    unlabelled = _synthetic_store(tmp_path / "nolabel", x, [None if i % 3 == 0 else v for i, v in enumerate(y)], groups)
+    with pytest.raises(ValueError, match="40 rows have no label"):
+        sweep(store, tests={"u": unlabelled}, resamples=0)
+
+
+@pytest.mark.parametrize("arch", ["lfm2", "nemotron_h"])
+def test_final_norm_found_under_other_names(arch):
+    from palingenesis.internals.lens import check_readout
+
+    if arch not in ARCHS:
+        pytest.skip(f"{arch} is not in this transformers version")
+    model = arch_model(arch)
+    assert find_sites(model).norm is not None
+    assert check_readout(model, ids()) < 1e-4
+
+
+def test_fingerprint_sees_any_layer_and_not_the_dtype():
+    from palingenesis.internals.capture import model_fingerprint
+
+    a, b = arch_model("llama"), arch_model("llama")
+    assert model_fingerprint(a)["weights_sha"] == model_fingerprint(b)["weights_sha"]
+    with torch.no_grad():
+        find_sites(b).layers[2].mlp.down_proj.weight.add_(1.0)  # one module of a middle layer
+    assert model_fingerprint(a)["weights_sha"] != model_fingerprint(b)["weights_sha"]
+    half = arch_model("llama").to(torch.bfloat16)  # the same checkpoint as loaded on a GPU
+    full = arch_model("llama")
+    full.load_state_dict({k: v.float() for k, v in half.state_dict().items()})
+    assert model_fingerprint(half)["weights_sha"] == model_fingerprint(full)["weights_sha"]
+
+
+def test_max_tokens_drops_a_long_span_row(chat):
+    from palingenesis.internals.positions import Encoder
+
+    long = {"messages": []}
+    for t in range(6):
+        long["messages"] += [
+            {"role": "user", "content": f"Question {t} " + "word " * 20},
+            {"role": "assistant", "content": f"Answer {t}."},
+        ]
+    full = Encoder(chat["tok"], "assistant_mean").encode(long)
+    encoder = Encoder(chat["tok"], "assistant_mean", max_tokens=len(full.ids) - 10)
+    assert encoder.encode(long) is None and encoder.dropped == {"too_long": 1}  # not truncated to fewer turns
+    assert Encoder(chat["tok"], "assistant_mean", max_tokens=len(full.ids)).encode(long).ids == full.ids
+
+
+def test_lens_reads_the_positions_that_predict_the_span(chat):
+    """At the last residual the lens is the model: its CE over `assistant_all` is the training loss on the assistant
+    tokens, and the margin at `assistant_first` is read where the reply's first trained token is predicted."""
+    from palingenesis.data import ChatDataset
+    from palingenesis.internals.lens import lens_report
+    from palingenesis.margins import log_odds
+
+    model, tok, rows = chat["model"], chat["tok"], chat["rows"][:5]
+    n = find_sites(model).n_layers
+    decision = [tok.convert_tokens_to_ids("<think>")]
+    ds = ChatDataset(None, tok, max_seq_length=4096)
+    total, count, margins = 0.0, 0, []
+    for row in rows:
+        out = ds._process(row)
+        with torch.no_grad():
+            logits = model(input_ids=out["input_ids"][None]).logits[0]
+        loss = torch.nn.functional.cross_entropy(logits[:-1], out["labels"][1:], ignore_index=-100, reduction="sum")
+        total, count = total + float(loss), count + int((out["labels"] != -100).sum())
+        first = int(torch.nonzero(out["labels"] != -100)[0])
+        margins.append(float(log_odds(logits[first - 1], decision)))
+    rep = lens_report(model, tok, rows, position="assistant_all")
+    assert rep["positions"] == count
+    assert rep["layers"][n]["ce"] == pytest.approx(total / count, abs=1e-3)
+    first = lens_report(model, tok, rows, position="assistant_first", decision=decision)
+    assert first["layers"][n]["margin"] == pytest.approx(sum(margins) / len(margins), abs=1e-3)
+    assert first["layers"][n]["ce"] is not None and first["positions"] == len(rows)
+
+
+def test_probe_reward_renders_tools_and_scores_a_prompt_once(chat, monkeypatch):
+    from palingenesis.internals import score as S
+
+    model, tok, rows = chat["model"], chat["tok"], chat["rows"]
+    g = torch.Generator().manual_seed(0)
+    probe = Probe("logistic", 1, "last_prompt", torch.randn(32, generator=g), 0.0, torch.randn(32, generator=g))
+    scorer = S.ProbeScorer(probe, model, tok)
+    monkeypatch.setitem(S._SCORERS, ("p", None, "cpu"), scorer)
+    tool = {
+        "type": "function",
+        "function": {"name": "lookup", "description": "Look a fact up.", "parameters": {"type": "object"}},
+    }
+    prompts = [rows[0]["messages"][:1], rows[1]["messages"][:1], rows[0]["messages"][:1], rows[0]["messages"][:1]]
+    plain = scorer.probabilities([{"messages": p} for p in prompts])
+    with_tools = scorer.probabilities([{"messages": p, "tools": [tool]} for p in prompts])
+    assert not torch.allclose(plain, with_tools)
+    scored = []
+    logits = scorer.logits
+    monkeypatch.setattr(scorer, "logits", lambda r: scored.append(len(r)) or logits(r))
+    values = S.probe_reward(prompts=prompts, probe="p", tools=[[tool]] * 4)
+    assert values == pytest.approx(with_tools.tolist(), abs=1e-5)
+    assert scored == [2]  # two distinct prompts among four rollouts
+    assert S.probe_reward(prompts=prompts, probe="p") == pytest.approx(plain.tolist(), abs=1e-5)
+
+
+def test_failed_capture_closes_the_store(chat, monkeypatch):
+    from palingenesis.internals import capture as C
+
+    writers = []
+
+    class Recording(StoreWriter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            writers.append(self)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("forward failed")
+
+    monkeypatch.setattr(C, "StoreWriter", Recording)
+    monkeypatch.setattr(C, "run_backbone", broken)
+    with pytest.raises(RuntimeError, match="forward failed"):
+        capture_dataset(chat["model"], chat["tok"], chat["rows"][:2], chat["tmp"] / "broken", layers=[1])
+    assert writers[0]._rows.closed and not (chat["tmp"] / "broken" / "meta.json").exists()
+    assert hooks.active_hooks(chat["model"]) == 0
+
+
+def test_cli_causal_and_patch_flags(chat, tmp_path, capsys):
+    """Lists that start with a minus sign (`--alphas -1,0,1`, `--offsets -1,-2`) parse, and --max-tokens applies."""
+    from palingenesis.internals.cli import main
+
+    rows = chat["rows"]
+    data = tmp_path / "rows.jsonl"
+    data.write_text("".join(json.dumps(r) + "\n" for r in rows[:6]))
+    store = capture_dataset(chat["model"], chat["tok"], rows, tmp_path / "acts", layers=[1], dtype="float32")
+    sweep(store, resamples=0, save_dir=tmp_path / "probes")
+    probe = str(tmp_path / "probes" / "best.safetensors")
+    common = ["--model", chat["path"], "--decision", "<think>"]
+    causal = ["causal", *common, "--probe", probe, "--data", str(data), "--n-random", "2"]
+    assert main([*causal, "--alphas", "-1,0,1"]) == 0
+    out = capsys.readouterr().out
+    assert "alpha -1.00" in out and "alpha +1.00" in out
+    assert re.search(r"\(z -?\d+\.\d\)\n", out)
+    assert main([*causal, "--alphas", "-1,0,1", "--max-tokens", "3"]) == 1  # every prompt is longer: nothing to measure
+    assert "no prompt left" in capsys.readouterr().err
+    twins = tmp_path / "twins.jsonl"
+    twins.write_text(
+        "".join(
+            json.dumps({"pos": {"messages": rows[i]["messages"][:1]}, "neg": {"messages": rows[i + 1]["messages"][:1]}})
+            + "\n"
+            for i in (0, 2)
+        )
+    )
+    assert main(["patch", *common, "--twins", str(twins), "--offsets", "-1,-2", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["offsets"] == [-1, -2]
+    assert main(["patch", *common, "--twins", str(twins), "--offsets", "-1,-2", "--max-tokens", "3"]) == 1
+    capsys.readouterr()
+    # a store that holds residual 1 of a 2-layer model: -1 is the model's last residual (2), which it does not hold
+    assert main(["probe", "--acts", str(tmp_path / "acts"), "--layers", "-1", "--bootstrap", "0"]) == 1
+    assert "holds residuals [1]" in capsys.readouterr().err
+    assert main(["probe", "--acts", str(tmp_path / "acts"), "--layers", "-2", "--bootstrap", "0"]) == 0
+    with pytest.raises(SystemExit):  # steer reads no data file: it has no --batch-size / --max-tokens / --limit
+        main(["steer", "--model", chat["path"], "--probe", probe, "--prompt", "Hi", "--max-tokens", "5"])

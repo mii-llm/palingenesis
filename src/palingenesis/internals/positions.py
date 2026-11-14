@@ -106,10 +106,10 @@ class Encoder:
         key = (reasoning, repr(sorted(kwargs.items())))
         ds = self._datasets.get(key)
         if ds is None:
-            ds = ChatDataset(
+            ds = ChatDataset(  # no length limit here: training truncates a long row, encode() drops it (counted)
                 None,
                 self.tok,
-                max_seq_length=self.max_tokens or 1 << 30,
+                max_seq_length=1 << 30,
                 train_on_reasoning=reasoning,
                 chat_template_kwargs=kwargs,
             )
