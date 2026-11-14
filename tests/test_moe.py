@@ -346,6 +346,26 @@ def test_defaults_follow_the_model_config():
     assert deepseek.bias_update_rate == pytest.approx(1e-3) and deepseek.balance_coef == 0.0
 
 
+def test_options_are_validated_in_every_config():
+    from palingenesis.config import Config, ConfigError
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.rl.config import RLConfig
+
+    config = Config()
+    config.moe.balance_loss_coef = -0.5
+    with pytest.raises(ConfigError, match="moe.balance_loss_coef"):
+        config.validate()
+    for cls in (RLConfig, OPDConfig):
+        other = cls()
+        other.set("moe.z_loss_coef", -1.0, "test")
+        with pytest.raises(Exception, match="moe.z_loss_coef"):
+            other.validate()
+    rl = RLConfig()
+    rl.set("rollout.routing_replay", "sometimes", "test")
+    with pytest.raises(Exception, match="routing_replay must be auto, on or off"):
+        rl.validate()
+
+
 def test_selection_bias_moves_against_the_load():
     """Auxiliary-loss-free balancing: after a step, overloaded experts' bias goes down by the rate,
     underloaded experts' up; applied again and again it evens out the loads."""

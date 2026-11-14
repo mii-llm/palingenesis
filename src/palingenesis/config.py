@@ -281,6 +281,21 @@ class MoEConfig:
     # library's sort-free dispatch and grouped GEMM), or a transformers name (eager, grouped_mm, batched_mm).
     experts_implementation: str = "auto"
 
+    def validate(self) -> list[str]:
+        """Errors in the section (shared by the pgs train, pgs rl and pgs distill configs)."""
+        errors = []
+        if self.balance_loss_coef < 0 and self.balance_loss_coef != -1:
+            errors.append(
+                f"moe.balance_loss_coef must be >= 0, or -1 for the model config's value (got {self.balance_loss_coef})."
+            )
+        if self.bias_update_rate < 0 and self.bias_update_rate != -1:
+            errors.append(
+                f"moe.bias_update_rate must be >= 0, or -1 for the model's default (got {self.bias_update_rate})."
+            )
+        if self.z_loss_coef < 0:
+            errors.append(f"moe.z_loss_coef must be >= 0 (got {self.z_loss_coef}).")
+        return errors
+
 
 @dataclass(slots=True)
 class MemoryConfig:
@@ -679,6 +694,7 @@ class Config:
             )
 
         errors += self._context_parallel_errors()
+        errors += self.moe.validate()
 
         if self.data.packing and self.parallel.context_parallel:
             errors.append(

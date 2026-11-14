@@ -589,6 +589,7 @@ class OPDConfig:
             errors.append("the source weights must not all be 0.")
         if self.cmr.enabled:
             errors += self.cmr.validate()
+        errors += self.moe.validate()
         formats = {s.format for s in self.sources.values()}
         if "agent_traces" in formats:
             if not formats <= {"agent_traces", "messages"}:

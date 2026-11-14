@@ -717,6 +717,9 @@ class RLConfig:
             errors.append("train.adam_eps must be >= 0 (0 = auto).")
         if t.steps < 1 or t.micro_tokens < 1:
             errors.append("train.steps and train.micro_tokens must be >= 1.")
+        errors += self.moe.validate()
+        if r.routing_replay not in ("auto", "on", "off"):
+            errors.append(f"rollout.routing_replay must be auto, on or off (got {r.routing_replay!r}).")
         if self.cmr.enabled:
             errors += self.cmr.validate()
             if sharded:
