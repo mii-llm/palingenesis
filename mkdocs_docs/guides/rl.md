@@ -222,7 +222,43 @@ Text and embedded text resources reach the policy as text; images and audio beco
 
 Rewards become group-relative advantages (reward minus the group mean, divided by the batch's standard deviation). Groups whose rollouts all got the same reward carry no gradient, so they are replaced by fresh prompts before the step (`rollout.max_refill`).
 
-The default loss, `masked_is`, is a policy gradient anchored to the sampler's own log-probabilities: the importance ratio π_θ/μ covers both staleness and the numerical difference between vLLM and the trainer, capped at `loss.is_cap`, with PPO's asymmetric clip (`eps_low` 0.2, `eps_high` 0.28) applied as a mask, and a sequence mask (`loss.seq_mask`) that drops a trajectory whose tokens drift too far. No reference model and no KL term, as in current recipes (DAPO, Magistral, ScaleRL, Olmo 3). `cispo`, `icepop` and `gspo` are one option away. Losses are aggregated per prompt by default (`loss.aggregation`).
+The default loss, `masked_is`, is a policy gradient anchored to the sampler's own log-probabilities: the importance ratio π_θ/μ covers both staleness and the numerical difference between vLLM and the trainer, capped at `loss.is_cap`, with PPO's asymmetric clip (`eps_low` 0.2, `eps_high` 0.28) applied as a mask, and a sequence mask (`loss.seq_mask`) that drops a trajectory whose tokens drift too far. No reference model and no KL term, as in current recipes (DAPO, Magistral, ScaleRL, Olmo 3). The other objectives are one option away (below). Losses are aggregated per prompt by default (`loss.aggregation`).
+
+### Choosing the algorithm
+
+The estimator is four independent options: the objective (`loss.type`), the group baseline (`loss.baseline`), the advantage scale (`loss.advantage_std`) and the aggregation over tokens (`loss.aggregation`). Switch from the config or the command line, nothing else changes:
+
+```bash
+pgs rl --config configs/rl_math.yaml --loss.type cispo
+pgs rl --config configs/rl_math.yaml --loss.type reinforce --loss.baseline leave_one_out --loss.advantage_std none
+```
+
+With ρ = π_θ/μ the ratio of the trained policy to the sampler on a token, A the advantage and S the sequence mask, every objective is a coefficient on A · ∇log π_θ:
+
+| `loss.type` | Coefficient | Use it when | Source |
+|---|---|---|---|
+| `masked_is` (default) | S · min(ρ, `is_cap`), zero where PPO's clip would stop the token (A > 0 and ρ > 1 + `eps_high`, or A < 0 and ρ < 1 - `eps_low`) | The default: GRPO / DAPO's clipped surrogate, anchored to the sampler's log-probs | GRPO (2402.03300, Feb 2024), DAPO (2503.14476, Mar 2025) |
+| `cispo` | S · min(ρ, `is_cap`), no mask | Every token should keep a gradient; the loss ScaleRL selected in its comparison (it found caps of 4, 5 and 8 equivalent) | MiniMax-M1 (2506.13585, Jun 2025), ScaleRL (2510.13786, Oct 2025) |
+| `icepop` | S · ρ inside [`icepop_low`, `icepop_high`], zero outside | The sampler and the trainer disagree on a few tokens (MoE routing, quantized rollouts) | Ring-1T (2510.18855, Oct 2025) |
+| `gspo` | one ratio per sequence (geometric mean of ρ), clipped at 1 ± `gspo_eps` | Token ratios are too noisy (long sequences, MoE); aggregation is then fixed per sequence | GSPO (2507.18071, Jul 2025) |
+| `ipo` | S · min(ρ, `is_cap`) where \|π_θ - μ\| ≤ `ipo_eps`, zero outside | Stale or mismatched rollouts where a ratio mask misfires: it drops a rare token moving 0.01 → 0.06 and keeps a likely one falling 0.9 → 0.2. Newer and less tested than the rows above | prime-rl's IPO (its algorithm docs, Oct 2026), after DPPO (2602.04879, Feb 2026); the published form has no cap on ρ, `is_cap` is kept here because a bounded difference does not bound the ratio of a rare token |
+| `reinforce` | S · 1 | On-policy runs where you want the plain score-function estimator, e.g. as a baseline for the others | REINFORCE; with `loss.baseline: leave_one_out`, RLOO (2402.14740, Feb 2024) |
+
+`reinforce` has no ratio, so it is the policy gradient only on samples of the policy being trained. It is refused with `rollout.max_staleness > 0` (older versions sampled part of the batch; `cispo` is the same estimator with the ratio) and with `rollout.think_skip` (a forced token needs its importance weight), and warns with FP8 rollouts. With `max_staleness: 0` every batch is sampled by the weights that train on it, so what it leaves uncorrected is the numerical difference between vLLM and the trainer: `policy/mismatch_k3` still reports it and `loss.seq_mask` still drops the trajectories where it is large. On-policy the other token-level objectives reduce to the same gradient wherever ρ is 1; they differ in what they do with the mismatch. Unclipped REINFORCE on off-policy samples has been reported to collapse (2509.24203, Sep 2025), which is why staleness is an error here and not a warning.
+
+| Option | Values | |
+|---|---|---|
+| `loss.baseline` | `mean` (default), `leave_one_out` | The mean reward of the group's scored rollouts, or of the other ones. For n scored rollouts the leave-one-out advantage is n / (n - 1) times the mean-baseline one: the same direction. It is a different estimator only where n differs between groups (failed rollouts) or the scale is kept (`advantage_std: none`); with `advantage_std: group` it changes nothing and is refused |
+| `loss.advantage_std` | `batch` (default), `group`, `none` | Divide the advantage by the batch's std (ScaleRL, REINFORCE++ 2501.03262), the group's (GRPO), or not (Dr. GRPO 2503.20783: the group's std up-weights prompts that are nearly all right or all wrong) |
+| `loss.aggregation` | `prompt` (default), `token`, `constant` | Token mean per prompt, then over prompts (ScaleRL); mean over all tokens (DAPO); sum over a constant budget (Dr. GRPO: no length bias) |
+| `loss.seq_mask` | `0.1` | Drop a trajectory whose mean \|ρ - 1\| exceeds this (Trust Region Masking 2512.23075, Dec 2025; its suggested range is 0.03 to 0.10) |
+| `loss.kl_ref`, `kl_coef`, `kl_ref_reset` | off | KL to a frozen reference, optionally reset every N steps (DeepSeek-R1 keeps 0.001 with resets; ProRL 2505.24864 resets when progress stalls) |
+
+Published recipes as options: DAPO is `masked_is` with `aggregation: token` and `overlong_buffer`; ScaleRL is `cispo` with the defaults and `data.retire_above: 0.9`; Dr. GRPO is `advantage_std: none` with `aggregation: constant`; RLOO is `reinforce` with `baseline: leave_one_out` and `advantage_std: none`.
+
+Why the defaults: ScaleRL, the one large comparison across recipes, found that the loss, the aggregation and the normalisation mostly change how fast a run learns, not where it ends, and that zero-variance filtering, prompt retirement and fp32 logits matter as much. `masked_is` keeps the mask because it bounds the update on stale and mismatched tokens at no cost on-policy; move to `cispo` when `policy/clipped` stays high, and to `ipo` or `icepop` when `policy/mismatch_k3` grows during the run.
+
+What is verified: each objective's gradient is tested against a hand-computed value, and on samples of the policy itself all six give the exact policy gradient of the expected reward (`tests/test_rl.py`); the trainer runs end to end with each switch on CPU. `reinforce`, `ipo` and `leave_one_out` have no GPU benchmark behind them in this repository yet. Not implemented, because they need a second model or a different loop: learned or Monte Carlo value baselines (VinePPO 2410.01679: better credit assignment at 2 to 5 times the cost per step), a decoupled proximal policy for high staleness (AReaL 2505.24298), sequence-level tapered weights for offline data (TOPR 2503.14286).
 
 Every step logs what to watch: `reward` and `rewards/*`, `policy/abs_ratio_dev` and `policy/mismatch_k3` (sampler/trainer agreement; a rise precedes collapse), `policy/clipped`, `policy/seq_masked`, `policy/entropy`, `groups/zero_variance`, `truncated`, `skipped`, and the time split (`time/rollout`, `time/train`). Rollout diagnostics: `engine/seqs_mean` (sequences decoding at once), `engine/tail_s` (time with under a quarter of the peak left), `engine/prefix_hit` and `engine/prefill_tokens`, `groups/continued`. `logging.dump_trajectories: N` writes every Nth batch (turns, tool calls and outputs, rewards, per-turn timing, zero-variance groups too) and the engine's concurrency timeline to `<output_dir>/rollouts/`: read it before tuning anything.
 
