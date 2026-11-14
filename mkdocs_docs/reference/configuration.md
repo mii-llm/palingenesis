@@ -13,7 +13,7 @@
 | `torch_dtype` | str | `bfloat16` | Weight precision. Options: `bfloat16`, `float16`, `float32`. bf16 recommended for A100+. |
 | `attn_implementation` | str | `sdpa` | Attention backend. `sdpa` works everywhere (packing included); `flash_attention_2` (if installed; otherwise training stops with a config error before loading the model) packs without an explicit mask; a Hub kernel `org/repo[@revision]` loaded through the `kernels` package, e.g. `kernels-community/aiter-flash-attn@v2` on [AMD GPUs](../getting-started/amd.md); `eager` for debugging. |
 | `use_liger_kernel` | bool | `true` | Liger's fused Triton kernels (RMSNorm, SwiGLU, RoPE, ...) for the model's `model_type`. Applied only when `compile` is false: torch.compile fuses the same ops (faster in our measurements) and cannot trace Liger's kernels. |
-| `compile` | bool | `true` | `torch.compile` each transformer layer. First step is slow (compilation), then 20-40% faster. |
+| `compile` | bool | `true` | `torch.compile` each transformer layer. First step is slow (compilation), then 20-40% faster on fixed-shape batches. Measure it on long rows of varying length: on Qwen3.5-0.8B with agentic traces of up to 16k tokens (H100) it was 15% slower than `compile: false` with Liger's kernels (19.4k vs 22.9k tokens/s over 400 steps). |
 | `compile_backend` | str | `inductor` | Compiler backend. `inductor` (default, fastest), `aot_eager` (debugging). |
 | `compile_mode` | str | `default` | Compile optimization level. `default`, `reduce-overhead` (small batches), `max-autotune` (5-15% faster, longer compile). |
 
