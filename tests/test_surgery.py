@@ -289,7 +289,9 @@ def test_saved_checkpoint_reproduces_measured_margins(setup, bf16_source):
     for dose in rep["doses"]:
         model = _load(dose["path"], torch.bfloat16)
         assert all(p.dtype == torch.bfloat16 for p in model.parameters())
-        measured = surgery.eval_margins(MarginReader(model, tok, device="cpu"), sets, micro_batch=4)["dev"]
+        # on the device the edit ran on: bf16 kernels differ in the last bits between CPU and GPU
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        measured = surgery.eval_margins(MarginReader(model.to(device), tok, device=device), sets, micro_batch=4)["dev"]
         assert measured == rep["eval"]["dev"][f"dose_{dose['alpha']:g}"]  # exactly the weights that were measured
     assert rep["doses"][1]["edit_survival"]["projection"] > 0.5  # dose 2 survives stochastic rounding too
 
