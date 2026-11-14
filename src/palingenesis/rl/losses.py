@@ -15,6 +15,12 @@ distribution actually sampled from), advantages A and aggregation weights w:
   icepop     -Σ w · S · 1[ρ ∈ [lo, hi]] · sg ρ · A · lp                    (INTELLECT-3)
   gspo       per sequence s = exp(mean_t log ρ), -Σ_seq w · min(s A, clip(s, 1±ε) A)
              (gradient s · A · mean_t ∇lp where unclipped)                  (Qwen GSPO)
+  ipo        -Σ w · S · 1[|e^lp - e^μ| ≤ ε] · min(sg ρ, C) · A · lp       (probability-difference mask)
+  reinforce  -Σ w · S · A · lp                                             (score function, on-policy only)
+
+reinforce leaves ρ out: its gradient is the policy gradient only when the tokens were sampled from π_θ, which the
+configuration guarantees (rollout.max_staleness 0, no forced tokens); ρ is still measured and logged, and S still
+drops a trajectory the sampler and the trainer disagree on.
 
 S is the sequence mask (Trust Region Masking): a trajectory whose mean |ρ - 1| exceeds
 loss.seq_mask is dropped whole, since token-level clipping cannot bound a long sequence's
@@ -284,6 +290,14 @@ def policy_loss(
         elif config.type == "icepop":
             clipped = (ratio < config.icepop_low) | (ratio > config.icepop_high)
             coef = (~clipped).float() * ratio * advantage
+        elif config.type == "ipo":
+            clipped = (lp.detach().exp() - behaviour.exp()).abs() > config.ipo_eps
+            coef = (~clipped).float() * capped * advantage
+        elif config.type == "reinforce":
+            if forced is not None and bool(forced.any()):
+                raise ValueError("loss.type reinforce cannot train forced tokens (they need an importance weight)")
+            clipped = torch.zeros_like(ratio, dtype=torch.bool)
+            coef = advantage
         else:
             raise ValueError(f"unknown loss.type {config.type!r}")
         coef = coef * s_mask
@@ -343,10 +357,13 @@ def mismatch_metrics(values: dict[str, float]) -> dict[str, float]:
 # ------------------------------------------------------- advantages & weights
 
 
-def assign_advantages(groups, std: str = "batch", eps: float = 1e-6, reduce=None) -> dict[str, float]:
-    """Group-relative advantages in place: reward minus the mean of the group's scored rollouts,
-    divided by the batch's std of those values ("batch"), the group's ("group"), or not.
-    `reduce` sums a list of floats over data-parallel ranks (the batch spans them).
+def assign_advantages(
+    groups, std: str = "batch", eps: float = 1e-6, reduce=None, baseline: str = "mean"
+) -> dict[str, float]:
+    """Group-relative advantages in place: reward minus the group's baseline, divided by the batch's std of those
+    values ("batch"), the group's ("group"), or not. The baseline is the mean reward of the group's scored rollouts
+    ("mean") or of the other scored rollouts ("leave_one_out": n / (n - 1) x the former; a rollout alone in its
+    group has no baseline and gets 0). `reduce` sums a list of floats over data-parallel ranks (the batch spans them).
     """
     centered = []
     for group in groups:
@@ -354,8 +371,9 @@ def assign_advantages(groups, std: str = "batch", eps: float = 1e-6, reduce=None
         if not scored:
             continue
         mean = sum(t.reward for t in scored) / len(scored)
+        scale = len(scored) / (len(scored) - 1) if baseline == "leave_one_out" and len(scored) > 1 else 1.0
         for t in group:
-            t.advantage = t.reward - mean if t.scored else 0.0
+            t.advantage = (t.reward - mean) * scale if t.scored else 0.0
         if std == "group":
             sd = math.sqrt(sum(t.advantage**2 for t in scored) / len(scored))
             for t in scored:

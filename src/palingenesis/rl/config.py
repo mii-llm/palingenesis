@@ -17,7 +17,8 @@ import yaml
 
 from palingenesis.cmr import CMRConfig
 
-LOSSES = ("masked_is", "cispo", "icepop", "gspo")
+LOSSES = ("masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce")
+BASELINES = ("mean", "leave_one_out")
 ADVANTAGE_STD = ("batch", "group", "none")
 AGGREGATIONS = ("prompt", "token", "constant")
 TRUNCATION = ("score", "mask")
@@ -72,7 +73,7 @@ class RLDataConfig:
     eval_size: int = 0
     # Rows whose rendered prompt is longer are dropped (0 = keep all that fit the context).
     max_prompt_tokens: int = 0
-    # Retire a prompt once its running mean reward reaches this (0 = never). With a 0/1
+    # Retire a prompt once a group's mean reward reaches this (0 = never). With a 0/1
     # reward, 0.9 retires prompts the policy has learned (ScaleRL's no-positive-resampling).
     retire_above: float = 0.0
     # Retry queue (0 = off; PromptSampler). Delays count policy versions (training steps), not draws: a training group
@@ -215,6 +216,12 @@ class RLLossConfig:
     # cispo:     sg(min(ratio, is_cap)) · A · log π, no mask (MiniMax-M1, ScaleRL).
     # icepop:    ratio · A inside [icepop_low, icepop_high], zero outside (INTELLECT-3).
     # gspo:      sequence-level ratio (geometric mean) with a tight clip (Qwen GSPO).
+    # ipo:       min(ratio, is_cap) · A where |π - μ| <= ipo_eps, zero outside: a trust region on the probability
+    #            difference, not the ratio (a ratio mask drops a rare token moving 0.01 -> 0.06 and keeps a likely
+    #            one falling 0.9 -> 0.2).
+    # reinforce: A · log π, the score-function estimator: no importance ratio, no clip. Unbiased only for samples of
+    #            the policy being trained, so it needs rollout.max_staleness 0 and no think-skip (refused otherwise);
+    #            the sampler/trainer numerical mismatch is not corrected, only guarded by seq_mask.
     type: str = "masked_is"
     eps_low: float = 0.2
     eps_high: float = 0.28
@@ -222,10 +229,17 @@ class RLLossConfig:
     icepop_low: float = 0.5
     icepop_high: float = 5.0
     gspo_eps: float = 4e-3
+    ipo_eps: float = 0.3
     # Sequence mask: drop a trajectory whose mean |ratio - 1| over its tokens exceeds this
     # (Trust Region Masking, "SER"; 0 = off). Guards against sampler/trainer mismatch.
     seq_mask: float = 0.1
-    # Advantage = reward - group mean, divided by the std of the batch / of the group / not.
+    # The group baseline subtracted from a rollout's reward: "mean" (of the group's scored rollouts, itself included)
+    # or "leave_one_out" (of the others: RLOO, the baseline is independent of the rollout it is subtracted from).
+    # reward - leave-one-out mean = n / (n - 1) x (reward - mean) for a group of n scored rollouts: the same
+    # direction, and a different estimator only where n varies between groups (failed rollouts) or the scale is kept
+    # (advantage_std none); advantage_std group cancels it (refused).
+    baseline: str = "mean"
+    # Advantage = reward - baseline, divided by the std of the batch / of the group / not.
     advantage_std: str = "batch"
     # prompt: mean over tokens within a prompt's group, then over prompts (ScaleRL);
     # token: mean over all tokens (DAPO); constant: sum / (sequences x max tokens) (Dr. GRPO).
@@ -583,6 +597,36 @@ class RLConfig:
 
         if loss.type not in LOSSES:
             errors.append(f"loss.type must be one of {LOSSES}, got {loss.type!r}.")
+        if loss.baseline not in BASELINES:
+            errors.append(f"loss.baseline must be one of {BASELINES}, got {loss.baseline!r}.")
+        if loss.baseline == "leave_one_out" and loss.advantage_std == "group":
+            errors.append(
+                "loss.baseline leave_one_out with loss.advantage_std group does nothing: the leave-one-out advantage "
+                "is n / (n - 1) x the mean-baseline one, and the group's std divides that factor out. Use "
+                "advantage_std batch or none."
+            )
+        if loss.type == "reinforce":
+            if r.max_staleness > 0:
+                errors.append(
+                    "loss.type reinforce has no importance ratio: it is unbiased only on samples of the policy being "
+                    f"trained, and rollout.max_staleness {r.max_staleness} trains on samples of older versions. Set "
+                    "rollout.max_staleness 0, or use cispo (the same estimator with the ratio, capped at is_cap)."
+                )
+            if r.think_skip:
+                errors.append(
+                    "loss.type reinforce cannot train rollout.think_skip: the forced token was not sampled from the "
+                    "policy and needs its importance weight. Use masked_is or cispo."
+                )
+            if r.kv_cache_dtype or r.quantization:
+                warnings.append(
+                    "loss.type reinforce with FP8 rollouts (rollout.kv_cache_dtype / quantization): the sampler is a "
+                    "quantized policy and reinforce does not correct for it (seq_mask only drops the worst "
+                    "trajectories); cispo applies the ratio."
+                )
+        if not 0 < loss.ipo_eps < 1:
+            errors.append(
+                f"loss.ipo_eps is a bound on |π - μ| (probabilities): it must be in (0, 1), got {loss.ipo_eps}."
+            )
         if loss.advantage_std not in ADVANTAGE_STD:
             errors.append(f"loss.advantage_std must be one of {ADVANTAGE_STD}, got {loss.advantage_std!r}.")
         if loss.aggregation not in AGGREGATIONS:

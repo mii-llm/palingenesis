@@ -89,6 +89,101 @@ def test_cispo_icepop_gspo_and_sequence_mask():
     assert (grad[:2] == 0).all() and stats["seq_masked"] == 1  # whole sequence dropped
 
 
+def test_reinforce_is_the_score_function_estimator_without_a_ratio():
+    config = RLLossConfig(type="reinforce", seq_mask=0.0)
+    lp = torch.tensor([-1.0, -2.0, -0.5, -0.3])
+    seq = torch.tensor([0, 0, 1, 1])
+    advantage = torch.tensor([1.0, 1.0, -2.0, -2.0])
+    behaviour = lp - torch.tensor([0.5, 0.0, 0.0, -0.5])  # ratios e^0.5, 1, 1, e^-0.5: ignored
+    x = lp.clone().requires_grad_(True)
+    loss, stats = policy_loss(x, behaviour, advantage, torch.ones(4), seq, 2, torch.tensor([2.0, 2.0]), config)
+    loss.backward()
+    assert loss.item() == pytest.approx(1.4)  # -(1·-1 + 1·-2 + -2·-0.5 + -2·-0.3)
+    assert torch.equal(x.grad, -advantage) and stats["clipped"] == 0
+    assert stats["ratio_max"].item() == pytest.approx(math.exp(0.5))  # still measured
+    # the sequence mask still drops a trajectory the sampler and the trainer disagree on
+    grad, stats = _loss_grad(RLLossConfig(type="reinforce", seq_mask=0.1), lp, behaviour, advantage, seq, 2)
+    assert torch.equal(grad, torch.zeros(4)) and stats["seq_masked"] == 2
+    with pytest.raises(ValueError, match="forced"):  # a forced token needs its importance weight
+        policy_loss(
+            x, behaviour, advantage, torch.ones(4), seq, 2, torch.tensor([2.0, 2.0]), config, torch.tensor([True] * 4)
+        )
+
+
+def test_ipo_masks_on_the_probability_difference():
+    lp = torch.tensor([0.06, 0.2, 0.5, 0.5]).log()
+    behaviour = torch.tensor([0.01, 0.9, 0.5, 0.1]).log()  # |π - μ| = 0.05, 0.7, 0, 0.4; ratios 6, 0.22, 1, 5
+    seq = torch.tensor([0, 0, 1, 1])
+    advantage = torch.tensor([1.0, 1.0, -2.0, 1.0])
+    grad, stats = _loss_grad(RLLossConfig(type="ipo", seq_mask=0.0), lp, behaviour, advantage, seq, 2)
+    # token 0 is kept (a ratio mask would drop it) with its ratio capped at is_cap; 1 and 3 moved more than ipo_eps
+    assert torch.allclose(grad, torch.tensor([-5.0, 0.0, 2.0, 0.0])) and stats["clipped"] == 2
+    grad, _ = _loss_grad(RLLossConfig(type="ipo", ipo_eps=0.45, seq_mask=0.0), lp, behaviour, advantage, seq, 2)
+    assert torch.allclose(grad, torch.tensor([-5.0, 0.0, 2.0, -5.0]))
+    grad, _ = _loss_grad(RLLossConfig(type="icepop", seq_mask=0.0), lp, behaviour, advantage, seq, 2)
+    assert grad[0] == 0  # ratio 6 > icepop_high
+
+
+@pytest.mark.parametrize("kind", ["masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce"])
+def test_every_objective_is_the_policy_gradient_on_policy(kind):
+    """On samples of the policy itself each objective's gradient is the exact policy gradient of the expected reward
+    (every action enumerated, weighted by its probability), and a step along it raises the expected reward."""
+    theta = torch.tensor([0.3, -0.2, 0.1, 0.0], requires_grad=True)
+    reward = torch.tensor([1.0, 0.0, 0.25, -0.5])
+    expected = (torch.softmax(theta, 0) * reward).sum()
+    (exact,) = torch.autograd.grad(expected, theta)
+    lp = torch.log_softmax(theta, 0)
+    prob = lp.detach().exp()
+    advantage = reward - (prob * reward).sum()  # any baseline: its term has zero expectation
+    seq = torch.arange(4)  # one-token sequences, so gspo's sequence ratio is the token ratio
+    loss, stats = policy_loss(lp, lp.detach(), advantage, prob, seq, 4, torch.ones(4), RLLossConfig(type=kind))
+    (grad,) = torch.autograd.grad(loss, theta)
+    assert torch.allclose(-grad, exact, atol=1e-6) and stats["clipped"] == 0
+    stepped = (torch.softmax(theta.detach() - 0.1 * grad, 0) * reward).sum()
+    assert stepped > expected
+
+
+def test_leave_one_out_baseline():
+    groups = [[_traj(1.0), _traj(0.0), _traj(0.0)], [_traj(1.0), _traj(0.0), _traj(5.0, scored=False)], [_traj(3.0)]]
+    assign_advantages(groups, "none", baseline="leave_one_out")
+    assert [t.advantage for t in groups[0]] == pytest.approx([1.0, -0.5, -0.5])  # 1 - mean(0, 0); 0 - mean(1, 0)
+    assert [t.advantage for t in groups[1]] == pytest.approx([1.0, -1.0, 0.0])  # the unscored rollout is no baseline
+    assert groups[2][0].advantage == 0.0  # alone: no baseline
+    assign_advantages(groups, "none")
+    assert [t.advantage for t in groups[0]] == pytest.approx([2 / 3, -1 / 3, -1 / 3])  # x (n - 1) / n
+    # the group's std divides the factor out: the same advantages as the mean baseline
+    assign_advantages(groups, "group")
+    mean_baseline = [t.advantage for g in groups for t in g]
+    assign_advantages(groups, "group", baseline="leave_one_out")
+    assert [t.advantage for g in groups for t in g] == pytest.approx(mean_baseline, abs=1e-5)
+
+
+def test_objective_options_are_validated(tmp_path):
+    path = tmp_path / "rl.yaml"
+    path.write_text("model: {policy: m}\ndata: {dataset: d.jsonl}\nrewards: {correct: math}\n")
+
+    def errors(**options):
+        config = RLConfig.from_yaml(path)
+        for key, value in options.items():
+            config.set(key.replace("__", "."), value)
+        return config.validate()
+
+    assert errors(loss__type="reinforce") == [] and errors(loss__type="ipo", loss__baseline="leave_one_out") == []
+    with pytest.raises(RLConfigError, match="reinforce has no importance ratio.*max_staleness 1"):
+        errors(loss__type="reinforce", rollout__max_staleness=1)
+    with pytest.raises(RLConfigError, match="reinforce cannot train rollout.think_skip"):
+        errors(loss__type="reinforce", rollout__think_skip=0.25)
+    assert any("FP8" in w for w in errors(loss__type="reinforce", rollout__kv_cache_dtype="fp8"))
+    with pytest.raises(RLConfigError, match="loss.baseline must be one of"):
+        errors(loss__baseline="loo")
+    with pytest.raises(RLConfigError, match="leave_one_out with loss.advantage_std group does nothing"):
+        errors(loss__baseline="leave_one_out", loss__advantage_std="group")
+    with pytest.raises(RLConfigError, match="ipo_eps"):
+        errors(loss__ipo_eps=1.5)
+    with pytest.raises(RLConfigError, match="loss.type must be one of"):
+        errors(loss__type="ppo")
+
+
 def _traj(reward, tokens=3, scored=True, trained=True, group=0):
     t = Trajectory({}, group, [1], [], tokens=[5] * tokens, mask=[True] * tokens, logprobs=[0.0] * tokens)
     t.reward, t.scored, t.trained = reward, scored, trained
@@ -963,6 +1058,46 @@ def test_trainer_logs_kl_to_reference_and_families(tmp_path):
         assert torch.allclose(ref[name].float(), p.detach().float(), atol=1e-2), name
 
 
+@pytest.mark.parametrize("kind", ["reinforce", "ipo"])
+def test_trainer_switches_objective_and_baseline(tmp_path, kind):
+    from palingenesis.rl.trainer import RLTrainer
+
+    rows = [{"prompt": f"What is {i} plus {i + 1}?", "answer": str(2 * i + 1)} for i in range(20)]
+    (tmp_path / "data.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    config = RLConfig()
+    for key, value in {
+        "model.policy": tiny_policy(tmp_path),
+        "model.use_liger_kernel": False,
+        "model.chat_template_kwargs": {"enable_thinking": False},
+        "data.dataset": str(tmp_path / "data.jsonl"),
+        "rollout.backend": "hf",
+        "rollout.batch_prompts": 3,
+        "rollout.group_size": 3,
+        "rollout.max_new_tokens": 8,
+        "rewards.m.fn": "math",
+        "rewards.m.weight": 0.0,
+        "train.output_dir": str(tmp_path / "run"),
+        "train.steps": 2,
+        "train.learning_rate": 1e-3,
+        "train.warmup_steps": 1,
+        "train.save_final": False,
+        "loss.type": kind,
+        "loss.baseline": "leave_one_out",
+        "loss.advantage_std": "none",
+    }.items():
+        config.set(key, value)
+    trainer = RLTrainer(config, rewards=[lambda completion: len(completion) / 40])
+    before = [p.detach().clone() for p in trainer.model.parameters()]
+    logged = []
+    trainer._log = lambda kind, metrics, step: logged.append((kind, dict(metrics)))
+    trainer.train()
+    steps = [m for kind, m in logged if kind == "step"]
+    assert len(steps) == 2 and all(m["trained_sequences"] > 0 and m["grad_norm"] > 0 for m in steps)
+    assert any(not torch.equal(a, b.detach()) for a, b in zip(before, trainer.model.parameters()))
+    # on-policy: every batch was sampled by the weights that train on it, so the ratio reinforce leaves out is 1
+    assert all(m["staleness"] == 0 and m["policy/abs_ratio_dev"] < 1e-3 and m["policy/clipped"] == 0 for m in steps)
+
+
 def test_kl_options_are_validated():
     config = RLConfig()
     config.set("loss.kl_coef", 0.1)
@@ -1337,6 +1472,8 @@ def test_sampler_counters_are_summed_over_ranks():
     out = trainer._combine(ranks[0])
     assert out["sampler/rows_tried"] == 40.0 and out["sampler/rows_solved_after_fail"] == 6.0
     assert out["groups/verifier_failed"] == 1 and out["reward"] == pytest.approx(0.3)
+    ranks[0]["policy/ratio_max"], ranks[1]["policy/ratio_max"] = 1.5, 4.0
+    assert trainer._combine(ranks[0])["policy/ratio_max"] == 4.0  # a maximum over the batch, not a mean over ranks
 
 
 # ------------------------------------------------- checkpoint save: memory, barriers

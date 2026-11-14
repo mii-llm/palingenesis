@@ -446,7 +446,9 @@ class RLTrainer:
         nothing to train on)."""
         loss_config = self.config.loss
         reduce = self.parallel.sum if self.parallel.world > 1 else None
-        advantage_stats = assign_advantages(groups, loss_config.advantage_std, reduce=reduce)
+        advantage_stats = assign_advantages(
+            groups, loss_config.advantage_std, reduce=reduce, baseline=loss_config.baseline
+        )
         weights = token_weights(
             groups,
             loss_config.aggregation,
@@ -780,6 +782,9 @@ class RLTrainer:
         combined = mean_stats(per_rank)
         for key in _SUMMED & combined.keys():
             combined[key] = sum(s.get(key, 0.0) for s in per_rank)
+        for key in combined:
+            if key.endswith("_max"):  # a maximum over the batch (policy/ratio_max, policy/kl_ref_max), not a rate
+                combined[key] = max(s[key] for s in per_rank if key in s)
         return combined
 
     def evaluate(self) -> dict[str, float]:
