@@ -26,7 +26,7 @@ echo "└───────────────────────�
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 torchrun \
     --standalone \

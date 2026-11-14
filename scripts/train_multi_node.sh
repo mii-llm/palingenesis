@@ -4,7 +4,9 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # For clusters WITHOUT SLURM (e.g., cloud VMs, bare-metal servers).
-# Run this script on EACH node. All nodes must be able to reach MASTER_ADDR.
+# Run this script on EACH node. All nodes must be able to reach MASTER_ADDR, and
+# train.output_dir, data.pretokenize_path and the data must be on a filesystem they share.
+# If a node's processes fail, stop the script on the other nodes too: nothing does it for you.
 #
 # Usage (run on each node):
 #   # Node 0 (master):
@@ -49,8 +51,10 @@ echo "└───────────────────────�
 # ── NCCL / CUDA ──────────────────────────────────────────────────────────────
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_IB_TIMEOUT=120
+# Abort the process on an NCCL error instead of waiting in the collective
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# InfiniBand ACK timeout, an exponent: 4.096 us x 2^22 = 17 s per retry (valid 1-22)
+export NCCL_IB_TIMEOUT=22
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 # ── Launch ────────────────────────────────────────────────────────────────────

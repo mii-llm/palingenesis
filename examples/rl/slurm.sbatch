@@ -1,9 +1,11 @@
 #!/bin/bash
 # Multi-node RL: one torchrun agent per node, one rank per GPU, FSDP2 policy + one colocated
-# vLLM engine per rank. Submit with:  sbatch examples/rl/slurm.sbatch configs/rl_math.yaml
+# vLLM engine per rank. Submit with (logs/ must exist: Slurm opens the log file before this runs):
+#   mkdir -p logs && sbatch examples/rl/slurm.sbatch configs/rl_math.yaml
 #
-# Preemption / time limit: Slurm sends SIGUSR1 ten minutes before the end; the trainer saves a
-# resumable checkpoint and exits, and `--train.resume_from auto` continues from it on requeue.
+# Preemption / time limit: Slurm sends SIGUSR1 ten minutes before the end; torchrun forwards it,
+# the trainer finishes its step, saves a resumable checkpoint and exits, and
+# `--train.resume_from auto` continues from it on requeue.
 
 #SBATCH --job-name=pgs-rl
 #SBATCH --nodes=2
@@ -22,6 +24,12 @@ shift
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_PORT=$(( 20000 + SLURM_JOB_ID % 20000 ))
 export OMP_NUM_THREADS=8
+# srun does not inherit --cpus-per-task from sbatch (Slurm >= 22.05): without this the torchrun
+# task and its workers are confined to one core.
+export SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"
+# torchrun stops its workers 30 s after forwarding a signal by default: not enough to finish the
+# step and write the checkpoint. Nine of the ten minutes Slurm gives (--signal=USR1@600).
+export TORCH_ELASTIC_SHUTDOWN_TIMEOUT=540
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
 srun --label --kill-on-bad-exit=1 \
