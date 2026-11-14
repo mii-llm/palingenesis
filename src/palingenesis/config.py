@@ -255,6 +255,28 @@ class ParallelConfig:
 
 
 @dataclass(slots=True)
+class MoEConfig:
+    """Mixture-of-Experts models (palingenesis.moe); ignored for models without MoE layers."""
+
+    # Router balancing and routing statistics. false: the routers train on the task loss alone.
+    balance: bool = True
+    # Coefficient of the load-balancing loss, measured over the global batch (every rank and
+    # micro-batch of the optimizer step). -1: the model config's router_aux_loss_coef, at most
+    # 0.01; 0: off.
+    balance_loss_coef: float = -1.0
+    # Coefficient of the router z-loss (ST-MoE used 0.001); 0: off.
+    z_loss_coef: float = 0.0
+    # Auxiliary-loss-free balancing: step size of the selection bias, for routers that have one in
+    # their checkpoint (DeepSeek-V3 family). -1: 0.001 for those models, off for the others; 0: off.
+    bias_update_rate: float = -1.0
+    # Also log the per-layer loads and router entropies (moe/layer_<i>/...).
+    log_layers: bool = False
+    # Expert compute: "auto" (transformers' default: grouped GEMM where available), "grouped" (this
+    # library's sort-free dispatch and grouped GEMM), or a transformers name (eager, grouped_mm, batched_mm).
+    experts_implementation: str = "auto"
+
+
+@dataclass(slots=True)
 class MemoryConfig:
     """Memory optimizations for ultra-long sequences."""
 
@@ -443,6 +465,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    moe: MoEConfig = field(default_factory=MoEConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     dpo: DPOConfig = field(default_factory=DPOConfig)
