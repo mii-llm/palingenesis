@@ -83,6 +83,22 @@ def test_tree_equals_every_branch_as_its_own_sequence(arch, chunk_size, branch_t
 
 
 @pytest.mark.parametrize("arch", MODELS)
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_tree_under_activation_checkpointing(arch, mode):
+    """One-token forwards (a one-token branch, adjacent starts) advance the convolution state in
+    place; the layers' recomputation in the backward must start from the state the forward did."""
+    from palingenesis.kernels import apply_activation_checkpointing
+
+    trunk, branches, targets, weights = _tree()
+    _, want = _naive(MODELS[arch](), trunk, branches, targets, weights)
+    model = MODELS[arch]()
+    apply_activation_checkpointing(model, mode=mode)
+    _, got = _treed(model, trunk, branches, targets, weights, chunk_size=16)
+    strip = lambda d: {n.replace("_checkpoint_wrapped_module.", ""): g for n, g in d.items()}  # noqa: E731
+    assert _max_rel_err(strip(got), want) < TOL[arch]
+
+
+@pytest.mark.parametrize("arch", MODELS)
 def test_gradient_reaches_the_trunk(arch):
     """Dropping the trunk's relay (branches trained on a frozen context) is measurably different:
     the exactness above is not an accident of tiny contributions."""

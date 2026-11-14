@@ -86,6 +86,20 @@ def test_packing_sequential_short_stream_yields_partial():
     assert blocks[0]["input_ids"].tolist() == [1, 2, 3, 4, 5], "sequential preserves arrival order"
 
 
+def test_packing_carries_the_unlikelihood_targets():
+    """data.repeat_unlikelihood / stop_unlikelihood targets stay aligned with their documents; a
+    document without them gets none."""
+    with_targets = _seq([1, 2, 3])
+    with_targets["repeat_targets"] = torch.tensor([-100, 7, -100])
+    with_targets["stop_targets"] = torch.tensor([-100, -100, 9])
+    blocks = list(PackedDataset([with_targets, _seq([4, 5])], max_len=64, eos_id=0, sort_buffer=0))
+    assert blocks[0]["input_ids"].tolist() == [1, 2, 3, 4, 5]
+    assert blocks[0]["repeat_targets"].tolist() == [-100, 7, -100, -100, -100]
+    assert blocks[0]["stop_targets"].tolist() == [-100, -100, 9, -100, -100]
+    plain = list(PackedDataset([_seq([1, 2]), _seq([4, 5])], max_len=64, eos_id=0, sort_buffer=0))
+    assert "repeat_targets" not in plain[0]
+
+
 def test_packing_empty_base_yields_nothing():
     assert list(PackedDataset([], max_len=64, eos_id=0, sort_buffer=256)) == []
 

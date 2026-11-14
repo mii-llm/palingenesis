@@ -520,8 +520,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     apply_activation_checkpointing(model, mode=config.train.gradient_checkpointing)
 
     # ── Packing: documents must stay apart in every layer type (palingenesis.packing) ──
+    # SeCO runs every packed document as a row of its own (seco._packed_plan): nothing to check.
     flatten_packed = False
-    if config.data.packing:
+    if config.data.packing and not config.memory.seco:
         check_packing_support(model, config.model.attn_implementation)
         flatten_packed = accelerator.is_flash_varlen(config.model.attn_implementation) or has_linear_attention(model)
 
@@ -884,6 +885,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             raise ConfigError(
                 "memory.seco is verified on a single process only; multi-GPU (FSDP) SeCO is not "
                 "supported yet. Use parallel.context_parallel for multi-GPU long sequences."
+            )
+        if config.data.packing and router_balancer is not None:
+            raise ConfigError(
+                "memory.seco with data.packing does not support MoE router balancing (the packed documents are "
+                "backpropagated one after the other, and the balancing losses need every token's routing first). "
+                "Set data.packing: false, or moe.balance: false."
             )
         lm_head = _get_lm_head(model)
         if lm_head is None:
@@ -1442,6 +1449,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         kv_offload=config.memory.seco_kv_offload,
                         num_loss_chunks=lambda n: _dynamic_num_chunks(n, _loss_vocab_size),
                         stable_softmax=config.train.stable_softmax,
+                        position_ids=position_ids,  # packed rows: every document on its own
                         unlikely=[
                             (batch.get("repeat_targets"), config.data.repeat_unlikelihood),
                             (batch.get("stop_targets"), config.data.stop_unlikelihood),

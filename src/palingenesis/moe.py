@@ -87,6 +87,11 @@ def token_window(lo: int, hi: int, weight: float = 1.0):
         _WINDOW.reset(token)
 
 
+def routing_active() -> bool:
+    """A `RouterBalancer` is measuring the micro-batch being run."""
+    return _ACTIVE.get() is not None
+
+
 def sync_routing() -> None:
     """`RouterBalancer.sync()` of the micro-batch being run, if any: for forward-backward routines
     that run their own backward (SeCO), called once every token has been routed."""

@@ -54,6 +54,7 @@ from palingenesis.seco import (
     _attach_stores,
     _backbone,
     _chunk_attention,
+    _hold,
     _is_append_only,
     _leafify,
     _new_cache,
@@ -63,7 +64,6 @@ from palingenesis.seco import (
     _run,
     _seed_kv,
     _set_rng_state,
-    _snapshot,
     _state,
     _storable,
     _tensors,
@@ -290,7 +290,7 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
                 [_stacked([clones(leaves[boundary[i]][idx]) for i in group]) for idx in range(len(append))],
             )
             ids, positions = _padded(branches, group)
-        before = [_snapshot(layer) for layer in cache.layers]
+        before = _hold(cache, ids.shape[1])
         hidden = _run(backbone, ids, cache, positions)
         for layer, state in zip(cache.layers, before):  # activation checkpointing re-runs forwards
             _restore(layer, state)
@@ -304,7 +304,7 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
     for j in range(k - 1, -1, -1):
         lo, hi = bounds[j]
         cache = fresh_cache(lo, [clones(s) for s in leaves[j]])
-        before = [_snapshot(layer) for layer in cache.layers]
+        before = _hold(cache, hi - lo)
         with torch.random.fork_rng(devices=devices):
             _set_rng_state(rng_states[j], devices)
             hidden = _run(backbone, trunk_ids[:, lo:hi], cache)

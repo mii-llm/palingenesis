@@ -191,6 +191,22 @@ def test_exact_under_activation_checkpointing(arch, mode):
     assert _max_rel_err(strip(grads), full_grads) < TOL[arch]
 
 
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_one_token_chunks_under_activation_checkpointing(mode):
+    """A one-token chunk advances the Gated DeltaNet convolution state in place (transformers' decode
+    path); the layers' recomputation in the backward must start from the state the forward did."""
+    from palingenesis.kernels import apply_activation_checkpointing
+
+    ids, labels, mask = _batch(seq=9)
+    labels[:, 2:] = ids[:, 2:]
+    _, full_grads = _full(_qwen35(), ids, labels, mask)
+    model = _qwen35()
+    apply_activation_checkpointing(model, mode=mode)
+    _, grads = _chunked(model, ids, labels, chunk_size=1)
+    strip = lambda d: {n.replace("_checkpoint_wrapped_module.", ""): g for n, g in d.items()}  # noqa: E731
+    assert _max_rel_err(strip(grads), full_grads) < TOL["qwen35_hybrid"]
+
+
 def test_loss_denominator_scales_gradients():
     model = _gpt2()
     ids, labels, _ = _batch()
@@ -304,7 +320,6 @@ def test_config_validation():
     config.memory.seco = True
     config.validate()
     for section, field, value, match in [
-        ("data", "packing", True, "data.packing"),
         ("parallel", "context_parallel", True, "context_parallel"),
         ("memory", "gradient_release", True, "gradient_release"),
         ("plugins", "sym_noise", True, "sym_noise"),
@@ -317,6 +332,17 @@ def test_config_validation():
         setattr(getattr(bad, section), field, value)
         with pytest.raises(ConfigError, match=match):
             bad.validate()
+    # packed rows are supported (every document on its own), except with SpaCO and distillation
+    config.data.packing = True
+    config.data.repeat_unlikelihood = 20.0
+    config.validate()
+    config.memory.spaco_budget = 2
+    with pytest.raises(ConfigError, match="data.packing with memory.spaco_budget"):
+        config.validate()
+    config.memory.spaco_budget = 0
+    config.distill.enabled = True
+    with pytest.raises(ConfigError, match="data.packing with distill.enabled"):
+        config.validate()
 
 
 # ── every architecture: verification passes <=> gradients are exact ────────
@@ -542,3 +568,290 @@ def test_offload_budget_counts_only_attention_layers_of_a_hybrid():
     need = _offloaded_bytes(model.model, batch=1, seq_len=512, cast=torch.bfloat16)
     assert need == 2 * full_layers * cfg.num_key_value_heads * cfg.head_dim * 512 * 2
     assert full_layers < cfg.num_hidden_layers  # the point of a hybrid
+
+
+# ── the last chunk is run once ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("chunk_size,forwards", [(16, 9), (35, 3), (70, 1), (128, 1)])
+def test_last_chunk_is_not_run_in_stage_one(chunk_size, forwards):
+    """k chunks cost k - 1 no-grad forwards and k with grad: a sequence of one chunk is one forward."""
+    model = _gpt2()
+    ids, labels, _ = _batch()
+    calls = []
+    handle = model.base_model.register_forward_hook(lambda *_: calls.append(torch.is_grad_enabled()))
+    try:
+        result, _ = _chunked(model, ids, labels, chunk_size=chunk_size)
+    finally:
+        handle.remove()
+    assert len(calls) == forwards and sum(calls) == result.num_chunks == (forwards + 1) // 2
+
+
+def test_dropout_draws_on_between_calls():
+    """The last chunk draws its masks from the generator itself (it is not a replay), so the next
+    sequence does not start from the state the last chunk started from."""
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    torch.manual_seed(0)
+    model = GPT2LMHeadModel(GPT2Config(n_layer=2, n_head=2, n_embd=32, vocab_size=VOCAB, resid_pdrop=0.3)).train()
+    ids, labels, _ = _batch()
+    for chunk_size in (16, 128):
+        torch.manual_seed(7)
+        before = torch.get_rng_state()
+        _, first = _chunked(model, ids, labels, chunk_size=chunk_size)
+        assert not torch.equal(torch.get_rng_state(), before)
+        _, second = _chunked(model, ids, labels, chunk_size=chunk_size)
+        assert _max_rel_err(second, first) > 1e-3  # other masks
+
+
+# ── packed rows ────────────────────────────────────────────────────────────
+
+
+def _packed(rows=((37, 5, 6, 4, 20, 3), (9, 44, 12)), seed=5):
+    """Packed rows as PackedDataset and the collator build them: documents one after the other with
+    positions restarting at 0, the shorter row padded (padding: one more document, no labels). Every
+    document's first 2 tokens are a prompt without loss; the first document of every row also ends
+    with 3 tokens without loss."""
+    g = torch.Generator().manual_seed(seed)
+    width = max(sum(lengths) for lengths in rows)
+    ids = torch.zeros(len(rows), width, dtype=torch.long)
+    labels = torch.full((len(rows), width), IGNORE_INDEX)
+    pos = torch.zeros(len(rows), width, dtype=torch.long)
+    for r, lengths in enumerate(rows):
+        at = 0
+        for d, n in enumerate(lengths):
+            doc = torch.randint(1, VOCAB, (n,), generator=g)
+            ids[r, at : at + n] = doc
+            labels[r, at + 2 : at + n - (3 if d == 0 else 0)] = doc[2 : n - (3 if d == 0 else 0)]
+            pos[r, at : at + n] = torch.arange(n)
+            at += n
+        pos[r, at:] = torch.arange(width - at)
+    return ids, labels, pos
+
+
+def _documents(pos):
+    out = []
+    for r in range(pos.shape[0]):
+        starts = [0] + [i for i in range(1, pos.shape[1]) if pos[r, i] == 0]
+        out += [(r, lo, hi) for lo, hi in zip(starts, starts[1:] + [pos.shape[1]])]
+    return out
+
+
+def _per_document(model, ids, labels, pos, extra=None):
+    """Full backpropagation of every document as a sequence of its own, losses summed over one
+    denominator: what packed training is. extra(logits [n, V], row, lo, hi) adds a term."""
+    model.zero_grad()
+    shifted = shift_labels(labels, pos)
+    total = 0.0
+    for r, lo, hi in _documents(pos):
+        logits = model(input_ids=ids[r : r + 1, lo:hi]).logits[0].double()
+        total = total + torch.nn.functional.cross_entropy(
+            logits, shifted[r, lo:hi], ignore_index=IGNORE_INDEX, reduction="sum"
+        )
+        if extra is not None:
+            total = total + extra(logits, r, lo, hi)
+    denom = (shifted != IGNORE_INDEX).sum()
+    (total / denom).backward()
+    ce = total if extra is None else None
+    grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+    return (ce.item() / denom.item() if ce is not None else None), grads
+
+
+@pytest.mark.parametrize("arch", MODELS)
+@pytest.mark.parametrize("chunk_size", [4, 16, 40, 64])
+def test_packed_rows_equal_every_document_on_its_own(arch, chunk_size):
+    """Long documents chunk by chunk, short ones batched (padded rows): the gradient of the documents'
+    own full backpropagations, with no attention, state or position carried across documents."""
+    model = MODELS[arch]()
+    ids, labels, pos = _packed()
+    loss, expected = _per_document(model, ids, labels, pos)
+    result, grads = _chunked(model, ids, labels, chunk_size=chunk_size, position_ids=pos)
+    assert abs(result.loss - loss) < LOSS_TOL * loss
+    assert _max_rel_err(grads, expected) < TOL[arch]
+    assert result.backpropagated == result.num_chunks
+    # the documents ARE apart: treating the rows as single sequences gives another gradient
+    _, joined = _chunked(model, ids, labels, chunk_size=chunk_size)
+    assert _max_rel_err(joined, expected) > 1e-2
+
+
+def test_packed_plan():
+    from palingenesis.seco import _packed_plan
+
+    ids, labels, pos = _packed()
+    scored = shift_labels(labels, pos) != IGNORE_INDEX
+    chains, groups = _packed_plan(pos, scored, 16)
+    # cut after the last scored position: the row's first document loses its 3 unscored tokens and
+    # the token whose target is the next document's first; the padding (no labels) is dropped
+    assert chains == [(0, 0, 33), (0, 52, 71), (1, 9, 52)]
+    assert groups == [[(1, 53, 64)], [(0, 42, 47), (1, 0, 5), (0, 37, 41)], [(0, 48, 51), (0, 72, 74)]]
+    assert all(len(g) * (g[0][2] - g[0][1]) <= 16 for g in groups)
+    chains, groups = _packed_plan(pos, scored, 64)  # everything fits a chunk: batches only
+    assert not chains and sum(len(g) for g in groups) == 9
+    assert all(len(g) * (g[0][2] - g[0][1]) <= 64 for g in groups)
+
+
+def test_packed_rows_report_their_padding_and_chunks():
+    model = _gpt2()
+    ids, labels, pos = _packed()
+    result, _ = _chunked(model, ids, labels, chunk_size=16, position_ids=pos)
+    # chains of 33, 19 and 43 tokens: 3 + 2 + 3 chunks; three batches of one chunk each
+    assert result.num_chunks == 11
+    assert result.padding == (5 - 4) + (3 - 2)  # rows of 5, 5, 4 and of 3, 2 tokens
+
+
+@pytest.mark.parametrize("arch", MODELS)
+def test_packed_rows_with_unlikelihood_targets(arch):
+    model = MODELS[arch]()
+    ids, labels, pos = _packed()
+    repeat = torch.full_like(ids, IGNORE_INDEX)
+    # in a long document (two chunks apart), in a batched one, on a document's first token (dropped:
+    # nothing predicts it) and after a document's last label (keeps the tokens up to it)
+    repeat[0, [10, 30, 45, 52]] = torch.tensor([3, 50, 7, 11])
+    repeat[0, 36] = 9
+    weight = 5.0
+    shifted_repeat = shift_labels(repeat, pos)
+
+    def term(logits, r, lo, hi):
+        where = (shifted_repeat[r, lo:hi] != IGNORE_INDEX).nonzero().flatten()
+        p = torch.softmax(logits[where], -1).gather(-1, shifted_repeat[r, lo:hi][where].unsqueeze(-1)).squeeze(-1)
+        return weight * -torch.log1p(-p).sum()
+
+    _, expected = _per_document(model, ids, labels, pos, extra=term)
+    result, grads = _chunked(model, ids, labels, chunk_size=16, position_ids=pos, unlikely=[(repeat, weight)])
+    assert result.unlikely_n == (4,)
+    assert _max_rel_err(grads, expected) < TOL[arch]
+    ce, _ = _per_document(model, ids, labels, pos)
+    assert abs(result.loss - ce) < LOSS_TOL * ce  # logged: the CE only
+
+
+@pytest.mark.parametrize("arch", MODELS)
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_packed_rows_under_activation_checkpointing(arch, mode):
+    from palingenesis.kernels import apply_activation_checkpointing
+
+    ids, labels, pos = _packed()
+    _, expected = _per_document(MODELS[arch](), ids, labels, pos)
+    model = MODELS[arch]()
+    apply_activation_checkpointing(model, mode=mode)
+    _, grads = _chunked(model, ids, labels, chunk_size=16, position_ids=pos)
+    strip = lambda d: {n.replace("_checkpoint_wrapped_module.", ""): g for n, g in d.items()}  # noqa: E731
+    assert _max_rel_err(strip(grads), expected) < TOL[arch]
+
+
+def test_packed_rows_with_a_loss_function():
+    """loss_fn (distillation) is called per document, with its window counted in the flattened batch."""
+    model = _gpt2()
+    ids, labels, pos = _packed()
+    _, expected = _per_document(model, ids, labels, pos)
+    flat = shift_labels(labels, pos).reshape(-1)
+    head, seen = model.get_output_embeddings(), []
+
+    def loss_fn(hidden, lo, hi, denom):
+        assert hidden.shape[:2] == (1, hi - lo)
+        seen.append((lo, hi))
+        return (
+            torch.nn.functional.cross_entropy(
+                head(hidden[0]).double(), flat[lo:hi], ignore_index=IGNORE_INDEX, reduction="sum"
+            )
+            / denom
+        )
+
+    _, grads = _chunked(model, ids, labels, chunk_size=16, position_ids=pos, loss_fn=loss_fn)
+    assert _max_rel_err(grads, expected) < TOL["gpt2"]
+    covered = sorted(seen)  # every token of every document once (documents are kept whole)
+    assert covered[0][0] == 0 and covered[-1][1] == ids.numel()
+    assert all(a[1] == b[0] for a, b in zip(covered, covered[1:]))
+
+
+def test_packed_rows_equal_the_packed_forward():
+    """The same gradient as the trainer's packed forward (documents kept apart by the attention mask
+    built from position_ids), which SeCO does not use."""
+    from palingenesis.packing import PackedBatch
+
+    model = build("llama", attn="eager").eval()
+    model.config.use_cache = False  # as in training (with a cache, transformers builds a plain causal mask)
+    ids, labels, pos = _packed()
+    shifted = shift_labels(labels, pos)
+    batch = PackedBatch.build(ids, shifted, pos, flatten=False, attn_implementation="eager")
+    model.zero_grad()
+    logits = model(input_ids=batch.input_ids, **batch.forward_kwargs).logits.double()
+    loss = (
+        torch.nn.functional.cross_entropy(
+            logits.reshape(-1, VOCAB), shifted.reshape(-1), ignore_index=IGNORE_INDEX, reduction="sum"
+        )
+        / (shifted != IGNORE_INDEX).sum()
+    )
+    loss.backward()
+    expected = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+    result, grads = _chunked(model, ids, labels, chunk_size=16, position_ids=pos)
+    assert abs(result.loss - loss.item()) < LOSS_TOL * loss.item()
+    assert _max_rel_err(grads, expected) < 5e-6
+
+
+@pytest.mark.parametrize("attn", ["eager", "sdpa"])
+@pytest.mark.parametrize("arch", ARCHS)
+def test_architecture_packed_exact_if_verified(arch, attn):
+    """Packed rows on every architecture SeCO accepts (sliding windows, recurrent and convolutional
+    states, MoE, absolute positions): exact, with documents shorter and longer than a chunk."""
+    try:
+        model = build(arch, attn=attn).eval()
+    except Exception as exc:  # architecture absent from this transformers version
+        pytest.skip(f"cannot build {arch}: {type(exc).__name__}")
+    try:
+        verify_chunked_forward(model)
+    except NotImplementedError:
+        pytest.skip("rejected by the chunked-forward check")
+    ids, labels, pos = _packed()
+    try:
+        _, expected = _per_document(model, ids, labels, pos)
+        _, grads = _chunked(model, ids, labels, chunk_size=16, position_ids=pos)
+    except Exception as exc:
+        if _is_cpu_kernel_gap(exc):
+            pytest.skip("kernel unavailable on CPU")
+        raise
+    assert _max_rel_err(grads, expected) < _ARCH_TOL.get(arch, 1e-4 if arch in FP32_ONLY else 5e-6)
+
+
+@pytest.mark.parametrize("arch", ["llama", "qwen3_5"])
+def test_packed_rows_with_kv_offload(arch):
+    model = build(arch, attn="sdpa").eval()
+    ids, labels, pos = _packed()
+    _, expected = _per_document(model, ids, labels, pos)
+    _, grads = _chunked(model, ids, labels, chunk_size=16, position_ids=pos, kv_offload=True)
+    assert _max_rel_err(grads, expected) < _ARCH_TOL.get(arch, 5e-6)
+
+
+def test_packed_rows_refuse_spaco_and_router_balancing():
+    from palingenesis import moe
+
+    model = _gpt2()
+    ids, labels, pos = _packed()
+    with pytest.raises(ValueError, match="packed"):
+        chunkwise_forward_backward(model, ids, labels, chunk_size=16, budget=2, position_ids=pos)
+    token = moe._ACTIVE.set(object())  # a RouterBalancer is measuring this micro-batch
+    try:
+        with pytest.raises(NotImplementedError, match="router balancing"):
+            chunkwise_forward_backward(model, ids, labels, chunk_size=16, position_ids=pos)
+    finally:
+        moe._ACTIVE.reset(token)
+
+
+@pytest.mark.parametrize("chunk_size", [16, 64])
+def test_trainer_packed_seco_matches_packed_training(tmp_path, chunk_size):
+    """The training loop on packed blocks: with memory.seco the loss after a few steps is that of
+    plain packed training (it depends on the gradients of the steps before)."""
+    import distill_helpers as H
+
+    tok = H.tokenizer()
+    H.save_model(tmp_path / "student", tok)
+    data = H.write_rows(tmp_path / "rows.jsonl")
+    losses = {}
+    for seco in (False, True):
+        config = H.cpu_config(tmp_path / str(seco), tmp_path / "student", data, steps=3)
+        config.data.packing = True
+        config.data.max_seq_length = 96
+        config.train.gradient_accumulation_steps = 1
+        config.memory.seco = seco
+        config.memory.seco_chunk_size = chunk_size
+        losses[seco] = H.run_cpu(config).metrics["train/loss"]
+    assert losses[True] == pytest.approx(losses[False], rel=1e-4)

@@ -1986,7 +1986,9 @@ class PackedDataset(_Epochs, IterableDataset):
     def _doc(self, ex: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # Oversized documents are cut to max_len (the chat pipeline already keeps whole
         # turns within max_seq_length; this only guards other sources).
-        keys = ["input_ids", "labels"] + [k for k in ("loss_weights", "source_ids", POSITION_FIELD) if k in ex]
+        keys = ["input_ids", "labels"] + [
+            k for k in ("loss_weights", "source_ids", "repeat_targets", "stop_targets", POSITION_FIELD) if k in ex
+        ]
         doc = {k: ex[k][: self.max_len] for k in keys}
         pixels = {k: ex[k] for k in PIXEL_FIELDS if k in ex}
         if pixels and ex["input_ids"].numel() > self.max_len:
@@ -2004,6 +2006,9 @@ class PackedDataset(_Epochs, IterableDataset):
             docs = [
                 d if "loss_weights" in d else {**d, "loss_weights": (d["labels"] != IGNORE_INDEX).float()} for d in docs
             ]
+        for k in ("repeat_targets", "stop_targets"):  # unlikelihood targets: none in the documents without them
+            if any(k in d for d in docs):
+                docs = [d if k in d else {**d, k: torch.full_like(d["labels"], IGNORE_INDEX)} for d in docs]
         multimodal = any(POSITION_FIELD in d for d in docs)
         block = {k: torch.cat([d[k] for d in docs]) for k in docs[0] if k not in PIXEL_FIELDS and k != POSITION_FIELD}
         if multimodal:
