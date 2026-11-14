@@ -291,18 +291,22 @@ class SurgeryConfig:
                 e.append(f"eval.{name}.side must be pos, neg or both, not {ev.side!r}")
         if not _is_int(self.iterations) or self.iterations < 0:
             e.append("iterations must be an integer >= 0")
-        if not (0 < self.cutoff < 1):
+        numeric = {k: _is_number(getattr(self, k)) for k in ("cutoff", "trust", "cap", "min_gap", "stop_se")}
+        e += [f"{k} must be a number, not {getattr(self, k)!r}" for k, ok in numeric.items() if not ok]
+        if numeric["cutoff"] and not (0 < self.cutoff < 1):
             e.append("cutoff must be in (0, 1)")
-        if self.trust <= 0 or self.cap <= 0:
+        if numeric["trust"] and numeric["cap"] and (self.trust <= 0 or self.cap <= 0):
             e.append("trust and cap must be > 0")
         if self.trust_ref not in ("reference_distance", "absolute"):
             e.append(f"trust_ref must be reference_distance or absolute, not {self.trust_ref!r}")
         if self.trust_ref == "reference_distance" and not self.reference:
             e.append("trust_ref: reference_distance needs `reference:` (or trust_ref: absolute)")
-        if self.min_gap < 0 or self.stop_se < 0:
+        if numeric["min_gap"] and numeric["stop_se"] and (self.min_gap < 0 or self.stop_se < 0):
             e.append("min_gap and stop_se must be >= 0")
         if not self.doses or any(not _is_number(a) or a <= 0 for a in self.doses):
             e.append(f"doses must be a non-empty list of numbers > 0, not {self.doses!r}")
+        elif len({_dose_dir(float(a)) for a in self.doses}) != len(self.doses):
+            e.append(f"doses {self.doses!r} map to the same output directory (dose_<α>, 6 significant digits)")
         if self.gram not in GRAM_MODES:
             e.append(f"gram must be one of {GRAM_MODES}, not {self.gram!r}")
         if self.master not in ("device", "cpu"):
@@ -345,6 +349,16 @@ def _is_int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
 
 
+def _as_number(value):
+    """PyYAML reads 1e-3 (no dot) as a string: such a value becomes the float it spells; anything else is returned."""
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
 def _set_field(obj, name: str, value, where: str) -> None:
     names = [f.name for f in dataclasses.fields(obj)]
     if name not in names:
@@ -353,10 +367,12 @@ def _set_field(obj, name: str, value, where: str) -> None:
             f"{where}: unknown option {name!r}" + (f" (did you mean {hint[0]!r}?)" if hint else "")
         )
     current = getattr(obj, name)
+    if isinstance(current, float) or name in ("target", "doses"):
+        value = _as_number(value)
     if isinstance(current, float) and _is_int(value):
         value = float(value)
-    if name == "doses" and _is_number(value):
-        value = [value]
+    if name == "doses":
+        value = [_as_number(v) for v in value] if isinstance(value, list) else [value] if _is_number(value) else value
     setattr(obj, name, value)
 
 
@@ -461,12 +477,21 @@ def build_groups(tok, name: str, fam: FamilyConfig, config: SurgeryConfig) -> tu
 
 @contextlib.contextmanager
 def _mode(model, train: bool):
-    was = model.training
-    model.train(train)
+    """Evaluation mode, restored afterwards. `train` is for gradient checkpointing, which transformers applies only to
+    modules in training mode: the training flag is set on the checkpointing modules alone, so dropout (which each
+    submodule gates on its own flag) stays off and the gradients are those of the margins that are measured."""
+    modules = list(model.modules())
+    was = [m.training for m in modules]
+    model.train(False)
+    if train:
+        for m in modules:
+            if getattr(m, "gradient_checkpointing", False):
+                m.training = True
     try:
         yield
     finally:
-        model.train(was)
+        for m, t in zip(modules, was):
+            m.training = t
 
 
 def _reader(model, tok, reader=None) -> MarginReader:
@@ -925,7 +950,7 @@ class _Editor:
     def apply(self, step: list[torch.Tensor], scale: float) -> None:
         for i, m in enumerate(self.master):
             # device -> host must be blocking: a non_blocking copy into a fresh host tensor can still be in flight when
-            # add_ reads it (the CPU master then received partial steps; found on GPU in validation 561)
+            # add_ reads it (the CPU master then receives partial steps)
             m.add_(step[i].to(m.device, non_blocking=m.device.type != "cpu"), alpha=scale)
         self.refresh()
 
@@ -978,9 +1003,10 @@ def _empty_cache(device) -> None:
         torch.cuda.empty_cache()
 
 
-def _prepare_out(path: str, overwrite: bool, inputs: Sequence[str | None] = ()) -> Path:
+def _prepare_out(path: str, overwrite: bool, inputs: Sequence[str | None] = (), clear: bool = True) -> Path:
     """The (emptied) output directory. An output that is, or contains, a local input checkpoint is refused: replacing
-    it would delete the model before it is loaded."""
+    it would delete the model before it is loaded. clear=False runs the checks and keeps the content: a run that
+    fails before it has anything to write must not have deleted the previous results."""
     out = Path(path)
     target = out.resolve()
     for src in inputs:
@@ -991,7 +1017,8 @@ def _prepare_out(path: str, overwrite: bool, inputs: Sequence[str | None] = ()) 
     if out.exists() and any(out.iterdir()):
         if not overwrite:
             raise SurgeryConfigError(f"{out} exists and is not empty (overwrite: true to replace it)")
-        shutil.rmtree(out)
+        if clear:
+            shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -1010,7 +1037,8 @@ def run_surgery(config: SurgeryConfig) -> dict:
         raise SurgeryConfigError("; ".join(errors))
     t_start = time.time()
     timings: dict[str, float] = {}
-    out = _prepare_out(config.output_dir, config.overwrite, [config.model, config.reference])
+    inputs = [config.model, config.reference]
+    _prepare_out(config.output_dir, config.overwrite, inputs, clear=False)  # refuse now, replace when the doses exist
     device = torch.device(config.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     tok = AutoTokenizer.from_pretrained(config.model)
 
@@ -1263,6 +1291,7 @@ def run_surgery(config: SurgeryConfig) -> dict:
     if config.gradient_checkpointing and train_mode:
         model.gradient_checkpointing_disable()
     editor.freeze()
+    out = _prepare_out(config.output_dir, config.overwrite, inputs)
     doses = []
     save_model = None
     for alpha in config.doses:
@@ -1274,7 +1303,9 @@ def run_surgery(config: SurgeryConfig) -> dict:
             for i, p in enumerate(params):
                 x = editor.dose(i, alpha)
                 s = editor.saved(i, x)
-                before = editor.saved(i, theta0[i])  # θ0 as saved (itself when stored in the save dtype)
+                # against the stored θ0, not its save cast: θ0's own rounding error (fp32 source, 16-bit save) is
+                # not part of the edit, and counted as such it hides the edit (projection near 0)
+                before = theta0[i].to(device)
                 meter.update(before, x, s)
                 for fmt, m in served.items():  # q = served θ0; does the edit survive serving in fmt?
                     q = simulate_cast(before, fmt)
@@ -1375,8 +1406,20 @@ def run_surgery(config: SurgeryConfig) -> dict:
         "doses": doses,
         "timings": {k: round(v, 2) for k, v in timings.items()},
     }
-    (out / "surgery_report.json").write_text(json.dumps(report, indent=2))
+    (out / "surgery_report.json").write_text(json.dumps(_strict_json(report), indent=2, allow_nan=False))
     return report
+
+
+def _strict_json(value):
+    """Non-finite floats as null (the survival of a zero edit is nan): NaN is not JSON, and a report with it is
+    unreadable outside Python."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _strict_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strict_json(v) for v in value]
+    return value
 
 
 def _family_means(groups: list[Group], margins: list[torch.Tensor]) -> dict:
