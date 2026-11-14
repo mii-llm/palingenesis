@@ -768,6 +768,11 @@ def test_probe_reward_renders_tools_and_scores_a_prompt_once(chat, monkeypatch):
     values = S.probe_reward(prompts=prompts, probe="p", tools=[[tool]] * 4)
     assert values == pytest.approx(with_tools.tolist(), abs=1e-5)
     assert scored == [2]  # two distinct prompts among four rollouts
+    # rewards run in threads: rows are rendered under the scorer's lock, like the forward (the encoder is stateful)
+    encode, held = scorer.encoder.encode, []
+    monkeypatch.setattr(scorer.encoder, "encode", lambda row: held.append(scorer._lock.locked()) or encode(row))
+    scorer.probabilities([{"messages": prompts[0]}])
+    assert held == [True]
     assert S.probe_reward(prompts=prompts, probe="p") == pytest.approx(plain.tolist(), abs=1e-5)
 
 

@@ -120,19 +120,20 @@ class ProbeScorer:
                 "ProbeScorer: a *_all probe scores tokens, not rows; fit it at *_mean / *_last / last_prompt"
             )
         out = torch.full((len(rows),), float("nan"))
-        items = [(i, e) for i, row in enumerate(rows) if (e := self.encoder.encode(row)) is not None]
-        if not items:
-            return out
         device = next(self.model.parameters()).device
         pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else (self.tok.eos_token_id or 0)
-        with self._lock, Recorder(self.model, [self.probe.layer], stop=True, sites=self.sites) as rec:
-            for batch_items in _batches(items, self.batch_size, self.max_batch_tokens):
-                batch = collate([e for _, e in batch_items], pad)
-                rec.select = batch.select
-                run_backbone(self.model, batch.input_ids.to(device), batch.attention_mask.to(device))
-                z = self.probe.logit(rec.take()[self.probe.layer]).cpu()
-                for (b, _), v in zip(batch.owners, z):
-                    out[batch_items[b][0]] = v
+        with self._lock:  # the encoder keeps per-row state (its datasets, the drop counts): render under the lock too
+            items = [(i, e) for i, row in enumerate(rows) if (e := self.encoder.encode(row)) is not None]
+            if not items:
+                return out
+            with Recorder(self.model, [self.probe.layer], stop=True, sites=self.sites) as rec:
+                for batch_items in _batches(items, self.batch_size, self.max_batch_tokens):
+                    batch = collate([e for _, e in batch_items], pad)
+                    rec.select = batch.select
+                    run_backbone(self.model, batch.input_ids.to(device), batch.attention_mask.to(device))
+                    z = self.probe.logit(rec.take()[self.probe.layer]).cpu()
+                    for (b, _), v in zip(batch.owners, z):
+                        out[batch_items[b][0]] = v
         return out
 
     def probabilities(self, rows: Sequence[dict]) -> torch.Tensor:
