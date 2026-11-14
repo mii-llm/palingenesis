@@ -26,7 +26,16 @@ What you gain with full fine-tune:
 - The model can reorganize its internals to suit your task
 - No merge step, no adapter management, no serving complexity
 
-Our position: if the hardware supports full fine-tune (and with our optimizations, it almost always does), there's no reason to accept the LoRA compromise.
+Our position: full fine-tuning stays the default. If the hardware supports it (and with our optimizations, it usually does), it learns more from a given dataset.
+
+LoRA is available as a plugin ([LoRA guide](../guides/lora.md)) for the cases where it wins:
+
+- many per-task adapters on one base
+- models too large for full-weight gradients and optimizer state on the GPUs at hand
+- runs where keeping the base model's abilities matters more than learning the most (LoRA tends to forget less, when its learning rate and alpha are set well)
+- RL, where an episode carries little information and a low rank was reported to suffice
+
+LoRA saves the gradients and optimizer state of the base weights. It does not save activations, so long sequences still need checkpointing or SeCO.
 
 ---
 

@@ -135,7 +135,7 @@ Loss hooks run where the trainer has the student's forward in hand (SFT with chu
 
 - Modules added in `transform_model` exist before FSDP wraps the model: they are sharded, their gradients reduced and their weights checkpointed like the rest.
 - In the optimizer-step hooks, parameters and gradients are sharded DTensors. FSDP2 shards dimension 0, so `p.to_local()` holds whole rows: per-row and per-group statistics are local; a per-tensor statistic needs an all-reduce over `p.device_mesh.get_group()` (see `palingenesis.qat`).
-- `export_state_dict` receives the gathered full state on rank 0.
+- `export_state_dict` receives the gathered full state on rank 0; files to write next to the exported model go under `ctx.export_dir` (`final/`, `best/model/`).
 
 ### Example: a regulariser and a metric
 

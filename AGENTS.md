@@ -133,4 +133,5 @@ Use `--json` flag (where available) for structured output suitable for programma
 | Agent drifts on its own errors | OPD `sources.<name>.format: agent_traces` on the student's episodes + `onset_branches`, `error_patterns`, `cutoff_logp` |
 | Off-policy KD: teacher too large | `distill.teachers.<name>.placement: shard` (FSDP), or `pgs distill-cache` once and `cache: <dir>` |
 | Off-policy KD: "no teacher target" | rebuild the cache with the training config, or `distill.missing: skip` + `distill.ce_weight: 0.1` |
+| LoRA (many adapters, model too big for full-weight optimizer state) | `plugins.custom: [{class: palingenesis.lora:LoRA, args: {rank: 16, alpha: 32}}]`, `train.learning_rate` ~10x the full fine-tune's (see the LoRA guide) |
 | Off-policy KD: student copies the teacher's tail / rambles | `distill.divergence: reverse_kl` or `jsd`, add `distill.ce_weight` |
