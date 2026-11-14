@@ -15,6 +15,7 @@ mutual-exclusivity tests; here we verify their numerics.
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -382,3 +383,52 @@ if __name__ == "__main__":
     test_infosft_masked_and_finite()
     test_chunked_deft_matches_unchunked_and_reports_ce()
     print("\nALL LABEL-SHIFT + LOSS-FAMILY TESTS PASSED ✓")
+
+
+def test_chunked_ce_projects_only_trained_positions():
+    # same loss and gradients as the full-logits CE, with the head called on the labelled positions only
+    import torch.nn as nn
+
+    from palingenesis.loss import IGNORE_INDEX, chunked_cross_entropy_loss, cross_entropy_loss
+
+    torch.manual_seed(0)
+    head = nn.Linear(16, 50, bias=False)
+    hidden = torch.randn(2, 12, 16, requires_grad=True)
+    labels = torch.full((2, 12), IGNORE_INDEX)
+    labels[0, 3:6] = torch.tensor([1, 2, 3])
+    labels[1, 10:] = torch.tensor([4, 5])
+    weights = torch.rand(2, 12)
+    seen = []
+    handle = head.register_forward_hook(lambda m, args, out: seen.append(args[0].shape[0]))
+    for w in (None, weights):
+        seen.clear()
+        head.zero_grad()
+        hidden.grad = None
+        loss = chunked_cross_entropy_loss(hidden, labels, head, num_chunks=12, global_valid_tokens=5.0, weights=w)
+        loss.backward()
+        got = (loss.item(), hidden.grad.clone(), head.weight.grad.clone())
+        assert sum(seen) == 5 and max(seen) <= 2  # 5 trained positions, slices of ceil(24 / 12) positions
+
+        head.zero_grad()
+        hidden.grad = None
+        ref = cross_entropy_loss(head(hidden), labels, 5.0, weights=w)
+        ref.backward()
+        assert got[0] == pytest.approx(ref.item(), rel=1e-5)
+        torch.testing.assert_close(got[1], hidden.grad, rtol=1e-5, atol=1e-7)
+        torch.testing.assert_close(got[2], head.weight.grad, rtol=1e-5, atol=1e-7)
+        assert got[1][0, 0].abs().sum() == 0  # untrained positions get no gradient
+    handle.remove()
+
+
+def test_chunked_ce_without_any_label_is_zero_and_still_reaches_the_head():
+    import torch.nn as nn
+
+    from palingenesis.loss import IGNORE_INDEX, chunked_cross_entropy_loss
+
+    head = nn.Linear(8, 20, bias=False)
+    hidden = torch.randn(1, 6, 8, requires_grad=True)
+    loss = chunked_cross_entropy_loss(hidden, torch.full((1, 6), IGNORE_INDEX), head, num_chunks=2)
+    loss.backward()
+    assert loss.item() == 0.0
+    assert head.weight.grad is not None and head.weight.grad.abs().sum() == 0  # FSDP reduces it on every rank
+    assert hidden.grad.abs().sum() == 0

@@ -12,6 +12,8 @@ Both sum reduction + explicit valid-token normalization for correct gradients
 across ranks with unbalanced masking (different # of valid tokens per rank).
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -195,16 +197,18 @@ def chunked_cross_entropy_loss(
     global_valid_tokens: float = 1.0,
     weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FSDP2-compatible chunked cross-entropy loss.
+    """FSDP2-compatible chunked cross-entropy loss over the trained positions.
 
-    Splits hidden states into N chunks along the sequence dimension and computes
-    lm_head + CE per chunk sequentially. Reduces peak memory from O(B*S*V) to
-    O(B*S/N*V).
+    Only positions with a label reach lm_head: their hidden states are gathered and projected a
+    slice at a time, each slice back-propagated at once, so peak memory is one slice of logits
+    and the head's work is proportional to the trained tokens. On agentic traces (tool results
+    and prompts carry no label) that is a fraction of the sequence; projecting every position
+    spent most of the head's time on logits the loss then ignored.
 
     FSDP2 composability (mimics torchtitan):
-      - Disable reshard_after_forward on lm_head (keep weight unsharded across chunks)
+      - Disable reshard_after_forward on lm_head (keep weight unsharded across slices)
       - Disable reshard_after_backward on lm_head (same reason)
-      - Disable gradient sync for chunks 0..N-2, enable only on last chunk
+      - Disable gradient sync for slices 0..N-2, enable only on the last one
         (coalesce reduce-scatter into a single operation)
       - Re-enable all and reshard after the loop
 
@@ -212,7 +216,7 @@ def chunked_cross_entropy_loss(
         hidden_states: [B, S, D] from model backbone (before lm_head)
         labels: [B, S] target tokens
         lm_head: The lm_head module (may be FSDP-wrapped)
-        num_chunks: Number of sequence chunks
+        num_chunks: Bounds a slice at ceil(B*S / num_chunks) positions (the logits of one slice)
         global_valid_tokens: Denominator for loss normalization
     """
     from torch.distributed._composable.fsdp import FSDPModule
@@ -222,63 +226,64 @@ def chunked_cross_entropy_loss(
     fsdp_enabled = isinstance(fsdp_head, FSDPModule)
     requires_grad = hidden_states.requires_grad
 
-    # Split into contiguous chunks along sequence dim
-    h_chunks = [c.contiguous() for c in torch.chunk(hidden_states.detach(), num_chunks, dim=1)]
-    label_chunks = list(torch.chunk(labels, num_chunks, dim=1))
-    weight_chunks = list(torch.chunk(weights, num_chunks, dim=1)) if weights is not None else [None] * len(h_chunks)
+    flat = hidden_states.detach().reshape(-1, hidden_states.shape[-1])
+    flat_labels = labels.reshape(-1)
+    rows = torch.nonzero(flat_labels != IGNORE_INDEX).flatten()
+    scale = 1.0
+    if rows.numel() == 0:
+        # Nothing trained in this batch: one position at zero weight, so the head still takes part
+        # in the backward (under FSDP every rank must reduce its gradient).
+        rows, scale = rows.new_zeros(1), 0.0
+        targets = flat_labels.new_zeros(1)
+    else:
+        targets = flat_labels.index_select(0, rows)
+    row_weights = weights.reshape(-1).index_select(0, rows) if weights is not None else None
+    slice_rows = max(1, math.ceil(flat.shape[0] / max(num_chunks, 1)))
 
-    # Make each chunk a leaf for gradient accumulation
-    if requires_grad:
-        for c in h_chunks:
-            c.requires_grad_(True)
-
-    # Pre-allocate gradient buffer
-    grad_buffer = torch.zeros_like(hidden_states, dtype=torch.float32) if requires_grad else None
+    # Gradient of the hidden states, filled slice by slice (zero at untrained positions)
+    grad_buffer = torch.zeros_like(flat, dtype=torch.float32) if requires_grad else None
 
     total_loss = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
 
     # === FSDP reshard management (exactly like torchtitan) ===
-    # Disable reshard to keep lm_head weight unsharded across all chunks
+    # Disable reshard to keep lm_head weight unsharded across all slices
     # (avoids N all-gathers; just 1 all-gather at the start)
-    # Disable grad sync for chunks 0..N-2, coalesce into last chunk
+    # Disable grad sync for slices 0..N-2, coalesce into the last one
     if fsdp_enabled:
         fsdp_head.set_reshard_after_forward(False)
         fsdp_head.set_reshard_after_backward(False)
         fsdp_head.set_requires_gradient_sync(False, recurse=False)
 
-    last_idx = len(h_chunks) - 1
-    seq_offset = 0
+    starts = range(0, rows.numel(), slice_rows)
+    for start in starts:
+        idx = rows[start : start + slice_rows]
+        h_slice = flat.index_select(0, idx)
+        if requires_grad:
+            h_slice.requires_grad_(True)
 
-    for i, (h_chunk, l_chunk, w_chunk) in enumerate(zip(h_chunks, label_chunks, weight_chunks)):
-        chunk_len = h_chunk.shape[1]
-
-        # Enable grad sync only on the last chunk (single reduce-scatter)
-        if fsdp_enabled and i == last_idx:
+        # Enable grad sync only on the last slice (single reduce-scatter)
+        if fsdp_enabled and start == starts[-1]:
             fsdp_head.set_requires_gradient_sync(True, recurse=False)
 
-        # lm_head projection: [B, chunk_S, D] -> [B, chunk_S, V]
-        logits = lm_head(h_chunk)
+        # lm_head projection: [rows, D] -> [rows, V]
+        logits = lm_head(h_slice)
 
         # CE with sum reduction (weighted per token under turn scaling)
-        chunk_loss = _weighted_sum(
+        slice_loss = _weighted_sum(
             F.cross_entropy(
-                logits.view(-1, logits.size(-1)).float(),
-                l_chunk.reshape(-1),
-                reduction="none" if w_chunk is not None else "sum",
-                ignore_index=IGNORE_INDEX,
+                logits.float(),
+                targets[start : start + slice_rows],
+                reduction="none" if row_weights is not None else "sum",
             ),
-            w_chunk,
+            row_weights[start : start + slice_rows] if row_weights is not None else None,
         )
-        scaled_loss = chunk_loss / global_valid_tokens
+        scaled_loss = slice_loss * scale / global_valid_tokens
         total_loss = total_loss + scaled_loss.detach()
 
-        # Per-chunk backward: frees logits immediately
+        # Per-slice backward: frees logits immediately
         if requires_grad:
             scaled_loss.backward()
-            grad_buffer[:, seq_offset : seq_offset + chunk_len] = h_chunk.grad.float()
-            h_chunk.grad = None
-
-        seq_offset += chunk_len
+            grad_buffer.index_copy_(0, idx, h_slice.grad.float())
 
     # === Restore FSDP state ===
     if fsdp_enabled:
@@ -291,5 +296,5 @@ def chunked_cross_entropy_loss(
         return total_loss
 
     # Bridge: connect accumulated gradient back to decoder's autograd graph
-    accumulated_grad = grad_buffer.to(hidden_states.dtype)
+    accumulated_grad = grad_buffer.view_as(hidden_states).to(hidden_states.dtype)
     return _BackwardBridge.apply(hidden_states, accumulated_grad, total_loss)
