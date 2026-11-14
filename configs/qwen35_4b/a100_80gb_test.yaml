@@ -20,8 +20,8 @@
 #
 # WORKFLOW (preprocessing is wired into this same config):
 #   1. pgs prepare --config configs/qwen35_4b/a100_80gb_test.yaml
-#      → scores with Qwen3.5-4B perplexity, filters outliers, reserves the
-#        50-sample eval holdout, selects the J-shaped optimal mix
+#      → cleans the rows with the Qwen3.5-4B tokenizer and template, reserves the
+#        50-sample eval holdout, keeps a random 1500-row subset
 #      RE-RUN THIS ONCE: the existing prepared/ dir predates eval_holdout,
 #      so it has no eval_data.parquet yet (and its training set may overlap
 #      what will become the holdout).
@@ -71,12 +71,9 @@ preprocess:
   output_dir: ./prepared/qwen35_4b-opus46-reasoning
   format: parquet                 # order-preserving, fast, direct-loadable
   budget: 1500                    # IMPORTANT: must be < dataset size (~2100)
-                                  # or selection is skipped and ALL samples are
-                                  # kept — the J-shape only applies when the
-                                  # budget forces a choice. 1500/2100 ≈ 70%.
-  strategy: optimal               # J-shape: 20% easy / 50% medium / 25% hard /
-                                  # ~5% very-hard (hardest surviving samples —
-                                  # see select_by_budget in prepare.py)
+                                  # or ALL samples are kept. 1500/2100 ≈ 70%.
+  strategy: random                # seeded random subset (no selection by
+                                  # perplexity has beaten it)
   eval_holdout: 50                # reserve 50 samples as eval_data.parquet —
                                   # random draw, excluded from training, auto-
                                   # consumed by training as the eval set

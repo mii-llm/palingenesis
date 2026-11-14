@@ -66,7 +66,7 @@ preprocess:
   output_dir: ./prepared/qwen35_4b
   format: parquet                  # parquet (default) or jsonl
   budget: 5000                     # samples to keep (0 = all)
-  strategy: optimal                # optimal | curriculum | balanced | flow | ...
+  strategy: random                # optimal | curriculum | balanced | flow | ...
   hes: true                        # optional reasoning-quality scoring
 ```
 
@@ -87,7 +87,6 @@ pgs prepare \
     --data raw_traces.jsonl \
     --output prepared/ \
     --budget 5000 \
-    --strategy optimal \
     --format parquet \
     --hes
 ```
@@ -144,7 +143,6 @@ pgs prepare-multi \
     --sources sources.yaml \
     --output prepared/ \
     --budget 3000 \
-    --strategy optimal \
     --hes
 ```
 
@@ -407,7 +405,7 @@ Why: difficulty is model-relative. What's "medium" for GPT-4 might be impossible
 ### 2. Training on ALL data regardless of quality
 
 ❌ `pgs train --data raw_dump.jsonl`
-✓ `pgs prepare --data raw_dump.jsonl --budget 5000 --strategy optimal`
+✓ `pgs prepare --data raw_dump.jsonl --budget 5000`
 
 Why: 5K curated samples consistently outperforms 50K unfiltered.
 

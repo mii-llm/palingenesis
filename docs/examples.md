@@ -19,7 +19,6 @@ pgs prepare \
     --data ./data/agentic_traces.jsonl \
     --output ./projects/qwen35_agentic/prepared/ \
     --budget 5000 \
-    --strategy optimal \
     --hes
 ```
 
@@ -271,7 +270,6 @@ pgs prepare \
     --model Qwen/Qwen3-4B \
     --data math_solutions_500.jsonl \
     --output prepared/ \
-    --strategy optimal \
     --hes
 ```
 
@@ -363,7 +361,6 @@ pgs prepare \
     --data scored/round_1.jsonl \
     --output prepared/round_1/ \
     --budget 2000 \
-    --strategy optimal \
     --hes
 ```
 

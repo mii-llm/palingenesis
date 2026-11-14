@@ -106,7 +106,6 @@ pgs prepare \
     --model ./checkpoints/current \
     --data scored/round_1.jsonl \
     --output prepared/round_1/ \
-    --strategy optimal \
     --budget 5000
 ```
 

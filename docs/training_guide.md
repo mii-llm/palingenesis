@@ -61,7 +61,7 @@ Your training data should be multi-turn conversations in the standard chat forma
 
 ## Step 2: Data Preparation
 
-The `prepare` pipeline scores your data by model-relative difficulty and selects an optimal subset.
+`pgs prepare` cleans your data with the target model's tokenizer and chat template: it drops the rows training would drop and exact duplicates, holds out an eval set that shares no prompt with the training data, and reports every removed row and why.
 
 ### Basic preparation
 
@@ -70,30 +70,14 @@ pgs prepare \
     --model Qwen/Qwen3.5-4B \
     --data my_traces.jsonl \
     --output prepared/ \
-    --budget 5000 \
-    --strategy optimal
+    --budget 5000
 ```
 
-This runs the target model over all samples and computes perplexity. The `optimal` strategy then selects a J-shaped difficulty distribution:
+No GPU is needed. `--budget` keeps a seeded random subset of that many rows.
 
-- 20% easy (maintains capabilities, stable gradients)
-- 50% medium (maximum information content)
-- 25% hard (pushes frontiers)
-- 5% very hard (exposure without overwhelming)
+### Scoring with the model (experimental)
 
-### With HES reasoning quality scoring
-
-For reasoning/code data, add `--hes` to compute the High-Entropy Sum metric. This identifies samples with genuine decision points (high-quality reasoning) vs template-following (low quality):
-
-```bash
-pgs prepare \
-    --model Qwen/Qwen3.5-4B \
-    --data reasoning_traces.jsonl \
-    --output prepared/ \
-    --budget 3000 \
-    --strategy optimal \
-    --hes
-```
+`--score` adds a forward pass that records each row's response perplexity, and `--hes` adds the High-Entropy Sum. Selecting or ordering rows by these scores (`--strategy optimal`, `curriculum`, ...) has not beaten a random subset in our measurements or in published replications, so use them to inspect a dataset, not to choose what to train on. See the data guide on the documentation site.
 
 ### Multi-source preparation
 
@@ -239,7 +223,7 @@ preprocess:
   enabled: true
   output_dir: ./prepared
   budget: 5000
-  strategy: optimal
+  strategy: random
 
 train:
   per_device_batch_size: 2
