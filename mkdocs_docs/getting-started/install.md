@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-1. **Linux with an NVIDIA GPU.** The default install targets CUDA 12.9, which needs an NVIDIA driver ≥ 575 (`nvidia-smi` shows the driver version). AMD Instinct GPUs (ROCm) install differently: see [Training on AMD GPUs](amd.md).
+1. **Linux with an NVIDIA GPU.** The default install targets CUDA 12.9, which needs an NVIDIA driver ≥ 575 (`nvidia-smi` shows the driver version). AMD Instinct GPUs (ROCm) install differently: see [Training on AMD GPUs](amd.md). NVIDIA DGX Spark (Arm CPU, memory shared between CPU and GPU): see [Training on NVIDIA DGX Spark](dgx-spark.md).
 2. **[uv](https://docs.astral.sh/uv/)** (recommended): `curl -LsSf https://astral.sh/uv/install.sh | sh`
 3. **Python 3.11 or 3.12.** uv downloads one if needed.
 
