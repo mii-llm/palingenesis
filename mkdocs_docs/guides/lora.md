@@ -2,21 +2,56 @@
 
 *Low-rank adapters on a frozen base, as a trainer plugin (`palingenesis.lora`).*
 
-Full fine-tuning stays the library default. LoRA trains a low-rank delta `scaling · B A` next to each targeted weight `W` and leaves `W` frozen. The plugin works with `pgs train` (SFT, DPO, off-policy distillation). The export is a plain model with the adapters folded in, plus the adapter alone in the PEFT layout.
+Full fine-tuning stays the library default. LoRA trains a low-rank delta $sBA$ next to each targeted weight $W$ and leaves $W$ frozen:
 
-```yaml
-plugins:
-  custom:
-    - class: palingenesis.lora:LoRA     # entry point name: lora
-      args: {rank: 16, alpha: 32}
-train:
-  learning_rate: 2e-4                   # ~10x a full fine-tune's rate
-  weight_decay: 0.0
-model:
-  torch_dtype: bfloat16                 # the frozen base needs no fp32 copy; adapters are fp32
-```
+$$
+y = xW^\top + b + s\,xA^\top B^\top, \qquad s = \frac{\alpha}{r}
+$$
 
-`pgs init lora` writes a complete example.
+where $W$ is the frozen weight `[out, in]`, $A$ `[r, in]` and $B$ `[out, r]` are the trained factors, $r$ is `rank`, $\alpha$ is `alpha`, and the scaling $s$ is $\alpha/\sqrt{r}$ instead with `rslora: true`. With `dropout`, the adapter's input $x$ is $\operatorname{dropout}(x)$; the base path never sees dropout.
+{: .pg-where }
+
+The plugin works with `pgs train` (SFT, DPO, off-policy distillation). The export is a plain model with the adapters folded in, plus the adapter alone in the PEFT layout.
+
+!!! abstract "Use it when"
+    You want many cheap adapters on one shared base, or the model does not fit with gradients and optimizer state for every weight. Otherwise full fine-tuning (the default) is usually the better tool: see [when LoRA wins](#when-lora-wins-and-when-full-fine-tuning-is-better) below.
+
+## Minimal setup
+
+=== "Config"
+
+    ```yaml
+    plugins:
+      custom:
+        - class: palingenesis.lora:LoRA     # entry point name: lora
+          args: {rank: 16, alpha: 32}
+    train:
+      learning_rate: 2e-4                   # ~10x a full fine-tune's rate
+      weight_decay: 0.0
+    model:
+      torch_dtype: bfloat16                 # the frozen base needs no fp32 copy; adapters are fp32
+    ```
+
+    `pgs init lora` writes a complete example (`lora.yaml`), then:
+
+    ```bash
+    pgs train --config lora.yaml
+    ```
+
+=== "Python"
+
+    `palingenesis.train.train` takes plugin objects next to the ones the config lists (see [Training from a Notebook](../getting-started/notebook.md)):
+
+    ```python
+    from palingenesis.config import Config
+    from palingenesis.lora import LoRA
+    from palingenesis.train import train
+
+    config = Config.from_yaml("sft.yaml")    # pgs init sft: a config without the plugin
+    config.train.learning_rate = 2e-4
+    config.train.weight_decay = 0.0
+    result = train(config, plugins=[LoRA(rank=16, alpha=32)])
+    ```
 
 ---
 
@@ -39,11 +74,11 @@ Full fine-tuning is better when:
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `rank` | 16 | rank `r` of `B [out, r] · A [r, in]` |
-| `alpha` | 32 | scaling `alpha / r` |
-| `rslora` | false | scaling `alpha / sqrt(r)` (rsLoRA, [arXiv:2312.03732](https://arxiv.org/abs/2312.03732)) |
+| `rank` | 16 | rank $r$ of $B\,[\text{out}, r] \cdot A\,[r, \text{in}]$ |
+| `alpha` | 32 | scaling $s = \alpha / r$ |
+| `rslora` | false | scaling $s = \alpha / \sqrt{r}$ (rsLoRA, [arXiv:2312.03732](https://arxiv.org/abs/2312.03732)) |
 | `dropout` | 0.0 | dropout on the adapter's input only |
-| `dora` | false | weight-decomposed LoRA (DoRA, [arXiv:2402.09353](https://arxiv.org/abs/2402.09353)): a trainable magnitude per output row, `y = m / ‖W + scaling·BA‖_row · (xWᵀ + scaling·x Aᵀ Bᵀ) + b`, with the row norm detached as in the paper (section 4.3) |
+| `dora` | false | weight-decomposed LoRA (DoRA, [arXiv:2402.09353](https://arxiv.org/abs/2402.09353)): a trainable magnitude $m$ per output row (initialised to the base's row norms), $y = \dfrac{m}{\lVert W + sBA \rVert_{\text{row}}} \left(xW^\top + s\,xA^\top B^\top\right) + b$, with the row norm detached as in the paper (section 4.3) |
 | `lr_ratio` | 1.0 | LoRA+ ([arXiv:2402.12354](https://arxiv.org/abs/2402.12354)): `B` learns at `lr_ratio × train.learning_rate`, `A` at the base rate |
 | `targets` | attention, MLP and Gated DeltaNet projections | regular expressions, each matched against a whole trailing part of the module name: `q_proj`, `self_attn\.q_proj`, `layers\.(0\|1)\.mlp\..*` |
 | `exclude` | none | regular expressions (searched anywhere in the name) that override `targets` |
@@ -59,9 +94,9 @@ The default targets are `q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
 The learning rate matters more than the choice of variant.
 
 - **Set it about 10x higher than a full fine-tune's.** "LoRA Without Regret" found the optimal LoRA learning rate is about 10x the full fine-tuning optimum (about 15x for runs under ~100 steps).
-- **Keep `alpha` fixed and change `rank` freely.** With scaling `alpha / r` and a fixed `alpha` (they use 32), the optimal learning rate barely moved between ranks 4 and 512. That is why the default is `alpha: 32` rather than `alpha = r`. With `rslora: true` the effective scale grows as `sqrt(r)`, so retune the learning rate when you change rank.
+- **Keep `alpha` fixed and change `rank` freely.** With scaling $\alpha / r$ and a fixed $\alpha$ (they use 32), the optimal learning rate barely moved between ranks 4 and 512. That is why the default is `alpha: 32` rather than $\alpha = r$. With `rslora: true` the effective scale grows as $\sqrt{r}$, so retune the learning rate when you change rank.
 - **Adapt every layer, the MLP especially.** Attention-only LoRA underperformed in the same study.
-- **Tune the learning rate per variant before comparing variants.** "Learning Rate Matters: Vanilla LoRA May Suffice" ([arXiv:2602.04998](https://arxiv.org/abs/2602.04998)) did this for nine variants on Qwen3-0.6B, Gemma-3-1B and Llama-2-7B/13B. Their best results fell within about 0.4-1.8% of vanilla LoRA. DoRA was the one consistent small gain (~1% at rank 8, same learning-rate range). That study used `alpha = r` and did not test rsLoRA or LoRA+.
+- **Tune the learning rate per variant before comparing variants.** "Learning Rate Matters: Vanilla LoRA May Suffice" ([arXiv:2602.04998](https://arxiv.org/abs/2602.04998)) did this for nine variants on Qwen3-0.6B, Gemma-3-1B and Llama-2-7B/13B. Their best results fell within about 0.4-1.8% of vanilla LoRA. DoRA was the one consistent small gain (~1% at rank 8, same learning-rate range). That study used $\alpha = r$ and did not test rsLoRA or LoRA+.
 - **On weight decay:** decay on the factors also shrinks `A`, which starts random, not only the update. Most LoRA recipes use 0. The example config does.
 
 ## Memory: what LoRA saves and what it does not
@@ -84,13 +119,13 @@ On a small model with long sequences LoRA is not the cheaper option by default: 
 
 ## Export
 
-`final/` (and `best/model/` with an eval set) holds a plain model of the original architecture, loadable anywhere. Each adapter is folded into its weight in float32 (`W + scaling·BA`; DoRA: rows rescaled to `m`) and rounded to nearest in the weight's dtype:
+`final/` (and `best/model/` with an eval set) holds a plain model of the original architecture, loadable anywhere. Each adapter is folded into its weight in float32 ($W' = W + sBA$; DoRA: rows rescaled to $m$) and rounded to nearest in the weight's dtype:
 
 - **float32 base:** the fold is exact. The exported model reproduces the adapted model's logits (tested to 1e-5).
-- **bf16 base:** during training the delta was added in full. In the saved bf16 weight, any element of the delta smaller than half a bf16 ulp of its weight is lost (one ulp is 2⁻⁷ to 2⁻⁸ of |w|). The export logs how much of the delta the saved weights keep (the projection of `precision.edit_survival`) and warns below 0.9.
-  - On a tiny random model, round-to-nearest kept 91% of a delta at ‖ΔW‖/‖W‖ ≈ 3·10⁻³, 41% at 7·10⁻⁴ and 9% at 1.4·10⁻⁴.
-  - Stochastic rounding (`palingenesis.precision`) keeps the delta in expectation, so it is the right tool for merges that are averaged further. For reproducing one model it was worse: its noise exceeds a sub-ulp delta in a single forward. Measured as error on the adapter's effect on the logits, round-to-nearest gave 8% vs 11% with stochastic rounding at 3·10⁻³, and 85% vs 240% at 7·10⁻⁴.
-  - The `plugins/lora/delta_rel` metric tracks ‖ΔW‖/‖W‖ during training.
+- **bf16 base:** during training the delta was added in full. In the saved bf16 weight, any element of the delta smaller than half a bf16 ulp of its weight is lost (one ulp is $2^{-7}$ to $2^{-8}$ of $\lvert w \rvert$). The export logs how much of the delta the saved weights keep (the projection of `precision.edit_survival`) and warns below 0.9.
+  - On a tiny random model, round-to-nearest kept 91% of a delta at $\lVert \Delta W \rVert / \lVert W \rVert \approx 3\cdot10^{-3}$, 41% at $7\cdot10^{-4}$ and 9% at $1.4\cdot10^{-4}$.
+  - Stochastic rounding (`palingenesis.precision`) keeps the delta in expectation, so it is the right tool for merges that are averaged further. For reproducing one model it was worse: its noise exceeds a sub-ulp delta in a single forward. Measured as error on the adapter's effect on the logits, round-to-nearest gave 8% vs 11% with stochastic rounding at $3\cdot10^{-3}$, and 85% vs 240% at $7\cdot10^{-4}$.
+  - The `plugins/lora/delta_rel` metric tracks $\lVert \Delta W \rVert / \lVert W \rVert$ during training.
 
 The adapter alone goes to `<export>/adapter/` (`adapter_model.safetensors`, `adapter_config.json`, fp32). It loads with `peft.PeftModel.from_pretrained(base, "<output>/final/adapter")` on the causal-LM model the run trained (module names as the trainer loads it). Base plus adapter serves exactly what was trained. For Qwen3.5, whose checkpoints are multimodal, the merged export is written in the source checkpoint's layout like any export, but the adapter uses the causal LM's module names (`model.layers.*`).
 
@@ -99,8 +134,36 @@ Resume checkpoints carry the adapters as ordinary model weights: `train.resume_f
 ## Metrics
 
 - `plugins/lora/trainable_params`, `plugins/lora/trainable_share`: what the optimizer trains.
-- `plugins/lora/delta_rel`: ‖scaling·BA‖_F / ‖W‖_F over all adapted weights. It is computed as `tr((AAᵀ)(BᵀB))`, never by forming the delta.
-- `plugins/lora/magnitude_change` (DoRA): mean relative change of the magnitudes from the base's row norms.
+- `plugins/lora/delta_rel`: the size of the adapters' update relative to the weights they adapt, over all adapted weights $\ell$:
+
+    $$
+    \texttt{delta\_rel} = \sqrt{\frac{\sum_\ell s^2 \lVert B_\ell A_\ell \rVert_F^2}{\sum_\ell \lVert W_\ell \rVert_F^2}}, \qquad \lVert BA \rVert_F^2 = \operatorname{tr}\!\big((AA^\top)(B^\top B)\big)
+    $$
+
+    The trace form uses only $r \times r$ products: the delta is never formed.
+
+- `plugins/lora/magnitude_change` (DoRA): mean relative change of the magnitudes from the base's row norms, $\sum \lvert m - m_0 \rvert \,/\, \sum \lvert m_0 \rvert$ over every row of every adapted weight, with $m_0$ the base's row norms.
+
+## How to check it worked
+
+1. **At startup** the log names what was adapted and what it costs:
+    - `lora: N linear modules adapted (q_proj, ...), rank 16, alpha 32, scaling 2`: the layer names it matched;
+    - `lora: ... trainable parameters of ... (x.xx%)`;
+    - `lora memory: frozen base ..., adapters ... + gradients ... + AdamW moments ...`, with what full fine-tuning would add.
+2. **During training** `plugins/lora/delta_rel` starts at 0 (`B` is zero) and grows; the loss falls as in a full fine-tune at a well-chosen learning rate.
+3. **At export** the log reports how much of the delta the saved weights keep: `lora: N adapters folded into the base weights: the saved weights keep 0.9xx of the delta`, then `lora: adapter saved (PEFT layout) -> <export>/adapter`. Below 0.9 it warns (see the table below).
+
+## Common failures
+
+| What you see | Cause | Fix |
+|---|---|---|
+| `lora: no nn.Linear matched targets / exclude; the model's linear layers are named [...]` | `targets` do not match this architecture's module names | Write `targets` from the names the error lists |
+| `lora does not support train.optimizer: muon, ...` | Muon, Hyperball, MONA, base merge and float8 act on full weight matrices | Turn them off for the LoRA run (see [Interactions](#interactions)) |
+| `lora: lr_ratio (LoRA+) sets one learning rate for every B matrix ...` | `lr_ratio` together with `train.llrd_decay` | Use one of them |
+| Warning `rank R is not below the smaller dimension of N module(s)` | The rank is as large as a small projection | Lower `rank`, or `exclude` those modules |
+| Warning at export: `the base weights' dtype cannot hold much of the adapters' delta` | A bf16 base rounds away most of a small delta | Serve the base with the adapter (`save_adapter`), or train with `model.torch_dtype: float32` ([Export](#export)) |
+| Out of memory on long sequences | LoRA does not shrink activations | `train.gradient_checkpointing: full`, `memory.seco`, or measure with `pgs fit` ([Single GPU](single-gpu.md#trading-speed-for-memory-pgs-fit)) |
+| Loss barely moves | Learning rate at a full fine-tune's value | About 10x a full fine-tune's rate ([above](#learning-rate-rank-and-alpha)) |
 
 ## Interactions
 

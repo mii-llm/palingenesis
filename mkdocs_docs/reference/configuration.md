@@ -36,15 +36,15 @@
 | `sources` | list | `[]` | Multi-dataset mode. List of `{dataset, split, weight, mode, messages_field}` dicts. |
 | `include_observations` | bool | `false` | **ECHO mode**: include tool/observation role tokens in loss. Teaches the model to predict tool outputs (world model). |
 | `train_on_reasoning` | bool | `true` | Include reasoning traces (`<think>` blocks / `reasoning`) in the loss. Required for distilling reasoning behavior. Set `false` to train only on the post-`</think>` response. Honored identically whether the chat template uses a `{% generation %}` span (fast path) or not (fallback path). |
-| `turn_scaling` | str | `uniform` | Per-turn loss weight. `uniform` (equal), `progressive` (later turns heavier, √(idx/total)), `last_heavy` (final turn 2×). Weights have mean 1 per conversation. Applied by CE, chunked CE, Cut Cross-Entropy and chunked DEFT; rejected with other objectives, SeCO and DPO. |
+| `turn_scaling` | str | `uniform` | Per-turn loss weight. `uniform` (equal), `progressive` (later turns heavier, $\sqrt{\text{idx}/\text{total}}$), `last_heavy` (final turn 2×). Weights have mean 1 per conversation. Applied by CE, chunked CE, Cut Cross-Entropy and chunked DEFT; rejected with other objectives, SeCO and DPO. |
 | `tools_field` | str | `tools` | Row field with the tool definitions (list or JSON string), passed to the chat template as `tools=`. |
 | `loop_recovery` | float | `0.0` | Share of agent rows (0–1) that get a repeated tool call: about one site per 10 calls, the call and its observations pasted again 1–3 times without loss, the gold continuation trained. Teaches the escape from a repeated action. Load-time only (files untouched); a row whose copies would not fit `max_seq_length` stays unaugmented. See [Agentic training](../guides/agentic-training.md#repetition-loops-and-runaway-episodes). |
 | `reasoning_loop_recovery` | float | `0.0` | Share of rows (0–1) where one reasoning sentence in about every third trained turn is written again 1–4 times without loss; the rest of the reasoning is trained. Works with `reasoning_content` and `reasoning` fields. |
-| `repeat_unlikelihood` | float | `0.0` | Weight of `−log(1 − p)` on the token that would continue a repeat, at the positions where the gold stops repeating: after an exact repeat of a call or sentence, or where a near-repeat diverges inside an argument value or sentence. Each target counts like this many tokens. Requires `memory.seco: true`, no `packing`, no `pretokenize`. Logged as `train/repeat_p`, `train/repeat_targets`. |
-| `stop_unlikelihood` | float | `0.0` | Weight of `−log(1 − p)` on starting another tool call in the final reply of a trace that used tools (the call opener at the reply start and after each separator, the separator at the end of the turn). The opener and separator are derived from the chat template (an added or special token is required, otherwise the term is off with a warning). Same requirements as `repeat_unlikelihood`; logged as `train/stop_p`, `train/stop_targets`. |
+| `repeat_unlikelihood` | float | `0.0` | Weight of $-\log(1 - p)$ on the token that would continue a repeat, at the positions where the gold stops repeating: after an exact repeat of a call or sentence, or where a near-repeat diverges inside an argument value or sentence. Each target counts like this many tokens. Requires `memory.seco: true`, no `packing`, no `pretokenize`. Logged as `train/repeat_p`, `train/repeat_targets`. |
+| `stop_unlikelihood` | float | `0.0` | Weight of $-\log(1 - p)$ on starting another tool call in the final reply of a trace that used tools (the call opener at the reply start and after each separator, the separator at the end of the turn). The opener and separator are derived from the chat template (an added or special token is required, otherwise the term is off with a warning). Same requirements as `repeat_unlikelihood`; logged as `train/stop_p`, `train/stop_targets`. |
 | `last_turn_only` | bool | `false` | Mask every assistant turn except the final one — in training, loss only on the last answer; in `eval_sources`, score only the last answer. Phase-neutral name (no `train_`/`eval_` prefix) since the same mask serves both. Use when earlier assistant turns are a fixed context you must not fit/score (e.g. few-shot exemplar answers in eval-format SFT). No-op for single-turn data. Overridable per source in `sources`/`eval_sources`. |
 | `eval_dataset` | str | `""` | Single validation dataset. Enables best-model tracking. Empty = no validation. Superseded by `eval_sources` when set. |
-| `eval_sources` | list | `[]` | Per-capability eval: each source is scored independently (no cross-contamination) and combined into a weighted composite for best-model tracking. Per-source keys below. |
+| `eval_sources` | list | `[]` | Per-capability eval: each source is scored independently (no cross-contamination) and combined into a weighted composite for best-model tracking. Logged as `eval/<name>/loss` next to the composite `eval/loss`, and on the console log line as `eval=<composite> eval_sources=<name>:<loss>,...`. Per-source keys below. |
 | `eval_split` | str | `test` | Validation split. |
 | `eval_samples` | int | `200` | Number of validation samples (fixed subset). |
 | `eval_every` | int | `100` | Evaluate every N optimizer steps. |
@@ -110,7 +110,7 @@
 | `max_steps` | int | `-1` | Maximum optimizer steps. Overrides epochs if positive. When unset, the LR-schedule horizon (warmup + decay) is **estimated** from the data's row counts and a sample of rows through the pipeline (a few seconds, typically ±1–2%; streaming included), so training starts at once; see the data guide's "Run length and streaming". A Hub stream without published sizes, or a `ga_ramp`, needs `max_steps`. |
 | `exact_steps` | bool | `false` | Scan the whole assembled pipeline once to count the steps exactly instead of estimating them (an extra pass over the data before training; not possible when streaming). |
 | `per_device_batch_size` | int | `1` | Sequences per GPU per forward pass. Increase if memory allows. |
-| `gradient_accumulation_steps` | int | `16` | Micro-batches before optimizer step. Effective batch = batch_size × GA × num_gpus. |
+| `gradient_accumulation_steps` | int | `16` | Micro-batches before optimizer step. Effective batch = `per_device_batch_size` $\times$ GA $\times$ GPUs. |
 | `ga_ramp_start` | int | `0` | Batch size scheduling: start GA at this value, linearly ramp to full `gradient_accumulation_steps`. 0 = constant. |
 | `learning_rate` | float | `2e-5` | Peak learning rate, applied as-is for adamw/lion8bit (Lion paper suggests 3–10× *lower* than AdamW). Muon applies a 10× internal scaling to its matrix params. |
 | `min_learning_rate` | float | `2e-6` | Minimum LR at end of schedule (as fraction: `min_lr / lr` is the floor ratio). |
@@ -120,7 +120,8 @@
 | `lr_scheduler` | str | `cosine` | LR schedule. `power_decay` (recommended), `wsd` (long runs), `cosine`, `linear`, `constant`. |
 | `optimizer` | str | `adamw` | Optimizer. `adamw`, `muon`, `lion8bit`, `adamw8bit`, `paged_adamw8bit`. |
 | `seed` | int | `42` | Training random seed. |
-| `save_steps` | int | `500` | Save checkpoint every N steps. Auto-purges old ones (keeps last 5). |
+| `save_steps` | int | `500` | Save a resumable checkpoint (`step-N/`) every N steps. Old ones are deleted after each save, keeping the newest `keep_checkpoints`. |
+| `keep_checkpoints` | int | `5` | Step checkpoints kept on disk; the oldest are deleted after each save. `best/` and `final/` are never deleted. `0` keeps all. A full checkpoint holds the weights and the optimizer state (about 3× the fp32 weights for AdamW): size the disk for `keep_checkpoints` of them. |
 | `save_final` | bool | `true` | Save the final model to `output_dir/final` (Hugging Face format) at the end. |
 | `logging_steps` | int | `1` | Log metrics every N steps. |
 | `bf16` | bool | `true` | Enable bf16 mixed precision with fp32 gradient reduction. |
@@ -128,20 +129,20 @@
 | `spike_detection` | bool | `true` | Skip optimizer step when gradient norm is anomalous (z-score based). |
 | `spike_z_threshold` | float | `5.0` | Z-score threshold for spike detection. Higher = fewer skips. |
 | `adagc` | bool | `false` | Per-tensor adaptive gradient clipping. Replaces global clipping. Better for stability. |
-| `adagc_lambda` | float | `1.5` | Relative clip threshold: clip if tensor norm > λ × EMA. |
+| `adagc_lambda` | float | `1.5` | Relative clip threshold: clip if the tensor's gradient norm $> \lambda \times$ its EMA, with $\lambda$ = `adagc_lambda`. |
 | `adagc_beta` | float | `0.95` | EMA decay for per-tensor norm tracking. |
 | `ema` | bool | `false` | Exponential Moving Average of weights. Better generalization. Stored on CPU. |
-| `ema_decay` | float | `0.999` | EMA decay factor. 0.999 ≈ 1000-step window. |
+| `ema_decay` | float | `0.999` | EMA decay factor. 0.999 $\approx$ 1000-step window. |
 | `ema_every` | int | `10` | Update EMA every N steps. |
 | `base_merge` | bool | `false` | Periodically merge toward pretrained weights (anti-forgetting). |
-| `base_merge_ratio` | float | `0.1` | Mix ratio: θ = (1-r)×θ_current + r×θ_base. |
+| `base_merge_ratio` | float | `0.1` | Mix ratio $r$: $\theta \leftarrow (1-r)\,\theta + r\,\theta_{\text{base}}$ (with `lerp`). |
 | `base_merge_every` | int | `500` | Steps between merges. |
 | `base_merge_method` | str | `lerp` | Interpolation: `lerp` (linear) or `slerp` (spherical, preserves norms). |
 | `adamc` | bool | `false` | Corrected weight decay for normalized layers. Prevents gradient explosion at end of training. |
 | `llrd_decay` | float | `1.0` | Layer-wise LR decay. 1.0 = off. 0.9 = early layers get 0.9× LR per depth. |
 | `freeze_non_attention` | bool | `false` | Hybrid models (Qwen3.5, Qwen3-Next, Mamba hybrids): freeze the linear-attention / recurrent layers (all their parameters except the layer norms); full-attention layers, embeddings, final norm and head train. No-op, with a warning, on models without such layers. |
 | `hyperball` | bool | `false` | Hyperball (arXiv:2606.16899): attention/MLP matrices keep their initial norm and move by a fixed angular step each update; embeddings, norms, biases and the head stay on the base optimizer. Any base optimizer. See [Optimizers](optimizers.md#hyperball). |
-| `hyperball_lr` | float | `0.0` | Hyperball's angular step η (fraction of each matrix norm moved per update, scaled by the LR schedule). `0` = per matrix, the base optimizer's first relative step (Adam/Lion: `learning_rate / rms(W)`). |
+| `hyperball_lr` | float | `0.0` | Hyperball's angular step $\eta$ (fraction of each matrix norm moved per update, scaled by the LR schedule). `0` = per matrix, the base optimizer's first relative step (Adam/Lion: $\texttt{learning\_rate} / \operatorname{rms}(W)$). |
 | `mona` | bool | `false` | MONA curvature-aware acceleration. Augments gradients with EMA of gradient differences. |
 | `mona_beta_a` | float | `0.975` | MONA acceleration EMA decay. Higher for larger models (0.99 for 68B). |
 | `mona_lite` | bool | `true` | Store MONA buffers in bf16 + streaming computation. 75% overhead reduction. |
@@ -230,7 +231,7 @@ Preference optimization (DPO and variants), a mode of `pgs train`. When `enabled
 |-----------|------|---------|-------------|
 | `enabled` | bool | `false` | Train on preference pairs instead of SFT conversations. |
 | `loss_type` | str | `sigmoid` | `sigmoid` (DPO), `hinge` (SLiC-HF), `ipo`, `robust` (rDPO), `sigmoid_norm` (length-normalised). |
-| `beta` | float | `0.1` | Inverse temperature of the implicit reward `β·(log π − log π_ref)`. |
+| `beta` | float | `0.1` | Inverse temperature $\beta$ of the implicit reward $\beta\,(\log \pi - \log \pi_{\text{ref}})$. |
 | `label_smoothing` | float | `0.0` | Assumed label-flip rate, `robust` only. Must be < 0.5. |
 | `ld_alpha` | float | `1.0` | LD-DPO: weight of the longer answer's tail beyond the shared length. `1.0` = off. |
 | `sft_weight` | float | `0.0` | Adds `sft_weight` × mean NLL of the chosen answer, anchoring it (RPO). |
@@ -256,7 +257,7 @@ Off-policy knowledge distillation, a mode of `pgs train`: the student trains on 
 | `divergence` | str | `forward_kl` | `forward_kl`, `reverse_kl`, `jsd` (GKD), `skew_forward_kl`, `skew_reverse_kl` (DistiLLM), `tvd` |
 | `beta` | float | `0.5` | `jsd` mixture weight of the teacher / `skew_*` skew coefficient, in (0, 1) |
 | `temperature` | float | `1.0` | Softmax temperature of both distributions |
-| `temperature_scale` | bool | `true` | Multiply the divergence by temperature² |
+| `temperature_scale` | bool | `true` | Multiply the divergence by $T^2$, with $T$ = `temperature` |
 | `kd_weight` | float | `1.0` | Weight of the divergence per trained token |
 | `ce_weight` | float | `0.0` | Weight of cross-entropy on the gold token |
 | `topk_mode` | str | `tail` | Cached teachers: `tail` (top-k + gold + a tail bucket per side) or `renorm` (both renormalised over the support) |
@@ -402,7 +403,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `beta` | float | `1.0` | `topk_kl` and dense term: weight of the reverse KL (1 − beta: forward KL). |
 | `is_low` / `is_high` | float | `0.5` / `2.0` | `sampled_rkl`/`xtok`: tokens whose importance ratio to the rollout policy falls outside the range get no gradient (ICE-POP). |
 | `length_norm` | bool | `false` | Mean per sequence, then over sequences, instead of per token over the batch. |
-| `xtok_spread` | str | `chunk` | `chunk`: every token of a chunk gets the chunk's advantage. `proportional`: token t gets A_c · log p(t) / log p(chunk). |
+| `xtok_spread` | str | `chunk` | `chunk`: every token of a chunk gets the chunk's advantage. `proportional`: token $t$ gets $A_c \log p(t) / \log p(c)$, its share of the chunk $c$'s advantage $A_c$. |
 | `xtok_dense_weight` | float | `0.0` | Weight of a top-k KL at chunks of exactly one token on each side. |
 | `mask_whitespace` | bool | `true` | xtok: no loss on whitespace-only chunks. |
 | `trace_kd_weight` | float | `0.0` | agent_traces: weight of distillation on the recorded assistant turns inside each trace (off-policy, from the teacher pass the regenerated turns need anyway). |

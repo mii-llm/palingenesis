@@ -2,6 +2,18 @@
 
 *All commands available through the `palingenesis` entry point.*
 
+`pgs train`, `pgs fit`, `pgs prepare` and `pgs distill` take overrides of single options as `--section.option value` (for example `--train.learning_rate 1e-5`); the options are in the [configuration reference](configuration.md).
+
+| I want to | Command |
+|---|---|
+| start from an example config | [`pgs init`](#init) |
+| train (SFT, DPO, off-policy distillation, LoRA) | [`pgs train`](#train) |
+| know whether a config fits in memory | [`pgs profile`](#profile) |
+| find the fastest memory setting that fits | [`pgs fit`](#fit) |
+| check data, masking and config before a run | [`pgs diagnose`](#diagnose), [`pgs inspect`](#inspect), [`pgs validate`](#validate) |
+| follow a running training | [`pgs monitor`](#monitor), [`pgs loss`](#loss) |
+| on-policy distillation / RL | [`pgs distill`](#distill), [`pgs rl`](#rl) |
+
 ---
 
 ## Commands
@@ -11,7 +23,7 @@
 Write a shipped example config to start from (works after `pip install`, no checkout needed).
 
 ```bash
-pgs init --list              # sft, dpo, distill, kd, rl
+pgs init --list              # sft, dpo, distill, kd, lora, rl
 pgs init sft                 # ./sft.yaml
 pgs init rl my_rl.yaml       # another file name (--force overwrites)
 ```
@@ -28,6 +40,8 @@ Equivalent to:
 ```bash
 torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/quickstart.yaml
 ```
+
+LoRA is a trainer plugin of `pgs train`, not a separate command: `pgs init lora`, then `pgs train --config lora.yaml` ([LoRA guide](../guides/lora.md)).
 
 ### distill
 
@@ -222,12 +236,25 @@ pgs profile --config config.yaml --gpu 80
 pgs profile --config config.yaml --measure
 ```
 
-`pgs fit` measures the fastest memory settings (activation checkpointing mode, SeCO chunk size) that fit a memory budget, with the real trainer on worst-case rows; exit code 1 when none fits. `--first-fit` stops at the first setting that fits, `--json` prints the report as JSON.
+### fit
+
+Measure the fastest memory settings (activation checkpointing mode, SeCO chunk size) that fit a memory budget, with the real trainer on worst-case rows (every row at `data.max_seq_length`), each setting in its own process. The report gives the peak and the throughput of each setting and recommends the fastest one under the budget, as command-line options and config lines; exit code 1 when none fits.
 
 ```bash
 pgs fit --config config.yaml              # budget: this GPU
 pgs fit --config config.yaml --gpu 24     # budget: 24 GiB
+pgs fit --config config.yaml --first-fit  # stop at the first setting that fits
 ```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--gpu` | this GPU's memory | budget in GiB |
+| `--headroom` | `0.92` | share of the budget the measured peak may use |
+| `--steps` | `3` | optimizer steps per setting (the last one is timed) |
+| `--first-fit` | off | stop at the first setting that fits |
+| `--json` | off | print the report as JSON |
+
+What it measures and how to read it: [Single GPU: trading speed for memory](../guides/single-gpu.md#trading-speed-for-memory-pgs-fit).
 
 ### monitor
 

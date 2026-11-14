@@ -32,7 +32,7 @@
     pgs train --config sft.yaml
     ```
 
-    `pgs init --list` shows the shipped examples (`sft`, `dpo`, `distill`, `rl`). The larger configs referenced in these docs (`configs/...`) are in the [repository](https://github.com/mii-llm/palingenesis/tree/main/configs). macOS installs work for data tooling and tests, not training (no CUDA).
+    `pgs init --list` shows the shipped examples (`sft`, `dpo`, `distill`, `kd`, `lora`, `rl`). The larger configs referenced in these docs (`configs/...`) are in the [repository](https://github.com/mii-llm/palingenesis/tree/main/configs). macOS installs work for data tooling and tests, not training (no CUDA).
 
 === "uv sync (from source)"
 

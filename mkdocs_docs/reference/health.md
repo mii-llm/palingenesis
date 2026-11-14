@@ -12,7 +12,7 @@ Core training dynamics, logged under `train/` and `eval/` on every `logging_step
 |--------|---------|-------------------|
 | `train/loss` | Per-token **objective** value, averaged over the accumulation window. With DEFT/DFT-family losses this is the gated loss — numerically much smaller than a cross-entropy (0.05–0.2 is normal) | Smooth decrease. Spikes → data or LR issues |
 | `train/ce_loss` | Unweighted cross-entropy on the same batches (logged under chunked DEFT, computed for free). This is the number comparable to `eval/loss` | Same scale as eval loss |
-| `train/token_gate` | Mean token gate of the gated objective (DEFT `p^α`, DFT `p`, InfoSFT, CADFT). Rising gate = model growing confident on its targets | Slow rise over training |
+| `train/token_gate` | Mean token gate of the gated objective (DEFT $p^{\alpha}$, DFT $p$, InfoSFT, CADFT). Rising gate = model growing confident on its targets | Slow rise over training |
 | `train/ppl` | `exp` of the true CE (`train/ce_loss` when available). Omitted when the objective is not a CE — `exp(DEFT)` would be meaningless | A ppl of 2-6 is typical mid-SFT |
 | `train/lr` | Current learning rate from the scheduler | Matches your configured schedule |
 | `train/grad_norm` | Global gradient norm (after clipping / AdaGC) | Stable band. Growth → instability brewing |
@@ -24,7 +24,9 @@ Core training dynamics, logged under `train/` and `eval/` on every `logging_step
 | `train/adagc_clips` | Cumulative per-tensor clips by AdaGC (if enabled) | Steady growth is fine; explosive growth → reduce LR |
 | `train/epoch` | Current epoch | — |
 | `eval/loss` | Validation loss (every `data.eval_every` steps) | The number that matters. Drives best-model tracking |
-| `eval/ppl` | `exp(eval/loss)` | Human-readable validation quality |
+| `eval/ppl` | $\exp(\texttt{eval/loss})$ | Human-readable validation quality |
+| `eval/<name>/loss`, `eval/<name>/ppl` | With `data.eval_sources`: each source's own loss; `eval/loss` is then their weighted composite. Also on the console log line as `eval_sources=<name>:<loss>,...` | One source rising while the composite falls = forgetting on that capability |
+| `eval/regressions` | With `data.eval_sources`: how many sources are above their `regression_floor` (a warning names them) | Above 0 → consider reducing source weights, or stop |
 | `eval/gap` | `eval/loss − train/ce_loss` — the generalization gap, CE vs CE (falls back to `train/loss` only when the objective is a plain CE) | Rising gap = overfitting. Stop or regularize |
 
 With `logging.rl_readiness: true`, `health/output_entropy` is also recorded every logging step — including under chunked and CCE loss, where full logits are never materialized (a sample of positions is projected through the LM head instead).
@@ -63,13 +65,20 @@ How consistent is the gradient direction between consecutive steps?
 
 Estimates the critical batch size — the batch size where adding more samples stops helping. From McCandlish et al. (OpenAI, 2018).
 
-- GNS < batch_size: batch is oversized (wasting compute)
-- GNS ≈ batch_size: optimal trade-off
-- GNS > batch_size: gradient is noisy, would benefit from larger batch
+- $\text{GNS} < B$: batch is oversized (wasting compute)
+- $\text{GNS} \approx B$: optimal trade-off
+- $\text{GNS} > B$: gradient is noisy, would benefit from larger batch
+
+with $B$ the batch size.
 
 ### Stable rank (`health/stable_rank_min`)
 
-`stable_rank = ‖W‖²_F / σ_max(W)²`. Measures effective dimensionality of weight matrices.
+$$
+\operatorname{stable\_rank}(W) = \frac{\lVert W \rVert_F^2}{\sigma_{\max}(W)^2}
+$$
+
+where $\sigma_{\max}$ is the largest singular value. It measures the effective dimensionality of a weight matrix (between 1 and its rank).
+{: .pg-where }
 
 Declining stable rank = the matrix is collapsing toward rank-1 = representation collapse. If any key matrix drops below 3.0, a warning is logged.
 

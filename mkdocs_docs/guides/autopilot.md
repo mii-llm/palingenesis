@@ -2,6 +2,9 @@
 
 *The learning rate is the most important hyperparameter in deep learning. Autopilot finds it for you.*
 
+!!! abstract "Use it when"
+    You start with a new model or dataset on one node and do not know a good learning rate. Once you know one, write the config by hand ([when to use manual instead](#when-to-use-manual-instead)). The result of every decision is in `autopilot_report.json` ([Phase 4](#phase-4-report)).
+
 ---
 
 ## The problem with learning rates
@@ -39,18 +42,22 @@ Reads your GPU's memory, compute capability, and available bandwidth. From this 
 
 A two-stage search informed by scaling-law research (arxiv:2409.19913, 2503.04715, 2405.14578):
 
-**Coarse sweep (5 candidates):** Logarithmically-spaced LRs centered on a scaling-law estimate. The center accounts for model size (`N^{-0.5}`) and effective batch tokens using the **surge phenomenon** — Adam's optimal LR peaks near B_crit ≈ 100K tokens/step and falls on both sides.
+**Coarse sweep (5 candidates):** Logarithmically-spaced LRs centered on a scaling-law estimate. The center accounts for model size ($N^{-0.5}$) and effective batch tokens using the **surge phenomenon** — Adam's optimal LR peaks near $B_{\text{crit}} \approx$ 100K tokens/step and falls on both sides.
 
-**Quadratic refinement (3 candidates):** A parabola is fit in (log₁₀(LR), loss) space to the coarse results. The parabola's minimizer gives an analytical LR estimate. Refinement candidates are placed tightly around it.
+**Quadratic refinement (3 candidates):** A parabola is fit in $(\log_{10} \text{LR},\ \text{loss})$ space to the coarse results. The parabola's minimizer gives an analytical LR estimate. Refinement candidates are placed tightly around it.
 
 The winner is selected by final loss, penalized for curvature (risk of early plateau).
 
-Then: **adaptive horizon correction**. A sweep at 100 steps overestimates the optimal LR for 5000 steps. The correction factor is `(sweep_steps / full_steps)^α`:
+Then: **adaptive horizon correction**. A sweep at 100 steps overestimates the optimal LR for 5000 steps. The swept LR is multiplied by
 
-- Base α = 0.088 (from arxiv:2409.19913, Table 5)
-- Attenuated ×0.7 for SFT (pretrained model → weaker horizon dependence, arxiv:2606.05610)
-- Adjusted by loss curvature: flattening curve → raise α; still-dropping → lower α
-- Effective range: α ∈ [0.04, 0.20]
+$$
+\left(\frac{\text{sweep\_steps}}{\text{full\_steps}}\right)^{\alpha}
+$$
+
+- Base $\alpha = 0.088$ (from arxiv:2409.19913, Table 5)
+- Attenuated $\times 0.7$ for SFT (pretrained model → weaker horizon dependence, arxiv:2606.05610)
+- Adjusted by loss curvature: flattening curve → raise $\alpha$; still-dropping → lower $\alpha$
+- Effective range: $\alpha \in [0.04, 0.20]$
 
 Bad trials terminate early (NaN, increasing loss, no progress), saving time for refinement.
 
@@ -88,15 +95,18 @@ Writes `autopilot_report.json` with every decision made:
 
 Even before the sweep runs, autopilot has an initial estimate from scaling laws:
 
-```
-center_lr = C × model_size^(-0.5) × surge_factor(batch_tokens)
-```
+$$
+\text{LR}_{\text{center}} = C \cdot N^{-0.5} \cdot f(B), \qquad f(B) = 2^{1.5} \, \frac{B / B_{\text{crit}}}{(1 + B / B_{\text{crit}})^{1.5}}
+$$
 
-Where `surge_factor` models the Adam-specific non-monotone batch-size relationship:
+where $N$ is the model size in billions of parameters, $B$ the effective batch in tokens per optimizer step, $B_{\text{crit}}$ = 100K tokens, and $C = 8.5 \cdot 10^{-5}$; the center is clamped to $[5 \cdot 10^{-6},\ 5 \cdot 10^{-4}]$.
+{: .pg-where }
 
-- Below B_crit (100K tokens): noisy gradients → factor < 1 → lower center
-- At B_crit: factor = 1.0 (peak, reference point)
-- Above B_crit: saturation → factor < 1 → lower center
+The surge factor $f$ models the Adam-specific non-monotone batch-size relationship:
+
+- Below $B_{\text{crit}}$ (100K tokens): noisy gradients → $f < 1$ → lower center
+- At $B_{\text{crit}}$: $f = 1$ (peak, reference point)
+- Above $B_{\text{crit}}$: saturation → $f < 1$ → lower center
 
 This centers the coarse sweep around the most probable optimal region, avoiding wasted trials.
 

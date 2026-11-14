@@ -20,7 +20,7 @@ Start from a shipped example config, or any YAML in the repository's `configs/`:
 ```python
 from palingenesis.examples import write_example
 
-write_example("sft", "sft.yaml", force=True)   # also: "dpo", "distill", "rl" (pgs init --list)
+write_example("sft", "sft.yaml", force=True)   # also: "dpo", "distill", "kd", "lora", "rl" (pgs init --list)
 ```
 
 ---
@@ -47,6 +47,15 @@ print(result.output_dir, result.global_step, result.metrics.get("train/loss"), r
 
 `Config.from_cli(["--config", "sft.yaml", "--train.max_steps", "100"])` applies the same dotted overrides as the
 command line; pass the list explicitly (the kernel's own `sys.argv` is never read when you do).
+
+Trainer plugins can be passed as objects, after the ones the config lists in `plugins.custom` (see
+[Plugins](../reference/plugins.md#trainer-plugins)). For example LoRA adapters ([LoRA guide](../guides/lora.md)):
+
+```python
+from palingenesis.lora import LoRA
+
+result = train(config, plugins=[LoRA(rank=16, alpha=32)])
+```
 
 What `train()` guarantees in-process:
 

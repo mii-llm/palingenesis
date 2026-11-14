@@ -2,6 +2,13 @@
 
 *Opt-in training enhancements. Each backed by a specific paper. All compose with torch.compile.*
 
+This page has two parts: the built-in switches under `plugins:` (DEFT, SymNoise, Pre-RL, DFT / CADFT / InfoSFT, Schedule-Free), and [trainer plugins](#trainer-plugins), your own code (or a shipped plugin) inside `pgs train`. Two trainer plugins ship with the library:
+
+| Plugin | Entry point | What it does | Guide |
+|---|---|---|---|
+| `palingenesis.lora:LoRA` | `lora` | low-rank adapters on a frozen base, folded export and PEFT adapter | [LoRA](../guides/lora.md) |
+| `palingenesis.qat:TernaryQAT` | `ternary-qat` | ternary quantisation-aware training | [Off-Policy Distillation](../guides/offpolicy-distillation.md#quantisation-aware-training-while-distilling) |
+
 ---
 
 ## DEFT
@@ -25,7 +32,7 @@ plugins:
   sym_noise_alpha: 5.0   # Higher = stronger regularization (try 7.0 for small models)
 ```
 
-"Symmetric" refers to the noise distribution: each embedding coordinate gets ±α/√(L·d) with equal probability (Bernoulli, where NEFTune uses uniform noise). Noise is added only in training mode; evaluation and inference see clean embeddings.
+"Symmetric" refers to the noise distribution: each embedding coordinate gets $\pm\alpha/\sqrt{L d}$ with equal probability, with $\alpha$ = `sym_noise_alpha`, $L$ the sequence length and $d$ the embedding width (Bernoulli, where NEFTune uses uniform noise). Noise is added only in training mode; evaluation and inference see clean embeddings.
 
 ---
 
@@ -56,7 +63,7 @@ Other token-weighting schemes. DEFT contains DFT as its confident-token limit; I
 
 | Plugin | Mechanism | When to use |
 |--------|-----------|-------------|
-| `dft` | Weight = p_θ(y_t) (model confidence) | Comparing against DEFT |
+| `dft` | Weight $= p_\theta(y_t)$ (model confidence) | Comparing against DEFT |
 | `cadft` | DFT + sample-level compatibility score | Multi-domain data |
 | `info_sft` | Weight = information content relative to calibration | Research comparison |
 
@@ -127,7 +134,7 @@ my-registered-plugin = "my_package.plugins:MyPlugin"
 
 `LossInputs` holds the model, the batch, the student's final hidden states `[B, T, H]` (with gradient), the shifted labels, `rows` (flat indices of the trained positions), the captured `features` (`{name: (student [N, Ds], teacher [N, Dt])}`), the teacher targets, the output head, the global token denominator and the accumulation steps.
 
-The trainer adds a plugin's term multiplied by `1 / (gradient accumulation steps × data-parallel ranks)`: gradients are summed over the accumulation window and over ranks, so return a **per-rank mean** (for example a mean over this rank's tokens). For a sum over tokens normalised like the main loss, multiply by `inputs.token_sum_scale`.
+The trainer adds a plugin's term multiplied by $1 / (\text{gradient accumulation steps} \times \text{data-parallel ranks})$: gradients are summed over the accumulation window and over ranks, so return a **per-rank mean** (for example a mean over this rank's tokens). For a sum over tokens normalised like the main loss, multiply by `inputs.token_sum_scale`.
 
 Loss hooks run where the trainer has the student's forward in hand (SFT with chunked / cut / plain cross-entropy, the gated objectives, off-policy distillation). Paths that run their own backward refuse them at startup: SeCO, DPO, `plugins.pre_rl`, `memory.gradient_release`. Put gradient-level terms in `on_before_optimizer_step` instead: they work on every path.
 

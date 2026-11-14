@@ -2,13 +2,26 @@
 
 *How a 4-billion parameter model fine-tunes in about 16 GiB — and what each technique contributes.*
 
+!!! abstract "Use this guide when"
+    You train on one GPU and want to know what fits, which memory setting is the fastest that still fits, and what each memory technique costs. For sequences of 32k tokens and more, read [Long Sequences (SeCO)](long-sequences.md) next; for several GPUs, [Multi-GPU](multi-gpu.md).
+
+## In short
+
+```bash
+pgs profile --config my.yaml --measure     # will it fit? two real optimizer steps, measured peak
+pgs fit --config my.yaml                   # the fastest memory setting that fits this GPU
+pgs train --config my.yaml                 # train
+```
+
+A config that already fits needs nothing else. The rest of this page explains where the memory goes and what to change when it does not fit.
+
 ---
 
 ## The problem
 
 A 4B parameter model in bf16 is 8 GB. AdamW stores two fp32 states per parameter: that's 32 GB for the optimizer alone. Add gradients (8 GB) and activations (12 GB), and you need 60 GB just to begin a training step.
 
-That's why most people reach for LoRA. But LoRA is a compromise — you're training a low-rank shadow of the model, not the model itself. The representations it can learn are fundamentally limited.
+That's why most people reach for LoRA. But LoRA is a compromise — you're training a low-rank shadow of the model, not the model itself. The representations it can learn are fundamentally limited. (When adapters are the right tool, see the [LoRA guide](lora.md).)
 
 Palingenesis takes a different path: eliminate the waste.
 
@@ -35,7 +48,23 @@ pgs fit --config my.yaml            # budget: this GPU
 pgs fit --config my.yaml --gpu 24   # budget: 24 GiB
 ```
 
-Each setting runs the real trainer for a few steps on worst-case rows (every row at `data.max_seq_length`) in its own process; the report gives the peak and the throughput of each, and recommends the fastest one under the budget with the options to set. Qwen3.5-0.8B, one 16,384-token row per micro-batch, on an H100:
+Each setting runs the real trainer for a few steps on worst-case rows (every row at `data.max_seq_length`) in its own process; the report gives the peak and the throughput of each, and recommends the fastest one under the budget with the options to set. The settings it measures:
+
+- the config as it is, then the three activation-checkpointing modes, `none`, `selective` and `full`;
+- SeCO at chunk sizes of 8192, 4096, 2048 and 1024 tokens (those shorter than `data.max_seq_length`), then the smallest chunk with its K/V cache offloaded (`memory.seco_kv_offload`). Settings the config cannot take (SeCO with packing or DPO, for example) are listed as skipped.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--gpu` | this GPU's memory | budget in GiB |
+| `--headroom` | `0.92` | share of the budget the measured peak may use (allocator fragmentation and everything else on the GPU take the rest) |
+| `--steps` | `3` | optimizer steps per setting (the last one is timed) |
+| `--first-fit` | off | stop at the first setting that fits |
+| `--json` | off | print the report as JSON |
+| `--section.option value` | | config overrides, as for `pgs train` |
+
+The report ends with the recommendation, as command-line options and as config lines (`Recommended: ... Add to the command line: ...`). When nothing fits, `pgs fit` exits with code 1 and suggests what to lower next: `data.max_seq_length` or `train.per_device_batch_size` (raise `train.gradient_accumulation_steps` to keep the effective batch), freezing part of the model (`train.freeze_non_attention` on hybrids), or splitting sequences over GPUs (`parallel.context_parallel`).
+
+Qwen3.5-0.8B, one 16,384-token row per micro-batch, on an H100:
 
 | Setting | Peak | Tokens/s |
 |---|:---:|:---:|
@@ -47,6 +76,9 @@ Each setting runs the real trainer for a few steps on worst-case rows (every row
 | SeCO, 1024-token chunks | 10.3 GiB | 2,800 |
 
 With memory to spare, `none` is the fastest; `full` gives up 17% of the speed for a third of the memory. On this model and length SeCO is slower than full checkpointing at a higher peak: it pays off on sequences that full checkpointing cannot hold.
+
+!!! note "Throughput is measured on worst-case rows"
+    Every row is at `data.max_seq_length`, so the peak is an upper bound for the run; shorter rows train faster in every setting.
 
 ---
 
@@ -94,13 +126,16 @@ train:
 
 Here's a subtle insight: in a Transformer, every weight matrix that sits between two normalization layers is *scale-invariant* — the loss doesn't care about its magnitude, only its direction. Weight decay's real job isn't regularization; it's indirectly controlling the *angular* learning rate.
 
-Hyperball makes this explicit. Each attention/MLP matrix is kept at its initial Frobenius norm R. The base optimizer only supplies a *direction* u, and every step moves the matrix by a fixed fraction of its norm:
+Hyperball makes this explicit. Each attention/MLP matrix is kept at its initial Frobenius norm $R$. The base optimizer only supplies a *direction* $u$, and every step moves the matrix by a fixed fraction of its norm:
 
-```
-W ← R · normalize(W − η · R · normalize(u))
-```
+$$
+W \leftarrow R \cdot \operatorname{normalize}\!\big(W - \eta R \operatorname{normalize}(u)\big), \qquad \operatorname{normalize}(X) = \frac{X}{\lVert X \rVert_F}
+$$
 
-η is an **angular** step. The optimizer's scale and the gradient scale drop out, and weight decay is replaced by the constraint. See the [optimizer reference](../reference/optimizers.md#hyperball) for details.
+where $R$ is the matrix's norm at the first step, $u$ the base optimizer's update direction and $\eta$ the angular step (`train.hyperball_lr`, scaled by the LR schedule).
+{: .pg-where }
+
+$\eta$ is an **angular** step. The optimizer's scale and the gradient scale drop out, and weight decay is replaced by the constraint. See the [optimizer reference](../reference/optimizers.md#hyperball) for details.
 
 The paper reports a 20–30% token-equivalent speedup at 1B+ scale, measured in pretraining with Muon (arxiv:2606.16899). It is experimental and not independently reproduced. It also reports better LR transfer across scales. Memory cost: one snapshot bucket (≤1 GiB).
 
@@ -112,7 +147,7 @@ train:
 
 ### Power-decay scheduler
 
-The theory (Li et al., February 2026) derives LR schedules from functional scaling laws. In its model of pretraining, for capacity exponent β > 3, cosine saturates and power decay with γ ≈ 2β-1 ≈ 4 does better. It has not been benchmarked here for fine-tuning; cosine is the library default and the baseline to compare against.
+The theory (Li et al., February 2026) derives LR schedules from functional scaling laws. In its model of pretraining, for capacity exponent $\beta > 3$, cosine saturates and power decay with $\gamma \approx 2\beta - 1 \approx 4$ does better (the schedule is in the [optimizer reference](../reference/optimizers.md#power_decay)). It has not been benchmarked here for fine-tuning; cosine is the library default and the baseline to compare against.
 
 ```yaml
 train:
@@ -164,7 +199,8 @@ step=150 loss=1.67 lr=4.4e-05 tok/s=6180 grad_norm=0.29 dt=1.2s
 
 - `tok/s` — training throughput (tokens processed per second)
 - `grad_norm` — gradient norm before clipping. Its scale depends on the model and the loss (5–30 at the start of a fine-tune is common); judge it against the run's own recent values. `pgs monitor` does that.
-- `eval` — validation loss (appears every `eval_every` steps)
+- `eval` — validation loss (appears every `eval_every` steps, and once as `step=0 eval=... (before training)`)
+- `eval_sources=name:loss,...` — with per-source eval sets (`data.eval_sources`), each source's loss follows the composite `eval`, so a regression on one source shows in the plain log ([per-capability eval](data.md#per-capability-eval-eval_sources))
 - `dt` — wall-clock per step. Should be stable; spikes indicate GC stalls.
 
 Healthy training: loss decreases smoothly, grad_norm is stable, tok/s is constant.
@@ -178,7 +214,7 @@ Healthy training: loss decreases smoothly, grad_norm is stable, tok/s is constan
 | Loss=NaN on step 1 | LR way too high | Divide `learning_rate` by 10 |
 | Loss decreases then spikes | Bad batch hit | Normal (<1% of steps). If >5%, filter data. |
 | Loss flat for 100+ steps early on | LR too low or all data is easy | Increase LR 2× or run `pgs prepare` (a slow decrease after the initial drop is normal) |
-| OOM crash | Batch too big or seq too long | Reduce `per_device_batch_size` by 1 |
+| OOM crash | Batch too big or seq too long | Reduce `per_device_batch_size` by 1, or run `pgs fit` for the fastest setting that fits |
 | Very slow (~1K tok/s) | Compile disabled | Set `model.compile: true` |
 | "SPIKE SKIPPED" in logs | Anomalous gradient detected | Palingenesis handled it. Investigate if frequent. |
 

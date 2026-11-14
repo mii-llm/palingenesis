@@ -36,6 +36,20 @@ step=3   loss=3.74 lr=8.00e-06 tok/s=6011  grad_norm=0.76 dt=1.2s
 !!! note "The first step is slow"
     `torch.compile` traces and compiles the model on the first forward pass. Steps 2+ are the real speed. This is normal and only happens once (cached for the session).
 
+How to read the line:
+
+| Field | Meaning |
+|---|---|
+| `loss` | the training objective, averaged over the accumulation window: it should fall |
+| `lr` | the learning rate from the schedule (it starts at 0 and warms up) |
+| `tok/s` | training throughput |
+| `grad_norm` | gradient norm before clipping; judge it against the run's own recent values |
+| `dt` | wall-clock time of the step |
+| `eval` | with an eval set (`data.eval_dataset` or `data.eval_sources`): the validation loss, every `data.eval_every` steps, and once as `step=0 eval=... (before training)` |
+| `eval_sources` | with `data.eval_sources`: each source's own loss, `eval_sources=<name>:<loss>,...`, after the composite `eval` |
+
+Checkpoints go to `train.output_dir` (`./output` here): a resumable `step-N/` every `train.save_steps` steps, of which the newest `train.keep_checkpoints` (default 5) are kept, and the final model in `final/`. See [Your First Training](first-training.md) for the layout and `best/`.
+
 ## 3. Use your own data
 
 Edit `configs/quickstart.yaml`:
@@ -81,5 +95,7 @@ All without configuring anything.
 ## Next
 
 - [Your first real training](first-training.md)
-- [Single GPU optimization](../guides/single-gpu.md)
+- [Single GPU optimization](../guides/single-gpu.md): what fits, and `pgs fit` for the fastest memory setting
+- [LoRA](../guides/lora.md): adapters on a frozen base (`pgs init lora`)
 - [Autopilot mode](../guides/autopilot.md)
+- [CLI reference](../reference/cli.md) and [configuration reference](../reference/configuration.md)
