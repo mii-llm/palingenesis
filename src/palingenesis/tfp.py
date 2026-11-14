@@ -1,7 +1,11 @@
 """Threshold Filtering Packing (TFP) — semantic-aware sample ordering.
 
 Paper: "Threshold Filtering Packing for SFT" (arxiv:2408.09327)
-Result: +7% GSM8K, +4% HumanEval over random packing.
+Result reported by the paper: +7% GSM8K, +4% HumanEval over random packing.
+
+Status: a standalone utility, not part of `pgs prepare` or `pgs train`. The paper's gain
+comes from packed samples attending to each other; palingenesis isolates every packed
+document (see PackedDataset), so this ordering changes nothing a model trained here sees.
 
 Key insight: Instead of random or length-sorted packing, order samples so that
 related-but-diverse samples land in the same pack. This creates implicit

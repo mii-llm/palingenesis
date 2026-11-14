@@ -1,5 +1,8 @@
 """Adaptive Multi-Source Fine-Tuning with per-source weight scheduling.
 
+Status: not wired into the training loop. `data.msft_tracking` only logs a warning and the
+weights of `data.sources` stay fixed; the scheduler below is untested on a real run.
+
 Inspired by MSFT (arxiv:2603.21606) but improved for our use case:
 
 MSFT paper: binary exclusion of overfitting sources + checkpoint rollback.
