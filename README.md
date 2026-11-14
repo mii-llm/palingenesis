@@ -60,6 +60,7 @@ AMD GPUs (ROCm): [Training on AMD GPUs](https://mii-llm.github.io/palingenesis/g
   re-tokenized. Rewards are checked answers, hidden tests, LLM judges or any Python function.
 - **Memory.** Chunked losses (the full logits are never materialised), selective activation checkpointing, gradient
   release, 8-bit optimizers. A Qwen3.5-4B fine-tune (attention pathway, 36% of the weights) fits in about 16 GiB.
+  `pgs fit` measures which memory settings are the fastest that fit your GPU.
 - **Long sequences on one GPU (SeCO).** Chunk-by-chunk training with a cache gives the exact gradient, verified against full
   backpropagation on 27 architectures, including the Qwen3.5 and LFM2 hybrids.
 - **Training you can inspect.** wandb and trackio with grad norm, spike and clip counters, gradient noise scale, entropy and
