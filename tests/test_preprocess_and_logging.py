@@ -318,30 +318,22 @@ def test_jsonl_replaces_stale_parquet():
     print("✓ test_jsonl_replaces_stale_parquet PASSED")
 
 
-def test_hes_tokenises_the_render_without_a_second_bos():
-    """HES scores the rendered conversation: the template already wrote BOS, the tokenizer must not add another."""
-    import types
-
-    import torch
+def test_scoring_tokenises_the_render_without_a_second_bos():
+    """Perplexity and HES score the ids training feeds the model: the template already wrote BOS, the tokenizer
+    must not add another."""
     from test_fallback_offsets import _bos_tok
 
-    from palingenesis.prepare import _compute_single_hes
+    from palingenesis.data import ChatDataset
+    from palingenesis.data_clean import CleanReport, tokenize_rows
 
     tok = _bos_tok()
-    seen = {}
-
-    class Model:
-        device = torch.device("cpu")
-
-        def __call__(self, input_ids):
-            seen["ids"] = input_ids[0].tolist()
-            return types.SimpleNamespace(logits=torch.zeros(1, input_ids.shape[1], len(tok)))
-
     sample = {"messages": [{"role": "user", "content": "hi there"}, {"role": "assistant", "content": "hello to you"}]}
-    assert _compute_single_hes(Model(), tok, sample, "messages", 256, 50.0) > 0
+    kept, entries = tokenize_rows([sample], ChatDataset(None, tok, 256), CleanReport(), keep_tokens=True)
+    ids = entries[0][1].tolist()
     want = tok.apply_chat_template(sample["messages"], tokenize=True, return_dict=True)["input_ids"]
-    assert seen["ids"] == want and seen["ids"].count(tok.bos_token_id) == 1
-    print("✓ test_hes_tokenises_the_render_without_a_second_bos PASSED")
+    assert ids == want and ids.count(tok.bos_token_id) == 1
+    assert kept[0]["_score_length"] == len(want)
+    print("✓ test_scoring_tokenises_the_render_without_a_second_bos PASSED")
 
 
 def test_prepare_writes_manifest():
@@ -583,7 +575,7 @@ if __name__ == "__main__":
     test_save_prepared_jsonl()
     test_parquet_replaces_stale_jsonl()
     test_jsonl_replaces_stale_parquet()
-    test_hes_tokenises_the_render_without_a_second_bos()
+    test_scoring_tokenises_the_render_without_a_second_bos()
     test_prepare_writes_manifest()
     test_tracker_disabled_backends_noop()
     test_tracker_run_id_persistence()

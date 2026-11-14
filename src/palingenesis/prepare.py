@@ -1,26 +1,32 @@
-"""Data preparation pipeline — offline scoring, filtering and selection.
+"""Data preparation pipeline: offline cleaning, held-out split and selection.
 
-Scores every training sample with the model you will fine-tune (one forward pass,
-the tokens training puts loss on), then filters and selects. Inference only.
+Default pipeline (tokenizer only, no forward pass; see data_clean):
+  1. drop the rows training would drop (cannot be rendered, nothing to train on, no
+     trained turn fits max_seq_length) and count the ones it would cut
+  2. drop exact duplicates; optionally cap the rows that share a prompt
+  3. reserve a held-out eval set that shares no prompt with the training pool
+  4. cap rows / tokens per group (source), then select a budget of rows or tokens
+  5. write the data, `prepared_meta.json` (what was kept, dropped and why, token counts,
+     per-group profile) and `dropped.jsonl` (every removed row with its reason)
 
-What the score is: the perplexity of the sample's *response* under the model. Low
-means the model would write something very close to this answer already
-(familiar); high means the answer is far from what the model would write
-(unfamiliar). It is NOT problem difficulty: on 20k NuminaMath problems, the
-Spearman correlation between Qwen3.5-0.8B's pass rate and this score was 0.009.
-Buckets are percentiles of the score over this dataset (bottom 25% familiar,
-top 25% unfamiliar).
+Optional scoring (`score`, or any perplexity option): one forward pass with the model you
+will fine-tune over the tokens training puts loss on. The score is the perplexity of the
+sample's *response* under the model: low means the model would write something very close
+to this answer already (familiar), high means the answer is far from what the model would
+write (unfamiliar). It is NOT problem difficulty: on 20k NuminaMath problems, the Spearman
+correlation between Qwen3.5-0.8B's pass rate and this score was 0.009.
 
-Selection strategies are heuristics; compare any of them with `random` on your
-own eval battery (see the data guide for measurements on Qwen3.5).
+The perplexity filter and the familiarity-based selection strategies are experimental: in
+our measurements and in published replications (arXiv:2410.09335, 2410.15225) they do not
+beat a random subset of the same size. Compare any of them with `random` on your own eval
+battery (see the data guide).
 
 Usage:
     # Standalone flags
     palingenesis prepare --model google/gemma-4-12B-it \\
                         --data your-org/agentic-traces \\
                         --output prepared/ \\
-                        --budget 10000 \\
-                        --strategy random
+                        --budget 10000
 
     # Or drive everything from the SAME config used for training
     # (model.name_or_path, data.dataset/split/messages_field/max_seq_length
@@ -34,6 +40,7 @@ Usage:
 import json
 import logging
 import math
+import random
 import sys
 import time
 from pathlib import Path
@@ -59,6 +66,45 @@ def _get_messages(sample: dict, messages_field: str) -> list[dict]:
     return raw if isinstance(raw, list) else []
 
 
+class Scorer:
+    """The tokenizer and (lazily, once) the model of a prepare run. Cleaning needs only the
+    tokenizer; the model is loaded on the first scoring call and shared by every source."""
+
+    def __init__(self, model_name: str, device: str = "auto"):
+        from transformers import AutoTokenizer
+
+        self.model_name = model_name
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self._model = None
+
+    @property
+    def model(self):
+        if self._model is None:
+            from transformers import AutoModelForCausalLM
+
+            logger.info(f"Loading model: {self.model_name}")
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                device_map=self.device,
+                low_cpu_mem_usage=True,
+            )
+            self._model.eval()
+        return self._model
+
+    def chat(self, max_seq_length: int, messages_field: str, chat_options: dict | None = None):
+        """The trainer's row pipeline (chat template, tools, truncation at turn boundaries,
+        and the exact tokens that get loss, per-message flags and reasoning settings
+        included), so prepare measures what training trains."""
+        from palingenesis.data import ChatDataset
+
+        return ChatDataset(None, self.tokenizer, max_seq_length, messages_field, **(chat_options or {}))
+
+
 def score_samples_with_model(
     model_name: str,
     samples: list[dict],
@@ -68,77 +114,56 @@ def score_samples_with_model(
     device: str = "auto",
     max_batch_tokens: int = 16384,
     chat_options: dict | None = None,
+    hes_top_k_pct: float | None = None,
 ) -> list[dict]:
     """Score samples by the perplexity of their responses under the model.
 
     Uses the model you will fine-tune, on exactly the tokens training puts loss
     on. Low perplexity = the response is familiar to the model (close to what it
     would write); high = unfamiliar. This measures the response, not how hard
-    the problem is.
-
-    Scoring is truly batched: samples are pre-tokenized, sorted by length,
-    packed into padded batches (≤ batch_size samples AND ≤ max_batch_tokens
-    padded tokens per forward — logits are B×S×V, so the token cap is what
-    protects memory), then scored one forward per batch.
+    the problem is. Rows training would drop are marked unscoreable (infinite
+    perplexity). hes_top_k_pct: also write the High-Entropy Sum (see _score_padded_batch).
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from palingenesis.data_clean import CleanReport, tokenize_rows
 
-    logger.info(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    scorer = Scorer(model_name, device)
+    chat = scorer.chat(max_seq_length, messages_field, chat_options)
+    for s in samples:
+        _mark_unscoreable(s)
+    kept, entries = tokenize_rows(samples, chat, CleanReport(), keep_tokens=True)
+    score_entries(scorer, entries, kept, batch_size, max_batch_tokens, hes_top_k_pct)
+    return samples
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map=device,
-        low_cpu_mem_usage=True,
-    )
-    model.eval()
 
-    # ── Phase 1: tokenize everything on CPU with the TRAINER's own pipeline ──
-    # (ChatDataset: chat template, tools, truncation at turn boundaries, and the
-    # exact tokens that get loss in training, per-message flags and reasoning
-    # settings included), so "response perplexity" scores what training trains.
-    from palingenesis.data import IGNORE_INDEX, ChatDataset
+def score_entries(
+    scorer: Scorer,
+    entries: list[tuple[int, torch.Tensor, torch.Tensor]],
+    samples: list[dict],
+    batch_size: int = 4,
+    max_batch_tokens: int = 16384,
+    hes_top_k_pct: float | None = None,
+) -> None:
+    """Score tokenized rows in place: entries are (index into samples, input_ids, trained mask).
 
-    chat = ChatDataset(None, tokenizer, max_seq_length, messages_field, **(chat_options or {}))
-    total = len(samples)
-    entries: list[tuple[int, list[int], torch.Tensor]] = []  # (sample_idx, input_ids, response_mask)
-    for idx, sample in enumerate(samples):
-        try:
-            processed = chat._process(sample)
-        except Exception as exc:
-            logger.debug(f"sample {idx} cannot be rendered: {exc!r}")
-            processed = None
-        if processed is None or processed["input_ids"].numel() < 2:
-            _mark_unscoreable(sample)
-            continue
-        ids = processed["input_ids"].tolist()
-        entries.append((idx, ids, processed["labels"] != IGNORE_INDEX))
-
-        if idx % 5000 == 0:
-            logger.info(f"  Tokenized {idx}/{total}")
-
-    # ── Phase 2: length-sorted batching (minimizes padding waste) ──
-    # Batches are capped by BOTH batch_size (samples) and max_batch_tokens
-    # (padded tokens per forward), because logits memory is B×S×V.
-    entries.sort(key=lambda e: len(e[1]))
+    Truly batched: entries are sorted by length and packed into padded batches
+    (≤ batch_size samples AND ≤ max_batch_tokens padded tokens per forward: logits are
+    B×S×V, so the token cap is what protects memory), one forward per batch. The
+    High-Entropy Sum, when asked for, comes from the same forward.
+    """
+    entries = sorted(entries, key=lambda e: len(e[1]))
     batches = _group_entries_by_length(entries, batch_size, max_batch_tokens)
     logger.info(
         f"Scoring {len(entries)} samples in {len(batches)} batched forwards "
         f"(batch_size≤{batch_size}, ≤{max_batch_tokens} padded tokens per forward)"
     )
-
-    # ── Phase 3: one forward per batch, per-sample masked NLL ──
-    pad_id = tokenizer.pad_token_id
+    model = scorer.model
+    pad_id = scorer.tokenizer.pad_token_id
     scored_count = 0
     scored_tokens = 0
     total_tokens = sum(len(e[1]) for e in entries)
     t0 = time.perf_counter()
     for batch_num, batch in enumerate(batches):
-        _score_padded_batch(model, batch, samples, pad_id)
+        _score_padded_batch(model, batch, samples, pad_id, hes_top_k_pct)
         scored_count += len(batch)
         scored_tokens += sum(len(e[1]) for e in batch)
         if batch_num % 20 == 0 or batch_num == len(batches) - 1:
@@ -153,8 +178,8 @@ def score_samples_with_model(
                 f"  Scored {scored_count}/{len(entries)} samples "
                 f"({rate:.1f} samples/s, {tok_rate / 1000:.1f}K tok/s, ETA {eta_s / 60:.0f}m)"
             )
-
-    return samples
+    if hes_top_k_pct:
+        _normalize_hes(samples)
 
 
 def _mark_unscoreable(sample: dict) -> None:
@@ -195,11 +220,15 @@ def _score_padded_batch(
     batch: list[tuple[int, list[int], torch.Tensor]],
     samples: list[dict],
     pad_id: int,
+    hes_top_k_pct: float | None = None,
 ) -> None:
     """Forward one padded batch and write per-sample PPL scores in-place.
 
     Response perplexity is computed only on assistant tokens — the same tokens
-    that receive loss during training.
+    that receive loss during training. With hes_top_k_pct, the High-Entropy Sum
+    (arXiv:2605.22389) is written too: the sum of the predictive entropies of the
+    top-k% highest-entropy response tokens (`_score_hes`), and their mean
+    (`_score_hes_mean`, comparable across response lengths, which the sum is not).
     """
     max_len = max(len(ids) for _, ids, _ in batch)
     n = len(batch)
@@ -208,7 +237,7 @@ def _score_padded_batch(
     attn_mask = torch.zeros((n, max_len), dtype=torch.long)
     resp_mask = torch.zeros((n, max_len), dtype=torch.bool)
     for row, (_, ids, rmask) in enumerate(batch):
-        input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+        input_ids[row, : len(ids)] = torch.as_tensor(ids, dtype=torch.long)
         attn_mask[row, : len(ids)] = 1
         resp_mask[row, : len(rmask)] = rmask
 
@@ -226,15 +255,24 @@ def _score_padded_batch(
     # while avoiding one tiny kernel launch per row.
     shift_labels = input_ids[:, 1:]
     nll = torch.empty((n, max_len - 1), dtype=torch.float32, device=device)
+    entropy = torch.empty_like(nll) if hes_top_k_pct else None
     rows_per_chunk = max(1, 8192 // max(max_len - 1, 1))
     for start in range(0, n, rows_per_chunk):
         end = min(start + rows_per_chunk, n)
         chunk = logits[start:end, :-1, :].float()
-        nll[start:end] = torch.nn.functional.cross_entropy(
-            chunk.reshape(-1, chunk.size(-1)),
-            shift_labels[start:end].reshape(-1),
-            reduction="none",
-        ).view(end - start, max_len - 1)
+        if entropy is None:
+            nll[start:end] = torch.nn.functional.cross_entropy(
+                chunk.reshape(-1, chunk.size(-1)),
+                shift_labels[start:end].reshape(-1),
+                reduction="none",
+            ).view(end - start, max_len - 1)
+            continue
+        # NLL and entropy from one log-softmax, with at most two fp32 copies alive (as above)
+        log_probs = torch.nn.functional.log_softmax(chunk, dim=-1)
+        del chunk
+        nll[start:end] = -log_probs.gather(-1, shift_labels[start:end].unsqueeze(-1)).squeeze(-1)
+        entropy[start:end] = -log_probs.exp().mul_(log_probs).sum(dim=-1)
+        del log_probs
     del logits
 
     valid = attn_mask[:, 1:].bool()  # real (non-pad) prediction targets
@@ -248,6 +286,9 @@ def _score_padded_batch(
     resp_nll_rows = (nll * resp).sum(dim=1) / resp_counts.clamp(min=1)
 
     stats = torch.stack([avg_nll_rows, resp_nll_rows, resp_counts.float()]).cpu()
+    if entropy is not None:
+        # response positions first, in decreasing entropy; the rest sorts last
+        ranked = entropy.masked_fill(~resp, -1.0).sort(dim=1, descending=True).values.cpu()
 
     for row, (sample_idx, ids, _) in enumerate(batch):
         sample = samples[sample_idx]
@@ -262,6 +303,22 @@ def _score_padded_batch(
         sample["_score_avg_nll"] = round(avg_nll, 4)
         sample["_score_response_nll"] = round(response_nll, 4)
         sample["_score_response_token_count"] = n_resp
+        if entropy is not None:
+            k = min(max(1, int(n_resp * hes_top_k_pct / 100.0)), n_resp)
+            top = ranked[row, :k]
+            sample["_score_hes"] = round(top.sum().item(), 4) if k else 0.0
+            sample["_score_hes_mean"] = round(top.mean().item(), 4) if k else 0.0
+
+
+def _normalize_hes(samples: list[dict]) -> None:
+    """`_score_hes_normalized`: the High-Entropy Sum min-max scaled to [0, 1] over this dataset."""
+    values = [s["_score_hes"] for s in samples if s.get("_score_hes", 0) > 0]
+    if not values:
+        return
+    low, span = min(values), (max(values) - min(values)) or 1.0
+    for s in samples:
+        raw = s.get("_score_hes", 0)
+        s["_score_hes_normalized"] = round((raw - low) / span, 4) if raw > 0 else 0.0
 
 
 FAMILIARITY_BUCKETS = ("familiar", "typical", "unfamiliar")
@@ -298,8 +355,8 @@ def classify_familiarity(
 
 
 def profile_groups(samples: list[dict], field: str) -> dict:
-    """Per-group profile of scored samples: count, median response NLL, mean
-    response tokens and familiarity buckets. Rows without the field go to "<none>"."""
+    """Per-group profile: count, tokens, mean response tokens and, when the rows are scored,
+    median response NLL and familiarity buckets. Rows without the field go to "<none>"."""
     groups: dict[str, list[dict]] = {}
     for s in samples:
         groups.setdefault(str(s.get(field, "<none>")), []).append(s)
@@ -313,10 +370,12 @@ def profile_groups(samples: list[dict], field: str) -> dict:
             fam[b] = fam.get(b, 0) + 1
         out[name] = {
             "count": len(rows),
-            "median_response_nll": round(nll[len(nll) // 2], 4) if nll else None,
+            "tokens": sum(r.get("_score_length", 0) for r in rows),
             "mean_response_tokens": round(sum(toks) / len(toks), 1),
-            "familiarity": fam,
         }
+        if nll:
+            out[name]["median_response_nll"] = round(nll[len(nll) // 2], 4)
+            out[name]["familiarity"] = fam
     return out
 
 
@@ -327,16 +386,19 @@ def filter_samples(
     min_length: int = 10,
     max_length: int = 32768,
     score: str = "response",
+    on_drop=None,
 ) -> list[dict]:
-    """Remove clearly bad samples.
+    """Remove outliers by perplexity and length.
 
-    - min_ppl < 1.5: essentially memorized / trivial (e.g., "Hi" → "Hello!")
-    - max_ppl > 500: model has no idea (corrupted, wrong language, noise)
-      Set max_ppl <= 0 to disable the upper-bound filter. This is useful for
-      multilingual/domain-shifted data where absolute PPL is high but relative
-      familiarity ranking is still useful.
-    - min_length: too short to be useful
-    - max_length: too long (would dominate training)
+    - min_ppl: below it the response is near-verbatim what the model writes already
+      (<= 0 disables). Short tool calls and templated answers also score this low.
+    - max_ppl: above it the response is usually corrupted or in the wrong language
+      (<= 0 disables). Absolute perplexity depends on the model, the domain and the
+      language: read the distribution before choosing a ceiling.
+    - min_length / max_length: tokens of the row as training sees it.
+
+    Rows without a score (scoring was not run) pass the perplexity bounds; rows marked
+    unscoreable are removed. on_drop(sample, reason) is called for every removed row.
 
     For chat SFT, filter on assistant-response perplexity by default. Training
     loss is applied to assistant tokens only, so filtering on full-sequence PPL
@@ -344,24 +406,30 @@ def filter_samples(
     learnable and masking is healthy.
     """
     filtered = []
-    removed = {"too_easy": 0, "too_hard": 0, "too_short": 0, "too_long": 0}
+    removed = {"unscoreable": 0, "too_easy": 0, "too_hard": 0, "too_short": 0, "too_long": 0}
     score_key = "_score_response_ppl" if score == "response" else "_score_ppl"
     use_max_ppl = max_ppl > 0
 
     for s in samples:
-        ppl = s.get(score_key, s.get("_score_ppl", float("inf")))
+        ppl = s.get(score_key, s.get("_score_ppl"))
         length = s.get("_score_length", 0)
 
-        if ppl < min_ppl:
-            removed["too_easy"] += 1
-        elif use_max_ppl and ppl > max_ppl:
-            removed["too_hard"] += 1
+        if ppl is not None and not math.isfinite(ppl):
+            reason = "unscoreable"
+        elif ppl is not None and ppl < min_ppl:
+            reason = "too_easy"
+        elif ppl is not None and use_max_ppl and ppl > max_ppl:
+            reason = "too_hard"
         elif length < min_length:
-            removed["too_short"] += 1
+            reason = "too_short"
         elif length > max_length:
-            removed["too_long"] += 1
+            reason = "too_long"
         else:
             filtered.append(s)
+            continue
+        removed[reason] += 1
+        if on_drop is not None:
+            on_drop(s, reason)
 
     finite_ppls = [s.get(score_key, s.get("_score_ppl")) for s in samples]
     finite_ppls = [p for p in finite_ppls if isinstance(p, (int, float)) and math.isfinite(p)]
@@ -542,23 +610,20 @@ def _find_by_basename(output_dir: str | Path, basename: str) -> Path | None:
     return None
 
 
-def split_eval_holdout(samples: list[dict], n_holdout: int, seed: int = 42) -> tuple[list[dict], list[dict]]:
-    """Reserve n_holdout random samples as a held-out eval set.
+def split_eval_holdout(
+    samples: list[dict], n_holdout: int, seed: int = 42, messages_field: str = "messages", key=None
+) -> tuple[list[dict], list[dict]]:
+    """Reserve about n_holdout random samples as a held-out eval set.
 
-    Returns (train_pool, eval_holdout) — disjoint, deterministic for a given
-    seed. Random (not familiarity-stratified) so the eval set is an unbiased
+    Returns (train_pool, eval_holdout): disjoint, deterministic for a given seed, and
+    split by prompt (data_clean.split_holdout): rows that share a system prompt and first
+    user turn stay on one side, so the eval set holds no task the model trained on under
+    another answer. Random (not familiarity-stratified) so the eval set is an unbiased
     draw from the same distribution the training pool comes from.
     """
-    import random
+    from palingenesis.data_clean import split_holdout
 
-    if n_holdout <= 0 or n_holdout >= len(samples):
-        return samples, []
-
-    rng = random.Random(seed)
-    indices = set(rng.sample(range(len(samples)), n_holdout))
-    train_pool = [s for i, s in enumerate(samples) if i not in indices]
-    holdout = [s for i, s in enumerate(samples) if i in indices]
-    return train_pool, holdout
+    return split_holdout(samples, n_holdout, seed, messages_field, key)
 
 
 def save_prepared(
@@ -605,6 +670,44 @@ def save_prepared(
     return out_file
 
 
+def load_samples(data_path: str, dataset_split: str = "train", max_samples: int | None = None) -> list[dict]:
+    """Rows of a local .jsonl / .json / .parquet file or a Hub dataset, as dicts; at most
+    max_samples of them (a seeded random subset)."""
+    path = Path(data_path)
+    if path.suffix == ".jsonl":
+        with path.open() as f:
+            samples = [json.loads(line) for line in f if line.strip()]
+    elif path.suffix == ".json":
+        with path.open() as f:
+            samples = json.load(f)
+    elif path.suffix == ".parquet":
+        from datasets import load_dataset
+
+        samples = [dict(row) for row in load_dataset("parquet", data_files=str(path), split="train")]
+    elif max_samples:
+        # HuggingFace dataset, capped: stream a shuffled prefix instead of
+        # downloading the whole dataset to keep max_samples rows of it.
+        import itertools
+
+        from datasets import load_dataset
+
+        ds = load_dataset(str(data_path), split=dataset_split, streaming=True)
+        ds = ds.shuffle(seed=42, buffer_size=max(10_000, 2 * max_samples))
+        samples = [dict(row) for row in itertools.islice(ds, max_samples)]
+    else:
+        from datasets import load_dataset
+
+        samples = [dict(row) for row in load_dataset(str(data_path), split=dataset_split)]
+
+    if max_samples and len(samples) > max_samples:
+        samples = random.Random(42).sample(samples, max_samples)
+    return samples
+
+
+# What the report calls the rows filter_samples removes.
+_FILTER_REASONS = {"too_easy": "response_ppl_below_min", "too_hard": "response_ppl_above_max"}
+
+
 def prepare_data(
     model_name: str,
     data_path: str,
@@ -620,125 +723,156 @@ def prepare_data(
     compute_hes: bool = False,
     hes_top_k_pct: float = 0.5,
     eval_holdout: int = 0,
-    min_ppl: float = 1.5,
-    max_ppl: float = 500.0,
+    min_ppl: float = 0.0,
+    max_ppl: float = 0.0,
     filter_score: str = "response",
     max_batch_tokens: int = 16384,
     chat_options: dict | None = None,
     group_field: str = "",
+    score: bool = False,
+    dedupe: bool = True,
+    max_per_prompt: int = 0,
+    max_per_group: int = 0,
+    max_tokens_per_group: int = 0,
+    token_budget: int = 0,
+    seed: int = 42,
+    scorer: Scorer | None = None,
 ) -> Path:
     """Full data preparation pipeline.
 
-    group_field: a per-row column (e.g. "source", "category") to profile: the
-    manifest reports, per group, the sample count, median response NLL, mean
-    response tokens and familiarity buckets, for the scored pool and for the
+    1. Load data
+    2. Drop exact duplicates (dedupe) and the rows training would drop; count the rows
+       it would cut to max_seq_length
+    3. Optionally score with the model (score, compute_hes, a perplexity bound or a
+       familiarity strategy turn it on), bucket by familiarity and filter by perplexity
+    4. Reserve a held-out eval set (eval_holdout > 0) that shares no prompt with the
+       training pool
+    5. Cap the rows that share a prompt (max_per_prompt) and the rows / tokens per
+       group (max_per_group, max_tokens_per_group; needs group_field)
+    6. Select by budget/strategy, then by token_budget
+    7. Save the dataset (parquet or jsonl), prepared_meta.json and dropped.jsonl
+
+    group_field: a per-row column (e.g. "source", "category") to cap and to profile: the
+    manifest reports, per group, the sample count, tokens, mean response tokens and, when
+    scored, median response NLL and familiarity buckets, for the cleaned pool and for the
     selection. Public datasets mixing sources differ a lot per source, and
     familiarity-based selection mostly moves the source mix.
 
     chat_options: ChatDataset options (train_on_reasoning, include_observations,
-    last_turn_only, tools_field) so scoring masks exactly what training trains.
+    last_turn_only, tools_field, think_tags, chat_template_kwargs) so prepare renders and
+    masks exactly what training trains.
 
-    1. Load data
-    2. Score with model perplexity
-    3. Bucket by familiarity (response-PPL percentiles)
-    4. Filter outliers
-    5. Reserve a held-out eval set (eval_holdout > 0) — never trained on
-    6. Select by budget/strategy from the remaining pool
-    7. Save scored + ordered dataset (parquet or jsonl) + prepared_meta.json
+    scorer: a Scorer to reuse (prepare_multi_source shares one model across sources).
 
     Returns the path to the prepared dataset file.
     """
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-    # Load data
-    logger.info(f"Loading data from: {data_path} (split={dataset_split})")
-    source_id = str(data_path)
-    data_path = Path(data_path)
-    if data_path.suffix == ".jsonl":
-        with data_path.open() as f:
-            samples = [json.loads(line) for line in f if line.strip()]
-    elif data_path.suffix == ".json":
-        with data_path.open() as f:
-            samples = json.load(f)
-    elif data_path.suffix == ".parquet":
-        from datasets import load_dataset
-
-        ds = load_dataset("parquet", data_files=str(data_path), split="train")
-        samples = [dict(row) for row in ds]
-    elif max_samples:
-        # HuggingFace dataset, capped: stream a shuffled prefix instead of
-        # downloading the whole dataset to keep max_samples rows of it.
-        import itertools
-
-        from datasets import load_dataset
-
-        ds = load_dataset(str(data_path), split=dataset_split, streaming=True)
-        ds = ds.shuffle(seed=42, buffer_size=max(10_000, 2 * max_samples))
-        samples = [dict(row) for row in itertools.islice(ds, max_samples)]
-    else:
-        # HuggingFace dataset
-        from datasets import load_dataset
-
-        ds = load_dataset(str(data_path), split=dataset_split)
-        samples = [dict(row) for row in ds]
-
-    if max_samples and len(samples) > max_samples:
-        import random
-
-        random.seed(42)
-        samples = random.sample(samples, max_samples)
-
-    logger.info(f"Loaded {len(samples)} samples")
-
-    # Score
-    logger.info("Scoring samples with model perplexity...")
-    samples = score_samples_with_model(
-        model_name,
-        samples,
-        messages_field,
-        max_seq_length,
-        batch_size,
-        max_batch_tokens=max_batch_tokens,
-        chat_options=chat_options,
+    from palingenesis.data_clean import (
+        ROW_INDEX,
+        CleanReport,
+        cap_groups,
+        drop_exact_duplicates,
+        prompt_key,
+        take_token_budget,
+        token_stats,
+        tokenize_rows,
     )
 
-    # Optional HES scoring (for reasoning data)
-    if compute_hes:
-        samples = compute_hes_scores(
-            model_name, samples, messages_field, max_seq_length, top_k_pct=hes_top_k_pct, batch_size=batch_size
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    # Settings that cannot work are refused before any row is read or scored.
+    if strategy not in STRATEGIES:
+        raise ValueError(f"Unknown selection strategy {strategy!r}; choose one of {STRATEGIES}")
+    if token_budget and strategy != "random":
+        raise ValueError(f"token_budget selects a random subset: it cannot be combined with strategy={strategy!r}")
+    if (max_per_group or max_tokens_per_group) and not group_field:
+        raise ValueError("max_per_group / max_tokens_per_group need group_field (the row column that names the group)")
+    scoring = score or compute_hes or min_ppl > 0 or max_ppl > 0 or strategy != "random"
+    if strategy != "random":
+        logger.warning(
+            f"strategy={strategy!r} is experimental: selection and ordering by response perplexity have not beaten "
+            "a random subset of the same size (see the data guide). Compare with strategy=random on your eval battery."
         )
 
-    # Bucket by familiarity
-    samples = classify_familiarity(samples)
+    logger.info(f"Loading data from: {data_path} (split={dataset_split})")
+    samples = load_samples(str(data_path), dataset_split, max_samples)
+    for i, s in enumerate(samples):
+        s[ROW_INDEX] = i
+    report = CleanReport(loaded=len(samples))
+    logger.info(f"Loaded {len(samples)} samples")
+
+    scorer = scorer or Scorer(model_name)
+    chat = scorer.chat(max_seq_length, messages_field, chat_options)
+    if dedupe:
+        samples = drop_exact_duplicates(samples, report, messages_field, chat.tools_field)
+    samples, entries = tokenize_rows(samples, chat, report, keep_tokens=scoring)
+
+    if scoring:
+        logger.info("Scoring samples with model perplexity...")
+        score_entries(scorer, entries, samples, batch_size, max_batch_tokens, hes_top_k_pct if compute_hes else None)
+        samples = classify_familiarity(samples)
+    del entries
     pool_groups = profile_groups(samples, group_field) if group_field else None
 
-    # Filter
-    samples = filter_samples(samples, min_ppl=min_ppl, max_ppl=max_ppl, score=filter_score)
+    # Rows are cut to max_seq_length already, so the length ceiling never removes any.
+    samples = filter_samples(
+        samples,
+        min_ppl=min_ppl,
+        max_ppl=max_ppl,
+        max_length=max_seq_length,
+        score=filter_score,
+        on_drop=lambda s, reason: report.drop(s, _FILTER_REASONS.get(reason, reason)),
+    )
     if not samples:
         hint = (
             "For domain-shifted or multilingual chat data, try `preprocess.max_ppl: 0` "
-            "to disable the absolute PPL ceiling and rely on percentile-based selection."
+            "to disable the absolute PPL ceiling."
             if max_ppl > 0
-            else "All samples were removed by non-PPL filters (usually min_length/max_length). "
-            "Check that messages_field matches the dataset schema and that prepare normalizes the conversation format."
+            else "Check that messages_field matches the dataset schema and that the rows hold a trained assistant turn."
         )
         raise ValueError(
-            "Preparation produced 0 samples after filtering. "
-            f"filter_score={filter_score}, min_ppl={min_ppl}, max_ppl={max_ppl}. "
-            f"{hint}"
+            f"Preparation produced 0 samples after cleaning and filtering (removed: {dict(report.reasons)}). "
+            f"filter_score={filter_score}, min_ppl={min_ppl}, max_ppl={max_ppl}. {hint}"
         )
 
-    # Reserve held-out eval BEFORE selection: an unbiased random draw from the
-    # filtered pool, guaranteed disjoint from anything that gets trained on.
+    prompt_keys = (
+        {s[ROW_INDEX]: prompt_key(s, messages_field) for s in samples} if eval_holdout or max_per_prompt else {}
+    )
+
+    def by_prompt(s: dict) -> str:
+        return prompt_keys[s[ROW_INDEX]]
+
+    # Reserve held-out eval BEFORE caps and selection: a random draw of whole prompts
+    # from the cleaned pool, disjoint from anything that gets trained on.
     eval_samples: list[dict] = []
     if eval_holdout:
-        samples, eval_samples = split_eval_holdout(samples, eval_holdout)
+        samples, eval_samples = split_eval_holdout(samples, eval_holdout, seed, messages_field, key=by_prompt)
+        if len(eval_samples) < eval_holdout:
+            logger.warning(
+                f"Held-out eval set has {len(eval_samples)} of the {eval_holdout} rows asked for "
+                f"(pool of {len(samples) + len(eval_samples)} rows; rows that share a prompt are kept together)"
+            )
         if eval_samples:
             logger.info(f"Reserved {len(eval_samples)} samples as held-out eval set")
 
+    if max_per_prompt:
+        samples = cap_groups(samples, by_prompt, report, "prompt_cap", max_rows=max_per_prompt, seed=seed)
+    if max_per_group or max_tokens_per_group:
+        samples = cap_groups(
+            samples,
+            lambda s: str(s.get(group_field, "<none>")),
+            report,
+            "group_cap",
+            max_rows=max_per_group,
+            max_tokens=max_tokens_per_group,
+            seed=seed,
+        )
+
     # Select by budget
+    pool_rows = len(samples)
     if budget:
-        samples = select_by_budget(samples, budget, strategy)
+        samples = select_by_budget(samples, budget, strategy, seed)
+    if token_budget:
+        samples = take_token_budget(samples, token_budget, seed)
 
     # Add curriculum rank if not already present
     if strategy == "curriculum":
@@ -752,31 +886,44 @@ def prepare_data(
     if eval_samples:
         eval_file = save_prepared(eval_samples, output_path, output_format, basename=EVAL_BASENAME)
         logger.info(f"Eval holdout: {eval_file} ({len(eval_samples)} samples)")
+    dropped_file = report.write(output_path)
 
     # Stats + manifest (consumed by training to verify provenance)
     ppls = [s["_score_response_ppl"] for s in samples if "_score_response_ppl" in s]
     buckets: dict[str, int] = {}
-    for s in samples:
-        b = s.get("_score_familiarity", "unknown")
-        buckets[b] = buckets.get(b, 0) + 1
+    if scoring:
+        for s in samples:
+            b = s.get("_score_familiarity", "unknown")
+            buckets[b] = buckets.get(b, 0) + 1
 
     meta = {
         "model": model_name,
-        "source_dataset": source_id,
+        "source_dataset": str(data_path),
         "dataset_split": dataset_split,
         "messages_field": messages_field,
         "max_seq_length": max_seq_length,
         "strategy": strategy,
         "budget": budget,
+        "token_budget": token_budget,
+        "seed": seed,
         "num_samples": len(samples),
         "format": out_file.suffix.lstrip("."),
         "output_file": str(out_file),
+        "scored": scoring,
+        "cleaning": report.summary(),
+        "dropped_file": str(dropped_file),
+        "selection": {"pool": pool_rows, "selected": len(samples)},
+        "tokens": token_stats(samples),
         "familiarity_distribution": buckets,
         "eval_holdout": len(eval_samples),
         "eval_file": str(eval_file) if eval_file else None,
         "filter_score": filter_score,
         "min_ppl": min_ppl,
         "max_ppl": max_ppl,
+        "dedupe": dedupe,
+        "max_per_prompt": max_per_prompt,
+        "max_per_group": max_per_group,
+        "max_tokens_per_group": max_tokens_per_group,
     }
     tokens = [s["_score_response_token_count"] for s in samples if "_score_response_token_count" in s]
     if tokens:
@@ -795,7 +942,11 @@ def prepare_data(
     with (Path(output_path) / PREPARED_META).open("w") as f:
         json.dump(meta, f, indent=2)
 
-    logger.info(f"Output: {out_file} ({len(samples)} samples)")
+    logger.info(
+        f"Cleaning: {report.loaded} loaded, removed {dict(sorted(report.reasons.items())) or 'none'}, "
+        f"{report.truncated} cut to max_seq_length={max_seq_length} (every removed row: {dropped_file})"
+    )
+    logger.info(f"Output: {out_file} ({len(samples)} samples, {meta['tokens'].get('total', 0):,} tokens)")
     if ppls:
         logger.info(
             f"Perplexity stats: min={min(ppls):.1f}, median={sorted(ppls)[len(ppls) // 2]:.1f}, "
@@ -804,11 +955,6 @@ def prepare_data(
         logger.info(f"Familiarity distribution: {buckets}")
 
     return out_file
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HES: HIGH-ENTROPY SUM METRIC (arxiv:2605.22389, May 2026)
-# ══════════════════════════════════════════════════════════════════════════════
 
 
 def compute_hes_scores(
@@ -820,132 +966,15 @@ def compute_hes_scores(
     batch_size: int = 4,
     device: str = "auto",
 ) -> list[dict]:
-    """Compute High-Entropy Sum (HES) scores for reasoning quality assessment.
+    """High-Entropy Sum scores (`_score_hes`, arXiv:2605.22389) next to the perplexity scores.
 
-    From arxiv:2605.22389 (Unified Data Selection for LLM Reasoning):
-    HES = sum of entropy for only the top-k% highest-entropy tokens in a sample.
-
-    Key insight: Average entropy across all tokens fails to distinguish quality
-    because most tokens (function words, punctuation) are low-entropy in both
-    good and bad samples. The CRITICAL reasoning tokens (decision points,
-    calculations, logical transitions) are the rare high-entropy positions.
-
-    HES is training-free and outperforms perplexity-based scoring for reasoning:
-    - Top 20% HES samples match full-dataset SFT performance
-    - Low-HES samples actively degrade reasoning when trained on
-
-    The metric captures:
-    - Correct reasoning: many high-entropy tokens (model considers alternatives)
-    - Rote/template: few high-entropy tokens (model just pattern-matches)
-    - Garbage/noise: high average entropy but LOW top-k entropy sum (uniformly confused)
-
-    Args:
-        model_name: Model to compute entropy with
-        samples: List of sample dicts with messages_field
-        messages_field: Key containing chat messages
-        max_seq_length: Maximum sequence length
-        top_k_pct: Percentage of highest-entropy tokens to sum (default 0.5%)
-        batch_size: Batch size for inference
-        device: Device for model
-
-    Returns:
-        Samples annotated with '_score_hes' field
+    Kept for callers of the former two-pass API: the entropies come from the scoring
+    forward (see _score_padded_batch), so this is score_samples_with_model with
+    hes_top_k_pct set.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    logger.info(f"Computing HES scores (top_k_pct={top_k_pct}%)")
-    logger.info(f"Loading model: {model_name}")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map=device,
-        low_cpu_mem_usage=True,
+    return score_samples_with_model(
+        model_name, samples, messages_field, max_seq_length, batch_size, device, hes_top_k_pct=top_k_pct
     )
-    model.eval()
-
-    scored = []
-    total = len(samples)
-
-    for i in range(0, total, batch_size):
-        batch = samples[i : i + batch_size]
-        for sample in batch:
-            hes = _compute_single_hes(model, tokenizer, sample, messages_field, max_seq_length, top_k_pct)
-            sample["_score_hes"] = round(hes, 4)
-            scored.append(sample)
-
-        if (i // batch_size) % 10 == 0:
-            logger.info(f"  HES scored {min(i + batch_size, total)}/{total}")
-
-    # Normalize HES scores to [0, 1] range for easier comparison
-    hes_values = [s["_score_hes"] for s in scored if s["_score_hes"] > 0]
-    if hes_values:
-        max_hes = max(hes_values)
-        min_hes = min(hes_values)
-        range_hes = max_hes - min_hes if max_hes > min_hes else 1.0
-        for s in scored:
-            raw = s["_score_hes"]
-            s["_score_hes_normalized"] = round((raw - min_hes) / range_hes, 4) if raw > 0 else 0.0
-
-    return scored
-
-
-@torch.no_grad()
-def _compute_single_hes(
-    model,
-    tokenizer,
-    sample: dict,
-    messages_field: str,
-    max_seq_length: int,
-    top_k_pct: float,
-) -> float:
-    """Compute HES for a single sample.
-
-    HES = sum of entropy for top-k% highest-entropy tokens.
-    """
-    messages = _get_messages(sample, messages_field)
-    if not messages:
-        return 0.0
-
-    try:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    except Exception:
-        text = "\n".join(m.get("content", "") for m in messages)
-
-    # the render already holds the template's special tokens (BOS): the tokenizer must not add its own
-    encoding = tokenizer(
-        text, return_tensors="pt", max_length=max_seq_length, truncation=True, add_special_tokens=False
-    )
-    input_ids = encoding["input_ids"].to(model.device)
-    seq_len = input_ids.shape[1]
-
-    if seq_len < 5:
-        return 0.0
-
-    outputs = model(input_ids)
-    logits = outputs.logits[:, :-1, :].float()  # [1, S-1, V]
-
-    # Compute per-token entropy: H = -sum(p * log(p))
-    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-    probs = log_probs.exp()
-    entropy = -(probs * log_probs).sum(dim=-1).squeeze(0)  # [S-1]
-
-    # Take top-k% highest entropy tokens and SUM their entropies
-    k = max(1, int(len(entropy) * top_k_pct / 100.0))
-    top_k_entropy = entropy.topk(k).values
-    hes = top_k_entropy.sum().item()
-
-    return hes
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MSFT-STYLE PER-SOURCE VALIDATION (arxiv:2603.21606, Mar 2026)
-# ══════════════════════════════════════════════════════════════════════════════
 
 
 def prepare_multi_source(
@@ -957,22 +986,25 @@ def prepare_multi_source(
     strategy: str = "random",
     compute_hes: bool = False,
     hes_top_k_pct: float = 0.5,
+    score: bool = False,
+    min_ppl: float = 0.0,
+    max_ppl: float = 0.0,
+    batch_size: int = 4,
+    max_batch_tokens: int = 16384,
 ):
-    """Prepare multiple data sources independently for MSFT-style training.
+    """Prepare several data sources, each on its own (prepare_data per source, one model).
 
-    MSFT insight: different sub-datasets overfit at different rates.
-    By preparing each source independently:
-      1. Each gets its own familiarity scoring (model-relative)
-      2. Each gets its own budget allocation (J-shaped within source)
-      3. During training, we track per-source val loss to detect overfitting
-      4. Sources that overfit early can be dynamically excluded
+    Creates:
+      - {output_path}/{source_name}/scored_data.jsonl (+ prepared_meta.json, dropped.jsonl)
+      - {output_path}/manifest.json: per source, rows, tokens, what cleaning removed, the
+        weight given and the share of rows and of tokens it amounts to. A `data.sources`
+        weight is a per-conversation sampling probability, so a source of long
+        conversations takes a larger share of the tokens than of the rows.
 
-    This function creates:
-      - prepared/{source_name}/scored_data.jsonl per source
-      - prepared/manifest.json with source metadata + recommended compute allocation
+    Duplicates are removed inside a source, not across sources.
 
     Args:
-        model_name: Model for scoring
+        model_name: Model whose tokenizer (and, when scoring, weights) is used
         sources: List of source configs, each with:
             - dataset: path or HF dataset name
             - split: dataset split (default "train")
@@ -980,16 +1012,17 @@ def prepare_multi_source(
             - weight: relative importance (default 1.0)
             - budget: per-source budget override (optional)
             - messages_field: field containing messages (default "messages")
+            - tools_field, last_turn_only: as in data.sources
         output_path: Base output directory
-        max_seq_length: Max sequence length for scoring
+        max_seq_length: Max sequence length
         budget_per_source: Default budget per source (None = use all)
         strategy: Selection strategy per source
-        compute_hes: Whether to also compute HES scores (slower, better for reasoning)
-        hes_top_k_pct: Top-k% for HES computation
+        compute_hes, hes_top_k_pct, score, min_ppl, max_ppl, batch_size, max_batch_tokens:
+            as in prepare_data
     """
-    from datasets import load_dataset
-
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    if strategy not in STRATEGIES:
+        raise ValueError(f"Unknown selection strategy {strategy!r}; choose one of {STRATEGIES}")
     output_base = Path(output_path)
     output_base.mkdir(parents=True, exist_ok=True)
 
@@ -998,92 +1031,69 @@ def prepare_multi_source(
         "strategy": strategy,
         "sources": [],
     }
+    scorer = Scorer(model_name)
 
     for src_config in sources:
         name = src_config.get("name", src_config.get("dataset", "unknown"))
         dataset_id = src_config.get("dataset")
-        split = src_config.get("split", "train")
         weight = src_config.get("weight", 1.0)
-        budget = src_config.get("budget", budget_per_source)
-        messages_field = src_config.get("messages_field", "messages")
 
         logger.info(f"\n{'=' * 60}")
-        logger.info(f"Processing source: {name}")
-        logger.info(f"  dataset={dataset_id}, split={split}, weight={weight}")
-
-        # Load
-        if dataset_id.endswith(".jsonl"):
-            with Path(dataset_id).open() as f:
-                samples = [json.loads(line) for line in f if line.strip()]
-        else:
-            ds = load_dataset(dataset_id, split=split)
-            samples = [dict(row) for row in ds]
-
-        logger.info(f"  Loaded {len(samples)} samples")
-
-        # Score with perplexity
-        samples = score_samples_with_model(model_name, samples, messages_field, max_seq_length, batch_size=4)
-
-        # Optional HES scoring (for reasoning data)
-        if compute_hes:
-            samples = compute_hes_scores(
-                model_name, samples, messages_field, max_seq_length, top_k_pct=hes_top_k_pct, batch_size=4
+        logger.info(f"Processing source: {name} (dataset={dataset_id}, weight={weight})")
+        if src_config.get("mode", "sft") != "sft":
+            logger.warning(
+                f"  Source '{name}' is mode={src_config['mode']}: only chat (sft) sources are prepared, skipped"
             )
+            continue
 
-        # Classify and filter
-        samples = classify_familiarity(samples)
-        samples = filter_samples(samples)
-
-        # Select by budget
-        if budget and len(samples) > budget:
-            samples = select_by_budget(samples, budget, strategy)
-
-        # Save per-source
         src_output = output_base / name.replace("/", "_").replace(" ", "_")
-        src_output.mkdir(parents=True, exist_ok=True)
-        out_file = src_output / "scored_data.jsonl"
-        with out_file.open("w") as f:
-            for s in samples:
-                f.write(json.dumps(s, ensure_ascii=False) + "\n")
-
-        # Compute source statistics for manifest
-        ppls = [s.get("_score_response_ppl", 0) for s in samples if "_score_response_ppl" in s]
-        median_ppl = sorted(ppls)[len(ppls) // 2] if ppls else 0
-        buckets = {}
-        for s in samples:
-            b = s.get("_score_familiarity", "unknown")
-            buckets[b] = buckets.get(b, 0) + 1
-
+        out_file = prepare_data(
+            model_name,
+            dataset_id,
+            str(src_output),
+            messages_field=src_config.get("messages_field", "messages"),
+            max_seq_length=max_seq_length,
+            budget=src_config.get("budget", budget_per_source),
+            strategy=strategy,
+            batch_size=batch_size,
+            dataset_split=src_config.get("split", "train"),
+            output_format="jsonl",
+            compute_hes=compute_hes,
+            hes_top_k_pct=hes_top_k_pct,
+            min_ppl=min_ppl,
+            max_ppl=max_ppl,
+            max_batch_tokens=max_batch_tokens,
+            chat_options={k: src_config[k] for k in ("tools_field", "last_turn_only") if k in src_config},
+            score=score,
+            scorer=scorer,
+        )
+        meta = json.loads((src_output / PREPARED_META).read_text())
         src_meta = {
             "name": name,
             "dataset": dataset_id,
             "output_path": str(out_file),
-            "num_samples": len(samples),
+            "num_samples": meta["num_samples"],
             "weight": weight,
-            "median_ppl": round(median_ppl, 2),
-            "familiarity_distribution": buckets,
-            # MSFT: estimate relative learning speed (lower ppl = faster learning = earlier overfit)
-            "estimated_overfit_risk": "high" if median_ppl < 5 else "medium" if median_ppl < 20 else "low",
+            "tokens": meta["tokens"],
+            "cleaning": meta["cleaning"],
         }
-        if compute_hes:
-            hes_vals = [s.get("_score_hes", 0) for s in samples if s.get("_score_hes", 0) > 0]
-            src_meta["median_hes"] = round(sorted(hes_vals)[len(hes_vals) // 2], 2) if hes_vals else 0
-
+        if meta["scored"]:
+            src_meta["median_ppl"] = meta.get("ppl_stats", {}).get("median", 0)
+            src_meta["familiarity_distribution"] = meta["familiarity_distribution"]
         manifest["sources"].append(src_meta)
-        logger.info(f"  Saved {len(samples)} samples to {out_file}")
-        logger.info(f"  Median PPL: {median_ppl:.1f}, Overfit risk: {src_meta['estimated_overfit_risk']}")
 
-    # Compute MSFT-style compute allocation recommendation
-    # Sources with higher overfit risk should get LESS compute (fewer epochs)
-    total_weight = sum(s["weight"] for s in manifest["sources"])
-    for src in manifest["sources"]:
-        # Normalize weight
+    # What the weights amount to: rows drawn per source, and the tokens those rows carry.
+    total_weight = sum(s["weight"] for s in manifest["sources"]) or 1.0
+    mean_tokens = [s["tokens"].get("total", 0) / max(s["num_samples"], 1) for s in manifest["sources"]]
+    token_mass = sum(s["weight"] * t for s, t in zip(manifest["sources"], mean_tokens)) or 1.0
+    for src, tokens_per_row in zip(manifest["sources"], mean_tokens):
         src["normalized_weight"] = round(src["weight"] / total_weight, 4)
-        # MSFT recommendation: overfitting sources get proportionally less training
-        risk_factor = {"high": 0.5, "medium": 1.0, "low": 1.5}.get(src["estimated_overfit_risk"], 1.0)
-        src["recommended_epoch_multiplier"] = risk_factor
+        src["token_share"] = round(src["weight"] * tokens_per_row / token_mass, 4)
+        logger.info(
+            f"  {src['name']}: {src['num_samples']} rows, {src['normalized_weight']:.1%} of examples, "
+            f"{src['token_share']:.1%} of tokens at weight {src['weight']}"
+        )
 
-    # Save manifest
     manifest_file = output_base / "manifest.json"
     with manifest_file.open("w") as f:
         json.dump(manifest, f, indent=2)
@@ -1094,37 +1104,47 @@ def prepare_multi_source(
 def prepare_from_config(config) -> Path:
     """Run preparation driven by the SAME YAML config used for training.
 
-    Reads: model.name_or_path, data.dataset, data.dataset_split,
-    data.messages_field, data.max_seq_length and the preprocess: section.
-    Training with preprocess.enabled=true then picks the output up
-    automatically from preprocess.output_dir.
+    Reads: model.name_or_path, data.dataset, data.dataset_split, data.messages_field,
+    data.max_seq_length, the data options that decide how a row is rendered and masked,
+    and the preprocess: section. Training with preprocess.enabled=true then picks the
+    output up automatically from preprocess.output_dir.
     """
+    pre = config.preprocess
     return prepare_data(
         model_name=config.model.name_or_path,
         data_path=config.data.dataset,
-        output_path=config.preprocess.output_dir,
+        output_path=pre.output_dir,
         messages_field=config.data.messages_field,
-        max_samples=config.preprocess.max_samples or None,
+        max_samples=pre.max_samples or None,
         max_seq_length=config.data.max_seq_length,
-        budget=config.preprocess.budget or None,
-        strategy=config.preprocess.strategy,
-        batch_size=config.preprocess.batch_size,
+        budget=pre.budget or None,
+        strategy=pre.strategy,
+        batch_size=pre.batch_size,
         dataset_split=config.data.dataset_split,
-        output_format=config.preprocess.format,
-        compute_hes=config.preprocess.hes,
-        hes_top_k_pct=config.preprocess.hes_top_k_pct,
-        eval_holdout=config.preprocess.eval_holdout,
-        min_ppl=config.preprocess.min_ppl,
-        max_ppl=config.preprocess.max_ppl,
-        filter_score=config.preprocess.filter_score,
-        max_batch_tokens=config.preprocess.max_batch_tokens,
-        group_field=config.preprocess.group_field,
+        output_format=pre.format,
+        compute_hes=pre.hes,
+        hes_top_k_pct=pre.hes_top_k_pct,
+        eval_holdout=pre.eval_holdout,
+        min_ppl=pre.min_ppl,
+        max_ppl=pre.max_ppl,
+        filter_score=pre.filter_score,
+        max_batch_tokens=pre.max_batch_tokens,
+        group_field=pre.group_field,
         chat_options={
             "train_on_reasoning": config.data.train_on_reasoning,
             "include_observations": config.data.include_observations,
             "last_turn_only": config.data.last_turn_only,
             "tools_field": config.data.tools_field,
+            "think_tags": config.data.think_tags,
+            "chat_template_kwargs": config.data.chat_template_kwargs,
         },
+        score=pre.score,
+        dedupe=pre.dedupe,
+        max_per_prompt=pre.max_per_prompt,
+        max_per_group=pre.max_per_group,
+        max_tokens_per_group=pre.max_tokens_per_group,
+        token_budget=pre.token_budget,
+        seed=config.data.seed,
     )
 
 
@@ -1134,7 +1154,7 @@ def main():
     Two modes:
       1. Config-driven (recommended): pgs prepare --config train_config.yaml
          Supports the same --section.field overrides as training, e.g.
-         pgs prepare --config cfg.yaml --preprocess.budget 5000 --preprocess.strategy curriculum
+         pgs prepare --config cfg.yaml --preprocess.budget 5000 --preprocess.eval_holdout 200
       2. Standalone flags: pgs prepare --model M --data D --output prepared/
     """
     if "--config" in sys.argv:
@@ -1147,20 +1167,42 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Score SFT data with the model (response perplexity), filter and select"
+        description="Clean SFT data (broken rows, duplicates), hold out an eval set and select a budget; "
+        "optionally score it with the model (response perplexity)"
     )
-    parser.add_argument("--model", required=True, help="Model name/path for scoring")
+    parser.add_argument("--model", required=True, help="Model name/path (its tokenizer; its weights only for scoring)")
     parser.add_argument("--data", required=True, help="Data path (JSONL, JSON, parquet, or HF dataset)")
     parser.add_argument("--output", default="./prepared", help="Output directory")
     parser.add_argument("--messages_field", default="messages", help="Field containing messages")
     parser.add_argument("--max_samples", type=int, help="Max samples to process")
     parser.add_argument("--max_seq_length", type=int, default=8192)
     parser.add_argument("--budget", type=int, help="Target number of samples to select")
+    parser.add_argument("--token_budget", type=int, default=0, help="Target number of tokens to select (random subset)")
     parser.add_argument(
         "--strategy",
         default="random",
         choices=list(STRATEGIES),
+        help="How --budget rows are chosen; every strategy but random is experimental and turns scoring on",
     )
+    parser.add_argument("--no_dedupe", action="store_true", help="Keep exact duplicate conversations")
+    parser.add_argument("--max_per_prompt", type=int, default=0, help="Keep at most N rows that share a prompt")
+    parser.add_argument(
+        "--group_field", default="", help="Row column (e.g. source) to cap and to profile in prepared_meta.json"
+    )
+    parser.add_argument("--max_per_group", type=int, default=0, help="Keep at most N rows per --group_field value")
+    parser.add_argument(
+        "--max_tokens_per_group", type=int, default=0, help="Keep at most N tokens per --group_field value"
+    )
+    parser.add_argument(
+        "--eval_holdout",
+        type=int,
+        default=0,
+        help="Reserve N samples as a held-out eval set (eval_data.parquet, shares no prompt with the training data)",
+    )
+    parser.add_argument("--split", default="train", help="Dataset split (for HF datasets)")
+    parser.add_argument("--format", default="parquet", choices=["parquet", "jsonl"], help="Output format")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--score", action="store_true", help="Score every row with the model (response perplexity)")
     parser.add_argument("--batch_size", type=int, default=4, help="Max samples per scoring forward")
     parser.add_argument(
         "--max_batch_tokens",
@@ -1168,26 +1210,19 @@ def main():
         default=16384,
         help="Padded-token cap per scoring forward (bounds logits memory; 32768+ OK on 80GB GPUs)",
     )
-    parser.add_argument("--split", default="train", help="Dataset split (for HF datasets)")
-    parser.add_argument("--format", default="parquet", choices=["parquet", "jsonl"], help="Output format")
-    parser.add_argument("--hes", action="store_true", help="Also compute HES reasoning quality scores")
+    parser.add_argument("--hes", action="store_true", help="Also compute HES scores (experimental; turns scoring on)")
     parser.add_argument("--hes_top_k", type=float, default=0.5, help="Top-k%% tokens for HES metric")
     parser.add_argument(
-        "--eval_holdout",
-        type=int,
-        default=0,
-        help="Reserve N samples as a held-out eval set (eval_data.parquet, excluded from training)",
+        "--min_ppl", type=float, default=0.0, help="Drop rows below this response PPL (0 = off; turns scoring on)"
     )
-    parser.add_argument("--min_ppl", type=float, default=1.5, help="Outlier filter lower PPL bound")
-    parser.add_argument("--max_ppl", type=float, default=500.0, help="Outlier filter upper PPL bound (<=0 disables)")
+    parser.add_argument(
+        "--max_ppl", type=float, default=0.0, help="Drop rows above this response PPL (0 = off; turns scoring on)"
+    )
     parser.add_argument(
         "--filter_score",
         default="response",
         choices=["response", "full"],
         help="PPL score used by the outlier filter (response=assistant tokens only, full=all tokens)",
-    )
-    parser.add_argument(
-        "--group_field", default="", help="Row column (e.g. source) to profile per group in prepared_meta.json"
     )
     args = parser.parse_args()
 
@@ -1211,6 +1246,13 @@ def main():
         filter_score=args.filter_score,
         max_batch_tokens=args.max_batch_tokens,
         group_field=args.group_field,
+        score=args.score,
+        dedupe=not args.no_dedupe,
+        max_per_prompt=args.max_per_prompt,
+        max_per_group=args.max_per_group,
+        max_tokens_per_group=args.max_tokens_per_group,
+        token_budget=args.token_budget,
+        seed=args.seed,
     )
 
 

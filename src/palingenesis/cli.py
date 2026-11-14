@@ -39,8 +39,8 @@ Commands:
   surgery     Margin surgery: a minimal weight edit restoring a decision's margins (run, margins, span)
   internals   Read the model's internals: capture, probes, lenses, compare checkpoints, steering, patching
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
-  prepare     Score and filter data by difficulty (offline, uses model inference)
-  prepare-multi  Prepare multiple sources with per-source scoring + MSFT allocation
+  prepare     Clean data (broken rows, duplicates), hold out an eval set, select a budget
+  prepare-multi  Prepare several sources, each on its own, with a row/token share manifest
   s0-tune     S0 Tuning: zero-overhead adaptation for hybrid models (Qwen3.5, FalconH1)
   diagnose    Run health diagnostics (pre/post/full)
   inspect     Visualize tokenization and masking
@@ -200,19 +200,31 @@ def _run_agent_tool(module_name: str):
 
 
 def _run_prepare_multi():
-    """CLI for multi-source data preparation with MSFT allocation."""
+    """CLI for multi-source data preparation."""
     import argparse
 
     import yaml
 
-    parser = argparse.ArgumentParser(description="Prepare multiple data sources with per-source scoring")
-    parser.add_argument("--model", required=True, help="Model name/path for scoring")
+    from palingenesis.prepare import STRATEGIES, prepare_multi_source
+
+    parser = argparse.ArgumentParser(description="Prepare multiple data sources, each on its own")
+    parser.add_argument("--model", required=True, help="Model name/path (its tokenizer; its weights only for scoring)")
     parser.add_argument("--sources", required=True, help="YAML file with source configurations")
     parser.add_argument("--output", default="./prepared", help="Output directory")
     parser.add_argument("--max_seq_length", type=int, default=8192)
     parser.add_argument("--budget", type=int, help="Budget per source")
-    parser.add_argument("--strategy", default="random")
-    parser.add_argument("--hes", action="store_true", help="Also compute HES reasoning quality scores")
+    parser.add_argument(
+        "--strategy",
+        default="random",
+        choices=list(STRATEGIES),
+        help="Every strategy but random is experimental and turns scoring on",
+    )
+    parser.add_argument("--score", action="store_true", help="Score every row with the model (response perplexity)")
+    parser.add_argument("--min_ppl", type=float, default=0.0, help="Drop rows below this response PPL (0 = off)")
+    parser.add_argument("--max_ppl", type=float, default=0.0, help="Drop rows above this response PPL (0 = off)")
+    parser.add_argument("--batch_size", type=int, default=4, help="Max samples per scoring forward")
+    parser.add_argument("--max_batch_tokens", type=int, default=16384, help="Padded-token cap per scoring forward")
+    parser.add_argument("--hes", action="store_true", help="Also compute HES scores (experimental; turns scoring on)")
     parser.add_argument("--hes_top_k", type=float, default=0.5, help="Top-k%% for HES")
     args = parser.parse_args()
 
@@ -223,8 +235,6 @@ def _run_prepare_multi():
 
     sources = sources_config if isinstance(sources_config, list) else sources_config.get("sources", [])
 
-    from palingenesis.prepare import prepare_multi_source
-
     prepare_multi_source(
         model_name=args.model,
         sources=sources,
@@ -234,6 +244,11 @@ def _run_prepare_multi():
         strategy=args.strategy,
         compute_hes=args.hes,
         hes_top_k_pct=args.hes_top_k,
+        score=args.score,
+        min_ppl=args.min_ppl,
+        max_ppl=args.max_ppl,
+        batch_size=args.batch_size,
+        max_batch_tokens=args.max_batch_tokens,
     )
 
 

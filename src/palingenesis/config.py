@@ -307,11 +307,16 @@ class PluginsConfig:
 
 @dataclass(slots=True)
 class PreprocessConfig:
-    """Offline data preparation (scoring, filtering, selection) — `pgs prepare --config`.
+    """Offline data preparation (cleaning, held-out split, selection) — `pgs prepare --config`.
 
-    Reuses model.name_or_path, data.dataset, data.dataset_split, data.messages_field
-    and data.max_seq_length from the same config used for training, so preprocess
-    and training can never drift apart.
+    Reuses model.name_or_path, data.dataset, data.dataset_split, data.messages_field,
+    data.max_seq_length and the masking options from the same config used for training,
+    so preprocess and training can never drift apart.
+
+    By default nothing here runs the model: rows training would drop and exact duplicates
+    are removed, and what was removed is reported. Scoring with the model (one forward
+    pass over the data) runs when `score` is set or an option that needs it is (min_ppl,
+    max_ppl, hes, any strategy but random); those options are experimental.
 
     When `enabled: true`, training automatically loads the prepared dataset from
     `output_dir` (instead of data.dataset) and preserves curriculum ordering if
@@ -322,27 +327,46 @@ class PreprocessConfig:
     output_dir: str = "./prepared"
     format: Literal["parquet", "jsonl"] = "parquet"
     max_samples: int = 0  # cap samples read from the raw dataset (0 = all)
-    budget: int = 0  # samples to keep after scoring/filtering (0 = all)
+    budget: int = 0  # samples to keep after cleaning/filtering (0 = all)
+    # Tokens to keep (0 = all): a random subset whose rows add up to at most this many
+    # tokens, the unit training cost is paid in. Applied after `budget`; strategy random only.
+    token_budget: int = 0
+    dedupe: bool = True  # drop exact duplicate conversations (same messages and tools)
+    # Keep at most N rows that share a prompt (system prompt + first user turn), e.g.
+    # several trajectories of one task. 0 = no cap.
+    max_per_prompt: int = 0
+    # Caps per value of `group_field` (e.g. per source): rows and tokens. 0 = no cap.
+    max_per_group: int = 0
+    max_tokens_per_group: int = 0
     # Reserve N samples as a held-out eval set (written to eval_data.parquet,
-    # EXCLUDED from the training selection). Training auto-uses it when
-    # data.eval_dataset is empty — a true same-distribution holdout.
+    # EXCLUDED from the training selection, and sharing no prompt with it). Training
+    # auto-uses it when data.eval_dataset is empty — a true same-distribution holdout.
     eval_holdout: int = 0
-    min_ppl: float = 1.5  # outlier filter lower bound
-    max_ppl: float = 500.0  # outlier filter upper bound (<=0 disables; useful for OOD/multilingual data)
+    # Score every row with the model (response perplexity). Off by default: it costs a
+    # forward pass over the data, and nothing selected by the score has beaten random.
+    score: bool = False
+    # Perplexity outlier filter, off by default (0). A bound > 0 turns scoring on. Absolute
+    # perplexity depends on model, domain and language: read the distribution first.
+    min_ppl: float = 0.0
+    max_ppl: float = 0.0
     filter_score: Literal["response", "full"] = "response"  # filter assistant tokens by default
-    # Selection among the scored samples when budget > 0 (prepare.select_by_budget).
-    # `random` by default: on Qwen3.5-0.8B math SFT no familiarity-based strategy beat
-    # a random subset, and `optimal` (the J-shaped mix) was worse (see guides/data.md).
+    # Selection when budget > 0 (prepare.select_by_budget). Every strategy but `random`
+    # is experimental and turns scoring on: on Qwen3.5-0.8B math SFT no familiarity-based
+    # strategy beat a random subset, and `optimal` (the J-shaped mix) was worse (see
+    # guides/data.md); `curriculum` also makes training keep the stored order.
     strategy: Literal["optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random"] = "random"
     batch_size: int = 4  # max samples per scoring forward (length-sorted padded batches)
     # Padded-token cap per scoring forward (logits are B×S×V, so THIS bounds
     # memory, not batch_size). 16384 ≈ 5GB of bf16 logits for a 150K vocab;
     # on an 80GB GPU with a 4B model, 32768–49152 is safe and faster.
     max_batch_tokens: int = 16384
-    hes: bool = False  # also compute HES reasoning-quality scores (slower)
+    # Also write HES (arXiv:2605.22389) from the scoring forward. Experimental: validated on
+    # long math/STEM reasoning only, and no selection strategy reads it.
+    hes: bool = False
     hes_top_k_pct: float = 0.5
-    # Row column to profile per group in prepared_meta.json (e.g. "source"): count, median
-    # response NLL, mean response tokens and familiarity buckets, before and after selection.
+    # Row column that names a row's group (e.g. "source"): the caps above apply per group,
+    # and prepared_meta.json profiles each group (count, tokens, mean response tokens and,
+    # when scored, median response NLL and familiarity buckets) before and after selection.
     group_field: str = ""
 
 
@@ -592,6 +616,16 @@ class Config:
         strategies = ("optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random")
         if self.preprocess.strategy not in strategies:
             errors.append(f"preprocess.strategy={self.preprocess.strategy!r} is not one of {', '.join(strategies)}.")
+        if self.preprocess.token_budget and self.preprocess.strategy != "random":
+            errors.append(
+                "preprocess.token_budget selects a random subset: it cannot be combined with "
+                f"preprocess.strategy={self.preprocess.strategy!r}."
+            )
+        if (self.preprocess.max_per_group or self.preprocess.max_tokens_per_group) and not self.preprocess.group_field:
+            errors.append(
+                "preprocess.max_per_group / max_tokens_per_group need preprocess.group_field "
+                "(the row column that names the group, e.g. source)."
+            )
 
         errors += self._context_parallel_errors()
 
