@@ -84,7 +84,13 @@ def iter_documents(config, tokenizer, views: list | None = None, rank: int = 0, 
         if config.preprocess.enabled:
             from palingenesis.prepare import find_prepared_dataset
 
-            dataset_id = str(find_prepared_dataset(config.preprocess.output_dir))
+            prepared = find_prepared_dataset(config.preprocess.output_dir)
+            if prepared is None:
+                raise FileNotFoundError(
+                    f"preprocess.enabled=true but no prepared dataset in '{config.preprocess.output_dir}'. "
+                    "Run: pgs prepare --config <this config>"
+                )
+            dataset_id = str(prepared)
         raw = _load_dataset_source(dataset_id, data.dataset_split, data.streaming)
         stages.append(source_stage(raw, tokenizer, data, None, rank, world_size, teacher_views=views))
     if data.pretrain_replay_dataset:
