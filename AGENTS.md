@@ -94,6 +94,15 @@ Training issue?
 │   │   training config, or distill.missing: skip (uncovered tokens get only ce_weight * CE)
 │   ├── OOM from the teacher: teachers.<name>.placement: shard (multi-GPU), dtype: bfloat16, or cache it
 │   └── QAT: plugins.custom: palingenesis.qat:TernaryQAT (watch plugins/ternary_qat/codes_changed, strength)
+├── MoE model (Qwen3-MoE, Qwen3.5-MoE, Mixtral, GPT-OSS, DeepSeek-V3 family): routers collapse, RL unstable
+│   ├── Watch: moe/load_max (1 = balanced), moe/dead_experts, moe/router_entropy in the log line (moe[...])
+│   ├── Balancing is on by default (moe.balance_loss_coef: the model config's router_aux_loss_coef, load measured
+│   │   over the global batch; DeepSeek-V3 family: selection-bias update). Collapse anyway: moe.balance_loss_coef
+│   │   0.01, moe.z_loss_coef 0.001, lower LR
+│   ├── RL: rollout.routing_replay (auto for MoE policies; vLLM needs rollout.prefix_caching) trains each token
+│   │   through the experts the engine used; watch moe/route_mismatch and policy/mismatch_k3
+│   └── Speed: python scripts/bench_moe_experts.py picks moe.experts_implementation; several GPUs:
+│       parallel.expert_parallel (experimental)
 ├── Training too slow
 │   ├── Check: python -m palingenesis.agent_tooling.monitor_run --log_file ... --brief
 │   ├── Likely causes: Data loading bottleneck, no compile, small batch
@@ -134,4 +143,6 @@ Use `--json` flag (where available) for structured output suitable for programma
 | Off-policy KD: teacher too large | `distill.teachers.<name>.placement: shard` (FSDP), or `pgs distill-cache` once and `cache: <dir>` |
 | Off-policy KD: "no teacher target" | rebuild the cache with the training config, or `distill.missing: skip` + `distill.ce_weight: 0.1` |
 | LoRA (many adapters, model too big for full-weight optimizer state) | `plugins.custom: [{class: palingenesis.lora:LoRA, args: {rank: 16, alpha: 32}}]`, `train.learning_rate` ~10x the full fine-tune's (see the LoRA guide) |
+| MoE routers collapse (`moe/load_max` rising, `moe/router_entropy` falling) | `moe.balance_loss_coef: 0.01`, `moe.z_loss_coef: 0.001` (see the MoE guide) |
+| MoE policy in RL: noisy ratios | `rollout.routing_replay: auto` with `rollout.prefix_caching: true` (vLLM returns the routed experts) |
 | Off-policy KD: student copies the teacher's tail / rambles | `distill.divergence: reverse_kl` or `jsd`, add `distill.ce_weight` |

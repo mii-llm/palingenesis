@@ -119,6 +119,7 @@ nav:
     - Long Sequences (SeCO): guides/long-sequences.md
     - Multi-GPU: guides/multi-gpu.md
     - Multi-Node & SLURM: guides/multi-node.md
+    - Mixture-of-Experts Models: guides/moe.md
     - Autopilot: guides/autopilot.md
     - On-Policy Distillation: guides/distillation.md
     - Off-Policy Distillation: guides/offpolicy-distillation.md

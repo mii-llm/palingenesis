@@ -15,7 +15,8 @@
 #
 # Key MoE training considerations:
 #   - ALL experts must be loaded (even inactive ones need gradients)
-#   - Expert load balancing is handled by the model's router
+#   - Router balancing: the load-balancing loss with the model's router_aux_loss_coef, expert loads
+#     measured over the global batch (the moe: section below; watch moe/load_max in the log line)
 #   - Per-token compute is only 3B params (fast forward pass)
 #   - But memory holds all 35B (must shard)
 #
@@ -77,6 +78,13 @@ memory:
   loss_num_chunks: 8      # 151K vocab * 8192 seq = big logits
   float32_matmul_precision: high
   float8_training: false   # MoE + float8 interaction untested, stay safe
+
+moe:
+  balance: true            # router balancing + moe/... metrics (the default)
+  balance_loss_coef: -1    # -1: the model config's router_aux_loss_coef (0.001)
+  z_loss_coef: 0.0         # 0.001 if moe/router_entropy falls while moe/load_max rises
+  # parallel.expert_parallel: true keeps each rank's experts in place and exchanges tokens instead of
+  # gathering the expert weights (experimental; needs ranks that divide 128)
 
 plugins:
   sym_noise: true          # Free quality boost
