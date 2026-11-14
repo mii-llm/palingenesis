@@ -226,6 +226,20 @@ def test_images_without_multimodal_are_ignored_with_a_warning(tok, caplog):
     assert "images are ignored" in caplog.text
 
 
+def test_vision_processor_travels_with_the_tokenizer(tok, vision):
+    """DataLoader workers get a pickled copy of the dataset: its tokenizer still carries the processor."""
+    import copy
+    import pickle
+
+    carrier = copy.deepcopy(tok)
+    multimodal.attach(carrier, vision)
+    for clone in (pickle.loads(pickle.dumps(carrier)), copy.deepcopy(carrier)):
+        assert multimodal.vision_of(clone).fingerprint == vision.fingerprint
+        (sample,) = list(ChatDataset([_row()], clone, 512))  # no vision argument: the tokenizer's
+        assert sample["image_grid_thw"].shape == (2, 3)
+    assert multimodal.vision_of(tok) is None
+
+
 def test_teacher_views_are_refused(tok, vision):
     with pytest.raises(MultimodalError, match="teacher views"):
         ChatDataset([], tok, 512, vision=vision, teacher_views=[(object(), object())])
@@ -483,3 +497,37 @@ def test_text_only_checkpoint_is_refused(tmp_path):
     config.multimodal.enabled = True
     with pytest.raises(MultimodalError, match="no vision tower"):
         run_cpu(config)
+
+
+def test_profile_counts_the_vision_tower(tmp_path):
+    from palingenesis.agent_tooling.profile_memory import estimate_memory
+
+    config = _mm_config(tmp_path)
+    frozen = estimate_memory(config)
+    assert frozen["vision_params_B"] > 0 and frozen["vision_memory_gb"] > 0
+    assert 0 < frozen["trainable_ratio"] < 1  # the vision side is in the weights, not in the optimizer
+    config.multimodal.train_vision_tower = config.multimodal.train_projector = True
+    trained = estimate_memory(config)
+    assert trained["trainable_ratio"] == 1.0
+    assert trained["vision_memory_gb"] > frozen["vision_memory_gb"]  # activations kept for the backward
+    assert trained["optimizer_memory_gb"] > frozen["optimizer_memory_gb"]
+    config.multimodal.enabled = False
+    config.multimodal.train_vision_tower = config.multimodal.train_projector = False
+    assert estimate_memory(config)["vision_memory_gb"] == 0.0
+
+
+def test_diagnostic_tools_read_images_like_the_trainer(tmp_path):
+    from palingenesis.agent_tooling._pipeline import load_tokenizer
+
+    config = _mm_config(tmp_path)
+    assert multimodal.vision_of(load_tokenizer(config)) is not None
+    config.multimodal.enabled = False
+    assert multimodal.vision_of(load_tokenizer(config)) is None
+
+
+def test_opd_refuses_images():
+    from palingenesis.opd.formatting import encode_prompt
+
+    messages = [{"role": "user", "content": [{"type": "image", "image": tiny_image(8, 8)}]}]
+    with pytest.raises(MultimodalError, match="does not take images yet"):
+        encode_prompt(tiny_tokenizer(), messages)

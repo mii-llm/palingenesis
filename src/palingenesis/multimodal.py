@@ -116,6 +116,15 @@ def has_image_parts(messages: list[dict]) -> bool:
     )
 
 
+def refuse_images(messages: list[dict], where: str) -> None:
+    """Raise when `messages` carry images in a pipeline that reads text only."""
+    if has_image_parts(messages):
+        raise MultimodalError(
+            f"{where} does not take images yet: its conversations are rendered as text. Train on images with "
+            "pgs train (SFT, DPO, off-policy distillation with an online teacher) or pgs rl."
+        )
+
+
 def split_images(messages: list[dict]) -> tuple[list[dict], list[Any]]:
     """(messages for the chat template, image references in rendering order). Image parts become
     bare {"type": "image"} parts, which templates render as one placeholder each; the pixels

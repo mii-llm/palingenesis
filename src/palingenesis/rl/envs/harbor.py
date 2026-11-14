@@ -752,6 +752,8 @@ class HarborEnv:
             drawn.name, self.profile_chat_kwargs.get(drawn.id, drawn.chat_template_kwargs)
         )
         self.episode_info = {"harness_profile": drawn.id, **({"chat_template_kwargs": dict(kwargs)} if kwargs else {})}
+        if drawn.image_results:  # where this harness puts a tool's images (multimodal policies)
+            self.episode_info["image_results"] = drawn.image_results
         user = next((m.get("content") for m in reversed(row.get("messages") or []) if m.get("role") == "user"), None)
         return self.session.conversation(user if isinstance(user, str) and user else self.task.instruction)
 

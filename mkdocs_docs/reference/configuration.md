@@ -8,7 +8,7 @@
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `name_or_path` | str | `meta-llama/Llama-3.1-8B-Instruct` | HuggingFace model ID or local path. Any `AutoModelForCausalLM`-compatible model. |
+| `name_or_path` | str | `meta-llama/Llama-3.1-8B-Instruct` | HuggingFace model ID or local path. Any `AutoModelForCausalLM`-compatible model; with [`multimodal.enabled`](#multimodal), a Qwen-VL family checkpoint in its multimodal architecture. |
 | `trust_remote_code` | bool | `true` | Allow executing model code from HuggingFace. Required for Qwen, Gemma. |
 | `torch_dtype` | str | `bfloat16` | Weight precision. Options: `bfloat16`, `float16`, `float32`. bf16 recommended for A100+. |
 | `attn_implementation` | str | `sdpa` | Attention backend. `sdpa` works everywhere (packing included); `flash_attention_2` (if installed; otherwise training stops with a config error before loading the model) packs without an explicit mask; a Hub kernel `org/repo[@revision]` loaded through the `kernels` package, e.g. `kernels-community/aiter-flash-attn@v2` on [AMD GPUs](../getting-started/amd.md); `eager` for debugging. |
@@ -272,6 +272,20 @@ Off-policy knowledge distillation, a mode of `pgs train`: the student trains on 
 | `features` | list | `[]` | Hidden-state / module-output matching: `{student, teacher, weight, loss: mse/nmse/cosine/lens_kl, projection: auto/linear/none, via}` |
 | `feature_lr` | float | `0.0` | Learning rate of the feature projections (0 = `train.learning_rate`) |
 | `rows_per_slice` | int | `0` | Rows per slice of the chunked loss (0 = automatic, ~512 MB of fp32 logits per side) |
+
+---
+
+## multimodal
+
+Images in the training data, for the Qwen-VL family (Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3.5). See the [Multimodal guide](../guides/multimodal.md) for the data format and for what is supported, refused and verified.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | bool | `false` | Load the checkpoint in its multimodal architecture and feed the images in the data's content parts to its vision tower. `false`: the language model alone is trained, image parts are ignored (with a warning) and exports copy the vision tower unchanged. Not supported with `memory.seco`, `parallel.context_parallel`, `data.pretokenize`, cached teachers or teacher views |
+| `train_vision_tower` | bool | `false` | Train the vision encoder (frozen otherwise) |
+| `train_projector` | bool | `false` | Train the projector that maps vision features into the language model (Qwen: the patch merger) |
+| `min_pixels` | int | `null` | Lower bound of the image processor's resize, in pixels (`null`: the checkpoint's) |
+| `max_pixels` | int | `null` | Upper bound of the resize. An image takes at most `max_pixels / (patch · merge)²` tokens. Serve the model with the same bounds; exports record them in `preprocessor_config.json` |
 
 ---
 

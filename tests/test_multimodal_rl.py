@@ -5,7 +5,6 @@ screenshots without retraining any turn on a context it did not see. Tiny Qwen3.
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,12 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from multimodal_helpers import save_tiny, tiny_image, tiny_image_processor, tiny_qwen3_5, tiny_tokenizer
 
 from palingenesis import multimodal
-from palingenesis.multimodal import MultimodalError, VisionProcessor
+from palingenesis.multimodal import VisionProcessor
 from palingenesis.opd.rollout import HFRollout, Rollout
 from palingenesis.rl.chat import ChatFormat
 from palingenesis.rl.config import RLConfig, RLConfigError
 from palingenesis.rl.env import EnvPool, ToolOutput
-from palingenesis.rl.trajectory import Trajectory
 
 KWARGS = {"enable_thinking": False}
 CALL = "Looking.\n<tool_call>\n<function=screenshot>\n</function>\n</tool_call>"
@@ -176,6 +174,26 @@ def test_image_tool_result_in_a_following_user_message():
         "<|im_start|>user\n(attached media from previous tool call)<|vision_start|><|image_pad|><|vision_end|><|im_end|>"
         in context
     )
+
+
+def test_an_episode_can_set_its_own_layout():
+    """A harness profile's layout reaches the episode through episode_info (HarborEnv sets it from
+    HarnessProfile.image_results) and wins over env.image_results."""
+
+    class ChatCompletionsHarness(ScreenEnv):
+        def reset(self, **row):
+            super().reset(**row)
+            self.episode_info = {"image_results": "user"}
+
+    tok = _tok()
+    engine = ScriptedEngine(tok, tok.eos_token_id, [CALL, "Done."])
+    (group,) = _run(_pipeline(tok, engine, ChatCompletionsHarness), [PROMPT])
+    assert [m["role"] for m in group[0].messages] == ["user", "assistant", "tool", "user", "assistant"]
+    assert group[0].messages[2]["content"] == "screen 1"
+
+    from palingenesis.rl.envs.harness.profile import HarnessProfile
+
+    assert HarnessProfile("custom", "1", image_results="user").image_results == "user"
 
 
 def test_image_prompt_and_text_only_policy():

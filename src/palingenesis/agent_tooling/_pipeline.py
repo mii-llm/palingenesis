@@ -22,6 +22,19 @@ def load_tokenizer(config: Config):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    if config.multimodal.enabled:  # the tools read the data as the trainer does: images expanded and positioned
+        from palingenesis.multimodal import VisionProcessor, attach
+
+        attach(
+            tokenizer,
+            VisionProcessor.from_pretrained(
+                config.model.name_or_path,
+                tokenizer,
+                config.multimodal.min_pixels,
+                config.multimodal.max_pixels,
+                config.model.trust_remote_code,
+            ),
+        )
     return tokenizer
 
 

@@ -11,6 +11,9 @@ max_completion_tokens: the generated tokens of a whole episode (all turns); defa
 context, max_model_len, still bounds it). engine: a rollout engine (palingenesis.opd.rollout: VLLMColocateRollout for vLLM in-process, or anything with
 generate(prompts, max_new_tokens, temperature)); temperature: a float or an opd.rollout.Sampling (top_p / top_k;
 streaming engines only). A group's k samples share the environment's per-group choices (a harness profile).
+Images: attach the policy's image processor to the tokenizer first (palingenesis.multimodal.attach(tokenizer,
+VisionProcessor.from_pretrained(model, tokenizer))) and use an engine that takes images (HFRollout(..., vision=...),
+VLLMColocateRollout); prompts may then carry image parts and tools may return rl.env.ToolOutput.
 stop_resample: a turn that would end the episode without a tool call is sampled again up to this many times, and the
 first sample that calls a tool is kept (rollout.stop_resample; the discarded samples are in t.info["stop_resamples"]).
 """

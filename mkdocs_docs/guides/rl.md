@@ -160,6 +160,16 @@ These adapters make other standards palingenesis environments, with no special c
 
 Tool calls are parsed in the model's own format (Hermes JSON for Qwen2.5/Qwen3, XML for Qwen3-Coder/Qwen3.5), run concurrently with a timeout, and their results (sanitized: a tool cannot inject control tokens; cut to `env.max_tool_output_tokens`) are appended as tokens rendered by the model's own chat template. Nothing is ever re-tokenized: what the trainer scores is exactly what the sampler saw, and only sampled tokens are trained. A tool error is returned to the policy as the tool's answer.
 
+**Images.** With `model.multimodal: true` (Qwen-VL family) prompts may carry image parts and a tool may return `ToolOutput(text, images=[...])`, e.g. a screenshot. The options are below; the layouts, the chat templates that support them and the handling of old screenshots are in the [Multimodal guide](multimodal.md#multi-turn-rl-with-images).
+
+| Option | Default | |
+|---|---|---|
+| `model.multimodal` | `false` | Load the policy with its vision tower; `model.train_vision_tower`, `model.train_projector` (both `false`), `model.min_pixels`, `model.max_pixels` as in [`multimodal`](../reference/configuration.md#multimodal). Engines: `hf`, in-process `vllm` |
+| `env.image_results` | `tool` | `tool`: the image inside the tool message. `user`: text in the tool message, the images in one user message after the turn's tool results (what OpenAI-style chat completions allow) |
+| `env.image_tool_note`, `env.image_user_note` | empty | `user` layout: the tool message's text when a tool returned only images, and the text that opens the user message |
+| `env.max_images` | `0` | Keep the last N images in the context (0 = all); older ones become `env.image_placeholder` (`[image omitted]`). Turns sampled before a drop stay trained on the context they saw |
+| `env.image_prune_slack` | `0` | Extra images allowed before dropping back to `max_images`: one context rewrite every slack + 1 images |
+
 ### MCP servers
 
 Any [Model Context Protocol](https://modelcontextprotocol.io/specification/latest) server works as an environment: `tools/list` becomes the policy's tool schemas and each `tools/call` result its observation. A server takes a few lines with the official SDK (`pip install "palingenesis[mcp]"`):

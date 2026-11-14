@@ -90,6 +90,9 @@ class HarnessProfile:
     # raw capture still stops at harbor.EXEC_LIMIT, 4 MiB per stream)
     chat_template_kwargs: dict | None = None  # applied to the episode's chat template (e.g. enable_thinking); None:
     # the model's default, as a harness that sends no chat_template_kwargs to vLLM gets
+    image_results: str | None = None  # where a tool's images go for this harness: "tool" (inside the tool
+    # message) or "user" (a user message after the tool results, as OpenAI-style chat completions need); None: the
+    # run's env.image_results
     emulates: str = ""  # what was read to write the profile
     legacy: bool = False
     values: dict[str, str] = field(default_factory=dict)  # extra template values (date, model)

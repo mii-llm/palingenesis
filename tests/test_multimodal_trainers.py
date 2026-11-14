@@ -76,9 +76,10 @@ def test_dpo_with_images(tmp_path, monkeypatch):
 
 
 def test_preference_rows_carry_images_on_both_sides(tmp_path):
+    from multimodal_helpers import tiny_image_processor
+
     from palingenesis.dpo import PreferenceDataset, collate_preferences
     from palingenesis.multimodal import VisionProcessor
-    from multimodal_helpers import tiny_image_processor
 
     tok = tiny_tokenizer()
     vision = VisionProcessor(tiny_image_processor(), tok, "qwen3_5")

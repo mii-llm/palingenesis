@@ -14,6 +14,8 @@ import random
 import re
 from typing import Any
 
+from palingenesis.multimodal import refuse_images
+
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 
 QUERY_TEMPLATE_MULTICHOICE = """
@@ -45,6 +47,7 @@ def encode_prompt(
     """Token ids of `messages` rendered with the tokenizer's chat template, ready for
     the assistant's turn (BOS prepended when the template leaves it out). `tools`: the
     tool schemas the template lists in the prompt (function-calling prompts)."""
+    refuse_images(messages, "on-policy distillation (pgs distill)")
     text = tok.apply_chat_template(
         messages, tools=tools or None, add_generation_prompt=True, tokenize=False, **(chat_template_kwargs or {})
     )
