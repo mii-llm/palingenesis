@@ -98,6 +98,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 | `hybrid` | causal-conv1d (compiled against your torch: a few minutes, needs `nvcc`) | Qwen3.5 / Qwen3-Next: ~25% faster, and required for `data.packing` on these models |
 | `float8` | torchao | Float8 training (`memory.float8_training`) on H100/B200 |
 | `vllm` | vLLM 0.26 (CUDA 12.9 build) with the matching torchvision, torchaudio and torchcodec (Linux) | Fast rollouts and vLLM teachers in [`pgs distill`](../guides/distillation.md). The server rollout backend (`rollout.backend: vllm_server`, experimental) also needs `uv pip install ray`: vLLM 0.26's CUDA IPC weight transfer imports it |
+| `multimodal` | torchvision (and pillow), the build matching your torch | Image training ([multimodal guide](../guides/multimodal.md)) |
 | `logging` | wandb, trackio | You want experiment tracking dashboards |
 | `loss` | Cut Cross-Entropy (Triton kernel) | Training models with 256K+ vocabulary (Gemma) |
 | `optim` | ScheduleFree | Using schedule-free mode |

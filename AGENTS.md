@@ -99,7 +99,7 @@ Training issue?
 │   ├── Balancing is on by default (moe.balance_loss_coef: the model config's router_aux_loss_coef, load measured
 │   │   over the global batch; DeepSeek-V3 family: selection-bias update). Collapse anyway: moe.balance_loss_coef
 │   │   0.01, moe.z_loss_coef 0.001, lower LR
-│   ├── RL: rollout.routing_replay (auto for MoE policies; vLLM needs rollout.prefix_caching) trains each token
+│   ├── RL: rollout.routing_replay: auto (opt-in; vLLM needs rollout.prefix_caching) trains each token
 │   │   through the experts the engine used; watch moe/route_mismatch and policy/mismatch_k3
 │   └── Speed: python scripts/bench_moe_experts.py picks moe.experts_implementation; several GPUs:
 │       parallel.expert_parallel (experimental)

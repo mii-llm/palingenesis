@@ -167,9 +167,9 @@ class RLRolloutConfig:
     # MoE policies: train each token through the experts the rollout engine routed it to (the engine returns them:
     # vLLM's enable_return_routed_experts; the hf backend records them), with gate values from the trainer's own
     # router. Without it, the engine and the trainer pick different experts for a share of the tokens, which adds
-    # noise to every importance ratio. "auto": on for MoE policies; "off"; "on": an error if the policy has no MoE
-    # layers. The vLLM backends need rollout.prefix_caching.
-    routing_replay: str = "auto"
+    # noise to every importance ratio. "off" (default until the vLLM path has run end to end on a GPU); "auto": on
+    # for MoE policies; "on": an error if the policy has no MoE layers. The vLLM backends need rollout.prefix_caching.
+    routing_replay: str = "off"
 
 
 @dataclass(slots=True)

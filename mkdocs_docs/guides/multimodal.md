@@ -28,7 +28,7 @@ data:
   max_seq_length: 8192          # image tokens count against it
 ```
 
-It needs `torchvision` and `pillow` (the image processors of transformers run on torchvision; both come with the `vllm` extra). Without torchvision the Qwen processor's pillow backend is used, with a warning: the token counts are the same, the pixels differ in the last bits of the interpolation.
+Install the `multimodal` extra (`uv sync --extra multimodal`, or `pip install 'palingenesis[multimodal]'`): it adds `torchvision` (and pillow with it), which the image processors of transformers run on; on Linux it is the CUDA 12.9 build that matches torch, as in the `vllm` extra. Without torchvision the Qwen processor's pillow backend is used, with a warning: the token counts are the same, the pixels differ in the last bits of the interpolation.
 
 ## Data format
 

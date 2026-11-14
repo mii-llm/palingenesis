@@ -3271,6 +3271,8 @@ all = [
     { name = "schedulefree" },
     { name = "sentence-transformers" },
     { name = "torchao" },
+    { name = "torchvision", version = "0.26.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.29.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "trackio" },
     { name = "wandb" },
 ]
@@ -3286,6 +3288,8 @@ dev = [
     { name = "schedulefree" },
     { name = "sentence-transformers" },
     { name = "torchao" },
+    { name = "torchvision", version = "0.26.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.29.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "trackio" },
     { name = "wandb" },
 ]
@@ -3305,6 +3309,10 @@ loss = [
 mcp = [
     { name = "mcp" },
 ]
+multimodal = [
+    { name = "torchvision", version = "0.26.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.29.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+]
 optim = [
     { name = "schedulefree" },
 ]
@@ -3322,14 +3330,14 @@ train = [
 vllm = [
     { name = "torchaudio", marker = "sys_platform == 'linux'" },
     { name = "torchcodec", marker = "sys_platform == 'linux'" },
-    { name = "torchvision", marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.26.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
     { name = "vllm", marker = "sys_platform == 'linux'" },
 ]
 vllm-server = [
     { name = "ray", marker = "sys_platform == 'linux'" },
     { name = "torchaudio", marker = "sys_platform == 'linux'" },
     { name = "torchcodec", marker = "sys_platform == 'linux'" },
-    { name = "torchvision", marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.26.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
     { name = "vllm", marker = "sys_platform == 'linux'" },
 ]
 
@@ -3384,8 +3392,14 @@ requires-dist = [
     { name = "torchaudio", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchcodec", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = ">=0.14", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchcodec", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = ">=0.14", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'all'", specifier = ">=0.26", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'dev'", specifier = ">=0.26", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'multimodal'", specifier = ">=0.26", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'vllm'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'vllm-server'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchvision", marker = "sys_platform != 'linux' and extra == 'all'", specifier = ">=0.26" },
+    { name = "torchvision", marker = "sys_platform != 'linux' and extra == 'dev'", specifier = ">=0.26" },
+    { name = "torchvision", marker = "sys_platform != 'linux' and extra == 'multimodal'", specifier = ">=0.26" },
     { name = "trackio", marker = "extra == 'all'", specifier = ">=0.25.0" },
     { name = "trackio", marker = "extra == 'dev'", specifier = ">=0.25.0" },
     { name = "trackio", marker = "extra == 'logging'", specifier = ">=0.25.0" },
@@ -3396,7 +3410,7 @@ requires-dist = [
     { name = "wandb", marker = "extra == 'dev'", specifier = ">=0.19.0" },
     { name = "wandb", marker = "extra == 'logging'", specifier = ">=0.19.0" },
 ]
-provides-extras = ["agent-sandbox", "all", "dev", "float8", "hybrid", "logging", "loss", "mcp", "optim", "prepare", "rl", "train", "vllm", "vllm-server"]
+provides-extras = ["agent-sandbox", "all", "dev", "float8", "hybrid", "logging", "loss", "mcp", "multimodal", "optim", "prepare", "rl", "train", "vllm", "vllm-server"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -5539,6 +5553,12 @@ wheels = [
 name = "torchvision"
 version = "0.26.0+cu129"
 source = { registry = "https://download.pytorch.org/whl/cu129" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version < '3.12' and sys_platform == 'linux'",
+]
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'linux'" },
@@ -5558,6 +5578,32 @@ wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.26.0%2Bcu129-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:cc716ad062482efc2557feb28eedb24abe56d56f54171137c428019a032d7f84", upload-time = "2026-04-09T23:21:50Z" },
     { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.26.0%2Bcu129-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:4089bfa520493f18cde8d70cb3091de805ecc398c9a7b0ad8ca151cf5203987e", upload-time = "2026-04-09T23:21:50Z" },
     { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.26.0%2Bcu129-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:c7774fe6386ed3c7e5a9b0770d304cb387dee0216ecc51660b09011c364d3f20", upload-time = "2026-04-09T23:21:51Z" },
+]
+
+[[package]]
+name = "torchvision"
+version = "0.29.2"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten'",
+    "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+]
+dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' and sys_platform != 'linux'" },
+    { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and sys_platform != 'linux'" },
+    { name = "pillow", marker = "sys_platform != 'linux'" },
+    { name = "torch", version = "2.14.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/ec/ce97c46e5322b588b95be388f2c21878d014ca20838478e7aab59edd128a/torchvision-0.29.2-py3-none-macosx_14_0_arm64.whl", hash = "sha256:d412494ff011f24c884a3cffd33eba1cb45a0299d4e26c1e175113f9d3b3ebc7", size = 1823414, upload-time = "2026-10-28T15:21:31.892Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/9a/a728c3af061bff5e0c8a8389b6dfe99646f8290a2f6a5f8fb624a0c15b92/torchvision-0.29.2-py3-none-win_amd64.whl", hash = "sha256:5812c312d4401c3587a045fa4c6228d982ebc4faa9b472275d11afe5852e24f9", size = 1379121, upload-time = "2026-10-28T15:21:30.558Z" },
 ]
 
 [[package]]
@@ -5832,7 +5878,7 @@ dependencies = [
     { name = "torch", version = "2.11.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
     { name = "torchaudio", marker = "sys_platform == 'linux'" },
     { name = "torchcodec", marker = "sys_platform == 'linux'" },
-    { name = "torchvision", marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.26.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
     { name = "tqdm", marker = "sys_platform == 'linux'" },
     { name = "transformers", marker = "sys_platform == 'linux'" },
     { name = "typing-extensions", marker = "sys_platform == 'linux'" },

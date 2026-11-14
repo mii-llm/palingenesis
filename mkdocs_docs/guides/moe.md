@@ -165,9 +165,12 @@ Routing Replay (R3), is implemented here:
 
 ```yaml
 rollout:
-  routing_replay: auto    # on for MoE policies; "off"; "on" raises when the policy has no MoE layers
+  routing_replay: auto    # on for MoE policies; "on" raises when the policy has no MoE layers; default "off"
   prefix_caching: true    # the vLLM backends need it to return routing
 ```
+
+Replay is off by default: the vLLM path (colocated engine and server) follows vLLM 0.26's source but has not yet run
+end to end on a GPU. The hf backend is tested.
 
 `moe/route_mismatch` reports how often the trainer's own routers would have chosen differently, per step. On the
 first step of an on-policy run it measures the engine against the trainer on identical weights. The token-level

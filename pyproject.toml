@@ -64,6 +64,10 @@ vllm = [
     "torchaudio==2.11.0; sys_platform == 'linux'",
     "torchcodec>=0.14; sys_platform == 'linux'",
 ]
+# Image training (multimodal.enabled / model.multimodal): the checkpoint's own image processor
+# (Qwen-VL family) needs torchvision; without it a pillow fallback gives slightly different
+# pixels. Each platform gets the release built for its torch (on Linux, 0.26 from the CUDA 12.9 index).
+multimodal = ["torchvision>=0.26"]
 # pgs rl: symbolic answer checking for the math reward, and the Kubernetes Agent Sandbox client
 rl = ["math-verify>=0.8"]
 agent-sandbox = ["k8s-agent-sandbox[async]>=1.0"]
@@ -93,7 +97,7 @@ prepare = [
 ]
 # Everything
 all = [
-    "palingenesis[train,float8,logging,loss,optim,prepare,rl,mcp]",
+    "palingenesis[train,float8,logging,loss,optim,prepare,rl,mcp,multimodal]",
 ]
 # Development
 dev = [

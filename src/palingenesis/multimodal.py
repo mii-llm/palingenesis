@@ -234,12 +234,13 @@ class VisionProcessor:
                 image_processor = Qwen2VLImageProcessorPil.from_pretrained(name_or_path)
             except Exception:  # noqa: BLE001
                 raise MultimodalError(
-                    "multimodal training needs torchvision and pillow for the image processor (both come "
-                    "with the vllm extra; otherwise install torchvision for your torch build)"
+                    "multimodal training needs torchvision for the image processor: "
+                    "pip install 'palingenesis[multimodal]' (or uv sync --extra multimodal)"
                 ) from e
             logger.warning(
                 "torchvision is not installed: images are resized with pillow, whose pixels differ slightly "
-                "from the torchvision processor a server uses. Install torchvision for training."
+                "from the torchvision processor a server uses. Install the multimodal extra for training: "
+                "pip install 'palingenesis[multimodal]'."
             )
         except Exception as e:  # noqa: BLE001 — a checkpoint saved without its processor files
             raise MultimodalError(f"{name_or_path} has no image processor (preprocessor_config.json): {e}") from e
