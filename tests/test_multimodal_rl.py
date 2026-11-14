@@ -359,6 +359,31 @@ def test_drop_images_edits_tokens_in_place():
     assert chat.drop_images(ids, vision.image_token_id, 0, "") == [1, 2, 3]
 
 
+def test_mcp_image_content_becomes_tool_images():
+    """An MCP server's image content (a browser server's screenshot) reaches a multimodal policy
+    as an image; by default it stays a text placeholder."""
+    import base64
+    import io
+    from types import SimpleNamespace
+
+    from palingenesis.multimodal import load_image
+    from palingenesis.rl.envs.mcp import _result_images, _result_text
+
+    buffer = io.BytesIO()
+    tiny_image(8, 16).save(buffer, format="PNG")
+    result = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="text", text="Page loaded."),
+            SimpleNamespace(type="image", data=base64.b64encode(buffer.getvalue()).decode(), mimeType="image/png"),
+        ],
+        structured_content=None,
+    )
+    assert _result_text(result) == "Page loaded.\n[image omitted]"
+    (picture,) = _result_images(result)
+    assert _result_text(result, images=False) == "Page loaded."
+    assert load_image(picture).size == (16, 8)
+
+
 # ----------------------------------------------------------------- generation client and engines
 
 

@@ -27,7 +27,9 @@ schema has them. Its structuredContent (a number, {"reward": x}, or a dict of co
 text (a number) is the environment reward.
 
 Content. Text and embedded text resources go to the policy as text; images, audio and binary
-resources are replaced by a short placeholder (the policy reads text). A result with
+resources are replaced by a short placeholder (the policy reads text). With `images: true` (a
+multimodal policy, model.multimodal) image content reaches the policy as images instead (a
+browser server's screenshots), placed as env.image_results says. A result with
 isError: true is an observation the policy can correct ("Error: ..."), and counts as a tool
 error; protocol errors (an unknown tool, a malformed call) are too.
 
@@ -40,7 +42,7 @@ import json
 import re
 from typing import Any
 
-from palingenesis.rl.env import ToolFailed
+from palingenesis.rl.env import ToolFailed, ToolOutput
 from palingenesis.rl.rewards import SkipSample, load_object
 
 _SEP = "__"  # server/tool separator when several servers are combined
@@ -139,7 +141,9 @@ class MCPEnv:
         reward_tool: str = "",
         headers: dict[str, str] | None = None,
         timeout: float = 60.0,
+        images: bool = False,
     ):
+        self.images = images  # image content goes to the policy as images (rl.env.ToolOutput)
         if bool(server) == bool(servers):
             raise ValueError("MCPEnv: set exactly one of server (one MCP server) or servers ({name: server})")
         if bool(state_tool) != bool(state_arg):
@@ -200,7 +204,7 @@ class MCPEnv:
             description = re.sub(rf"(?m)^[ \t]*{re.escape(self.state_arg)}\b[^:\n]*:.*\n?", "", description)
         return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> "str | ToolOutput":
         await self.tool_schemas()
         if name not in self.routes:
             raise ToolFailed(f"unknown tool {name!r}. Available tools: {', '.join(self.routes) or 'none'}.")
@@ -208,10 +212,11 @@ class MCPEnv:
         if self.handle is not None:
             arguments = {**arguments, self.state_arg: self.handle}
         result = await self._call(server, tool, arguments)
-        text = _result_text(result)
+        pictures = _result_images(result) if self.images else []
+        text = _result_text(result, images=not pictures)
         if result.is_error:
             raise ToolFailed(text or "the tool failed")
-        return text
+        return ToolOutput(text, pictures) if pictures else text
 
     # ---------------------------------------------------------------- episode
 
@@ -282,10 +287,24 @@ def _untitled(schema: Any) -> Any:
     return out
 
 
-def _result_text(result: Any) -> str:
+def _result_images(result: Any) -> list[bytes]:
+    """The image content of a result, decoded (MCP sends base64)."""
+    import base64
+
+    return [
+        base64.b64decode(item.data)
+        for item in result.content or []
+        if getattr(item, "type", "") == "image" and getattr(item, "data", None)
+    ]
+
+
+def _result_text(result: Any, images: bool = True) -> str:
+    """`images` false: image content is left out (it goes to the policy as images)."""
     parts = []
     for item in result.content or []:
         kind = getattr(item, "type", "")
+        if kind == "image" and not images:
+            continue
         if kind == "text":
             parts.append(item.text)
         elif kind == "resource":

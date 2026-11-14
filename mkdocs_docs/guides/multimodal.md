@@ -130,6 +130,8 @@ class ComputerEnv:
 
 Prompts may carry image parts as in SFT.
 
+MCP servers: `MCPEnv` with `args: {images: true}` passes a tool result's image content (a browser server's screenshots) to the policy as images; by default it is replaced by a text placeholder.
+
 ### Where a tool's image goes
 
 OpenAI-style chat completions take images only in user messages: the tool message is text. Anthropic's `tool_result` and the Responses API's `function_call_output` carry images inside the tool result. Agent harnesses follow the API they speak, so both layouts exist in deployment, and a model should be trained in the one it will be served in.
