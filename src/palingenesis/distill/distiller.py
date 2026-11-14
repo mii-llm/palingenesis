@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from palingenesis import stable_softmax as S
 from palingenesis.distill import losses as L
 from palingenesis.distill.cache import CacheLookup, TopKCache, batch_field
 from palingenesis.distill.chunked import chunked_rows_loss, rows_per_slice
@@ -128,8 +129,12 @@ class Distiller:
         features: list[FeatureSpec] | None = None,
         student_vocab: int = 0,
         max_seq_length: int = 8192,
+        stable_softmax: bool = False,
     ):
         self.config = config
+        # train.stable_softmax: the gold cross-entropy always, and the forward KL to an online teacher that
+        # shares the student's whole vocabulary (palingenesis.stable_softmax); other supports keep the default
+        self.stable_softmax = stable_softmax
         self.max_seq_length = max_seq_length  # the student's; a teacher view's default limit is twice it
         self.specs = {s.name: s for s in specs}
         self.online = online
@@ -366,6 +371,13 @@ class Distiller:
                     if t.hidden is not None:
                         teacher = self.online[name]
                         tl = teacher.logits(t.hidden[a:b].index_select(0, sel.to(t.hidden.device)))
+                        if self._stable_dense(z, tl, teacher):
+                            d = S.forward_kl(z / temperature, tl / temperature) * self.t2
+                            kd_sum = kd_sum.index_add(0, sel, t.weight * d)
+                            w_sum = w_sum.index_add(0, sel, torch.full_like(d, t.weight))
+                            out_stats[f"kd_sum/{name}"] = d.detach().sum()
+                            out_stats[f"kd_tokens/{name}"] = n
+                            continue
                         lp, lq, mask = self._dense(z, tl, teacher)
                     else:
                         cache = self.caches[name]
@@ -388,7 +400,8 @@ class Distiller:
                     out_stats[f"kd_tokens/{name}"] = n
             kd = torch.where(w_sum > 0, kd_sum / w_sum.clamp(min=1e-12), torch.zeros_like(kd_sum))
             per_row = cfg.kd_weight * kd
-            ce = L.gold_cross_entropy(logits, gold)  # always reported (the logits are here anyway)
+            # always reported (the logits are here anyway)
+            ce = S.cross_entropy(logits, gold) if self.stable_softmax else L.gold_cross_entropy(logits, gold)
             out_stats["ce_sum"] = ce.detach().sum()
             if cfg.ce_weight > 0:
                 per_row = per_row + cfg.ce_weight * ce
@@ -398,6 +411,15 @@ class Distiller:
             return (targets.token_weights[a:b] * per_row).sum(), out_stats
 
         return fn
+
+    def _stable_dense(self, z: Tensor, teacher_logits: Tensor, teacher: OnlineTeacher) -> bool:
+        """The stable forward KL applies: asked for, forward KL, and one vocabulary on both sides."""
+        return (
+            self.stable_softmax
+            and self.config.divergence == "forward_kl"
+            and not teacher.bridge.swap
+            and z.shape[-1] == teacher_logits.shape[-1] == teacher.bridge.shared_vocab_size
+        )
 
     def _dense(self, z: Tensor, teacher_logits: Tensor, teacher: OnlineTeacher):
         lq_full = F.log_softmax(z.float() / self.temperature, -1)
@@ -676,4 +698,5 @@ def build_distiller(
         features,
         student_vocab=len(tokenizer),
         max_seq_length=config.data.max_seq_length,
+        stable_softmax=config.train.stable_softmax,
     )

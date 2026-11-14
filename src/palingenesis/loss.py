@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from palingenesis import stable_softmax
+
 IGNORE_INDEX = -100
 
 # Try importing Cut Cross-Entropy (optional dependency)
@@ -88,13 +90,17 @@ def cross_entropy_loss(
     labels: torch.Tensor,
     global_valid_tokens: float = 1.0,
     weights: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> torch.Tensor:
     """Cross-entropy with sum reduction / global_valid_tokens normalization.
 
     This gives correct gradients across distributed ranks when each rank
     has different numbers of valid (non-masked) tokens. `weights` ([B, S], shifted
-    like the labels) scale each token's term (per-turn scaling).
+    like the labels) scale each token's term (per-turn scaling). `stable`: palingenesis.stable_softmax.
     """
+    if stable:
+        loss = stable_softmax.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), IGNORE_INDEX)
+        return _weighted_sum(loss, weights) / global_valid_tokens
     loss = F.cross_entropy(
         logits.view(-1, logits.size(-1)).float(),
         labels.view(-1),
@@ -196,6 +202,7 @@ def chunked_cross_entropy_loss(
     num_chunks: int = 8,
     global_valid_tokens: float = 1.0,
     weights: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> torch.Tensor:
     """FSDP2-compatible chunked cross-entropy loss over the trained positions.
 
@@ -218,6 +225,7 @@ def chunked_cross_entropy_loss(
         lm_head: The lm_head module (may be FSDP-wrapped)
         num_chunks: Bounds a slice at ceil(B*S / num_chunks) positions (the logits of one slice)
         global_valid_tokens: Denominator for loss normalization
+        stable: palingenesis.stable_softmax's cross-entropy instead of PyTorch's
     """
     from torch.distributed._composable.fsdp import FSDPModule
 
@@ -269,12 +277,15 @@ def chunked_cross_entropy_loss(
         logits = lm_head(h_slice)
 
         # CE with sum reduction (weighted per token under turn scaling)
+        slice_targets = targets[start : start + slice_rows]
+        if stable:
+            per_token = stable_softmax.cross_entropy(logits, slice_targets)
+        else:
+            per_token = F.cross_entropy(
+                logits.float(), slice_targets, reduction="none" if row_weights is not None else "sum"
+            )
         slice_loss = _weighted_sum(
-            F.cross_entropy(
-                logits.float(),
-                targets[start : start + slice_rows],
-                reduction="none" if row_weights is not None else "sum",
-            ),
+            per_token,
             row_weights[start : start + slice_rows] if row_weights is not None else None,
         )
         scaled_loss = slice_loss * scale / global_valid_tokens

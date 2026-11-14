@@ -368,6 +368,7 @@ def _chunkwise(
     kv_offload: bool = False,
     unlikely: list | None = None,
     loss_fn=None,
+    stable_softmax: bool = False,
 ) -> ChunkwiseResult:
     """Accumulate d(loss)/d(params) into `.grad`, chunk by chunk; the caller must
     NOT call `.backward()` afterwards.
@@ -387,6 +388,7 @@ def _chunkwise(
     loss_fn:    replaces the chunk's cross-entropy: loss_fn(hidden [B, L, H], lo, hi, denom) -> the chunk's
                 loss divided by denom, with the head's gradients already accumulated (off-policy
                 distillation: palingenesis.distill.Distiller.seco_loss_fn).
+    stable_softmax: the chunk's cross-entropy from palingenesis.stable_softmax (train.stable_softmax).
     """
     backbone, lm_head = _backbone(model), _lm_head(model)
     if getattr(backbone, "gradient_checkpointing", False) and backbone.training:
@@ -420,6 +422,7 @@ def _chunkwise(
                 lm_head,
                 num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
                 global_valid_tokens=denom / weight,
+                stable=stable_softmax,
             )
         if with_repeat:
             for (targets, w), st in zip(terms, stats):

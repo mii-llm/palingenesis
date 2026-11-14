@@ -805,6 +805,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         or config.plugins.deft
         or config.plugins.info_sft
         or config.plugins.pre_rl
+        or config.train.stable_softmax  # its cross-entropy needs the logits (CCE never forms them)
     )
 
     # Token-gated objectives (DEFT, DFT, InfoSFT, CADFT) run chunked under
@@ -1377,6 +1378,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         loss_denom=loss_denom,
                         kv_offload=config.memory.seco_kv_offload,
                         num_loss_chunks=lambda n: _dynamic_num_chunks(n, _loss_vocab_size),
+                        stable_softmax=config.train.stable_softmax,
                         unlikely=[
                             (batch.get("repeat_targets"), config.data.repeat_unlikelihood),
                             (batch.get("stop_targets"), config.data.stop_unlikelihood),
@@ -1483,6 +1485,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         num_chunks=_dynamic_num_chunks(input_ids.numel(), _loss_vocab_size),
                         global_valid_tokens=loss_denom,
                         weights=loss_weights,
+                        stable=config.train.stable_softmax,
                     )
                 elif config.plugins.cadft:
                     outputs = model(**fwd_kwargs)
@@ -1527,7 +1530,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 else:
                     outputs = model(**fwd_kwargs)
                     logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-                    loss = cross_entropy_loss(logits, labels, loss_denom, weights=loss_weights)
+                    loss = cross_entropy_loss(
+                        logits, labels, loss_denom, weights=loss_weights, stable=config.train.stable_softmax
+                    )
 
             PACKED_VARLEN.reset(_varlen)
 

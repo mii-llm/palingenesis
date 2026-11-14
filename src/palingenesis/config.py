@@ -207,6 +207,10 @@ class TrainConfig:
     save_final: bool = True  # write the final model at the end (off for dry runs such as `pgs profile --measure`)
     logging_steps: int = 1
     bf16: bool = True
+    # Cross-entropy, and the dense forward KL of off-policy distillation, computed so the target's gradient
+    # never rounds to zero and equal student and teacher logits give a zero gradient (arXiv:2610.31642;
+    # palingenesis.stable_softmax). A few extra element-wise passes over the logits; not measured on quality.
+    stable_softmax: bool = False
     gradient_checkpointing: Literal["full", "selective", "none"] = "selective"  # STATUS: proven
     spike_detection: bool = True  # STATUS: validated — ZClip-inspired adaptive spike skipping
     spike_z_threshold: float = 5.0  # z-score threshold (higher = fewer skips)
@@ -564,6 +568,24 @@ class Config:
                 errors.append(f"{where} must be two different non-empty strings [open, close], got {tags!r}.")
         if self.train.keep_checkpoints < 0:
             errors.append(f"train.keep_checkpoints must be >= 0 (0 keeps all), got {self.train.keep_checkpoints}.")
+        if self.train.stable_softmax:
+            uncovered = [
+                name
+                for name, on in (
+                    (
+                        "plugins.deft/dft/cadft/info_sft",
+                        self.plugins.deft or self.plugins.dft or self.plugins.cadft or self.plugins.info_sft,
+                    ),
+                    ("plugins.pre_rl", self.plugins.pre_rl),
+                    ("dpo.enabled", self.dpo.enabled),
+                )
+                if on
+            ]
+            if uncovered:
+                errors.append(
+                    "train.stable_softmax covers cross-entropy and distillation's forward KL, not "
+                    f"{', '.join(uncovered)}: turn one of them off."
+                )
         if self.memory.gradient_release:
             if self.train.gradient_accumulation_steps > 1:
                 errors.append(

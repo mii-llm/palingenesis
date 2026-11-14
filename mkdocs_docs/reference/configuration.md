@@ -125,6 +125,7 @@
 | `save_final` | bool | `true` | Save the final model to `output_dir/final` (Hugging Face format) at the end. |
 | `logging_steps` | int | `1` | Log metrics every N steps. |
 | `bf16` | bool | `true` | Enable bf16 mixed precision with fp32 gradient reduction. |
+| `stable_softmax` | bool | `false` | Cross-entropy, and the forward KL of off-policy distillation to an online teacher with the student's vocabulary, computed so the target token's gradient never rounds to zero (it does in fp32 once the target logit leads the others by about 17) and equal student and teacher logits give a zero gradient ([arXiv:2610.31642](https://arxiv.org/abs/2610.31642)). Covers plain, chunked and SeCO cross-entropy and the distillation gold cross-entropy; turns off Cut Cross-Entropy; refused with DPO, `plugins.pre_rl` and the gated objectives. A few extra element-wise passes over the logits. Not measured on training quality. |
 | `gradient_checkpointing` | str | `selective` | Activation checkpointing. `selective` keeps attention outputs and every other matmul (Qwen3-0.6B, 8×2048 tokens, compiled: 8.6 GiB of activations, +10% step time); `full` recomputes each layer (1.9 GiB, +25%); `none` keeps everything (19.8 GiB, fastest). |
 | `spike_detection` | bool | `true` | Skip optimizer step when gradient norm is anomalous (z-score based). |
 | `spike_z_threshold` | float | `5.0` | Z-score threshold for spike detection. Higher = fewer skips. |
