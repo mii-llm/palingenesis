@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+try:  # optional: dedupe keys are the same without it, only slower
+    import orjson
+except ImportError:
+    orjson = None
+
 logger = logging.getLogger(__name__)
 
 ROW_INDEX = "_row"  # position of the row in the loaded data, kept in the output
@@ -63,10 +68,68 @@ def _messages(sample: dict, messages_field: str) -> list:
     return raw if isinstance(raw, list) else []
 
 
+# Whitespace that str.split() splits on and JSON writes as is: json.dumps and orjson escape every
+# character below U+0020 (tab and newline included), which leaves the space and these.
+_UNICODE_SPACES = (
+    "\x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+_UNICODE_SPACE_BYTES = tuple(c.encode() for c in _UNICODE_SPACES)
+_ORJSON_MAX_DEPTH = 254  # orjson refuses deeper nesting
+
+
+def _orjson_writes_as_json(obj: Any, depth: int = 0) -> bool:
+    """Whether orjson writes `obj` byte for byte as _canonical_json's json.dumps call does: plain
+    JSON types (exact dict with string keys, list or tuple, str, bool, None), integers within 64 bits, and
+    floats whose shortest repr both libraries write the same (not inf or nan). Anything else
+    (subclasses, dates, numpy values, ...) goes through json.dumps and its default=str."""
+    kind = type(obj)
+    if kind is str or kind is bool or obj is None:
+        return True
+    if kind is dict:
+        if depth >= _ORJSON_MAX_DEPTH:
+            return False
+        for key, value in obj.items():
+            if type(key) is not str or (type(value) is not str and not _orjson_writes_as_json(value, depth + 1)):
+                return False
+        return True
+    if kind is list or kind is tuple:
+        if depth >= _ORJSON_MAX_DEPTH:
+            return False
+        for value in obj:
+            if type(value) is not str and not _orjson_writes_as_json(value, depth + 1):
+                return False
+        return True
+    if kind is int:
+        return -(2**63) <= obj < 2**64
+    if kind is float:
+        return orjson.dumps(obj) == float.__repr__(obj).encode()
+    return False
+
+
+def _canonical_json(obj: Any) -> bytes:
+    """Compact JSON with sorted keys, as UTF-8. orjson (if installed) writes the same bytes as the
+    standard library for the values it is used on, about ten times faster."""
+    if orjson is not None and _orjson_writes_as_json(obj):
+        try:
+            return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS)
+        except orjson.JSONEncodeError:  # e.g. a lone surrogate: json.dumps decides, as without orjson
+            pass
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode()
+
+
+def _collapse_whitespace(data: bytes) -> bytes:
+    """`" ".join(text.split())` of UTF-8 JSON text, without splitting when there is nothing to collapse."""
+    if data.isascii() or not any(space in data for space in _UNICODE_SPACE_BYTES):
+        # The only whitespace is the space (JSON text never starts or ends with one), and bytes.split()
+        # splits on it alone: multi-byte UTF-8 sequences hold no ASCII byte.
+        return b" ".join(data.split()) if b"  " in data else data
+    return " ".join(data.decode().split()).encode()
+
+
 def _digest(obj: Any) -> str:
     # whitespace runs are collapsed: re-exports of one conversation differ in them
-    text = " ".join(json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str).split())
-    return hashlib.sha1(text.encode()).hexdigest()
+    return hashlib.sha1(_collapse_whitespace(_canonical_json(obj))).hexdigest()
 
 
 def conversation_key(sample: dict, messages_field: str = "messages", tools_field: str = "tools") -> str:

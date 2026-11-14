@@ -3,6 +3,7 @@
 Network-free: a GPT-2 tokenizer under a ChatML template, and a table-lookup model on CPU.
 """
 
+import hashlib
 import json
 import math
 
@@ -108,6 +109,62 @@ def test_conversation_key_ignores_whitespace_runs_and_schema_but_not_content_or_
     assert conversation_key(a) != conversation_key(_row("what is 2+2?", "five"))
     with_tools = dict(a, tools=[{"type": "function", "function": {"name": "calc"}}])
     assert conversation_key(a) != conversation_key(with_tools)
+
+
+def _reference_digest(obj) -> str:
+    """The definition the fast paths must match: compact sorted JSON, str.split() whitespace runs."""
+    text = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha1(" ".join(text.split()).encode()).hexdigest()
+
+
+def _key_objects() -> list:
+    import datetime
+    import enum
+
+    class Color(enum.Enum):
+        RED = 1
+
+    class Tag(str):
+        pass
+
+    every_char = "".join(chr(c) for c in range(0x110000) if not 0xD800 <= c < 0xE000)
+    nested: list = ["leaf"]
+    for _ in range(300):  # deeper than orjson writes
+        nested = [nested]
+    return [
+        [every_char[i : i + 4096] for i in range(0, len(every_char), 4096)],
+        {"b": 1, "a": [1, 2.5, None, True, False], "é": "x", "\u00e9a": "y", "z\u3000": "\u3000 a  b\xa0\xa0c"},
+        [2**63 - 1, -(2**63), 2**64 - 1, 2**64, -(2**63) - 1, 10**30],
+        [0.1, 1.0, -0.0, 1e15, 1e16, 1e-4, 1e-5, 1e300, 5e-324, 123456.789, float("nan"), float("inf"), -float("inf")],
+        ("tuple", ["in", ("tuples",)]),
+        {1: "int key", 2: "another"},
+        [datetime.datetime(2024, 1, 2, 3, 4, 5), Color.RED, Tag("sub  class")],
+        nested,
+        {"messages": [{"role": "user", "content": "  leading and trailing  "}], "tools": None},
+        [" ", "  ", "a" + " " * 33 + "b", "\t\n\r tabs \t and\n\nnewlines"],
+    ]
+
+
+def test_dedupe_keys_match_the_reference_with_and_without_orjson(monkeypatch):
+    """orjson (when installed) only speeds the keys up: both paths give the reference digest, so
+    environments with and without it dedupe identically."""
+    objects = _key_objects()
+    want = [_reference_digest(o) for o in objects]
+    assert [data_clean._digest(o) for o in objects] == want
+    monkeypatch.setattr(data_clean, "orjson", None)
+    assert [data_clean._digest(o) for o in objects] == want
+
+
+def test_dedupe_keys_collapse_every_unicode_whitespace_like_str_split(monkeypatch):
+    spaces = [chr(c) for c in range(0x110000) if chr(c).isspace()]
+    # JSON escapes what is below U+0020; the rest is written as is and must be collapsed
+    assert set(data_clean._UNICODE_SPACES) == {c for c in spaces if c > " "}
+    for orjson in (data_clean.orjson, None):
+        monkeypatch.setattr(data_clean, "orjson", orjson)
+        for c in spaces:
+            row = [{"content": f"a{c}{c} b{c}"}, f"{c}x"]
+            assert data_clean._digest(row) == _reference_digest(row), (orjson, hex(ord(c)))
+        assert data_clean._digest(["a \u3000\xa0 b"]) == data_clean._digest(["a b"]) != data_clean._digest(["a\nb"])
 
 
 def test_prompt_key_is_the_conversation_up_to_the_first_user_turn():
