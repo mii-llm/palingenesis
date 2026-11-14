@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 
 from palingenesis.cmr import CMRConfig
+from palingenesis.config import MoEConfig
 
 LOSSES = ("masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce")
 BASELINES = ("mean", "leave_one_out")
@@ -154,6 +155,12 @@ class RLRolloutConfig:
     # {speculative_config: {method: ngram, num_speculative_tokens: 4, prompt_lookup_max: 4}}.
     vllm_args: dict = field(default_factory=dict)
     micro_seqs: int = 64  # hf: sequences per generate() call
+    # MoE policies: train each token through the experts the rollout engine routed it to (the engine returns them:
+    # vLLM's enable_return_routed_experts; the hf backend records them), with gate values from the trainer's own
+    # router. Without it, the engine and the trainer pick different experts for a share of the tokens, which adds
+    # noise to every importance ratio. "auto": on for MoE policies; "off"; "on": an error if the policy has no MoE
+    # layers. The vLLM backends need rollout.prefix_caching.
+    routing_replay: str = "auto"
 
 
 @dataclass(slots=True)
@@ -353,6 +360,7 @@ class RLConfig:
     train: RLTrainConfig = field(default_factory=RLTrainConfig)
     logging: RLLoggingConfig = field(default_factory=RLLoggingConfig)
     cmr: CMRConfig = field(default_factory=CMRConfig)  # common-mode rejection (palingenesis.cmr); off by default
+    moe: MoEConfig = field(default_factory=MoEConfig)  # MoE policies: router balancing (palingenesis.moe)
 
     # ------------------------------------------------------------------ loading
 

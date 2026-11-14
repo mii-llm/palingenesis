@@ -174,6 +174,23 @@ def is_moe(model: nn.Module) -> bool:
     return bool(find_moe_layers(model))
 
 
+def config_is_moe(name_or_path: str, trust_remote_code: bool = False) -> bool:
+    """Whether a checkpoint's config describes routed experts (read without loading the weights)."""
+    from transformers import AutoConfig
+
+    try:
+        config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+    except (OSError, ValueError):
+        return False
+    configs = [config, getattr(config, "text_config", None)]
+    return any(
+        isinstance(n := getattr(c, attr, None), int) and n > 0
+        for c in configs
+        if c is not None
+        for attr in ("num_experts", "num_local_experts", "n_routed_experts")
+    )
+
+
 def _full_precision(logits: Tensor) -> Tensor:
     """Router logits in at least fp32 (routers are computed in fp32: ST-MoE, section 3.2)."""
     return logits if logits.dtype in (torch.float32, torch.float64) else logits.float()
@@ -263,6 +280,10 @@ class RouterBalancer:
         self._load: Tensor | None = None  # [layers, max_experts]: f of the buffer
         self._loss_sums: Tensor | None = None  # balance loss, z-loss, micro-batches since the last metrics()
         self._warned: set[str] = set()
+        self._tokens: int | None = None
+        self._bias_masters: dict[int, Tensor] = {}
+        # expert parallelism: ranks the experts are split over (contiguous blocks), for moe/rank_load_max
+        self.expert_ranks = 1
         self._token: contextvars.Token | None = None
         for layer in layers:
             self._handles.append(layer.router.register_forward_hook(self._router_hook(layer)))
@@ -271,8 +292,9 @@ class RouterBalancer:
     # -- construction
 
     @classmethod
-    def attach(cls, model: nn.Module, config=None) -> "RouterBalancer | None":
-        """The balancer for `model` under a `MoEConfig` (palingenesis.config; None: its defaults)."""
+    def attach(cls, model: nn.Module, config=None, replay: bool = False) -> "RouterBalancer | None":
+        """The balancer for `model` under a `MoEConfig` (palingenesis.config; None: its defaults).
+        `replay`: routing replay will be used, so a balancer is needed even with balancing off."""
         from palingenesis.config import MoEConfig
 
         config = config or MoEConfig()
@@ -281,7 +303,7 @@ class RouterBalancer:
             return None
         if not config.balance:
             logger.info(f"MoE: {len(layers)} layers; router balancing and statistics are off (moe.balance: false)")
-            return None
+            return cls(layers) if replay else None
         model_coef = float(getattr(getattr(model, "config", None), "router_aux_loss_coef", 0.0) or 0.0)
         if config.balance_loss_coef >= 0:
             coef = config.balance_loss_coef
@@ -331,7 +353,13 @@ class RouterBalancer:
 
     # -- the micro-batch
 
-    def begin(self, token_mask: Tensor | None = None, grad_accum: int = 1, replay: Tensor | None = None) -> None:
+    def begin(
+        self,
+        token_mask: Tensor | None = None,
+        grad_accum: int = 1,
+        replay: Tensor | None = None,
+        tokens: int | None = None,
+    ) -> None:
         """Before a micro-batch's forward.
 
         token_mask: [B, S], non-zero at real tokens, in the layout the model sees (None: all real).
@@ -339,6 +367,10 @@ class RouterBalancer:
         grad_accum: micro-batches per optimizer step (the losses are averaged over them).
         replay:     [B, S, layers, top_k] expert indices to route with (a negative first index:
                     this token keeps the model's own choice), or None.
+        tokens:     the real tokens the losses are averaged over, when the forwards of this
+                    micro-batch are not all run before its first backward (prompt-sharing trees:
+                    branches run and backpropagate one group at a time). The loads are then
+                    those of the tokens routed before the first backward. One process only.
         """
         if self._active:
             self.end()
@@ -346,6 +378,7 @@ class RouterBalancer:
         self._mask = token_mask.to(device).bool() if token_mask is not None else None
         self._replay = replay.to(device) if replay is not None else None
         self._grad_accum = max(int(grad_accum), 1)
+        self._tokens = tokens
         self._local = torch.zeros(len(self.layers), self._width, dtype=torch.float64, device=device)
         self._batch = None
         self._logits.clear()
@@ -410,9 +443,11 @@ class RouterBalancer:
                 if bias is None:
                     continue
                 counts = self._buffer[layer.index, : layer.num_experts]
-                delta = self.bias_update_rate * torch.sign(counts.mean() - counts)
+                # an fp32 master: a bf16 buffer would round the small steps away
+                master = self._bias_masters.setdefault(layer.index, bias.detach().float().clone())
+                master += self.bias_update_rate * torch.sign(counts.mean() - counts).to(master)
                 with torch.no_grad():
-                    bias.add_(delta.to(bias))
+                    bias.copy_(master)
         self._last, self._buffer, self._load = self._buffer, None, None
 
     # -- hooks
@@ -427,7 +462,8 @@ class RouterBalancer:
             if self._active:
                 self._logits[layer.index] = output[0] if isinstance(output, (tuple, list)) else output
 
-        return hook
+        # under model.compile the hooks stay Python (a graph break): they keep state between calls
+        return torch.compiler.disable(hook)
 
     def _window(self, tokens: int, layer: MoELayer):
         """(mask [N] or None, replay [N, top_k] or None, loss weight) of the forward being run."""
@@ -471,7 +507,7 @@ class RouterBalancer:
                 weights = _InjectRouterGradient.apply(weights, logits, self, layer, mask, weight)
             return (hidden, index, weights, *args[3:])
 
-        return hook
+        return torch.compiler.disable(hook)
 
     @torch.no_grad()
     def _measure(self, layer: MoELayer, logits: Tensor, index: Tensor, mask, replayed, mismatched) -> None:
@@ -507,7 +543,7 @@ class RouterBalancer:
                 )
             self.sync()
         e = self.max_experts
-        tokens = float(self._batch[layer.index, 2 * e + _TOKENS].clamp(min=1.0))
+        tokens = float(self._tokens or self._batch[layer.index, 2 * e + _TOKENS].clamp(min=1.0))
         scale = weight / (tokens * self._grad_accum * len(self.layers))
         with torch.enable_grad():
             z = _full_precision(logits.detach().reshape(-1, logits.shape[-1])).requires_grad_(True)
@@ -533,7 +569,9 @@ class RouterBalancer:
         moe/router_entropy: mean entropy of the router distribution / log(experts), mean over layers;
         moe/balance_loss, moe/z_loss: the two losses (before their coefficients);
         moe/route_mismatch: with recorded routing, the share of recorded expert choices the trainer's
-        own router would not have made. With `log_layers`, the first four also per layer."""
+        own router would not have made; moe/rank_load_max: under expert parallelism, the busiest
+        rank's share of the routed tokens relative to an even split, worst layer (what a placement of
+        the experts by load could remove). With `log_layers`, the first four also per layer."""
         stats = self._buffer if self._buffer is not None else self._last
         if stats is None:
             return {}
@@ -569,6 +607,13 @@ class RouterBalancer:
             out["moe/balance_loss"] = balance / n
             out["moe/z_loss"] = z / n
             self._loss_sums = None
+        if self.expert_ranks > 1:
+            worst = 1.0
+            for layer in self.layers:
+                per_rank = stats[layer.index, : layer.num_experts].view(self.expert_ranks, -1).sum(-1)
+                if float(per_rank.sum()) > 0:
+                    worst = max(worst, float(per_rank.max() / per_rank.mean()))
+            out["moe/rank_load_max"] = worst
         replayed = float(stats[:, 2 * m + _REPLAYED].sum())
         if replayed > 0:
             out["moe/route_mismatch"] = float(stats[:, 2 * m + _MISMATCHED].sum()) / replayed
@@ -653,11 +698,13 @@ def _replay_routing(layer: MoELayer, logits: Tensor, index: Tensor, weights: Ten
 
 class RoutingRecorder:
     """Records the experts a model routes each token to: `with RoutingRecorder(model) as rec:` then
-    `rec.indices()` is [tokens, layers, top_k] (int16; tokens in the order the forwards saw them,
-    forwards concatenated along the sequence for a batch of rows: [B, S, layers, top_k])."""
+    `rec.indices()` is [tokens, layers, top_k] (tokens in the order the forwards saw them; with
+    `rows`, the forwards concatenated along the sequence: [B, S, layers, top_k]). One byte per
+    choice for up to 256 experts, else int16."""
 
     def __init__(self, model: nn.Module):
         self.layers = find_moe_layers(model)
+        self.dtype = torch.uint8 if all(layer.num_experts <= 256 for layer in self.layers) else torch.int16
         self._chunks: list[list[Tensor]] = [[] for _ in self.layers]
         self._handles: list = []
 
@@ -666,7 +713,7 @@ class RoutingRecorder:
 
             def hook(module, args, layer=layer):
                 if len(args) >= 3:
-                    self._chunks[layer.index].append(args[1].detach().to(torch.int16).cpu())
+                    self._chunks[layer.index].append(args[1].detach().to(self.dtype).cpu())
 
             self._handles.append(layer.experts.register_forward_pre_hook(hook))
         return self
@@ -680,7 +727,7 @@ class RoutingRecorder:
         """[rows, S, layers, top_k] when `rows` is given (every forward had that many rows), else
         [tokens, layers, top_k]."""
         if not self.layers or not self._chunks[0]:
-            return torch.empty(0, len(self.layers), 0, dtype=torch.int16)
+            return torch.empty(0, len(self.layers), 0, dtype=self.dtype)
         per_layer = []
         for chunks in self._chunks:
             if rows is None:

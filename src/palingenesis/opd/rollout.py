@@ -22,6 +22,7 @@ vLLM is imported lazily: without it installed, the hf backend works as before.
 
 import atexit
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -97,6 +98,9 @@ class Rollout:
     # The version that sampled the first token (None: policy_version). Older when new weights were loaded while the
     # request was decoding (partial rollouts): its tokens then come from more than one policy version.
     first_version: int | None = None
+    # MoE policies, with routing replay: the experts the engine routed each token it processed to,
+    # [prompt + completion - 1, MoE layers, top_k] (the last sampled token was never forwarded); None otherwise.
+    routed_experts: object | None = None
 
 
 class RolloutEngine(Protocol):
@@ -140,6 +144,18 @@ def checkpoint_named_parameters(
 # ------------------------------------------------------------------------- hf
 
 
+def decode_routed_experts(encoded: str | None):
+    """A vLLM server's `routed_experts` field (base64 of a .npy file, with --enable-return-routed-experts):
+    the array [tokens - 1, MoE layers, top_k], or None when the server did not send one."""
+    if not encoded:
+        return None
+    import io
+
+    import numpy as np
+
+    return np.load(io.BytesIO(base64.b64decode(encoded)), allow_pickle=False)
+
+
 class _RecordLogprobs:
     """Logits processor: temperature-scales (and top-k / top-p truncates) the scores
     and records each sampled token's log-probability. The token sampled at step t is
@@ -177,6 +193,7 @@ class HFRollout:
         self.pad_id = pad_id
         self.micro_seqs = micro_seqs
         self.version = 0
+        self.record_routing = False  # MoE routing replay: return the experts every token was routed to
 
     def update_weights(self, named_tensors, version: int) -> None:
         self.version = version  # it generates with the trained model itself
@@ -220,13 +237,20 @@ class HFRollout:
                         **sample_kwargs,
                     )
                     recorder = _RecordLogprobs(sampling, width) if temperature > 0 else None
-                    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    routing = contextlib.ExitStack()
+                    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"), routing:
+                        if self.record_routing:
+                            from palingenesis.moe import RoutingRecorder
+
+                            routed = routing.enter_context(RoutingRecorder(self.model))
                         seqs = self.model.generate(
                             ids.to(device),
                             attention_mask=mask.to(device),
                             generation_config=config,
                             logits_processor=LogitsProcessorList([recorder] if recorder else []),
                         )
+                    # [rows, width + decoding steps, layers, top_k]: the left-padded prompts, then one token per step
+                    experts = routed.indices(rows=len(chunk)) if self.record_routing else None
                     generated = seqs[:, width:]
                     logprobs = recorder.finish(seqs).tolist() if recorder else None
                     for row, i in enumerate(chunk):
@@ -238,6 +262,11 @@ class HFRollout:
                             logprobs[row][: len(tokens)] if logprobs else [],
                             "stop" if cut else "length",
                             self.version,
+                            routed_experts=(
+                                experts[row, width - len(prompts[i]) : width + len(tokens) - 1].numpy()
+                                if experts is not None
+                                else None
+                            ),
                         )
         finally:
             self.model.train(was_training)
@@ -453,7 +482,8 @@ class VLLMColocateRollout:
             tokens = list(o.token_ids)
             logprobs = [step[t].logprob for step, t in zip(o.logprobs, tokens)] if o.logprobs else []
             finish = "stop" if o.finish_reason == "stop" else "length"
-            rollouts.append(Rollout(tokens, logprobs, finish, self.version, first_version))
+            routed = getattr(o, "routed_experts", None)  # with enable_return_routed_experts (MoE routing replay)
+            rollouts.append(Rollout(tokens, logprobs, finish, self.version, first_version, routed))
         return rollouts
 
     # Streaming (continuous batching across calls): requests join the running batch the moment
@@ -679,5 +709,6 @@ class VLLMServerRollout:
                     logprobs,
                     "stop" if choice["finish_reason"] == "stop" else "length",
                     self.version,
+                    routed_experts=decode_routed_experts(choice.get("routed_experts")),
                 )
         return out

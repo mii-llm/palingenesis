@@ -46,6 +46,7 @@ import torch
 import torch.nn as nn
 
 from palingenesis import seco
+from palingenesis.moe import sync_routing
 from palingenesis.seco import (
     _ACTIVE,
     _KV,
@@ -246,6 +247,7 @@ def _tree(model, trunk_ids, branches, loss_fn, trunk_loss_fn, bounds, branch_tok
     del cache
     for store in stores.values():
         store.start_gradients()
+    sync_routing()  # MoE: the routers' balancing gradients use the trunk's expert loads
 
     # Grad-carrying leaves of every boundary's state: the branches and the trunk chunk
     # starting there all read (clones of) them, and their gradients meet in them.

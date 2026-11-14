@@ -35,6 +35,7 @@ from palingenesis.kernels import apply_liger_kernel, model_type_of
 from palingenesis.logging import wandb_define_step_axis, wandb_row
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.memory import trim_host_memory
+from palingenesis.moe import RouterBalancer
 from palingenesis.opd import fused_rkl, losses
 from palingenesis.opd.align import ByteChunkAligner, SharedVocabAligner
 from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig, rollout_max_num_seqs
@@ -203,6 +204,10 @@ class OPDTrainer:
         student_path = self.resume_path or config.model.student
         logger.info("Loading student %s (fp32 master weights, bf16 autocast) on %s", student_path, self.device)
         self.student = load_causal_lm(student_path, torch.float32).to(self.device)
+        # MoE students: router balancing and routing statistics. No routing replay: the loss scores the student's
+        # current distribution on its own samples, it has no importance ratio against the rollout engine.
+        self.router_balancer = RouterBalancer.attach(self.student, config.moe)
+        self._moe_micro_batches = 1
         if config.model.gradient_checkpointing:
             self.student.gradient_checkpointing_enable()
         self.head = output_head(self.student)
@@ -434,6 +439,9 @@ class OPDTrainer:
         if kind in ("topk_kl", "sampled_rkl", "rs_kd"):
             token_lp = torch.cat([s.scores.token_lp for s in samples]).to(device)
 
+        balancer = getattr(self, "router_balancer", None) if train else None
+        if balancer is not None:
+            balancer.begin(mask, grad_accum=self._moe_micro_batches)
         with (
             torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
             torch.set_grad_enabled(train),
@@ -504,7 +512,11 @@ class OPDTrainer:
                     beta=loss.beta,
                 )
         if train:
+            if balancer is not None:
+                balancer.sync()
             value.backward()
+        if balancer is not None:
+            balancer.end()
         stats["loss"] = float(value.detach())
         stats["tokens"] = targets.numel()
         return stats
@@ -578,6 +590,11 @@ class OPDTrainer:
         samples = batch.samples
         total_tokens = sum(len(s.completion) for s in samples)
         stats: dict[str, float] = defaultdict(float)
+        micro_seqs = self.config.train.score_micro_seqs
+        # micro-batches of this step: the MoE balancing losses are averaged over them
+        self._moe_micro_batches = max(
+            1, sum(-(-sum(s.teacher == name for s in samples) // micro_seqs) for name in self.routes)
+        )
         for name in self.routes:
             group = sorted((s for s in samples if s.teacher == name), key=lambda s: len(s.completion))
             for start in range(0, len(group), self.config.train.score_micro_seqs):
@@ -623,6 +640,10 @@ class OPDTrainer:
                 with self.weights.lock:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), config.train.max_grad_norm)
                     self.opt.step()
+                    moe_stats = {}
+                    if self.router_balancer is not None:
+                        moe_stats = self.router_balancer.metrics()
+                        self.router_balancer.step()
                     cmr_stats = self.cmr.post_step() if self.cmr is not None else {}
                     self.opt.zero_grad(set_to_none=True)
                     if self.device == "cuda":
@@ -632,6 +653,7 @@ class OPDTrainer:
                 self.weights.publish()
                 metrics = self._summarize(stats, batch)
                 metrics.update(cmr_stats)
+                metrics.update(moe_stats)
                 metrics.update(
                     {
                         "lr": lr,

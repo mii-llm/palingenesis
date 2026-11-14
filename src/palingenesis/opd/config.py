@@ -15,6 +15,7 @@ from pathlib import Path
 import yaml
 
 from palingenesis.cmr import CMRConfig
+from palingenesis.config import MoEConfig
 from palingenesis.validate_data import valid_think_tags
 
 LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok", "rs_kd")
@@ -336,6 +337,7 @@ class OPDConfig:
     train: OPDTrainConfig = field(default_factory=OPDTrainConfig)
     logging: OPDLoggingConfig = field(default_factory=OPDLoggingConfig)
     cmr: CMRConfig = field(default_factory=CMRConfig)  # common-mode rejection (palingenesis.cmr); off by default
+    moe: MoEConfig = field(default_factory=MoEConfig)  # MoE students: router balancing (palingenesis.moe)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "OPDConfig":
