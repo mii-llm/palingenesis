@@ -19,6 +19,7 @@ Or from Python, with your own rewards and environment:
 """
 
 import contextlib
+import functools
 import inspect
 import json
 import logging
@@ -42,7 +43,7 @@ from palingenesis.kernels import (
     match_vllm_gated_norm,
     model_type_of,
 )
-from palingenesis.logging import wandb_define_step_axis, wandb_row
+from palingenesis.logging import Tracker
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
 from palingenesis.memory import trim_host_memory
 from palingenesis.moe import RouterBalancer, config_is_moe
@@ -78,6 +79,7 @@ from palingenesis.rl.pipeline import RLBatch, RLPipeline
 from palingenesis.rl.rewards import code_reward, load_object, resolve_rewards
 from palingenesis.rl.sandbox import make_sandbox
 from palingenesis.rl.trajectory import Trajectory
+from palingenesis.rollouts import DROPPED_METRIC, RolloutSink, rl_record
 from palingenesis.seco import use_chunk_attention
 
 logger = logging.getLogger(__name__)
@@ -107,6 +109,7 @@ _SUMMED = {
     "sampler/revisits_pending",
     "sampler/revisits_served",
     "sampler/cooldown_overrides",
+    DROPPED_METRIC,
 }
 
 
@@ -206,6 +209,13 @@ class RLTrainer:
             logger.warning("MoE policy without rollout.prefix_caching: vLLM cannot return routing; no routing replay")
             self.routing_replay = False
         if r.backend == "vllm_server":
+            import importlib.util
+
+            if not r.url and importlib.util.find_spec("ray") is None:
+                raise RLConfigError(
+                    "rollout.backend vllm_server: vLLM's weight transfer into the server it "
+                    "launches needs ray. Install it with: pip install 'palingenesis[vllm-server]'"
+                )
             self.server = VLLMServer(
                 m.policy,
                 url=r.url,
@@ -379,23 +389,17 @@ class RLTrainer:
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
         self.stop_requested = False
-        self.wandb, self.wandb_id = None, wandb_id
-        if config.logging.use_wandb and self.parallel.main:
-            try:
-                import wandb
-
-                run = wandb.init(
-                    project=config.logging.project,
-                    name=config.logging.run_name or None,
-                    config=config.to_dict(),
-                    dir=t.output_dir,
-                    id=wandb_id,
-                    resume="allow" if wandb_id else None,
-                )
-                wandb_define_step_axis(run)  # x-axis = the training step, a resumed run included
-                self.wandb, self.wandb_id = wandb, run.id
-            except Exception as e:  # noqa: BLE001 — a metrics backend must never kill a training run
-                logger.warning("wandb init failed (%s); continuing without it", e)
+        # metrics: wandb, trackio, logging.trackers (rank 0); the run id is saved with each checkpoint
+        self.tracker = Tracker.for_run(config.logging, config.to_dict(), t.output_dir, wandb_id, self.parallel.main)
+        self.dumps = None  # logging.dump_trajectories: the trajectories' writer (palingenesis.rollouts)
+        if config.logging.dump_trajectories:
+            self.dumps = RolloutSink(
+                Path(t.output_dir) / "rollouts",
+                "rl",
+                functools.partial(rl_record, content=config.logging.dump_content),
+                self.parallel.rank,
+                self.parallel.world,
+            )
 
     # ------------------------------------------------------------------ setup
 
@@ -749,6 +753,7 @@ class RLTrainer:
     def train(self) -> None:
         config = self.config
         t = config.train
+        failed = True  # until the run ends normally (a stop request included)
         if self.start_step >= t.steps:
             logger.warning("the checkpoint is at step %d of %d: nothing to train", self.start_step, t.steps)
         if self.parallel.fsdp and self.engine.version < self.weights.version:
@@ -772,6 +777,8 @@ class RLTrainer:
                 if self.cmr is not None:  # its own forward / backward on the twins; grads cleared before the task's
                     self.cmr.pre_step()
                 metrics = self._train_step(groups)
+                if self.dumps is not None and batch.dump is not None:  # advantages assigned: written off-thread
+                    self.dumps.submit(step + 1, batch.dump, batch.timeline)
                 trained = self.parallel.sum([metrics.get("trained_sequences", 0.0)])[0]
                 with self.weights.lock:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self._trainable(), t.max_grad_norm)
@@ -813,6 +820,8 @@ class RLTrainer:
                         **trim_host_memory(),  # after the step: frees what the batch held, then reads the RSS
                     }
                 )
+                if self.dumps is not None:
+                    metrics[DROPPED_METRIC] = self.dumps.dropped
                 metrics = self._combine(metrics)
                 if step == 0:
                     self._parity_check(metrics)
@@ -827,6 +836,7 @@ class RLTrainer:
                 if self._should_stop():
                     logger.warning("stop requested: saving a resumable checkpoint at step %d and exiting", step + 1)
                     self.save(f"step_{step + 1}", step + 1)
+                    failed = False
                     return
                 if t.eval_every and (step + 1) % t.eval_every == 0 and step + 1 < t.steps:
                     self._log("eval", self.evaluate(), step + 1)
@@ -835,11 +845,15 @@ class RLTrainer:
             self._log("eval", self.evaluate(), t.steps)
             if t.save_final:
                 self.save("final")
+            failed = False
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
             self.orchestrator.stop()
             self.pipeline.close()
+            if self.dumps is not None:
+                self.dumps.close()
+            self.tracker.finish(1 if failed else 0)
             if self.server is not None:
                 self.server.close()
             self.parallel.close()
@@ -913,15 +927,7 @@ class RLTrainer:
         if not self.parallel.main or not metrics:
             return
         logger.info("%s %d | %s", kind, step, " ".join(f"{k}={v:.4g}" for k, v in sorted(metrics.items())))
-        if self.wandb:
-            try:
-                # No step=: wandb drops rows below its history step, i.e. every step a resume
-                # from an older checkpoint redoes. The training step rides in the row instead.
-                row = {(f"eval/{k}" if kind == "eval" else k): v for k, v in metrics.items()}
-                self.wandb.log(wandb_row(row, step))
-            except Exception as e:  # noqa: BLE001 — a metrics backend must never kill training
-                logger.warning("wandb.log failed (%s); disabling wandb", e)
-                self.wandb = None
+        self.tracker.log({(f"eval/{k}" if kind == "eval" else k): v for k, v in metrics.items()}, step)
 
     def save(self, name: str, step: int | None = None) -> None:
         """The policy in Hugging Face format; with `step`, also the state to resume from: the
@@ -970,7 +976,7 @@ class RLTrainer:
                     "step": step,
                     "world": self.parallel.world,
                     "stale_groups": self.stale_groups,
-                    "wandb_id": self.wandb_id,
+                    "wandb_id": self.tracker.run_id,  # the tracker's run id (key kept for older checkpoints)
                 }
                 torch.save(state, path / (TRAINER_STATE_FILE + ".tmp"))
                 os.replace(path / (TRAINER_STATE_FILE + ".tmp"), path / TRAINER_STATE_FILE)

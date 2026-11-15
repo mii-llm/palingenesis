@@ -49,6 +49,7 @@ Commands:
   fit         Measure the fastest memory settings (checkpointing, SeCO) that fit a GPU memory budget
   monitor     Check status of a running training
   loss        Analyze loss curve from log file
+  rollouts    Read RL / distillation rollout dumps: finish reasons, rewards, tool errors, loops, slowest, worst
   version     Show version info
 
 Usage:
@@ -175,6 +176,9 @@ def main():
 
         case "loss":
             _run_agent_tool("palingenesis.agent_tooling.check_loss")
+
+        case "rollouts":
+            _run_agent_tool("palingenesis.agent_tooling.rollouts")
 
         case "gradients":
             _run_agent_tool("palingenesis.agent_tooling.check_gradients")

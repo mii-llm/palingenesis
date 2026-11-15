@@ -12,6 +12,7 @@
 | find the fastest memory setting that fits | [`pgs fit`](#fit) |
 | check data, masking and config before a run | [`pgs diagnose`](#diagnose), [`pgs inspect`](#inspect), [`pgs validate`](#validate) |
 | follow a running training | [`pgs monitor`](#monitor), [`pgs loss`](#loss) |
+| read what RL / distillation rollouts do | [`pgs rollouts`](#rollouts) |
 | on-policy distillation / RL | [`pgs distill`](#distill), [`pgs rl`](#rl) |
 
 ---
@@ -268,7 +269,7 @@ What it measures and how to read it: [Single GPU: trading speed for memory](../g
 
 ### monitor
 
-Check status of a running training from its log file.
+Check status of a running training from its log file (`pgs train`, `pgs rl` and `pgs distill` logs alike).
 
 ```bash
 pgs monitor --log_file outputs/train.log --brief
@@ -280,6 +281,14 @@ Analyze a training loss curve.
 
 ```bash
 pgs loss --log_file outputs/train.log
+```
+
+### rollouts
+
+Read the trajectory dumps of `pgs rl` / `pgs distill` (`logging.dump_trajectories`): finish-reason shares (stop / length / turn limit), reward components, tool error rates and latency per tool, the loop share, the slowest turns and tool calls, the worst trajectories. Exit code 1 when an alarm fires (`--threshold name=value` moves one). See [Observability](../guides/observability.md#pgs-rollouts).
+
+```bash
+pgs rollouts --dir outputs/rl --since 200 --json
 ```
 
 ### version

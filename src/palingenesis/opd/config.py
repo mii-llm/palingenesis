@@ -309,7 +309,15 @@ class OPDTrainConfig:
 @dataclass(slots=True)
 class OPDLoggingConfig:
     log_every: int = 1
+    # Every N steps, write the batch's completions (text, finish reason, sampler and teacher log-probs) to
+    # <output_dir>/rollouts/ (palingenesis.rollouts; read them with `pgs rollouts`). 0 = never.
+    dump_trajectories: int = 0
+    dump_groups: int = 0  # prompts (with all their rollouts) per dumped batch, drawn at random (0 = all of them)
+    dump_content: bool = True  # false: counts and log-probs only (no prompts or completions)
     use_wandb: bool = False
+    use_trackio: bool = False
+    # Further metric backends: `module:Class` or `file.py:Class` (palingenesis.logging.Tracker documents the interface)
+    trackers: list = field(default_factory=list)
     project: str = "palingenesis-opd"
     run_name: str = ""
 

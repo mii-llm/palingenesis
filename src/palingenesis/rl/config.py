@@ -367,11 +367,16 @@ class RLTrainConfig:
 @dataclass(slots=True)
 class RLLoggingConfig:
     log_every: int = 1
-    # Every N steps, write the batch's trajectories (turns, tool calls and outputs, rewards,
-    # per-turn timing; zero-variance groups too) and the engine's concurrency timeline to
-    # <output_dir>/rollouts/step_<n>.jsonl (0 = never).
+    # Every N steps, write the batch's trajectories (turns, tool calls and outputs, rewards, advantages,
+    # per-turn and per-tool timing; zero-variance groups too) and the engine's concurrency timeline to
+    # <output_dir>/rollouts/ (palingenesis.rollouts; read them with `pgs rollouts`). 0 = never.
     dump_trajectories: int = 0
+    dump_groups: int = 0  # groups per dumped batch, drawn at random (0 = all of them)
+    dump_content: bool = True  # false: counts, timings and rewards only (no prompts, texts, arguments or results)
     use_wandb: bool = False
+    use_trackio: bool = False
+    # Further metric backends: `module:Class` or `file.py:Class` (palingenesis.logging.Tracker documents the interface)
+    trackers: list = field(default_factory=list)
     project: str = "palingenesis-rl"
     run_name: str = ""
 

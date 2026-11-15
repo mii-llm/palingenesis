@@ -317,6 +317,7 @@ Images in the training data, for the Qwen-VL family (Qwen2-VL, Qwen2.5-VL, Qwen3
 | `run_name` | str\|null | `null` | Run name. Auto-generated from model name if null. |
 | `use_wandb` | bool | `true` | Log to Weights & Biases. |
 | `use_trackio` | bool | `true` | Log to trackio. |
+| `trackers` | list | `[]` | Further metric backends, `module:Class` or `path/to/file.py:Class` ([Observability](../guides/observability.md#your-own-backend)). |
 | `log_grad_norm` | bool | `true` | Include gradient norm in logs. |
 | `health_tier2_every` | int | `10` | Steps between tier-2 health checks (grad cosine sim, GNS, CUDA memory). Should be a multiple of `train.logging_steps`. |
 | `health_tier3_every` | int | `100` | Steps between tier-3 health checks (weight norms, stable rank, weight drift). Lower it for short test runs — otherwise a run under 100 steps never produces tier-3 metrics. |
@@ -481,5 +482,10 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 |-----------|------|---------|-------------|
 | `log_every` | int | `1` | Train-metric cadence. |
 | `use_wandb` | bool | `false` | Mirror metrics to wandb; failures degrade to console, never kill the run. |
-| `project` | str | `palingenesis-opd` | wandb project. |
-| `run_name` | str | `""` | wandb run name (empty = auto). |
+| `use_trackio` | bool | `false` | Mirror metrics to trackio. |
+| `trackers` | list | `[]` | Further metric backends, `module:Class` or `path/to/file.py:Class` ([Observability](../guides/observability.md#your-own-backend)). |
+| `project` | str | `palingenesis-opd` | Tracker project. |
+| `run_name` | str | `""` | Run name (empty = auto). |
+| `dump_trajectories` | int | `0` | Every N steps, write the batch's completions to `<output_dir>/rollouts/` (0 = never); read them with `pgs rollouts`. |
+| `dump_groups` | int | `0` | Prompts (with all their rollouts) per dumped batch, drawn at random (0 = all). |
+| `dump_content` | bool | `true` | `false`: counts and log-probs only, no prompts or completions. |

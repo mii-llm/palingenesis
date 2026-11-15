@@ -169,6 +169,19 @@ python -m palingenesis.agent_tooling monitor_run --log_file outputs/train.log --
 python -m palingenesis.agent_tooling monitor_run --log_file outputs/train.log --last 50
 ```
 
+It reads the step lines of every trainer: `step=N loss=...` (`pgs train`) and `step N | k=v ...` / `eval N | k=v ...` (`pgs rl`, `pgs distill`).
+
+### `rollouts` — RL / Distillation Rollout Dumps
+
+Reads `<output_dir>/rollouts/` (written with `logging.dump_trajectories`): finish-reason shares, reward components,
+zero-variance groups, tool error rates and latency per tool, loop share, slowest turns and tool calls, worst
+trajectories, and alarms (exit code 1).
+
+```bash
+python -m palingenesis.agent_tooling rollouts --dir outputs/rl --json
+python -m palingenesis.agent_tooling rollouts --dir outputs/rl --since 200 --threshold loop_share=0.05
+```
+
 ## Agent Decision Framework
 
 ```

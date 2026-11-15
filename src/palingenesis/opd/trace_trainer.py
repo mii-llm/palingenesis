@@ -55,6 +55,7 @@ from palingenesis.opd.traces import (
     topic_teacher,
 )
 from palingenesis.opd.trainer import OPDTrainer
+from palingenesis.rollouts import pick
 from palingenesis.seco_tree import Branch, tree_forward_backward, tree_hidden_states
 
 logger = logging.getLogger(__name__)
@@ -431,6 +432,36 @@ class TraceTrainer(OPDTrainer):
             prefix_caching=self.config.rollout.prefix_caching and self.config.rollout.backend != "hf",
             cutoffs={name: _cutoff(source) for name, source in self.config.sources.items()},
         )
+
+    def _dump_items(self, batch: TraceBatch, step: int) -> list[dict]:
+        """The regenerated turns of logging.dump_groups traces (one group per trace), as plain values.
+        The context (the trace up to the turn) is counted, not written."""
+        items = []
+        for group, sample in enumerate(pick(batch.samples, self.config.logging.dump_groups, step)):
+            for i, (branch, completion) in enumerate(zip(sample.plan.branches, sample.completions)):
+                fields = {"group": group, "source": sample.meta.get("_src"), "teacher": sample.teacher}
+                scores = sample.teacher_hidden[i] if sample.teacher_hidden else None
+                logprobs = sample.behaviour_lp[i]
+                if (
+                    isinstance(scores, TeacherScores)
+                    and scores.token_lp is not None
+                    and len(scores.token_lp) == len(logprobs)
+                ):
+                    teacher = float(scores.token_lp.mean())
+                    fields["teacher_logprob_mean"] = teacher
+                    fields["k1_mean"] = sum(logprobs) / max(len(logprobs), 1) - teacher
+                meta = {"turn": branch.turn, "onset": branch.onset, "error": branch.error, "weight": branch.weight}
+                items.append(
+                    {
+                        "ids": list(completion),
+                        "logprobs": list(logprobs),
+                        "finish": sample.finish[i],
+                        "prompt_tokens": len(branch.context),
+                        "fields": fields,
+                        "meta": meta,
+                    }
+                )
+        return items
 
     def _make_source(self):
         config = self.config

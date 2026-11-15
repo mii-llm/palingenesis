@@ -135,6 +135,7 @@ nav:
     - Margin Surgery: guides/surgery.md
     - Reading Model Internals: guides/internals.md
     - SFT → RL Transition: guides/sft-to-rl.md
+    - Observability (Rollouts, Trackers, Tracing): guides/observability.md
   - Reference:
     - Configuration: reference/configuration.md
     - Optimizers: reference/optimizers.md

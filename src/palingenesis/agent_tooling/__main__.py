@@ -13,6 +13,7 @@ TOOLS = {
     "check_gradients": "palingenesis.agent_tooling.check_gradients",
     "profile_memory": "palingenesis.agent_tooling.profile_memory",
     "monitor_run": "palingenesis.agent_tooling.monitor_run",
+    "rollouts": "palingenesis.agent_tooling.rollouts",
 }
 
 HELP = """
@@ -29,6 +30,7 @@ Available tools:
     check_gradients   Per-layer gradient norm analysis (needs GPU)
     profile_memory    Estimate peak GPU memory from config
     monitor_run       Monitor active training from log output
+    rollouts          Read RL / distillation rollout dumps (finish reasons, tool errors, loops, worst)
 
 Examples:
     python -m palingenesis.agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre
