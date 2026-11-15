@@ -3,8 +3,11 @@
 Network-free: a GPT-2 tokenizer under a ChatML template, and a table-lookup model on CPU.
 """
 
+import hashlib
 import json
 import math
+import os
+import sys
 
 import pytest
 import torch
@@ -108,6 +111,62 @@ def test_conversation_key_ignores_whitespace_runs_and_schema_but_not_content_or_
     assert conversation_key(a) != conversation_key(_row("what is 2+2?", "five"))
     with_tools = dict(a, tools=[{"type": "function", "function": {"name": "calc"}}])
     assert conversation_key(a) != conversation_key(with_tools)
+
+
+def _reference_digest(obj) -> str:
+    """The definition the fast paths must match: compact sorted JSON, str.split() whitespace runs."""
+    text = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha1(" ".join(text.split()).encode()).hexdigest()
+
+
+def _key_objects() -> list:
+    import datetime
+    import enum
+
+    class Color(enum.Enum):
+        RED = 1
+
+    class Tag(str):
+        pass
+
+    every_char = "".join(chr(c) for c in range(0x110000) if not 0xD800 <= c < 0xE000)
+    nested: list = ["leaf"]
+    for _ in range(300):  # deeper than orjson writes
+        nested = [nested]
+    return [
+        [every_char[i : i + 4096] for i in range(0, len(every_char), 4096)],
+        {"b": 1, "a": [1, 2.5, None, True, False], "é": "x", "\u00e9a": "y", "z\u3000": "\u3000 a  b\xa0\xa0c"},
+        [2**63 - 1, -(2**63), 2**64 - 1, 2**64, -(2**63) - 1, 10**30],
+        [0.1, 1.0, -0.0, 1e15, 1e16, 1e-4, 1e-5, 1e300, 5e-324, 123456.789, float("nan"), float("inf"), -float("inf")],
+        ("tuple", ["in", ("tuples",)]),
+        {1: "int key", 2: "another"},
+        [datetime.datetime(2024, 1, 2, 3, 4, 5), Color.RED, Tag("sub  class")],
+        nested,
+        {"messages": [{"role": "user", "content": "  leading and trailing  "}], "tools": None},
+        [" ", "  ", "a" + " " * 33 + "b", "\t\n\r tabs \t and\n\nnewlines"],
+    ]
+
+
+def test_dedupe_keys_match_the_reference_with_and_without_orjson(monkeypatch):
+    """orjson (when installed) only speeds the keys up: both paths give the reference digest, so
+    environments with and without it dedupe identically."""
+    objects = _key_objects()
+    want = [_reference_digest(o) for o in objects]
+    assert [data_clean._digest(o) for o in objects] == want
+    monkeypatch.setattr(data_clean, "orjson", None)
+    assert [data_clean._digest(o) for o in objects] == want
+
+
+def test_dedupe_keys_collapse_every_unicode_whitespace_like_str_split(monkeypatch):
+    spaces = [chr(c) for c in range(0x110000) if chr(c).isspace()]
+    # JSON escapes what is below U+0020; the rest is written as is and must be collapsed
+    assert set(data_clean._UNICODE_SPACES) == {c for c in spaces if c > " "}
+    for orjson in (data_clean.orjson, None):
+        monkeypatch.setattr(data_clean, "orjson", orjson)
+        for c in spaces:
+            row = [{"content": f"a{c}{c} b{c}"}, f"{c}x"]
+            assert data_clean._digest(row) == _reference_digest(row), (orjson, hex(ord(c)))
+        assert data_clean._digest(["a \u3000\xa0 b"]) == data_clean._digest(["a b"]) != data_clean._digest(["a\nb"])
 
 
 def test_prompt_key_is_the_conversation_up_to_the_first_user_turn():
@@ -382,3 +441,124 @@ def test_prepare_multi_reports_row_and_token_shares(tmp_path, monkeypatch):
     assert by_name["short"]["token_share"] + by_name["long"]["token_share"] == pytest.approx(1.0, abs=1e-3)
     assert "estimated_overfit_risk" not in by_name["short"] and "recommended_epoch_multiplier" not in by_name["short"]
     assert (tmp_path / "out" / "long" / "scored_data.jsonl").exists()
+
+
+# ── parallel tokenization ─────────────────────────────────────────────────────
+
+
+def _messy_rows() -> list[dict]:
+    """Rows of every outcome: kept, duplicate, nothing to train on, too long, cut, unrenderable."""
+    rows = []
+    for i in range(70):
+        kind = i % 7
+        if kind == 0:
+            rows.append(_row(f"question {i}", f"answer {i} " * (1 + i % 5)))
+        elif kind == 1:
+            rows.append(_row("question 0", "answer 0 "))  # duplicate of row 0
+        elif kind == 2:
+            rows.append({"messages": [{"role": "user", "content": f"unanswered {i}"}]})
+        elif kind == 3:
+            rows.append(_row(f"short {i}", "long answer " * 400))  # no trained turn fits
+        elif kind == 4:
+            first, second = _row(f"first {i}", "short answer")["messages"], _row("second", "long " * 400)["messages"]
+            rows.append({"messages": first + second})  # cut to its first turn
+        elif kind == 5:
+            rows.append({"messages": [{"role": "user", "content": f"q {i}"}, {"role": "assistant", "content": i}]})
+        else:
+            rows.append(_row(f"task {i % 3}", f"trajectory {i} " * 3, source="a" if i % 2 else "b"))
+    return rows
+
+
+def _outputs(out) -> dict:
+    files = {p.name: p.read_bytes() for p in sorted(out.iterdir())}
+    meta = json.loads(files.pop(PREPARED_META))
+    for key in ("output_file", "dropped_file", "eval_file"):
+        if meta.get(key):
+            meta[key] = os.path.basename(meta[key])
+    return {**files, PREPARED_META: meta}
+
+
+@needs_tok
+@pytest.mark.parametrize("output_format", ["jsonl", "parquet"])
+def test_parallel_tokenization_writes_the_same_files(tmp_path, monkeypatch, output_format):
+    monkeypatch.setattr(data_clean, "MIN_ROWS_PER_WORKER", 4)
+    monkeypatch.setattr(data_clean, "MAX_SHARD_ROWS", 3)  # many shards: their order must hold
+    data = _write(tmp_path, _messy_rows())
+    runs = {}
+    for workers in (1, 3):
+        prepare_data(
+            "fake",
+            data,
+            str(tmp_path / f"out{workers}"),
+            max_seq_length=256,
+            output_format=output_format,
+            max_ppl=1e9,
+            compute_hes=True,
+            eval_holdout=5,
+            group_field="source",
+            budget=30,
+            scorer=FakeScorer(),
+            num_workers=workers,
+        )
+        runs[workers] = _outputs(tmp_path / f"out{workers}")
+    assert runs[1] == runs[3]
+    cleaning = runs[1][PREPARED_META]["cleaning"]
+    assert set(cleaning["dropped"]) == {"duplicate", "no_trained_turn_fits", "nothing_to_train_on", "unrenderable"}
+    assert cleaning["truncated_to_max_seq_length"] == 10
+
+
+@needs_tok
+@pytest.mark.parametrize("method", ["fork", "spawn"])
+def test_parallel_tokenize_rows_returns_and_counts_the_same(monkeypatch, method):
+    from palingenesis.data import ChatDataset
+
+    if method == "fork" and not sys.platform.startswith("linux"):
+        pytest.skip("fork workers are used on Linux only")
+    monkeypatch.setattr(data_clean, "MIN_ROWS_PER_WORKER", 4)
+    monkeypatch.setattr(data_clean, "_start_method", lambda: method)
+    results = {}
+    for workers in (1, 2):
+        rows = _messy_rows()
+        for i, r in enumerate(rows):
+            r[ROW_INDEX] = i
+        chat, report = ChatDataset(None, TOK, 256), CleanReport(loaded=len(rows))
+        kept, entries = data_clean.tokenize_rows(rows, chat, report, keep_tokens=True, num_workers=workers)
+        results[workers] = (kept, [(i, ids.tolist(), mask.tolist(), ids.dtype, mask.dtype) for i, ids, mask in entries],
+                            report.summary(), report.dropped, dict(chat.stats))
+    assert results[1] == results[2]
+    assert results[1][1][0][3] == torch.int32 and results[1][1][0][4] == torch.bool
+
+
+@needs_tok
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fork workers are used on Linux only")
+def test_a_worker_that_dies_fails_the_run_cleanly(monkeypatch):
+    from palingenesis.data import ChatDataset
+
+    parent = os.getpid()
+    process = ChatDataset._process
+
+    def dies_in_a_worker(self, sample):
+        if os.getpid() != parent and sample.get("die"):
+            os._exit(1)
+        return process(self, sample)
+
+    monkeypatch.setattr(ChatDataset, "_process", dies_in_a_worker)
+    monkeypatch.setattr(data_clean, "MIN_ROWS_PER_WORKER", 4)
+    monkeypatch.delenv("TOKENIZERS_PARALLELISM", raising=False)
+    rows = _rows(20)
+    rows[13]["die"] = True
+    with pytest.raises(RuntimeError, match="worker died"):
+        data_clean.tokenize_rows(rows, ChatDataset(None, TOK, 256), CleanReport(), num_workers=2)
+    assert "TOKENIZERS_PARALLELISM" not in os.environ  # the caller's environment is restored
+
+
+def test_worker_count_defaults_and_small_inputs_stay_in_process(monkeypatch):
+    assert 1 <= data_clean.default_workers() <= 8
+    calls = []
+    monkeypatch.setattr(data_clean, "_tokenize_parallel", lambda *a: calls.append(a) or [])
+    monkeypatch.setattr(data_clean, "_tokenize_one", lambda *a: ("drop", "nothing_to_train_on", {}))
+    rows = [{} for _ in range(2 * data_clean.MIN_ROWS_PER_WORKER - 1)]
+    data_clean.tokenize_rows(rows, None, CleanReport(), num_workers=8)
+    assert not calls  # fewer than two workers' worth of rows: no processes
+    data_clean.tokenize_rows(rows + [{}], None, CleanReport(), num_workers=8)
+    assert calls[0][3] == 2

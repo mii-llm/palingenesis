@@ -247,6 +247,7 @@ Offline data preparation, driven by the **same config** as training (see the [Da
 | `max_batch_tokens` | int | `16384` | Padded-token cap per scoring forward. Logits are batch×seq×vocab, so this is what bounds memory: 16K ≈ 5GB bf16 logits at 150K vocab. On an 80GB GPU with a ≤8B model, `32768` is safe and noticeably faster. |
 | `hes` | bool | `false` | Also write High-Entropy Sum scores of the response (`_score_hes`, `_score_hes_mean`) from the scoring forward. Turns scoring on. No selection strategy reads them. |
 | `hes_top_k_pct` | float | `0.5` | Top-k% highest-entropy response tokens summed for HES. |
+| `num_workers` | int | `0` | Processes that render and tokenize the rows: 0 = the CPUs available, at most 8; 1 = in the calling process. Small datasets use fewer (at least 256 rows per process). The output is identical whatever the number. CLI: `--num_workers` (`pgs prepare`, `pgs prepare-multi`). |
 
 ---
 

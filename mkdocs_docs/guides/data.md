@@ -17,7 +17,7 @@
 
 By default `pgs prepare` needs only the tokenizer, no GPU and no forward pass:
 
-1. **Render** every row with the trainer's own pipeline (chat template, tools, truncation at turn boundaries, masking). Rows training would drop are removed and named: `nothing_to_train_on` (no messages, or no assistant turn that gets loss), `no_trained_turn_fits` (the first trained turn already exceeds `data.max_seq_length`), `unrenderable` (the template rejects the row). Rows that are kept but cut to `max_seq_length` are counted.
+1. **Render** every row with the trainer's own pipeline (chat template, tools, truncation at turn boundaries, masking). Rows training would drop are removed and named: `nothing_to_train_on` (no messages, or no assistant turn that gets loss), `no_trained_turn_fits` (the first trained turn already exceeds `data.max_seq_length`), `unrenderable` (the template rejects the row). Rows that are kept but cut to `max_seq_length` are counted. Rows are rendered in parallel processes (`num_workers`, default: the CPUs available, at most 8); the output is the same as in one process.
 2. **Deduplicate**: exact duplicates (same messages and tool definitions, whitespace runs collapsed) keep their first row. `max_per_prompt: N` also keeps at most N rows that share a system prompt and first user turn, for example several trajectories of one task.
 3. **Hold out** (`eval_holdout: N`): about N rows, drawn as whole prompts, so the eval set never holds a task the model trained on under another answer.
 4. **Cap** (`group_field: source` with `max_per_group` / `max_tokens_per_group`): at most that many rows or tokens per source, drawn at random inside the source.

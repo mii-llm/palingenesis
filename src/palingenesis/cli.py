@@ -230,6 +230,12 @@ def _run_prepare_multi():
     parser.add_argument("--max_batch_tokens", type=int, default=16384, help="Padded-token cap per scoring forward")
     parser.add_argument("--hes", action="store_true", help="Also compute HES scores (experimental; turns scoring on)")
     parser.add_argument("--hes_top_k", type=float, default=0.5, help="Top-k%% for HES")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Processes that tokenize the rows (0 = the CPUs available, at most 8; 1 = in this process)",
+    )
     args = parser.parse_args()
 
     from pathlib import Path
@@ -253,6 +259,7 @@ def _run_prepare_multi():
         max_ppl=args.max_ppl,
         batch_size=args.batch_size,
         max_batch_tokens=args.max_batch_tokens,
+        num_workers=args.num_workers,
     )
 
 

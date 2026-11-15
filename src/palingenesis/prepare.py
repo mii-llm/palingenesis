@@ -115,6 +115,7 @@ def score_samples_with_model(
     max_batch_tokens: int = 16384,
     chat_options: dict | None = None,
     hes_top_k_pct: float | None = None,
+    num_workers: int = 0,
 ) -> list[dict]:
     """Score samples by the perplexity of their responses under the model.
 
@@ -123,6 +124,7 @@ def score_samples_with_model(
     would write); high = unfamiliar. This measures the response, not how hard
     the problem is. Rows training would drop are marked unscoreable (infinite
     perplexity). hes_top_k_pct: also write the High-Entropy Sum (see _score_padded_batch).
+    num_workers: processes that tokenize the rows (see data_clean.tokenize_rows).
     """
     from palingenesis.data_clean import CleanReport, tokenize_rows
 
@@ -130,7 +132,7 @@ def score_samples_with_model(
     chat = scorer.chat(max_seq_length, messages_field, chat_options)
     for s in samples:
         _mark_unscoreable(s)
-    kept, entries = tokenize_rows(samples, chat, CleanReport(), keep_tokens=True)
+    kept, entries = tokenize_rows(samples, chat, CleanReport(), keep_tokens=True, num_workers=num_workers)
     score_entries(scorer, entries, kept, batch_size, max_batch_tokens, hes_top_k_pct)
     return samples
 
@@ -737,6 +739,7 @@ def prepare_data(
     token_budget: int = 0,
     seed: int = 42,
     scorer: Scorer | None = None,
+    num_workers: int = 0,
 ) -> Path:
     """Full data preparation pipeline.
 
@@ -763,6 +766,9 @@ def prepare_data(
     masks exactly what training trains.
 
     scorer: a Scorer to reuse (prepare_multi_source shares one model across sources).
+
+    num_workers: processes that tokenize the rows (0 = the CPUs available, at most 8; 1 = in
+    this process). The output is the same whatever the number.
 
     Returns the path to the prepared dataset file.
     """
@@ -804,7 +810,7 @@ def prepare_data(
     chat = scorer.chat(max_seq_length, messages_field, chat_options)
     if dedupe:
         samples = drop_exact_duplicates(samples, report, messages_field, chat.tools_field)
-    samples, entries = tokenize_rows(samples, chat, report, keep_tokens=scoring)
+    samples, entries = tokenize_rows(samples, chat, report, keep_tokens=scoring, num_workers=num_workers)
 
     if scoring:
         logger.info("Scoring samples with model perplexity...")
@@ -991,6 +997,7 @@ def prepare_multi_source(
     max_ppl: float = 0.0,
     batch_size: int = 4,
     max_batch_tokens: int = 16384,
+    num_workers: int = 0,
 ):
     """Prepare several data sources, each on its own (prepare_data per source, one model).
 
@@ -1017,8 +1024,8 @@ def prepare_multi_source(
         max_seq_length: Max sequence length
         budget_per_source: Default budget per source (None = use all)
         strategy: Selection strategy per source
-        compute_hes, hes_top_k_pct, score, min_ppl, max_ppl, batch_size, max_batch_tokens:
-            as in prepare_data
+        compute_hes, hes_top_k_pct, score, min_ppl, max_ppl, batch_size, max_batch_tokens,
+            num_workers: as in prepare_data
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     if strategy not in STRATEGIES:
@@ -1066,6 +1073,7 @@ def prepare_multi_source(
             chat_options={k: src_config[k] for k in ("tools_field", "last_turn_only") if k in src_config},
             score=score,
             scorer=scorer,
+            num_workers=num_workers,
         )
         meta = json.loads((src_output / PREPARED_META).read_text())
         src_meta = {
@@ -1145,6 +1153,7 @@ def prepare_from_config(config) -> Path:
         max_tokens_per_group=pre.max_tokens_per_group,
         token_budget=pre.token_budget,
         seed=config.data.seed,
+        num_workers=pre.num_workers,
     )
 
 
@@ -1202,6 +1211,12 @@ def main():
     parser.add_argument("--split", default="train", help="Dataset split (for HF datasets)")
     parser.add_argument("--format", default="parquet", choices=["parquet", "jsonl"], help="Output format")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Processes that tokenize the rows (0 = the CPUs available, at most 8; 1 = in this process)",
+    )
     parser.add_argument("--score", action="store_true", help="Score every row with the model (response perplexity)")
     parser.add_argument("--batch_size", type=int, default=4, help="Max samples per scoring forward")
     parser.add_argument(
@@ -1253,6 +1268,7 @@ def main():
         max_tokens_per_group=args.max_tokens_per_group,
         token_budget=args.token_budget,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
 
 

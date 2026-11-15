@@ -418,6 +418,9 @@ class PreprocessConfig:
     # and prepared_meta.json profiles each group (count, tokens, mean response tokens and,
     # when scored, median response NLL and familiarity buckets) before and after selection.
     group_field: str = ""
+    # Processes that tokenize the rows (0 = the CPUs available, at most 8; 1 = in this process).
+    # The output is the same whatever the number.
+    num_workers: int = 0
 
 
 @dataclass(slots=True)
@@ -739,6 +742,8 @@ class Config:
         strategies = ("optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random")
         if self.preprocess.strategy not in strategies:
             errors.append(f"preprocess.strategy={self.preprocess.strategy!r} is not one of {', '.join(strategies)}.")
+        if self.preprocess.num_workers < 0:
+            errors.append(f"preprocess.num_workers must be >= 0 (got {self.preprocess.num_workers}; 0 = automatic).")
         if self.preprocess.token_budget and self.preprocess.strategy != "random":
             errors.append(
                 "preprocess.token_budget selects a random subset: it cannot be combined with "
