@@ -112,7 +112,19 @@ data:
 
 By default tool results are context only. With `include_observations: true` they get loss too, so the model is also trained to predict what the environment returns.
 
-The idea comes from ECHO ([Shrivastava et al., arXiv:2605.24517](https://arxiv.org/abs/2605.24517)), with one difference to keep in mind. ECHO adds the observation-prediction loss to **reinforcement learning** (GRPO): the policy predicts the observations its own actions produce, which turns failed rollouts into supervision. The paper reports GRPO's pass@1 on TerminalBench-2.0 roughly doubled (Qwen3-8B 2.7% → 5.2%, Qwen3-14B 5.2% → 10.8%). Here the option applies the same loss to **SFT** traces, where the observations follow someone else's actions. Whether it helps in SFT has not been measured by us or, as far as we know, published: treat it as an experiment and compare against the default on your own evals.
+The idea comes from ECHO ([Shrivastava et al., arXiv:2605.24517](https://arxiv.org/abs/2605.24517)), but this option is not what the paper tested:
+
+| | ECHO (the paper) | `include_observations` (here) |
+|---|---|---|
+| Training | RL (GRPO, 16 rollouts per prompt), the loss added to the policy-gradient loss | SFT |
+| Whose observations | the policy's own rollouts | the traces' (someone else's actions) |
+| Weight | λ = 0.05; 0.01–0.05 worked, runs degraded at 0.1 and could collapse at 0.2 | the same weight as the assistant's tokens |
+| Normalisation | divided by the observation length | the trainer's usual token normalisation |
+| Which tokens | the environment's output, without the harness's own warning prefix | every token of the tool / observation messages |
+
+What the paper reports (terminal tasks, Table 1): starting from base models, ECHO beats GRPO on every benchmark, e.g. TerminalBench-2.0 pass@1 2.70 → 5.17 (Qwen3-8B) and 5.17 → 10.79 (Qwen3-14B), where the paper puts the standard error near 1.5 points. Starting from a policy already fine-tuned on expert demonstrations, the gains are small (TerminalBench-2.0 pass@1 7.64 → 7.87, pass@3 slightly lower). Episodes got shorter for two of the three starting policies. The paper does not test the loss in SFT, and does not measure tool selection or error recovery.
+
+So treat this option as an untested experiment: compare it against the default on your own evals, and expect it to need a much smaller weight than the assistant's tokens get, which this option does not offer yet.
 
 When to try it, and when not:
 

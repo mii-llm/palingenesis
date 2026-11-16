@@ -217,9 +217,10 @@ When `data.include_observations: true`, the model also gets loss on tool/environ
 
 ### Where the idea comes from (ECHO, arXiv:2605.24517)
 
-ECHO adds a loss on the environment's observations to reinforcement learning (GRPO): the policy predicts what its
-own actions produce, and the paper reports GRPO's TerminalBench-2.0 pass@1 roughly doubled. This option applies the
-same loss to SFT traces, where the observations follow someone else's actions; that use is not measured. Treat it as
+ECHO adds a loss on the environment's observations (weight 0.05, normalised by observation length) to reinforcement
+learning (GRPO): the policy predicts what its own actions produce. The paper reports TerminalBench-2.0 pass@1 roughly
+doubled from base models and small gains from an SFT'd policy. This option applies the loss to SFT traces at full
+weight, where the observations follow someone else's actions; that use is not measured. Treat it as
 an experiment, and avoid it on outputs the model cannot predict (IDs, timestamps, search results, long dumps). See the
 agentic guide on the documentation site.
 
