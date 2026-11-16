@@ -92,8 +92,11 @@ Behind the scenes, palingenesis applied:
 
 All without configuring anything.
 
+New to training? [How training works](how-training-works.md) explains each of these, and the log line above, from the start.
+
 ## Next
 
+- [How training works](how-training-works.md): what the loss, the masking and these settings mean, and which method fits your goal
 - [Your first real training](first-training.md)
 - [Single GPU optimization](../guides/single-gpu.md): what fits, and `pgs fit` for the fastest memory setting
 - [LoRA](../guides/lora.md): adapters on a frozen base (`pgs init lora`)

@@ -403,6 +403,16 @@ Install, run, see results in 5 minutes.
 
 <div markdown>
 
+### New to training?
+
+Tokens, loss, masking, and which method fits your goal.
+
+[How training works](getting-started/how-training-works.md)
+
+</div>
+
+<div markdown>
+
 ### Have agentic data?
 
 Reasoning traces, tool calls, multi-turn. Native support.
