@@ -94,6 +94,10 @@ class HarnessProfile:
     # message) or "user" (a user message after the tool results, as OpenAI-style chat completions need); None: the
     # run's env.image_results
     emulates: str = ""  # what was read to write the profile
+    # Regular expressions (re.DOTALL) of text the harness itself writes into an observation next to the
+    # environment's output (terminus-2's warning prefix): never a target of the RL observation loss
+    # (loss.observation_weight; HarborEnv.observation_notes). Whole harness messages (format errors) need none.
+    observation_notes: tuple[str, ...] = ()
     legacy: bool = False
     values: dict[str, str] = field(default_factory=dict)  # extra template values (date, model)
 

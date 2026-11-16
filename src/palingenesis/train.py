@@ -49,6 +49,7 @@ from palingenesis.config import Config, ConfigError
 from palingenesis.context_parallel import ContextParallel, ContextParallelError, check_model_support, route_attention
 from palingenesis.data import (
     IGNORE_INDEX,
+    OBSERVATION_FIELD,
     _load_dataset_source,
     build_dataloader,
     build_dataset,
@@ -103,6 +104,7 @@ from palingenesis.logits import (
 from palingenesis.loss import (
     cce_available,
     chunked_cross_entropy_loss,
+    counted_tokens,
     cross_entropy_loss,
     cut_cross_entropy_loss,
     shift_labels,
@@ -253,10 +255,11 @@ def _resolve_total_steps(config: Config, world_size: int, make_dataloader, devic
 def eval_reader(config, tokenizer, eval_ds):
     """The held-out set's reader, matching training: raw text with all-token loss when every data source is
     `mode: pretrain` (a CPT run; a chat reader would find no messages and silently disable validation), otherwise
-    chat with the same masking as training (include_observations, train_on_reasoning): otherwise eval measures a
-    different token set than the one being optimized, e.g. with ECHO (observations trained but excluded from eval)
-    assistant-only eval CE can rise while the training objective improves, which reads as phantom overfitting.
-    turn_scaling is irrelevant here: eval computes unweighted CE."""
+    chat with the same masking as training (train_on_reasoning, last_turn_only): otherwise eval measures a different
+    token set than the one being optimized. Observation tokens count only under observation_normalization "token",
+    where they are trained like the assistant's; with "conversation" (the default) the observation term is a small
+    auxiliary loss and eval measures the assistant's tokens. turn_scaling is irrelevant here: eval computes
+    unweighted CE."""
     from palingenesis.data import ChatDataset, PretrainDataset
 
     sources = config.data.sources or []
@@ -271,7 +274,9 @@ def eval_reader(config, tokenizer, eval_ds):
         config.data.messages_field,
         rank=0,
         world_size=1,
-        include_observations=config.data.include_observations,
+        include_observations=config.data.include_observations and config.data.observation_normalization == "token",
+        observation_weight=1.0,
+        observation_normalization="token",
         train_on_reasoning=config.data.train_on_reasoning,
         last_turn_only=config.data.last_turn_only,
         tools_field=config.data.tools_field,
@@ -1297,8 +1302,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             # position_ids for packed sequences (document-aware masking)
             position_ids = batch.get("position_ids", None)
             labels = shift_labels(batch["labels"], position_ids)
-            # Per-token loss weights (data.turn_scaling), aligned like the labels
+            # Per-token loss weights (data.turn_scaling, the observation loss), aligned like the labels
             loss_weights = shift_weights(batch["loss_weights"]) if "loss_weights" in batch else None
+            # data.include_observations: the observation targets, left out of the token count below
+            observed = shift_weights(batch[OBSERVATION_FIELD].float()) if OBSERVATION_FIELD in batch else None
             raw_input_ids = input_ids
             kd_reshape = None  # per-token batch fields -> the layout the student sees
             if position_ids is not None:
@@ -1335,6 +1342,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     attention_mask = cp.shard(attention_mask, pad_value=0) if attention_mask is not None else None
                     if loss_weights is not None:
                         loss_weights = cp.shard(loss_weights, pad_value=0)
+                    if observed is not None:
+                        observed = cp.shard(observed, pad_value=0)
                     kd_reshape = cp.shard
                     fwd_kwargs = {
                         "input_ids": input_ids,
@@ -1359,8 +1368,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 model.set_requires_gradient_sync(is_last_micro)
 
             # ── Forward ───────────────────────────────────────────────
-            # Count valid tokens for this micro-batch (local)
-            local_valid = (labels != IGNORE_INDEX).sum()
+            # Count valid tokens for this micro-batch (local); observation targets are not counted
+            local_valid = counted_tokens(labels, observed)
 
             # All-reduce valid tokens across DP ranks for correct loss normalization.
             # Without this, each rank divides by its own local count, causing
@@ -1447,6 +1456,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         budget=config.memory.spaco_budget or None,
                         loss_denom=loss_denom,
                         kv_offload=config.memory.seco_kv_offload,
+                        weights=batch.get("loss_weights"),  # unshifted, like the labels
                         num_loss_chunks=lambda n: _dynamic_num_chunks(n, _loss_vocab_size),
                         stable_softmax=config.train.stable_softmax,
                         position_ids=position_ids,  # packed rows: every document on its own

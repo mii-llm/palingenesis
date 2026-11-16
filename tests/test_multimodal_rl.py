@@ -322,6 +322,45 @@ def test_training_scores_exactly_what_the_rollout_sampled(pruned):
     assert _trainer(model, tok)._train_step(groups)["policy/abs_ratio_dev"] > 10 * max(exact, 1e-5)
 
 
+@pytest.mark.parametrize("pruned", [False, True], ids=["all-images", "last-image-only"])
+def test_observation_loss_targets_the_tool_text_never_an_image(pruned):
+    """loss.observation_weight with a multimodal policy: the targets are the tools' own text ("screen N"), never an
+    image placeholder nor the template's markup, each kept with the context it was read in; the train step adds
+    the term and logs it."""
+    torch.manual_seed(0)
+    tok = _tok()
+    vision = multimodal.vision_of(tok)
+    model = tiny_qwen3_5(tok)
+    options = {"rollout.max_new_tokens": 6, "loss.observation_weight": 0.05}
+    if pruned:
+        options["env.max_images"] = 1
+
+    def engine(eot):
+        return _ShortTurns(model, (eot,), tok.pad_token_id, 8, vision=vision)
+
+    pipeline = _pipeline(tok, engine, ActingEnv, **options)
+    try:
+        groups = [pipeline._await(pipeline._group(0, PROMPT, 1.0, 2, True))]
+    finally:
+        pipeline.close()
+    added = set(tok.get_added_vocab().values())
+    targets = 0
+    for t in groups[0]:
+        assert t.finish == "turns", t.info.get("error")
+        assert bool(t.segments) == pruned
+        read = [[part.tokens[j] for j in part.observation_targets] for part in (*t.segments, t)]
+        assert not added & {token for tokens in read for token in tokens}  # no image placeholder, no markup
+        assert "".join(tok.decode(tokens) for tokens in read) == "".join(f"screen {k}" for k in range(1, t.turns))
+        targets += sum(len(tokens) for tokens in read)
+        assert t.observation_tokens == t.observation_target_count > 0
+    _score(groups)
+    config = RLConfig()
+    config.set("loss.observation_weight", 0.05)
+    stats = _trainer(model, tok, config)._train_step(groups)
+    assert stats["observation_tokens"] == targets
+    assert 0 < stats["loss/observation"] < 30
+
+
 def test_context_rewrite_keeps_every_turn_with_its_context():
     tok = _tok()
     vision = multimodal.vision_of(tok)

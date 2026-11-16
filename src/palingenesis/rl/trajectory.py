@@ -14,6 +14,10 @@ Context rewrites. Dropping old screenshots changes tokens the policy has already
 sequence is no longer append-only. A rewrite closes the current segment (its prompt and the turns
 sampled on it) and starts a new one whose prompt is the rewritten context. Every sampled token
 belongs to exactly one segment and is trained on the context it was sampled from: `training_views`.
+
+Observations (loss.observation_weight). With the observation loss on, the context appended after a tool turn
+records which of its tokens are the environment's output (`observation_targets`, indices into `tokens`) and how
+many tokens the observations hold in all (`observation_tokens`, the loss's per-trajectory normaliser).
 """
 
 import dataclasses
@@ -35,6 +39,7 @@ class Segment:
     forced: list[int]
     images: list[Any]
     image_tokens: list[int]
+    observation_targets: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -69,6 +74,10 @@ class Trajectory:
     images: list[Any] = field(default_factory=list)  # the context's images, in placeholder order
     image_tokens: list[int] = field(default_factory=list)  # tokens each image expands to
     segments: list[Segment] = field(default_factory=list)  # closed by context rewrites (image pruning)
+    # The observation loss: indices into `tokens` of its targets (the environment's output), and the observation
+    # tokens of the whole trajectory, targets or not (its normaliser |O|, shared by the segments)
+    observation_targets: list[int] = field(default_factory=list)
+    observation_tokens: int = 0
 
     def append_generated(
         self, ids: list[int], logprobs: list[float], version: int, first_version: int | None = None
@@ -121,6 +130,12 @@ class Trajectory:
         self.mask += [False] * len(ids)
         self.logprobs += [0.0] * len(ids)
 
+    def append_observations(self, start: int, marked: list[tuple[int, int]]) -> None:
+        """The observation tokens of the context appended at `start` in `tokens`: (index in it, kind), as
+        ChatFormat.continuation marks them (kind 1: a target, 2: counted in the observation length only)."""
+        self.observation_targets += [start + i for i, kind in marked if kind == 1]
+        self.observation_tokens += len(marked)
+
     def append_images(self, images: list[Any], tokens: list[int]) -> None:
         """Images of the context just appended (one placeholder token each), and their token counts."""
         self.images += images
@@ -137,8 +152,10 @@ class Trajectory:
         """Replace what the policy reads from now on (old screenshots dropped): the turns sampled so
         far stay with the context they were sampled from, as a closed segment. The segment ends at
         its last sampled token: the context after it (and its images, counted by `image_token_id`)
-        conditions nothing that is trained."""
+        conditions nothing that is trained, except observation targets (kept with the segment: the new context
+        holds them as prompt)."""
         end = max((j + 1 for j, sampled in enumerate(self.mask) if sampled), default=0)
+        end = max(end, self.observation_targets[-1] + 1 if self.observation_targets else 0)
         shown = len(self.images)
         if image_token_id is not None:
             shown = sum(1 for token in self.prompt_ids + self.tokens[:end] if token == image_token_id)
@@ -153,11 +170,13 @@ class Trajectory:
                 self.forced,
                 self.images[:shown],
                 self.image_tokens[:shown],
+                self.observation_targets,
             )
         )
         self.prompt_ids, self.images, self.image_tokens = list(prompt_ids), list(images), list(image_tokens)
         self.tokens, self.mask, self.logprobs = [], [], []
         self.first_versions, self.turn_starts, self.forced = [], [], []
+        self.observation_targets = []
 
     def training_views(self) -> list["Trajectory"]:
         """The sequences to train on: the trajectory itself, or one per segment when its context was
@@ -178,6 +197,7 @@ class Trajectory:
                 forced=segment.forced,
                 images=segment.images,
                 image_tokens=segment.image_tokens,
+                observation_targets=segment.observation_targets,
             )
             for segment in self.segments
         ]
@@ -187,6 +207,11 @@ class Trajectory:
     @property
     def sampled_tokens(self) -> int:
         return sum(self.mask) + sum(sum(segment.mask) for segment in self.segments)
+
+    @property
+    def observation_target_count(self) -> int:
+        """Observation targets in the whole trajectory (every segment)."""
+        return len(self.observation_targets) + sum(len(s.observation_targets) for s in self.segments)
 
     def token_versions(self) -> list[int]:
         """Per token of `tokens`, the oldest policy version that sampled any token of its assistant turn (a turn

@@ -70,6 +70,7 @@ from palingenesis.rl.losses import (
     assign_advantages,
     mismatch_by_bucket,
     mismatch_metrics,
+    observation_weights,
     policy_loss,
     target_logprobs,
     token_weights,
@@ -96,6 +97,7 @@ _SUMMED = {
     "rollout_tok_s",
     "trained_tokens",
     "trained_sequences",
+    "observation_tokens",
     "groups/launched",
     "groups/kept",
     "groups/carried",
@@ -153,6 +155,11 @@ class RLTrainer:
         if m.multimodal:
             self.vision = VisionProcessor.from_pretrained(m.policy, self.tok, m.min_pixels, m.max_pixels)
             multimodal.attach(self.tok, self.vision)
+        if config.loss.observation_weight > 0 and not getattr(self.tok, "is_fast", False):
+            raise RLConfigError(
+                "loss.observation_weight needs a fast tokenizer: observation tokens are located by their character "
+                "offsets in the rendered tool results."
+            )
         kwargs = m.chat_template_kwargs
         self.stop_ids = student_stop_ids(self.tok, m.policy, m.stop_tokens, kwargs)
         self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.stop_ids[0]
@@ -516,6 +523,7 @@ class RLTrainer:
             reduce=reduce,
         )
         trajectories = [t for g in groups for t in g if id(t) in weights]
+        observed = observation_weights(trajectories, loss_config.observation_weight, reduce)
         if any(t.segments for t in trajectories):
             # a trajectory whose context was rewritten (old images dropped) trains as its segments, each on
             # the context its tokens were sampled from, with the trajectory's advantage and token weight
@@ -523,13 +531,15 @@ class RLTrainer:
             for t in trajectories:
                 for view in t.training_views():
                     weights[id(view)] = weights[id(t)]
+                    if id(t) in observed:
+                        observed[id(view)] = observed[id(t)]
                     views.append(view)
             trajectories = views
         totals: dict[str, torch.Tensor] = {}
         reference = getattr(self, "reference", None)
         self.ref_lp = reference.logprobs(trajectories) if reference is not None and trajectories else {}
         if self._share_prompts(groups):
-            trajectories = self._train_trees(groups, weights, totals)  # the rest: groups too small to share
+            trajectories = self._train_trees(groups, weights, totals, observed)  # the rest: groups too small to share
         micro_batches: list[list[Trajectory] | None] = list(self._micro_batches(trajectories))
         count = self.parallel.max(len(micro_batches))  # FSDP's gathers are collectives: same count on every rank
         micro_batches += [None] * (count - len(micro_batches))
@@ -571,7 +581,16 @@ class RLTrainer:
             positions = torch.zeros(ids.shape, dtype=torch.bool)
             targets, behaviour, advantage, weight, seq, forced = [], [], [], [], [], []
             completion_pos, sampled_by = [], []
+            # the observation loss: its targets' positions, tokens and weights (none when it is off)
+            echo = any(id(t) in observed and t.observation_targets for t in micro)
+            echo_positions = torch.zeros(ids.shape, dtype=torch.bool) if echo else None
+            echo_targets, echo_weight = [], []
             for row, t in enumerate(micro):
+                if echo and id(t) in observed and t.observation_targets:
+                    before = [len(t.prompt_ids) + j - 1 for j in t.observation_targets]
+                    echo_positions[row, [index[row][p] for p in before] if index else before] = True
+                    echo_targets += [t.tokens[j] for j in t.observation_targets]
+                    echo_weight += [observed[id(t)]] * len(t.observation_targets)
                 sampled = [j for j, trained in enumerate(t.mask) if trained]
                 forced += [j in t.forced for j in sampled] if t.forced else [False] * len(sampled)
                 before = [len(t.prompt_ids) + j - 1 for j in sampled]  # the token whose output predicts j
@@ -590,9 +609,10 @@ class RLTrainer:
             seq_len = torch.tensor([float(t.sampled_tokens) for t in micro]).to(device, non_blocking=True)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 # right-padded rows need no mask: padding comes after every position scored
-                hidden = final_hidden_states(self.model, ids, None, **image_kwargs)[
-                    positions.to(device, non_blocking=True)
-                ]
+                states = final_hidden_states(self.model, ids, None, **image_kwargs)
+                hidden = states[positions.to(device, non_blocking=True)]
+                echo_hidden = states[echo_positions.to(device, non_blocking=True)] if echo else None
+                del states
             inv_t = getattr(self, "inv_temperature", 1.0)  # applied to the fp32 logits
             lp, entropy = target_logprobs(
                 hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight, scale=inv_t
@@ -604,6 +624,8 @@ class RLTrainer:
             stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], forced_t))
             if self.ref_lp:
                 loss = self._kl_term(loss, stats, lp, torch.cat([self.ref_lp[id(t)] for t in micro]), floats[2])
+            if echo:
+                loss = loss + self._observation_term(stats, echo_hidden, echo_targets, echo_weight)
             if balancer is not None:
                 balancer.sync()  # the ranks' expert counts, before the routers' backward
             loss.backward()
@@ -632,7 +654,22 @@ class RLTrainer:
         if "kl_ref" in values:
             metrics["policy/kl_ref"] = values["kl_ref"] / tokens
             metrics["policy/kl_ref_max"] = values["kl_ref_max"]
+        if loss_config.observation_weight > 0:
+            metrics["observation_tokens"] = values.get("observation_tokens", 0.0)
+            if values.get("observation_tokens"):
+                metrics["loss/observation"] = values["observation_nll"] / values["observation_tokens"]
         return metrics
+
+    def _observation_term(self, stats: dict, hidden: torch.Tensor, targets: list[int], weight: list[float]):
+        """The observation loss of a micro-batch (or branch): its targets' NLL under the model's own logits (not
+        scaled by the sampling temperature: this is the likelihood of the environment's text, which the policy
+        did not sample), each times its trajectory's weight (observation_weights). Logs the NLL's sum and count."""
+        device = hidden.device
+        lp, _ = target_logprobs(hidden, self.head, torch.tensor(targets, device=device), low=self.head_weight)
+        nll = -lp
+        stats["observation_nll"] = nll.detach().sum()
+        stats["observation_tokens"] = torch.tensor(float(nll.numel()), device=device)
+        return (nll * torch.tensor(weight, dtype=nll.dtype, device=device)).sum()
 
     def _kl_term(self, loss: torch.Tensor, stats: dict, lp: torch.Tensor, ref_lp: torch.Tensor, weight: torch.Tensor):
         """Log the per-token k3 KL to the reference; with loss.kl_coef > 0 add it with the policy loss's weights."""
@@ -660,7 +697,11 @@ class RLTrainer:
         return bool(lengths) and sum(lengths) / len(lengths) >= 1024 and self.config.rollout.group_size >= 4
 
     def _train_trees(
-        self, groups: list[list[Trajectory]], weights: dict[int, float], totals: dict[str, torch.Tensor]
+        self,
+        groups: list[list[Trajectory]],
+        weights: dict[int, float],
+        totals: dict[str, torch.Tensor],
+        observed: dict[int, float] | None = None,
     ) -> list[Trajectory]:
         """Each group's trained rollouts as branches off their shared prompt (the trunk), one
         exact tree forward/backward per group: the prompt is computed once, not once per
@@ -687,6 +728,8 @@ class RLTrainer:
             def loss_fn(i: int, hidden: torch.Tensor, trained=trained) -> torch.Tensor:
                 t = trained[i]
                 sampled = [j for j, m in enumerate(t.mask) if m]
+                echo = bool(observed) and id(t) in observed and bool(t.observation_targets)
+                echo_hidden = hidden[0, t.observation_targets] if echo else None  # branch position j predicts j
                 rows = hidden[0, sampled]
                 targets = torch.tensor([t.tokens[j] for j in sampled], device=device)
                 floats = torch.tensor(
@@ -709,6 +752,9 @@ class RLTrainer:
                 stats.update(mismatch_by_bucket(lp, floats[0], where[0], where[1], forced))
                 if self.ref_lp:
                     loss = self._kl_term(loss, stats, lp, self.ref_lp[id(t)], floats[2])
+                if echo:
+                    targets = [t.tokens[j] for j in t.observation_targets]
+                    loss = loss + self._observation_term(stats, echo_hidden, targets, [observed[id(t)]] * len(targets))
                 _accumulate(totals, stats, loss, entropy)
                 return loss
 

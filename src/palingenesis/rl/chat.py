@@ -23,6 +23,34 @@ from typing import Any, Callable
 
 _DUMMY_USER = "PgsDummyUserTurn"
 _DUMMY_ANSWER = "PgsDummyAssistantTurn"
+# What ChatFormat.truncate writes where it cuts a tool output (the trainer's text, not the environment's)
+TRUNCATION_MARKER = r"\n\.\.\.\[\d+ tokens truncated\]\.\.\.\n"
+
+# Observation token kinds (ChatFormat.continuation): the environment's output, a target of the observation loss;
+# text inside an observation that is not the environment's (a harness's note), which still counts in the
+# observation length
+OBSERVATION_TARGET = 1
+OBSERVATION_EXCLUDED = 2
+
+
+@dataclass
+class Observation:
+    """What of one observation message is not the environment's output, for the observation loss: per text part of
+    the message (message_texts), the character spans a harness wrote (excluded); harness=True: the whole message
+    is the trainer's or the harness's own (the error answering a malformed call, a format error)."""
+
+    excluded: list[list[tuple[int, int]]] = field(default_factory=list)
+    harness: bool = False
+
+
+def message_texts(message: dict) -> list[str]:
+    """The text parts of a message's content, in order (a string content is one part; images are not text)."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [p["text"] for p in content if isinstance(p, dict) and p.get("type") == "text" and p.get("text")]
+    return []
 
 
 def encode_prompt(
@@ -94,6 +122,79 @@ class ChatFormat:
     ) -> list[int]:
         """Tokens after an assistant turn's end-of-turn token when `messages` follow it, up to
         and including the next assistant header (the next turn's generation prompt)."""
+        return self.tok.encode(self._continuation_text(messages, tools, calls), add_special_tokens=False)
+
+    def continuation(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        calls: list["ToolCall"] | None,
+        observations: list[Observation],
+    ) -> tuple[list[int], list[tuple[int, int]]]:
+        """continuation_ids, and its observation tokens as (index, kind), `observations` being one per message.
+        Observation tokens lie inside a text part of a message as the template renders it, a merged leading space
+        aside: never the template's glue (role headers, <tool_response> tags, the whitespace around the text, a
+        token reaching into markup).
+        The parts are located through a render with a placeholder in place of each one, so a text that also
+        occurs in the glue ("user") is not mistaken for it. Kind OBSERVATION_EXCLUDED: the token touches an
+        excluded span, or the message is the harness's. A part the template does not render verbatim (stripped at
+        most) ends the search: it and the parts after it have no observation tokens. Needs a fast tokenizer."""
+        text = self._continuation_text(messages, tools, calls)
+        enc = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
+        placeholders, probe = [], []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str):
+                placeholders.append(f"PgsObservation{len(placeholders)}End")
+                probe.append({**message, "content": placeholders[-1]})
+            elif isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                        placeholders.append(f"PgsObservation{len(placeholders)}End")
+                        part = {**part, "text": placeholders[-1]}
+                    parts.append(part)
+                probe.append({**message, "content": parts})
+            else:
+                probe.append(message)
+        probe_text = self._continuation_text(probe, tools, calls)
+        kind_at = bytearray(len(text))  # per character: 0 (glue), OBSERVATION_TARGET or OBSERVATION_EXCLUDED
+        shift, n = 0, 0  # characters the real parts add over their placeholders, so far
+        located = True
+        for message, observation in zip(messages, observations):
+            for k, part in enumerate(message_texts(message)):
+                q = probe_text.find(placeholders[n], 0) if located else -1
+                n += 1
+                p = q + shift
+                if q == -1:
+                    located = False
+                    continue
+                if text.startswith(part, p):
+                    rendered = part
+                elif text.startswith(part.strip(), p):  # a template that trims
+                    rendered = part.strip()
+                else:
+                    located = False
+                    continue
+                shift += len(rendered) - len(placeholders[n - 1])
+                lead = len(part) - len(part.lstrip()) if rendered is not part else 0
+                body_start = p + len(rendered) - len(rendered.lstrip())
+                body_end = p + len(rendered.rstrip())
+                kind = OBSERVATION_EXCLUDED if observation.harness else OBSERVATION_TARGET
+                kind_at[body_start:body_end] = bytes([kind]) * max(body_end - body_start, 0)
+                for a, b in observation.excluded[k] if k < len(observation.excluded) else []:
+                    a, b = max(p + a - lead, body_start), min(p + b - lead, body_end)
+                    if b > a:
+                        kind_at[a:b] = bytes([OBSERVATION_EXCLUDED]) * (b - a)
+        marked = []
+        for i, (a, b) in enumerate(enc["offset_mapping"]):
+            kinds = kind_at[a:b]
+            # inside a text, or covering one and nothing else but whitespace (a merged leading space)
+            if any(kinds) and all(k or c.isspace() for k, c in zip(kinds, text[a:b])):
+                marked.append((i, OBSERVATION_EXCLUDED if OBSERVATION_EXCLUDED in kinds else OBSERVATION_TARGET))
+        return enc["input_ids"], marked
+
+    def _continuation_text(self, messages: list[dict], tools: list[dict] | None, calls) -> str:
         assistant: dict[str, Any] = {"role": "assistant", "content": _DUMMY_ANSWER}
         if calls:
             assistant["tool_calls"] = [c.message() for c in calls]
@@ -108,7 +209,7 @@ class ChatFormat:
         end = text.find(self.eot_text, start)
         if end < 0:
             raise ValueError(f"the chat template does not close an assistant turn with {self.eot_text!r}")
-        return self.tok.encode(text[end + len(self.eot_text) :], add_special_tokens=False)
+        return text[end + len(self.eot_text) :]
 
     def image_wrapper(self, image_token_id: int) -> tuple[list[int], list[int]]:
         """The control tokens the template writes right before and after an image placeholder
@@ -177,7 +278,7 @@ class ChatFormat:
         half = max_tokens // 2
         return (
             self.tok.decode(ids[:half])
-            + f"\n...[{len(ids) - 2 * half} tokens truncated]...\n"
+            + f"\n...[{len(ids) - 2 * half} tokens truncated]...\n"  # TRUNCATION_MARKER
             + self.tok.decode(ids[-half:])
         )
 

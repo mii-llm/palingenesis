@@ -69,6 +69,10 @@ from palingenesis.validate_data import THINK_TAGS
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
+# Per-token bool of chat samples under data.include_observations: the token is an observation target (a tool's
+# output). Its loss weight carries the observation term, and the trainer leaves it out of the token count.
+OBSERVATION_FIELD = "observation_mask"
+OBSERVATION_ROLES = frozenset({"tool", "observation", "ipython", "function"})
 
 
 def _load_dataset_source(dataset_id: str, split: str, streaming: bool):
@@ -474,6 +478,16 @@ class _TokenSpans:
         hi = bisect.bisect_left(self._starts, c1)
         return [ti for ti in range(lo, hi) if self._ends[ti] > self._starts[ti]]
 
+    def within(self, text: str, c0: int, c1: int) -> list[int]:
+        """Tokens of `text` that cover characters of [c0, c1) and nothing else but whitespace: a token that merges
+        the space before a word belongs to the word, one that reaches into the next markup does not."""
+        out = []
+        for ti in self.overlapping(c0, c1):
+            o0, o1 = self.offsets[ti]
+            if not text[o0:c0].strip() and not text[c1:o1].strip():
+                out.append(ti)
+        return out
+
     def first_at(self, c: int) -> int:
         """First non-empty token starting at or after character c."""
         ti = bisect.bisect_left(self._starts, c)
@@ -511,6 +525,8 @@ _ECHO_MARKERS = (
 
 
 def _echo_text_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of the tool outputs between the markers, without the markers and the whitespace the
+    template writes around the content."""
     spans = []
     for start_marker, end_marker in _ECHO_MARKERS:
         pos = 0
@@ -518,8 +534,13 @@ def _echo_text_spans(text: str) -> list[tuple[int, int]]:
             c0 = start + len(start_marker)
             c1 = text.find(end_marker, c0)
             c1 = len(text) if c1 == -1 else c1
-            spans.append((c0, c1))
             pos = c1 + len(end_marker)
+            while c0 < c1 and text[c0].isspace():
+                c0 += 1
+            while c1 > c0 and text[c1 - 1].isspace():
+                c1 -= 1
+            if c1 > c0:
+                spans.append((c0, c1))
     return spans
 
 
@@ -609,9 +630,14 @@ def _repeat_sentence(messages: list[dict], rng: random.Random) -> list[dict]:
 class ChatDataset(_Epochs, IterableDataset):
     """SFT dataset: chat template masking, only assistant tokens get loss.
 
-    When include_observations=True (ECHO mode), tool/observation role tokens
-    also receive loss. This trains the model to predict tool outputs, teaching
-    it a world model of tool behavior (arxiv:2605.24517, ICML 2026).
+    include_observations=True: the text of tool / observation messages (roles tool, observation, ipython,
+    function, and tool-output blocks such as <tool_response> inside other turns) also gets loss, so the model is
+    trained to predict what the environment returns (after ECHO, arXiv:2605.24517). Only the environment's text is
+    a target, never the template's wrapper (role headers, tags, the whitespace around the content). The
+    observation tokens are marked in `observation_mask` and weighted by `loss_weights`: with
+    observation_normalization "conversation", λ x n_assistant / n_observation each (λ = observation_weight), so a
+    conversation's loss over the assistant-only denominator is its assistant loss + λ x its mean observation NLL;
+    with "token", λ each (and counted in the denominator, no mask).
     """
 
     def __init__(
@@ -623,6 +649,8 @@ class ChatDataset(_Epochs, IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         include_observations: bool = False,
+        observation_weight: float = 0.05,
+        observation_normalization: str = "conversation",
         turn_scaling: str = "uniform",
         train_on_reasoning: bool = True,
         last_turn_only: bool = False,
@@ -666,6 +694,12 @@ class ChatDataset(_Epochs, IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.include_observations = include_observations
+        if observation_normalization not in ("conversation", "token"):
+            raise ValueError(
+                f"observation_normalization must be conversation or token, got {observation_normalization!r}"
+            )
+        self.observation_weight = float(observation_weight)
+        self.observation_normalization = observation_normalization
         self.turn_scaling = turn_scaling
         self.train_on_reasoning = train_on_reasoning
         # Delimiters of reasoning baked into the data's assistant content. None: the chat
@@ -849,9 +883,42 @@ class ChatDataset(_Epochs, IterableDataset):
         self._row_images = []
         self._encodings = {}
         result = self._process_row(example)
-        if result is None or self.vision is None:
+        if result is not None and self.vision is not None:
+            result = self._attach_images(result)
+        if result is not None and OBSERVATION_FIELD in result:
+            result = self._weigh_observations(result)
+        return result
+
+    def _weigh_observations(self, result: dict[str, torch.Tensor]) -> dict[str, torch.Tensor] | None:
+        """The observation loss's per-token weights (see the class doc) from the masker's observation tokens. A
+        conversation that trains no assistant token is dropped under "conversation" (its term has no scale)."""
+        observed = result.pop(OBSERVATION_FIELD) & (result["labels"] != IGNORE_INDEX)  # images are never targets
+        if not observed.any():
             return result
-        return self._attach_images(result)
+        labels, weight = result["labels"], self.observation_weight
+        assistant = (labels != IGNORE_INDEX) & ~observed
+        if weight == 0 or (self.observation_normalization == "conversation" and not assistant.any()):
+            labels[observed] = IGNORE_INDEX
+            if "loss_weights" in result:
+                result["loss_weights"][observed] = 0.0
+            return result if assistant.any() else None
+        if self.observation_normalization == "token":
+            if weight != 1.0:  # 1.0: the plain token loss, as before observation_weight existed
+                weights = result.get("loss_weights")
+                weights = (labels != IGNORE_INDEX).float() if weights is None else weights
+                weights[observed] = weight
+                result["loss_weights"] = weights
+            return result
+        weights = result.get("loss_weights")
+        if weights is None:
+            weights = assistant.float()
+        else:  # turn scaling: the assistant's weights keep their mean of 1 without the observation tokens
+            weights = torch.where(assistant, weights, torch.zeros_like(weights))
+            weights[assistant] /= weights[assistant].mean()
+        weights[observed] = weight * float(assistant.sum()) / float(observed.sum())
+        result["loss_weights"] = weights
+        result[OBSERVATION_FIELD] = observed
+        return result
 
     def _attach_images(self, result: dict[str, torch.Tensor]) -> dict[str, torch.Tensor] | None:
         """The row's multimodal fields (palingenesis.multimodal.image_fields). Truncation keeps whole
@@ -968,6 +1035,7 @@ class ChatDataset(_Epochs, IterableDataset):
             or self._row_images  # tokenized from the render with expanded image placeholders
             or self.repeat_targets
             or self.turn_scaling != "uniform"
+            or self.include_observations  # observation tokens are located by the turn-aware masker
             or not self._template_has_generation_span()
         ):
             return self._fallback(messages)
@@ -1013,11 +1081,6 @@ class ChatDataset(_Epochs, IterableDataset):
         if not self.train_on_reasoning:
             full_text = self._render_chat(messages, tokenize=False, add_generation_prompt=False)
             labels = self._strip_reasoning_labels(input_ids, labels, full_text)
-
-        # ECHO: if include_observations, also unmask tool_response regions within user messages
-        # Some models (Qwen3.5) wrap tool outputs as <tool_response>...</tool_response> inside user turns
-        if self.include_observations:
-            labels = self._apply_echo_from_text(input_ids, labels, messages)
 
         if (labels != IGNORE_INDEX).sum() == 0:
             return None
@@ -1319,19 +1382,16 @@ class ChatDataset(_Epochs, IterableDataset):
         spans = _TokenSpans(offsets)
 
         markers = self._turn_markers()
+        # turns: [(token indices, message)] per assistant message, in order
         if markers is None:
-            located = self._locate_turns_by_content(full, messages, spans, input_ids)
+            turns = self._locate_turns_by_content(full, messages, spans, input_ids)
         else:
-            located = self._locate_turns_by_markers(full, messages, spans, markers)
-        turns, echo = located  # turns: [(token indices, message)] per assistant message, in order
+            turns = self._locate_turns_by_markers(full, messages, spans, markers)
 
         def train(idx: list[int]) -> None:
             if idx:
                 t = torch.tensor(idx, dtype=torch.long)
                 labels[t] = input_ids[t]
-
-        for tset in echo:  # tool/observation ECHO turns: always trained, never gated by last_turn_only
-            train(tset)
 
         trained_turns = [(tset, i) for i, (tset, msg) in enumerate(turns) if is_trained_message(msg)]
         if self.last_turn_only and trained_turns:
@@ -1343,9 +1403,17 @@ class ChatDataset(_Epochs, IterableDataset):
 
         labels[attn_mask == 0] = IGNORE_INDEX
 
+        observed = None
         if self.include_observations:
-            for c0, c1 in _echo_text_spans(full):
-                train(spans.overlapping(c0, c1))
+            # tool / observation messages (never gated by last_turn_only), and tool-output blocks inside other
+            # turns; never a token of an assistant turn
+            observed = torch.zeros_like(input_ids, dtype=torch.bool)
+            for c0, c1 in self._observation_spans(messages, full) + _echo_text_spans(full):
+                observed[spans.within(full, c0, c1)] = True
+            for tset, _ in turns:
+                observed[tset] = False
+            observed &= labels == IGNORE_INDEX
+            labels[observed] = input_ids[observed]
 
         if (labels != IGNORE_INDEX).sum() == 0:
             return None
@@ -1382,14 +1450,13 @@ class ChatDataset(_Epochs, IterableDataset):
                 loss_weights[valid] /= loss_weights[valid].mean()
             result["loss_weights"] = loss_weights
 
+        if observed is not None:
+            result[OBSERVATION_FIELD] = observed  # weighted in _process (_weigh_observations)
         return result
 
     def _locate_turns_by_markers(self, full: str, messages: list[dict], spans: "_TokenSpans", markers: "TurnMarkers"):
-        """Token indices of every assistant turn (header excluded, end-of-turn included),
-        and of the ECHO-trained tool/observation contents."""
-        echo_roles = {"tool", "observation", "ipython", "function"} if self.include_observations else set()
+        """Token indices of every assistant turn (header excluded, end-of-turn included)."""
         turns: list[tuple[list[int], dict]] = []
-        echo: list[list[int]] = []
         cursor = 0
         n = len(full)
 
@@ -1407,13 +1474,6 @@ class ChatDataset(_Epochs, IterableDataset):
 
         for msg in messages:
             role = msg.get("role")
-            if role in echo_roles:
-                _, answer = self._split_reasoning(msg)
-                stop = full.find(markers.header, cursor)
-                p = full.find(answer, cursor, n if stop == -1 else stop) if answer else -1
-                if p != -1:
-                    echo.append(spans.overlapping(p, p + len(answer)))
-                continue
             if role != "assistant":
                 continue
 
@@ -1444,7 +1504,7 @@ class ChatDataset(_Epochs, IterableDataset):
                 pieces = _subtract_intervals((start, end), excluded)
             tset = sorted({ti for c0, c1 in pieces for ti in spans.overlapping(c0, c1)})
             turns.append((tset, msg))
-        return turns, echo
+        return turns
 
     def _locate_turns_by_content(self, full: str, messages: list[dict], spans: "_TokenSpans", input_ids: torch.Tensor):
         """Legacy locator for templates whose turn markers cannot be derived: finds each
@@ -1452,9 +1512,7 @@ class ChatDataset(_Epochs, IterableDataset):
         Text the template renders from other fields (tool calls) is not found."""
         special_ids = special_token_ids(self.tokenizer)
         n_tok = len(input_ids)
-        echo_roles = {"tool", "observation", "ipython", "function"} if self.include_observations else set()
         turns: list[tuple[list[int], dict]] = []
-        echo: list[list[int]] = []
         cursor = 0
 
         def is_ws(ti: int) -> bool:
@@ -1480,11 +1538,11 @@ class ChatDataset(_Epochs, IterableDataset):
                     a0, a1 = p, p + len(answer_raw)
                     cursor = a1
 
-            if role != "assistant" and role not in echo_roles:
+            if role != "assistant":
                 continue
 
             tset: set[int] = set()
-            if role == "assistant" and self.train_on_reasoning and reasoning_raw and r0 != -1:
+            if self.train_on_reasoning and reasoning_raw and r0 != -1:
                 think_open = full.rfind(self._render_tags()[0], 0, r0)
                 tset.update(spans.overlapping(think_open if think_open != -1 else r0, r1))
                 if a0 != -1:
@@ -1494,7 +1552,7 @@ class ChatDataset(_Epochs, IterableDataset):
 
             # Terminator: skip whitespace, include ONE end-of-turn special token.
             anchor = a1 if a1 != -1 else r1
-            if anchor != -1 and role == "assistant":
+            if anchor != -1:
                 ti = spans.first_at(anchor)
                 while ti < n_tok and is_ws(ti):
                     tset.add(ti)
@@ -1502,11 +1560,42 @@ class ChatDataset(_Epochs, IterableDataset):
                 if ti < n_tok and int(input_ids[ti]) in special_ids:
                     tset.add(ti)
 
-            if role == "assistant":
-                turns.append((sorted(tset), msg))
+            turns.append((sorted(tset), msg))
+        return turns
+
+    def _observation_spans(self, messages: list[dict], full: str) -> list[tuple[int, int]]:
+        """Character spans in the render `full` of the observation messages' text (roles tool, observation,
+        ipython, function), without the whitespace around it. Located through a render with a placeholder in
+        place of each text, so a text that also occurs in the template's glue ("user") is not mistaken for it.
+        A text the template does not render verbatim (stripped at most) ends the search."""
+        placeholders, probe = [], []
+        for m in messages:
+            content = m.get("content")
+            if m.get("role") in OBSERVATION_ROLES and isinstance(content, str) and content.strip():
+                placeholders.append((f"PgsObservation{len(placeholders)}End", content))
+                m = {**m, "content": placeholders[-1][0]}
+            probe.append(m)
+        if not placeholders:
+            return []
+        try:
+            probe_text = self._render_chat(probe, tokenize=False, add_generation_prompt=False)
+        except Exception:
+            return []
+        out, shift, pos = [], 0, 0  # shift: characters the texts add over their placeholders, so far
+        for mark, content in placeholders:
+            q = probe_text.find(mark, pos)
+            if q == -1:
+                break
+            pos, p = q + len(mark), q + shift
+            if full.startswith(content, p):
+                rendered = content
+            elif full.startswith(content.strip(), p):  # a template that trims
+                rendered = content.strip()
             else:
-                echo.append(sorted(tset))
-        return turns, echo
+                break
+            shift += len(rendered) - len(mark)
+            out.append((p + len(rendered) - len(rendered.lstrip()), p + len(rendered.rstrip())))
+        return out
 
     def _fallback_progressive(self, messages: list[dict]) -> dict[str, torch.Tensor] | None:
         """Legacy fallback masking: progressive tokenization to find exact turn boundaries.
@@ -1539,10 +1628,9 @@ class ChatDataset(_Epochs, IterableDataset):
         seq_len = len(input_ids)
         labels = torch.full_like(input_ids, IGNORE_INDEX)
 
-        # Roles that get loss
+        # Roles that get loss (observation messages: their content only, see below)
         train_roles = {"assistant"}
-        if self.include_observations:
-            train_roles.update({"tool", "observation", "ipython", "function"})
+        observed = torch.zeros_like(input_ids, dtype=torch.bool) if self.include_observations else None
 
         # Track turn boundaries for progressive scaling
         assistant_turn_idx = 0
@@ -1566,7 +1654,11 @@ class ChatDataset(_Epochs, IterableDataset):
                 prev_len = max(prev_len, 0)
                 continue
 
-            if msg.get("role") in train_roles and is_trained_message(msg):
+            if observed is not None and msg.get("role") in OBSERVATION_ROLES:
+                span = self._observation_tokens(messages, i, prefix_ids)
+                if span is not None:
+                    observed[min(span[0], seq_len) : min(span[1], seq_len)] = True
+            elif msg.get("role") in train_roles and is_trained_message(msg):
                 # This turn gets loss. But we want to exclude the header/role tokens
                 # (e.g., "<|start_header_id|>assistant<|end_header_id|>\n\n")
                 # Strategy: tokenize messages[:i] + a stub that produces the header
@@ -1608,7 +1700,7 @@ class ChatDataset(_Epochs, IterableDataset):
                         # If stub fails (some templates need non-empty content), use prev_len
                         content_start = prev_len
                 else:
-                    # For tool/observation roles, unmask the entire turn (header is short/irrelevant)
+                    # An assistant turn without content or reasoning (tool calls only): the whole turn
                     content_start = prev_len
 
                 # Clamp to sequence length
@@ -1632,9 +1724,13 @@ class ChatDataset(_Epochs, IterableDataset):
                 if idx != last_idx:
                     labels[s:e] = IGNORE_INDEX
 
-        # ECHO: Also unmask <tool_response> regions inside user messages
-        if self.include_observations:
-            labels = self._apply_echo_from_text(input_ids, labels, messages)
+        # Observations: the tool messages' content, and tool-output blocks inside other turns (<tool_response>
+        # in a user turn), never a trained assistant token
+        if observed is not None:
+            for s, e in self._echo_token_ranges(input_ids):
+                observed[s:e] = True
+            observed &= labels == IGNORE_INDEX
+            labels[observed] = input_ids[observed]
 
         if (labels != IGNORE_INDEX).sum() == 0:
             return None
@@ -1664,67 +1760,51 @@ class ChatDataset(_Epochs, IterableDataset):
 
             result["loss_weights"] = loss_weights
 
+        if observed is not None:
+            result[OBSERVATION_FIELD] = observed  # weighted in _process (_weigh_observations)
         return result
 
-    def _apply_echo_from_text(
-        self,
-        input_ids: torch.Tensor,
-        labels: torch.Tensor,
-        messages: list[dict],
-    ) -> torch.Tensor:
-        """Apply ECHO observation loss by detecting tool output regions in tokenized text.
+    def _observation_tokens(self, messages: list[dict], i: int, prefix_ids: list[int]) -> tuple[int, int] | None:
+        """Token range of message i's content in the progressive render (prefix_ids: messages[: i + 1]), from a
+        render of the same message with empty content: the tokens the two share in front are the turn's header,
+        the stub's remaining tokens its closing; whitespace-only tokens at the edges (the template's) are left out.
+        None when the template does not render the message that way."""
+        try:
+            stub_text = self._render_chat(
+                messages[:i] + [{**messages[i], "content": ""}], tokenize=False, add_generation_prompt=False
+            )
+            stub_ids = self.tokenizer(
+                stub_text, truncation=True, max_length=self.max_seq_length, add_special_tokens=False
+            )["input_ids"]
+        except Exception:
+            return None
+        start, limit = 0, min(len(stub_ids), len(prefix_ids))
+        while start < limit and stub_ids[start] == prefix_ids[start]:
+            start += 1
+        end = len(prefix_ids) - (len(stub_ids) - start)
 
-        Handles multiple patterns for tool outputs:
-          1. Explicit role: "tool", "observation", "ipython", "function" → already handled in fallback
-          2. Qwen-style: <tool_response>...</tool_response> inside user messages
-          3. Generic markers: [Tool Output], [Observation], ```output inside user messages
-          4. Content field: messages with tool_call_id or name field (tool responses)
+        def blank(t: int) -> bool:
+            return not self.tokenizer.decode([prefix_ids[t]]).strip()
 
-        For pattern 2 (Qwen3.5), the chat template converts:
-          {"role": "tool", "content": "4"} → user message with <tool_response>4</tool_response>
+        while start < end and blank(start):
+            start += 1
+        while end > start and blank(end - 1):
+            end -= 1
+        return (start, end) if end > start else None
 
-        We find these regions in the tokenized output and unmask them for loss.
-        """
-        # Decode full text to find tool_response markers
+    def _echo_token_ranges(self, input_ids: torch.Tensor) -> list[tuple[int, int]]:
+        """Token ranges of the tool-output blocks inside the render (<tool_response>...</tool_response> in a user
+        turn, [Tool Output], ...; see _ECHO_MARKERS), for tokenizers without an offset mapping: the block's text
+        without the markers and the surrounding whitespace, mapped to tokens by tokenizing the text before it."""
         full_text = self.tokenizer.decode(input_ids, skip_special_tokens=False)
-
-        # Markers that indicate tool output content (model-agnostic)
-        TOOL_START_MARKERS = ["<tool_response>", "<|tool▁output|>", "<observation>", "[Tool Output]", "```output\n"]
-        TOOL_END_MARKERS = ["</tool_response>", "<|tool▁output▁end|>", "</observation>", "[/Tool Output]", "```"]
-
-        for start_marker, end_marker in zip(TOOL_START_MARKERS, TOOL_END_MARKERS):
-            # Find all occurrences of this marker pair
-            search_pos = 0
-            while True:
-                start_idx = full_text.find(start_marker, search_pos)
-                if start_idx == -1:
-                    break
-                # Find the content start (after the opening tag)
-                content_start = start_idx + len(start_marker)
-                end_idx = full_text.find(end_marker, content_start)
-                if end_idx == -1:
-                    # No closing tag — take until end of text
-                    end_idx = len(full_text)
-
-                # Convert character positions to token positions
-                # Tokenize the prefix up to content_start and end_idx
-                prefix_to_start = full_text[:content_start]
-                prefix_to_end = full_text[:end_idx]
-
-                tok_start = len(self.tokenizer.encode(prefix_to_start, add_special_tokens=False))
-                tok_end = len(self.tokenizer.encode(prefix_to_end, add_special_tokens=False))
-
-                # Clamp to valid range
-                tok_start = min(tok_start, len(input_ids))
-                tok_end = min(tok_end, len(input_ids))
-
-                # Unmask these tokens (give them loss)
-                if tok_start < tok_end:
-                    labels[tok_start:tok_end] = input_ids[tok_start:tok_end]
-
-                search_pos = end_idx + len(end_marker)
-
-        return labels
+        ranges = []
+        for c0, c1 in _echo_text_spans(full_text):
+            tok_start = len(self.tokenizer.encode(full_text[:c0], add_special_tokens=False))
+            tok_end = len(self.tokenizer.encode(full_text[:c1], add_special_tokens=False))
+            tok_start, tok_end = min(tok_start, len(input_ids)), min(tok_end, len(input_ids))
+            if tok_start < tok_end:
+                ranges.append((tok_start, tok_end))
+        return ranges
 
     # Encodings kept per row: truncation tokenizes the candidate cuts with offsets, and the masker
     # reuses the chosen one (one of the last two tokenized).
@@ -2043,7 +2123,7 @@ class PackedDataset(_Epochs, IterableDataset):
     document does not fit).
 
     Output per block (trailing blocks may be shorter than max_len; the collator pads):
-      - input_ids, labels (and loss_weights, when present): the documents concatenated
+      - input_ids, labels (and loss_weights, observation_mask, when present): the documents concatenated
       - attention_mask: all ones
       - position_ids: restart at 0 at each document
     """
@@ -2067,7 +2147,9 @@ class PackedDataset(_Epochs, IterableDataset):
         # Oversized documents are cut to max_len (the chat pipeline already keeps whole
         # turns within max_seq_length; this only guards other sources).
         keys = ["input_ids", "labels"] + [
-            k for k in ("loss_weights", "source_ids", "repeat_targets", "stop_targets", POSITION_FIELD) if k in ex
+            k
+            for k in ("loss_weights", OBSERVATION_FIELD, "source_ids", "repeat_targets", "stop_targets", POSITION_FIELD)
+            if k in ex
         ]
         doc = {k: ex[k][: self.max_len] for k in keys}
         pixels = {k: ex[k] for k in PIXEL_FIELDS if k in ex}
@@ -2085,6 +2167,13 @@ class PackedDataset(_Epochs, IterableDataset):
             # per trained token, as in the collator
             docs = [
                 d if "loss_weights" in d else {**d, "loss_weights": (d["labels"] != IGNORE_INDEX).float()} for d in docs
+            ]
+        if any(OBSERVATION_FIELD in d for d in docs):  # data.include_observations: none in the other documents
+            docs = [
+                d
+                if OBSERVATION_FIELD in d
+                else {**d, OBSERVATION_FIELD: torch.zeros_like(d["labels"], dtype=torch.bool)}
+                for d in docs
             ]
         for k in ("repeat_targets", "stop_targets"):  # unlikelihood targets: none in the documents without them
             if any(k in d for d in docs):
@@ -2220,13 +2309,14 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
 
     Packed rows (with position_ids): the padding gets positions 0, 1, 2, ..., i.e. it
     is one more document, attending only to itself, instead of one document per pad
-    token. loss_weights (per-turn scaling) are padded with 0.
+    token. loss_weights (per-turn scaling, the observation loss) are padded with 0, observation_mask with False.
     """
     max_len = max(x["input_ids"].size(0) for x in batch)
     if pad_to_multiple > 1:
         max_len = ((max_len + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
     has_positions = "position_ids" in batch[0]
     has_weights = any("loss_weights" in x for x in batch)
+    has_observations = any(OBSERVATION_FIELD in x for x in batch)
     extra = [k for k in ("repeat_targets", "stop_targets") if any(k in x for x in batch)]
     # Off-policy distillation: source tags and teacher views, per token (-1 = none); a teacher's own
     # rendering is padded to its own length.
@@ -2240,6 +2330,8 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
         out["position_ids"] = []
     if has_weights:
         out["loss_weights"] = []
+    if has_observations:
+        out[OBSERVATION_FIELD] = []
 
     for item in batch:
         n = item["input_ids"].size(0)
@@ -2254,6 +2346,10 @@ def _collate_fn(batch: list[dict[str, torch.Tensor]], pad_id: int, pad_to_multip
             if weights is None:
                 weights = (item["labels"] != IGNORE_INDEX).float()
             out["loss_weights"].append(torch.cat([weights.float(), torch.zeros(pad_len)]))
+        if has_observations:
+            observed = item.get(OBSERVATION_FIELD)
+            observed = torch.zeros(n, dtype=torch.bool) if observed is None else observed.bool()
+            out[OBSERVATION_FIELD].append(torch.cat([observed, torch.zeros(pad_len, dtype=torch.bool)]))
         for k in extra:  # unlikelihood targets (data.repeat_unlikelihood / stop_unlikelihood)
             t = item.get(k)
             if t is None:
@@ -2365,6 +2461,8 @@ def source_stage(
     masking = dict(
         messages_field=src.get("messages_field", config.messages_field if not src else "messages"),
         include_observations=config.include_observations,
+        observation_weight=getattr(config, "observation_weight", 0.05),
+        observation_normalization=getattr(config, "observation_normalization", "conversation"),
         train_on_reasoning=getattr(config, "train_on_reasoning", True),
         last_turn_only=src.get("last_turn_only", getattr(config, "last_turn_only", False)),
         tools_field=src.get("tools_field", config.tools_field),
@@ -2814,7 +2912,19 @@ def _fingerprint_payload(config, tokenizer) -> dict:
     if getattr(d, "turn_scaling", "uniform") != "uniform":
         # the cache stores the per-token loss weights: one written without them must be rebuilt, not read as uniform
         payload["loss_weights"] = True
+    if getattr(d, "include_observations", False):  # the observation tokens' weights and mask are in the cache
+        payload["observation_weight"] = getattr(d, "observation_weight", 0.05)
+        payload["observation_normalization"] = getattr(d, "observation_normalization", "conversation")
     return payload
+
+
+def _cached_fields(d) -> tuple[bool, bool]:
+    """(loss_weights, observation_mask): the optional per-token columns a pre-tokenized cache of `d` holds."""
+    observations = getattr(d, "include_observations", False)
+    normalization = getattr(d, "observation_normalization", "conversation")
+    weighted = observations and (normalization == "conversation" or getattr(d, "observation_weight", 0.05) != 1.0)
+    turn_weights = getattr(d, "turn_scaling", "uniform") != "uniform"
+    return turn_weights or weighted, observations and normalization == "conversation"
 
 
 def pretokenize_fingerprint(config, tokenizer) -> str:
@@ -2847,8 +2957,8 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
     """Iterate the assembled (masked/mixed/packed) stream once and write tensors to parquet.
 
     Writes ``{cache_dir}/train.parquet`` (columns: input_ids, attention_mask, labels,
-    position_ids when packed, and loss_weights under data.turn_scaling: null for a
-    sequence without per-turn weights) plus ``pretokenized_meta.json`` with the
+    position_ids when packed, loss_weights under data.turn_scaling or the observation loss, and observation_mask
+    under data.include_observations: null for a sequence without them) plus ``pretokenized_meta.json`` with the
     fingerprint and exact sequence count. Returns the number of sequences written.
     """
     import json as _json
@@ -2865,8 +2975,15 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
     writer: "pq.ParquetWriter | None" = None
     count = 0
     has_pos: bool | None = None
-    has_weights = getattr(config.data, "turn_scaling", "uniform") != "uniform"
-    buf: dict[str, list] = {"input_ids": [], "attention_mask": [], "labels": [], "position_ids": [], "loss_weights": []}
+    has_weights, has_observations = _cached_fields(config.data)
+    buf: dict[str, list] = {
+        "input_ids": [],
+        "attention_mask": [],
+        "labels": [],
+        "position_ids": [],
+        "loss_weights": [],
+        OBSERVATION_FIELD: [],
+    }
 
     def _flush():
         nonlocal writer
@@ -2881,6 +2998,8 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
             cols["position_ids"] = buf["position_ids"]
         if has_weights:  # typed: a first chunk of rows without weights would otherwise fix the column as null
             cols["loss_weights"] = pa.array(buf["loss_weights"], type=pa.list_(pa.float32()))
+        if has_observations:
+            cols[OBSERVATION_FIELD] = pa.array(buf[OBSERVATION_FIELD], type=pa.list_(pa.bool_()))
         table = pa.table(cols)
         if writer is None:
             writer = pq.ParquetWriter(str(tmp), table.schema)
@@ -2900,6 +3019,9 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
             if has_weights:
                 weights = ex.get("loss_weights")
                 buf["loss_weights"].append(None if weights is None else weights.tolist())
+            if has_observations:
+                observed = ex.get(OBSERVATION_FIELD)
+                buf[OBSERVATION_FIELD].append(None if observed is None else observed.tolist())
             count += 1
             if len(buf["input_ids"]) >= 1000:
                 _flush()
@@ -2922,6 +3044,7 @@ def materialize_pretokenized(final_ds_factory, cache_dir, fingerprint: str, conf
         "packing": config.data.packing,
         "has_position_ids": bool(has_pos),
         "has_loss_weights": has_weights,
+        "has_observation_mask": has_observations,
     }
     meta_path.write_text(_json.dumps(meta, indent=2))
     return count
@@ -2955,6 +3078,9 @@ class PretokenizedDataset(_Epochs, IterableDataset):
             weights = ex.get("loss_weights")  # data.turn_scaling; null for a sequence without per-turn weights
             if weights is not None:
                 out["loss_weights"] = weights.float()
+            observed = ex.get(OBSERVATION_FIELD)  # data.include_observations; null without observation tokens
+            if observed is not None:
+                out[OBSERVATION_FIELD] = observed.bool()
             yield out
 
 

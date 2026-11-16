@@ -157,7 +157,7 @@ Your training data must be in one of:
   pgs train --config config.yaml  # config points to HF dataset name
   ```
 
-Multi-turn conversations (any number of user/assistant/system turns) are fully supported. Tool-calling traces with `tool` and `observation` roles work too — enable `include_observations: true` to train on tool outputs.
+Multi-turn conversations (any number of user/assistant/system turns) are fully supported. Tool-calling traces with `tool` and `observation` roles work too — enable `include_observations: true` to also train on tool outputs (an auxiliary loss, weight `observation_weight`).
 
 ---
 

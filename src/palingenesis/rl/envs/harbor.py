@@ -772,6 +772,11 @@ class HarborEnv:
             return self.session.observation_text(results)
         return "\n\n".join(out for _, out in results)
 
+    @property
+    def observation_notes(self) -> tuple[str, ...]:
+        """The harness profile's own text in observations (regular expressions; palingenesis.rl.env)."""
+        return self.session.profile.observation_notes if self.session is not None else ()
+
     def unknown_tool(self, name: str, arguments: dict[str, Any]) -> str | None:
         """A call of a tool the episode does not expose: the harness's own answer (or alias) under a profile; None
         (the trainer's own message) otherwise."""

@@ -30,6 +30,10 @@ An environment is any class. Per trajectory, the trainer takes an instance from 
         (over the model's; a row's own chat_template_kwargs win).
     unknown_tool(self, name, arguments) -> str           optional, sync or async
         The answer to a call of a tool the episode does not expose (None, or no method: "Error: unknown tool ...").
+    observation_notes                                    optional attribute, read after each tool turn
+        Regular expressions of text the environment's harness writes into its observations (warnings, notes),
+        as opposed to what the environment returned: never targets of the observation loss
+        (loss.observation_weight). HarborEnv's harness profiles declare theirs.
 
 Text-protocol environments (tools described in the system prompt in a custom format — XML tags, ReAct lines, JSON
 actions — rather than native function calling) add two optional methods:

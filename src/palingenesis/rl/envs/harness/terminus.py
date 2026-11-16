@@ -309,6 +309,10 @@ def _terminus_start(s) -> dict[str, str]:
     return {"terminal_state": limit_output(tmux.incremental())}
 
 
+# The prefix _terminus_batch writes before the terminal output when the response parsed with warnings
+TERMINUS_WARNING = r"\APrevious response had warnings:\nWARNINGS: .*?\n\n"
+
+
 def terminus_format_error(reason: str, n: int) -> str:
     return reason  # TerminusJSON words the whole feedback
 
@@ -325,6 +329,7 @@ def terminus_2() -> HarnessProfile:
         answer=StopAnswer(None),
         start=_terminus_start,
         format_error=terminus_format_error,
+        observation_notes=(TERMINUS_WARNING,),
         context=Context("compaction", emulated=False, note="unwind + 3-subagent summarisation near the limit"),
         emulates="Harbor 0.24.0 agents/terminus_2 (terminus-json-plain.txt, terminus_json_plain_parser.py, "
         "tmux_session.py; parser json, pane 160x40, 10 KB output cap, task_complete twice); summarisation "

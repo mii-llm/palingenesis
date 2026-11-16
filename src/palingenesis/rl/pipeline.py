@@ -19,6 +19,7 @@ import itertools
 import json
 import logging
 import math
+import re
 import threading
 import time
 from collections import Counter, defaultdict
@@ -29,10 +30,19 @@ from palingenesis.accelerator import on_current_device
 from palingenesis.multimodal import MultimodalError, has_image_parts, load_image, split_images, vision_of
 from palingenesis.opd.orchestrator import PublishedWeights
 from palingenesis.opd.rollout import RolloutEngine
-from palingenesis.rl.chat import ChatFormat, ToolCall, encode_prompt, parse_assistant
+from palingenesis.rl.chat import (
+    TRUNCATION_MARKER,
+    ChatFormat,
+    Observation,
+    ToolCall,
+    encode_prompt,
+    message_texts,
+    parse_assistant,
+)
 from palingenesis.rl.config import RLConfig
 from palingenesis.rl.data import PromptSampler, prompt_messages, row_limit
 from palingenesis.rl.env import EnvPool, ToolOutput, call_sync_or_async, row_tools, run_tool
+from palingenesis.rl.envs.harness.profile import FORMAT_ERROR
 from palingenesis.rl.generation import GenerationClient
 from palingenesis.rl.rewards import SKIPPED, Reward, SkipSample, load_object, whitespace_defects
 from palingenesis.rl.trajectory import Trajectory, group_is_informative
@@ -80,6 +90,9 @@ class RLPipeline:
         self.stop_ids = set(stop_ids)
         self.vision = vision_of(tok)
         self.group_shaping = load_object(config.loss.group_shaping) if config.loss.group_shaping else None
+        # loss.observation_weight: training rollouts record their observation tokens (ChatFormat.continuation)
+        self.observation_loss = config.loss.observation_weight > 0
+        self.observation_exclude = self.observation_patterns(config.loss.observation_exclude)
         # n-sample merging only helps when a group's rollouts are one turn each
         self.client = GenerationClient(engine, merge=env_pool is None)
         self.lock = threading.RLock()
@@ -465,6 +478,8 @@ class RLPipeline:
                     for c, text in zip(parsed.calls, texts)
                 ]
                 observations += [{"role": "tool", "content": error} for error in parsed.errors]
+                # the trainer's own messages (a malformed call's error) are not the environment's output
+                harness = [False] * len(parsed.calls) + [True] * len(parsed.errors)
                 if text_protocol:  # one user turn with the results, in the environment's own format
                     render = getattr(env, "observation_text", None)
                     body = (
@@ -473,6 +488,8 @@ class RLPipeline:
                         else "\n\n".join(texts)
                     )
                     observations = [{"role": "user", "content": body}]
+                    harness = [all(c.name == FORMAT_ERROR for c in parsed.calls)]  # the harness's format error
+                harness = [h or not o["content"] for h, o in zip(harness, observations)]  # an image's note fills it
                 for o in observations:
                     o["content"] = self.chat.truncate(self.chat.sanitize(o["content"]), e.max_tool_output_tokens)
                 if any(pictures):
@@ -483,15 +500,25 @@ class RLPipeline:
                     trajectory.messages.extend(observations)
                     trajectory.finish = "env_done"
                     break
+                harness += [True] * (len(observations) - len(harness))  # env.image_results "user": the note's message
                 rendered, shown = self._split_images(observations)
-                context_ids = chat.continuation_ids(rendered, schemas, None if text_protocol else parsed.calls)
+                calls = None if text_protocol else parsed.calls
+                marked: list[tuple[int, int]] = []
+                if training and self.observation_loss:
+                    notes = self._observation_notes(rendered, harness, env)
+                    context_ids, marked = chat.continuation(rendered, schemas, calls, notes)
+                else:
+                    context_ids = chat.continuation_ids(rendered, schemas, calls)
                 if out.ids and out.ids[-1] != self.chat.eot_id:  # the turn ended on another stop token
                     context_ids = [self.chat.eot_id] + context_ids
+                    marked = [(i + 1, kind) for i, kind in marked]
                 shown, image_tokens = self._measure_images(context_ids, shown)
                 added = len(context_ids) + sum(n - 1 for n in image_tokens)
                 if trajectory.context_tokens + added >= r.max_model_len - 1:
                     trajectory.finish = "length"
                     break
+                if marked:
+                    trajectory.append_observations(len(trajectory.tokens), marked)
                 trajectory.append_context(context_ids)
                 trajectory.append_images(shown, image_tokens)
                 trajectory.messages.extend(observations)
@@ -513,6 +540,29 @@ class RLPipeline:
             timing["end"] = clock() - self.rollout_start
             self.client.exit()
         return trajectory, env
+
+    @staticmethod
+    def observation_patterns(exclude: list | None) -> list[re.Pattern]:
+        """loss.observation_exclude compiled, and the truncation marker (the trainer's own text)."""
+        return [re.compile(str(p), re.DOTALL) for p in exclude or []] + [re.compile(TRUNCATION_MARKER)]
+
+    def _observation_notes(self, messages: list[dict], harness: list[bool], env: Any) -> list[Observation]:
+        """Per observation message (as rendered), what of it is not the environment's output: the whole message
+        when it is the trainer's or the harness's own, else the spans of each text part that loss.observation_exclude,
+        the truncation marker or the environment's observation_notes match."""
+        patterns = self.observation_exclude + [
+            re.compile(str(p), re.DOTALL) for p in (getattr(env, "observation_notes", None) or ())
+        ]
+        return [
+            Observation(
+                [
+                    [m.span() for p in patterns for m in p.finditer(text) if m.end() > m.start()]
+                    for text in message_texts(o)
+                ],
+                whole,
+            )
+            for o, whole in zip(messages, harness)
+        ]
 
     # ------------------------------------------------------------------ images
 

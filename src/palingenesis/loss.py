@@ -76,6 +76,17 @@ def shift_weights(weights: torch.Tensor) -> torch.Tensor:
     return shifted
 
 
+def counted_tokens(labels: torch.Tensor, observed: torch.Tensor | None = None) -> torch.Tensor:
+    """The number of tokens a loss is normalised by: the labelled ones (shifted labels), without the observation
+    targets of data.include_observations (`observed`, shifted like the labels, any layout with the same number of
+    elements): their loss weights normalise the observation term per conversation already, and counting them
+    would dilute the assistant's loss."""
+    counted = labels != IGNORE_INDEX
+    if observed is not None:
+        counted = counted & (observed.reshape(labels.shape) == 0)
+    return counted.sum()
+
+
 def _weighted_sum(per_token: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
     return per_token.sum() if weights is None else (per_token * weights.reshape(-1).to(per_token.dtype)).sum()
 

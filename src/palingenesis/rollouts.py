@@ -32,7 +32,9 @@ field carries that name (gen_ai.*), so an exporter is a mapping; everything else
       tool_calls: gen_ai.operation.name ("execute_tool"), gen_ai.tool.name, gen_ai.tool.call.id,
                   gen_ai.tool.call.arguments, gen_ai.tool.call.result, error, duration_s
   RL only: group, kept (False: a zero-variance group), scored, trained, reward, rewards (components),
-           advantage, turn_count, tool_calls, tool_errors, context_tokens, version, start_s, duration_s, info
+           advantage, turn_count, tool_calls, tool_errors, context_tokens, version, start_s, duration_s, info;
+           with loss.observation_weight: observation_tokens (the tool results' tokens) and observation_targets
+           (those that are the environment's output, the loss's targets)
   OPD only: group, source, teacher, version, teacher_logprob_mean, k1_mean (sampled reverse KL per token),
             meta (agent traces: turn, onset, error, weight)
   kind "timeline" (RL): events, the engine's (time, sequences in flight, finished) per engine step
@@ -338,6 +340,9 @@ def rl_record(item: tuple[bool, Any], content: bool = True) -> dict:
         "turns": turns,
         "info": extras,
     }
+    if getattr(t, "observation_tokens", 0):  # loss.observation_weight: the loss's length |O|, its targets
+        record["observation_tokens"] = t.observation_tokens
+        record["observation_targets"] = t.observation_target_count
     if content:
         record["prompt"] = prompt
     return record
