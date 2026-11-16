@@ -58,11 +58,9 @@ class DataConfig:
     # share of the rows, so unweighted sources behave like one shuffled concatenation.
     # "first_exhausted": the epoch ends when a source runs out (sizes unknown fall back to it).
     mix_epoch: str = "total"
-    # ECHO-style observation loss: include tool/environment outputs in training
-    # Paper: "Terminal Agents Learn World Models for Free" (ICML 2026, arxiv:2605.24517)
-    # When true, tool/observation role tokens get loss (not just assistant)
-    # Combined with DEFT: model naturally learns more from surprising observations
-    # Effect: model becomes a world model, predicting tool behavior internally
+    # Observation loss: tool / environment messages get loss too, so the model is also trained to predict
+    # what the environment returns. After ECHO (arXiv:2605.24517), which adds this loss to GRPO on the
+    # policy's own rollouts; on SFT traces its effect is not measured (see the agentic guide).
     include_observations: bool = False
     # Train on reasoning traces (<think>...</think> blocks / reasoning_content).
     # true (default): reasoning tokens get loss — required for distilling

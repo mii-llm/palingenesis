@@ -215,18 +215,13 @@ From the paper (arxiv:2605.22389):
 
 When `data.include_observations: true`, the model also gets loss on tool/environment output tokens (roles: `tool`, `observation`, `ipython`, `function`).
 
-### Why this matters (arxiv:2605.24517, ICML 2026)
+### Where the idea comes from (ECHO, arXiv:2605.24517)
 
-Standard SFT only trains on `assistant` tokens. But tool outputs contain rich information:
-- What happens when you run `ls -la`
-- What errors look like
-- How APIs respond
-- What file contents look like
-
-By training on these, the model builds an internal "world model" — it learns to PREDICT what tools will return. This means:
-- Better tool selection (knows what each tool does)
-- Better error handling (knows what errors look like)
-- Fewer unnecessary tool calls (can predict outputs without calling)
+ECHO adds a loss on the environment's observations to reinforcement learning (GRPO): the policy predicts what its
+own actions produce, and the paper reports GRPO's TerminalBench-2.0 pass@1 roughly doubled. This option applies the
+same loss to SFT traces, where the observations follow someone else's actions; that use is not measured. Treat it as
+an experiment, and avoid it on outputs the model cannot predict (IDs, timestamps, search results, long dumps). See the
+agentic guide on the documentation site.
 
 ### Configuration
 
@@ -424,7 +419,7 @@ Why: Repetition helps for hard tasks. But increase weight_decay to 0.3 for multi
 ### 5. Ignoring tool outputs
 
 ❌ Standard masking (only assistant tokens get loss)
-✓ `include_observations: true` (ECHO: model learns world model for free)
+✓ `include_observations: true` only as a measured experiment (observation loss; untested in SFT)
 
 ### 6. Uniform turn weighting
 
