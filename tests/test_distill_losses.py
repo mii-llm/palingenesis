@@ -262,3 +262,13 @@ def test_mixing_teachers_is_a_weighted_mean_per_token():
     da, db = kd(lp_a), kd(lp_b)
     expected = float(((da + 3 * db) / 4)[:2].sum() + da[2:].sum())  # rows 2-3: teacher a only
     assert math.isclose(both, expected, rel_tol=1e-5)
+
+
+def test_log1mexp_gradient_is_finite_where_fp32_rounds_exp_to_one():
+    # a student whose top-k mass rounds to 1 in fp32 (tail just below 0): the tail bucket must not give a NaN gradient
+    x = torch.tensor([-2e-8, -5e-8, -1e-6, -0.3, -5.0, 0.0], requires_grad=True)
+    y = L.log1mexp(x)
+    y.sum().backward()
+    assert torch.isfinite(y).all() and torch.isfinite(x.grad).all()
+    ref = torch.log(-torch.expm1(x.detach().double().clamp(max=math.log1p(-L.TAIL_FLOOR))))
+    torch.testing.assert_close(y.double(), ref, rtol=1e-5, atol=1e-6)

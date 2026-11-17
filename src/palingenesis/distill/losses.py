@@ -71,7 +71,15 @@ def divergence(lp: Tensor, lq: Tensor, mask: Tensor | None, kind: str, beta: flo
 def log1mexp(x: Tensor) -> Tensor:
     """log(1 - exp(x)) for x <= 0, floored at log(TAIL_FLOOR)."""
     x = x.clamp(max=math.log1p(-TAIL_FLOOR))
-    return torch.where(x > -math.log(2), torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
+    near_zero = x > -math.log(2)
+    # Each branch only sees the inputs it is selected for: in fp32 exp(x) rounds to 1 for x just below 0, where
+    # log1p(-exp(x)) has an infinite gradient, and torch.where would turn the unselected branch's 0 * inf into NaN.
+    filler = torch.full_like(x, -1.0)
+    return torch.where(
+        near_zero,
+        torch.log(-torch.expm1(torch.where(near_zero, x, filler))),
+        torch.log1p(-torch.exp(torch.where(near_zero, filler, x))),
+    )
 
 
 def dense_support(

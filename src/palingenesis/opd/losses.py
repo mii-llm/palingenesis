@@ -170,7 +170,13 @@ def _to_host(stats: dict) -> None:
 def _log1mexp(x: Tensor) -> Tensor:
     """log(1 - exp(x)) for x <= 0, at least ~log(TAIL_FLOOR)."""
     x = x.clamp(max=-TAIL_FLOOR)
-    return torch.where(x > -math.log(2), torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
+    near_zero = x > -math.log(2)
+    filler = torch.full_like(x, -1.0)  # each branch only sees its own inputs (no 0 * inf in the backward)
+    return torch.where(
+        near_zero,
+        torch.log(-torch.expm1(torch.where(near_zero, x, filler))),
+        torch.log1p(-torch.exp(torch.where(near_zero, filler, x))),
+    )
 
 
 def coarse_kl(student_lp: Tensor, teacher_lp: Tensor, valid: Tensor, beta: float) -> Tensor:
