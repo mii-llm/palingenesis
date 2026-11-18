@@ -134,7 +134,7 @@ $v$ runs over the vocabulary (for a cached teacher: its top-k, the gold token an
 
 - `temperature` $T$ softens both distributions; with `temperature_scale: true` (default) the divergence is multiplied by $T^2$, which keeps gradient magnitudes comparable across temperatures (Hinton et al.).
 - `ce_weight` mixes in cross-entropy on the gold token; `kd_weight: 0` turns distillation into plain SFT plus whatever features / plugins add.
-- The data's per-token weights apply (`data.turn_scaling`), and only trained tokens are distilled: chat masking decides what the teacher supervises (assistant turns, `include_observations`, `train_on_reasoning`, per-message `"loss": false`). Pretraining-mode sources (`mode: pretrain`) distill every token.
+- The data's per-token weights apply (`data.turn_scaling`, the observation loss's), and only trained tokens are distilled: chat masking decides what the teacher supervises (assistant turns, `include_observations`, `train_on_reasoning`, per-message `"loss": false`). Pretraining-mode sources (`mode: pretrain`) distill every token.
 - `train/kd_loss` (per covered token), `train/gold_ce` (cross-entropy on the gold tokens, always reported), `train/kd_coverage`, `train/kd/<teacher>`.
 
 ## Context distillation (teacher views)

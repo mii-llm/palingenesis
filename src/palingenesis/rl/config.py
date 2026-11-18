@@ -9,7 +9,9 @@ and options that would do nothing in the selected mode are rejected up front.
 """
 
 import dataclasses
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -299,6 +301,20 @@ class RLLossConfig:
     # (.reward, .rewards, .messages, .finish, .tokens); it changes .reward in place and may log terms in .rewards.
     # Async functions are awaited; a function that raises leaves the group's rewards as they were (logged).
     group_shaping: str = ""
+    # Observation loss (ECHO, arXiv:2605.24517): λ x the cross-entropy of the environment's output in the policy's own
+    # trajectories (the tool results, not the chat template's glue), per trajectory summed over its observation
+    # targets and divided by its observation length, averaged over the step's trajectories that have observations,
+    # added to the policy loss. Trains the policy to predict what its actions return. 0 = off (no cost); the paper
+    # used 0.05 (0.01-0.05 worked, 0.1 degraded, 0.2 could collapse). Logged as loss/observation (the mean NLL per
+    # target token) and observation_tokens. Needs a fast tokenizer.
+    observation_weight: float = 0.0
+    # Regular expressions (Python re, DOTALL) of text inside observations that is not the environment's output
+    # (a harness's warnings or notes): matched text is not a target, its tokens still count in the observation length
+    # (the paper's normalisation by |O|, not |O'|). Always left out besides these: the trainer's own messages (the
+    # error answering a malformed call, a text protocol's format error), the marker env.max_tool_output_tokens
+    # writes where it cuts an output, and what the environment declares as its own text (observation_notes;
+    # HarborEnv: the harness profile's, e.g. terminus-2's warning prefix).
+    observation_exclude: list = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -702,6 +718,13 @@ class RLConfig:
                     errors.append(f"model.{name} must be a number of pixels (0: the checkpoint's own).")
         elif m.train_vision_tower or m.train_projector or e.max_images:
             errors.append("model.train_vision_tower / train_projector and env.max_images need model.multimodal: true.")
+        if not math.isfinite(loss.observation_weight) or loss.observation_weight < 0:
+            errors.append(f"loss.observation_weight must be a finite number >= 0, got {loss.observation_weight}.")
+        for pattern in loss.observation_exclude or []:
+            try:
+                re.compile(str(pattern))
+            except re.error as error:
+                errors.append(f"loss.observation_exclude: {pattern!r} is not a regular expression ({error}).")
         if (loss.kl_coef > 0 or loss.kl_ref_reset > 0) and not loss.kl_ref:
             errors.append('loss.kl_coef / kl_ref_reset need loss.kl_ref ("start" or a checkpoint).')
         # FSDP2 shards the policy with train.fsdp, with train.cpu_offload and under torchrun (rl.parallel)

@@ -76,7 +76,7 @@ import torch.nn.functional as F
 from transformers import cache_utils as cu
 
 from palingenesis.logits import output_head, verify_output_head
-from palingenesis.loss import chunked_cross_entropy_loss, shift_labels
+from palingenesis.loss import chunked_cross_entropy_loss, shift_labels, shift_weights
 from palingenesis.moe import routing_active, sync_routing, token_window
 from palingenesis.seco_attention import KVStore, check_host_budget, chunk_attention, reset_host_budget
 
@@ -388,6 +388,7 @@ def _chunkwise(
     loss_fn=None,
     stable_softmax: bool = False,
     position_ids: torch.Tensor | None = None,
+    weights: torch.Tensor | None = None,
 ) -> ChunkwiseResult:
     """Accumulate d(loss)/d(params) into `.grad`, chunk by chunk; the caller must
     NOT call `.backward()` afterwards.
@@ -411,6 +412,9 @@ def _chunkwise(
     stable_softmax: the chunk's cross-entropy from palingenesis.stable_softmax (train.stable_softmax).
     position_ids: [B, S] of packed rows, restarting at 0 at every document (data.packing): every document
                 is trained on its own (module doc). Exact SeCO only.
+    weights:    [B, S] per-token loss weights aligned with the labels (data.turn_scaling, the observation loss),
+                shifted here like them; they scale each token's cross-entropy (not a loss_fn's: distillation
+                weighs its own targets).
     """
     backbone, lm_head = _backbone(model), _lm_head(model)
     if getattr(backbone, "gradient_checkpointing", False) and backbone.training:
@@ -429,6 +433,7 @@ def _chunkwise(
             "SeCO on packed rows does not support MoE router balancing: set data.packing: false or moe.balance: false."
         )
     shifted = shift_labels(labels, position_ids)
+    shifted_weights = shift_weights(weights) if weights is not None else None
     denom = float(loss_denom if loss_denom is not None else max((shifted != IGNORE_INDEX).sum().item(), 1))
     loss_chunks = num_loss_chunks or (lambda n: 1)
 
@@ -451,6 +456,7 @@ def _chunkwise(
                     lm_head,
                     num_chunks=loss_chunks(hidden.shape[0] * hidden.shape[1]),
                     global_valid_tokens=denom / weight,
+                    weights=view(shifted_weights)[:, lo:hi] if shifted_weights is not None else None,
                     stable=stable_softmax,
                 )
             elif spans is None:

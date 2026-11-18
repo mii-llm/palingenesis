@@ -42,8 +42,10 @@ def test_seco_chunks_are_shorter_than_the_sequence():
 
 
 def test_settings_the_config_refuses_are_skipped_with_the_reason():
-    by_name = {c.name: c for c in candidates(_config(turn_scaling="progressive"))}
-    assert "turn_scaling" in by_name["SeCO, 4096-token chunks"].skipped
+    c = _config()
+    c.logging.rl_readiness = True  # needs full-sequence hidden states, which SeCO does not keep
+    by_name = {x.name: x for x in candidates(c)}
+    assert "rl_readiness" in by_name["SeCO, 4096-token chunks"].skipped
     assert not by_name["full checkpointing"].skipped
 
 

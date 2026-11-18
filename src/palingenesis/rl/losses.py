@@ -26,6 +26,10 @@ S is the sequence mask (Trust Region Masking): a trajectory whose mean |ρ - 1| 
 loss.seq_mask is dropped whole, since token-level clipping cannot bound a long sequence's
 divergence. All coefficients are detached: the loss's value is not an objective, its
 gradient is.
+
+The observation loss (loss.observation_weight, ECHO) is added to any of them: λ x the mean over trajectories of
+the summed NLL of the environment's output tokens divided by the trajectory's observation length
+(observation_weights gives each target its weight).
 """
 
 import math
@@ -416,3 +420,19 @@ def token_weights(groups, aggregation: str, budget: int, sequence_level: bool = 
             else:
                 weights[id(t)] = 1.0 / (sequences * budget)
     return weights
+
+
+def observation_weights(trajectories, weight: float, reduce=None) -> dict[int, float]:
+    """The observation loss (ECHO, arXiv:2605.24517; loss.observation_weight): per trajectory with observations,
+    keyed by id(trajectory), the weight of each of its targets' NLL,
+        λ / (trajectories with observations, over the ranks x the trajectory's observation length |O|),
+    so that the step adds λ x the mean over those trajectories of (summed target NLL / |O|): each trajectory's
+    observation term is normalised by its observation length (targets or not), as in the paper, and averaged over
+    trajectories like the policy loss over prompts. Empty when the loss is off."""
+    if weight <= 0:
+        return {}
+    observed = [t for t in trajectories if t.observation_tokens]
+    count = len(observed)
+    if reduce is not None:
+        count = reduce([count])[0]
+    return {id(t): weight / (count * t.observation_tokens) for t in observed}

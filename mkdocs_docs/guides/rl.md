@@ -281,6 +281,7 @@ With ρ = π_θ/μ the ratio of the trained policy to the sampler on a token, A 
 | `loss.aggregation` | `prompt` (default), `token`, `constant` | Token mean per prompt, then over prompts (ScaleRL); mean over all tokens (DAPO); sum over a constant budget (Dr. GRPO: no length bias) |
 | `loss.seq_mask` | `0.1` | Drop a trajectory whose mean \|ρ - 1\| exceeds this (Trust Region Masking 2512.23075, Dec 2025; its suggested range is 0.03 to 0.10) |
 | `loss.kl_ref`, `kl_coef`, `kl_ref_reset` | off | KL to a frozen reference, optionally reset every N steps (DeepSeek-R1 keeps 0.001 with resets; ProRL 2505.24864 resets when progress stalls) |
+| `loss.observation_weight`, `observation_exclude` | `0` (off), `[]` | The observation loss: λ × the NLL of the environment's output in the policy's own multi-turn trajectories, added to the policy loss (ECHO 2605.24517, which used λ = 0.05); see [below](#observation-loss) |
 
 Published recipes as options: DAPO is `masked_is` with `aggregation: token` and `overlong_buffer`; ScaleRL is `cispo` with the defaults and `data.retire_above: 0.9`; Dr. GRPO is `advantage_std: none` with `aggregation: constant`; RLOO is `reinforce` with `baseline: leave_one_out` and `advantage_std: none`.
 
@@ -289,6 +290,16 @@ Why the defaults: ScaleRL, the one large comparison across recipes, found that t
 What is verified: each objective's gradient is tested against a hand-computed value, and on samples of the policy itself all six give the exact policy gradient of the expected reward (`tests/test_rl.py`); the trainer runs end to end with each switch on CPU. `reinforce`, `ipo` and `leave_one_out` have no GPU benchmark behind them in this repository yet. Not implemented, because they need a second model or a different loop: learned or Monte Carlo value baselines (VinePPO 2410.01679: better credit assignment at 2 to 5 times the cost per step), a decoupled proximal policy for high staleness (AReaL 2505.24298), sequence-level tapered weights for offline data (TOPR 2503.14286).
 
 Every step logs what to watch: `reward` and `rewards/*`, `policy/abs_ratio_dev` and `policy/mismatch_k3` (sampler/trainer agreement; a rise precedes collapse), `policy/clipped`, `policy/seq_masked`, `policy/entropy`, `groups/zero_variance`, `truncated`, `skipped`, and the time split (`time/rollout`, `time/train`). Rollout diagnostics: `engine/seqs_mean` (sequences decoding at once), `engine/tail_s` (time with under a quarter of the peak left), `engine/prefix_hit` and `engine/prefill_tokens`, `groups/continued`. `logging.dump_trajectories: N` writes every Nth batch (turns, tool calls and outputs, rewards and their components, advantages, per-turn and per-tool timing, zero-variance groups too; `logging.dump_groups` samples groups) and the engine's concurrency timeline to `<output_dir>/rollouts/`, on a background thread. Read it before tuning anything: `pgs rollouts --dir <output_dir>` reports finish reasons, tool errors and latency, loops and the worst trajectories ([Observability](observability.md)). `pgs monitor` and `pgs loss` read the step lines of the log; `logging.use_wandb`, `logging.use_trackio` and `logging.trackers` send the metrics to a tracker.
+
+### Observation loss
+
+```yaml
+loss:
+  observation_weight: 0.05          # λ; 0 (the default) turns it off
+  observation_exclude: ['\A\[hint\][^\n]*\n']   # optional: harness text in tool results, not a target
+```
+
+With a multi-turn environment, the policy is also trained to predict what its actions return: the tool results' tokens in its own trajectories get a cross-entropy term, added to the policy loss of any `loss.type`. Per trajectory the term is the summed NLL of its targets divided by its observation length (all its tool-result tokens, targets or not), and the step adds λ × the mean over its trajectories that have observations: ECHO's $\mathcal{L}_{\text{GRPO}} + \lambda \mathcal{L}_{\text{Env}}$ ([arXiv:2605.24517](https://arxiv.org/abs/2605.24517); the paper does not state the batch average). The targets are the text of the tool results as the chat template renders it, never the template's markup or an image placeholder; the trainer's own messages (the answer to a malformed call, a format error), the truncation marker of `env.max_tool_output_tokens`, text the environment declares in `observation_notes` (HarborEnv: its harness profile's, e.g. terminus-2's warning prefix) and `loss.observation_exclude` matches count in the length but are not targets. Steps log `loss/observation` (mean NLL per target token) and `observation_tokens`. The paper reports gains from base models on terminal tasks and small ones from an SFT'd policy, at λ = 0.05 (0.01–0.05 worked, 0.1 degraded, 0.2 could collapse); nothing has been measured with it here. Details and the SFT counterpart: [Agentic training](agentic-training.md#observation-loss-include_observations).
 
 ## Sampler/trainer agreement
 

@@ -6,6 +6,7 @@ STATUS convention for features:
   # STATUS: experimental — Single-paper, limited testing, use with monitoring
 """
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -58,10 +59,19 @@ class DataConfig:
     # share of the rows, so unweighted sources behave like one shuffled concatenation.
     # "first_exhausted": the epoch ends when a source runs out (sizes unknown fall back to it).
     mix_epoch: str = "total"
-    # Observation loss: tool / environment messages get loss too, so the model is also trained to predict
-    # what the environment returns. After ECHO (arXiv:2605.24517), which adds this loss to GRPO on the
-    # policy's own rollouts; on SFT traces its effect is not measured (see the agentic guide).
+    # Observation loss: the text of tool / environment messages gets loss too (never the template's wrapper: role
+    # headers, <tool_response> tags), so the model is also trained to predict what the environment returns. After
+    # ECHO (arXiv:2605.24517), which adds this loss with weight 0.05 to GRPO on the policy's own rollouts (pgs rl:
+    # loss.observation_weight); on SFT traces its effect is not measured (see the agentic guide).
     include_observations: bool = False
+    # Weight λ of the observation loss. With observation_normalization "conversation" each conversation's loss is
+    # its assistant loss + λ x the mean NLL of its observation tokens (ECHO's per-sequence normalisation by the
+    # observation length), and the loss's token count (its denominator) counts assistant tokens only, so tool
+    # outputs no longer dilute the assistant's loss. "token": observation tokens are trained like assistant tokens
+    # with weight λ per token and counted in the denominator; observation_weight 1.0 with "token" is the behaviour
+    # of include_observations before observation_weight existed.
+    observation_weight: float = 0.05
+    observation_normalization: str = "conversation"
     # Train on reasoning traces (<think>...</think> blocks / reasoning_content).
     # true (default): reasoning tokens get loss — required for distilling
     #   reasoning behavior from traces (the whole point of reasoning datasets).
@@ -834,12 +844,13 @@ class Config:
         for knob in ("loop_recovery", "reasoning_loop_recovery"):
             if not 0.0 <= getattr(self.data, knob) <= 1.0:
                 errors.append(f"data.{knob} must be in [0, 1], got {getattr(self.data, knob)}.")
+        errors.extend(self._observation_errors())
         if self.data.turn_scaling not in ("uniform", "progressive", "last_heavy"):
             errors.append(
                 f"data.turn_scaling={self.data.turn_scaling!r} is not one of uniform, progressive, last_heavy."
             )
         elif self.data.turn_scaling != "uniform":
-            # Per-token weights reach CE, chunked CE, CCE and the chunked gated objectives.
+            # Per-token weights reach CE, chunked CE, CCE, SeCO and the chunked gated objectives.
             gated = self.plugins.dft or self.plugins.cadft or self.plugins.info_sft or self.plugins.deft
             unweighted = [
                 name
@@ -849,7 +860,6 @@ class Config:
                         "plugins.deft/dft/cadft/info_sft without memory.chunked_loss",
                         gated and not self.memory.chunked_loss,
                     ),
-                    ("memory.seco", self.memory.seco),
                     ("dpo.enabled", self.dpo.enabled),
                 )
                 if on
@@ -1007,6 +1017,41 @@ class Config:
                 "parallel.cpu_offload": p.cpu_offload,
             }
             errors += [f"parallel.expert_parallel does not support {name}." for name, on in unsupported.items() if on]
+        return errors
+
+    def _observation_errors(self) -> list[str]:
+        """data.observation_weight / observation_normalization, and the objectives that cannot apply them."""
+        d = self.data
+        errors: list[str] = []
+        if not math.isfinite(d.observation_weight) or d.observation_weight < 0:
+            errors.append(f"data.observation_weight must be a finite number >= 0, got {d.observation_weight}.")
+        if d.observation_normalization not in ("conversation", "token"):
+            errors.append(
+                f"data.observation_normalization={d.observation_normalization!r} is not one of conversation, token."
+            )
+        weighted = d.observation_normalization == "conversation" or d.observation_weight != 1.0
+        if d.include_observations and weighted:
+            # the observation term is carried by per-token weights and, per conversation, an assistant-only
+            # denominator: objectives that ignore the weights would train observations at full weight
+            gated = self.plugins.dft or self.plugins.cadft or self.plugins.info_sft or self.plugins.deft
+            unweighted = [
+                name
+                for name, on in (
+                    ("plugins.pre_rl", self.plugins.pre_rl),
+                    (
+                        "plugins.deft/dft/cadft/info_sft without memory.chunked_loss",
+                        gated and not self.memory.chunked_loss,
+                    ),
+                )
+                if on
+            ]
+            if unweighted:
+                errors.append(
+                    f"data.include_observations with observation_weight={d.observation_weight} / "
+                    f"observation_normalization={d.observation_normalization!r} is not applied by "
+                    f"{', '.join(unweighted)}; use memory.chunked_loss, or observation_normalization: token with "
+                    "observation_weight: 1.0 (observation tokens trained like the assistant's)."
+                )
         return errors
 
     def _seco_errors(self) -> list[str]:

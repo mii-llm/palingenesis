@@ -105,31 +105,65 @@ Keep the share of each mode in the data close to how the model will be used: a m
 
 ## Observation loss (`include_observations`)
 
+By default tool results are context only. The observation loss also trains the model to predict what the environment returns, as an auxiliary term next to its usual loss. It comes from ECHO ([Shrivastava et al., arXiv:2605.24517](https://arxiv.org/abs/2605.24517)), and palingenesis has it in two places:
+
 ```yaml
+# pgs rl: the setting the paper tested (the policy's own rollouts)
+loss:
+  observation_weight: 0.05     # 0 = off (the default)
+
+# pgs train: SFT on recorded traces (not tested by the paper)
 data:
-  include_observations: true   # tool / observation messages also get loss
+  include_observations: true
+  observation_weight: 0.05     # the default
 ```
 
-By default tool results are context only. With `include_observations: true` they get loss too, so the model is also trained to predict what the environment returns.
+What the paper does: $\mathcal{L}_{\text{ECHO}} = \mathcal{L}_{\text{GRPO}}(\theta; \mathcal{A}) + \lambda \, \mathcal{L}_{\text{Env}}(\theta; \mathcal{O}')$, where $\mathcal{L}_{\text{Env}}$ is the negative log-likelihood of the observation targets $\mathcal{O}'$ of a rollout (the environment's output, without the harness's warning prefix), summed and divided by the rollout's whole observation length $|\mathcal{O}|$ ("so runs with different target subsets remain comparable"). The paper does not say how the per-sequence terms are averaged over a batch. It sweeps $\lambda \in \{0.001, \ldots, 0.2\}$: 0.01–0.05 worked, runs degraded at 0.1 and could collapse at 0.2; the main text uses a constant $\lambda = 0.05$ in all reported runs, while an appendix lists $\lambda \in \{0.02, 0.05\}$ ("SFT vs. base") without saying which run used 0.02.
 
-The idea comes from ECHO ([Shrivastava et al., arXiv:2605.24517](https://arxiv.org/abs/2605.24517)), but this option is not what the paper tested:
+| | ECHO (the paper) | `pgs rl`: `loss.observation_weight` | `pgs train`: `data.include_observations` |
+|---|---|---|---|
+| Training | GRPO, 16 rollouts per prompt | any `loss.type` (the term is added to the policy loss) | SFT |
+| Whose observations | the policy's own rollouts | the policy's own rollouts | the traces' (someone else's actions) |
+| Weight λ | 0.05 (0.01–0.05 worked) | `loss.observation_weight`, default 0 (off); 0.05 is the paper's | `data.observation_weight`, default 0.05 |
+| Normalisation | per rollout: summed NLL over $\mathcal{O}'$ / $\lvert\mathcal{O}\rvert$; batch average not stated | per trajectory: summed NLL over its targets / its observation length $\lvert\mathcal{O}\rvert$, averaged over the step's trajectories that have observations | per conversation: λ × the mean NLL of its observation tokens, added to its assistant loss (below) |
+| Which tokens | the environment's output, without the harness's warning prefix | the text of the tool results; not the chat template's markup, not the trainer's own messages, not text the harness declares as its own or `loss.observation_exclude` matches (below) | the text of tool / observation messages and tool-output blocks; not the chat template's markup |
+| Measured | the results below | nothing yet: implemented and unit-tested, no training run | nothing yet: implemented and unit-tested, no training run |
 
-| | ECHO (the paper) | `include_observations` (here) |
-|---|---|---|
-| Training | RL (GRPO, 16 rollouts per prompt), the loss added to the policy-gradient loss | SFT |
-| Whose observations | the policy's own rollouts | the traces' (someone else's actions) |
-| Weight | λ = 0.05; 0.01–0.05 worked, runs degraded at 0.1 and could collapse at 0.2 | the same weight as the assistant's tokens |
-| Normalisation | divided by the observation length | the trainer's usual token normalisation |
-| Which tokens | the environment's output, without the harness's own warning prefix | every token of the tool / observation messages |
+What the paper reports (terminal tasks, Table 1): starting from base models, ECHO beats GRPO on every benchmark, e.g. TerminalBench-2.0 pass@1 2.70 → 5.17 (Qwen3-8B) and 5.17 → 10.79 (Qwen3-14B), where the paper puts the standard error near 1.5 points. Starting from a policy already fine-tuned on expert demonstrations, the gains are small (TerminalBench-2.0 pass@1 7.64 → 7.87, pass@3 slightly lower). Episodes got shorter for two of the three starting policies. The paper does not use the loss in SFT, and does not measure tool selection or error recovery.
 
-What the paper reports (terminal tasks, Table 1): starting from base models, ECHO beats GRPO on every benchmark, e.g. TerminalBench-2.0 pass@1 2.70 → 5.17 (Qwen3-8B) and 5.17 → 10.79 (Qwen3-14B), where the paper puts the standard error near 1.5 points. Starting from a policy already fine-tuned on expert demonstrations, the gains are small (TerminalBench-2.0 pass@1 7.64 → 7.87, pass@3 slightly lower). Episodes got shorter for two of the three starting policies. The paper does not test the loss in SFT, and does not measure tool selection or error recovery.
+### In RL (`loss.observation_weight`)
 
-So treat this option as an untested experiment: compare it against the default on your own evals, and expect it to need a much smaller weight than the assistant's tokens get, which this option does not offer yet.
+Each trajectory's term is the summed NLL of its observation targets divided by its observation length $\lvert\mathcal{O}\rvert$ (the tokens of the tool results, targets or not, as in the paper); the step adds λ × the mean of these terms over its trajectories that have observations. The NLL is the model's own (logits not scaled by the sampling temperature: the policy did not sample these tokens).
 
-When to try it, and when not:
+- **Targets**: the tokens of each tool result's text as the chat template renders it, never the template's markup (role headers, `<tool_response>` tags, the whitespace around the text). Image placeholders are never targets.
+- **Counted in $\lvert\mathcal{O}\rvert$ but not targets**: the trainer's own messages (the error answering a malformed tool call, a text protocol's format error), the `...[N tokens truncated]...` marker `env.max_tool_output_tokens` writes, the text an environment declares in its `observation_notes` (regular expressions; HarborEnv takes its harness profile's: terminus-2's `Previous response had warnings:` prefix, the paper's case), and whatever `loss.observation_exclude` matches. The error of a tool that raised (`Error: ...`) is the environment's answer and stays a target; add a pattern to leave it out.
+- It works with every `loss.type`, gradient accumulation, FSDP, prompt sharing, context rewrites (dropped screenshots: targets stay with the context they were read in), multimodal policies and MoE routing replay. It needs a fast tokenizer. Off (`0`), the train step is unchanged.
+- Logged: `loss/observation` (the mean NLL per target token) and `observation_tokens` (targets in the step); `loss` includes the term. Trajectory dumps add `observation_tokens` and `observation_targets` per trajectory.
+
+### In SFT (`data.include_observations`)
+
+Per conversation the loss is its assistant loss plus λ × the mean NLL of its observation tokens; the trainer's token count (the loss's denominator) counts assistant tokens only, so long tool outputs no longer dilute the assistant's loss. Over a batch,
+
+$$
+\mathcal{L} = \frac{\sum_c \Big( \sum_{t \in A_c} w_t \, \ell_t \; + \; \lambda \, |A_c| \, \frac{1}{|O_c|} \sum_{t \in O_c} \ell_t \Big)}{\sum_c |A_c|}
+$$
+
+with $A_c$ the assistant tokens of conversation $c$, $O_c$ its observation tokens, $\ell_t$ the token's cross-entropy and $w_t$ the [turn-scaling](#turn-scaling) weight (1 by default): each conversation's observation term is weighted by its share of the assistant tokens, like its assistant loss. It is carried by per-token loss weights, so plain, chunked and Cut Cross-Entropy, the chunked DEFT-family objectives, packing, SeCO, context parallel, pre-tokenized caches and off-policy distillation apply it the same way; `plugins.pre_rl` and the DEFT family without `memory.chunked_loss` ignore the weights and are refused. A conversation whose only targets are observations is dropped. The held-out loss (`eval/loss`) measures the assistant's tokens.
+
+!!! warning "Behaviour change"
+    Before `data.observation_weight` existed, `include_observations: true` trained every token of the tool messages, wrapper tokens included, at the assistant's weight and counted them in the denominator. Now it trains the tool text at λ = 0.05 per conversation. To get the old weighting back (on the text only):
+
+    ```yaml
+    data:
+      include_observations: true
+      observation_normalization: token   # observation tokens like assistant tokens, counted in the denominator
+      observation_weight: 1.0            # their per-token weight
+    ```
+
+Treat both as untested experiments: compare against the run without the loss on your own evals. When to try it, and when not:
 
 - **Plausible**: environments whose outputs are mostly determined by the action (file contents, compiler errors, test output, structured API responses).
-- **Avoid**: outputs that are noise to the model (random IDs, timestamps, web search results, very long dumps). They add loss on tokens the model cannot predict, and on long tool outputs they can outweigh the assistant's own tokens.
+- **Avoid**: outputs that are noise to the model (random IDs, timestamps, web search results, very long dumps): loss on tokens the model cannot predict. Per-conversation normalisation keeps a long dump from outweighing the assistant's tokens, but it still sets the direction of the term.
 
 ---
 
@@ -146,7 +180,7 @@ data:
 | `progressive` | weight $w_k = \sqrt{k / K}$ for the $k$-th of $K$ trained turns |
 | `last_heavy` | the final turn gets weight 2, the others 1 |
 
-The rationale for `progressive` / `last_heavy` is that early turns of a long trace are often exploration and the late ones produce the solution. It is a heuristic, not a measured result: compare it with `uniform` on your evals. Weights are normalised to mean 1 per conversation, so the loss scale does not change. They are applied by the cross-entropy losses (plain, chunked, Cut Cross-Entropy); SeCO, DPO and the other objectives refuse a non-uniform `turn_scaling`.
+The rationale for `progressive` / `last_heavy` is that early turns of a long trace are often exploration and the late ones produce the solution. It is a heuristic, not a measured result: compare it with `uniform` on your evals. Weights are normalised to mean 1 per conversation, so the loss scale does not change. They are applied by the cross-entropy losses (plain, chunked, Cut Cross-Entropy, the chunked DEFT-family objectives) and by SeCO; DPO, `plugins.pre_rl` and the DEFT family without `memory.chunked_loss` refuse a non-uniform `turn_scaling`.
 
 ---
 
