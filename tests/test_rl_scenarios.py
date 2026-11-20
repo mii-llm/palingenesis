@@ -1062,17 +1062,22 @@ def test_two_ranks_with_a_replicated_base_stay_one_policy(tmp_path):
         subprocess.Popen(
             [sys.executable, "-m", "palingenesis.rl.trainer", "--config", str(tmp_path / "rl.yaml")],
             env={**environment, "RANK": str(rank), "LOCAL_RANK": str(rank)},
-            stdout=subprocess.PIPE,
+            stdout=open(tmp_path / f"rank{rank}.log", "w"),
             stderr=subprocess.STDOUT,
-            text=True,
         )
         for rank in range(2)
     ]
     try:
-        outputs = [process.communicate(timeout=240)[0] for process in ranks]
+        deadline = time.monotonic() + 240
+        while time.monotonic() < deadline and all(process.poll() in (None, 0) for process in ranks):
+            if all(process.poll() == 0 for process in ranks):
+                break
+            time.sleep(0.2)  # a rank that fails leaves the other waiting in a collective: stop both
     finally:
         for process in ranks:
             process.kill()
+            process.wait()
+        outputs = [(tmp_path / f"rank{rank}.log").read_text() for rank in range(2)]
     assert [process.returncode for process in ranks] == [0, 0], outputs[0][-2000:] + outputs[1][-2000:]
     assert "step 3 |" in outputs[0] and "role/a/reward" in outputs[0]
     step = tmp_path / "run" / "step_3"

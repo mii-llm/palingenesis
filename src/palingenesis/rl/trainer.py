@@ -1186,7 +1186,7 @@ class RLTrainer:
                 if self.adapters is None:
                     _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
                 elif self.parallel.replicated and not self.parallel.main:
-                    pass  # every rank holds the same policy: rank 0 writes it
+                    path.mkdir(parents=True, exist_ok=True)  # every rank holds the same policy: rank 0 writes it
                 else:  # the folded model in float32 (a plain checkpoint) and <path>/adapter
                     export = self.adapters.export(path)
                     _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp, export)
