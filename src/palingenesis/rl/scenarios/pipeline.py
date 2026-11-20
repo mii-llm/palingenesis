@@ -262,7 +262,8 @@ class ScenarioPipeline(RLPipeline, Host):
             else:
                 messages.insert(0, {"role": "system", "content": spec.system_prompt})
         if spec.partner is not None:
-            return PartnerSession(session, spec.partner, tools, limits.get("max_turns") or PARTNER_TURNS)
+            turns = limits.get("max_turns") or PARTNER_TURNS
+            return PartnerSession(session, spec.partner, tools, turns, conversational)
         session.trained = spec.train
         view = copy.copy(self)  # the turn loop with this session's engine, limits and port
         view.client, view.config = self.clients[spec.engine], self.role_configs[session.role]
@@ -291,7 +292,12 @@ class ScenarioPipeline(RLPipeline, Host):
         episode.temperature = temperature
         failure = None
         try:
-            await asyncio.wait_for(self.scenario.run(episode, row), self.config.scenario.timeout)
+
+            async def whole():
+                await self.scenario.run(episode, row)
+                await episode.join()  # work the scenario spawned without waiting for it
+
+            await asyncio.wait_for(whole(), self.config.scenario.timeout)
             for live in episode.live:
                 await live.close()
         except asyncio.CancelledError:

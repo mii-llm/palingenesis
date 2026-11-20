@@ -16,11 +16,12 @@ placement  a cluster description turned into a layout of trainers and rollout en
 """
 
 from palingenesis.rl.scenarios.base import BUILTIN, Scenario, build_scenario, scenario_class
-from palingenesis.rl.scenarios.runtime import Channel, Episode, LiveSession, Session, play
+from palingenesis.rl.scenarios.runtime import Channel, EndSession, Episode, LiveSession, Session, play
 
 __all__ = [
     "BUILTIN",
     "Channel",
+    "EndSession",
     "Episode",
     "LiveSession",
     "Scenario",

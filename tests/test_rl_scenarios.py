@@ -1089,3 +1089,106 @@ def test_two_ranks_with_a_replicated_base_stay_one_policy(tmp_path):
         torch.testing.assert_close(states[0][key]["exp_avg"], states[1][key]["exp_avg"], rtol=0, atol=0)
         moved += bool(states[0][key]["exp_avg"].abs().sum() > 0)
     assert moved > 0
+
+
+# ------------------------------------- background work, notifications, ending a session
+
+
+class Background(Scenario):
+    """A lead in the style of an agent harness: `spawn` starts a helper and returns at once, the helper's result
+    is left for the lead as a notification (read with its next tool result), and `finish` ends the lead's session."""
+
+    name = "background"
+    roles = ("lead", "helper")
+    outcome = "lead"
+
+    @classmethod
+    def generate(cls, n, seed=0):
+        return [{"scenario": "background", "id": f"bg-{seed}-{i}", "secret": 100 + i} for i in range(n)]
+
+    async def run(self, episode, row):
+        from palingenesis.rl.scenarios import EndSession
+
+        state = {"answer": None, "order": []}
+
+        async def spawn(brief: str) -> str:
+            """Start a helper on a sub-task without waiting for it.
+
+            Args:
+                brief: What the helper should do.
+            """
+
+            async def work():
+                helper = await episode.run("helper", [user(f"{brief} The number is {row['secret']}.")])
+                helper.reward("done", 1.0)
+                state["order"].append("helper finished")
+                lead.notify(f"[helper finished] {helper.text}")
+
+            episode.spawn(work())
+            state["order"].append("spawn returned")
+            return "started"
+
+        async def check() -> str:
+            """See whether anything has arrived."""
+            await asyncio.sleep(0.05)  # (the helper is a partner: it finishes in the meantime)
+            return "checked"
+
+        async def finish(answer: str) -> str:
+            """Give the final answer and stop.
+
+            Args:
+                answer: The answer.
+            """
+            state["answer"] = answer
+            raise EndSession("recorded")
+
+        lead = await episode.open(
+            "lead",
+            [user("Find the number.")],
+            tools={"spawn": spawn, "check": check, "finish": finish},
+            conversational=False,
+        )
+        session = await lead.done()
+        session.reward("right", float(state["answer"] == str(row["secret"])))
+        episode.shared["order"] = state["order"]
+
+
+def test_a_tool_can_spawn_work_be_notified_of_its_result_and_end_its_session():
+    def call(name, **arguments):
+        return f"<tool_call>\n{json.dumps({'name': name, 'arguments': arguments})}\n</tool_call>"
+
+    def lead(prompt, n):
+        if "<tool_response>" not in prompt:
+            return call("spawn", brief="Report the number.")
+        if "[helper finished]" not in prompt:
+            return call("check")
+        number = prompt.split("[helper finished] The number is ")[1].split(".")[0]
+        return call("finish", answer=number)
+
+    rows = Background.generate(2)
+    roles = {"helper": {"partner": f"{__file__}:echo_number"}}
+    budget = {"rollout.max_new_tokens": 128, "rollout.max_completion_tokens": 1024}
+    pipeline, engine, _ = _pipeline(f"{__file__}:Background", rows, lead, roles, **budget)
+    try:
+        groups = pipeline._await(pipeline._eval(rows, 1.0, 1))
+    finally:
+        pipeline.close()
+    for row, (t,) in zip(rows, groups):
+        assert t.role == "lead" and t.finish == "env_done" and t.reward == 1.0 and t.tool_calls == 3 and t.turns == 3
+        results = [m["content"] for m in t.messages if m["role"] == "tool"]
+        assert results[0] == "started"  # the spawn did not wait for the helper
+        assert results[1] == f"checked\n\n[helper finished] The number is {row['secret']}."  # read at a turn boundary
+        assert results[2] == "recorded" and t.messages[-1]["role"] == "tool"  # the tool ended the session
+
+    # without a model: the same scenario with partners; spawned work is awaited before the episode is scored
+    async def scripted_lead(messages, tools):
+        assert await tools["spawn"](brief="Report the number.") == "started"
+        return "no answer"  # it stops without waiting: the helper still runs to its end and is rewarded
+
+    (episode,) = play(Background(), rows[:1], {"lead": scripted_lead, "helper": echo_number})[0]
+    helper = next(s for s in episode.sessions if s.role == "helper")
+    assert helper.rewards == {"done": 1.0} and episode.shared["order"] == ["spawn returned", "helper finished"]
+
+
+def echo_number(messages):
+    return "The number is " + messages[-1]["content"].split("The number is ")[1]

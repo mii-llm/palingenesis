@@ -16,6 +16,12 @@ A scenario is `async def run(episode, row)`. It builds an episode from five thin
   credit    `session.reward(name, value)`: named components per session, combined per role with the scenario's
             weights. A component named `metric/...` is logged only; None means "does not apply".
 
+Work that does not block its caller: `episode.spawn(coroutine)` starts a task the episode waits for before it is
+scored (a tool that starts a sub-agent and returns at once), and `live.notify(text)` leaves a message for a
+running session, which it reads with the result of its next tool call or with the next answer it gets (delivery
+at a turn boundary, as agent harnesses deliver a background agent's completion or a teammate's message). A tool
+ends its own session by raising EndSession.
+
 Sessions talk through asyncio queues on the pipeline's event loop: a session waiting for another's answer is
 suspended, holds no thread and no engine slot, and the engines batch whatever turns are ready, whichever role
 or model they belong to.
@@ -38,6 +44,11 @@ from typing import Any
 
 class ScenarioError(Exception):
     """A scenario used the runtime wrongly (a programming error in the scenario, not a policy's failure)."""
+
+
+class EndSession(Exception):
+    """Raised by a tool to end the session that called it: its message is the tool's result, and the session
+    takes no further turn (a `submit` or `finish` tool, a transfer of the task to another role)."""
 
 
 CLOSE = object()  # the answer that ends an open session
@@ -145,6 +156,11 @@ class LiveSession:
     async def close(self) -> None:
         raise NotImplementedError
 
+    def notify(self, text: str) -> None:
+        """Leave `text` for the session: it reads it at its next turn boundary (with its next tool result or the
+        next answer it gets). A message for a session that takes no further turn is never read."""
+        raise NotImplementedError
+
     async def done(self) -> Session:
         await self.close()
         return self.session
@@ -159,18 +175,31 @@ them itself. Any state it needs is in `messages` (a partner object may be shared
 class PartnerSession(LiveSession):
     """A session played by a partner: text in, text out, nothing to train."""
 
-    def __init__(self, session: Session, partner: Partner, tools: dict[str, Callable] | None, max_turns: int):
+    def __init__(
+        self,
+        session: Session,
+        partner: Partner,
+        tools: dict[str, Callable] | None,
+        max_turns: int,
+        conversational: bool = True,
+    ):
         self.session, self.partner, self.tools, self.max_turns = session, partner, tools or {}, max_turns
+        self.conversational = conversational  # False: it answers its messages once, by the time it is closed
         self.turns = 0
         self.takes_tools = len(inspect.signature(partner).parameters) >= 2
         self.closed = False
+        self.notes: list[str] = []
+
+    def notify(self, text: str) -> None:
+        self.notes.append(str(text))
 
     async def say(self, reply: str | None = None) -> str | None:
         s = self.session
         if self.closed:
             return None
-        if reply is not None:
-            s.messages.append({"role": "user", "content": reply})
+        if reply is not None or self.notes:
+            notes, self.notes = self.notes, []
+            s.messages.append({"role": "user", "content": "\n\n".join([*([reply] if reply else []), *notes])})
         if self.turns >= self.max_turns:
             self.closed, s.finish = True, "turns"
             return None
@@ -185,6 +214,8 @@ class PartnerSession(LiveSession):
 
     async def close(self) -> None:
         if not self.closed:
+            if not self.conversational and self.turns == 0:
+                await self.say()
             self.closed = True
             self.session.finish = self.session.finish or "stop"
 
@@ -206,6 +237,13 @@ class SessionPort:
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.done = False
         self.closing = False
+        self.notes: list[str] = []  # messages left for the session (LiveSession.notify), read at its next turn boundary
+
+    def _with_notes(self, result: Any) -> Any:
+        if not self.notes or self.done:
+            return result
+        notes, self.notes = self.notes, []
+        return "\n\n".join([*([str(result)] if result not in (None, "") else []), *notes])
 
     def tool_schemas(self) -> list[dict]:
         return self.schemas
@@ -223,8 +261,14 @@ class SessionPort:
             from palingenesis.rl.env import ToolFailed
 
             raise ToolFailed(f"unknown tool {name!r}. Available tools: {', '.join(self.tools) or 'none'}.")
-        result = self.tools[name](**arguments)
-        return await result if inspect.isawaitable(result) else result
+        try:
+            result = self.tools[name](**arguments)
+            if inspect.isawaitable(result):
+                result = await result
+        except EndSession as end:
+            self.done = True
+            return str(end)
+        return self._with_notes(result)
 
     async def _exchange(self, text: str) -> str:
         if self.closing:
@@ -241,7 +285,7 @@ class SessionPort:
         if reply is CLOSE:
             self.done = True
             return ""
-        return reply
+        return self._with_notes(reply)
 
 
 class RolloutSession(LiveSession):
@@ -309,6 +353,9 @@ class RolloutSession(LiveSession):
     def cancel(self) -> None:
         self.task.cancel()
 
+    def notify(self, text: str) -> None:
+        self.port.notes.append(str(text))
+
 
 # ------------------------------------------------------------------ episode
 
@@ -353,10 +400,11 @@ class Episode:
             self.log: list[dict] = []
             self.shared: dict[str, Any] = {}
             self.counter: dict[str, int] = {}
+            self.background: list[asyncio.Task] = []
         self.rng = random.Random(stable_seed(seed, row.get("id", ""), self.path))
 
     def __getattr__(self, name: str):  # a branch shares its root's records
-        if name in ("sessions", "live", "log", "shared", "counter"):
+        if name in ("sessions", "live", "log", "shared", "counter", "background"):
             return getattr(self.__dict__["root"], name)
         raise AttributeError(name)
 
@@ -396,8 +444,6 @@ class Episode:
         """A session run to its end: the role answers `messages`, calling its tools as it needs."""
         options.setdefault("conversational", False)
         live = await self.open(role, messages, **options)
-        if isinstance(live, PartnerSession):
-            await live.say()
         return await live.done()
 
     async def branch(self, n: int, fn: Callable[["Episode"], Awaitable], label: str = "branch") -> list:
@@ -422,9 +468,28 @@ class Episode:
         ]
         return list(await asyncio.gather(*(fn(sub) for sub in subs)))
 
+    def spawn(self, work: Awaitable) -> asyncio.Task:
+        """Start `work` (a coroutine: a sub-agent's session and what follows it) without waiting for it. The
+        episode waits for it before it ends (`join`), so whatever it rewards counts, and cancels it if the
+        episode fails. A tool returns right after spawning; the result reaches the caller later, e.g. through
+        `live.notify`."""
+        task = asyncio.ensure_future(work)
+        self.background.append(task)
+        return task
+
+    async def join(self) -> None:
+        """Wait for everything spawned (including what spawned work spawns). A failure there fails the episode."""
+        done = 0
+        while done < len(self.background):
+            pending = self.background[done:]
+            done = len(self.background)
+            await asyncio.gather(*pending)
+
     async def abort(self) -> None:
         """Cancel the sessions still running (the episode failed or ran out of time)."""
-        tasks = []
+        tasks = [task for task in self.background if not task.done()]
+        for task in tasks:
+            task.cancel()
         for live in self.live:
             if isinstance(live, RolloutSession) and not live.task.done():
                 live.cancel()
@@ -466,7 +531,8 @@ class PartnerHost(Host):
         return getattr(self.partners.get(role), "__name__", role)
 
     async def open(self, episode, session, messages, tools, conversational, limits) -> LiveSession:
-        return PartnerSession(session, self.partner(session.role), tools, limits.get("max_turns") or self.max_turns)
+        turns = limits.get("max_turns") or self.max_turns
+        return PartnerSession(session, self.partner(session.role), tools, turns, conversational)
 
 
 def play(scenario: Any, rows: list[dict], partners: dict[str, Partner], seed: int = 0, episodes: int = 1) -> list:
@@ -477,6 +543,7 @@ def play(scenario: Any, rows: list[dict], partners: dict[str, Partner], seed: in
     async def one(row: dict, group: int, index: int) -> Episode:
         episode = Episode(PartnerHost(partners), row, group, index, seed, training=False)
         await scenario.run(episode, row)
+        await episode.join()
         for live in episode.live:
             await live.close()
         return episode

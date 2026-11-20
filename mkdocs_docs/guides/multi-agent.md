@@ -39,6 +39,8 @@ A scenario is `async def run(episode, row)`. It uses five things:
 | branch | a fork: *n* sub-episodes that share everything before it | `await episode.branch(n, fn)` |
 | credit | named reward components per session | `session.reward(name, value)` |
 
+Two more calls cover work that does not block its caller: `episode.spawn(coroutine)` starts a task the episode waits for before scoring, and `live.notify(text)` leaves a message a running session reads at its next turn boundary. A tool ends its own session by raising `EndSession`.
+
 A session of the trained policy is **one token-exact trajectory**, however many turns it has. Another role's message arrives as the next user message (or as a tool result), is context, and is never trained. The trainer scores exactly the tokens the sampler produced, as in single-agent RL.
 
 ```python
@@ -66,6 +68,34 @@ class Handoff(Scenario):
 ```
 
 Use it with `scenario.type: "my_file.py:Handoff"`.
+
+## Agent-harness patterns
+
+Agent harnesses compose agents in a handful of ways: a main agent that calls subagents as tools, background agents that report when they finish, mailboxes, handoffs, group chats, pipelines. A model that will run inside one should be trained on episodes shaped the same way. This is how each pattern is written with the runtime, and what it cannot do yet.
+
+| Pattern | Status | How |
+|---|---|---|
+| Subagent as a tool (fresh context, final text returned as the tool result; nested) | supported | a tool that runs a session: `async def task(brief): return (await episode.run("worker", [user(brief)])).text` |
+| Parallel subagents | supported | the tool calls of one turn run concurrently; or `asyncio.gather` / `episode.branch` in the scenario |
+| Background subagent with a completion notification | supported | the tool calls `episode.spawn(work())` and returns at once; `work` ends with `lead.notify(text)`, which the lead reads with its next tool result |
+| Messages between agents, a child reporting to its parent, steering a running agent | supported at turn boundaries | `live.notify(text)` from any code that holds the session; mailboxes are queues in `episode.shared` |
+| Resumable subagent (continue with its context intact) | supported | keep the `episode.open(...)` handle and `say(message)` again: one trajectory |
+| A tool that ends its session (submit, finish) | supported | the tool raises `EndSession(result)` |
+| Handoff (control moves to another agent) | supported | a tool raises `EndSession`, the scenario then runs the next role on the conversation so far (`session.messages`) |
+| Prompt chaining, routing, orchestrator-workers, evaluator-optimizer | supported | plain scenario code over `run` and `open` |
+| Role-play pairs, debate, voting, mixture of agents | supported | `open` sessions relayed by the scenario (`take_away`); `branch` and a merge function |
+| Group chat (selector, round robin) | supported | several open sessions; the scenario or a selector session picks the speaker and passes on the unseen messages |
+| Shared task board, blackboard | supported | a dict in `episode.shared` behind tools |
+| Verification gates (reviewer, test runner, stop hook) | supported | a session or a Python tool; a stop hook answers an open session's last message instead of closing it |
+| Workflow scripts and pipes | supported | a scenario is a workflow script; a channel is a pipe |
+| MCP tools, A2A tasks | by wrapping | MCP tools as async functions; an A2A task is a spawned session with notifications |
+| Fork (a child that inherits the running parent's context) | **not supported** | a tool cannot read its caller's live transcript; a *finished* session can be continued from its `messages` |
+| Interrupting a session in the middle of a turn | **not supported** | delivery is at turn boundaries only |
+| A shared filesystem, worktrees, containers | **not supported** | scenario tools are Python functions; no sandbox per episode yet |
+| A token budget shared by a whole delegation tree | **not supported** | limits are per session, plus `scenario.timeout` |
+| Anything that outlives an episode (schedules, long waits) | **not supported** | an episode is the unit of training |
+
+When the *model* decides the shape (how many subagents, with which briefs), sessions of one role are no longer interchangeable: give children a `slot` (their depth, or their index) so that only comparable sessions share a baseline, or pay them on a result that can be checked by itself, as `ledger_sum` does.
 
 ## The starter scenarios
 
