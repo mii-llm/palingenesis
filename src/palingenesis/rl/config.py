@@ -22,7 +22,7 @@ from palingenesis.config import MoEConfig
 
 LOSSES = ("masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce")
 BASELINES = ("mean", "leave_one_out")
-ADVANTAGE_STD = ("batch", "group", "none")
+ADVANTAGE_STD = ("batch", "group", "none", "role")
 AGGREGATIONS = ("prompt", "token", "constant")
 TRUNCATION = ("score", "mask")
 ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server")
@@ -276,8 +276,12 @@ class RLLossConfig:
     # direction, and a different estimator only where n varies between groups (failed rollouts) or the scale is kept
     # (advantage_std none); advantage_std group cancels it (refused).
     baseline: str = "mean"
-    # Advantage = reward - baseline, divided by the std of the batch / of the group / not.
+    # Advantage = reward - baseline, divided by the std of the batch / of the group / not. "role" (scenarios): the
+    # std of the same role's centred rewards over the batch, never less than advantage_std_floor, so one role's
+    # reward scale does not set another's gradient and a role whose rewards hardly differ is not scaled up to
+    # unit size.
     advantage_std: str = "batch"
+    advantage_std_floor: float = 0.0
     # prompt: mean over tokens within a prompt's group, then over prompts (ScaleRL);
     # token: mean over all tokens (DAPO); constant: sum / (sequences x max tokens) (Dr. GRPO).
     aggregation: str = "prompt"
@@ -401,6 +405,39 @@ class RLLoRAConfig:
 
 
 @dataclass(slots=True)
+class RLScenarioConfig:
+    # A multi-role scenario (palingenesis.rl.scenarios): a built-in (take_away, ledger_sum, checked_answer) or
+    # "module:Class" / "path/to/file.py:Class". Empty = single-agent RL. With a scenario, every group is
+    # rollout.group_size episodes of it on one row of data.dataset (rows from `pgs scenario generate`), rewards
+    # come from the scenario's verifier (no `rewards:` section), and `roles:` says who plays each role.
+    type: str = ""
+    args: dict = field(default_factory=dict)  # the scenario's own options (e.g. weights: {role: {component: w}})
+    timeout: float = 600.0  # seconds an episode may take; a slower one is cancelled and left out of training
+    outcome: str = ""  # the role whose reward is the task's outcome (retire / retry, pass@k); empty = the scenario's
+
+
+@dataclass(slots=True)
+class RLRoleConfig:
+    # Who plays one role of the scenario (roles.<name>). Default: the trained policy.
+    # adapter: a LoRA adapter of its own on the policy's frozen base (needs lora.rank; roles naming the same
+    #          adapter share it). Empty = the policy's own weights (or its default adapter).
+    # partner: a frozen partner instead: "base" (the policy's base with its adapters off; needs lora.rank),
+    #          "scripted:<name>" (one of the scenario's scripted partners, e.g. scripted:oracle), an
+    #          OpenAI-compatible endpoint ("http://host:port/v1", partner_args: {model: ...}) or "module:callable".
+    # train:   false = the policy plays the role and its tokens do not train (a frozen copy of the current policy).
+    adapter: str = ""
+    partner: str = ""
+    partner_args: dict = field(default_factory=dict)
+    train: bool = True
+    system_prompt: str = ""  # put before the scenario's own instructions
+    max_turns: int = 0  # 0 = the scenario's
+    max_new_tokens: int = 0  # per turn; 0 = rollout.max_new_tokens
+    max_completion_tokens: int = 0  # per session; 0 = the rollout's budget
+    chat_template_kwargs: dict = field(default_factory=dict)
+    share: float = 1.0  # the role's part of the loss, relative to the other trained roles
+
+
+@dataclass(slots=True)
 class RLLoggingConfig:
     log_every: int = 1
     # Every N steps, write the batch's trajectories (turns, tool calls and outputs, rewards, advantages,
@@ -430,6 +467,8 @@ class RLConfig:
     logging: RLLoggingConfig = field(default_factory=RLLoggingConfig)
     cmr: CMRConfig = field(default_factory=CMRConfig)  # common-mode rejection (palingenesis.cmr); off by default
     moe: MoEConfig = field(default_factory=MoEConfig)  # MoE policies: router balancing (palingenesis.moe)
+    scenario: RLScenarioConfig = field(default_factory=RLScenarioConfig)  # multi-role episodes; off by default
+    roles: dict = field(default_factory=dict)  # scenario role name -> RLRoleConfig
     lora: RLLoRAConfig = field(
         default_factory=RLLoRAConfig
     )  # low-rank adapters instead of full weights; off by default
@@ -451,7 +490,14 @@ class RLConfig:
                 continue
             if not isinstance(options, dict):
                 raise ConfigError(f"{path}: `{section}:` must be a mapping.")
-            if section == "rewards":
+            if section == "roles":
+                for name, entry in options.items():
+                    if not isinstance(entry, dict | type(None)):
+                        raise ConfigError(f"{path}: `roles.{name}:` must be a mapping.")
+                    config.roles.setdefault(name, RLRoleConfig())
+                    for key, value in (entry or {}).items():
+                        config.set(f"roles.{name}.{key}", value, where=str(path))
+            elif section == "rewards":
                 for name, entry in options.items():
                     if isinstance(entry, str):  # rewards: {correct: math}
                         entry = {"fn": entry}
@@ -496,11 +542,12 @@ class RLConfig:
         from palingenesis.config import ConfigError, _section, _set_option
 
         parts = key.split(".")
-        if parts[0] == "rewards":
+        if parts[0] in ("rewards", "roles"):
             if len(parts) != 3:
-                raise ConfigError(f"{where}: {key}: use rewards.<name>.<option> (names cannot contain dots).")
+                raise ConfigError(f"{where}: {key}: use {parts[0]}.<name>.<option> (names cannot contain dots).")
+            table, kind = (self.rewards, RewardConfig) if parts[0] == "rewards" else (self.roles, RLRoleConfig)
             section, section_name, option = (
-                self.rewards.setdefault(parts[1], RewardConfig()),
+                table.setdefault(parts[1], kind()),
                 key.rsplit(".", 1)[0],
                 parts[2],
             )
@@ -649,7 +696,15 @@ class RLConfig:
         if e.tool_parser not in TOOL_PARSERS:
             errors.append(f"env.tool_parser must be one of {TOOL_PARSERS}, got {e.tool_parser!r}.")
 
-        if not self.rewards and not python_rewards and not custom_env:
+        if self.scenario.type or self.roles or self.scenario != RLScenarioConfig():
+            from palingenesis.rl.scenarios.config import validate as validate_scenario
+
+            errors += validate_scenario(
+                self, sharded=os.environ.get("WORLD_SIZE", "1") != "1" or t.fsdp or t.cpu_offload
+            )
+        elif loss.advantage_std == "role" or loss.advantage_std_floor:
+            errors.append("loss.advantage_std role and loss.advantage_std_floor need a scenario (scenario.type).")
+        if not self.rewards and not python_rewards and not custom_env and not self.scenario.type:
             errors.append(
                 "at least one reward is required: rewards: {<name>: {fn: math}} (or an environment with get_reward)."
             )

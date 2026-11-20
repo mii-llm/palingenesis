@@ -46,6 +46,7 @@ from palingenesis.precision import SurvivalMeter, cast_state_dict
 
 logger = logging.getLogger(__name__)
 
+NAMED_DIR = "adapters"  # <checkpoint>/adapters/<name>: the named adapters of a run with several
 ADAPTER_DIR = "adapter"  # inside every checkpoint of a run with adapters
 SURVIVAL_EVERY = 50  # weight pushes between measurements of what the engine's dtype keeps of the delta
 # A delta the engine's bf16 weights mostly round away means the engine still samples close to the base while the
@@ -94,6 +95,10 @@ class PolicyAdapters:
             output_dir=config.train.output_dir,
         )
         self.lr_ratio = float(c.lr_ratio)
+        # further adapters on the same frozen base, one per name: roles of a scenario that have their own policy
+        # (roles.<name>.adapter). "" is the default adapter; `default_trains`: some role (or a plain run) uses it.
+        self.names: list[str] = []
+        self.default_trains = True
         self.resumed = False  # the adapters came from a checkpoint (apply)
         self.warned = False  # the low push_survival warning, once
         self.pushes = 0
@@ -105,9 +110,17 @@ class PolicyAdapters:
         """Freeze `model` (the policy's base, as loaded) and wrap its targeted linears; with `resume`, load that
         checkpoint's adapters. Before the model is moved, wrapped for checkpointing or sharded."""
         model = self.plugin.transform_model(model, self.ctx)
+        for name in self.names:
+            self.plugin.add_adapter(name, int(self.ctx.config.train.seed))
+        if not self.default_trains:  # every trained role has its own adapter: the default one stays at zero
+            for m in self.plugin.modules.values():
+                m.lora_A.requires_grad_(False)
+                m.lora_B.requires_grad_(False)
         if resume is not None:
             self._check_saved_settings(Path(resume) / ADAPTER_DIR)
             self.plugin.load_adapter(Path(resume) / ADAPTER_DIR)
+            for name in self.names:
+                self.plugin.load_adapter(Path(resume) / NAMED_DIR / name, name)
         self.resumed = resume is not None
         return model
 
@@ -167,6 +180,10 @@ class PolicyAdapters:
         the optimizer steps under the module names `names`."""
         split_b = self.lr_ratio != 1.0
         split_m = self.plugin.dora and self.ctx.config.train.weight_decay > 0
+        if self.names:  # one group per adapter: each is clipped by itself (adapter_of names a parameter's adapter)
+            order = ([""] if self.default_trains else []) + self.names
+            groups = [{"params": [p for p, n in zip(params, names) if adapter_of(n) == name]} for name in order]
+            return groups, [1.0] * len(groups)
         if not split_b and not split_m:
             return params, [1.0]
         kinds = [
@@ -231,6 +248,8 @@ class PolicyAdapters:
         for name, tensor in hf_state_dict_items(named):
             module, _, leaf = name.rpartition(".")
             m = modules.get(module)
+            if adapter_of(name):  # a named adapter's tensors: not part of this (the default adapter's) policy
+                continue
             if m is None or leaf not in ("weight", *ADAPTER_KEYS):
                 yield name, tensor
                 continue
@@ -252,8 +271,9 @@ class PolicyAdapters:
         """The model's state with the adapters folded in: a plain model's state (a reference reset loads it)."""
         return dict(self.fold_stream(model.state_dict().items()))
 
-    def engine_parameters(self, model: nn.Module) -> Iterator[tuple[str, Tensor]]:
-        """(checkpoint name, tensor) of the policy as a rollout engine loads it (one process, not sharded): what
+    def engine_parameters(self, model: nn.Module, adapter: str = "") -> Iterator[tuple[str, Tensor]]:
+        """(checkpoint name, tensor) of the policy as a rollout engine loads it (one process, not sharded; with
+        `adapter`, the policy of that named adapter): what
         opd.rollout.checkpoint_named_parameters gives for a plain model, with each adapted weight replaced by its
         fold. The fold reads the model's own parameters, the values the trainer computes with (on one GPU the
         published bf16 copies of the adapters, as a full-weight push reads the published bf16 weights), so the
@@ -279,8 +299,9 @@ class PolicyAdapters:
                 yield name, tensor
                 continue
             magnitude = None if m.lora_magnitude is None else m.lora_magnitude.detach()
+            a, b = m.factors(adapter)
             folded += 1
-            yield name, self._fold(m, tensor, m.lora_A.detach(), m.lora_B.detach(), magnitude, meter)
+            yield name, self._fold(m, tensor, a.detach(), b.detach(), magnitude, meter)
         if folded != len(by_weight):
             # a weight the checkpoint stores in another form would reach the engine without its adapter
             raise RuntimeError(
@@ -321,6 +342,15 @@ class PolicyAdapters:
                 )
             self.ctx.export_dir = str(path)
             try:
+                for name in self.names:  # each named adapter by itself (PEFT layout), read from the state saved
+                    parts = {
+                        module: {
+                            "lora_A": wide[f"{module}.roles.{name}.lora_A"],
+                            "lora_B": wide[f"{module}.roles.{name}.lora_B"],
+                        }
+                        for module in self.plugin.modules
+                    }
+                    self.plugin._write_peft_adapter(Path(path) / NAMED_DIR / name, parts, self.ctx)
                 return self.plugin.export_state_dict(wide, None, self.ctx)
             finally:
                 self.ctx.export_dir = ""
@@ -338,6 +368,12 @@ class PolicyAdapters:
         if self.push_survival is not None:
             out["lora/push_survival"] = self.push_survival
         return out
+
+
+def adapter_of(parameter_name: str) -> str:
+    """The named adapter a parameter belongs to ("" for the default adapter and for base weights)."""
+    found = re.search(r"\.roles\.([A-Za-z0-9_]+)\.lora_[AB]$", parameter_name)
+    return found.group(1) if found else ""
 
 
 def validate(config: Any, sharded: bool) -> tuple[list[str], list[str]]:

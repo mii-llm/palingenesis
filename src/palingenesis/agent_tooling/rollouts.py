@@ -94,6 +94,8 @@ def analyze(records, top: int = 5, thresholds: dict | None = None) -> dict:
     components: dict[str, list[float]] = defaultdict(list)
     groups: dict[tuple, bool] = {}  # (step, rank, group) -> kept (RL)
     loops = 0
+    # scenarios (multi-role RL): the same counts per role
+    roles: dict[str, dict] = defaultdict(lambda: {"n": 0, "finish": Counter(), "loops": 0, "rewards": [], "tokens": 0})
     calls = errors = 0
     tools: dict[str, dict] = defaultdict(lambda: {"calls": 0, "errors": 0, "seconds": []})
     output_tokens: list[float] = []
@@ -115,6 +117,14 @@ def analyze(records, top: int = 5, thresholds: dict | None = None) -> dict:
             groups[(step, r.get("rank", 0), r["group"])] = bool(r["kept"])
         if r.get("loop"):
             loops += 1
+        role = roles[r["role"]] if r.get("role") else None
+        if role is not None:
+            role["n"] += 1
+            role["finish"][finish] += 1
+            role["loops"] += bool(r.get("loop"))
+            role["tokens"] += tokens
+            if isinstance(r.get("reward"), int | float) and r.get("scored", True) and finish != "error":
+                role["rewards"].append(r["reward"])
         reward = r.get("reward")
         if isinstance(reward, int | float) and r.get("scored", True) and finish != "error":
             rewards.append(reward)
@@ -186,6 +196,20 @@ def analyze(records, top: int = 5, thresholds: dict | None = None) -> dict:
         }
     if turn_seconds:
         report["turn_seconds"] = _summary(turn_seconds)
+    if roles:
+        report["roles"] = {
+            name: {
+                "trajectories": role["n"],
+                "finish": {k: round(v / role["n"], 4) for k, v in role["finish"].most_common()},
+                "loop_share": round(role["loops"] / role["n"], 4),
+                "output_tokens_mean": round(role["tokens"] / role["n"], 1),
+                **({"reward_mean": round(sum(role["rewards"]) / len(role["rewards"]), 4)} if role["rewards"] else {}),
+            }
+            for name, role in sorted(roles.items())
+        }
+        for name, role in roles.items():  # the same limits per role: one role's failure hides in the pooled shares
+            values[f"{name}.length_share"] = role["finish"]["length"] / role["n"]
+            values[f"{name}.loop_share"] = role["loops"] / role["n"]
     report["slowest_turns"] = slow_turns.items()
     report["slowest_tool_calls"] = slow_calls.items()
     report["worst"] = {
@@ -198,6 +222,11 @@ def analyze(records, top: int = 5, thresholds: dict | None = None) -> dict:
         for name, limit in limits.items()
         if name in values and values[name] > limit
     ]
+    for role in sorted(roles):
+        for key in ("length_share", "loop_share"):
+            value = values.get(f"{role}.{key}", 0.0)
+            if key in limits and value > limits[key]:
+                alarms.append(f"role {role}: {key} {value:.3f} > {limits[key]:g}: {EXPLAIN[key]}")
     report["alarms"] = alarms
     report["status"] = "ISSUES" if alarms else "HEALTHY"
     return report
@@ -223,6 +252,10 @@ def print_report(report: dict) -> None:
     print(f"  {report['trajectories']} trajectories, {span}{report['dumped_steps']} dumped step(s)")
     print("  Finish: " + "  ".join(f"{k} {v:.1%}" for k, v in report["finish"].items()))
     print(f"  Loops: {report['loop_share']:.1%}")
+    for name, role in (report.get("roles") or {}).items():
+        finish = "  ".join(f"{k} {v:.1%}" for k, v in role["finish"].items())
+        reward = f"  reward {role['reward_mean']:.3g}" if "reward_mean" in role else ""
+        print(f"    role {name}: {role['trajectories']} sessions  {finish}  loops {role['loop_share']:.1%}{reward}")
     print(f"  Output tokens: {_fmt(report['output_tokens'])}")
     if "reward" in report:
         print(f"  Reward: {_fmt(report['reward'])}")

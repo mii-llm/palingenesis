@@ -47,6 +47,7 @@ checkpointing, memory.seco or `pgs fit`.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import logging
 import math
@@ -98,6 +99,36 @@ def fold_weight(
     return w
 
 
+# The named adapter a forward uses (use_adapter): "" is the layer's own lora_A / lora_B. A context variable, not
+# module state: threads and asyncio tasks each see their own value, so a rollout thread generating with one role's
+# adapter and a training forward of another's cannot change each other's.
+_ACTIVE: contextvars.ContextVar[str] = contextvars.ContextVar("palingenesis_lora_adapter", default="")
+
+
+def set_adapter(name: str) -> None:
+    """Select the adapter for the forwards that follow in this thread or task (use_adapter without a block)."""
+    _ACTIVE.set(name or "")
+
+
+@contextlib.contextmanager
+def use_adapter(name: str):
+    """Forwards inside the block (in this thread or task) compute with the adapter called `name` in every
+    adapted layer that has one (LoRALinear.add_adapter); "" is the default adapter."""
+    token = _ACTIVE.set(name or "")
+    try:
+        yield
+    finally:
+        _ACTIVE.reset(token)
+
+
+class Factors(nn.Module):
+    """One named adapter of a layer: its own A [rank, in] and B [out, rank]."""
+
+    def __init__(self, a: Tensor, b: Tensor):
+        super().__init__()
+        self.lora_A, self.lora_B = nn.Parameter(a), nn.Parameter(b)
+
+
 class LoRALinear(nn.Module):
     """nn.Linear with a frozen weight and a trainable low-rank delta (optionally DoRA)."""
 
@@ -132,6 +163,29 @@ class LoRALinear(nn.Module):
             self.register_parameter("lora_magnitude", None)
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.enabled = True  # False: the frozen base alone (LoRA.disabled: a reference policy without a copy)
+        self.roles: nn.ModuleDict | None = None  # further adapters by name (add_adapter), chosen by use_adapter
+
+    def add_adapter(self, name: str, generator: torch.Generator | None = None) -> Factors:
+        """A second (third, ...) adapter on this layer, the same rank and scaling, B zero: several policies on
+        one frozen base. Not with DoRA (a magnitude per adapter is not implemented)."""
+        if self.lora_magnitude is not None:
+            raise ValueError("named adapters are not supported with DoRA")
+        if self.roles is None:
+            self.roles = nn.ModuleDict()
+        a = torch.empty(self.rank, self.in_features, dtype=torch.float32)
+        nn.init.kaiming_uniform_(a, a=math.sqrt(5), generator=generator)
+        device = self.weight.device
+        factors = Factors(a.to(device), torch.zeros(self.out_features, self.rank, dtype=torch.float32, device=device))
+        self.roles[name] = factors
+        return factors
+
+    def factors(self, name: str | None = None) -> tuple[Tensor, Tensor]:
+        """(A, B) of the adapter `name` (default: the one use_adapter selected; "" or a name this layer does not
+        have: the layer's own)."""
+        name = _ACTIVE.get() if name is None else name
+        if name and self.roles is not None and name in self.roles:
+            return self.roles[name].lora_A, self.roles[name].lora_B
+        return self.lora_A, self.lora_B
 
     def delta(self, x: Tensor) -> Tensor:
         """scaling * dropout(x) A^T B^T, computed against the float32 adapters (under autocast: in its dtype)."""
@@ -140,7 +194,8 @@ class LoRALinear(nn.Module):
             # under autocast the matmuls cast both sides themselves: a float32 copy of every adapted
             # layer's input would only cost memory and time
             h = h.to(self.lora_A.dtype)
-        return F.linear(F.linear(h, self.lora_A), self.lora_B) * self.scaling
+        a, b = self.factors()
+        return F.linear(F.linear(h, a), b) * self.scaling
 
     def dora_scale(self) -> Tensor:
         """m / ||W + scaling B A||_row: the norm in float32 outside autocast, detached (DoRA, section 4.3)."""
@@ -427,11 +482,36 @@ class LoRA(TrainerPlugin):
             for m, enabled in zip(self.modules.values(), before):
                 m.enabled = enabled
 
+    def add_adapter(self, name: str, seed: int = 0) -> None:
+        """A further adapter called `name` on every adapted layer (after transform_model), A seeded from
+        (seed, module name, adapter name): the same on every rank and in a resumed run."""
+        if not name or not re.fullmatch(r"[A-Za-z0-9_]+", name):
+            raise ValueError(f"lora: adapter names are letters, digits and underscores (got {name!r})")
+        for module_name, m in self.modules.items():
+            g = torch.Generator().manual_seed(tensor_seed(seed, f"{module_name}#{name}"))
+            m.add_adapter(name, g)
+        self.names = [*getattr(self, "names", []), name]
+
+    def adapter_tensors(self, adapter: str = "") -> dict[str, dict[str, Tensor]]:
+        """{module name: {"lora_A": ..., "lora_B": ...[, "lora_magnitude": ...]}} of one adapter ("": the default)."""
+        out = {}
+        for name, m in self.modules.items():
+            a, b = m.factors(adapter)
+            out[name] = {"lora_A": a, "lora_B": b}
+            if not adapter and m.lora_magnitude is not None:
+                out[name]["lora_magnitude"] = m.lora_magnitude
+        return out
+
+    def save_adapter(self, path: str | Path, ctx: PluginContext, adapter: str = "") -> None:
+        """Write one adapter to `path` in the PEFT layout (float32), as export does for the default adapter."""
+        self._write_peft_adapter(Path(path), self.adapter_tensors(adapter), ctx)
+
     @torch.no_grad()
-    def load_adapter(self, path: str | Path) -> None:
+    def load_adapter(self, path: str | Path, adapter: str = "") -> None:
         """Copy the adapters saved at `path` (a directory in the PEFT layout, as export writes it) into the model's,
         after transform_model and before the model is sharded. The file must hold exactly this run's adapters:
-        the same modules, shapes and DoRA setting (a file from other lora settings is refused, not partly loaded)."""
+        the same modules, shapes and DoRA setting (a file from other lora settings is refused, not partly loaded).
+        `adapter`: the named adapter to load into (add_adapter) instead of the default one."""
         from safetensors.torch import load_file
 
         file = Path(path) / "adapter_model.safetensors"
@@ -439,12 +519,12 @@ class LoRA(TrainerPlugin):
             raise PluginError(f"lora: no adapter at {file}")
         saved = load_file(str(file))
         wanted: dict[str, nn.Parameter] = {}
-        for name, m in self.modules.items():
+        for name, parts in self.adapter_tensors(adapter).items():
             prefix = f"base_model.model.{name}"
-            wanted[f"{prefix}.lora_A.weight"] = m.lora_A
-            wanted[f"{prefix}.lora_B.weight"] = m.lora_B
-            if m.lora_magnitude is not None:
-                wanted[f"{prefix}.lora_magnitude_vector"] = m.lora_magnitude
+            wanted[f"{prefix}.lora_A.weight"] = parts["lora_A"]
+            wanted[f"{prefix}.lora_B.weight"] = parts["lora_B"]
+            if "lora_magnitude" in parts:
+                wanted[f"{prefix}.lora_magnitude_vector"] = parts["lora_magnitude"]
         missing, extra = sorted(wanted.keys() - saved.keys()), sorted(saved.keys() - wanted.keys())
         if missing or extra:
             raise PluginError(

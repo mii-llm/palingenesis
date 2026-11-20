@@ -34,6 +34,7 @@ Commands:
   distill-score  Annotate an mcqa distillation pool with the teacher's answers (filter before training)
   rl          Reinforcement learning: rollouts scored by rewards (math, code, tools, your own)
   harbor      Harbor task directories (Docker envs with tests): check oracle/nop, export RL rows
+  scenario    Multi-role RL scenarios: generate rows, audit verifiers, export episodes, plan a cluster layout
   harness     Harness profiles for Harbor tasks: list, record a real harness's requests (capture)
   merge       Weight-space merging: interpolate, linear, soup, task-arithmetic, model-stock, ram, materialize
   surgery     Margin surgery: a minimal weight edit restoring a decision's margins (run, margins, span)
@@ -106,6 +107,11 @@ def main():
             from palingenesis.rl.envs.harbor import main as harbor_main
 
             sys.exit(harbor_main())
+
+        case "scenario":
+            from palingenesis.rl.scenarios.cli import main as scenario_main
+
+            sys.exit(scenario_main())
 
         case "harness":
             from palingenesis.rl.envs.harness.capture import main as harness_main

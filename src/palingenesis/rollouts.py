@@ -31,6 +31,9 @@ field carries that name (gen_ai.*), so an exporter is a mapping; everything else
       tools_s, observations (results that answer no call: a malformed call's error, a text-protocol reply),
       tool_calls: gen_ai.operation.name ("execute_tool"), gen_ai.tool.name, gen_ai.tool.call.id,
                   gen_ai.tool.call.arguments, gen_ai.tool.call.result, error, duration_s
+  scenarios (multi-role RL): role, model, adapter, episode, session, comparison (the sessions its baseline
+           was computed over); info.tools (the session's tool schemas) and, on the first record of an episode,
+           info.episode_record (its partners' sessions and the channel messages)
   RL only: group, kept (False: a zero-variance group), scored, trained, reward, rewards (components),
            advantage, turn_count, tool_calls, tool_errors, context_tokens, version, start_s, duration_s, info;
            with loss.observation_weight: observation_tokens (the tool results' tokens) and observation_targets
@@ -340,6 +343,15 @@ def rl_record(item: tuple[bool, Any], content: bool = True) -> dict:
         "turns": turns,
         "info": extras,
     }
+    if getattr(t, "role", ""):  # a scenario's session (palingenesis.rl.scenarios): who played it, compared with whom
+        record.update(
+            role=t.role,
+            model=t.model,
+            adapter=t.adapter,
+            episode=t.episode,
+            session=t.session,
+            comparison=[str(part) for part in t.comparison],
+        )
     if getattr(t, "observation_tokens", 0):  # loss.observation_weight: the loss's length |O|, its targets
         record["observation_tokens"] = t.observation_tokens
         record["observation_targets"] = t.observation_target_count

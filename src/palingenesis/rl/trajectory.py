@@ -78,6 +78,16 @@ class Trajectory:
     # tokens of the whole trajectory, targets or not (its normaliser |O|, shared by the segments)
     observation_targets: list[int] = field(default_factory=list)
     observation_tokens: int = 0
+    # Scenarios (palingenesis.rl.scenarios): the role this context window played, the model and the LoRA adapter
+    # that played it ("": the policy's own weights), its episode among the row's and its session in it, and the
+    # comparison group (the sessions its baseline is computed over) with the unit it counts as in it.
+    role: str = ""
+    model: str = ""
+    adapter: str = ""
+    episode: int = 0
+    session: str = ""
+    comparison: tuple = ()
+    unit: tuple = ()
 
     def append_generated(
         self, ids: list[int], logprobs: list[float], version: int, first_version: int | None = None
@@ -243,5 +253,8 @@ class Trajectory:
 def group_is_informative(group: list[Trajectory], tol: float = 1e-6) -> bool:
     """Whether a group's scored rollouts disagree on reward (and one of them trains): with
     equal rewards every advantage is 0 and the group carries no gradient."""
+    parts = getattr(group, "comparison_groups", None)
+    if parts is not None:  # a row's episodes of several roles (scenarios): informative if any role's group is
+        return any(group_is_informative(part, tol) for part in parts)
     rewards = [t.reward for t in group if t.scored]
     return (len(rewards) >= 2 and max(rewards) - min(rewards) > tol) and any(t.trained for t in group)

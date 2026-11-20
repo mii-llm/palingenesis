@@ -28,6 +28,7 @@ import os
 import random
 import shutil
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +46,7 @@ from palingenesis.kernels import (
 )
 from palingenesis.logging import Tracker
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
+from palingenesis.lora import set_adapter
 from palingenesis.memory import trim_host_memory
 from palingenesis.moe import RouterBalancer, config_is_moe
 from palingenesis.multimodal import VisionProcessor
@@ -129,6 +131,10 @@ class RLTrainer:
     # lora.rank > 0: the policy's low-rank adapters (palingenesis.rl.adapters); None: every weight trains
     adapters: PolicyAdapters | None = None
     lr_scales: tuple[float, ...] = ()  # per optimizer group, with adapters (LoRA+); empty: one rate for all
+    # scenario.type: multi-role episodes (palingenesis.rl.scenarios); None: single-agent RL
+    scenario = None
+    role_specs: dict = {}
+    servers: dict = {}  # further vLLM servers: one per adapter with its own engine, one for the frozen base
 
     def __init__(
         self,
@@ -171,7 +177,18 @@ class RLTrainer:
         self.chat = ChatFormat(self.tok, end_of_turn_id(self.tok, kwargs), kwargs, _think_tags(self.tok, kwargs))
         self.rewards = resolve_rewards(config.rewards, rewards)
         self.env_pool = self._env_pool(env)
-        if not self.rewards and not (self.env_pool and self.env_pool.has_reward):
+        engine_keys: list[str] = []
+        if config.scenario.type:  # multi-role episodes: the scenario's verifier rewards, its roles' models
+            from palingenesis.rl.scenarios.base import build_scenario
+            from palingenesis.rl.scenarios.config import adapter_names
+            from palingenesis.rl.scenarios.pipeline import BASE, resolve_roles
+
+            self.scenario = build_scenario(config.scenario.type, config.scenario.args)
+            self.role_specs = resolve_roles(config, self.scenario)
+            engine_keys = adapter_names(config)
+            if any(spec.label == BASE for spec in self.role_specs.values()):
+                engine_keys.append(BASE)
+        if self.scenario is None and not self.rewards and not (self.env_pool and self.env_pool.has_reward):
             raise RLConfigError(
                 "no reward: configure rewards:, pass rewards=[...], or use an environment with get_reward"
             )
@@ -228,28 +245,34 @@ class RLTrainer:
                     "rollout.backend vllm_server: vLLM's weight transfer into the server it "
                     "launches needs ray. Install it with: pip install 'palingenesis[vllm-server]'"
                 )
-            self.server = VLLMServer(
-                m.policy,
-                url=r.url,
-                log_path=os.path.join(t.output_dir, "vllm.log"),
-                args=(
-                    "--gpu-memory-utilization",
-                    str(r.gpu_memory_utilization),
-                    "--max-model-len",
-                    str(r.max_model_len),
-                    "--logprobs-mode",
-                    "processed_logprobs",
-                    "--weight-transfer-config",
-                    '{"backend": "ipc"}',
-                    *(["--enforce-eager"] if r.enforce_eager else []),
-                    *(["--enable-prefix-caching"] if r.prefix_caching else []),
-                    *(["--max-num-seqs", str(r.max_num_seqs)] if r.max_num_seqs else []),
-                    *(["--kv-cache-dtype", r.kv_cache_dtype] if r.kv_cache_dtype else []),
-                    *(["--quantization", r.quantization] if r.quantization else []),
-                    *(["--enable-return-routed-experts"] if self.routing_replay else []),
-                    *serve_flags(precision),
-                ),
-            )
+
+            def launch(tag: str = "") -> VLLMServer:
+                return VLLMServer(
+                    m.policy,
+                    url=r.url,
+                    log_path=os.path.join(t.output_dir, f"vllm{tag}.log"),
+                    args=(
+                        "--gpu-memory-utilization",
+                        str(r.gpu_memory_utilization),
+                        "--max-model-len",
+                        str(r.max_model_len),
+                        "--logprobs-mode",
+                        "processed_logprobs",
+                        "--weight-transfer-config",
+                        '{"backend": "ipc"}',
+                        *(["--enforce-eager"] if r.enforce_eager else []),
+                        *(["--enable-prefix-caching"] if r.prefix_caching else []),
+                        *(["--max-num-seqs", str(r.max_num_seqs)] if r.max_num_seqs else []),
+                        *(["--kv-cache-dtype", r.kv_cache_dtype] if r.kv_cache_dtype else []),
+                        *(["--quantization", r.quantization] if r.quantization else []),
+                        *(["--enable-return-routed-experts"] if self.routing_replay else []),
+                        *serve_flags(precision),
+                    ),
+                )
+
+            self.server = launch()
+            # one more server per engine key: each adapter's folded weights are a model of their own to vLLM
+            self.servers = {key: launch(f"_{key}") for key in engine_keys}
         model_type = model_type_of(m.policy) if m.match_vllm_norm or m.use_liger_kernel else None
         if m.use_liger_kernel and self.device.startswith("cuda") and model_type:
             apply_liger_kernel(model_type)  # patches classes: before the model loads
@@ -259,6 +282,13 @@ class RLTrainer:
         fsdp = self.parallel.fsdp
         if config.lora.rank:  # low-rank adapters on a frozen base
             self.adapters = PolicyAdapters(config, self.device, rank, world, fsdp)
+            if self.scenario is not None:  # roles with an adapter of their own on the same base
+                from palingenesis.rl.scenarios.config import adapter_names
+
+                self.adapters.names = adapter_names(config)
+                self.adapters.default_trains = any(
+                    spec.partner is None and spec.train and not spec.adapter for spec in self.role_specs.values()
+                )
         if self.resume_path and (self.adapters is not None) != is_adapter_checkpoint(self.resume_path):
             raise RLConfigError(
                 f"{self.resume_path} was saved "
@@ -419,7 +449,7 @@ class RLTrainer:
         self.weights = PublishedWeights(self.model, self._engine_parameters if self.adapters is not None else None)
         if fsdp:  # the trainer thread pushes the weights (collectives); the producer never gathers
             self.weights.sync = lambda engine: 0.0
-        self.pipeline = RLPipeline(
+        pipeline_args = (
             self.tok,
             self.chat,
             self.engine,
@@ -431,6 +461,10 @@ class RLTrainer:
             self.sandbox,
             self.stop_ids,
         )
+        if self.scenario is None:
+            self.pipeline = RLPipeline(*pipeline_args)
+        else:
+            self.pipeline = self._scenario_pipeline(pipeline_args, engine_keys)
         self.orchestrator = Orchestrator(self.pipeline, lambda: self.batch_prompts, r.temperature, r.max_staleness)
         if self.adapters is not None:
             groups, scales = self.adapters.param_groups(self._trainable(), self._trainable_names())
@@ -500,7 +534,9 @@ class RLTrainer:
             raise RLConfigError(str(e)) from None
         limit = d.max_prompt_tokens or (self.config.rollout.max_model_len - self.config.rollout.max_new_tokens)
         dynamic = self.env_pool is not None and (self.env_pool.reusable or self.env_pool.dynamic)
-        if not dynamic:  # reset() or tool_schemas() may change the prompt: rollouts check the room instead
+        if (
+            not dynamic and self.scenario is None
+        ):  # (a scenario writes its prompts itself, per role)  # reset() or tool_schemas() may change the prompt: rollouts check the room instead
             static = self.env_pool.schemas if self.env_pool else None
             kwargs = self.config.model.chat_template_kwargs
             texts = [
@@ -546,6 +582,27 @@ class RLTrainer:
             return [n for n, p in self.model.named_parameters() if p.requires_grad]
         return [n for n, _ in self.model.named_parameters()]
 
+    def _scenario_pipeline(self, pipeline_args: tuple, engine_keys: list[str]):
+        """The pipeline of a scenario run, with one rollout engine per engine key besides the policy's own: the
+        trainer's model itself under the hf backend (one adapter per call), a vLLM server per key otherwise (fed
+        that adapter's folded weights; the frozen base's server keeps the weights it loaded)."""
+        from palingenesis.rl.scenarios.pipeline import BASE, AdapterEngine, ScenarioPipeline, WeightsView
+
+        engines = {}
+        if engine_keys and isinstance(self.engine, HFRollout):
+            lock = threading.Lock()  # one model: one generate call at a time, whichever adapter
+            self.engine = AdapterEngine(self.engine, "", lock, self.adapters)
+            pipeline_args = (*pipeline_args[:2], self.engine, *pipeline_args[3:])
+            for key in engine_keys:
+                engines[key] = (AdapterEngine(self.engine.engine, key, lock, self.adapters), WeightsView(self.weights))
+        else:
+            for key in engine_keys:
+                named = None if key == BASE else functools.partial(self.adapters.engine_parameters, self.model, key)
+                weights = WeightsView(self.weights, named, frozen=key == BASE)
+                engines[key] = (VLLMServerRollout(self.servers[key], self.stop_ids), weights)
+        self.role_shares = {name: spec.share for name, spec in self.role_specs.items()}
+        return ScenarioPipeline(*pipeline_args, scenario=self.scenario, roles=self.role_specs, engines=engines)
+
     def _engine_parameters(self):
         """With adapters: the policy as a rollout engine loads it, the adapters folded into new weight tensors
         (W + scaling * B A from the float32 adapters; the trainer's weights are not written)."""
@@ -577,16 +634,39 @@ class RLTrainer:
         nothing to train on)."""
         loss_config = self.config.loss
         reduce = self.parallel.sum if self.parallel.world > 1 else None
-        advantage_stats = assign_advantages(
-            groups, loss_config.advantage_std, reduce=reduce, baseline=loss_config.baseline
-        )
-        weights = token_weights(
-            groups,
-            loss_config.aggregation,
-            self.config.completion_budget,
-            sequence_level=loss_config.type == "gspo",
-            reduce=reduce,
-        )
+        if self.scenario is not None:
+            # each row's episodes split into the groups a baseline is valid in (same role, same place of the
+            # episode); advantages scaled per role, each role's part of the loss set by its share
+            from palingenesis.rl.scenarios import credit
+
+            groups = credit.comparison_groups(groups)
+            advantage_stats = credit.assign_advantages(
+                groups,
+                loss_config.advantage_std,
+                loss_config.advantage_std_floor,
+                reduce=reduce,
+                baseline=loss_config.baseline,
+                roles=self.scenario.roles,
+            )
+            weights = credit.token_weights(
+                groups,
+                loss_config.aggregation,
+                self.config.completion_budget,
+                self.role_shares,
+                sequence_level=loss_config.type == "gspo",
+                reduce=reduce,
+            )
+        else:
+            advantage_stats = assign_advantages(
+                groups, loss_config.advantage_std, reduce=reduce, baseline=loss_config.baseline
+            )
+            weights = token_weights(
+                groups,
+                loss_config.aggregation,
+                self.config.completion_budget,
+                sequence_level=loss_config.type == "gspo",
+                reduce=reduce,
+            )
         trajectories = [t for g in groups for t in g if id(t) in weights]
         observed = observation_weights(trajectories, loss_config.observation_weight, reduce)
         if any(t.segments for t in trajectories):
@@ -605,7 +685,15 @@ class RLTrainer:
         self.ref_lp = reference.logprobs(trajectories) if reference is not None and trajectories else {}
         if self._share_prompts(groups):
             trajectories = self._train_trees(groups, weights, totals, observed)  # the rest: groups too small to share
-        micro_batches: list[list[Trajectory] | None] = list(self._micro_batches(trajectories))
+        micro_adapters: list[str] = []  # with several adapters: the adapter each micro-batch trains
+        if self.adapters is not None and self.adapters.names:
+            micro_batches: list[list[Trajectory] | None] = []
+            for name in sorted({t.adapter for t in trajectories}):
+                part = self._micro_batches([t for t in trajectories if t.adapter == name])
+                micro_batches += part
+                micro_adapters += [name] * len(part)
+        else:
+            micro_batches = list(self._micro_batches(trajectories))
         count = self.parallel.max(len(micro_batches))  # FSDP's gathers are collectives: same count on every rank
         micro_batches += [None] * (count - len(micro_batches))
         device = self.device
@@ -613,6 +701,8 @@ class RLTrainer:
         self.model.train()
         balancer = getattr(self, "router_balancer", None)
         for i, micro in enumerate(micro_batches):
+            if micro_adapters and i < len(micro_adapters):
+                set_adapter(micro_adapters[i])  # this micro-batch's forward and backward use its role's adapter
             self.parallel.gradient_sync(self.model, i == count - 1)
             if micro is None:  # this rank ran out: a zero-weight pass keeps the collectives in step
                 if balancer is not None:  # no real token; the count all-reduce stays in step too
@@ -697,6 +787,8 @@ class RLTrainer:
             if balancer is not None:
                 balancer.end()
             _accumulate(totals, stats, loss, entropy)
+        if micro_adapters:
+            set_adapter("")
         if not totals:
             return {}
         values = dict(zip(totals, torch.stack(list(totals.values())).tolist()))  # the step's one host sync
@@ -780,9 +872,13 @@ class RLTrainer:
         for group in groups:
             trained = [t for t in group if id(t) in weights]
             prompt = trained[0].prompt_ids if trained else []
-            if len(trained) < 2 or len(prompt) < 2:
+            # a tree needs one trunk: a group whose members start from different prompts (a scenario's sessions
+            # compared across episodes) goes the plain way
+            if len(trained) < 2 or len(prompt) < 2 or any(t.prompt_ids != prompt for t in trained[1:]):
                 rest += trained
                 continue
+            if self.adapters is not None and self.adapters.names:
+                set_adapter(trained[0].adapter)
             # the trunk ends one token early: branch position j (the prompt's last token, then the
             # completion) predicts completion token j, exactly as in the full sequence
             trunk = torch.tensor([prompt[:-1]], device=device)
@@ -895,7 +991,15 @@ class RLTrainer:
                     self.dumps.submit(step + 1, batch.dump, batch.timeline)
                 trained = self.parallel.sum([metrics.get("trained_sequences", 0.0)])[0]
                 with self.weights.lock:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self._trainable(), t.max_grad_norm)
+                    if self.adapters is not None and self.adapters.names:
+                        # each adapter clipped by itself: one role's large gradient does not shrink another's
+                        norms = [
+                            torch.nn.utils.clip_grad_norm_(group["params"], t.max_grad_norm)
+                            for group in self.opt.param_groups
+                        ]
+                        grad_norm = torch.stack([n.float() for n in norms]).norm()
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self._trainable(), t.max_grad_norm)
                     grad_norm = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
                     if trained:  # every rank steps (or none does): the parameters are sharded
                         self.opt.step()
@@ -972,6 +1076,8 @@ class RLTrainer:
             self.tracker.finish(1 if failed else 0)
             if self.server is not None:
                 self.server.close()
+            for server in self.servers.values():
+                server.close()
             self.parallel.close()
 
     def _parity_check(self, metrics: dict[str, float]) -> None:
