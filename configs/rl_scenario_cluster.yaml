@@ -2,9 +2,9 @@
 # frozen base that every rank holds whole (train.replicate_base). Each rank runs its own vLLM engine, its own
 # episodes and its own forward / backward with no collective; the adapters' gradients are summed once per step.
 #
-#   pgs scenario plan --config configs/scenario_cluster.yaml --params-b 4 --nodes 2 --gpus-per-node 8
+#   pgs scenario plan --config configs/rl_scenario_cluster.yaml --params-b 4 --nodes 2 --gpus-per-node 8
 #   torchrun --nnodes 2 --nproc_per_node 8 --rdzv_backend c10d --rdzv_endpoint $HEAD_NODE:29400 \
-#       -m palingenesis.rl.trainer --config configs/scenario_cluster.yaml
+#       -m palingenesis.rl.trainer --config configs/rl_scenario_cluster.yaml
 #
 # Not run on any GPU yet (a two-rank CPU run is tested). Compare against the same config with
 # train.replicate_base false (FSDP) before relying on it.

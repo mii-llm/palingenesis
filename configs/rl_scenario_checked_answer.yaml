@@ -6,7 +6,7 @@
 #   pgs scenario generate checked_answer --n 4000 --seed 0 --out data/checked_answer.jsonl
 #   pgs scenario generate checked_answer --n 200 --seed 1 --out data/checked_answer_eval.jsonl
 #   pgs scenario audit checked_answer
-#   pgs rl --config configs/scenario_checked_answer.yaml
+#   pgs rl --config configs/rl_scenario_checked_answer.yaml
 #
 # CPU-tested only (hf backend). The vllm_server path with several servers has not been run.
 

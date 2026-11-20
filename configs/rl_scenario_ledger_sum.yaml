@@ -5,7 +5,7 @@
 #   pgs scenario generate ledger_sum --n 4000 --seed 0 --out data/ledger_sum.jsonl
 #   pgs scenario generate ledger_sum --n 200 --seed 1 --out data/ledger_sum_eval.jsonl
 #   pgs scenario audit ledger_sum
-#   pgs rl --config configs/scenario_ledger_sum.yaml
+#   pgs rl --config configs/rl_scenario_ledger_sum.yaml
 #
 # CPU-tested only: not yet run on a GPU.
 

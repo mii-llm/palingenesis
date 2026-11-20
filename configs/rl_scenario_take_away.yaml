@@ -5,7 +5,7 @@
 #   pgs scenario generate take_away --n 4000 --seed 0 --out data/take_away.jsonl
 #   pgs scenario generate take_away --n 200 --seed 1 --out data/take_away_eval.jsonl
 #   pgs scenario audit take_away
-#   pgs rl --config configs/scenario_take_away.yaml
+#   pgs rl --config configs/rl_scenario_take_away.yaml
 #
 # CPU-tested only: not yet run on a GPU.
 

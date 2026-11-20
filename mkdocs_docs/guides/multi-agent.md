@@ -12,11 +12,11 @@ A **scenario** is a task played by several roles: two players of a game, a lead 
 ```bash
 pgs scenario generate take_away --n 4000 --seed 0 --out data/take_away.jsonl
 pgs scenario audit take_away                      # the verifier pays oracles and no degenerate policy
-pgs rl --config configs/scenario_take_away.yaml
+pgs rl --config configs/rl_scenario_take_away.yaml
 ```
 
 ```yaml
-# configs/scenario_take_away.yaml (excerpt)
+# configs/rl_scenario_take_away.yaml (excerpt)
 scenario:
   type: take_away
 roles:
