@@ -185,9 +185,37 @@ Episodes never leave their rank: every GPU runs a trainer rank, its own engine a
 
 With a replicated base each rank folds and loads its own engine's weights locally, on the rollout thread. Every 50 steps the ranks compare a checksum of their adapters (`replica/drift`, 0 when they agree) and take rank 0's on a mismatch. A two-rank run is tested on CPU; nothing on GPUs.
 
-`pgs scenario plan --config rl.yaml --params-b 0.8 --nodes 2 --gpus-per-node 8` prints the layout for a cluster: ranks, estimated trainer memory, the memory share per engine, the launch command, and what does not fit.
+### Engines on other GPUs or nodes
 
-Roles with their own adapter run on one GPU for now.
+`rollout.backend: remote` takes the engines out of the trainer's process and off its GPUs. Each engine is a worker started with `python -m palingenesis.rl.pool.worker --model <policy> --port <port>` on its own GPU (several GPUs with vLLM's tensor parallelism); `rollout.engines` lists their addresses. Under torchrun, rank *r* generates with `engines[r::ranks]` and rank 0 sends the weights to all of them.
+
+- **A weight update never waits for the engines.** The trainer copies what has to travel into host staging buffers (pinned with a GPU), which is the only part under its weights lock, and goes on with its next step. The bytes leave on the pool's own thread.
+- **An engine never samples from half an update.** It receives a push into its own staging area while it keeps generating with the weights it has, applies the complete push between two of its steps, and tags everything it samples from then on with the new version. A push whose sender dies in the middle is dropped whole.
+- **Two staging areas alternate** on the trainer. A new snapshot goes to the one no push is being sent from; when both are still travelling it is skipped, and the next update carries newer weights. An engine still receiving version *v* gets the newest staged version next.
+- **Staleness decides what trains.** Every turn carries the version that sampled it; a row older than `rollout.max_staleness` is dropped. With `max_staleness: 0` an update waits for every engine instead.
+
+What travels (`rollout.push`):
+
+| Push | Sent per update | Engine side | Use |
+|---|---|---|---|
+| `full` | every weight, 2 bytes per parameter | loaded as is | full-weight training; adapters under FSDP |
+| `fold` | the adapters' factors, megabytes (and the base, once) | computes $W + sBA$ against the base it was sent | one adapter; any engine |
+| `native` | every named adapter's factors | loaded as named LoRA adapters of the engine; a request names its adapter and adapters share the batch | roles with their own adapter |
+
+`native` is how several roles' policies are served by **one** engine pool: vLLM loads LoRA adapters next to the base and reloads one in place under the same name while requests run (`load_inplace`), so no server per adapter is needed. With the `hf` worker the adapters are this library's own layers, which is what the tests run. The vLLM side (adapters written to a memory file system in the PEFT layout, then reloaded) has not been run.
+
+The transport is a TCP stream per engine, not an NCCL collective. Two reasons, both derived, not measured:
+
+- The trainers' process group is theirs: FSDP's gathers and the batch normalisers run on it, so engines in that group would have to take part in every collective, and a second NCCL communicator driven from a background thread could not be exercised without GPUs.
+- The traffic does not call for it. With adapters an update is megabytes: about 160 MB for 4B parameters at rank 16, 0.05 s on a 25 Gbit link. A full push of 4B parameters is 8 GB: about 2.6 s at 25 Gbit, 6.5 s at 10 Gbit, travelling while the trainer steps. NCCL over InfiniBand would cut that several times, which matters only when full-weight updates take longer than a training step.
+
+`pool/push_mb`, `pool/push_s`, `pool/lag` (versions the slowest engine is behind) and `pool/skipped` are logged every step.
+
+`pgs scenario plan --config rl.yaml --params-b 4 --nodes 2 --gpus-per-node 8 --engine-gpus 8 --hosts node1,node2` prints this layout for a cluster: the trainers' GPUs, one launch line per engine worker, the `rollout.engines` list, the estimated size and travel time of an update, and the trainer's launch command. Without `--engine-gpus` it sizes engines on the trainers' own GPUs: ranks, estimated trainer memory, the memory share per engine, the launch command, and what does not fit.
+
+A two-rank trainer sharing two engine workers, pushes overlapping training, the staleness drop and a sender dying mid-push are tested across processes on CPU. Nothing on GPUs.
+
+Roles with their own adapter need `rollout.backend: remote` (named adapters of one engine pool) to use several GPUs; with `vllm_server` they stay on one.
 
 ## Audit a verifier before training
 
@@ -230,6 +258,9 @@ pgs scenario export runs/x/rollouts --format traces --out traces.jsonl
 |---|---|
 | `role/<r>/reward`, `role/<r>/rewards/<component>` | per role, over the batch's kept rows |
 | `role/<r>/advantage_std`, `role/<r>/advantage_abs` | the role's reward spread and advantage size |
+| `role/<r>/policy/mismatch_k3`, `abs_ratio_dev`, `clipped`, `entropy`, `kl_ref` | the policy statistics of the RL guide, over that role's trained tokens (`role/<r>/trained_tokens`) |
+| `grad_norm/<adapter>` | each adapter's gradient norm before its own clip |
+| `pool/push_mb`, `pool/push_s`, `pool/lag`, `pool/skipped` | remote engines: an update's size and travel time, versions the slowest engine is behind, snapshots skipped |
 | `role/<r>/sessions`, `turns`, `completion_len`, `truncated`, `skipped` | what the role's sessions looked like |
 | `episode/sessions`, `episode/messages`, `episode/failed` | per episode |
 | `reward`, `outcome/pass@1` | of the outcome role (`scenario.outcome`) |
@@ -250,4 +281,4 @@ Multi-agent training has a poor record against simple controls. Before trusting 
 - Roles with their own adapter: one GPU; not with DoRA, LoRA+, FSDP or `kl_ref_reset`.
 - Scenario sessions have no sandbox yet: tools are Python functions of the scenario. Harbor containers shared between roles are not implemented.
 - `loss.overlong_buffer`, `loss.group_shaping`, `loss.observation_weight`, `rollout.think_skip` and `model.multimodal` are refused with a scenario.
-- Policy statistics (`policy/entropy`, `policy/mismatch_k3`) are pooled over roles.
+- Remote engines take no images and no MoE routing replay yet, and their weights travel over TCP (no NCCL or RDMA transport).

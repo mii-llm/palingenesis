@@ -6,6 +6,7 @@
     pgs scenario export runs/x/rollouts --format sft --out sft.jsonl [--roles lead --min-reward 1]
     pgs scenario export runs/x/rollouts --format dpo --out pairs.jsonl [--margin 0.5]
     pgs scenario plan --config rl.yaml --params-b 0.8 --nodes 2 --gpus-per-node 8 --gpu-memory-gb 80
+    pgs scenario plan --config rl.yaml --params-b 4 --nodes 2 --gpus-per-node 8 --engine-gpus 8 --hosts n1,n2
 
 Training itself is `pgs rl --config <a config with a scenario: section>`.
 """
@@ -49,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--nodes", type=int, default=1)
     p.add_argument("--gpus-per-node", type=int, default=1)
     p.add_argument("--gpu-memory-gb", type=float, default=80.0)
+    p.add_argument(
+        "--engine-gpus", type=int, default=0, help="GPUs given to engine workers (0: engines share the trainers' GPUs)"
+    )
+    p.add_argument("--engine-tp", type=int, default=1, help="GPUs per engine (tensor parallelism)")
+    p.add_argument("--hosts", default="", help="comma-separated node names, in order")
+    p.add_argument("--link-gbps", type=float, default=25.0, help="the network between nodes")
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -98,6 +105,23 @@ def main(argv: list[str] | None = None) -> int:
     from palingenesis.rl.scenarios.placement import Cluster, plan, workload_of
 
     config = RLConfig.from_yaml(args.config)
+    if args.engine_gpus:
+        from palingenesis.rl.scenarios.config import adapter_names
+        from palingenesis.rl.scenarios.placement import plan_pool
+
+        pool = plan_pool(
+            Cluster(args.nodes, args.gpus_per_node, args.gpu_memory_gb),
+            workload_of(config, args.params_b),
+            args.engine_gpus,
+            args.config,
+            hosts=args.hosts.split(",") if args.hosts else None,
+            model=config.model.policy,
+            engine_tp=args.engine_tp,
+            link_gbps=args.link_gbps,
+            adapters=len(adapter_names(config)),
+        )
+        print(json.dumps(pool.to_dict(), indent=2))
+        return 1 if pool.errors else 0
     layout = plan(
         Cluster(args.nodes, args.gpus_per_node, args.gpu_memory_gb), workload_of(config, args.params_b), args.config
     )

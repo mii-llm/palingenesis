@@ -202,6 +202,9 @@ RL configs (`pgs rl`) run multi-role episodes when they have a `scenario:` secti
 | `roles.<name>.share` | float | `1.0` | The role's part of the loss, relative to the other trained roles. |
 | `loss.advantage_std` | str | `batch` | `role` (scenarios): the standard deviation of the same role's centred rewards over the batch. |
 | `loss.advantage_std_floor` | float | `0.0` | The least value `role` divides by. |
+| `rollout.backend` | str | `vllm` | `remote`: the engines are `palingenesis.rl.pool.worker` processes on other GPUs or nodes. |
+| `rollout.engines` | list | `[]` | remote: the workers' `host:port` addresses; rank *r* generates with `engines[r::ranks]`, rank 0 sends the weights to all. |
+| `rollout.push` | str | `auto` | remote: what a weight update sends. `full`, `fold` (LoRA factors folded by each engine), `native` (LoRA factors as named adapters of the engine), `auto`. |
 | `train.replicate_base` | bool | `false` | With `lora.rank` under torchrun: every rank holds the whole frozen base; only the adapters' gradients are summed over ranks, once per step, instead of FSDP. |
 
 RL configs also have `rollout.routing_replay` (`auto` / `on` / `off`, default `off` until the vLLM path is verified on a GPU): train each token through the

@@ -1259,3 +1259,48 @@ def test_a_tool_can_spawn_work_be_notified_of_its_result_and_end_its_session():
 
 def echo_number(messages):
     return "The number is " + messages[-1]["content"].split("The number is ")[1]
+
+
+def test_the_planner_lays_out_trainers_and_engines_on_separate_gpus():
+    from palingenesis.rl.scenarios.placement import Cluster, Workload, plan_pool
+
+    # 2 nodes x 8 GPUs, half of every node to engines: each trainer rank has engines on its own host
+    layout = plan_pool(
+        Cluster(2, 8, 80),
+        Workload(params_b=4.0, lora_rank=16, replicate_base=True, batch_prompts=250),
+        engine_gpus=8,
+        config_path="rl.yaml",
+        hosts=["n1", "n2"],
+        model="org/model",
+    )
+    assert not layout.errors and layout.mode == "replicated" and layout.push == "fold"
+    assert layout.trainers == [f"{h}:{g}" for h in ("n1", "n2") for g in range(4)]
+    assert [e["address"] for e in layout.engines] == [f"{h}:{7000 + k}" for h in ("n1", "n2") for k in range(4)]
+    assert (
+        layout.engines[0]["gpus"] == ["n1:4"]
+        and "CUDA_VISIBLE_DEVICES=4 python -m palingenesis.rl.pool.worker" in layout.engines[0]["command"]
+    )
+    assert layout.overrides["rollout.backend"] == "remote" and layout.overrides["rollout.engines"][-1] == "n2:7003"
+    assert layout.overrides["rollout.batch_prompts"] == 256  # a multiple of the 8 trainer ranks
+    assert "--nnodes 2 --nproc_per_node 4" in layout.command and layout.command.startswith(
+        "CUDA_VISIBLE_DEVICES=0,1,2,3 "
+    )
+    assert layout.push_mb == pytest.approx(40 * 4.0) and layout.push_seconds == pytest.approx(
+        160 / (16 * 125), abs=1e-3
+    )
+    assert layout.trainer_gb == pytest.approx(2 * 4 + 0.2 + 8) and layout.engine_gb == 8.0
+
+    # full weights: gigabytes per update; whole nodes for engines when the split per node does not come out even
+    full = plan_pool(Cluster(3, 8, 80), Workload(params_b=4.0), engine_gpus=8, hosts=["a", "b", "c"], link_gbps=10)
+    assert full.push == "full" and full.push_mb == pytest.approx(8192) and full.mode == "fsdp"
+    assert full.push_seconds == pytest.approx(8192 / (10 * 125), abs=1e-2)  # 10 GbE: 6.6 s an update
+    assert {e["address"].split(":")[0] for e in full.engines} == {"c"} and len(full.trainers) == 16
+    # named adapters in one engine pool; tensor-parallel engines for a policy too big for one GPU
+    workload = Workload(params_b=0.8, lora_rank=16, replicate_base=True)
+    native = plan_pool(Cluster(1, 8, 80), workload, engine_gpus=4, adapters=2)
+    assert native.push == "native" and "--lora-rank 16 --max-loras 3" in native.engines[0]["command"]
+    wide = plan_pool(Cluster(1, 8, 80), Workload(params_b=60.0, lora_rank=16), engine_gpus=4, engine_tp=2)
+    assert len(wide.engines) == 2 and "tensor_parallel_size" in wide.engines[0]["command"] and wide.engine_gb == 60.0
+    assert any("trainer rank needs" in e for e in wide.errors)  # 120 GB of frozen base on one trainer GPU
+    with pytest.raises(ValueError, match="neither"):
+        plan_pool(Cluster(2, 8, 80), Workload(), engine_gpus=3)

@@ -237,7 +237,9 @@ def test_adapters_travel_as_factors_and_the_engines_sample_the_trained_policy(tm
     }
     trainer, steps = _train(tmp_path, engines, **options)
     assert trainer.push_mode == "fold" and len(steps) == 3
-    assert all(m["staleness"] == 0 and m["pool/lag"] == 0 for m in steps), [(m["staleness"], m["pool/lag"]) for m in steps]
+    assert all(m["staleness"] == 0 and m["pool/lag"] == 0 for m in steps), [
+        (m["staleness"], m["pool/lag"]) for m in steps
+    ]
     # the engines' folded weights are the trained policy up to float32 rounding in another process, while the
     # policy is far from the base it started from
     assert all(m["policy/mismatch_k3"] < 1e-3 for m in steps), [m["policy/mismatch_k3"] for m in steps]

@@ -103,6 +103,8 @@ Training issue?
 │   │   role/<r>/truncated, episode/failed; pgs rollouts reports finish reasons, loops and rewards per role
 │   ├── Sessions end after one turn: rollout.max_completion_tokens is a session's whole budget (default: one turn)
 │   ├── One role dominates: loss.advantage_std: role + advantage_std_floor, roles.<name>.share
+│   ├── Engines on other GPUs (rollout.backend remote): pool/lag growing or stale_groups_dropped rising = updates
+│   │   travel longer than a step: push adapters (rollout.push fold / native), raise max_staleness, or add link speed
 │   └── Always run a single-agent control at equal sampled tokens (see the multi-agent guide)
 ├── Distilling a larger teacher on fixed data (off-policy KD in pgs train), or QAT while distilling
 │   ├── Setup: distill.enabled + distill.teachers.<name>: {model: ...} (online) or {cache: ...} (pgs distill-cache)
