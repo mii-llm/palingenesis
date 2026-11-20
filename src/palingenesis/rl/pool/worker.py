@@ -21,12 +21,16 @@ A push whose connection ends before its last byte is dropped whole; the engine k
            The worker keeps the base in host memory for it: 2 bytes per parameter for a bf16 model.
   native   LoRA factors per named adapter, loaded as adapters of the engine (after the held base, if one came):
            requests name the adapter they want and requests of different adapters share the batch. With vLLM the
-           adapters are written to `--adapter-dir` (a memory file system) in the PEFT layout and reloaded in
-           place, and the versions before the last two are deleted; with the hf engine they are this library's
+           adapters are written to `--adapter-dir` (a memory file system) in the PEFT layout, each version an
+           adapter of its own to the engine, and the versions before the last two are deleted; with the hf engine they are this library's
            own adapter layers. The trainer's default adapter is the adapter "policy".
 
-Identity. A trainer starts with a `hello` that names its model, stop tokens, chat-template arguments, context
-length and head precision; the worker answers with its own, and the trainer refuses to go on if they differ.
+Identity. A trainer starts with a `hello`; the worker answers with its model's architecture, stop tokens,
+chat-template arguments, context length, head precision and the LoRA rank it serves, and the trainer refuses to go
+on if they differ from its own. The `hello` of the trainer that sends the weights also marks what the worker
+holds as another run's: until that trainer's first update is applied, completions are tagged with version -1,
+which no trainer trains on (a worker that outlived a run would otherwise sample its old weights under a version
+number the new run takes for its own).
 
 Custom engines (tests, other servers): `--engine module:factory`, a callable returning a RolloutEngine.
 """
@@ -143,6 +147,8 @@ class EngineWorker:
         self.adapter_dir = adapter_dir
         self.default_adapter = ""  # the engine's name for the trainer's default adapter, once it was loaded
         self.pushes = self.dropped = 0
+        self.confirmed = True  # False from a pushing trainer's hello until its first update is applied
+        self.adapter_root: Path | None = None
         self.receiving = False
         self.server: asyncio.AbstractServer | None = None
         self.stopping = asyncio.Event()
@@ -160,9 +166,13 @@ class EngineWorker:
     async def run(self, host: str, port: int, announce=print) -> None:
         port = await self.serve(host, port)
         announce(f"engine worker listening on {host}:{port}", flush=True)
-        await self.stopping.wait()
-        self.server.close()
-        self.client.close()
+        try:
+            await self.stopping.wait()
+        finally:
+            self.server.close()
+            self.client.close()
+            if self.adapter_root is not None:
+                shutil.rmtree(self.adapter_root, ignore_errors=True)
 
     async def _gate(self, header: dict) -> None:
         if header.get("op") == "weights":
@@ -173,6 +183,12 @@ class EngineWorker:
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         lock = asyncio.Lock()  # replies of concurrent requests must not interleave
         seen: set[str] = set()  # the ops this connection carried
+        pushing = False  # the payload of a weights frame is being read
+
+        async def gate(header: dict) -> None:
+            nonlocal pushing
+            pushing = header.get("op") == "weights"
+            await self._gate(header)
 
         async def reply(header: dict) -> None:
             async with lock:
@@ -181,17 +197,15 @@ class EngineWorker:
         try:
             while True:
                 try:
-                    header, tensors = await receive(reader, self.staging, self._gate)
-                except asyncio.IncompleteReadError as error:
-                    frame = getattr(error, "frame", None)
-                    pushing = frame is not None and (
-                        frame.get("op") == "weights" or (not frame and "weights" in seen and "generate" not in seen)
-                    )
-                    if pushing or self.held is not None and "weights" in seen:
+                    header, tensors = await receive(reader, self.staging, gate)
+                except (asyncio.IncompleteReadError, ConnectionError) as error:  # (a reset as well as an end)
+                    cut = getattr(error, "frame", None) == {} and "weights" in seen and "generate" not in seen
+                    if pushing or cut or self.held is not None and "weights" in seen:
                         self.dropped += 1  # cut inside a push: nothing of it was applied
                         self.held = None
                         self.receiving = False
                     raise
+                pushing = False
                 op = header.get("op")
                 seen.add(op)
                 if op == "generate":
@@ -208,6 +222,8 @@ class EngineWorker:
                     finally:
                         self.receiving = False
                 elif op == "hello":
+                    if header.get("push"):  # a new trainer sends the weights from now on: these are another run's
+                        self.confirmed, self.held = False, None
                     await reply({"op": "hello", "id": header.get("id"), "identity": self.identity, **self.state()})
                 elif op == "state":
                     await reply({"op": "state", "id": header.get("id"), **self.state()})
@@ -222,7 +238,13 @@ class EngineWorker:
             writer.close()
 
     def state(self) -> dict:
-        return {"version": self.version, "pushes": self.pushes, "dropped": self.dropped, "receiving": self.receiving}
+        return {
+            "version": self.version,
+            "pushes": self.pushes,
+            "dropped": self.dropped,
+            "receiving": self.receiving,
+            "confirmed": self.confirmed,
+        }
 
     async def _generate(self, header: dict, reply) -> None:
         self.client.enter()
@@ -241,8 +263,8 @@ class EngineWorker:
                 "ids": list(out.ids),
                 "logprobs": list(out.logprobs),
                 "finish": out.finish,
-                "version": out.version,
-                "first_version": out.first_version,
+                "version": out.version if self.confirmed else -1,
+                "first_version": out.first_version if self.confirmed else -1,
             }
         except Exception as error:  # noqa: BLE001 — the requester sees the failure
             message = {"op": "generated", "id": header["id"], "error": f"{type(error).__name__}: {error}"}
@@ -295,16 +317,17 @@ class EngineWorker:
             if adapters is not None:
                 self._load_adapters(adapters, version, header["lora"])
         self.pushes += 1
+        self.confirmed = True
         return time.perf_counter() - start
 
     def _load_adapters(self, adapters: dict, version: int, lora: dict) -> None:
         if hasattr(self.engine, "load_adapters"):
             self.engine.load_adapters(adapters, version, lora)
             return
-        # vLLM: each adapter as a PEFT directory, reloaded in place under its name (opd.rollout.VLLMColocateRollout)
+        # vLLM: each adapter version as a PEFT directory of its own (opd.rollout.VLLMColocateRollout.load_adapter)
         from safetensors.torch import save_file
 
-        root = Path(self.adapter_dir or tempfile.gettempdir()) / f"pgs-adapters-{os.getpid()}"
+        root = self.adapter_root = Path(self.adapter_dir or tempfile.gettempdir()) / f"pgs-adapters-{os.getpid()}"
         for adapter, modules in adapters.items():
             name = adapter or DEFAULT_ADAPTER
             path = root / name / f"v{version}"
@@ -357,6 +380,7 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
         "chat_template_kwargs": kwargs,
         "max_model_len": args.max_model_len,
         "fp32_head": bool(args.fp32_head),
+        "lora_rank": args.lora_rank,
     }
     if args.backend == "hf":
         from palingenesis.opd.teachers import load_causal_lm
@@ -364,7 +388,8 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = load_causal_lm(args.model, torch.bfloat16 if device == "cuda" else torch.float32).to(device).eval()
         pad_id = tok.pad_token_id if tok.pad_token_id is not None else stop_ids[0]
-        del identity["fp32_head"], identity["max_model_len"]  # (vLLM's settings: the hf engine has neither)
+        for key in ("fp32_head", "max_model_len", "lora_rank"):  # vLLM's settings: the hf engine has none
+            del identity[key]
         return HFWorkerEngine(model, stop_ids, pad_id), identity
     from palingenesis.opd.rollout import VLLMColocateRollout, precision_options
 

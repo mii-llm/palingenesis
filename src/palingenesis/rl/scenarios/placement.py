@@ -290,7 +290,7 @@ def plan_pool(
             if engine_tp > 1:
                 line += f""" --vllm-args '{{"tensor_parallel_size": {engine_tp}}}'"""
             if push == "native":
-                line += f" --lora-rank {workload.lora_rank} --max-loras {max(adapters, 1) + 1}"
+                line += f" --lora-rank {workload.lora_rank} --max-loras {2 * (max(adapters, 1) + 1)}"
             engines.append(
                 {
                     "address": f"{host}:{port}",

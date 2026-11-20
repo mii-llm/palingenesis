@@ -69,6 +69,8 @@ def validate(config: Any, sharded: bool) -> list[str]:
             errors.append(f"roles.{name}.adapter {role.adapter!r}: letters, digits and underscores only.")
         if role.adapter == BASE:
             errors.append(f"roles.{name}.adapter cannot be called 'base' (the frozen base is partner: base).")
+        if role.adapter == "policy":
+            errors.append(f"roles.{name}.adapter cannot be called 'policy' (the name of the default adapter).")
         if role.partner and role.adapter:
             errors.append(f"roles.{name}: partner and adapter are alternatives (a partner is not the policy).")
         if role.partner_args and not role.partner:
@@ -106,6 +108,11 @@ def validate(config: Any, sharded: bool) -> list[str]:
             "roles with their own adapter (or partner: base) on remote engines are served as named adapters next "
             "to the base in one engine: rollout.push must be native (or auto). An engine that folds, or receives "
             "full weights, holds the trained policy alone."
+        )
+    if based and config.rollout.backend == "remote" and sharded:
+        errors.append(
+            "roles.<name>.partner base on remote engines is not supported with FSDP (the engines would hold the "
+            "trained policy alone): use train.replicate_base."
         )
     if based and config.rollout.backend == "remote" and config.lora.dora:
         errors.append("roles.<name>.partner base on remote engines needs rollout.push native, which has no lora.dora.")

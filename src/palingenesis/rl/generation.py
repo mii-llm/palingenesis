@@ -221,7 +221,7 @@ class GenerationClient:
                 except asyncio.TimeoutError:
                     break
             batch, self.pending = self.pending, []
-            for temperature, adapter in sorted({(b[2], b[5]) for b in batch}):
+            for temperature, adapter in sorted({(b[2], b[5]) for b in batch}, key=repr):  # (floats and Samplings)
                 part = [b for b in batch if b[2] == temperature and b[5] == adapter]
                 call = self.engine.generate
                 if any(b[4] for b in part):  # only multimodal engines take images

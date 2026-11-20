@@ -99,16 +99,27 @@ def fold_weight(
     return w
 
 
-# The named adapter a forward uses (use_adapter): "" is the layer's own lora_A / lora_B. A context variable, not
-# module state: threads and asyncio tasks each see their own value, so a rollout thread generating with one role's
-# adapter and a training forward of another's cannot change each other's.
-_ACTIVE: contextvars.ContextVar[str] = contextvars.ContextVar("palingenesis_lora_adapter", default="")
+# The named adapter a forward uses: "" is the layer's own lora_A / lora_B. Two levels. use_adapter sets a context
+# variable: threads and asyncio tasks each see their own value, so a rollout thread generating with one role's
+# adapter and a training forward of another's cannot change each other's. set_adapter sets the process's adapter,
+# which every thread without a use_adapter block computes with: the trainer selects a micro-batch's adapter with
+# it, because autograd recomputes checkpointed segments during backward on its own threads (one per CUDA device),
+# which do not see the context variables of the thread that called backward.
+_ACTIVE: contextvars.ContextVar[str | None] = contextvars.ContextVar("palingenesis_lora_adapter", default=None)
+_PROCESS = [""]
 BASE = "base"  # use_adapter(BASE): no adapter at all, the frozen base (a reserved adapter name)
 
 
+def active_adapter() -> str:
+    """The adapter a forward on this thread computes with."""
+    name = _ACTIVE.get()
+    return _PROCESS[0] if name is None else name
+
+
 def set_adapter(name: str) -> None:
-    """Select the adapter for the forwards that follow in this thread or task (use_adapter without a block)."""
-    _ACTIVE.set(name or "")
+    """Select the adapter of every forward that is not inside a use_adapter block, on any thread (a training
+    forward, and its recomputation during backward under gradient checkpointing)."""
+    _PROCESS[0] = name or ""
 
 
 @contextlib.contextmanager
@@ -183,7 +194,7 @@ class LoRALinear(nn.Module):
     def factors(self, name: str | None = None) -> tuple[Tensor, Tensor]:
         """(A, B) of the adapter `name` (default: the one use_adapter selected; "" or a name this layer does not
         have: the layer's own)."""
-        name = _ACTIVE.get() if name is None else name
+        name = active_adapter() if name is None else name
         if name and self.roles is not None and name in self.roles:
             return self.roles[name].lora_A, self.roles[name].lora_B
         return self.lora_A, self.lora_B
@@ -206,7 +217,7 @@ class LoRALinear(nn.Module):
         return self.lora_magnitude / norm
 
     def forward(self, x: Tensor) -> Tensor:
-        if not self.enabled or _ACTIVE.get() == BASE:
+        if not self.enabled or active_adapter() == BASE:
             return F.linear(x, self.weight, self.bias)
         if self.lora_magnitude is None:
             out = F.linear(x, self.weight, self.bias)

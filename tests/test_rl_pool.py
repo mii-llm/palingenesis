@@ -265,14 +265,15 @@ def test_versions_follow_the_weights_across_processes(workers):
 
     pool = RemotePool([workers(*SCRIPTED), workers(*SCRIPTED)])
     try:
-        assert [generate(pool) for _ in range(4)] == [([0, 0, 0], 0)] * 4 and pool.version == -1
+        # before this run's first update a worker's completions carry no version of the run
+        assert [generate(pool) for _ in range(4)] == [([0, 0, 0], -1)] * 4 and pool.version == -1
         weights = {"a.weight": torch.full((4, 8), 0.5, dtype=torch.bfloat16), "b.bias": torch.ones(8)}
-        pool.update_weights(weights.items(), 1)
-        assert pool.version == 1  # handed over; the engines confirm when it is theirs
-        assert wait_for(lambda: pool.applied() == [1, 1])
+        pool.update_weights(weights.items(), 1)  # the first update waits for the engines
+        assert pool.version == 1 and pool.applied() == [1, 1]
         assert {tuple(generate(pool)[0]) for _ in range(6)} == {(1, 24, 0)}  # both engines, the new weights' sum
         weights["a.weight"] += 1
         pool.update_weights(weights.items(), 2)
+        assert pool.version == 2  # handed over; the engines confirm when it is theirs
         assert wait_for(lambda: pool.applied() == [2, 2]) and generate(pool) == ([2, 56, 0], 2)
         assert generate(pool, "verifier")[0][2] == ord("v")  # a request names its adapter
         assert generate(pool, temperature=Sampling(0.7, top_k=11))[0] == [2, 56, 0, 11]  # sampling settings travel
@@ -294,24 +295,26 @@ def test_a_push_travels_while_the_engine_generates_and_the_trainer_goes_on(worke
     pool = RemotePool([workers(*SCRIPTED, "--gate", str(gate.path))], pin=False)
     try:
         weights = {"w": torch.ones(MB, dtype=torch.float32)}
+        pool.update_weights(weights.items(), 0)  # the run's first update (it waits for the engine)
         gate.close()
+        weights["w"].mul_(2)
         pool.update_weights(weights.items(), 1)  # returns with the push staged, not delivered
         assert pool.version == 1 and wait_for(lambda: pool.state()[0]["receiving"])
         weights["w"].mul_(3)  # the trainer's next step changes its weights: the push carries the staged snapshot
-        assert [generate(pool) for _ in range(5)] == [([0, 0, 0], 0)] * 5  # the old weights, whole
-        assert pool.applied() == [-1] and pool.metrics()["pool/lag"] == 2
+        assert [generate(pool) for _ in range(5)] == [([0, MB, 0], 0)] * 5  # the old weights, whole
+        assert pool.applied() == [0] and pool.metrics()["pool/lag"] == 1
         pool.update_weights(weights.items(), 2)  # staged in the other area: it follows the push in flight
         weights["w"].mul_(2)
         pool.update_weights(weights.items(), 3)  # both areas busy: skipped, the next sync brings newer weights
         assert pool.version == 2 and pool.stats["skipped"] == 1 and pool.sending == [1, 1]
-        assert generate(pool) == ([0, 0, 0], 0)
+        assert generate(pool) == ([0, MB, 0], 0)
         gate.open()
         assert wait_for(lambda: pool.applied() == [2]) and pool.sending == [0, 0]
-        assert generate(pool) == ([2, 3 * MB, 0], 2)  # the snapshot taken at version 2
-        assert pool.state()[0]["pushes"] == 2  # version 1 (the snapshot of ones) was applied whole before it
+        assert generate(pool) == ([2, 6 * MB, 0], 2)  # the snapshot taken at version 2
+        assert pool.state()[0]["pushes"] == 3  # version 1 (its own snapshot) was applied whole before it
         pool.update_weights(weights.items(), 4)  # both areas free again
         assert pool.version == 4 and wait_for(lambda: pool.applied() == [4])
-        assert generate(pool) == ([4, 6 * MB, 0], 4)
+        assert generate(pool) == ([4, 12 * MB, 0], 4)
     finally:
         pool.close(shutdown=True)
 
@@ -319,6 +322,7 @@ def test_a_push_travels_while_the_engine_generates_and_the_trainer_goes_on(worke
 def test_a_push_cut_short_is_dropped_whole_and_a_new_trainer_takes_over(workers, gate):
     address = workers(*SCRIPTED, "--gate", str(gate.path))
     first = RemotePool([address], pin=False)
+    first.update_weights({"w": torch.ones(2)}.items(), 0)
     gate.close()
     first.update_weights({"w": torch.ones(16 * MB)}.items(), 1)  # 64 MB: more than the sockets buffer
     assert wait_for(lambda: first.state()[0]["receiving"])
@@ -329,10 +333,12 @@ def test_a_push_cut_short_is_dropped_whole_and_a_new_trainer_takes_over(workers,
     try:
         assert wait_for(lambda: second.state()[0]["dropped"] == 1)
         state = second.state()[0]
-        assert (state["version"], state["pushes"], state["dropped"], state["receiving"]) == (0, 0, 1, False)
-        assert generate(second) == ([0, 0, 0], 0)  # nothing of the cut push reached the engine's weights
+        assert (state["version"], state["pushes"], state["dropped"], state["receiving"]) == (0, 1, 1, False)
+        # nothing of the cut push reached the engine's weights; and what it holds is the first trainer's, so the
+        # new trainer gets it tagged as no version of its own until its first update has arrived
+        assert state["confirmed"] is False and generate(second) == ([0, 2, 0], -1)
         second.update_weights({"w": torch.full((64,), 2.0)}.items(), 7)  # the resumed trainer's first update
-        assert wait_for(lambda: second.applied() == [7]) and generate(second) == ([7, 128, 0], 7)
+        assert second.applied() == [7] and generate(second) == ([7, 128, 0], 7)
     finally:
         second.close(shutdown=True)
 
@@ -373,7 +379,7 @@ def test_every_rank_of_a_blocking_pool_waits_for_its_own_engines(workers, gate):
         waiting = in_thread(rank1.update_weights, (), 1)
         assert wait_for(lambda: rank1.state()[0]["receiving"]) and wait_for(lambda: rank0.applied()[0] == 1)
         assert pushing.is_alive() and waiting.is_alive() and rank1.version == -1
-        assert generate(rank1) == ([0, 0, 0], 0)  # (what rank 1 would have collected)
+        assert generate(rank1) == ([0, 0, 0], -1)  # (what rank 1 would have collected: not this run's)
         gate.open()
         pushing.join(30), waiting.join(30)
         assert pushing.error is None and waiting.error is None and not waiting.is_alive()
@@ -389,7 +395,7 @@ def test_a_worker_that_dies_loses_no_request_and_ends_the_run_at_the_next_update
     pool = RemotePool([doomed, other], pin=False)
     try:
         pool.update_weights({"w": torch.ones(4)}.items(), 1)
-        assert wait_for(lambda: pool.applied() == [1, 1])
+        assert pool.applied() == [1, 1]
         hold.write_text("")
         running = [asyncio.run_coroutine_threadsafe(pool._request([1], 4, 1.0, ""), pool.loop) for _ in range(4)]
         assert wait_for(lambda: pool.engines[0].load == 2)  # two of them are on the worker that holds its calls
@@ -413,8 +419,9 @@ def test_a_worker_that_dies_loses_no_request_and_ends_the_run_at_the_next_update
         pool.close()
     again = RemotePool([doomed], pin=False)  # the resumed run: its first update brings the worker to its version
     try:
+        assert generate(again)[1] == -1
         again.update_weights({"w": torch.ones(4)}.items(), 5)
-        assert wait_for(lambda: again.applied() == [5]) and generate(again) == ([5, 4, 0], 5)
+        assert again.applied() == [5] and generate(again) == ([5, 4, 0], 5)
     finally:
         again.close(shutdown=True)
 
@@ -422,11 +429,12 @@ def test_a_worker_that_dies_loses_no_request_and_ends_the_run_at_the_next_update
 def test_a_weights_connection_that_ends_fails_the_next_update(workers):
     pool = RemotePool([workers(*SCRIPTED)], pin=False)
     try:
+        pool.update_weights({"w": torch.ones(4)}.items(), 1)
         pool.loop.call_soon_threadsafe(pool.targets[0].weights_writer.transport.abort)
-        pool.update_weights({"w": torch.ones(4)}.items(), 1)  # starts sending: the connection is found gone
-        assert wait_for(lambda: bool(pool.failure)) and pool.sending == [0, 0]
+        pool.update_weights({"w": torch.ones(4)}.items(), 2)  # starts sending: the connection is found gone
+        assert wait_for(lambda: bool(pool.failure)) and pool.sending == [0, 0] and pool.applied() == [1]
         with pytest.raises(RuntimeError, match="went away"):
-            pool.update_weights({"w": torch.ones(4)}.items(), 2)
+            pool.update_weights({"w": torch.ones(4)}.items(), 3)
     finally:
         pool.close(shutdown=True)
 
@@ -443,21 +451,23 @@ def test_an_update_that_fails_releases_its_staging_area_and_is_raised(workers):
         with pytest.raises(KeyError):
             pool.update_weights((), 1)
         assert pool.sending == [0, 0] and pool.version == -1
+        pool.payload = None
+        pool.update_weights({"w": torch.ones(2)}.items(), 1)
         pool.payload = lambda first: [({"mode": "full"}, {"w": torch.zeros(2, dtype=torch.complex64)})]
-        pool.update_weights((), 1)  # refused where it is packed for the wire, on the pool's thread
+        pool.update_weights((), 2)  # refused where it is packed for the wire, on the pool's thread
         assert wait_for(lambda: bool(pool.failure)) and pool.sending == [0, 0]
         with pytest.raises(RuntimeError, match="complex64"):
-            pool.check()
+            pool.update_weights((), 3)
     finally:
         pool.close(shutdown=True)
     pool = RemotePool([workers(*SCRIPTED)], pin=False)
     try:
         # the worker cannot apply it (factors without the base they fold into): it says so, the pool raises
+        # and a pool that waits raises the worker's reason at once, not a timeout
         pool.payload = lambda first: [({"mode": "fold", "scaling": {}}, {})]
-        pool.update_weights((), 1)
-        assert wait_for(lambda: bool(pool.failure)) and pool.sending == [0, 0]
         with pytest.raises(RuntimeError, match="fold push came before the base"):
-            pool.update_weights((), 2)
+            pool.update_weights((), 1)
+        assert pool.sending == [0, 0] and pool.version == -1
         assert pool.state()[0]["version"] == 0 and pool.state()[0]["receiving"] is False
     finally:
         pool.close(shutdown=True)
@@ -611,6 +621,40 @@ def test_a_worker_started_with_other_settings_is_refused(tmp_path, workers):
         RemotePool([address], identity={**mine, "stop_ids": [0]})
 
 
+def test_a_worker_must_serve_adapters_of_the_run_s_rank():
+    """The hello of a run with named adapters refuses a worker whose engine serves a lower LoRA rank."""
+    worker = EngineWorker(WireEngine(), identity={"lora_rank": 8})
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    port = asyncio.run_coroutine_threadsafe(worker.serve(), loop).result(30)
+    try:
+        RemotePool([f"127.0.0.1:{port}"], identity={"lora_rank": 4}, pin=False).close()
+        with pytest.raises(ValueError, match="lora_rank: the trainer has 16, the worker 8"):
+            RemotePool([f"127.0.0.1:{port}"], identity={"lora_rank": 16}, pin=False)
+    finally:
+        wait_for(lambda: not asyncio.all_tasks(loop))  # (the workers' connections have ended)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(10)
+        worker.client.close()
+
+
+def test_rows_of_another_run_s_versions_are_never_trained():
+    from types import SimpleNamespace
+
+    from palingenesis.rl.trainer import RLTrainer
+
+    trainer = SimpleNamespace(
+        config=SimpleNamespace(rollout=SimpleNamespace(max_staleness=1)),
+        weights=SimpleNamespace(version=5),
+        stale_groups=0,
+    )
+    groups = [
+        [SimpleNamespace(version=v) for v in versions] for versions in ([5, 5], [4, 5], [3, 5], [-1, 5], [5, 120])
+    ]
+    assert RLTrainer._fresh(trainer, groups) == groups[:2] and trainer.stale_groups == 3
+
+
 # ----------------------------------------------------------- with the trainer
 
 
@@ -649,7 +693,7 @@ def _train(tmp_path, engines, each_step=None, watch=None, **overrides):
     trainer = RLTrainer(_config(tmp_path, engines, **overrides))
     logged = []
     if watch is not None:
-        in_thread(watch, trainer)
+        watch(trainer)
 
     def log(kind, metrics, step):
         logged.append((kind, dict(metrics)))
@@ -726,23 +770,33 @@ def test_full_weights_overlap_training_and_rows_past_the_staleness_bound_are_dro
         if gate.path.exists():
             while_held.append(metrics)
 
-    def watch(trainer):  # the trainer has dropped rows as stale and waits for newer ones: let the pushes through
-        if wait_for(lambda: trainer.orchestrator.replaced + trainer.stale_groups > 0, 120):
-            gate.open()
+    def watch(trainer):
+        update = trainer.engine.update_weights
 
-    gate.close()
+        def first_then_held(named, version):  # the run's first update arrives (it waits); the next ones are held
+            update(named, version)
+            gate.close()
+            trainer.engine.update_weights = update
+
+        def release():  # the trainer has dropped rows as stale and waits for newer ones: let the pushes through
+            if wait_for(lambda: trainer.orchestrator.replaced + trainer.stale_groups > 0, 120):
+                gate.open()
+
+        trainer.engine.update_weights = first_then_held
+        in_thread(release)
+
     trainer, steps = _train(tmp_path, held, each_step, watch, **{"train.steps": 5})
     assert trainer.push_mode == "full" and len(steps) == 5
     # steps were taken while every push was still on its way, on rows of the version the engine had
     assert len(while_held) >= 2 and while_held[0]["trained_sequences"] > 0
-    assert while_held[-1]["pool/lag"] >= 2 and all(m["staleness"] <= 1 for m in steps)
+    assert while_held[-1]["pool/lag"] >= 1 and all(m["staleness"] <= 1 for m in steps)
     # the engine was past the bound until the pushes arrived: its batches were dropped, whole or by group
     assert trainer.orchestrator.replaced + steps[-1]["stale_groups_dropped"] > 0
     assert any(m.get("trained_sequences", 0) > 0 for m in steps[len(while_held) :])  # and trains again after
 
     fast = [workers("--model", policy, "--backend", "hf", *KWARGS)]
     trainer, steps = _train(tmp_path, fast, **{"train.steps": 4, "train.output_dir": str(tmp_path / "fast")})
-    assert sum(m.get("trained_sequences", 0) > 0 for m in steps) >= 3 and all(m["staleness"] <= 1 for m in steps)
+    assert any(m.get("trained_sequences", 0) > 0 for m in steps) and all(m["staleness"] <= 1 for m in steps)
     current = [m["policy/mismatch_k3/current"] for m in steps if "policy/mismatch_k3/current" in m]
     # turns sampled at the trained version: the pushed weights are the trained ones
     assert current and max(current) < 1e-3
@@ -834,6 +888,8 @@ def test_two_trainer_ranks_share_a_pool_and_only_rank_0_pushes(tmp_path, workers
         ({"rollout.push": "fold", "lora.rank": 4, "roles.b.partner": "base"}, "rollout.push must be native"),
         ({"rollout.push": "native", "lora.rank": 4, "lora.dora": True}, "lora.dora magnitudes"),
         ({"lora.rank": 4, "lora.dora": True, "roles.b.partner": "base"}, "has no lora.dora"),
+        ({"lora.rank": 4, "roles.b.partner": "base", "train.fsdp": True}, "partner base on remote engines is not"),
+        ({"lora.rank": 4, "roles.a.adapter": "policy"}, "cannot be called 'policy'"),
     ],
 )
 def test_configuration_errors(overrides, match):

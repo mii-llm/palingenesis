@@ -471,8 +471,12 @@ class RLTrainer:
                     "chat_template_kwargs": dict(m.chat_template_kwargs or {}),
                     "max_model_len": r.max_model_len,
                     "fp32_head": bool(r.fp32_head),
+                    **({"lora_rank": config.lora.rank} if self.push_mode == "native" else {}),
                 },
             )
+            # every rank goes on only after rank 0 has greeted every worker: from then on a worker tags what it
+            # samples as not this run's until rank 0's first update has reached it
+            self.parallel.sum([0.0])
             if self.push_mode != "full" and self.parallel.main:
                 self.engine.payload = self._wire_frames
         else:
@@ -640,12 +644,19 @@ class RLTrainer:
     def _push_mode(self) -> str:
         """What a weight update sends to remote engines (rollout.push)."""
         mode = self.config.rollout.push
-        if self.adapters is None or self.parallel.fsdp:
+        if self.adapters is None:
             return "full"
         # an engine that folds holds one policy: roles on other adapters, or on the bare base (partner: base),
         # need the adapters next to the base
         several = bool(self.adapters.names) or not self.adapters.default_trains
         several = several or any(spec.label == "base" for spec in self.role_specs.values())
+        if self.parallel.fsdp:
+            if several:
+                raise ValueError(
+                    "roles on their own adapter or on the frozen base need the adapters served next to the base "
+                    "(rollout.push native), which FSDP cannot send: use train.replicate_base."
+                )
+            return "full"
         if mode == "auto":
             mode = "native" if several else "fold"
         if mode == "fold" and several:
@@ -1250,7 +1261,9 @@ class RLTrainer:
     def _fresh(self, groups: list[list[Trajectory]]) -> list[list[Trajectory]]:
         """Groups within rollout.max_staleness of the current policy (carried groups can be older)."""
         limit = self.config.rollout.max_staleness
-        fresh = [g for g in groups if self.weights.version - min(t.version for t in g) <= limit]
+        current = self.weights.version  # (a version below 0 or above the trainer's is another run's: never trained)
+        fresh = [g for g in groups if 0 <= min(t.version for t in g) and current - min(t.version for t in g) <= limit]
+        fresh = [g for g in fresh if max(t.version for t in g) <= current]
         self.stale_groups += len(groups) - len(fresh)
         return fresh
 
@@ -1260,8 +1273,14 @@ class RLTrainer:
             return metrics
         per_rank = self.parallel.gather(metrics)
         combined = mean_stats(per_rank)
-        for key in _SUMMED & combined.keys():
-            combined[key] = sum(s.get(key, 0.0) for s in per_rank)
+        for key in combined:
+            if key in _SUMMED or key == "pool/engines" or (key.startswith("role/") and key.endswith("/trained_tokens")):
+                combined[key] = sum(s.get(key, 0.0) for s in per_rank)
+            elif key.startswith("role/") and "/policy/" in key:  # per-token means: weighted by each rank's tokens
+                count = key.split("/policy/")[0] + "/trained_tokens"
+                total = sum(s.get(count, 0.0) for s in per_rank if key in s)
+                if total > 0:
+                    combined[key] = sum(s[key] * s.get(count, 0.0) for s in per_rank if key in s) / total
         for key in combined:
             if key.endswith("_max"):  # a maximum over the batch (policy/ratio_max, policy/kl_ref_max), not a rate
                 combined[key] = max(s[key] for s in per_rank if key in s)

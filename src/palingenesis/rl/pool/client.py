@@ -14,9 +14,13 @@ being sent, the snapshot is skipped and the next sync tries again with newer wei
 is never the reason a trainer waits). An engine that is still receiving version v when v+1 is staged receives v+1
 next: a push is never interrupted, and the newest staged version is the one that follows.
 
+The first update of a run waits for the engines whatever max_staleness is, and its `hello` marks what a worker
+held before as another run's (palingenesis.rl.pool.worker): a worker that outlived a run samples nothing that the
+new run would train.
+
 Losing an engine. A worker whose connection ends is not sent anything more. Requests it was running are sent
-again to the engines that remain, so no rollout waits for it; the run itself ends at the next weight update with
-an error that names the worker (an engine that missed updates would otherwise keep sampling an old policy, and a
+again to the other engines of this process, so no rollout waits for it (a rank whose only engine is gone fails
+its rollouts at once); the run itself ends at the next weight update with an error that names the worker (an engine that missed updates would otherwise keep sampling an old policy, and a
 restarted one holds none of this run's weights). Restart the worker and resume from the last checkpoint.
 
 A request goes to the engine with the fewest requests in flight. There is no prefix affinity: every push resets
@@ -57,6 +61,7 @@ class _Engine:
         self.queued: tuple | None = None  # the push that follows the one being sent (the newest staged)
         self.listener: asyncio.Task | None = None
         self.dead = ""  # why nothing more is sent to this worker
+        self.confirmed = False  # the worker holds weights this run sent it
 
     @property
     def load(self) -> int:
@@ -93,6 +98,7 @@ class RemotePool:
         self.version = -1
         self.payload = None  # callable(first) -> [(header fields, tensors), ...] (LoRA pushes), else full weights
         self.first = True  # the next push is this trainer's first: engines get everything they need to keep
+        self.started = False  # the first update was confirmed by the engines (it always waits for them)
         self.staging = [Staging(pin), Staging(pin)]
         self.sending = [0, 0]  # pushes still being sent from each staging area (under `counts`)
         self.once: list[list[str]] = [[], []]  # tensors of each area that are sent once (the base): freed after
@@ -143,19 +149,21 @@ class RemotePool:
             if engine.reader is not None
             else (engine.weights_reader, engine.weights_writer)
         )
-        await send(writer, {"op": "hello"})
+        await send(writer, {"op": "hello", "push": engine in self.targets})
         reply, _ = await receive(reader)
         theirs = reply.get("identity") or {}
         differ = [
             f"{key}: the trainer has {mine!r}, the worker {theirs[key]!r}"
             for key, mine in self.identity.items()
-            if key in theirs and theirs[key] != mine
+            # (the worker serves adapters up to its rank; every other setting must be the same)
+            if key in theirs and (theirs[key] < mine if key == "lora_rank" else theirs[key] != mine)
         ]
         if differ:
             raise ValueError(
                 f"engine worker {engine.address} was started with other settings than this run's "
                 f"({'; '.join(differ)}). Start it with the flags `pgs scenario plan --engine-gpus` prints "
-                "(or the worker's --model, --stop-tokens, --chat-template-kwargs, --max-model-len, --fp32-head)."
+                "(or the worker's --model, --stop-tokens, --chat-template-kwargs, --max-model-len, --fp32-head, "
+                "--lora-rank)."
             )
 
     def _lose(self, engine: _Engine, reason: str, closing: bool = False) -> None:
@@ -180,6 +188,7 @@ class RemotePool:
                     future.set_result(header)
         except asyncio.CancelledError:
             self._lose(engine, "the pool was closed", closing=True)
+            raise
         except (asyncio.IncompleteReadError, ConnectionError, OSError) as error:
             self._lose(engine, repr(error))
 
@@ -197,7 +206,10 @@ class RemotePool:
             engine.waiting.pop(number, None)
             self._lose(engine, repr(error))
             raise EngineLost(f"engine worker {engine.address} went away ({error!r})") from None
-        return await future
+        try:
+            return await future
+        finally:
+            engine.waiting.pop(number, None)  # (a cancelled request no longer counts as this engine's load)
 
     # ------------------------------------------------------------- generation
 
@@ -246,14 +258,15 @@ class RemotePool:
         """Stage the weights of `version` and start sending them to every target engine; returns at once (see
         the module docstring), or when every engine applied them if the pool is blocking. A process that does not
         push (ranks other than 0) records the version, and if the pool is blocking waits until its own engines
-        report it."""
+        report it. The first update of a run always waits: no rollout is sampled from what a worker held before."""
         self.check()
+        blocking = self.blocking or not self.started
         if not self.targets:
             for _ in named_tensors or ():  # (gathered parameters: every rank must iterate them)
                 pass
-            if self.blocking:
+            if blocking:
                 self._wait(self._reached(version), f"version {version} from rank 0")
-            self.version = version
+            self.version, self.started = version, True
             return
         with self.counts:
             free = [i for i in (0, 1) if not self.sending[i]]
@@ -285,16 +298,17 @@ class RemotePool:
                 self.sending[free[0]] -= len(self.targets)
             raise
         self.first = False
-        if not self.blocking:
+        if not blocking:
             self.version = version
         futures = [
             asyncio.run_coroutine_threadsafe(self._push(engine, free[0], frames), self.loop) for engine in self.targets
         ]
-        if self.blocking:
+        if blocking:
             self._wait(self._all(futures), f"version {version}")
+            self.check()  # (a push the worker could not apply is raised now, not after a wait for its version)
             self._wait(self._reached(version), f"version {version}")  # (engines of this rank it does not push to)
             self.check()
-            self.version = version  # (after the engines have it: pool/lag reads 0 between updates)
+            self.version, self.started = version, True  # (set after the engines have it: pool/lag reads 0)
 
     async def _all(self, futures) -> None:
         await asyncio.gather(*(asyncio.wrap_future(f) for f in futures))
@@ -312,15 +326,19 @@ class RemotePool:
             ) from None
 
     async def _reached(self, version: int) -> None:
-        """Until every engine this process generates with reports `version` or newer."""
-        while True:
-            behind = [e for e in self.engines if not e.dead and e.applied < version]
-            if not behind:
-                return
-            for engine in behind:
+        """Until every engine this process generates with holds this run's weights, at `version` or newer (or a
+        push failed: the caller raises it)."""
+
+        def behind() -> list[_Engine]:
+            return [e for e in self.engines if not e.dead and not (e.confirmed and e.applied >= version)]
+
+        while behind() and not self.failure:
+            for engine in behind():
                 with contextlib.suppress(EngineLost):
-                    engine.applied = max(engine.applied, int((await self._ask(engine, {"op": "state"}))["version"]))
-            if any(e.applied < version for e in behind if not e.dead):
+                    state = await self._ask(engine, {"op": "state"})
+                    if state.get("confirmed", True):
+                        engine.confirmed, engine.applied = True, max(engine.applied, int(state["version"]))
+            if behind():
                 await asyncio.sleep(0.02)
 
     async def _push(self, engine: _Engine, area: int, frames: list) -> None:
@@ -344,7 +362,7 @@ class RemotePool:
                         reply, _ = await receive(engine.weights_reader)
                         if "error" in reply:
                             raise RuntimeError(f"the worker could not apply the update: {reply['error']}")
-                    engine.applied = max(engine.applied, int(reply["version"]))
+                    engine.applied, engine.confirmed = max(engine.applied, int(reply["version"])), True
                     self.stats["pushes"] += 1
                     self.stats["bytes"] += sent
                     self.stats["seconds"] += time.perf_counter() - start

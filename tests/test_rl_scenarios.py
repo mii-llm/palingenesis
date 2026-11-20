@@ -1301,7 +1301,7 @@ def test_the_planner_lays_out_trainers_and_engines_on_separate_gpus():
     # named adapters in one engine pool; tensor-parallel engines for a policy too big for one GPU
     workload = Workload(params_b=0.8, lora_rank=16, replicate_base=True)
     native = plan_pool(Cluster(1, 8, 80), workload, engine_gpus=4, adapters=2)
-    assert native.push == "native" and "--lora-rank 16 --max-loras 3" in native.engines[0]["command"]
+    assert native.push == "native" and "--lora-rank 16 --max-loras 6" in native.engines[0]["command"]
     # a role on the frozen base needs the adapters next to the base too; the launch lines carry what the trainer
     # checks when it connects
     from palingenesis.rl.config import RLConfig
@@ -1348,3 +1348,45 @@ def test_role_statistics_leave_forced_tokens_out_of_the_sampler_comparison():
     unmarked = role_statistics(lp, behaviour, advantage, role, ["a", "b"], config)
     unmarked = role_metrics({k: float(v) for k, v in unmarked.items()}, ["a", "b"], entropy=False, reference=False)
     assert unmarked["role/a/policy/clipped"] == pytest.approx(1 / 3)
+
+
+def test_the_trainer_s_adapter_reaches_a_forward_recomputed_on_another_thread():
+    """Under gradient checkpointing autograd recomputes a segment during backward on its own thread (one per
+    CUDA device), which sees no context variable of the trainer's thread: set_adapter must reach it, and a
+    use_adapter block of a rollout thread must still win over it."""
+    import threading
+
+    from torch.utils.checkpoint import checkpoint
+
+    from palingenesis.lora import LoRALinear, set_adapter, use_adapter
+
+    torch.manual_seed(0)
+    layer = LoRALinear(torch.nn.Linear(4, 4), rank=2, alpha=4)
+    critic = layer.add_adapter("critic")
+    with torch.no_grad():
+        layer.lora_B.normal_(), critic.lora_B.normal_()
+    x = torch.randn(3, 4, requires_grad=True)
+    seen = {}
+
+    def other_thread(key, call):
+        thread = threading.Thread(target=lambda: seen.__setitem__(key, call()))
+        thread.start(), thread.join()
+        return seen[key]
+
+    set_adapter("critic")
+    try:
+        with use_adapter("critic"):
+            expected = layer(x).detach()
+        assert torch.equal(other_thread("forward", lambda: layer(x).detach()), expected)
+        out = checkpoint(layer, x, use_reentrant=False)
+        other_thread("backward", lambda: out.sum().backward())  # the recomputation runs on that thread
+        assert critic.lora_B.grad.abs().sum() > 0 and layer.lora_B.grad is None
+
+        def rollout():
+            with use_adapter(""):
+                return layer(x).detach()
+
+        assert not torch.equal(other_thread("rollout", rollout), expected)  # its own block wins
+    finally:
+        set_adapter("")
+    assert not torch.equal(layer(x).detach(), expected)

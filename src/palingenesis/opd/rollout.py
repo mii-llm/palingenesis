@@ -475,21 +475,29 @@ class VLLMColocateRollout:
         return request
 
     def load_adapter(self, name: str, path: str, version: int) -> None:
-        """Make the LoRA adapter saved at `path` (PEFT layout) the adapter `name` of this engine, replacing the
-        one it had (vLLM's in-place reload: requests in flight keep running). The engine must have been built
-        with enable_lora (engine_kwargs: enable_lora, max_loras, max_lora_rank). Not run on a GPU yet."""
+        """Make the LoRA adapter saved at `path` (PEFT layout) what requests for the adapter `name` use from now
+        on. Each version is an adapter of its own to vLLM (its own name and id), loaded when the first request
+        names it: requests in flight keep the version they started with, a new version never reads another's
+        files, and cached prefixes of an older version are not reused (the prefix cache is reset as well). The
+        engine must have been built with enable_lora (engine_kwargs: enable_lora, max_loras, max_lora_rank), with
+        max_loras at least twice the number of adapters. Not run on a GPU yet."""
         from vllm.lora.request import LoRARequest
 
-        number = self.adapter_ids.setdefault(name, len(self.adapter_ids) + 1)
-        try:
-            request = LoRARequest(lora_name=name, lora_int_id=number, lora_path=path, load_inplace=True)
-        except TypeError:  # a vLLM without in-place reload: a new id per version makes it load the new files
-            request = LoRARequest(lora_name=name, lora_int_id=number * 1_000_000 + version, lora_path=path)
+        self.adapter_ids[name] = number = (
+            len(self.adapter_ids) + 1 if name not in self.adapter_ids else self.adapter_ids[name]
+        )
+        request = LoRARequest(lora_name=f"{name}-v{version}", lora_int_id=number * 1_000_000 + version, lora_path=path)
         self.adapters[name] = request
+        self.llm.reset_prefix_cache()
 
     def _lora(self, adapter: str) -> dict:
         if not adapter or adapter == "base":
             return {}
+        if adapter not in self.adapters:
+            raise KeyError(
+                f"the adapter {adapter!r} was not loaded into this engine (loaded: {sorted(self.adapters)}): "
+                "adapters reach an engine with the trainer's weight updates (rollout.push native)."
+            )
         return {"lora_request": self.adapters[adapter]}
 
     def generate(self, prompts, max_new_tokens, temperature, images=None, adapter: str = ""):
