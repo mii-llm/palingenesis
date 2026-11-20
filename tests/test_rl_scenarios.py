@@ -867,6 +867,11 @@ def test_two_roles_train_their_own_adapters_on_one_base(tmp_path):
     assert steps[0]["policy/mismatch_k3"] < 1e-6 and steps[0]["policy/abs_ratio_dev"] < 1e-3  # the right adapter each
     assert steps[0]["policy/kl_ref"] > 1e-4  # ... and far from the base, which the reference still is
     assert steps[0]["grad_norm/alpha"] > 0 and steps[0]["grad_norm/beta"] > 0  # clipped, and logged, one by one
+    for role in ("a", "b"):  # the policy statistics per role: each adapter matches its sampler and left the base
+        assert steps[0][f"role/{role}/policy/mismatch_k3"] < 1e-6 and steps[0][f"role/{role}/policy/kl_ref"] > 1e-5
+        assert steps[0][f"role/{role}/policy/entropy"] > 0 and 0 <= steps[0][f"role/{role}/policy/clipped"] <= 1
+    pooled = sum(steps[0][f"role/{r}/trained_tokens"] * steps[0][f"role/{r}/policy/kl_ref"] for r in ("a", "b"))
+    assert pooled / steps[0]["trained_tokens"] == pytest.approx(steps[0]["policy/kl_ref"], rel=1e-4)
     after = dict(trainer.model.named_parameters())
     moved = {n for n in after if not torch.equal(after[n], before[n])}
     assert moved <= trainable and any(".roles.alpha." in n for n in moved) and any(".roles.beta." in n for n in moved)

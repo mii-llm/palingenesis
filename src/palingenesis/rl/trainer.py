@@ -788,8 +788,17 @@ class RLTrainer:
                 lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config, forced_t
             )
             stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], forced_t))
+            reference_lp = torch.cat([self.ref_lp[id(t)] for t in micro]) if self.ref_lp else None
+            if self.scenario is not None:  # the same statistics per role
+                names = self.scenario.roles
+                of_row = torch.tensor([names.index(t.role) for t in micro], device=device)
+                stats.update(
+                    credit.role_statistics(
+                        lp, floats[0], floats[1], of_row[longs[1]], names, loss_config, entropy, reference_lp, forced_t
+                    )
+                )
             if self.ref_lp:
-                loss = self._kl_term(loss, stats, lp, torch.cat([self.ref_lp[id(t)] for t in micro]), floats[2])
+                loss = self._kl_term(loss, stats, lp, reference_lp, floats[2])
             if echo:
                 loss = loss + self._observation_term(stats, echo_hidden, echo_targets, echo_weight)
             if balancer is not None:
@@ -817,6 +826,10 @@ class RLTrainer:
             **mismatch_metrics(values),
             **advantage_stats,
         }
+        if self.scenario is not None:
+            from palingenesis.rl.scenarios.credit import role_metrics
+
+            metrics.update(role_metrics(values, self.scenario.roles, "entropy" in values, "kl_ref" in values))
         if "entropy" in values:
             metrics["policy/entropy"] = values["entropy"] / tokens
         if "kl_ref" in values:
@@ -922,6 +935,17 @@ class RLTrainer:
                 loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced)
                 where = torch.tensor([sampled, _sampled_by(t, sampled, current)], dtype=torch.long, device=device)
                 stats.update(mismatch_by_bucket(lp, floats[0], where[0], where[1], forced))
+                if self.scenario is not None:
+                    from palingenesis.rl.scenarios.credit import role_statistics
+
+                    names = self.scenario.roles
+                    of_token = torch.full((len(sampled),), names.index(t.role), dtype=torch.long, device=device)
+                    reference_lp = self.ref_lp[id(t)] if self.ref_lp else None
+                    stats.update(
+                        role_statistics(
+                            lp, floats[0], floats[1], of_token, names, loss_config, entropy, reference_lp, forced
+                        )
+                    )
                 if self.ref_lp:
                     loss = self._kl_term(loss, stats, lp, self.ref_lp[id(t)], floats[2])
                 if echo:

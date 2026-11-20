@@ -157,3 +157,66 @@ def token_weights(
         role_weights = losses.token_weights(by_role[name], aggregation, budget, sequence_level, reduce)
         weights.update({key: value * factor for key, value in role_weights.items()})
     return weights
+
+
+ROLE_STATISTICS = ("tokens", "mismatch_k3", "abs_ratio_dev", "clipped", "entropy", "kl_ref")
+
+
+def role_statistics(lp, behaviour, advantage, role, names, config, entropy=None, reference=None, forced=None) -> dict:
+    """Per role, the sums over a micro-batch's trained tokens that the policy statistics are means of: the token
+    count, the sampler / trainer mismatch (k3 = rho - 1 - log rho and |rho - 1|, rho the importance ratio), the
+    tokens the objective clipped or masked, the policy's entropy and the k3 estimate of its KL to the reference.
+    `role`: [N] long, each token's index in `names`; the other tensors are losses.policy_loss's. 0-d tensors keyed
+    role_stat/<name>/<statistic> (no host sync); `role_metrics` turns the step's sums into means."""
+    import torch
+
+    with torch.no_grad():
+        log_ratio = lp.detach() - behaviour
+        ratio = log_ratio.exp()
+        keep = torch.ones_like(ratio) if forced is None else (~forced).float()
+        kind = config.type
+        if kind == "masked_is":
+            clipped = ((advantage > 0) & (ratio > 1 + config.eps_high)) | (
+                (advantage < 0) & (ratio < 1 - config.eps_low)
+            )
+        elif kind == "cispo":
+            clipped = ratio > config.is_cap
+        elif kind == "icepop":
+            clipped = (ratio < config.icepop_low) | (ratio > config.icepop_high)
+        elif kind == "ipo":
+            clipped = (lp.detach().exp() - behaviour.exp()).abs() > config.ipo_eps
+        else:  # gspo clips whole sequences, reinforce nothing
+            clipped = torch.zeros_like(ratio, dtype=torch.bool)
+        zeros = torch.zeros_like(ratio)
+        rows = torch.stack(
+            [
+                torch.ones_like(ratio),
+                (ratio - 1 - log_ratio) * keep,
+                (ratio - 1).abs() * keep,
+                clipped.float(),
+                entropy.detach().float() if entropy is not None and entropy.numel() else zeros,
+                (torch.exp(reference - lp.detach()) - (reference - lp.detach()) - 1.0)
+                if reference is not None
+                else zeros,
+            ]
+        )
+        sums = rows.new_zeros(len(ROLE_STATISTICS), len(names)).index_add_(1, role, rows)
+    return {
+        f"role_stat/{name}/{key}": sums[i, j] for j, name in enumerate(names) for i, key in enumerate(ROLE_STATISTICS)
+    }
+
+
+def role_metrics(values: dict[str, float], names, entropy: bool, reference: bool) -> dict[str, float]:
+    """role/<name>/policy/{mismatch_k3, abs_ratio_dev, clipped, entropy, kl_ref}: per-token means of a step's
+    summed role_statistics, for the roles that trained tokens."""
+    out = {}
+    for name in names:
+        tokens = values.get(f"role_stat/{name}/tokens", 0.0)
+        if tokens <= 0:
+            continue
+        for key in ROLE_STATISTICS[1:]:
+            if (key == "entropy" and not entropy) or (key == "kl_ref" and not reference):
+                continue
+            out[f"role/{name}/policy/{key}"] = values[f"role_stat/{name}/{key}"] / tokens
+        out[f"role/{name}/trained_tokens"] = tokens
+    return out
