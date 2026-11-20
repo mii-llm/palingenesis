@@ -106,8 +106,8 @@ def main(argv: list[str] | None = None) -> int:
 
     config = RLConfig.from_yaml(args.config)
     if args.engine_gpus:
-        from palingenesis.rl.scenarios.config import adapter_names
-        from palingenesis.rl.scenarios.placement import plan_pool
+        from palingenesis.rl.scenarios.config import BASE, adapter_names
+        from palingenesis.rl.scenarios.placement import plan_pool, worker_flags
 
         pool = plan_pool(
             Cluster(args.nodes, args.gpus_per_node, args.gpu_memory_gb),
@@ -119,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
             engine_tp=args.engine_tp,
             link_gbps=args.link_gbps,
             adapters=len(adapter_names(config)),
+            flags=worker_flags(config),
+            base_partner=any(role.partner == BASE for role in config.roles.values()),
         )
         print(json.dumps(pool.to_dict(), indent=2))
         return 1 if pool.errors else 0

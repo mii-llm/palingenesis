@@ -101,11 +101,14 @@ def validate(config: Any, sharded: bool) -> list[str]:
             errors.append(
                 "roles with their own adapter are not supported with loss.kl_ref_reset (kl_ref: start works)."
             )
-    if names and config.rollout.backend == "remote" and config.rollout.push in ("full", "fold"):
+    if (names or based) and config.rollout.backend == "remote" and config.rollout.push in ("full", "fold"):
         errors.append(
-            "roles with their own adapter on remote engines are served as named adapters of one engine: "
-            "rollout.push must be native (or auto)."
+            "roles with their own adapter (or partner: base) on remote engines are served as named adapters next "
+            "to the base in one engine: rollout.push must be native (or auto). An engine that folds, or receives "
+            "full weights, holds the trained policy alone."
         )
+    if based and config.rollout.backend == "remote" and config.lora.dora:
+        errors.append("roles.<name>.partner base on remote engines needs rollout.push native, which has no lora.dora.")
     if (names or based) and config.rollout.backend not in ("hf", "remote") and os.environ.get("WORLD_SIZE", "1") != "1":
         errors.append(
             "roles with their own adapter (or partner: base) run on one GPU for now: a vLLM server per adapter is "

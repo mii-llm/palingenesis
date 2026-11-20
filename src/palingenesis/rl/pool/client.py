@@ -14,6 +14,11 @@ being sent, the snapshot is skipped and the next sync tries again with newer wei
 is never the reason a trainer waits). An engine that is still receiving version v when v+1 is staged receives v+1
 next: a push is never interrupted, and the newest staged version is the one that follows.
 
+Losing an engine. A worker whose connection ends is not sent anything more. Requests it was running are sent
+again to the engines that remain, so no rollout waits for it; the run itself ends at the next weight update with
+an error that names the worker (an engine that missed updates would otherwise keep sampling an old policy, and a
+restarted one holds none of this run's weights). Restart the worker and resume from the last checkpoint.
+
 A request goes to the engine with the fewest requests in flight. There is no prefix affinity: every push resets
 an engine's prefix cache, and an engine's own batch is where the turns of a session meet their prefix.
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import itertools
 import logging
 import threading
@@ -31,6 +37,10 @@ from palingenesis.rl.generation import Generation
 from palingenesis.rl.pool.protocol import Staging, receive, send
 
 logger = logging.getLogger(__name__)
+
+
+class EngineLost(ConnectionError):
+    """The connection to an engine worker ended."""
 
 
 class _Engine:
@@ -46,6 +56,7 @@ class _Engine:
         self.applied = -1  # the newest version the worker confirmed
         self.queued: tuple | None = None  # the push that follows the one being sent (the newest staged)
         self.listener: asyncio.Task | None = None
+        self.dead = ""  # why nothing more is sent to this worker
 
     @property
     def load(self) -> int:
@@ -53,9 +64,12 @@ class _Engine:
 
 
 class RemotePool:
-    """`addresses`: "host:port" of every engine worker this process generates with. `push`: whether this process
-    sends the weights (rank 0 of a multi-rank trainer does, for every rank's engines: `push_to`). `blocking`: a
-    weight update returns only when every engine has applied it."""
+    """`addresses`: "host:port" of every engine worker this process generates with. `push_to`: the workers this
+    process sends the weights to (rank 0 of a multi-rank trainer: every rank's engines; the other ranks: none).
+    `blocking`: a weight update returns only when the engines have applied it (the ones this process sends to,
+    and the ones it generates with), or fails after `push_timeout` seconds. `identity`: this trainer's model
+    signature, stop tokens, chat-template arguments, context length and head precision; a worker that was started
+    with other values is refused."""
 
     def __init__(
         self,
@@ -64,26 +78,36 @@ class RemotePool:
         blocking: bool = False,
         connect_timeout: float = 600.0,
         pin: bool = True,
+        identity: dict | None = None,
+        push_timeout: float = 1800.0,
     ):
         if not addresses:
             raise ValueError("rollout.engines is empty: list the engine workers as host:port")
         self.engines = [_Engine(a) for a in addresses]
         known = {e.address: e for e in self.engines}
         self.targets = [known.get(a) or _Engine(a) for a in (addresses if push_to is None else push_to)]
-        self.blocking = blocking
+        self.blocking, self.push_timeout = blocking, push_timeout
+        self.identity = dict(identity or {})
         # the newest version handed to the pool (PublishedWeights compares with it). -1: nothing yet, so the first
         # sync always sends: a worker may hold another run's weights
         self.version = -1
-        self.payload = None  # callable -> (header fields, tensors) of the current weights (LoRA pushes), else full
+        self.payload = None  # callable(first) -> [(header fields, tensors), ...] (LoRA pushes), else full weights
         self.first = True  # the next push is this trainer's first: engines get everything they need to keep
         self.staging = [Staging(pin), Staging(pin)]
-        self.sending = [0, 0]  # pushes still being sent from each staging area
+        self.sending = [0, 0]  # pushes still being sent from each staging area (under `counts`)
+        self.once: list[list[str]] = [[], []]  # tensors of each area that are sent once (the base): freed after
+        self.counts = threading.Lock()
+        self.failure = ""  # a push that was not applied, or a worker that went away: the next update raises
         self.ids = itertools.count()
         self.stats = {"pushes": 0, "skipped": 0, "bytes": 0, "seconds": 0.0, "stage_seconds": 0.0}
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, name="pgs-engine-pool", daemon=True)
         self.thread.start()
-        self._call(self._connect(connect_timeout))
+        try:
+            self._call(self._connect(connect_timeout))
+        except BaseException:
+            self.close()
+            raise
 
     def _call(self, coroutine, timeout: float | None = None):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout)
@@ -108,8 +132,44 @@ class RemotePool:
                         ) from None
                     await asyncio.sleep(0.5)
             engine.write_lock, engine.push_lock = asyncio.Lock(), asyncio.Lock()
+            await self._hello(engine)
             if engine.reader is not None:
                 engine.listener = asyncio.ensure_future(self._listen(engine))
+
+    async def _hello(self, engine: _Engine) -> None:
+        """Refuse a worker that was started for another model or with other generation settings."""
+        reader, writer = (
+            (engine.reader, engine.writer)
+            if engine.reader is not None
+            else (engine.weights_reader, engine.weights_writer)
+        )
+        await send(writer, {"op": "hello"})
+        reply, _ = await receive(reader)
+        theirs = reply.get("identity") or {}
+        differ = [
+            f"{key}: the trainer has {mine!r}, the worker {theirs[key]!r}"
+            for key, mine in self.identity.items()
+            if key in theirs and theirs[key] != mine
+        ]
+        if differ:
+            raise ValueError(
+                f"engine worker {engine.address} was started with other settings than this run's "
+                f"({'; '.join(differ)}). Start it with the flags `pgs scenario plan --engine-gpus` prints "
+                "(or the worker's --model, --stop-tokens, --chat-template-kwargs, --max-model-len, --fp32-head)."
+            )
+
+    def _lose(self, engine: _Engine, reason: str, closing: bool = False) -> None:
+        if closing:
+            engine.dead = engine.dead or reason
+        if not engine.dead:
+            engine.dead = reason
+            logger.error("engine worker %s is gone (%s)", engine.address, reason)
+            if engine in self.targets:
+                self.failure = self.failure or f"engine worker {engine.address} went away ({reason})"
+        for future in engine.waiting.values():
+            if not future.done():
+                future.set_exception(EngineLost(f"engine worker {engine.address} went away ({reason})"))
+        engine.waiting.clear()
 
     async def _listen(self, engine: _Engine) -> None:
         try:
@@ -118,11 +178,26 @@ class RemotePool:
                 future = engine.waiting.pop(header.get("id"), None)
                 if future is not None and not future.done():
                     future.set_result(header)
-        except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError) as error:
-            for future in engine.waiting.values():
-                if not future.done():
-                    future.set_exception(ConnectionError(f"engine worker {engine.address} went away ({error!r})"))
-            engine.waiting.clear()
+        except asyncio.CancelledError:
+            self._lose(engine, "the pool was closed", closing=True)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as error:
+            self._lose(engine, repr(error))
+
+    async def _ask(self, engine: _Engine, header: dict) -> dict:
+        """Send a request frame on the request connection and wait for the reply with its id."""
+        if engine.dead:
+            raise EngineLost(f"engine worker {engine.address} went away ({engine.dead})")
+        number = next(self.ids)
+        future = self.loop.create_future()
+        engine.waiting[number] = future
+        try:
+            async with engine.write_lock:
+                await send(engine.writer, {**header, "id": number})
+        except (ConnectionError, OSError) as error:
+            engine.waiting.pop(number, None)
+            self._lose(engine, repr(error))
+            raise EngineLost(f"engine worker {engine.address} went away ({error!r})") from None
+        return await future
 
     # ------------------------------------------------------------- generation
 
@@ -130,69 +205,132 @@ class RemotePool:
         return RemoteClient(self, adapter)
 
     async def _request(self, prompt_ids, max_new_tokens, temperature, adapter: str) -> Generation:
-        engine = min(self.engines, key=lambda e: e.load)
-        number = next(self.ids)
-        future = self.loop.create_future()
-        engine.waiting[number] = future
+        if dataclasses.is_dataclass(temperature):  # opd.rollout.Sampling
+            temperature = dataclasses.asdict(temperature)
+        else:
+            temperature = float(temperature)
         header = {
             "op": "generate",
-            "id": number,
             "prompt": list(prompt_ids),
             "max_new_tokens": int(max_new_tokens),
-            "temperature": float(temperature),
+            "temperature": temperature,
             "adapter": adapter,
         }
-        async with engine.write_lock:
-            await send(engine.writer, header)
-        reply = await future
-        if "error" in reply:
-            raise RuntimeError(f"engine worker {engine.address}: {reply['error']}")
-        return Generation(reply["ids"], reply["logprobs"], reply["finish"], reply["version"], reply["first_version"])
+        while True:
+            alive = [e for e in self.engines if not e.dead]
+            if not alive:
+                gone = "; ".join(f"{e.address}: {e.dead}" for e in self.engines)
+                raise ConnectionError(f"no engine worker is left to generate with ({gone})")
+            engine = min(alive, key=lambda e: e.load)
+            try:
+                reply = await self._ask(engine, header)
+            except EngineLost:
+                continue  # the request starts again on an engine that is still there
+            if "error" in reply:
+                raise RuntimeError(f"engine worker {engine.address}: {reply['error']}")
+            return Generation(
+                reply["ids"], reply["logprobs"], reply["finish"], reply["version"], reply["first_version"]
+            )
 
     # ---------------------------------------------------------------- weights
+
+    def check(self) -> None:
+        """Raise if a worker went away or a push was not applied (see the module docstring)."""
+        if self.failure:
+            raise RuntimeError(
+                f"rollout engines: {self.failure}. The engines no longer hold this run's weights: restart the "
+                "worker and resume from the last checkpoint."
+            )
 
     def update_weights(self, named_tensors, version: int) -> None:
         """Stage the weights of `version` and start sending them to every target engine; returns at once (see
         the module docstring), or when every engine applied them if the pool is blocking. A process that does not
-        push (ranks other than 0) only records the version."""
+        push (ranks other than 0) records the version, and if the pool is blocking waits until its own engines
+        report it."""
+        self.check()
         if not self.targets:
             for _ in named_tensors or ():  # (gathered parameters: every rank must iterate them)
                 pass
+            if self.blocking:
+                self._wait(self._reached(version), f"version {version} from rank 0")
             self.version = version
             return
-        free = [i for i in (0, 1) if not self.sending[i]]
+        with self.counts:
+            free = [i for i in (0, 1) if not self.sending[i]]
+            if free:
+                self.sending[free[0]] += len(self.targets)
         if not free:
             for _ in named_tensors or ():
                 pass
             self.stats["skipped"] += 1  # both snapshots still travelling: the next sync brings newer weights
             return
-        start = time.perf_counter()
-        if self.payload is not None:  # LoRA: [(header fields, tensors), ...], the base first on the first push
-            for _ in named_tensors or ():
-                pass
-            frames = self.payload(self.first)
-        else:
-            frames = [({"mode": "full"}, dict(named_tensors))]
-        area = self.staging[free[0]]
-        frames = [({"op": "weights", "version": version, **fields}, area.stage(tensors)) for fields, tensors in frames]
-        self.stats["stage_seconds"] += time.perf_counter() - start
+        try:
+            start = time.perf_counter()
+            if self.payload is not None:  # LoRA: [(header fields, tensors), ...], the base first on the first push
+                for _ in named_tensors or ():
+                    pass
+                frames = self.payload(self.first)
+            else:
+                frames = [({"mode": "full"}, dict(named_tensors))]
+            area = self.staging[free[0]]
+            self.once[free[0]] = [
+                name for fields, tensors in frames if fields.get("mode") == "base" for name in tensors
+            ]
+            frames = [
+                ({"op": "weights", "version": version, **fields}, area.stage(tensors)) for fields, tensors in frames
+            ]
+            self.stats["stage_seconds"] += time.perf_counter() - start
+        except BaseException:
+            with self.counts:
+                self.sending[free[0]] -= len(self.targets)
+            raise
         self.first = False
         if not self.blocking:
             self.version = version
-        self.sending[free[0]] += len(self.targets)
         futures = [
             asyncio.run_coroutine_threadsafe(self._push(engine, free[0], frames), self.loop) for engine in self.targets
         ]
         if self.blocking:
-            for future in futures:
-                future.result()
+            self._wait(self._all(futures), f"version {version}")
+            self._wait(self._reached(version), f"version {version}")  # (engines of this rank it does not push to)
+            self.check()
             self.version = version  # (after the engines have it: pool/lag reads 0 between updates)
 
+    async def _all(self, futures) -> None:
+        await asyncio.gather(*(asyncio.wrap_future(f) for f in futures))
+
+    def _wait(self, coroutine, what: str) -> None:
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        try:
+            future.result(self.push_timeout)
+        except TimeoutError:
+            future.cancel()
+            behind = [f"{e.address} (at version {e.applied})" for e in {*self.targets, *self.engines}]
+            raise RuntimeError(
+                f"rollout engines did not confirm {what} in {self.push_timeout:g} s (rollout.max_staleness 0 waits "
+                f"for them): {', '.join(sorted(behind))}. Check the workers and the link between the nodes."
+            ) from None
+
+    async def _reached(self, version: int) -> None:
+        """Until every engine this process generates with reports `version` or newer."""
+        while True:
+            behind = [e for e in self.engines if not e.dead and e.applied < version]
+            if not behind:
+                return
+            for engine in behind:
+                with contextlib.suppress(EngineLost):
+                    engine.applied = max(engine.applied, int((await self._ask(engine, {"op": "state"}))["version"]))
+            if any(e.applied < version for e in behind if not e.dead):
+                await asyncio.sleep(0.02)
+
     async def _push(self, engine: _Engine, area: int, frames: list) -> None:
+        if engine.dead:
+            self._sent(area)
+            return
         if engine.push_lock.locked():  # a push is on its way to this engine: this one follows it, unless a newer
             previous, engine.queued = engine.queued, (area, frames)  # one is staged before it starts
             if previous is not None:
-                self.sending[previous[0]] -= 1
+                self._sent(previous[0])
             return
         async with engine.push_lock:
             job: tuple | None = (area, frames)
@@ -204,15 +342,31 @@ class RemotePool:
                     for header, staged in frames:
                         sent += await send(engine.weights_writer, header, staged)
                         reply, _ = await receive(engine.weights_reader)
+                        if "error" in reply:
+                            raise RuntimeError(f"the worker could not apply the update: {reply['error']}")
                     engine.applied = max(engine.applied, int(reply["version"]))
                     self.stats["pushes"] += 1
                     self.stats["bytes"] += sent
                     self.stats["seconds"] += time.perf_counter() - start
-                except (ConnectionError, asyncio.IncompleteReadError) as error:
-                    logger.warning("weights for %s were not delivered (%r)", engine.address, error)
+                except (ConnectionError, OSError, asyncio.IncompleteReadError) as error:
+                    self._lose(engine, repr(error))
+                except Exception as error:  # noqa: BLE001 — the trainer raises it at its next update
+                    logger.exception("weights for %s were not applied", engine.address)
+                    self.failure = self.failure or f"{engine.address}: {error}"
                 finally:
-                    self.sending[area] -= 1
+                    self._sent(area)
                 job, engine.queued = engine.queued, None
+                if job is not None and engine.dead:
+                    self._sent(job[0])
+                    job = None
+
+    def _sent(self, area: int) -> None:
+        """One push from `area` is over (delivered or not); its one-time tensors are freed with the last."""
+        with self.counts:
+            self.sending[area] -= 1
+            if not self.sending[area] and self.once[area]:
+                self.staging[area].release(self.once[area])
+                self.once[area] = []
 
     def applied(self) -> list[int]:
         """The newest version each target engine confirmed."""
@@ -220,30 +374,25 @@ class RemotePool:
 
     def metrics(self) -> dict[str, float]:
         """pool/lag: versions the slowest engine is behind the newest staged one; pool/push_s and pool/push_mb:
-        means per delivered push; pool/skipped: snapshots not staged because two were still travelling."""
+        means per delivered push; pool/skipped: snapshots not staged because two were still travelling;
+        pool/engines: workers still generating."""
         pushes = max(self.stats["pushes"], 1)
         out = {
             "pool/push_s": self.stats["seconds"] / pushes,
             "pool/push_mb": self.stats["bytes"] / pushes / 2**20,
             "pool/skipped": float(self.stats["skipped"]),
+            "pool/engines": float(sum(not e.dead for e in self.engines)),
         }
         if self.targets:
             out["pool/lag"] = float(self.version - min(self.applied()))
         return out
 
     def state(self) -> list[dict]:
-        """Each generating engine's own state (version, pushes applied, pushes dropped)."""
+        """Each generating engine's own state (version, pushes applied, pushes dropped, receiving)."""
         return self._call(self._states())
 
     async def _states(self) -> list[dict]:
-        out = []
-        for engine in self.engines:
-            future = self.loop.create_future()
-            engine.waiting[None] = future
-            async with engine.write_lock:
-                await send(engine.writer, {"op": "state"})
-            out.append(await future)
-        return out
+        return list(await asyncio.gather(*(self._ask(engine, {"op": "state"}) for engine in self.engines)))
 
     def sleep(self) -> None:
         pass
@@ -263,6 +412,8 @@ class RemotePool:
                                 await send(writer, {"op": "shutdown"})
                         writer.close()
 
+        if not self.thread.is_alive():
+            return
         with contextlib.suppress(Exception):
             self._call(finish(), 10)
         self.loop.call_soon_threadsafe(self.loop.stop)

@@ -159,6 +159,25 @@ def workload_of(config, params_b: float) -> Workload:
 # ------------------------------------------------------------ engines apart
 
 
+def worker_flags(config) -> str:
+    """The flags of `python -m palingenesis.rl.pool.worker` that must agree with an RLConfig: a trainer refuses a
+    worker whose stop tokens, chat-template arguments, context length or head precision differ from its own."""
+    import json
+    import shlex
+
+    m, r = config.model, config.rollout
+    flags = f"--max-model-len {r.max_model_len} --ssm-state-dtype {r.ssm_state_dtype}"
+    if r.fp32_head:
+        flags += " --fp32-head"
+    if m.stop_tokens:
+        flags += f" --stop-tokens {shlex.quote(json.dumps(list(m.stop_tokens)))}"
+    if m.chat_template_kwargs:
+        flags += f" --chat-template-kwargs {shlex.quote(json.dumps(dict(m.chat_template_kwargs)))}"
+    if r.max_num_seqs:
+        flags += f" --max-num-seqs {r.max_num_seqs}"
+    return flags
+
+
 @dataclass
 class PoolLayout:
     """Trainers and rollout engines on separate GPUs (rollout.backend remote, palingenesis.rl.pool)."""
@@ -168,7 +187,7 @@ class PoolLayout:
     mode: str  # the trainers' layout: "single" | "fsdp" | "replicated"
     push: str  # what a weight update sends: "full" | "fold" | "native"
     push_mb: float  # megabytes per update per engine (an estimate from the parameter count)
-    push_seconds: float  # ... and the time it travels, at the link's speed
+    push_seconds: float  # ... and the time until the last engine has it (the engines of other nodes share a link)
     trainer_gb: float
     engine_gb: float  # weights per engine GPU; the rest is its KV cache
     overrides: dict = field(default_factory=dict)
@@ -194,6 +213,8 @@ def plan_pool(
     link_gbps: float = 25.0,
     base_port: int = 7000,
     adapters: int = 0,
+    flags: str = "",
+    base_partner: bool = False,
 ) -> PoolLayout:
     """A layout with `engine_gpus` of the cluster's GPUs running engine workers and the rest trainer ranks.
 
@@ -205,8 +226,13 @@ def plan_pool(
     Sync. Rank 0 stages each update in host memory and sends it to every engine while the trainers step; an
     engine applies it between two of its steps. `push_mb` is 2 bytes per parameter for full weights; with
     adapters, their factors: about 1% of the parameters at rank 16, in float32 (measure it: lora/trainable_params
-    x 4 bytes, or pool/push_mb). `push_seconds` is that size over the slower of the links it crosses
-    (`link_gbps` between nodes; a loopback stream within one)."""
+    x 4 bytes, or pool/push_mb). `push_seconds` is the time until the last engine has an update: the engines
+    of other nodes are all fed through rank 0's link (`link_gbps`), so their pushes share it; an engine on rank 0's
+    node has a loopback stream of its own. The first update also carries the frozen base (as large as "full").
+
+    `flags`: worker flags every launch line carries (`worker_flags(config)`: the settings a trainer checks when it
+    connects). `adapters`: roles' own adapters; `base_partner`: a role plays the frozen base; either makes the
+    engines serve named adapters ("native")."""
     hosts = hosts or [f"node{i}" for i in range(cluster.nodes)]
     total = cluster.nodes * cluster.gpus_per_node
     notes, errors = [], []
@@ -246,7 +272,7 @@ def plan_pool(
     if engine_gb + workload.kv_gb_per_engine > cluster.gpu_memory_gb:
         errors.append(f"an engine GPU holds {engine_gb:.0f} GB of weights: raise engine_tp or use larger GPUs.")
     if workload.lora_rank and mode != "fsdp":
-        push = "native" if adapters else "fold"
+        push = "native" if adapters or base_partner else "fold"
         push_mb = 40.0 * gb * workload.lora_rank / 16 * max(adapters, 1)
     else:
         push, push_mb = "full", 2 * gb * 1024
@@ -260,30 +286,30 @@ def plan_pool(
         for k in range(0, len(gpus), engine_tp):
             group = gpus[k : k + engine_tp]
             port = base_port + len([e for e in engines if e["address"].startswith(host + ":")])
-            flags = f"--model {model} --host 0.0.0.0 --port {port}"
+            line = f"--model {model} --host 0.0.0.0 --port {port}" + (f" {flags}" if flags else "")
             if engine_tp > 1:
-                flags += f""" --vllm-args '{{"tensor_parallel_size": {engine_tp}}}'"""
+                line += f""" --vllm-args '{{"tensor_parallel_size": {engine_tp}}}'"""
             if push == "native":
-                flags += f" --lora-rank {workload.lora_rank} --max-loras {max(adapters, 1) + 1}"
+                line += f" --lora-rank {workload.lora_rank} --max-loras {max(adapters, 1) + 1}"
             engines.append(
                 {
                     "address": f"{host}:{port}",
                     "gpus": [f"{host}:{gpu}" for gpu in group],
-                    "command": f"CUDA_VISIBLE_DEVICES={','.join(map(str, group))} python -m palingenesis.rl.pool.worker {flags}",
+                    "command": f"CUDA_VISIBLE_DEVICES={','.join(map(str, group))} python -m palingenesis.rl.pool.worker {line}",
                 }
             )
     if len(engines) < ranks:
         errors.append(f"{len(engines)} engines for {ranks} trainer ranks: every rank needs at least one engine.")
-    remote = any(engine["address"].split(":")[0] != hosts[0] for engine in engines)
-    gbps = min(link_gbps, LOOPBACK_GBPS) if remote else LOOPBACK_GBPS
-    push_seconds = push_mb / (gbps * 125.0)
+    remote = sum(engine["address"].split(":")[0] != hosts[0] for engine in engines)  # fed through rank 0's link
+    push_seconds = max(push_mb / (LOOPBACK_GBPS * 125.0), remote * push_mb / (link_gbps * 125.0))
     batch = workload.batch_prompts
     overrides: dict = {"rollout.backend": "remote", "rollout.engines": [e["address"] for e in engines]}
     if batch % ranks:
         overrides["rollout.batch_prompts"] = math.ceil(batch / ranks) * ranks
     notes.append(
         f"rank r generates with engines[r::{ranks}]; rank 0 sends every update to all {len(engines)} engines "
-        f"({push}: about {push_mb:.0f} MB each, {push_seconds:.2f} s on the slowest link), without waiting for them."
+        f"({push}: about {push_mb:.0f} MB each; {push_seconds:.2f} s until the last has it, {remote} of them over "
+        f"rank 0's {link_gbps:g} Gbit link), without waiting for them."
     )
     notes.append(
         "rollout.max_staleness 1 or more: with 0 every update waits for the engines. Keep the update's travel time "

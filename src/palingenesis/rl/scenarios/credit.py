@@ -159,7 +159,8 @@ def token_weights(
     return weights
 
 
-ROLE_STATISTICS = ("tokens", "mismatch_k3", "abs_ratio_dev", "clipped", "entropy", "kl_ref")
+ROLE_STATISTICS = ("tokens", "sampled", "mismatch_k3", "abs_ratio_dev", "clipped", "entropy", "kl_ref")
+SAMPLED_STATISTICS = ("mismatch_k3", "abs_ratio_dev", "clipped")  # means over the tokens the policy sampled
 
 
 def role_statistics(lp, behaviour, advantage, role, names, config, entropy=None, reference=None, forced=None) -> dict:
@@ -191,9 +192,10 @@ def role_statistics(lp, behaviour, advantage, role, names, config, entropy=None,
         rows = torch.stack(
             [
                 torch.ones_like(ratio),
+                keep,
                 (ratio - 1 - log_ratio) * keep,
                 (ratio - 1).abs() * keep,
-                clipped.float(),
+                clipped.float() * keep,
                 entropy.detach().float() if entropy is not None and entropy.numel() else zeros,
                 (torch.exp(reference - lp.detach()) - (reference - lp.detach()) - 1.0)
                 if reference is not None
@@ -214,9 +216,11 @@ def role_metrics(values: dict[str, float], names, entropy: bool, reference: bool
         tokens = values.get(f"role_stat/{name}/tokens", 0.0)
         if tokens <= 0:
             continue
-        for key in ROLE_STATISTICS[1:]:
+        sampled = max(values.get(f"role_stat/{name}/sampled", tokens), 1.0)
+        for key in ROLE_STATISTICS[2:]:
             if (key == "entropy" and not entropy) or (key == "kl_ref" and not reference):
                 continue
-            out[f"role/{name}/policy/{key}"] = values[f"role_stat/{name}/{key}"] / tokens
+            count = sampled if key in SAMPLED_STATISTICS else tokens
+            out[f"role/{name}/policy/{key}"] = values[f"role_stat/{name}/{key}"] / count
         out[f"role/{name}/trained_tokens"] = tokens
     return out

@@ -1285,22 +1285,66 @@ def test_the_planner_lays_out_trainers_and_engines_on_separate_gpus():
     assert "--nnodes 2 --nproc_per_node 4" in layout.command and layout.command.startswith(
         "CUDA_VISIBLE_DEVICES=0,1,2,3 "
     )
+    # the four engines of the other node are fed through rank 0's one link (25 Gbit): their pushes share it
     assert layout.push_mb == pytest.approx(40 * 4.0) and layout.push_seconds == pytest.approx(
-        160 / (16 * 125), abs=1e-3
+        4 * 160 / (25 * 125), abs=1e-3
     )
     assert layout.trainer_gb == pytest.approx(2 * 4 + 0.2 + 8) and layout.engine_gb == 8.0
 
     # full weights: gigabytes per update; whole nodes for engines when the split per node does not come out even
     full = plan_pool(Cluster(3, 8, 80), Workload(params_b=4.0), engine_gpus=8, hosts=["a", "b", "c"], link_gbps=10)
     assert full.push == "full" and full.push_mb == pytest.approx(8192) and full.mode == "fsdp"
-    assert full.push_seconds == pytest.approx(8192 / (10 * 125), abs=1e-2)  # 10 GbE: 6.6 s an update
+    assert full.push_seconds == pytest.approx(8 * 8192 / (10 * 125), abs=1e-2)  # 8 engines behind one 10 GbE link
+    one = plan_pool(Cluster(1, 8, 80), Workload(params_b=4.0), engine_gpus=4)
+    assert one.push_seconds == pytest.approx(8192 / (16 * 125), abs=1e-2)  # one host: a loopback stream each
     assert {e["address"].split(":")[0] for e in full.engines} == {"c"} and len(full.trainers) == 16
     # named adapters in one engine pool; tensor-parallel engines for a policy too big for one GPU
     workload = Workload(params_b=0.8, lora_rank=16, replicate_base=True)
     native = plan_pool(Cluster(1, 8, 80), workload, engine_gpus=4, adapters=2)
     assert native.push == "native" and "--lora-rank 16 --max-loras 3" in native.engines[0]["command"]
+    # a role on the frozen base needs the adapters next to the base too; the launch lines carry what the trainer
+    # checks when it connects
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.scenarios.placement import worker_flags
+
+    config = RLConfig()
+    for key, value in {
+        "rollout.max_model_len": 4096,
+        "rollout.fp32_head": True,
+        "model.chat_template_kwargs": {"enable_thinking": False},
+        "model.stop_tokens": ["<|im_end|>"],
+    }.items():
+        config.set(key, value)
+    flags = worker_flags(config)
+    based = plan_pool(Cluster(1, 8, 80), workload, engine_gpus=4, base_partner=True, flags=flags)
+    assert based.push == "native" and all(flags in e["command"] for e in based.engines)
+    assert "--max-model-len 4096" in flags and "--fp32-head" in flags and """--stop-tokens '["<|im_end|>"]'""" in flags
+    assert """--chat-template-kwargs '{"enable_thinking": false}'""" in flags
     wide = plan_pool(Cluster(1, 8, 80), Workload(params_b=60.0, lora_rank=16), engine_gpus=4, engine_tp=2)
     assert len(wide.engines) == 2 and "tensor_parallel_size" in wide.engines[0]["command"] and wide.engine_gb == 60.0
     assert any("trainer rank needs" in e for e in wide.errors)  # 120 GB of frozen base on one trainer GPU
     with pytest.raises(ValueError, match="neither"):
         plan_pool(Cluster(2, 8, 80), Workload(), engine_gpus=3)
+
+
+def test_role_statistics_leave_forced_tokens_out_of_the_sampler_comparison():
+    """A token the environment wrote has no sampled log-prob: it counts as a trained token, not in the mismatch
+    or the clipped share, which are means over the tokens the policy sampled."""
+    from types import SimpleNamespace
+
+    from palingenesis.rl.scenarios.credit import role_metrics, role_statistics
+
+    lp = torch.log(torch.tensor([0.5, 0.5, 0.9, 0.5]))
+    behaviour = torch.log(torch.tensor([0.5, 0.1, 0.9, 0.25]))  # the second token: forced, far from the policy
+    advantage = torch.ones(4)
+    role = torch.tensor([0, 0, 0, 1])
+    forced = torch.tensor([False, True, False, False])
+    config = SimpleNamespace(type="cispo", is_cap=1.5)
+    sums = role_statistics(lp, behaviour, advantage, role, ["a", "b"], config, forced=forced)
+    metrics = role_metrics({k: float(v) for k, v in sums.items()}, ["a", "b"], entropy=False, reference=False)
+    assert metrics["role/a/trained_tokens"] == 3 and metrics["role/a/policy/clipped"] == 0
+    assert metrics["role/a/policy/mismatch_k3"] == 0 and metrics["role/a/policy/abs_ratio_dev"] == 0
+    assert metrics["role/b/policy/clipped"] == 1 and metrics["role/b/policy/abs_ratio_dev"] == pytest.approx(1.0)
+    unmarked = role_statistics(lp, behaviour, advantage, role, ["a", "b"], config)
+    unmarked = role_metrics({k: float(v) for k, v in unmarked.items()}, ["a", "b"], entropy=False, reference=False)
+    assert unmarked["role/a/policy/clipped"] == pytest.approx(1 / 3)

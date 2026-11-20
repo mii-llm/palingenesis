@@ -458,12 +458,21 @@ class RLTrainer:
 
             # engines in other processes: this rank generates with its share of them; rank 0 sends every engine
             # the weights, staged in host memory and sent while the trainer steps (max_staleness 0: it waits)
+            from palingenesis.rl.pool.protocol import model_signature
+
+            self.push_mode = self._push_mode()
             self.engine = RemotePool(
                 r.engines[rank::world],
                 push_to=list(r.engines) if self.parallel.main else [],
                 blocking=r.max_staleness == 0,
+                identity={
+                    "model": model_signature(self.model.config),
+                    "stop_ids": sorted(int(i) for i in self.stop_ids),
+                    "chat_template_kwargs": dict(m.chat_template_kwargs or {}),
+                    "max_model_len": r.max_model_len,
+                    "fp32_head": bool(r.fp32_head),
+                },
             )
-            self.push_mode = self._push_mode()
             if self.push_mode != "full" and self.parallel.main:
                 self.engine.payload = self._wire_frames
         else:
@@ -633,15 +642,28 @@ class RLTrainer:
         mode = self.config.rollout.push
         if self.adapters is None or self.parallel.fsdp:
             return "full"
+        # an engine that folds holds one policy: roles on other adapters, or on the bare base (partner: base),
+        # need the adapters next to the base
+        several = bool(self.adapters.names) or not self.adapters.default_trains
+        several = several or any(spec.label == "base" for spec in self.role_specs.values())
         if mode == "auto":
-            return "native" if self.adapters.names or not self.adapters.default_trains else "fold"
+            mode = "native" if several else "fold"
+        if mode == "fold" and several:
+            raise ValueError("rollout.push fold serves one policy per engine: roles need native (or auto).")
+        if mode == "native" and self.config.lora.dora:
+            raise ValueError("rollout.push native does not carry lora.dora magnitudes: use push fold (or full).")
         return mode
 
     def _wire_frames(self, first: bool) -> list[tuple[dict, dict]]:
         """With adapters and remote engines: the frames of a weight update (palingenesis.rl.pool.worker). The
-        adapters' factors only, megabytes: per adapted weight for the engines to fold ("fold", preceded on the
-        first update by the base they fold into), or per named adapter ("native")."""
+        adapters' factors only, megabytes: per adapted weight for the engines to fold ("fold"), or per named
+        adapter ("native"); on the first update the frozen base goes first, which the engine applies together
+        with what follows it."""
         plugin, c = self.adapters.plugin, self.config.lora
+        suffixes = (".lora_A", ".lora_B", ".lora_magnitude")
+        base = ((n, p) for n, p in self.model.named_parameters() if not n.endswith(suffixes))
+        named = dict(checkpoint_named_parameters(self.model, base))
+        frames = [({"mode": "base"}, named)] if first else []  # a worker may hold another run's base
         if self.push_mode == "native":
             names = ([""] if self.adapters.default_trains else []) + self.adapters.names
             tensors = {
@@ -657,14 +679,8 @@ class RLTrainer:
                 "targets": list(c.targets),
                 "exclude": list(c.exclude),
             }
-            return [({"mode": "native", "lora": lora}, tensors)]
-        frames = []
-        suffixes = (".lora_A", ".lora_B", ".lora_magnitude")
+            return [*frames, ({"mode": "native", "lora": lora}, tensors)]
         by_weight = {m.weight.data_ptr(): m for m in plugin.modules.values()}
-        base = ((n, p) for n, p in self.model.named_parameters() if not n.endswith(suffixes))
-        named = dict(checkpoint_named_parameters(self.model, base))
-        if first:
-            frames.append(({"mode": "base"}, named))
         tensors, scaling = {}, {}
         for name, tensor in named.items():
             m = by_weight.get(tensor.data_ptr()) if tensor.numel() else None

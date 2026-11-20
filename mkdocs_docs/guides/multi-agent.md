@@ -192,7 +192,9 @@ With a replicated base each rank folds and loads its own engine's weights locall
 - **A weight update never waits for the engines.** The trainer copies what has to travel into host staging buffers (pinned with a GPU), which is the only part under its weights lock, and goes on with its next step. The bytes leave on the pool's own thread.
 - **An engine never samples from half an update.** It receives a push into its own staging area while it keeps generating with the weights it has, applies the complete push between two of its steps, and tags everything it samples from then on with the new version. A push whose sender dies in the middle is dropped whole.
 - **Two staging areas alternate** on the trainer. A new snapshot goes to the one no push is being sent from; when both are still travelling it is skipped, and the next update carries newer weights. An engine still receiving version *v* gets the newest staged version next.
-- **Staleness decides what trains.** Every turn carries the version that sampled it; a row older than `rollout.max_staleness` is dropped. With `max_staleness: 0` an update waits for every engine instead.
+- **Staleness decides what trains.** Every turn carries the version that sampled it; a row older than `rollout.max_staleness` is dropped. With `max_staleness: 0` an update waits instead: rank 0 for every engine it sends to, each other rank for its own engines, so no rank collects rows of the old version. If the engines do not confirm in 30 minutes the run stops with an error that names them.
+- **A worker is checked when the trainer connects.** The trainer compares its model's architecture, stop tokens, chat-template arguments, context length and head precision with the worker's and refuses a worker that was started with others. `pgs scenario plan --engine-gpus` prints launch lines that carry them.
+- **A lost worker ends the run.** Requests it was running are sent again to the engines that remain, so no rollout waits for it; the next weight update raises an error that names the worker. Restart it and resume from the last checkpoint: a restarted worker holds none of the run's weights, and the first update of a run sends everything an engine needs. The trainer does not reconnect on its own.
 
 What travels (`rollout.push`):
 
@@ -200,20 +202,28 @@ What travels (`rollout.push`):
 |---|---|---|---|
 | `full` | every weight, 2 bytes per parameter | loaded as is | full-weight training; adapters under FSDP |
 | `fold` | the adapters' factors, megabytes (and the base, once) | computes $W + sBA$ against the base it was sent | one adapter; any engine |
-| `native` | every named adapter's factors | loaded as named LoRA adapters of the engine; a request names its adapter and adapters share the batch | roles with their own adapter |
+| `native` | every named adapter's factors (and the base, once) | loaded as named LoRA adapters of the engine; a request names its adapter and adapters share the batch | roles with their own adapter, or a role on the frozen base (`partner: base`) |
 
-`native` is how several roles' policies are served by **one** engine pool: vLLM loads LoRA adapters next to the base and reloads one in place under the same name while requests run (`load_inplace`), so no server per adapter is needed. With the `hf` worker the adapters are this library's own layers, which is what the tests run. The vLLM side (adapters written to a memory file system in the PEFT layout, then reloaded) has not been run.
+`auto` picks `native` when a role has its own adapter or plays the frozen base, and `fold` otherwise; `fold` is refused in those cases, because an engine that folds holds the trained policy alone. `native` is refused with `lora.dora` (the magnitudes cannot be loaded as a plain adapter). Under FSDP adapters travel folded into the full weights.
+
+The first update of a run also carries the frozen base, so that an engine never folds into, or serves adapters next to, weights of another run. The engine applies the base together with the factors that follow it, never before. That first update is as large as a full one.
+
+**Memory on the hosts.** With `fold` each worker keeps the base in host memory to fold against, next to the copy on its GPU: 2 bytes per parameter for a bf16 model, so 8 GB per worker for 4B parameters, 16 GB for 8B, 64 GB for 32B; eight workers of a 4B policy on one node hold 64 GB of host memory. The trainer needs the same amount once, while the first update is staged (freed when it has been sent). `native` keeps no base on the host. `full` stages every update on both sides: up to two snapshots on the trainer (2 x 2 bytes per parameter) and one on each worker.
+
+`native` is how several roles' policies are served by **one** engine pool: vLLM loads LoRA adapters next to the base and reloads one in place under the same name while requests run (`load_inplace`), so no server per adapter is needed. With the `hf` worker the adapters are this library's own layers, which is what the tests run. The trainer's default adapter is the adapter `policy` there: a request that names no adapter samples it, not the bare base. Each update writes the adapters to `--adapter-dir` (a memory file system) in the PEFT layout and deletes the versions before the last two. The vLLM side has not been run.
 
 The transport is a TCP stream per engine, not an NCCL collective. Two reasons, both derived, not measured:
 
 - The trainers' process group is theirs: FSDP's gathers and the batch normalisers run on it, so engines in that group would have to take part in every collective, and a second NCCL communicator driven from a background thread could not be exercised without GPUs.
 - The traffic does not call for it. With adapters an update is megabytes: about 160 MB for 4B parameters at rank 16, 0.05 s on a 25 Gbit link. A full push of 4B parameters is 8 GB: about 2.6 s at 25 Gbit, 6.5 s at 10 Gbit, travelling while the trainer steps. NCCL over InfiniBand would cut that several times, which matters only when full-weight updates take longer than a training step.
 
-`pool/push_mb`, `pool/push_s`, `pool/lag` (versions the slowest engine is behind) and `pool/skipped` are logged every step.
+`pool/push_mb`, `pool/push_s`, `pool/lag` (versions the slowest engine is behind), `pool/skipped` and `pool/engines` (workers still generating) are logged every step.
 
-`pgs scenario plan --config rl.yaml --params-b 4 --nodes 2 --gpus-per-node 8 --engine-gpus 8 --hosts node1,node2` prints this layout for a cluster: the trainers' GPUs, one launch line per engine worker, the `rollout.engines` list, the estimated size and travel time of an update, and the trainer's launch command. Without `--engine-gpus` it sizes engines on the trainers' own GPUs: ranks, estimated trainer memory, the memory share per engine, the launch command, and what does not fit.
+The wire format is a length-prefixed JSON header followed by the raw bytes of the tensors, in the hosts' native byte order: trainer and workers must have the same endianness. A tensor of a dtype the format does not know is refused by name.
 
-A two-rank trainer sharing two engine workers, pushes overlapping training, the staleness drop and a sender dying mid-push are tested across processes on CPU. Nothing on GPUs.
+`pgs scenario plan --config rl.yaml --params-b 4 --nodes 2 --gpus-per-node 8 --engine-gpus 8 --hosts node1,node2` prints this layout for a cluster: the trainers' GPUs, one launch line per engine worker, the `rollout.engines` list, the estimated size of an update and the time until the last engine has it (the engines of other nodes share rank 0's link), and the trainer's launch command. Without `--engine-gpus` it sizes engines on the trainers' own GPUs: ranks, estimated trainer memory, the memory share per engine, the launch command, and what does not fit.
+
+A two-rank trainer sharing two engine workers, pushes overlapping training, the staleness drop, a sender dying mid-push, a worker dying or restarting, and a role on the frozen base are tested across processes on CPU. Nothing on GPUs.
 
 Roles with their own adapter need `rollout.backend: remote` (named adapters of one engine pool) to use several GPUs; with `vllm_server` they stay on one.
 

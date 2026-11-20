@@ -177,10 +177,12 @@ class RLRolloutConfig:
     # generates with engines[r::ranks] and rank 0 sends the weights to all of them. A weight update returns as soon
     # as the weights are staged in host memory: they travel while the trainer steps, each engine applies them when
     # they have arrived whole and tags what it samples with its version, and max_staleness decides what is trained
-    # (max_staleness 0: the update waits for every engine). `push`: what travels. "full": every weight. "fold"
-    # (lora): the adapters' factors, folded into the base by each engine. "native" (lora): the adapters as named
-    # LoRA adapters of the engine (vLLM's LoRA serving; several roles' adapters in one engine). "auto": full
-    # without lora, fold with one adapter, native with roles that have their own.
+    # (max_staleness 0: the update waits for the engines; every rank for its own). `push`: what travels. "full":
+    # every weight. "fold" (lora): the adapters' factors, folded into the base by each engine. "native" (lora, not
+    # dora): the adapters as named LoRA adapters of the engine (vLLM's LoRA serving; several roles' adapters, and
+    # the bare base, in one engine). "auto": full without lora, native with roles that have their own adapter or
+    # play the frozen base (partner: base), else fold. The first fold or native update also sends the frozen base.
+    # A worker that goes away ends the run at the next update (restart it, resume from the last checkpoint).
     engines: list = field(default_factory=list)
     push: str = "auto"
 
@@ -643,6 +645,11 @@ class RLConfig:
             errors.append("rollout.push is only used with rollout.backend remote.")
         elif r.push in ("fold", "native") and not self.lora.rank:
             errors.append(f"rollout.push {r.push} sends LoRA adapters: it needs lora.rank.")
+        elif r.push == "native" and self.lora.dora:
+            errors.append(
+                "rollout.push native loads the adapters into the engines as plain LoRA: lora.dora magnitudes "
+                "cannot travel that way. Use rollout.push fold (or full)."
+            )
         elif r.push in ("fold", "native") and (t.fsdp or t.cpu_offload):
             errors.append(f"rollout.push {r.push} is not supported with FSDP: use train.replicate_base, or push full.")
         if r.backend == "remote" and r.engines and len(r.engines) < int(os.environ.get("WORLD_SIZE", "1")):
