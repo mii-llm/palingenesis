@@ -39,7 +39,6 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from palingenesis.checkpoint import hf_state_dict
 from palingenesis.hooks import PluginContext
 from palingenesis.lora import ADAPTER_KEYS, LoRA, LoRALinear, fold_weight
 from palingenesis.precision import SurvivalMeter, cast_state_dict
@@ -60,6 +59,8 @@ PEFT_CONFIG_FILE = "adapter_config.json"
 
 def hf_state_dict_items(named: Iterable[tuple[str, Tensor]]) -> Iterator[tuple[str, Tensor]]:
     """`named` with the wrapper prefixes removed from every name (checkpoint.hf_state_dict, one pair at a time)."""
+    from palingenesis.checkpoint import hf_state_dict  # lazy: config validation imports this module without safetensors
+
     for name, tensor in named:
         yield next(iter(hf_state_dict({name: tensor}).items()))
 
