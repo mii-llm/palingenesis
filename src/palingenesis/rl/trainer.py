@@ -213,6 +213,15 @@ class RLTrainer:
         )
         self.batch_prompts = r.batch_prompts // world
         self.sandbox = make_sandbox(config.sandbox) if self._needs_sandbox() else None
+        if self.scenario is not None:  # a pattern is scored by the run's rewards and reads the run's own rows
+            self.scenario.bind(self.rewards, self.sandbox, config)
+            problems = [problem for row in train_rows[:200] for problem in self.scenario.check_row(row)]
+            if problems:
+                raise RLConfigError(
+                    f"{len(problems)} of the first {min(200, len(train_rows))} rows of {config.data.dataset or 'the dataset'} "
+                    f"do not fit scenario {self.scenario.name}. The first: {problems[0]}"
+                )
+            self.scenario.prepare(train_rows)
         logger.info(
             "RL: %d training prompts, %d held out%s; rewards %s; env %s",
             len(train_rows),

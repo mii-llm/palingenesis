@@ -7,8 +7,9 @@
 
 runtime    episodes, sessions, channels, branches and credit; `play` runs a scenario without a model
 base       the Scenario class (rows, roles, verifier, scripted partners, audit) and the registry
-library    starter scenarios: take_away (a two-player game), ledger_sum (a lead and its workers), checked_answer
-           (a solver and a verifier)
+library    starter scenarios with their own generator: take_away (a two-player game), ledger_sum (a lead and its
+           workers), checked_answer (a solver and a verifier); and patterns over an ordinary RL dataset, scored by
+           the run's `rewards:` section: solve_check, handoff, lead_workers (plan_execute: Harbor tasks)
 pipeline   the RL pipeline's episodes: trained sessions through the rollout loop, comparison groups
 credit     per-role advantages, their normalisation and each role's share of the loss
 export     episodes from the rollout dumps as SFT, DPO and distillation rows

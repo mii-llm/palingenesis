@@ -262,7 +262,7 @@ class ScenarioPipeline(RLPipeline, Host):
                 messages.insert(0, {"role": "system", "content": spec.system_prompt})
         if spec.partner is not None:
             turns = limits.get("max_turns") or PARTNER_TURNS
-            return PartnerSession(session, spec.partner, tools, turns, conversational)
+            return PartnerSession(session, spec.partner, tools, turns, conversational, episode.row)
         session.trained = spec.train
         view = copy.copy(self)  # the turn loop with this session's engine, limits and port
         view.client, view.config = self.clients[spec.engine], self.role_configs[session.role]

@@ -1,0 +1,61 @@
+# Multi-role RL on Harbor tasks: a planner who reads the task and an executor who carries it out in the task's
+# container; the task's tests are the reward (guides/multi-agent.md, guides/harbor.md).
+#
+# Rows are Harbor rows, {"task_dir": ..., "messages": [system, instruction]}:
+#
+#   pgs harbor check data/harbor_tasks
+#   pgs harbor rows  data/harbor_tasks data/harbor_rows.jsonl
+#   pgs scenario check --config configs/rl_scenario_plan_execute.yaml --n 5   # starts containers
+#   pgs rl --config configs/rl_scenario_plan_execute.yaml
+#
+# No rewards: section and no env: section: the scenario runs HarborEnv itself, one container per executor.
+# Tested with a stand-in environment on CPU; not yet run against Docker or on a GPU.
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/harbor_rows.jsonl
+  prompt_field: messages
+
+scenario:
+  type: plan_execute
+  timeout: 1800                    # seconds per episode: the planner, then the executors' containers
+  args:
+    executor_samples: 2            # executors per plan, each in its own container
+    max_plan_chars: 4000
+    max_turns: 16                  # the executor's; a row's own "max_turns" wins
+    tool_timeout: 120
+    max_concurrent: 16             # containers alive at once
+    control: false                 # true: one executor without a plan per episode, and a `lift` for the planner
+    env_args: {}                   # HarborEnv arguments (tools, reward_key, workdir, images); no harness profiles
+
+roles:
+  planner: {max_new_tokens: 1024}
+  executor: {max_completion_tokens: 8192}   # a session's whole budget, over all its turns
+
+rollout:
+  backend: vllm
+  batch_prompts: 8
+  group_size: 4                    # x (1 planner + 2 executors) per episode
+  max_new_tokens: 1024
+  max_model_len: 16384
+  gpu_memory_utilization: 0.35
+  max_staleness: 1
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+
+train:
+  output_dir: runs/scenario_plan_execute
+  steps: 200
+  learning_rate: 2.0e-6
+  eval_every: 25
+  eval_samples: 32
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 16

@@ -1,0 +1,58 @@
+# Multi-role RL on a dataset you already have: a solver and a checker over GSM8K-style rows, scored by the same
+# reward as single-agent RL (guides/multi-agent.md, "Your own RL dataset plus a pattern").
+#
+# Rows are single-agent rows, {"question": ..., "answer": ...}; nothing is generated and no Python is written.
+# The pattern (scenario.type) supplies the protocol, the rewards: section the verifier.
+#
+#   pgs scenario patterns                                             # the patterns, their row fields and options
+#   pgs scenario check --config configs/rl_scenario_solve_check.yaml  # your rows, your rewards, the audit on them
+#   pgs rl --config configs/rl_scenario_solve_check.yaml
+#
+# The single-agent control on the same rows and reward is configs/rl_math.yaml: run it next to this one.
+# CPU-tested only (hf backend); not yet run on a GPU.
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/gsm8k_train.jsonl
+  eval_dataset: data/gsm8k_test.jsonl
+
+rewards:
+  correct: {fn: math, args: {field: answer}}
+
+scenario:
+  type: solve_check
+  args:
+    gold_field: answer             # the reference answer: the oracle partners and the right candidate read it
+    solver_samples: 2              # attempts per episode; a wrong one is the other's wrong twin
+    checker_samples: 2             # checker sessions per candidate (two candidates per episode)
+
+# roles: both are the trained policy by default. A checker of its own:
+#   roles: {checker: {adapter: checker}}   (with lora.rank and rollout.backend vllm_server)
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 4                    # x (2 solver + 4 checker sessions) per episode
+  max_new_tokens: 1024
+  max_model_len: 4096
+  gpu_memory_utilization: 0.35
+  max_staleness: 1
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+
+train:
+  output_dir: runs/scenario_solve_check
+  steps: 200
+  learning_rate: 2.0e-6
+  eval_every: 25
+  eval_samples: 200
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 30

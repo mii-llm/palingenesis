@@ -1,0 +1,57 @@
+# Multi-role RL on a reading-comprehension dataset you already have: a writer who sees the text and a reader who
+# sees only the writer's note (guides/multi-agent.md, "Your own RL dataset plus a pattern").
+#
+# Rows: {"context": the text, "question": ..., "answer": a string or a list of acceptable answers}. Other column
+# names: scenario.args.material_field, question_field, gold_field.
+#
+#   pgs scenario check --config configs/rl_scenario_handoff.yaml
+#   pgs rl --config configs/rl_scenario_handoff.yaml
+#
+# CPU-tested only (hf backend); not yet run on a GPU.
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/reading_train.jsonl
+  eval_dataset: data/reading_dev.jsonl
+
+rewards:
+  f1: {fn: qa_match, args: {field: answer, metric: f1}}
+
+scenario:
+  type: handoff
+  args:
+    material_field: context
+    max_note_chars: 400            # below the length of the texts, or the best note is a copy (the check warns)
+    reader_samples: 2
+    control: true                  # one reader without a note: the writer is paid for what its note adds
+
+# A reader that does not learn keeps the notes readable by anyone (no private code):
+#   roles: {reader: {train: false}}
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 4                    # x (1 writer + 2 readers + 1 control) per episode
+  max_new_tokens: 512
+  max_model_len: 8192
+  gpu_memory_utilization: 0.35
+  max_staleness: 1
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+
+train:
+  output_dir: runs/scenario_handoff
+  steps: 200
+  learning_rate: 2.0e-6
+  eval_every: 25
+  eval_samples: 200
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 30

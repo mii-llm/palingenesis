@@ -18,6 +18,15 @@ A scenario is a class with
               (`roles.<name>.partner: scripted:oracle`): a fixed opponent, a perfect worker, a baseline.
 
 Rows are plain JSONL, made by `pgs scenario generate` and read through `data.dataset` like any RL data.
+
+A pattern (palingenesis.rl.scenarios.library.patterns) is a scenario without a generator: its rows are an ordinary
+single-agent RL dataset and its verifier is the run's `rewards:` section (`uses_rewards`). Four more hooks serve
+them, each a no-op by default:
+
+  fields      {row field: what it holds}: what `pgs scenario patterns` lists
+  bind        the run's rewards, sandbox and config, given once before the first episode
+  check_row   the problems of one row (a missing field), as text: the trainer and `pgs scenario check` stop on them
+  prepare     the rows the run will use, before the first episode (a pool of answers to draw wrong candidates from)
 """
 
 from __future__ import annotations
@@ -39,6 +48,8 @@ class Scenario:
     # audit: the least mean reward the oracle partners must earn together, per role (default: 0.9 x the sum of the
     # role's positive weights; a zero-sum game sets its own, since its oracles cannot both win)
     oracle_floor: dict[str, float] = {}
+    uses_rewards = False  # True: sessions are scored by the run's `rewards:` functions (patterns), given by `bind`
+    fields: dict[str, str] = {}  # the row fields it reads: {name: what it holds}
 
     def __init__(self, weights: dict[str, dict[str, float]] | None = None):
         merged = {role: dict(components) for role, components in type(self).weights.items()}
@@ -58,6 +69,20 @@ class Scenario:
     def partners(self) -> dict[str, dict[str, Partner]]:
         return {}
 
+    def bind(self, rewards: list, sandbox: Any = None, config: Any = None) -> None:
+        """The run's reward functions (palingenesis.rl.rewards.Reward), its code sandbox and its RL config."""
+
+    def check_row(self, row: dict) -> list[str]:
+        """What is wrong with a row for this scenario (a missing or empty field), one message each."""
+        return []
+
+    def prepare(self, rows: list[dict]) -> None:
+        """Called once with the rows the episodes will be drawn from."""
+
+    def advice(self, rows: list[dict]) -> list[str]:
+        """Warnings about rows that are valid but make the task degenerate (`pgs scenario check` prints them)."""
+        return []
+
     def reward(self, role: str, components: dict[str, float | None]) -> float | None:
         """A session's reward from its components: the weighted sum of those that apply (not None, not
         `metric/...`); None when none applies (the session cannot be judged and stays out of the loss)."""
@@ -71,12 +96,13 @@ class Scenario:
 
     # ------------------------------------------------------------------ audit
 
-    def audit(self, n: int = 200, seed: int = 0) -> dict:
-        """Play the scripted partners through the verifier on `n` generated rows: the oracles together, then
-        each degenerate partner in its role with oracles in the others. Returns {"oracle": {role: mean reward},
-        "degenerate": {"role/name": mean reward}, "failures": [...]}: an oracle must earn more than 0.9 of its
-        role's best reward, a degenerate partner at most 0 on average."""
-        rows = self.generate(n, seed)
+    def audit(self, n: int = 200, seed: int = 0, rows: list[dict] | None = None) -> dict:
+        """Play the scripted partners through the verifier on `n` generated rows (or on `rows`: a dataset of
+        your own): the oracles together, then each degenerate partner in its role with oracles in the others.
+        Returns {"oracle": {role: mean reward}, "degenerate": {"role/name": mean reward}, "failures": [...]}:
+        an oracle must earn more than 0.9 of its role's best reward, a degenerate partner at most 0 on average."""
+        rows = self.generate(n, seed) if rows is None else list(rows)
+        self.prepare(rows)
         table = self.partners()
         missing = [role for role in self.roles if "oracle" not in table.get(role, {})]
         if missing:
@@ -116,7 +142,14 @@ BUILTIN = {
     "take_away": "palingenesis.rl.scenarios.library.take_away:TakeAway",
     "ledger_sum": "palingenesis.rl.scenarios.library.ledger_sum:LedgerSum",
     "checked_answer": "palingenesis.rl.scenarios.library.checked_answer:CheckedAnswer",
+    "solve_check": "palingenesis.rl.scenarios.library.solve_check:SolveCheck",
+    "handoff": "palingenesis.rl.scenarios.library.handoff:Handoff",
+    "lead_workers": "palingenesis.rl.scenarios.library.lead_workers:LeadWorkers",
+    "plan_execute": "palingenesis.rl.scenarios.library.plan_execute:PlanExecute",
 }
+# the built-ins that have a generator of their own, and those that run on a dataset you bring (patterns)
+GENERATED = ("take_away", "ledger_sum", "checked_answer")
+PATTERNS = ("solve_check", "handoff", "lead_workers", "plan_execute")
 
 
 def scenario_class(spec: str) -> type[Scenario]:
@@ -161,9 +194,23 @@ def tagged_word(text: str, tag: str, words: tuple[str, ...]) -> str | None:
     return found[0].lower()
 
 
+def tagged_text(text: str, tag: str) -> str | None:
+    """The text of the one line `TAG: ...` in `text` (case-insensitive tag), stripped of surrounding emphasis
+    marks. None when there is no such line, several, or nothing after the tag."""
+    found = re.findall(rf"(?im)^[ \t>*_`]*{re.escape(tag)}\b[ \t*_`]*:[ \t]*(.*?)[ \t]*$", text or "")
+    if len(found) != 1:
+        return None
+    value = found[0].strip().strip("*_`").strip()
+    return value or None
+
+
 def user(content: str) -> dict:
     return {"role": "user", "content": content}
 
 
 def system(content: str) -> dict:
     return {"role": "system", "content": content}
+
+
+def assistant(content: str) -> dict:
+    return {"role": "assistant", "content": content}

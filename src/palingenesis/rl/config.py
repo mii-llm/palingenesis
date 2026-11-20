@@ -424,10 +424,13 @@ class RLLoRAConfig:
 
 @dataclass(slots=True)
 class RLScenarioConfig:
-    # A multi-role scenario (palingenesis.rl.scenarios): a built-in (take_away, ledger_sum, checked_answer) or
-    # "module:Class" / "path/to/file.py:Class". Empty = single-agent RL. With a scenario, every group is
-    # rollout.group_size episodes of it on one row of data.dataset (rows from `pgs scenario generate`), rewards
-    # come from the scenario's verifier (no `rewards:` section), and `roles:` says who plays each role.
+    # A multi-role scenario (palingenesis.rl.scenarios). Empty = single-agent RL. With a scenario, every group is
+    # rollout.group_size episodes of it on one row of data.dataset, and `roles:` says who plays each role.
+    #   a pattern over your own RL dataset (solve_check, handoff, lead_workers): rows as for single-agent RL, final
+    #     answers scored by the `rewards:` section; plan_execute: Harbor rows, scored by the task's tests
+    #   a scenario with its own generator and verifier (take_away, ledger_sum, checked_answer): rows from
+    #     `pgs scenario generate`, no `rewards:` section
+    #   your own: "module:Class" / "path/to/file.py:Class"
     type: str = ""
     args: dict = field(default_factory=dict)  # the scenario's own options (e.g. weights: {role: {component: w}})
     timeout: float = 600.0  # seconds an episode may take; a slower one is cancelled and left out of training
@@ -748,7 +751,9 @@ class RLConfig:
         if self.scenario.type or self.roles or self.scenario != RLScenarioConfig():
             from palingenesis.rl.scenarios.config import validate as validate_scenario
 
-            errors += validate_scenario(self, sharded=in_world or t.fsdp or t.cpu_offload)
+            errors += validate_scenario(
+                self, sharded=in_world or t.fsdp or t.cpu_offload, python_rewards=python_rewards
+            )
         elif loss.advantage_std == "role" or loss.advantage_std_floor:
             errors.append("loss.advantage_std role and loss.advantage_std_floor need a scenario (scenario.type).")
         if not self.rewards and not python_rewards and not custom_env and not self.scenario.type:

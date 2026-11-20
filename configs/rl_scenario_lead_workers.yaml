@@ -1,0 +1,57 @@
+# Multi-role RL on a dataset you already have: a lead splits each task, workers answer the parts, the lead merges
+# (guides/multi-agent.md, "Your own RL dataset plus a pattern"). Rows and reward as for single-agent RL.
+#
+#   pgs scenario check --config configs/rl_scenario_lead_workers.yaml
+#   pgs rl --config configs/rl_scenario_lead_workers.yaml
+#
+# Watch role/lead/rewards/metric/control next to the reward: it is the lead answering alone. When the two are
+# close, delegation adds tokens and nothing else.
+# CPU-tested only (hf backend); not yet run on a GPU.
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/gsm8k_train.jsonl
+  eval_dataset: data/gsm8k_test.jsonl
+
+rewards:
+  correct: {fn: math, args: {field: answer}}
+
+scenario:
+  type: lead_workers
+  args:
+    max_workers: 3                 # subtasks a plan may hand out
+    team_samples: 2                # teams of workers per plan (the workers' comparison)
+    merge_samples: 2               # merges per team (the merge's comparison)
+    control: true                  # one session of the lead alone, logged
+    # weights: {lead: {total: 0, lift: 1}}   # pay the plan only for what delegating adds
+
+roles:
+  lead: {share: 2.0}
+
+rollout:
+  backend: vllm
+  batch_prompts: 16
+  group_size: 2                    # x (1 plan + 2 x (3 workers + 2 merges) + 1 control) per episode
+  max_new_tokens: 768
+  max_model_len: 8192
+  gpu_memory_utilization: 0.35
+  max_staleness: 1
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+
+train:
+  output_dir: runs/scenario_lead_workers
+  steps: 200
+  learning_rate: 2.0e-6
+  eval_every: 25
+  eval_samples: 200
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 30

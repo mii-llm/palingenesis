@@ -20,8 +20,9 @@ def adapter_names(config: Any) -> list[str]:
     return names
 
 
-def validate(config: Any, sharded: bool) -> list[str]:
-    """Errors of the scenario and roles sections. `sharded`: the policy is sharded with FSDP."""
+def validate(config: Any, sharded: bool, python_rewards: bool = False) -> list[str]:
+    """Errors of the scenario and roles sections. `sharded`: the policy is sharded with FSDP; `python_rewards`:
+    reward functions are passed to the trainer in Python."""
     s, e, loss = config.scenario, config.env, config.loss
     errors: list[str] = []
     if not s.type:
@@ -42,9 +43,16 @@ def validate(config: Any, sharded: bool) -> list[str]:
         errors.append(
             "scenario with env.type / env.tools: a scenario gives each role its tools; leave env at its default."
         )
-    if config.rewards:
+    if scenario.uses_rewards and not config.rewards and not python_rewards:
         errors.append(
-            "scenario with rewards: the scenario's verifier sets the rewards (weights: scenario.args.weights)."
+            f"scenario {scenario.name} is a pattern over your own dataset: its answers are scored by the run's "
+            "rewards. Add a rewards: section, as for single-agent RL (e.g. rewards: {correct: {fn: math}})."
+        )
+    if config.rewards and not scenario.uses_rewards:
+        errors.append(
+            f"scenario {scenario.name} with rewards: the scenario's verifier sets the rewards (weights: "
+            "scenario.args.weights). The patterns that are scored by rewards: are solve_check, handoff and "
+            "lead_workers."
         )
     if config.model.multimodal:
         errors.append("scenario with model.multimodal is not supported yet.")

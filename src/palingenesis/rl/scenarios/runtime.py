@@ -169,7 +169,9 @@ class LiveSession:
 Partner = Callable[..., Any]
 """A frozen role: `partner(messages) -> str` (or async), the next assistant message of a conversation; with a
 second parameter, `partner(messages, tools)`, it also gets the session's tools ({name: async callable}) and calls
-them itself. Any state it needs is in `messages` (a partner object may be shared by concurrent sessions)."""
+them itself. A partner that declares a parameter named `row` also gets the episode's row as a keyword (an oracle
+reads the gold answer there). Any other state it needs is in `messages` (a partner object may be shared by
+concurrent sessions)."""
 
 
 class PartnerSession(LiveSession):
@@ -182,11 +184,14 @@ class PartnerSession(LiveSession):
         tools: dict[str, Callable] | None,
         max_turns: int,
         conversational: bool = True,
+        row: dict | None = None,
     ):
         self.session, self.partner, self.tools, self.max_turns = session, partner, tools or {}, max_turns
         self.conversational = conversational  # False: it answers its messages once, by the time it is closed
         self.turns = 0
-        self.takes_tools = len(inspect.signature(partner).parameters) >= 2
+        parameters = inspect.signature(partner).parameters
+        self.takes_tools = len([name for name in parameters if name != "row"]) >= 2
+        self.keywords = {"row": row or {}} if "row" in parameters else {}
         self.closed = False
         self.notes: list[str] = []
 
@@ -205,7 +210,7 @@ class PartnerSession(LiveSession):
             return None
         self.turns += 1
         args = (s.messages, self.tools) if self.takes_tools else (s.messages,)
-        text = self.partner(*args)
+        text = self.partner(*args, **self.keywords)
         if inspect.isawaitable(text):
             text = await text
         text = "" if text is None else str(text)
@@ -230,7 +235,8 @@ class SessionPort:
         from palingenesis.rl.chat import tool_schema
 
         self.tools = dict(tools or {})
-        self.schemas = [tool_schema(fn, name) for name, fn in self.tools.items()]
+        # a tool that carries its own schema (a `schema` attribute: an environment's tool behind a function) keeps it
+        self.schemas = [getattr(fn, "schema", None) or tool_schema(fn, name) for name, fn in self.tools.items()]
         self.conversational = conversational
         self.client = client  # the generation client: a session waiting for an answer is not waiting for a turn
         self.outbox: asyncio.Queue = asyncio.Queue()
@@ -537,7 +543,7 @@ class PartnerHost(Host):
 
     async def open(self, episode, session, messages, tools, conversational, limits) -> LiveSession:
         turns = limits.get("max_turns") or self.max_turns
-        return PartnerSession(session, self.partner(session.role), tools, turns, conversational)
+        return PartnerSession(session, self.partner(session.role), tools, turns, conversational, episode.row)
 
 
 def play(scenario: Any, rows: list[dict], partners: dict[str, Partner], seed: int = 0, episodes: int = 1) -> list:
