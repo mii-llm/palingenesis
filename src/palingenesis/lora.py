@@ -103,6 +103,7 @@ def fold_weight(
 # module state: threads and asyncio tasks each see their own value, so a rollout thread generating with one role's
 # adapter and a training forward of another's cannot change each other's.
 _ACTIVE: contextvars.ContextVar[str] = contextvars.ContextVar("palingenesis_lora_adapter", default="")
+BASE = "base"  # use_adapter(BASE): no adapter at all, the frozen base (a reserved adapter name)
 
 
 def set_adapter(name: str) -> None:
@@ -205,7 +206,7 @@ class LoRALinear(nn.Module):
         return self.lora_magnitude / norm
 
     def forward(self, x: Tensor) -> Tensor:
-        if not self.enabled:
+        if not self.enabled or _ACTIVE.get() == BASE:
             return F.linear(x, self.weight, self.bias)
         if self.lora_magnitude is None:
             out = F.linear(x, self.weight, self.bias)

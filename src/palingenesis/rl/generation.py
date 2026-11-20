@@ -70,7 +70,7 @@ class GenerationClient:
             self.executor = ThreadPoolExecutor(
                 1, thread_name_prefix="pgs-generate", initializer=on_current_device(lambda: None)
             )
-            self.pending: list[tuple[list[int], int, float, asyncio.Future, list | None]] = []
+            self.pending: list[tuple[list[int], int, float, asyncio.Future, list | None, str]] = []
             self._arrived: asyncio.Event | None = None
             self._flusher: asyncio.Task | None = None
 
@@ -83,17 +83,23 @@ class GenerationClient:
             self._signal()  # one fewer to wait for
 
     async def generate(
-        self, prompt_ids: list[int], max_new_tokens: int, temperature: float, images: list | None = None
+        self,
+        prompt_ids: list[int],
+        max_new_tokens: int,
+        temperature: float,
+        images: list | None = None,
+        adapter: str = "",
     ) -> Generation:
         """`images`: the prompt's images, one per placeholder token of `prompt_ids`, in order
-        (a multimodal policy; the engine expands the placeholders)."""
+        (a multimodal policy; the engine expands the placeholders). `adapter`: the LoRA adapter of the engine to
+        generate with (engines that serve several; requests of different adapters share the running batch)."""
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         images = list(images) if images else None
         if self.streaming:
-            self.inbox.put((prompt_ids, max_new_tokens, temperature, future, loop, images))
+            self.inbox.put((prompt_ids, max_new_tokens, temperature, future, loop, images, adapter))
             return await future
-        self.pending.append((prompt_ids, max_new_tokens, temperature, future, images))
+        self.pending.append((prompt_ids, max_new_tokens, temperature, future, images, adapter))
         if self._arrived is None:
             self._arrived = asyncio.Event()
         self._signal()
@@ -133,20 +139,26 @@ class GenerationClient:
         nothing is in flight)."""
         groups: dict[tuple, list] = {}
         pictures: dict[tuple, list] = {}
-        for i, (prompt, budget, temperature, future, loop, *images) in enumerate(items):
-            images = images[0] if images else None  # a text request may come without the field
+        adapters: dict[tuple, str] = {}
+        for i, (prompt, budget, temperature, future, loop, *rest) in enumerate(items):
+            images = rest[0] if rest else None  # a text request may come without the fields
+            adapter = rest[1] if len(rest) > 1 else ""
             # greedy requests stay separate: vLLM refuses n > 1 without sampling
             merge = self.merge and samplings(temperature, 1)[0].temperature > 0
             # the same tokens with other pictures are another prompt (a group's rollouts share the objects)
             seen = tuple(id(image) for image in images or ())
-            key = (tuple(prompt), budget, temperature, seen) + (() if merge else (i,))
+            key = (tuple(prompt), budget, temperature, seen, adapter) + (() if merge else (i,))
             groups.setdefault(key, []).append((future, loop))
             if images:
                 pictures[key] = images
+            if adapter:
+                adapters[key] = adapter
         for key, waiters in groups.items():
             prompt, budget, temperature = key[:3]
             request_id = str(next(self.ids))
             extra = {"images": pictures[key]} if key in pictures else {}
+            if key in adapters:
+                extra["adapter"] = adapters[key]
             try:
                 self.engine.stream_add(request_id, list(prompt), budget, temperature, len(waiters), **extra)
             except BaseException as e:  # noqa: BLE001 — the waiting trajectories see the failure
@@ -209,11 +221,13 @@ class GenerationClient:
                 except asyncio.TimeoutError:
                     break
             batch, self.pending = self.pending, []
-            for temperature in sorted({b[2] for b in batch}):
-                part = [b for b in batch if b[2] == temperature]
+            for temperature, adapter in sorted({(b[2], b[5]) for b in batch}):
+                part = [b for b in batch if b[2] == temperature and b[5] == adapter]
                 call = self.engine.generate
                 if any(b[4] for b in part):  # only multimodal engines take images
                     call = functools.partial(call, images=[b[4] for b in part])
+                if adapter:  # engines that serve several LoRA adapters
+                    call = functools.partial(call, adapter=adapter)
                 try:
                     rollouts = await loop.run_in_executor(
                         self.executor,

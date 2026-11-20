@@ -217,7 +217,16 @@ class HFRollout:
         return [s.input_ids.tolist() for s in sequences], sequences
 
     @torch.no_grad()
-    def generate(self, prompts, max_new_tokens, temperature, images=None):
+    def generate(self, prompts, max_new_tokens, temperature, images=None, adapter: str = ""):
+        """`adapter`: the named LoRA adapter to generate with (palingenesis.lora.use_adapter; "base": none)."""
+        if not adapter:
+            return self._generate(prompts, max_new_tokens, temperature, images)
+        from palingenesis.lora import use_adapter
+
+        with use_adapter(adapter):
+            return self._generate(prompts, max_new_tokens, temperature, images)
+
+    def _generate(self, prompts, max_new_tokens, temperature, images=None):
         from transformers import GenerationConfig, LogitsProcessorList
 
         prompts, sequences = self._expand(prompts, images)
@@ -426,6 +435,8 @@ class VLLMColocateRollout:
         self.asleep = False  # KV cache released
         self.prompt_tokens = self.cached_tokens = 0  # streaming: prefill accounting
         self.started: dict[str, int] = {}  # streaming: request id -> the version its decoding started with
+        self.adapters: dict = {}  # LoRA adapters by name (load_adapter), for requests that name one
+        self.adapter_ids: dict[str, int] = {}
 
     def update_weights(self, named_tensors, version: int) -> None:
         if self.version < 0:
@@ -463,10 +474,28 @@ class VLLMColocateRollout:
             request["multi_modal_data"] = {"image": [load_image(image) for image in images]}
         return request
 
-    def generate(self, prompts, max_new_tokens, temperature, images=None):
+    def load_adapter(self, name: str, path: str, version: int) -> None:
+        """Make the LoRA adapter saved at `path` (PEFT layout) the adapter `name` of this engine, replacing the
+        one it had (vLLM's in-place reload: requests in flight keep running). The engine must have been built
+        with enable_lora (engine_kwargs: enable_lora, max_loras, max_lora_rank). Not run on a GPU yet."""
+        from vllm.lora.request import LoRARequest
+
+        number = self.adapter_ids.setdefault(name, len(self.adapter_ids) + 1)
+        try:
+            request = LoRARequest(lora_name=name, lora_int_id=number, lora_path=path, load_inplace=True)
+        except TypeError:  # a vLLM without in-place reload: a new id per version makes it load the new files
+            request = LoRARequest(lora_name=name, lora_int_id=number * 1_000_000 + version, lora_path=path)
+        self.adapters[name] = request
+
+    def _lora(self, adapter: str) -> dict:
+        if not adapter or adapter == "base":
+            return {}
+        return {"lora_request": self.adapters[adapter]}
+
+    def generate(self, prompts, max_new_tokens, temperature, images=None, adapter: str = ""):
         """One completion per prompt. Identical requests (a GRPO group's rollouts) become one
         request with n samples: the prompt is prefilled once and its KV cache forked, instead
-        of relying on the prefix cache to find it n times."""
+        of relying on the prefix cache to find it n times. `adapter`: a loaded LoRA adapter (load_adapter)."""
         unique: dict[tuple, list[int]] = {}
         pictures: dict[tuple, list] = {}
         images = images or [None] * len(prompts)
@@ -484,7 +513,10 @@ class VLLMColocateRollout:
             for g, ((_, budget, sampling, _), indices) in zip(greedy, requests)
         ]
         outputs = self.llm.generate(
-            [self._request(key[0], pictures[key]) for key, _ in requests], params, use_tqdm=False
+            [self._request(key[0], pictures[key]) for key, _ in requests],
+            params,
+            use_tqdm=False,
+            **self._lora(adapter),
         )
         rollouts: list[Rollout | None] = [None] * len(prompts)
         for g, (_, indices), out in zip(greedy, requests, outputs):
@@ -527,10 +559,17 @@ class VLLMColocateRollout:
     # they are added and come back the step they finish. One thread must own these calls.
 
     def stream_add(
-        self, request_id: str, prompt: list[int], max_new_tokens: int, temperature, n: int, images=None
+        self,
+        request_id: str,
+        prompt: list[int],
+        max_new_tokens: int,
+        temperature,
+        n: int,
+        images=None,
+        adapter: str = "",
     ) -> None:
         params = self._params(n, max_new_tokens, temperature, final_only=True)
-        self.llm.llm_engine.add_request(request_id, self._request(prompt, images), params)
+        self.llm.llm_engine.add_request(request_id, self._request(prompt, images), params, **self._lora(adapter))
         self.started[request_id] = self.version  # when added, not at the first token: an upper bound on staleness
 
     def stream_pending(self) -> bool:

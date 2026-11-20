@@ -225,7 +225,7 @@ class RLTrainer:
         # A vLLM server starts before the policy loads: it claims its share of free GPU memory.
         self.server = None
         precision: dict = {}
-        if r.backend != "hf" and not (r.backend == "vllm_server" and r.url):  # a running server keeps its own settings
+        if r.backend not in ("hf", "remote") and not (r.backend == "vllm_server" and r.url):  # (their own settings)
             try:  # the installed vLLM must support what is asked (an fp32 head)
                 overrides = r.vllm_args.get("hf_overrides") if r.backend == "vllm" else None
                 precision = precision_options(r.fp32_head, r.ssm_state_dtype, overrides)
@@ -453,9 +453,25 @@ class RLTrainer:
                 self.engine = colocated(
                     {**extra, "enable_return_routed_experts": True} if self.routing_replay else extra
                 )
+        elif r.backend == "remote":
+            from palingenesis.rl.pool.client import RemotePool
+
+            # engines in other processes: this rank generates with its share of them; rank 0 sends every engine
+            # the weights, staged in host memory and sent while the trainer steps (max_staleness 0: it waits)
+            self.engine = RemotePool(
+                r.engines[rank::world],
+                push_to=list(r.engines) if self.parallel.main else [],
+                blocking=r.max_staleness == 0,
+            )
+            self.push_mode = self._push_mode()
+            if self.push_mode != "full" and self.parallel.main:
+                self.engine.payload = self._wire_frames
         else:
             self.engine = VLLMServerRollout(self.server, self.stop_ids)
-        self.weights = PublishedWeights(self.model, self._engine_parameters if self.adapters is not None else None)
+        named = self._engine_parameters if self.adapters is not None else None
+        if getattr(self.engine, "payload", None) is not None or (r.backend == "remote" and not self.parallel.main):
+            named = tuple  # nothing to fold here: the adapters travel as they are (or this rank does not push)
+        self.weights = PublishedWeights(self.model, named)
         if fsdp:  # the trainer thread pushes the weights (collectives); the producer never gathers
             self.weights.sync = lambda engine: 0.0
         pipeline_args = (
@@ -604,13 +620,66 @@ class RLTrainer:
             pipeline_args = (*pipeline_args[:2], self.engine, *pipeline_args[3:])
             for key in engine_keys:
                 engines[key] = (AdapterEngine(self.engine.engine, key, lock, self.adapters), WeightsView(self.weights))
-        else:
+        elif not hasattr(self.engine, "make_client"):  # (a remote pool serves every adapter by name)
             for key in engine_keys:
                 named = None if key == BASE else functools.partial(self.adapters.engine_parameters, self.model, key)
                 weights = WeightsView(self.weights, named, frozen=key == BASE)
                 engines[key] = (VLLMServerRollout(self.servers[key], self.stop_ids), weights)
         self.role_shares = {name: spec.share for name, spec in self.role_specs.items()}
         return ScenarioPipeline(*pipeline_args, scenario=self.scenario, roles=self.role_specs, engines=engines)
+
+    def _push_mode(self) -> str:
+        """What a weight update sends to remote engines (rollout.push)."""
+        mode = self.config.rollout.push
+        if self.adapters is None or self.parallel.fsdp:
+            return "full"
+        if mode == "auto":
+            return "native" if self.adapters.names or not self.adapters.default_trains else "fold"
+        return mode
+
+    def _wire_frames(self, first: bool) -> list[tuple[dict, dict]]:
+        """With adapters and remote engines: the frames of a weight update (palingenesis.rl.pool.worker). The
+        adapters' factors only, megabytes: per adapted weight for the engines to fold ("fold", preceded on the
+        first update by the base they fold into), or per named adapter ("native")."""
+        plugin, c = self.adapters.plugin, self.config.lora
+        if self.push_mode == "native":
+            names = ([""] if self.adapters.default_trains else []) + self.adapters.names
+            tensors = {
+                f"{name}|{module}|{part}": tensor.detach()
+                for name in names
+                for module, parts in plugin.adapter_tensors(name).items()
+                for part, tensor in parts.items()
+            }
+            lora = {
+                "rank": c.rank,
+                "alpha": c.alpha,
+                "rslora": c.rslora,
+                "targets": list(c.targets),
+                "exclude": list(c.exclude),
+            }
+            return [({"mode": "native", "lora": lora}, tensors)]
+        frames = []
+        suffixes = (".lora_A", ".lora_B", ".lora_magnitude")
+        by_weight = {m.weight.data_ptr(): m for m in plugin.modules.values()}
+        base = ((n, p) for n, p in self.model.named_parameters() if not n.endswith(suffixes))
+        named = dict(checkpoint_named_parameters(self.model, base))
+        if first:
+            frames.append(({"mode": "base"}, named))
+        tensors, scaling = {}, {}
+        for name, tensor in named.items():
+            m = by_weight.get(tensor.data_ptr()) if tensor.numel() else None
+            if m is None or tensor.shape != m.weight.shape:
+                continue
+            scaling[name] = m.scaling
+            tensors[f"{name}|A"], tensors[f"{name}|B"] = m.lora_A.detach(), m.lora_B.detach()
+            if m.lora_magnitude is not None:
+                tensors[f"{name}|m"] = m.lora_magnitude.detach()
+        if len(scaling) != len(by_weight):
+            raise RuntimeError(
+                "lora: some adapted weights were not found under their checkpoint names (rollout.push fold)"
+            )
+        frames.append(({"mode": "fold", "scaling": scaling}, tensors))
+        return frames
 
     def _engine_parameters(self):
         """With adapters: the policy as a rollout engine loads it, the adapters folded into new weight tensors
@@ -989,6 +1058,11 @@ class RLTrainer:
                     full = self.adapters.fold_stream(full, measure=True)
                 named = checkpoint_named_parameters(self.model, full)
                 self.engine.update_weights(named, version)
+        elif hasattr(self.engine, "make_client"):  # remote engines: every rank gathers, rank 0 stages and sends
+            full = self.parallel.full_parameters(self.model)
+            if self.adapters is not None:
+                full = self.adapters.fold_stream(full, measure=True)
+            self.engine.update_weights(checkpoint_named_parameters(self.model, full), version)
         else:
             self.engine.update_weights((), version)
         return time.perf_counter() - start
@@ -1082,6 +1156,8 @@ class RLTrainer:
                     metrics[DROPPED_METRIC] = self.dumps.dropped
                 if self.adapters is not None:
                     metrics.update(self.adapters.metrics(self.model, step + 1))
+                if hasattr(self.engine, "metrics"):  # remote engines: push time and size, versions behind
+                    metrics.update(self.engine.metrics())
                 if self.parallel.replicated and (step + 1) % REPLICA_CHECK_EVERY == 0:
                     with self.weights.lock:  # the replicas must stay one policy: checked, and repaired from rank 0
                         metrics["replica/drift"] = self.parallel.replica_drift(self._trainable())
@@ -1121,6 +1197,8 @@ class RLTrainer:
                 self.server.close()
             for server in self.servers.values():
                 server.close()
+            if hasattr(self.engine, "make_client"):
+                self.engine.close()
             self.parallel.close()
 
     def _parity_check(self, metrics: dict[str, float]) -> None:

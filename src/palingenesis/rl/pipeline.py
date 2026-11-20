@@ -94,7 +94,10 @@ class RLPipeline:
         self.observation_loss = config.loss.observation_weight > 0
         self.observation_exclude = self.observation_patterns(config.loss.observation_exclude)
         # n-sample merging only helps when a group's rollouts are one turn each
-        self.client = GenerationClient(engine, merge=env_pool is None)
+        if hasattr(engine, "make_client"):  # engines in other processes (palingenesis.rl.pool): requests travel
+            self.client = engine.make_client(merge=env_pool is None)
+        else:
+            self.client = GenerationClient(engine, merge=env_pool is None)
         self.lock = threading.RLock()
         self.group_ids = itertools.count()
         self.carry: list[list[Trajectory]] = []  # surplus informative groups (max_staleness > 0)

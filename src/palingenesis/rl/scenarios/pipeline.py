@@ -170,12 +170,8 @@ class AdapterEngine:
         pass
 
     def generate(self, prompts, max_new_tokens, temperature, **kwargs):
-        with self.lock:
-            if self.adapter == BASE:
-                with self.adapters.disabled():
-                    return self.engine.generate(prompts, max_new_tokens, temperature, **kwargs)
-            with use_adapter(self.adapter):
-                return self.engine.generate(prompts, max_new_tokens, temperature, **kwargs)
+        with self.lock, use_adapter(self.adapter):  # BASE is the reserved name of "no adapter"
+            return self.engine.generate(prompts, max_new_tokens, temperature, **kwargs)
 
 
 class WeightsView:
@@ -232,6 +228,9 @@ class ScenarioPipeline(RLPipeline, Host):
             self.clients[key] = GenerationClient(engine, merge=False)
             self.extra[key] = (engine, weights)
         self.client.merge = False  # sessions are multi-turn: an n-sample request returns when its longest ends
+        if hasattr(self.engine, "make_client"):  # an engine pool serves every adapter: requests name theirs
+            for key in sorted({spec.engine for spec in roles.values() if spec.partner is None} - {""}):
+                self.clients[key] = self.engine.make_client(adapter=key)
         missing = sorted({spec.engine for spec in roles.values() if spec.partner is None} - set(self.clients))
         if missing:
             raise ScenarioError(f"no rollout engine for {missing}")

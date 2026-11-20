@@ -101,7 +101,12 @@ def validate(config: Any, sharded: bool) -> list[str]:
             errors.append(
                 "roles with their own adapter are not supported with loss.kl_ref_reset (kl_ref: start works)."
             )
-    if (names or based) and config.rollout.backend != "hf" and os.environ.get("WORLD_SIZE", "1") != "1":
+    if names and config.rollout.backend == "remote" and config.rollout.push in ("full", "fold"):
+        errors.append(
+            "roles with their own adapter on remote engines are served as named adapters of one engine: "
+            "rollout.push must be native (or auto)."
+        )
+    if (names or based) and config.rollout.backend not in ("hf", "remote") and os.environ.get("WORLD_SIZE", "1") != "1":
         errors.append(
             "roles with their own adapter (or partner: base) run on one GPU for now: a vLLM server per adapter is "
             "single-process. Under torchrun, share the weights between the roles."

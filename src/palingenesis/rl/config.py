@@ -25,7 +25,7 @@ BASELINES = ("mean", "leave_one_out")
 ADVANTAGE_STD = ("batch", "group", "none", "role")
 AGGREGATIONS = ("prompt", "token", "constant")
 TRUNCATION = ("score", "mask")
-ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server")
+ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server", "remote")
 ENV_TYPES = ("single_turn", "tools")  # or "module:Class" / "path/to/file.py:Class"
 TOOL_PARSERS = ("auto", "hermes", "xml")
 SANDBOX_BACKENDS = ("docker", "agent_sandbox", "subprocess")
@@ -172,6 +172,17 @@ class RLRolloutConfig:
     # noise to every importance ratio. "off" (default until the vLLM path has run end to end on a GPU); "auto": on
     # for MoE policies; "on": an error if the policy has no MoE layers. The vLLM backends need rollout.prefix_caching.
     routing_replay: str = "off"
+    # remote (palingenesis.rl.pool): the rollout engines are other processes, on other GPUs or nodes, each started
+    # with `python -m palingenesis.rl.pool.worker`. `engines`: their "host:port" addresses; under torchrun rank r
+    # generates with engines[r::ranks] and rank 0 sends the weights to all of them. A weight update returns as soon
+    # as the weights are staged in host memory: they travel while the trainer steps, each engine applies them when
+    # they have arrived whole and tags what it samples with its version, and max_staleness decides what is trained
+    # (max_staleness 0: the update waits for every engine). `push`: what travels. "full": every weight. "fold"
+    # (lora): the adapters' factors, folded into the base by each engine. "native" (lora): the adapters as named
+    # LoRA adapters of the engine (vLLM's LoRA serving; several roles' adapters in one engine). "auto": full
+    # without lora, fold with one adapter, native with roles that have their own.
+    engines: list = field(default_factory=list)
+    push: str = "auto"
 
 
 @dataclass(slots=True)
@@ -620,6 +631,24 @@ class RLConfig:
             )
         if r.max_staleness < 0:
             errors.append("rollout.max_staleness must be >= 0.")
+        if r.backend == "remote" and not r.engines:
+            errors.append(
+                'rollout.backend remote needs rollout.engines: ["host:port", ...] (rl.pool.worker processes).'
+            )
+        if r.engines and r.backend != "remote":
+            errors.append("rollout.engines is only used with rollout.backend remote.")
+        if r.push not in ("auto", "full", "fold", "native"):
+            errors.append(f"rollout.push must be auto, full, fold or native, got {r.push!r}.")
+        elif r.push != "auto" and r.backend != "remote":
+            errors.append("rollout.push is only used with rollout.backend remote.")
+        elif r.push in ("fold", "native") and not self.lora.rank:
+            errors.append(f"rollout.push {r.push} sends LoRA adapters: it needs lora.rank.")
+        elif r.push in ("fold", "native") and (t.fsdp or t.cpu_offload):
+            errors.append(f"rollout.push {r.push} is not supported with FSDP: use train.replicate_base, or push full.")
+        if r.backend == "remote" and r.engines and len(r.engines) < int(os.environ.get("WORLD_SIZE", "1")):
+            errors.append("rollout.engines: every trainer rank needs at least one engine.")
+        if r.backend == "remote" and (m.multimodal or r.routing_replay != "off"):
+            errors.append("rollout.backend remote does not support model.multimodal or rollout.routing_replay yet.")
         if r.max_staleness > 0 and r.backend == "hf":
             errors.append(
                 "rollout.max_staleness > 0 needs a vLLM backend (hf generates with the trained model itself)."
