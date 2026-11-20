@@ -240,8 +240,8 @@ class SessionPort:
         self.notes: list[str] = []  # messages left for the session (LiveSession.notify), read at its next turn boundary
 
     def _with_notes(self, result: Any) -> Any:
-        if not self.notes or self.done:
-            return result
+        if not self.notes or self.done or not isinstance(result, str | type(None)):
+            return result  # (a result with images keeps them: the notes wait for the next text result)
         notes, self.notes = self.notes, []
         return "\n\n".join([*([str(result)] if result not in (None, "") else []), *notes])
 
@@ -308,11 +308,14 @@ class RolloutSession(LiveSession):
             raise ScenarioError(f"{self.session.name}: an answer was given before the session said anything")
         if not self.task.done():
             get = asyncio.ensure_future(self.port.outbox.get())
-            await asyncio.wait({get, self.task}, return_when=asyncio.FIRST_COMPLETED)
-            if get.done():
+            try:
+                await asyncio.wait({get, self.task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:  # also when the caller is cancelled: a waiter left behind would take the next message
+                if not get.done():
+                    get.cancel()
+            if get.done() and not get.cancelled():
                 self.awaiting_reply = True
                 return get.result()
-            get.cancel()
         return self._last()
 
     def _last(self) -> str | None:
@@ -340,14 +343,16 @@ class RolloutSession(LiveSession):
     async def close(self) -> None:
         if not self.task.done():
             self.port.closing = True
-            if self.awaiting_reply:
-                self.port.inbox.put_nowait(CLOSE)
-                self.awaiting_reply = False
+            # always: the loop may be waiting for an answer to a message nobody read (an unread CLOSE is harmless)
+            self.port.inbox.put_nowait(CLOSE)
+            self.awaiting_reply = False
             try:
-                await self.task
-            except BaseException:  # noqa: BLE001 — recorded by _finish; a cancellation of the caller propagates below
-                if not self.task.done():
+                await asyncio.shield(self.task)
+            except asyncio.CancelledError:
+                if not self.task.cancelled():  # the caller was cancelled, not the session: pass it on
                     raise
+            except Exception:  # noqa: BLE001 — the session's own failure: recorded by _finish
+                pass
         self._finish()
 
     def cancel(self) -> None:

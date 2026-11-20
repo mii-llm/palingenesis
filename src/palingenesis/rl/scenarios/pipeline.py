@@ -255,7 +255,7 @@ class ScenarioPipeline(RLPipeline, Host):
 
     async def open(self, episode: Episode, session: Session, messages, tools, conversational, limits) -> LiveSession:
         spec = self.roles[session.role]
-        limits = {**spec.limits, **{k: v for k, v in limits.items() if v}}
+        limits = {**{k: v for k, v in limits.items() if v}, **spec.limits}  # the role's own settings win
         if spec.system_prompt:
             if messages and messages[0].get("role") == "system":
                 messages[0]["content"] = f"{spec.system_prompt}\n\n{messages[0]['content']}"
@@ -296,10 +296,10 @@ class ScenarioPipeline(RLPipeline, Host):
             async def whole():
                 await self.scenario.run(episode, row)
                 await episode.join()  # work the scenario spawned without waiting for it
+                for live in episode.live:  # sessions the scenario left open (inside the timeout: a close waits
+                    await live.close()  # for the session's current turn)
 
             await asyncio.wait_for(whole(), self.config.scenario.timeout)
-            for live in episode.live:
-                await live.close()
         except asyncio.CancelledError:
             await episode.abort()
             raise

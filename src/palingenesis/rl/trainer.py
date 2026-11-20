@@ -330,6 +330,12 @@ class RLTrainer:
         # MoE: router balancing over the global batch, routing statistics, routing replay
         self.router_balancer = RouterBalancer.attach(self.model, config.moe, replay=self.routing_replay)
         self.routing_replay = self.routing_replay and self.router_balancer is not None
+        if self.router_balancer is not None and self.parallel.replicated:
+            raise RLConfigError(
+                "train.replicate_base is not supported for MoE policies yet: router balancing reduces its counts "
+                "over the ranks at every micro-batch, and replicated ranks run different numbers of them. Use FSDP "
+                "(train.replicate_base: false)."
+            )
         if self.adapters is not None and self.router_balancer is not None and self.parallel.main:
             logger.warning(
                 "lora on an MoE policy: the routers and any expert weights that are not nn.Linear layers stay frozen, "
@@ -688,6 +694,7 @@ class RLTrainer:
         self.ref_lp = reference.logprobs(trajectories) if reference is not None and trajectories else {}
         if self._share_prompts(groups):
             trajectories = self._train_trees(groups, weights, totals, observed)  # the rest: groups too small to share
+            set_adapter("")  # (the trees select each group's adapter)
         micro_adapters: list[str] = []  # with several adapters: the adapter each micro-batch trains
         if self.adapters is not None and self.adapters.names:
             micro_batches: list[list[Trajectory] | None] = []

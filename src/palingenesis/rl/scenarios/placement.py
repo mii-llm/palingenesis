@@ -38,12 +38,13 @@ class Workload:
     kv_gb_per_engine: float = 8.0  # the least KV cache an engine needs to be worth running
     batch_prompts: int = 32
     backend: str = "vllm"
+    replicate_base: bool = False  # train.replicate_base: with adapters, every rank holds the whole frozen base
 
 
 @dataclass
 class Layout:
     ranks: int
-    mode: str  # "single" | "fsdp"
+    mode: str  # "single" | "fsdp" | "replicated"
     trainer_gb: float
     engine_weights_gb: float
     gpu_memory_utilization: float  # per engine
@@ -64,9 +65,10 @@ def plan(cluster: Cluster, workload: Workload, config_path: str = "config.yaml")
     notes, errors = [], []
     if ranks < 1 or workload.engines < 1:
         raise ValueError("a cluster needs at least one GPU and a workload at least one engine")
-    mode = "single" if ranks == 1 else "fsdp"
+    replicated = workload.replicate_base and bool(workload.lora_rank) and ranks > 1
+    mode = "single" if ranks == 1 else "replicated" if replicated else "fsdp"
     if workload.lora_rank:
-        trainer = 2 * gb if ranks == 1 else 4 * gb / ranks + 2 * gb
+        trainer = 2 * gb if ranks == 1 or replicated else 4 * gb / ranks + 2 * gb
         trainer += 0.2  # adapters, their gradients and moments
     else:
         trainer = 18 * gb if ranks == 1 else 16 * gb / ranks + 2 * gb
@@ -106,8 +108,11 @@ def plan(cluster: Cluster, workload: Workload, config_path: str = "config.yaml")
     if ranks > 1:
         overrides["rollout.backend"] = overrides.get("rollout.backend", "vllm")
         notes.append(
-            "one trainer rank and one engine per GPU; the policy is sharded with FSDP2 and each rank loads the "
-            "gathered weights into its own engine after every step."
+            "one trainer rank and one engine per GPU; every rank holds the whole frozen base and folds its own "
+            "engine's weights; the adapters' gradients are summed over the ranks once per step."
+            if replicated
+            else "one trainer rank and one engine per GPU; the policy is sharded with FSDP2 and each rank loads "
+            "the gathered weights into its own engine after every step."
         )
         if not workload.lora_rank:
             notes.append(f"{16 * gb / ranks:.1f} GB of master weights, gradients and AdamW moments per GPU.")
@@ -147,4 +152,5 @@ def workload_of(config, params_b: float) -> Workload:
         engines=1 + extra,
         batch_prompts=config.rollout.batch_prompts,
         backend=config.rollout.backend,
+        replicate_base=config.train.replicate_base,
     )

@@ -68,13 +68,15 @@ def make_question(rng: random.Random) -> tuple[str, int]:
 
 
 def distractor(answer: int, rng: random.Random) -> int:
-    """A wrong answer one slip away from `answer`."""
-    options = {answer + 1, answer - 1, answer + 10, answer - 10, -answer}
+    """A wrong answer one slip away from `answer`, of the same sign (a candidate's sign must not give away its
+    class: right answers are almost never negative)."""
+    options = {answer + 1, answer - 1, answer + 10, answer - 10}
     text = str(abs(answer))
     if len(text) > 1:
         options.add(int(text[::-1]) * (1 if answer >= 0 else -1))
     options.discard(answer)
-    return rng.choice(sorted(options))
+    same_sign = {o for o in options if (o < 0) == (answer < 0)}
+    return rng.choice(sorted(same_sign or options))
 
 
 def verdict_reward(text: str, candidate_right: bool, answer: int) -> float:
@@ -105,6 +107,12 @@ def oracle_verifier(messages: list[dict]) -> str:
     answer = _evaluate(re.search(r"(?:compute|calcola) (.+)", text).group(1))
     candidate = re.search(r"(?:Proposed answer|Risposta proposta): (.*)", text).group(1).strip()
     return "VERDICT: ACCEPT" if candidate == str(answer) else f"VERDICT: REJECT\nANSWER: {answer}"
+
+
+def surface_verifier(messages: list[dict]) -> str:
+    """A verifier that never computes: it rejects what looks odd (no number, a negative one) and accepts the rest."""
+    candidate = re.search(r"(?:Proposed answer|Risposta proposta): (.*)", messages[-1]["content"]).group(1).strip()
+    return "VERDICT: ACCEPT" if re.fullmatch(r"\d+", candidate) else "VERDICT: REJECT\nANSWER: 0"
 
 
 class CheckedAnswer(Scenario):
@@ -152,6 +160,7 @@ class CheckedAnswer(Scenario):
                 "always_reject": lambda messages: "VERDICT: REJECT\nANSWER: 0",
                 "silent": lambda messages: "",
                 "both": lambda messages: "VERDICT: ACCEPT\nVERDICT: REJECT",
+                "surface": surface_verifier,
             },
         }
 
@@ -161,7 +170,9 @@ class CheckedAnswer(Scenario):
         given = tagged_integer(solver.text, "ANSWER") if solver.ok else None
         right = given == answer
         solver.reward("correct", -0.5 if given is None else float(right))
-        own = "" if given is None else str(given)  # an unanswered question shows the verifier an empty answer
+        # the verifier always sees a number: a solver without an answer is shown a slip instead (an empty candidate
+        # would be wrong every time, and "reject what is empty" would pay without any checking)
+        own = str(distractor(answer, episode.rng)) if given is None else str(given)
         twin = str(distractor(answer, episode.rng)) if right else str(answer)
         candidates = episode.channel("candidate", max_chars=24)
         team = float(right)

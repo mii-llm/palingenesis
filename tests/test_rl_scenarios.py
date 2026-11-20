@@ -178,6 +178,54 @@ def test_rollout_session_exchanges_turns_with_the_turn_loop():
     asyncio.run(scene())
 
 
+def test_closing_or_abandoning_a_session_never_leaves_it_waiting():
+    async def loop(port):  # speaks, waits for an answer, speaks again
+        trajectory = Trajectory({}, 0, [], [{"role": "user", "content": "go"}])
+        for i in range(3):
+            trajectory.messages.append({"role": "assistant", "content": f"m{i}"})
+            await port.call_tool("reply", {"text": f"m{i}"})
+            if port.done:
+                break
+        trajectory.finish = "env_done"
+        return trajectory
+
+    async def scene():
+        # closed without anyone reading its first message: the loop is waiting for an answer nobody will give
+        port = SessionPort(None, True)
+        live = RolloutSession(Session("r", "r#1", (), ()), port, loop(port))
+        await asyncio.sleep(0)
+        session = await asyncio.wait_for(live.done(), 2)
+        assert session.finish == "env_done" and session.trajectory is not None
+
+        # a say() given up on (a timeout in the scenario) leaves no waiter behind: the next say() gets the message
+        port = SessionPort(None, True)
+
+        async def slow():
+            await asyncio.sleep(0.2)
+            return await loop(port)
+
+        live = RolloutSession(Session("r", "r#2", (), ()), port, slow())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(live.say(), 0.05)
+        assert await asyncio.wait_for(live.say(), 2) == "m0"
+
+        # a cancellation of the caller during close() is the caller's, and is not swallowed
+        port = SessionPort(None, True)
+
+        async def stuck():
+            await asyncio.sleep(30)
+
+        live = RolloutSession(Session("r", "r#3", (), ()), port, stuck())
+        closing = asyncio.ensure_future(live.close())
+        await asyncio.sleep(0.01)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        live.cancel()
+
+    asyncio.run(scene())
+
+
 def test_answer_parsers_take_exactly_one_tagged_line():
     assert tagged_integer("I think.\nTAKE: 3", "TAKE") == 3 and tagged_integer("take 3.", "TAKE") == 3
     assert tagged_integer("**TOTAL: 1,234**", "TOTAL") == 1234 and tagged_integer("ANSWER: -17", "ANSWER") == -17
@@ -596,6 +644,15 @@ def test_a_lead_delegates_through_a_tool_and_partners_play_the_workers():
             assert [m["role"] for m in t.messages].count("tool") == len(row["ledgers"])
         assert sorted(t.rewards["total"] for t in group) == [0.0, 1.0] and group_is_informative(group)
     assert stats["role/lead/reward"] == pytest.approx(0.5) and stats["role/lead/rewards/coverage"] == 1.0
+
+    # a role's own limit wins over the scenario's: with one turn the lead can only ask, never answer
+    roles["lead"] = {"max_turns": 1}
+    pipeline, engine, _ = _pipeline("ledger_sum", rows[:1], policy, roles, **budget)
+    try:
+        ((t, _),) = pipeline._await(pipeline._eval(rows[:1], 1.0, 2))
+    finally:
+        pipeline.close()
+    assert t.turns == 1 and t.finish == "turns" and t.info["max_turns"] == 1 and t.rewards["total"] == 0.0
     assert stats["reward"] == stats["role/lead/reward"]
 
 
@@ -916,6 +973,11 @@ def test_the_planner_sizes_a_layout_and_says_what_does_not_fit():
     assert cluster.overrides["rollout.batch_prompts"] == 64 and not cluster.errors
     assert cluster.trainer_gb == pytest.approx(16 * 4 / 16 + 2 * 4 + 8)
     assert plan(Cluster(1, 2, 80), Workload(params_b=0.8, lora_rank=16, engines=2)).errors
+    replicated = plan(Cluster(2, 8, 80), Workload(params_b=4.0, lora_rank=16, replicate_base=True))
+    sharded = plan(Cluster(2, 8, 80), Workload(params_b=4.0, lora_rank=16))
+    assert replicated.mode == "replicated" and replicated.trainer_gb == pytest.approx(2 * 4 + 0.2 + 8)
+    assert sharded.mode == "fsdp" and sharded.trainer_gb == pytest.approx(4 * 4 / 16 + 2 * 4 + 0.2 + 8)
+    assert "summed over the ranks" in replicated.notes[0] and "FSDP2" in sharded.notes[0]
     config = RLConfig()
     for key, value in {
         "scenario.type": "take_away",
