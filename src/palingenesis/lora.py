@@ -34,6 +34,11 @@ logged (precision.edit_survival's projection). Stochastic rounding would keep th
 its noise exceeds a sub-ulp delta in any single forward, so it reproduces the adapted model worse. To serve
 exactly what was trained, load the adapter (`save_adapter`: <export>/adapter/, PEFT layout) on the base.
 
+The RL trainer (`pgs rl`) uses the same plugin through its `lora:` section (palingenesis.rl.adapters): the
+rollout engine receives the folded weights (`fold_weight`) after every step, a KL reference at the starting
+policy is the model with its adapters switched off (`disabled`), and a checkpoint is resumed from its adapter
+(`load_adapter`).
+
 Memory: LoRA removes the base weights' gradients and optimizer state. It does not shrink activations
 (each adapted layer still saves its input for the backward): long sequences still need activation
 checkpointing, memory.seco or `pgs fit`.
@@ -41,6 +46,7 @@ checkpointing, memory.seco or `pgs fit`.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -125,6 +131,7 @@ class LoRALinear(nn.Module):
         else:
             self.register_parameter("lora_magnitude", None)
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.enabled = True  # False: the frozen base alone (LoRA.disabled: a reference policy without a copy)
 
     def delta(self, x: Tensor) -> Tensor:
         """scaling * dropout(x) A^T B^T, computed against the float32 adapters (under autocast: in its dtype)."""
@@ -143,6 +150,8 @@ class LoRALinear(nn.Module):
         return self.lora_magnitude / norm
 
     def forward(self, x: Tensor) -> Tensor:
+        if not self.enabled:
+            return F.linear(x, self.weight, self.bias)
         if self.lora_magnitude is None:
             out = F.linear(x, self.weight, self.bias)
             return out + self.delta(x).to(out.dtype)
@@ -337,6 +346,8 @@ class LoRA(TrainerPlugin):
     def on_train_start(self, model: nn.Module, ctx: PluginContext) -> None:
         sq = torch.stack([_local(m.weight).float().pow(2).sum() for m in self.modules.values()]).sum()
         if ctx.is_fsdp and dist.is_available() and dist.is_initialized():
+            if ctx.device is not None:  # CPU-offloaded shards: the collective runs on the rank's device
+                sq = sq.to(ctx.device)
             dist.all_reduce(sq)
         self._base_sq = float(sq)
         if self.dora:
@@ -372,8 +383,8 @@ class LoRA(TrainerPlugin):
             f"lora memory: frozen base {_gb(base_bytes)} ({'/'.join(dtypes)}, no gradient, no optimizer state); "
             f"adapters {_gb(adapter_bytes)} + gradients {_gb(adapter_bytes)} + AdamW moments {_gb(2 * adapter_bytes)} "
             f"(float32). Full fine-tuning would add ~{_gb(full_ft)} of gradients and AdamW moments. Activations "
-            "are the same as full fine-tuning: long sequences still need activation checkpointing, memory.seco "
-            "or `pgs fit`."
+            "are the same as full fine-tuning: long sequences still need activation checkpointing"
+            + (", memory.seco or `pgs fit`." if hasattr(ctx.config, "memory") else " (model.gradient_checkpointing).")
         )
 
     @torch.no_grad()
@@ -402,25 +413,83 @@ class LoRA(TrainerPlugin):
         self._last = out
         return dict(out)
 
+    # -- the base alone, and adapters from a file
+
+    @contextlib.contextmanager
+    def disabled(self):
+        """The model computes its frozen base inside the block: every adapter is skipped (not removed)."""
+        before = [m.enabled for m in self.modules.values()]
+        for m in self.modules.values():
+            m.enabled = False
+        try:
+            yield
+        finally:
+            for m, enabled in zip(self.modules.values(), before):
+                m.enabled = enabled
+
+    @torch.no_grad()
+    def load_adapter(self, path: str | Path) -> None:
+        """Copy the adapters saved at `path` (a directory in the PEFT layout, as export writes it) into the model's,
+        after transform_model and before the model is sharded. The file must hold exactly this run's adapters:
+        the same modules, shapes and DoRA setting (a file from other lora settings is refused, not partly loaded)."""
+        from safetensors.torch import load_file
+
+        file = Path(path) / "adapter_model.safetensors"
+        if not file.exists():
+            raise PluginError(f"lora: no adapter at {file}")
+        saved = load_file(str(file))
+        wanted: dict[str, nn.Parameter] = {}
+        for name, m in self.modules.items():
+            prefix = f"base_model.model.{name}"
+            wanted[f"{prefix}.lora_A.weight"] = m.lora_A
+            wanted[f"{prefix}.lora_B.weight"] = m.lora_B
+            if m.lora_magnitude is not None:
+                wanted[f"{prefix}.lora_magnitude_vector"] = m.lora_magnitude
+        missing, extra = sorted(wanted.keys() - saved.keys()), sorted(saved.keys() - wanted.keys())
+        if missing or extra:
+            raise PluginError(
+                f"lora: the adapter at {path} does not match this run's (missing {missing[:3]}, unexpected "
+                f"{extra[:3]}): it was saved with other targets, exclude or dora settings"
+            )
+        for key, param in wanted.items():
+            if saved[key].shape != param.shape:
+                raise PluginError(
+                    f"lora: {key} at {path} has shape {tuple(saved[key].shape)}, this run's is {tuple(param.shape)} "
+                    "(another rank?)"
+                )
+            param.copy_(saved[key].to(device=param.device, dtype=param.dtype))
+        logger.info(f"lora: {len(self.modules)} adapters loaded from {path}")
+
     # -- export
 
-    def export_state_dict(self, state: dict, model: nn.Module, ctx: PluginContext) -> dict:
+    def fold_state(
+        self, state: dict[str, Tensor], meter: SurvivalMeter | None = None
+    ) -> tuple[dict[str, Tensor], dict[str, dict[str, Tensor]]]:
+        """(`state` with every adapter folded into its base weight and the adapter tensors removed, the adapters
+        per module). `state` is keyed like the model's state dict (wrapper prefixes removed) and is not modified:
+        a folded weight is a new tensor in its base weight's dtype (computed in float32, rounded to nearest), and
+        the other tensors pass through. `meter` accumulates how much of the delta that rounding keeps."""
         out = {k: v for k, v in state.items() if not any(k.endswith(f".{a}") for a in ADAPTER_KEYS)}
         adapters: dict[str, dict[str, Tensor]] = {}
-        meter = SurvivalMeter()
         for name, m in self.modules.items():
             key = f"{name}.weight"
             if key not in state:
                 continue
             parts = {a: state.get(f"{name}.{a}") for a in ADAPTER_KEYS}
             if parts["lora_A"] is None or parts["lora_B"] is None or (self.dora and parts["lora_magnitude"] is None):
-                raise PluginError(f"lora: the exported state has {key} but not its adapter")
+                raise PluginError(f"lora: the state has {key} but not its adapter")
             w = state[key]
             folded = fold_weight(w, parts["lora_A"], parts["lora_B"], m.scaling, parts["lora_magnitude"])
             cast = folded.to(w.dtype)
-            meter.update(w, folded, cast)
+            if meter is not None:
+                meter.update(w, folded, cast)
             out[key] = cast
             adapters[name] = {a: t for a, t in parts.items() if t is not None}
+        return out, adapters
+
+    def export_state_dict(self, state: dict, model: nn.Module, ctx: PluginContext) -> dict:
+        meter = SurvivalMeter()
+        out, adapters = self.fold_state(state, meter)
         if adapters:
             s = meter.result()
             logger.info(
@@ -457,7 +526,8 @@ class LoRA(TrainerPlugin):
         config = {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": getattr(model_cfg, "name_or_path", None),
+            # the SFT config names the base model.name_or_path, the RL config model.policy
+            "base_model_name_or_path": getattr(model_cfg, "name_or_path", None) or getattr(model_cfg, "policy", None),
             "r": self.rank,
             "lora_alpha": self.alpha,
             "lora_dropout": self.dropout,

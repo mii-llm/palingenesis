@@ -156,6 +156,7 @@ Use `--json` flag (where available) for structured output suitable for programma
 | Off-policy KD: teacher too large | `distill.teachers.<name>.placement: shard` (FSDP), or `pgs distill-cache` once and `cache: <dir>` |
 | Off-policy KD: "no teacher target" | rebuild the cache with the training config, or `distill.missing: skip` + `distill.ce_weight: 0.1` |
 | LoRA (many adapters, model too big for full-weight optimizer state) | `plugins.custom: [{class: palingenesis.lora:LoRA, args: {rank: 16, alpha: 32}}]`, `train.learning_rate` ~10x the full fine-tune's (see the LoRA guide) |
+| LoRA in RL (`pgs rl`: policy too big for full-weight optimizer state next to the rollout engine) | `lora.rank: 16`, `lora.alpha: 32` in the RL config; watch `lora/push_survival` and `policy/mismatch_k3`; checkpoints are plain models plus `adapter/` (tested on CPU only; GPU validation pending, see the LoRA guide) |
 | MoE routers collapse (`moe/load_max` rising, `moe/router_entropy` falling) | `moe.balance_loss_coef: 0.01`, `moe.z_loss_coef: 0.001` (see the MoE guide) |
 | MoE policy in RL: noisy ratios | `rollout.routing_replay: auto` with `rollout.prefix_caching: true` (vLLM returns the routed experts) |
 | Off-policy KD: student copies the teacher's tail / rambles | `distill.divergence: reverse_kl` or `jsd`, add `distill.ce_weight` |

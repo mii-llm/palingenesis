@@ -367,6 +367,7 @@ Every rank owns a GPU, its shard of the prompts and a colocated vLLM engine; the
 | `model.gradient_checkpointing: selective` | Keeps matmul outputs, recomputes the cheap operations: most of the activation memory for a few % of compute (`full`: everything; the default `auto` is `full` with `train.cpu_offload`, else off) |
 | `train.micro_tokens` | Tokens per forward/backward micro-batch |
 | `train.fsdp` | Shards parameters, gradients and optimizer state over the ranks (automatic under torchrun) |
+| `lora.rank: 16` | Low-rank adapters on a frozen base instead of full weights: no gradients or optimizer state for the base, which is held in bf16 only. The engine gets the folded weights after every step; checkpoints are plain models plus `adapter/`. Tested on CPU only; validation on a GPU is pending ([LoRA in RL](lora.md#lora-in-rl)) |
 | `train.optimizer: adamw8bit` | bitsandbytes' 8-bit AdamW moments: 2 bytes per parameter instead of 8 (one GPU, without FSDP). `train.adam_eps` then defaults to 1e-8: 8-bit moments round small second moments to 0, and the fp32 default of 1e-15 would let those updates explode |
 | `train.cpu_offload` | FSDP2 offload: parameters, gradients and optimizer state in CPU memory (also on one GPU), for the largest model a GPU can train. Budget about 24 bytes of host RAM per parameter per node: 16 for the fp32 parameters, gradients and AdamW moments, plus pinned staging (a 4B policy on one GPU needs about 96 GB; tmpfs files count against it); the trainer warns at startup when it will not fit |
 
@@ -388,4 +389,4 @@ See also: [Harbor Environments](harbor.md) and [Harness Profiles](harness-profil
 
 ## Resuming
 
-`train.save_steps` writes resumable checkpoints: the policy in Hugging Face format, the optimizer (sharded with DCP under FSDP), every rank's prompt sampler with its retired prompts, and the random states. `train.resume_from: auto` continues from the newest one, so the same command starts and resumes a run (with the same number of ranks).
+`train.save_steps` writes resumable checkpoints: the policy in Hugging Face format (with `lora.rank`: the folded policy, and its adapter in `adapter/`, which is what a resume loads on top of `model.policy`), the optimizer (sharded with DCP under FSDP), every rank's prompt sampler with its retired prompts, and the random states. `train.resume_from: auto` continues from the newest one, so the same command starts and resumes a run (with the same number of ranks).

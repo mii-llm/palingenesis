@@ -180,6 +180,8 @@ Mixture-of-Experts models (ignored for dense models). The same section exists in
 | `log_layers` | bool | `false` | Also log the loads and router entropy of every MoE layer (`moe/layer_<i>/...`). |
 | `experts_implementation` | str | `auto` | Expert compute: `auto` (transformers' default, a grouped GEMM where torch has one), `grouped` or `padded` (this library's forwards), or a transformers name (`eager`, `grouped_mm`, `batched_mm`). `pgs train`. Measure with `scripts/bench_moe_experts.py`. |
 
+RL configs also have a `lora:` section (`rank`, `alpha`, `rslora`, `dora`, `lr_ratio`, `targets`, `exclude`; `rank: 0` = off) that trains low-rank adapters instead of the full weights: see [LoRA in RL](../guides/lora.md#lora-in-rl).
+
 RL configs also have `rollout.routing_replay` (`auto` / `on` / `off`, default `off` until the vLLM path is verified on a GPU): train each token through the
 experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.md#rl-routing-replay).
 

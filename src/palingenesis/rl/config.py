@@ -381,6 +381,26 @@ class RLTrainConfig:
 
 
 @dataclass(slots=True)
+class RLLoRAConfig:
+    # Low-rank adapters (palingenesis.lora, palingenesis.rl.adapters): rank > 0 freezes the policy's weights and
+    # trains a delta scaling * B A next to each targeted linear, B [out, rank] zero at the start, A [rank, in].
+    # 0 = off: every weight trains. The rollout engine gets the folded weights after every step; checkpoints hold
+    # the folded model (a plain checkpoint) and the adapter alone (<checkpoint>/adapter, PEFT layout).
+    rank: int = 0
+    alpha: float = 32.0  # scaling = alpha / rank (rslora: alpha / sqrt(rank))
+    rslora: bool = False
+    dora: bool = False  # weight-decomposed LoRA: a trained magnitude per output row
+    lr_ratio: float = 1.0  # LoRA+: B learns at lr_ratio x train.learning_rate
+    # Module name patterns (regular expressions matched against the end of a module's name) of the nn.Linear layers
+    # to adapt; empty = the attention and MLP projections (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
+    # down_proj) and the Gated DeltaNet projections of Qwen3.5 / Qwen3-Next (in_proj_qkv, in_proj_z, in_proj_qkvz,
+    # out_proj). The output head and the embeddings are never adapted. `exclude`: patterns searched anywhere in the
+    # name, e.g. ["layers\\.(0|1)\\."].
+    targets: list = field(default_factory=list)
+    exclude: list = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class RLLoggingConfig:
     log_every: int = 1
     # Every N steps, write the batch's trajectories (turns, tool calls and outputs, rewards, advantages,
@@ -410,6 +430,9 @@ class RLConfig:
     logging: RLLoggingConfig = field(default_factory=RLLoggingConfig)
     cmr: CMRConfig = field(default_factory=CMRConfig)  # common-mode rejection (palingenesis.cmr); off by default
     moe: MoEConfig = field(default_factory=MoEConfig)  # MoE policies: router balancing (palingenesis.moe)
+    lora: RLLoRAConfig = field(
+        default_factory=RLLoRAConfig
+    )  # low-rank adapters instead of full weights; off by default
 
     # ------------------------------------------------------------------ loading
 
@@ -804,7 +827,16 @@ class RLConfig:
                     "cmr is single-GPU only (the update correction needs the full parameters); turn off fsdp "
                     "(train.fsdp, train.cpu_offload, torchrun)"
                 )
-        if t.learning_rate > 1e-5:
+        if self.lora.rank != 0 or self.lora != RLLoRAConfig():
+            from palingenesis.rl.adapters import validate as validate_lora
+
+            lora_errors, lora_warnings = validate_lora(self, sharded)
+            errors += lora_errors
+            warnings += lora_warnings
+        adapters = isinstance(self.lora.rank, int) and self.lora.rank > 0
+        if adapters and t.learning_rate > 1e-3:
+            warnings.append(f"train.learning_rate {t.learning_rate} with lora: high even for adapters.")
+        elif not adapters and t.learning_rate > 1e-5:
             warnings.append(f"train.learning_rate {t.learning_rate}: RL recipes use 5e-7 to 2e-6.")
 
         if errors:

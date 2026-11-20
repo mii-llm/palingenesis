@@ -109,10 +109,15 @@ class PublishedWeights:
 
     `lock` is held by the trainer while it changes the weights and by a rollout
     engine while it copies them, so an engine never loads a half-updated model.
+
+    `named`: a callable returning the (checkpoint name, tensor) pairs an engine loads, when
+    they are not the model's own parameters (LoRA adapters folded into their base weights);
+    called, and consumed by the engine, under `lock`.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, named: Callable[[], Any] | None = None):
         self.model = model
+        self.named = named
         self.version = 0
         self.lock = threading.Lock()
         self._changed = threading.Condition()
@@ -147,7 +152,8 @@ class PublishedWeights:
         with self.lock:
             if cuda:  # the optimizer's kernels (another stream) are done
                 torch.cuda.synchronize()
-            engine.update_weights(checkpoint_named_parameters(self.model), self.version)
+            named = self.named() if self.named is not None else checkpoint_named_parameters(self.model)
+            engine.update_weights(named, self.version)
             if cuda:  # the copy is done before the optimizer may run again
                 torch.cuda.synchronize()
         return time.perf_counter() - start

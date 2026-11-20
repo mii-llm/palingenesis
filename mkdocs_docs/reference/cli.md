@@ -42,7 +42,7 @@ Equivalent to:
 torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/quickstart.yaml
 ```
 
-LoRA is a trainer plugin of `pgs train`, not a separate command: `pgs init lora`, then `pgs train --config lora.yaml` ([LoRA guide](../guides/lora.md)).
+LoRA is a trainer plugin of `pgs train`, not a separate command: `pgs init lora`, then `pgs train --config lora.yaml` ([LoRA guide](../guides/lora.md)). In `pgs rl` it is the config's `lora:` section ([LoRA in RL](../guides/lora.md#lora-in-rl)).
 
 ### distill
 

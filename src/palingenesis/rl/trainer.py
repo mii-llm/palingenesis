@@ -60,6 +60,7 @@ from palingenesis.opd.rollout import (
 )
 from palingenesis.opd.teachers import end_of_turn_id, load_causal_lm, right_pad
 from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, prunable_checkpoints, student_stop_ids
+from palingenesis.rl.adapters import PolicyAdapters, is_adapter_checkpoint
 from palingenesis.rl.chat import ChatFormat
 from palingenesis.rl.config import RLConfig, RLConfigError, max_num_seqs
 from palingenesis.rl.data import PromptSampler, check_row_limits, load_rows, prompt_messages, split_rows
@@ -124,6 +125,10 @@ class RLTrainer:
     dataset        rows (a list of dicts or a datasets.Dataset) replacing data.dataset
     eval_dataset   held-out rows replacing data.eval_dataset / data.eval_size
     """
+
+    # lora.rank > 0: the policy's low-rank adapters (palingenesis.rl.adapters); None: every weight trains
+    adapters: PolicyAdapters | None = None
+    lr_scales: tuple[float, ...] = ()  # per optimizer group, with adapters (LoRA+); empty: one rate for all
 
     def __init__(
         self,
@@ -252,9 +257,21 @@ class RLTrainer:
             match_vllm_gated_norm(model_type)  # also patches a class
         self.resume_path = _resolve_resume(t.resume_from, t.output_dir)
         fsdp = self.parallel.fsdp
+        if config.lora.rank:  # low-rank adapters on a frozen base
+            self.adapters = PolicyAdapters(config, self.device, rank, world, fsdp)
+        if self.resume_path and (self.adapters is not None) != is_adapter_checkpoint(self.resume_path):
+            raise RLConfigError(
+                f"{self.resume_path} was saved "
+                + (
+                    "without adapters, and this run has lora.rank set"
+                    if self.adapters is not None
+                    else "by a run with LoRA adapters (lora.rank), and this run trains the full weights"
+                )
+                + ": resume with the configuration the checkpoint was trained with."
+            )
         logger.info(
             "Loading policy %s (fp32 master weights, bf16 compute%s) on %s",
-            self.resume_path or m.policy,
+            m.policy if self.adapters is not None else self.resume_path or m.policy,  # adapters: always the base
             ", FSDP2" if fsdp else "",
             "cpu, then sharded" if fsdp else self.device,
         )
@@ -262,6 +279,9 @@ class RLTrainer:
             self.model = multimodal.load_model(self.resume_path or m.policy, dtype=torch.float32)
             multimodal.check_model(self.model, self.vision, "the policy")
             multimodal.set_vision_trainable(self.model, m.train_vision_tower, m.train_projector)
+        elif self.adapters is not None:
+            # the base is always the policy's own checkpoint: a resumed run adds the checkpoint's adapters to it
+            self.model = self.adapters.apply(load_causal_lm(m.policy, torch.float32), self.resume_path)
         else:
             self.model = load_causal_lm(self.resume_path or m.policy, torch.float32)
         if self.resume_path:
@@ -277,6 +297,11 @@ class RLTrainer:
         # MoE: router balancing over the global batch, routing statistics, routing replay
         self.router_balancer = RouterBalancer.attach(self.model, config.moe, replay=self.routing_replay)
         self.routing_replay = self.routing_replay and self.router_balancer is not None
+        if self.adapters is not None and self.router_balancer is not None and self.parallel.main:
+            logger.warning(
+                "lora on an MoE policy: the routers and any expert weights that are not nn.Linear layers stay frozen, "
+                "so the balancing losses reach the routers only through the adapters before them (untested)."
+            )
         if self.routing_replay and self.vision is not None:
             # the engine records routing per expanded position, the trajectory stores one placeholder per image
             if r.routing_replay == "on":
@@ -300,7 +325,14 @@ class RLTrainer:
         verify_output_head(self.model, output_head(self.model), device=self.device)
         self.parallel.reshard(self.model)
         # one GPU: bf16 parameters, fp32 masters in the optimizer (FSDP2 does this across ranks)
-        self.master = MasterWeights(self.model) if not fsdp and self.device.startswith("cuda") else None
+        if self.adapters is not None and not fsdp and self.device.startswith("cuda"):
+            self.adapters.lower_base_precision(self.model)  # the frozen base has no master: bf16 only
+        # with adapters there are no masters: the adapters stay float32 parameters (megabytes), so nothing trained
+        # is rounded in the module (a bf16 DoRA magnitude would make the starting policy differ from the base)
+        cuda = not fsdp and self.device.startswith("cuda")
+        self.master = MasterWeights(self.model) if cuda and self.adapters is None else None
+        if self.adapters is not None:
+            self.adapters.start(self.model)  # logs the trainable-parameter count
         self.head = output_head(self.model)
         self.head_weight = LowPrecisionWeight()  # bf16 copy of the head, cast once per optimizer step
         # The policy is the one that samples: vLLM samples (and reports behaviour log-probs) at rollout.temperature,
@@ -317,9 +349,23 @@ class RLTrainer:
             from palingenesis.rl.reference import ReferencePolicy
 
             ref_path = m.policy if config.loss.kl_ref == "start" else config.loss.kl_ref
-            self.reference = ReferencePolicy(
-                ref_path, self.device, self.pad_id, t.micro_tokens, temperature=config.rollout.temperature
-            )
+            if self.adapters is not None and config.loss.kl_ref == "start" and not config.loss.kl_ref_reset:
+                from palingenesis.rl.reference import AdapterFreeReference
+
+                # the frozen base is the starting policy: the reference is the model with its adapters off
+                self.reference = AdapterFreeReference(
+                    self.model,
+                    self.adapters,
+                    self.device,
+                    self.pad_id,
+                    t.micro_tokens,
+                    temperature=config.rollout.temperature,
+                )
+                ref_path = self.reference.path
+            else:
+                self.reference = ReferencePolicy(
+                    ref_path, self.device, self.pad_id, t.micro_tokens, temperature=config.rollout.temperature
+                )
             logger.info(
                 "KL reference: %s (kl_coef %g, reset every %d steps)",
                 ref_path,
@@ -370,7 +416,7 @@ class RLTrainer:
                 )
         else:
             self.engine = VLLMServerRollout(self.server, self.stop_ids)
-        self.weights = PublishedWeights(self.model)
+        self.weights = PublishedWeights(self.model, self._engine_parameters if self.adapters is not None else None)
         if fsdp:  # the trainer thread pushes the weights (collectives); the producer never gathers
             self.weights.sync = lambda engine: 0.0
         self.pipeline = RLPipeline(
@@ -386,7 +432,12 @@ class RLTrainer:
             self.stop_ids,
         )
         self.orchestrator = Orchestrator(self.pipeline, lambda: self.batch_prompts, r.temperature, r.max_staleness)
-        self.opt = _optimizer(self._trainable(), t, self.device, self._trainable_names())
+        if self.adapters is not None:
+            groups, scales = self.adapters.param_groups(self._trainable(), self._trainable_names())
+            self.lr_scales = tuple(scales)
+            self.opt = _optimizer(groups, t, self.device)
+        else:
+            self.opt = _optimizer(self._trainable(), t, self.device, self._trainable_names())
         self.cmr = None
         if config.cmr.enabled:  # common-mode rejection on the parameters the optimizer steps (fp32 masters)
             from palingenesis.cmr import CommonModeRejection
@@ -481,14 +532,28 @@ class RLTrainer:
         return t.learning_rate * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
     def _trainable(self) -> list[torch.nn.Parameter]:
-        """The parameters the optimizer steps: the fp32 masters, or the module's own."""
-        return self.master.parameters() if self.master is not None else list(self.model.parameters())
+        """The parameters the optimizer steps: the fp32 masters, or the module's own (with adapters: the adapters
+        alone, the frozen base holds no optimizer state)."""
+        if self.master is not None:
+            return self.master.parameters()
+        if self.adapters is not None:
+            return [p for p in self.model.parameters() if p.requires_grad]
+        return list(self.model.parameters())
 
     def _trainable_names(self) -> list[str]:
         """Names of _trainable(), in order (the fp32 masters mirror the module's trainable parameters)."""
-        if self.master is not None:
+        if self.master is not None or self.adapters is not None:
             return [n for n, p in self.model.named_parameters() if p.requires_grad]
         return [n for n, _ in self.model.named_parameters()]
+
+    def _engine_parameters(self):
+        """With adapters: the policy as a rollout engine loads it, the adapters folded into new weight tensors
+        (W + scaling * B A from the float32 adapters; the trainer's weights are not written)."""
+        return self.adapters.engine_parameters(self.model)
+
+    def _folded_state(self) -> dict[str, torch.Tensor]:
+        """With adapters: the model's state with the adapters folded in (a plain model's state)."""
+        return self.adapters.folded_state(self.model)
 
     def _micro_batches(self, trajectories: list[Trajectory]) -> list[list[Trajectory]]:
         """Micro-batches of at most train.micro_tokens padded tokens, longest trajectories first,
@@ -788,7 +853,10 @@ class RLTrainer:
             # no batch is being collected and the engine does not step: partial rollouts (max_staleness > 0) keep
             # decoding between batches, and continue with the new weights
             with self.pipeline.lock, self.pipeline.client.paused():
-                named = checkpoint_named_parameters(self.model, self.parallel.full_parameters(self.model))
+                full = self.parallel.full_parameters(self.model)
+                if self.adapters is not None:  # gathered on every rank (collectives), folded as they arrive
+                    full = self.adapters.fold_stream(full, measure=True)
+                named = checkpoint_named_parameters(self.model, full)
                 self.engine.update_weights(named, version)
         else:
             self.engine.update_weights((), version)
@@ -817,8 +885,8 @@ class RLTrainer:
                 waited = time.perf_counter() - t0
                 groups = self._fresh(batch.samples)
                 lr = self._lr_at(step)
-                for group in self.opt.param_groups:
-                    group["lr"] = lr
+                for i, group in enumerate(self.opt.param_groups):
+                    group["lr"] = lr * self.lr_scales[i] if self.lr_scales else lr
                 t1 = time.perf_counter()
                 if self.cmr is not None:  # its own forward / backward on the twins; grads cleared before the task's
                     self.cmr.pre_step()
@@ -840,7 +908,7 @@ class RLTrainer:
                         metrics.update(self.router_balancer.metrics())
                         self.router_balancer.step()
                     if self.reference is not None and t_loss.kl_ref_reset and (step + 1) % t_loss.kl_ref_reset == 0:
-                        self.reference.reset_to(self.model)
+                        self.reference.reset_to(self.model, self._folded_state() if self.adapters is not None else None)
                         logger.info("KL reference reset to the policy at step %d", step + 1)
                     if self.device.startswith("cuda"):
                         torch.cuda.synchronize()
@@ -868,6 +936,8 @@ class RLTrainer:
                 )
                 if self.dumps is not None:
                     metrics[DROPPED_METRIC] = self.dumps.dropped
+                if self.adapters is not None:
+                    metrics.update(self.adapters.metrics(self.model, step + 1))
                 metrics = self._combine(metrics)
                 if step == 0:
                     self._parity_check(metrics)
@@ -984,7 +1054,7 @@ class RLTrainer:
         device before each barrier: an awake rollout engine (rollout.max_staleness > 0) may hold
         the rest of the GPU, and NCCL allocates for a barrier. On one process there is no
         barrier at all, so trainer_state.pt follows rank0.pt directly."""
-        from palingenesis.checkpoint import _save_gathered_or_local
+        from palingenesis.checkpoint import _save_gathered_or_local, _set_config_dtype
         from palingenesis.distributed import release_cuda_memory
 
         path = Path(self.config.train.output_dir) / name
@@ -995,7 +1065,13 @@ class RLTrainer:
         with self.pipeline.lock, self.weights.lock:
             self.parallel.reshard(self.model)
             with self.master.fp32() if self.master is not None else contextlib.nullcontext():
-                _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
+                if self.adapters is None:
+                    _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
+                else:  # the folded model in float32 (a plain checkpoint) and <path>/adapter
+                    export = self.adapters.export(path)
+                    _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp, export)
+                    if self.parallel.main:
+                        _set_config_dtype(path / "config.json", torch.float32)  # the live base may be bf16
             if step is not None and self.parallel.fsdp:
                 from torch.distributed.checkpoint import save as dcp_save
                 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict

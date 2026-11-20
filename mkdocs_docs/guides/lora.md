@@ -11,7 +11,7 @@ $$
 where $W$ is the frozen weight `[out, in]`, $A$ `[r, in]` and $B$ `[out, r]` are the trained factors, $r$ is `rank`, $\alpha$ is `alpha`, and the scaling $s$ is $\alpha/\sqrt{r}$ instead with `rslora: true`. With `dropout`, the adapter's input $x$ is $\operatorname{dropout}(x)$; the base path never sees dropout.
 {: .pg-where }
 
-The plugin works with `pgs train` (SFT, DPO, off-policy distillation). The export is a plain model with the adapters folded in, plus the adapter alone in the PEFT layout.
+The plugin works with `pgs train` (SFT, DPO, off-policy distillation). The export is a plain model with the adapters folded in, plus the adapter alone in the PEFT layout. `pgs rl` trains the same adapters through its own `lora:` section: see [LoRA in RL](#lora-in-rl).
 
 !!! abstract "Use it when"
     You want many cheap adapters on one shared base, or the model does not fit with gradients and optimizer state for every weight. Otherwise full fine-tuning (the default) is usually the better tool: see [when LoRA wins](#when-lora-wins-and-when-full-fine-tuning-is-better) below.
@@ -62,7 +62,7 @@ LoRA is the better tool when:
 - **You need many adapters on one base.** You train one adapter per task or customer, then store and serve them side by side (an adapter is megabytes, the base is shared).
 - **The model does not fit with gradients and optimizer state for every weight.** Examples are a large model on one GPU, or a fine-tune next to other jobs.
 - **You want less forgetting.** In "LoRA Learns Less and Forgets Less" ([arXiv:2405.09673](https://arxiv.org/abs/2405.09673)), LoRA kept more of the base model's abilities than full fine-tuning did, and learned less of the target domain. This is not automatic. "An Illusion of Equivalence" ([arXiv:2410.21228](https://arxiv.org/abs/2410.21228)) finds LoRA-specific "intruder dimensions" that can make LoRA forget more when rank, alpha or learning rate are poorly chosen.
-- **You are doing RL.** Policy-gradient RL carries little information per episode. "LoRA Without Regret" (Thinking Machines, 2025) reports that rank 1 matched full fine-tuning there. The RL trainer does not load this plugin yet (see below).
+- **You are doing RL.** Policy-gradient RL carries little information per episode. "LoRA Without Regret" (Thinking Machines, 2025) reports that rank 1 matched full fine-tuning there. See [LoRA in RL](#lora-in-rl); nothing has been measured with it here yet.
 
 Full fine-tuning is better when:
 
@@ -174,6 +174,48 @@ Resume checkpoints carry the adapters as ordinary model weights: `train.resume_f
 - **The config warning for DPO / SeCO with a bf16 model** does not apply to the adapters, which are fp32.
 - **FSDP:** adapters are sharded with their layer. Only trainable parameters must share a dtype under FSDP2, and every adapter is fp32. Under `train.bf16` FSDP computes them in bf16 and reduces gradients in fp32.
 - **DoRA cost:** each forward builds a weight-sized fp32 temporary per adapted layer for the row norm (no gradient), so it costs more compute and transient memory than plain LoRA.
+
+## LoRA in RL
+
+`pgs rl` trains adapters instead of the full weights when its config sets `lora.rank`. It uses this page's adapted layer, fold and export; the RL config has no `plugins:` section, so the options live in a section of their own.
+
+```yaml
+# rl.yaml
+model:
+  policy: Qwen/Qwen3.5-0.8B
+lora:
+  rank: 16
+  alpha: 32
+train:
+  learning_rate: 2.0e-5        # a starting point, not measured here
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `lora.rank` | 0 | rank of the adapters; 0 = off, every weight trains |
+| `lora.alpha` | 32 | scaling $s = \alpha / r$ |
+| `lora.rslora` | false | scaling $s = \alpha / \sqrt{r}$ |
+| `lora.dora` | false | a trained magnitude per output row |
+| `lora.lr_ratio` | 1.0 | LoRA+: `B` learns at this multiple of `train.learning_rate` (not with FSDP) |
+| `lora.targets` | `[]` | module name patterns; empty = the defaults of [Options](#options) |
+| `lora.exclude` | `[]` | patterns of modules to leave alone |
+
+There is no `dropout` option: the trainer must score the policy the engine sampled from, and dropout on the adapters would make the two differ at every token.
+
+What a run with adapters does differently:
+
+- **Optimizer.** It steps the adapters only. The adapters stay float32 parameters (megabytes), so nothing trained is rounded in the module; on one GPU the frozen base is held in bf16 alone. With `train.weight_decay`, `A` and `B` are decayed as configured (the delta shrinks towards the base) and DoRA's magnitudes are not. The log line `lora: N trainable parameters of M` is printed before the first step.
+- **Rollouts.** After every optimizer step the engine receives the folded weights $W + sBA$ through the same weight push as full-weight RL (in place for the in-process engine, over CUDA IPC for `vllm_server`). vLLM's own LoRA support is not used: the engine serves a plain model at its usual speed, and nothing depends on adapter hot-reloading. The fold builds new tensors from the parameters the trainer computes with, so the trainer's weights are never written. The in-process engine copies one folded weight at a time; a `vllm_server` push keeps every tensor until the server has loaded them, which is one extra bf16 copy of the adapted weights on the GPU for the time of the push.
+- **Precision of the push.** The engine's weights are bf16. The part of the delta below half an ulp of its weight is rounded away in the engine, while the trainer computes with the adapters next to the unchanged base. The importance ratio treats this like any other sampler/trainer difference. `lora/push_survival` reports the share of the delta the pushed weights carry (1 = all of it), measured every 50 pushes; watch it together with `policy/mismatch_k3`. Early in a run, while the delta is tiny, a low value is expected: the engine then still samples close to the base while the trainer scores the adapted policy. A warning is logged once if the share is still below 0.5 after 50 pushes; the remedies are a higher `train.learning_rate` or `lora.alpha`, or `lora.rslora`.
+- **KL reference.** With `loss.kl_ref: start` the reference is the policy with its adapters switched off, since the frozen base is the starting policy. No second copy of the model is loaded. A different checkpoint as reference, or `loss.kl_ref_reset`, keeps the frozen copy (a reset loads the folded policy into it).
+- **Checkpoints.** Every checkpoint (`step_*`, `final`) holds the folded model in float32 (4 bytes per parameter, as a full-weight RL checkpoint; set `train.keep_checkpoints` accordingly), which is a plain checkpoint of the policy's architecture that loads anywhere the base does and works with the [merging tools](merging.md), and `adapter/` in the PEFT layout. A bf16 base plus the fp32 delta is exact in float32, so nothing is lost in the fold. `train.resume_from` loads `model.policy` as the base and the checkpoint's adapter on top; a checkpoint saved with another `lora.rank`, `alpha`, `rslora`, `dora`, targets or `model.policy`, or by a full-weight run, is refused.
+- **Metrics.** `lora/trainable_params`, `lora/trainable_share`, `lora/delta_rel`, `lora/magnitude_change` (DoRA), `lora/push_survival`. Every other RL metric is unchanged.
+
+Supported: one GPU and FSDP (`train.fsdp`, `train.cpu_offload`, torchrun), every `loss.type`, `model.gradient_checkpointing`, `train.prompt_sharing`, the Qwen3.5 hybrid (attention, MLP and Gated DeltaNet projections by default).
+
+Refused at startup: `train.optimizer: muon`, `model.multimodal`, `cmr.enabled`, and `lora.lr_ratio` or `lora.dora` under FSDP.
+
+Not verified: any run on a GPU, and so the vLLM weight push and the bf16 base next to float32 adapters under autocast (the tests run on CPU with tiny models and the `hf` backend; `tests/test_rl_lora.py`), FSDP on more than one rank, the 8-bit optimizers, and MoE policies, where the routers stay frozen and a warning is logged.
 
 ## Variants shipped and left out
 
