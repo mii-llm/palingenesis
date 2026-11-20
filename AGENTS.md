@@ -98,7 +98,14 @@ Training issue?
 │   │   tool_error_rate > 0.3 (schemas / arguments / timeouts), loop_share > 0.1, zero_variance_share > 0.5
 │   └── Rollout engine latency: vLLM OTLP traces via rollout.vllm_args (see the Observability guide)
 ├── Multi-role RL (pgs rl with a scenario: section; CPU-tested only, GPU validation pending)
-│   ├── Before training: pgs scenario audit <name> (oracle partners must earn, degenerate ones must not; exit 1)
+│   ├── Data: an ordinary RL dataset plus a pattern (scenario.type solve_check | handoff | lead_workers, scored by
+│   │   the rewards: section; plan_execute on Harbor rows); pgs scenario patterns lists row fields and options
+│   ├── Before training: pgs scenario check --config <rl.yaml> (a pattern: fields, rewards, prompts per role, the
+│   │   audit on your rows) or pgs scenario audit <name> (a generated scenario); oracle partners must earn,
+│   │   degenerate ones must not; exit 1
+│   ├── check fails on "oracle solver": the gold column does not pass the reward as a final answer (a worked
+│   │   solution in the column, another answer format): scenario.args.gold_field / answer_tag, rewards.<name>.args
+│   ├── Delegation adds nothing: role/<r>/rewards/metric/control close to the role's reward (lift near 0)
 │   ├── Watch per role: role/<r>/reward, role/<r>/advantage_std (0 = that role's groups carry no signal),
 │   │   role/<r>/truncated, episode/failed; pgs rollouts reports finish reasons, loops and rewards per role
 │   ├── Sessions end after one turn: rollout.max_completion_tokens is a session's whole budget (default: one turn)

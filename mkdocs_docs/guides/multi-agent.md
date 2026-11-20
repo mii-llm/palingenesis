@@ -9,6 +9,23 @@ A **scenario** is a task played by several roles: two players of a game, a lead 
 
 ## Quick start
 
+You already have a dataset and a reward for `pgs rl`. Add a `scenario:` section that names a **pattern**, check it, train:
+
+```yaml
+# rows as for single-agent RL: {"question": "...", "answer": "72"}
+data:     {dataset: data/gsm8k_train.jsonl}
+rewards:  {correct: {fn: math}}             # the same section as for single-agent RL
+scenario: {type: solve_check}               # a solver and a checker
+loss:     {advantage_std: role, advantage_std_floor: 0.05}
+```
+
+```bash
+pgs scenario check --config rl.yaml         # your rows, your rewards, the prompts of each role, the audit
+pgs rl --config rl.yaml
+```
+
+No Python and no generated data: see [Where the data comes from](#where-the-data-comes-from). The library also ships scenarios with a generator of their own:
+
 ```bash
 pgs scenario generate take_away --n 4000 --seed 0 --out data/take_away.jsonl
 pgs scenario audit take_away                      # the verifier pays oracles and no degenerate policy
@@ -26,6 +43,229 @@ loss:
   advantage_std: role
   advantage_std_floor: 0.05
 ```
+
+## Where the data comes from
+
+!!! note "What is a multi-agent row"
+    A row is a **single-agent task**: a prompt and whatever checks the answer (a gold answer, hidden tests, a task directory). Nothing in it says who talks to whom.
+
+    - The **pattern** (or scenario) supplies the protocol: the roles, what each one sees, the prompts, who is paid for what.
+    - The **rewards** supply the verifier: the functions of the `rewards:` section score a final answer exactly as in single-agent RL.
+
+    So one file serves single-agent RL, every pattern, every role assignment and every prompt revision.
+
+There are three ways to get rows, from least to most work.
+
+| Path | Rows | Verifier | You write |
+|---|---|---|---|
+| [(a) A built-in generator](#a-a-built-in-generator) | `pgs scenario generate` | the scenario's own | nothing |
+| [(b) Your RL dataset plus a pattern](#b-your-rl-dataset-plus-a-pattern) | the JSONL / parquet / Hub dataset you use for `pgs rl` | your `rewards:` section | YAML |
+| [(c) Your own scenario](#c-your-own-scenario) | anything | your code | a Python class |
+
+### (a) A built-in generator
+
+`pgs scenario generate <name> --n N --seed S --out rows.jsonl` writes the rows of a [starter scenario](#the-starter-scenarios): synthetic tasks with a known solution, for learning the machinery and for tests. Use a different seed for held-out rows (`data.eval_dataset`).
+
+```json
+{"scenario": "ledger_sum", "id": "ledger_sum-0-3", "language": "it", "item": "pere",
+ "ledgers": {"nord": {"pere": 12, "mele": 40}, "sud": {"fichi": 7}}, "answer": 12}
+```
+
+### (b) Your RL dataset plus a pattern
+
+A pattern is a scenario with no generator and no verifier of its own. It reads a row's prompt the way `pgs rl` does (`data.prompt_field`, else the first of `messages`, `prompt`, `question`, `problem`; `data.system_prompt` applies) and scores every final answer with the run's `rewards:` functions and weights.
+
+| Pattern | Roles | What happens | Rows need |
+|---|---|---|---|
+| `solve_check` | `solver`, `checker` | The solver answers. The checker judges two candidates per episode, one right and one wrong, and corrects the wrong one. | a prompt, a gold answer |
+| `handoff` | `writer`, `reader` | The writer sees a text and writes a note without knowing the question. Readers answer from the note alone. | a text (`context`), a question, a gold answer |
+| `lead_workers` | `lead`, `worker` | The lead splits the task into `SUBTASK:` lines, workers answer them, the lead merges into the final answer. | a prompt, a gold answer |
+| `plan_execute` | `planner`, `executor` | The planner reads a [Harbor](harbor.md) task and writes a plan. The executor works in the task's container; the task's tests are the reward. | `task_dir`, `messages` (`pgs harbor rows`) |
+
+`pgs scenario patterns` prints this list with every option, and the row fields under the names the options use.
+
+**A worked example.** `data/gsm8k_train.jsonl` holds single-agent rows; the `answer` column is the final number:
+
+```json
+{"question": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?", "answer": "72"}
+```
+
+The config is the single-agent one plus `scenario:` (the whole file is `configs/rl_scenario_solve_check.yaml`):
+
+```yaml
+model:
+  policy: <your model>
+data:
+  dataset: data/gsm8k_train.jsonl
+  eval_dataset: data/gsm8k_test.jsonl
+rewards:
+  correct: {fn: math, args: {field: answer}}     # the built-in math reward, as in configs/rl_math.yaml
+scenario:
+  type: solve_check
+  args:
+    gold_field: answer                           # the column the oracle partners and the right candidate read
+rollout:
+  group_size: 4
+  max_new_tokens: 1024
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+train:
+  output_dir: runs/solve_check
+```
+
+Check it before training:
+
+```bash
+pgs scenario check --config rl.yaml --n 200
+```
+
+```text
+scenario    solve_check: roles solver, checker; outcome solver
+rewards     correct (math, x1)
+rows        7473 in data/gsm8k_train.jsonl; 200 checked, 200 fit the scenario
+
+--- prompt of solver (en) ---
+[user] Natalia sold clips to 48 of her friends in April, ...
+
+End your reply with exactly one line of the form:
+ANSWER: <your final answer>
+
+--- prompt of checker (en) ---
+[user] A colleague was given this task:
+...
+Their final answer:
+72
+
+Check the answer yourself. Reply with exactly one line `VERDICT: ACCEPT` if it is right, or `VERDICT: REJECT` ...
+
+oracle      solver                   +1.000
+oracle      checker                  +1.000
+degenerate  solver/silent            +0.000
+degenerate  checker/always_accept    +0.000
+degenerate  checker/always_reject    -0.250
+...
+scenario check: passed
+```
+
+It does four things, and exits 1 if any fails:
+
+1. **Fields.** Every sampled row must have what the pattern reads. A miss names the row, its columns and the option that fixes it (`scenario.args.prompt_field`, `gold_field`, `material_field`, ...). `pgs rl` makes the same check on its first 200 rows and stops before the first rollout.
+2. **Rewards.** The `rewards:` section must resolve (a built-in name, or `module:function`).
+3. **Prompts.** One episode per language is played with the oracle partners and each role's opening prompt is printed, so you read what the model will read.
+4. **The audit, on your rows.** The oracle partners must earn the reward and no degenerate partner may ([Audit a verifier before training](#audit-a-verifier-before-training)). The oracle answers with the gold column, so this also tests your data against your reward: if the column holds a worked solution (`"... #### 72"`) and the reward compares the whole string, the oracle is not paid and the check says so.
+
+Then train, and train the single-agent control on the same rows next to it:
+
+```bash
+pgs rl --config rl.yaml
+pgs rl --config configs/rl_math.yaml        # the same data and reward, one agent
+```
+
+**The final answer.** By default a pattern asks every answering role to end with one line `ANSWER: ...`, and gives the rewards the text of that line as the completion. A reply without the line, with two of them, or cut by a token limit has not answered and scores 0. Rewards that parse a format of their own (a `\boxed{}` answer, a fenced code block) want `answer_tag: ""`: the prompt is then the row's own, untouched, and the whole reply is the completion.
+
+**Options every pattern takes** (`scenario.args`):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `prompt_field` | `""` | the prompt's column; empty: `data.prompt_field`, else the first of `messages`, `prompt`, `question`, `problem` |
+| `gold_field` | `answer` | the reference answer's column (a string, or a list whose first entry is used), for the oracle partners and for the right candidate of `solve_check`. Rewards read their own column (`rewards.<name>.args.field`) |
+| `answer_tag` | `ANSWER` | the tag of the final-answer line; `""`: no protocol, the whole reply is the answer |
+| `language_field`, `language` | `language`, `en` | prompts are written in English and Italian and chosen per row from this column (`en` / `it`); any other value, or no column, uses `language` |
+| `threshold` | `data.success_threshold` | an answer is "right" from this reward on. It does not change what a session is paid; `solve_check` uses it to tell its right candidate from its wrong one |
+| `weights` | per pattern | `{role: {component: weight}}`, as for every scenario |
+
+`plan_execute` takes `prompt_field`, `language_field`, `language` and `weights` only.
+
+#### `solve_check`
+
+In every episode the checker judges two candidates in two separate sessions: one that your rewards score as right and one that they score as wrong. One of them is the solver's own answer, the other its twin of the opposite class. So "always accept" earns +1 −1 = 0 in every episode and "always reject" at most −0.5, whatever the solver's accuracy.
+
+- Solver right: the wrong twin is the wrong answer of another solver attempt of the same episode (`solver_samples`, default 2); else a numeric gold one slip away (±1, ±10, digits reversed); else an entry of the row's `distractors` column (`distractor_field`); else the gold answer of another row.
+- Solver wrong: the right twin is the gold answer.
+- Every twin is scored by your rewards before it is shown. If no pair of one right and one wrong answer exists, no checker session runs in that episode (`role/solver/rewards/metric/checked`).
+
+| Role | Component | Value |
+|---|---|---|
+| solver | `correct` | the rewards' weighted sum on its final answer |
+| checker | `verdict` | right accept +1, wrong accept −1, right reject −1, wrong reject +0.5, +1 with a right correction, no verdict −1 |
+
+Other options: `checker_samples` (2), `max_candidate_chars` (400). The candidates are final answers only, never the reasoning. One cue remains: a gold answer is written the way the dataset writes it, a solver's answer the way the model does. Watch `metric/twin_gold` against `metric/twin_slip`, `twin_distractor` and `twin_other_row`; the module docstring has the full analysis.
+
+#### `handoff`
+
+```yaml
+rewards:  {f1: {fn: qa_match, args: {metric: f1}}}
+scenario:
+  type: handoff
+  args: {material_field: context, max_note_chars: 400}
+```
+
+The writer is given the text (`material_field`, default `context`) and not the question. The reader is given the note (cut to `max_note_chars`, default 600) and the question (the row's prompt; `question_field` names another column), never the text. `reader_samples` readers (2) answer from the same note. With `control: true` (the default) one more reader answers without a note; its session is logged and not trained.
+
+| Role | Component | Value |
+|---|---|---|
+| writer | `lift` | its readers' mean reward minus the control's: what the note added |
+| writer | `readers` | its readers' mean reward (weight 0; the writer's reward with `control: false`) |
+| reader | `correct` | the rewards' weighted sum on its final answer |
+
+A constant note earns a lift of 0, and so does a note for a question the reader can answer alone. What the reward cannot see: a note that copies a text shorter than the limit (the check warns), and a private code between a writer and a reader trained together (train against `roles.reader.train: false` or `partner: base`).
+
+#### `lead_workers`
+
+The lead writes at most `max_workers` (3) lines `SUBTASK: ...`; each goes to one worker, which sees nothing else. The lead's conversation then continues with the workers' replies and it gives the final answer. The work and merge stages run `team_samples` (2) times from one plan, and each team's merge `merge_samples` (2) times from the same replies. With `control: true` (the default) one more session is the lead answering alone.
+
+| Role | Session | Component | Compared with |
+|---|---|---|---|
+| lead | plan | `total`: the mean reward of the merges that followed it. `lift` (weight 0): `total` minus the control's | the plans of the row's other episodes |
+| lead | merge | `correct`: the rewards' weighted sum on its final answer | the other merges of the same team, which read the same replies |
+| worker | | `team`: the mean reward of its team's merges | the workers of the other teams that got the same subtask |
+
+These follow the [credit rules](#credit): a session is compared only with sessions that could have been it. A sub-answer cannot be checked by itself (the dataset has gold for the task, not for its parts), so a worker shares its team's reward and its credit is noisy with few teams. A lead that ignores its workers and solves alone is paid in full: `metric/control` measures exactly that, inside the run.
+
+#### `plan_execute`
+
+```yaml
+data:     {dataset: data/harbor_rows.jsonl, prompt_field: messages}
+scenario:
+  type: plan_execute
+  timeout: 1800
+  args: {executor_samples: 2, max_turns: 16, max_concurrent: 16}
+roles:
+  executor: {max_completion_tokens: 8192}
+```
+
+Rows are [Harbor rows](harbor.md) (`pgs harbor rows`); there is no `rewards:` and no `env:` section. The planner gets the task's instruction and no tools. Each of `executor_samples` executors gets the row's own conversation with the plan appended (cut to `max_plan_chars`, default 4000), and a `HarborEnv` of its own: the same container, tools and tests as single-agent RL on Harbor. `env_args` are HarborEnv's arguments; `env` names another environment class with the same interface.
+
+| Role | Component | Value |
+|---|---|---|
+| planner | `executed` | the mean reward of its executors |
+| planner | `lift` | `executed` minus a plan-less executor's reward (weight 0; needs `control: true`, one more container per episode) |
+| executor | `tests` | the task's tests |
+
+`pgs scenario check --config ... --n 5` starts containers: its oracle planner writes the task's `solution/solve.sh` as the plan and its oracle executor runs it.
+
+### (c) Your own scenario
+
+When no pattern has the shape you need, write the protocol and the verifier as a class ([What a scenario is made of](#what-a-scenario-is-made-of)) and use it with `scenario.type: "my_file.py:Handoff"`. Give it rows any way you like (a `generate` classmethod makes `pgs scenario generate` and `pgs scenario audit` work), and write an oracle and the obvious degenerate partners. To score with the run's rewards instead of your own verifier, subclass `palingenesis.rl.scenarios.library.patterns.Pattern`: `await self.pay(session, row)` grades a session's final answer with the `rewards:` functions.
+
+### From rollouts back to datasets
+
+Multi-agent rollouts become ordinary single-agent datasets again. With `logging.dump_trajectories: N`, every trained session is one record with its `role`, `model`, `adapter`, `episode`, `session` and `comparison` group; the first record of an episode also holds the partners' sessions and every channel message, as sent and as delivered. [`pgs rollouts`](observability.md#pgs-rollouts) reports finish reasons, loops and rewards per role.
+
+```bash
+pgs scenario export runs/x/rollouts --format sft --out sft.jsonl --roles lead --min-reward 1
+pgs scenario export runs/x/rollouts --format dpo --out pairs.jsonl --margin 0.5
+pgs scenario export runs/x/rollouts --format traces --out traces.jsonl
+```
+
+| Format | Rows | For |
+|---|---|---|
+| `sft` | `{"messages", "tools"}` of sessions that earned `--min-reward`: one conversation per session, as that role saw it | `pgs train`: the system distilled into one model |
+| `dpo` | `{"prompt", "chosen", "rejected"}` from comparison groups whose sessions answered the same prompt, best against worst | `pgs train` with DPO |
+| `traces` | every scored session, failures included | on-policy distillation (`sources.<name>.format: agent_traces`) |
+
+Each row keeps its `role`, `reward` and source (step, group, episode, session). For example, `--roles checker --min-reward 1` of a `solve_check` run is a dataset of verified checks, and `--roles solver --format dpo` pairs a right and a wrong answer to the same question.
 
 ## What a scenario is made of
 
@@ -99,7 +339,7 @@ When the *model* decides the shape (how many subagents, with which briefs), sess
 
 ## The starter scenarios
 
-Each has a seeded generator, a programmatic verifier, an oracle partner and degenerate partners for the audit, and prompts written in English and Italian (the generator alternates them).
+These are the scenarios of [path (a)](#a-a-built-in-generator). Each has a seeded generator, a programmatic verifier, an oracle partner and degenerate partners for the audit, and prompts written in English and Italian (the generator alternates them).
 
 | Scenario | Roles | The task | Reward |
 |---|---|---|---|
@@ -234,34 +474,7 @@ Roles with their own adapter need `rollout.backend: remote` (named adapters of o
 pgs scenario audit checked_answer --n 500
 ```
 
-It plays the scenario's scripted partners through the verifier: the oracles together (they must earn the reward), then each degenerate partner with oracles in the other roles (none may earn more than 0 on average). Exit code 1 on a failure. Write an oracle and the obvious degenerate policies for every scenario of your own (`Scenario.partners`); a small policy finds what the audit did not try.
-
-## Data
-
-`pgs scenario generate <name> --n N --seed S --out rows.jsonl` writes rows. A row is **the task alone**: its numbers, texts and gold answers, plus `scenario`, `id` and `language`. Prompts are built per role by the scenario, so one file serves every role assignment and prompt revision.
-
-```json
-{"scenario": "ledger_sum", "id": "ledger_sum-0-3", "language": "it", "item": "pere",
- "ledgers": {"nord": {"pere": 12, "mele": 40}, "sud": {"fichi": 7}}, "answer": 12}
-```
-
-Use a different seed for held-out rows (`data.eval_dataset`).
-
-### What a run logs, and exports
-
-With `logging.dump_trajectories: N`, every trained session is one record with its `role`, `model`, `adapter`, `episode`, `session` and `comparison` group; the first record of an episode also holds the partners' sessions and every channel message, as sent and as delivered. [`pgs rollouts`](observability.md#pgs-rollouts) reports finish reasons, loops and rewards per role.
-
-```bash
-pgs scenario export runs/x/rollouts --format sft --out sft.jsonl --roles lead --min-reward 1
-pgs scenario export runs/x/rollouts --format dpo --out pairs.jsonl --margin 0.5
-pgs scenario export runs/x/rollouts --format traces --out traces.jsonl
-```
-
-| Format | Rows | For |
-|---|---|---|
-| `sft` | `{"messages", "tools"}` of sessions that earned `--min-reward` | `pgs train`: the system distilled into one model |
-| `dpo` | `{"prompt", "chosen", "rejected"}` from comparison groups whose sessions answered the same prompt, best against worst | `pgs train` with DPO |
-| `traces` | every scored session, failures included | on-policy distillation (`sources.<name>.format: agent_traces`) |
+It plays the scenario's scripted partners through the verifier: the oracles together (they must earn the reward), then each degenerate partner with oracles in the other roles (none may earn more than 0 on average). Exit code 1 on a failure. A [pattern](#b-your-rl-dataset-plus-a-pattern) is audited on your own rows and rewards by `pgs scenario check --config rl.yaml`, which runs the same audit. A partner that declares a `row` parameter gets the episode's row, which is how an oracle reads the gold answer. Write an oracle and the obvious degenerate policies for every scenario of your own (`Scenario.partners`); a small policy finds what the audit did not try.
 
 ## Metrics
 
@@ -275,6 +488,8 @@ pgs scenario export runs/x/rollouts --format traces --out traces.jsonl
 | `role/<r>/sessions`, `turns`, `completion_len`, `truncated`, `skipped` | what the role's sessions looked like |
 | `episode/sessions`, `episode/messages`, `episode/failed` | per episode |
 | `reward`, `outcome/pass@1` | of the outcome role (`scenario.outcome`) |
+| `role/<r>/rewards/metric/control`, `.../lift` | patterns: the control session's reward (a reader without a note, a lead alone, an executor without a plan) and what the role added to it |
+| `role/solver/rewards/metric/checked`, `metric/twin_<source>`, `metric/team` | `solve_check`: episodes with a balanced pair, where the twin came from, and whether the pair's final answer was right |
 | `replica/drift` | replicated base: 0 when the ranks hold the same adapters |
 
 ## What to compare against
@@ -291,6 +506,8 @@ Multi-agent training has a poor record against simple controls. Before trusting 
 - No GPU run has been made: the vLLM paths (a server per adapter, folded pushes, replicated ranks) are untested.
 - Roles with their own adapter: not with DoRA, LoRA+, FSDP or `kl_ref_reset`. Several GPUs need `rollout.backend: remote` (with `train.replicate_base` for several trainer ranks); with `vllm_server` they stay on one.
 - `set_adapter` (what the trainer selects a micro-batch's adapter with) is process-wide, so that a forward recomputed under gradient checkpointing uses the right adapter; rollout threads select theirs with `use_adapter`, which wins inside its block.
-- Scenario sessions have no sandbox yet: tools are Python functions of the scenario. Harbor containers shared between roles are not implemented.
+- Scenario sessions have no sandbox of their own: tools are Python functions of the scenario. `plan_execute` gives each executor session a Harbor container through `HarborEnv`; a container shared between roles is not implemented, and harness profiles (`env_args.profile` / `profiles`) are refused, because a session's conversation and text protocol are the scenario's. `plan_execute` is tested with a stand-in environment and has not been run against Docker.
+- Patterns read rows whose prompt ends with a user message of text: no images, and a row's `tools` column is not passed on. Their prompts exist in English and Italian only.
+- In `lead_workers`, a sub-answer is not checked by itself: workers share their team's reward.
 - `loss.overlong_buffer`, `loss.group_shaping`, `loss.observation_weight`, `rollout.think_skip` and `model.multimodal` are refused with a scenario.
 - Remote engines take no images and no MoE routing replay yet, and their weights travel over TCP (no NCCL or RDMA transport).

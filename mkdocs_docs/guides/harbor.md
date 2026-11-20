@@ -266,4 +266,4 @@ To publish such a task set for the CLI, convert it to Harbor's single-step `[[st
 - **Thinking**: `model.chat_template_kwargs: {enable_thinking: false}` for non-thinking runs. A row's own `chat_template_kwargs` wins, and with harness profiles the order is model < profile < row.
 - **Held-out tasks**: split by task family and parameters, not by random rows. Near-duplicate tasks in train and dev inflate the evaluation.
 
-See also: [Reinforcement Learning](rl.md) for the trainer, [Harness Profiles](harness-profiles.md) to train inside real agent harnesses, and the [CLI reference](../reference/cli.md) for `pgs harbor`.
+See also: [Reinforcement Learning](rl.md) for the trainer, [Multi-Agent RL](multi-agent.md#plan_execute) for a planner and an executor on the same tasks (`plan_execute`), [Harness Profiles](harness-profiles.md) to train inside real agent harnesses, and the [CLI reference](../reference/cli.md) for `pgs harbor`.

@@ -188,8 +188,9 @@ RL configs (`pgs rl`) run multi-role episodes when they have a `scenario:` secti
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `scenario.type` | str | `""` | A built-in scenario (`take_away`, `ledger_sum`, `checked_answer`) or `module:Class` / `path/to/file.py:Class`. Empty: single-agent RL. |
-| `scenario.args` | dict | `{}` | The scenario's own options, e.g. `{weights: {lead: {coverage: 0.2}}}`. |
+| `scenario.type` | str | `""` | A pattern over your own RL dataset (`solve_check`, `handoff`, `lead_workers`: scored by the `rewards:` section; `plan_execute`: Harbor rows, scored by the task's tests), a scenario with its own generator and verifier (`take_away`, `ledger_sum`, `checked_answer`: no `rewards:` section), or `module:Class` / `path/to/file.py:Class`. Empty: single-agent RL. |
+| `scenario.args` | dict | `{}` | The scenario's own options, e.g. `{weights: {lead: {coverage: 0.2}}}`. Patterns: `prompt_field`, `gold_field`, `answer_tag`, `language_field`, `language`, `threshold`, and each pattern's own (`pgs scenario patterns` lists them; [Multi-Agent RL](../guides/multi-agent.md#b-your-rl-dataset-plus-a-pattern)). |
+| `rewards` | dict | `{}` | With a pattern: required, and used as in single-agent RL (the final answer is the completion). With any other scenario: refused. |
 | `scenario.timeout` | float | `600` | Seconds an episode may take; a slower one is cancelled and left out of training. |
 | `scenario.outcome` | str | `""` | The role whose reward is the task's outcome (retire / retry, `outcome/*`); empty: the scenario's. |
 | `roles.<name>.adapter` | str | `""` | A LoRA adapter of its own on the policy's base (needs `lora.rank`). |
