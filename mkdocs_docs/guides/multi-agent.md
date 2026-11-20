@@ -73,7 +73,7 @@ There are three ways to get rows, from least to most work.
 
 ### (b) Your RL dataset plus a pattern
 
-A pattern is a scenario with no generator and no verifier of its own. It reads a row's prompt the way `pgs rl` does (`data.prompt_field`, else the first of `messages`, `prompt`, `question`, `problem`; `data.system_prompt` applies) and scores every final answer with the run's `rewards:` functions and weights.
+A pattern is a scenario with no generator and no verifier of its own. It reads a row's prompt the way `pgs rl` does (`data.prompt_field`, else the first of `messages`, `prompt`, `question`, `problem`) and scores every final answer with the run's `rewards:` functions and weights.
 
 | Pattern | Roles | What happens | Rows need |
 |---|---|---|---|
@@ -84,7 +84,9 @@ A pattern is a scenario with no generator and no verifier of its own. It reads a
 
 `pgs scenario patterns` prints this list with every option, and the row fields under the names the options use.
 
-**A worked example.** `data/gsm8k_train.jsonl` holds single-agent rows; the `answer` column is the final number:
+`data.system_prompt` goes to the sessions that start from the row's own conversation (the solver, the reader, the lead), not to the roles whose prompt the pattern writes (the checker, the writer, the worker, the planner): give those `roles.<name>.system_prompt`.
+
+**A worked example.** `data/gsm8k_train.jsonl` holds single-agent rows with the task in `question` (or `prompt`, as `examples/rl/prepare_gsm8k.py` writes it: both are read) and the final number in `answer`:
 
 ```json
 {"question": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?", "answer": "72"}
@@ -117,7 +119,7 @@ train:
 Check it before training:
 
 ```bash
-pgs scenario check --config rl.yaml --n 200
+pgs scenario check --config rl.yaml          # 200 sampled rows; --n changes it
 ```
 
 ```text
@@ -179,18 +181,19 @@ pgs rl --config configs/rl_math.yaml        # the same data and reward, one agen
 
 #### `solve_check`
 
-In every episode the checker judges two candidates in two separate sessions: one that your rewards score as right and one that they score as wrong. One of them is the solver's own answer, the other its twin of the opposite class. So "always accept" earns +1 −1 = 0 in every episode and "always reject" at most −0.5, whatever the solver's accuracy.
+In every episode the checker judges two candidates in two separate sessions: one that your rewards score as right and one that they score as wrong. One of them is the solver's own answer, the other its twin of the opposite class. So "always accept" earns +1 −1 = 0 in every episode, and "always reject" −1 +0.5 = −0.5, or 0 when it always adds the right answer (it is then a solver that wrongly rejects): never above 0, whatever the solver's accuracy.
 
 - Solver right: the wrong twin is the wrong answer of another solver attempt of the same episode (`solver_samples`, default 2); else a numeric gold one slip away (±1, ±10, digits reversed); else an entry of the row's `distractors` column (`distractor_field`); else the gold answer of another row.
-- Solver wrong: the right twin is the gold answer.
-- Every twin is scored by your rewards before it is shown. If no pair of one right and one wrong answer exists, no checker session runs in that episode (`role/solver/rewards/metric/checked`).
+- Solver wrong: the right twin is the gold answer; without a gold that passes the rewards, a right answer of another attempt.
+- Every candidate, the solver's own included, is classified by your rewards on its text alone before it is shown. One that is longer than `max_candidate_chars`, or that the rewards could not score, is never shown. If no pair of one right and one wrong answer exists, no checker session runs in that episode (`role/solver/rewards/metric/checked`).
+- A candidate is right when the weighted sum of all your rewards reaches `threshold`. With a format reward next to the correctness one, set `threshold` so that only a correct answer reaches it.
 
 | Role | Component | Value |
 |---|---|---|
 | solver | `correct` | the rewards' weighted sum on its final answer |
 | checker | `verdict` | right accept +1, wrong accept −1, right reject −1, wrong reject +0.5, +1 with a right correction, no verdict −1 |
 
-Other options: `checker_samples` (2), `max_candidate_chars` (400). The candidates are final answers only, never the reasoning. One cue remains: a gold answer is written the way the dataset writes it, a solver's answer the way the model does. Watch `metric/twin_gold` against `metric/twin_slip`, `twin_distractor` and `twin_other_row`; the module docstring has the full analysis.
+Other options: `checker_samples` (2), `max_candidate_chars` (400). The candidates are final answers only, never the reasoning. One cue remains: a gold answer is written the way the dataset writes it, a solver's answer the way the model does. Watch `metric/twin_gold` against `metric/twin_slip`, `twin_distractor` and `twin_other_row`; the module docstring has the full analysis. Keep the answer line for this pattern: with `answer_tag: ""` the candidates are whole replies, and a gold answer next to a reply of a few sentences is told apart by its length.
 
 #### `handoff`
 
@@ -209,7 +212,7 @@ The writer is given the text (`material_field`, default `context`) and not the q
 | writer | `readers` | its readers' mean reward (weight 0; the writer's reward with `control: false`) |
 | reader | `correct` | the rewards' weighted sum on its final answer |
 
-A constant note earns a lift of 0, and so does a note for a question the reader can answer alone. What the reward cannot see: a note that copies a text shorter than the limit (the check warns), and a private code between a writer and a reader trained together (train against `roles.reader.train: false` or `partner: base`).
+An empty note earns a lift of 0, and so does a note for a question the reader can answer alone. What the reward cannot see: a note that copies a text shorter than the limit (the check warns); a note of generic advice that makes any answer score better (the control has no note at all); a private code between a writer and a reader trained together (train against `roles.reader.train: false`, or `partner: base` with `lora.rank`). If the question column already contains the text, the reader needs no note: the check warns, and `question_field` should name the column with the bare question.
 
 #### `lead_workers`
 
@@ -221,7 +224,7 @@ The lead writes at most `max_workers` (3) lines `SUBTASK: ...`; each goes to one
 | lead | merge | `correct`: the rewards' weighted sum on its final answer | the other merges of the same team, which read the same replies |
 | worker | | `team`: the mean reward of its team's merges | the workers of the other teams that got the same subtask |
 
-These follow the [credit rules](#credit): a session is compared only with sessions that could have been it. A sub-answer cannot be checked by itself (the dataset has gold for the task, not for its parts), so a worker shares its team's reward and its credit is noisy with few teams. A lead that ignores its workers and solves alone is paid in full: `metric/control` measures exactly that, inside the run.
+These follow the [credit rules](#credit): a session is compared only with sessions that could have been it. A sub-answer cannot be checked by itself (the dataset has gold for the task, not for its parts), so a worker shares its team's reward and its credit is noisy with few teams. A lead that ignores its workers and solves alone is paid in full: `metric/control` measures exactly that, inside the run. `lift` is what the team stage added to one session of the lead alone, which includes plain extra compute (the same task sent to three workers is a vote). With `weights: {lead: {total: 0, lift: 1}}` the run's `reward`, `outcome/pass@1` and `data.retire_above` read a mix of lift and correctness: do not retire rows with it.
 
 #### `plan_execute`
 
@@ -237,13 +240,15 @@ roles:
 
 Rows are [Harbor rows](harbor.md) (`pgs harbor rows`); there is no `rewards:` and no `env:` section. The planner gets the task's instruction and no tools. Each of `executor_samples` executors gets the row's own conversation with the plan appended (cut to `max_plan_chars`, default 4000), and a `HarborEnv` of its own: the same container, tools and tests as single-agent RL on Harbor. `env_args` are HarborEnv's arguments; `env` names another environment class with the same interface.
 
+At most `max_concurrent` (8) containers are alive at once per trainer process. An executor waiting for one is inside its episode, so the wait counts against `scenario.timeout`: keep `max_concurrent` at or above `rollout.batch_prompts` × `rollout.group_size` × the executors per episode, or raise the timeout.
+
 | Role | Component | Value |
 |---|---|---|
 | planner | `executed` | the mean reward of its executors |
 | planner | `lift` | `executed` minus a plan-less executor's reward (weight 0; needs `control: true`, one more container per episode) |
 | executor | `tests` | the task's tests |
 
-`pgs scenario check --config ... --n 5` starts containers: its oracle planner writes the task's `solution/solve.sh` as the plan and its oracle executor runs it.
+`pgs scenario check --config ...` starts containers (it plays 5 rows by default for this pattern): its oracle planner writes the task's `solution/solve.sh` as the plan and its oracle executor runs it.
 
 ### (c) Your own scenario
 

@@ -23,7 +23,15 @@ Reward components:
 
 Reward hacking, by policy:
 
-  an empty or constant note   reads like no note: the readers score what the control scores and the lift is 0.
+  an empty note               reads like no note: the readers score what the control scores and the lift is 0.
+  a constant note             of generic advice ("answer in as few words as possible") can earn a lift without
+                              a word about the material, when it makes the reader's answers score better: the
+                              control has no note at all, so the lift also pays what any text adds. The reader's
+                              prompt already asks for the answer line, which leaves little to coach; compare
+                              role/writer/rewards/lift with a run whose writer is `scripted:filler`.
+  the material in the prompt  a row whose question column already contains the text (single-agent reading rows
+                              often do) gives the reader everything: lift 0 for every writer.
+                              `pgs scenario check` warns; point question_field at the bare question.
   a reader that knows the     earns its own `correct`, as it should, and nothing for the writer: the control
   answer without the note     knows it too. Without the control (`control: false`) the writer would be paid for
                               questions the reader can answer alone; keep it on unless the questions cannot be
@@ -107,6 +115,16 @@ class Handoff(Pattern):
         sizes = [len(row[self.material_field]) for row in rows if isinstance(row.get(self.material_field), str)]
         fit = sum(size <= self.max_note_chars for size in sizes)
         warnings = super().advice(rows)
+        leaked = 0
+        for row in rows:
+            material = row.get(self.material_field)
+            if isinstance(material, str) and material.strip()[:200] in self.task(row):
+                leaked += 1
+        if leaked:
+            warnings.append(
+                f"handoff: in {leaked} of {len(rows)} rows the question already contains the material, so the reader "
+                "does not need the note. Point scenario.args.question_field at the column with the bare question."
+            )
         if sizes and fit > len(sizes) / 2:
             warnings.append(
                 f"handoff: {fit} of {len(sizes)} materials fit in a note of {self.max_note_chars} characters, so the "

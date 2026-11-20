@@ -42,7 +42,7 @@ Equivalent to:
 torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/quickstart.yaml
 ```
 
-`pgs scenario` validates, generates, audits and exports multi-role RL data and plans a cluster layout (`pgs scenario patterns | check | list | generate | audit | export | plan`; [Multi-Agent RL](../guides/multi-agent.md)); training on a scenario is `pgs rl` with a `scenario:` section. `pgs scenario patterns` lists the patterns that run on an ordinary RL dataset with their row fields and options; `pgs scenario check --config rl.yaml [--n 200] [--json]` checks that dataset against the config's pattern (fields, rewards, one rendered prompt per role) and runs the audit on its rows (exit 1 on a failure).
+`pgs scenario` validates, generates, audits and exports multi-role RL data and plans a cluster layout (`pgs scenario patterns | check | list | generate | audit | export | plan`; [Multi-Agent RL](../guides/multi-agent.md)); training on a scenario is `pgs rl` with a `scenario:` section. `pgs scenario patterns` lists the patterns that run on an ordinary RL dataset with their row fields and options; `pgs scenario check --config rl.yaml [--n N] [--json]` checks that dataset against the config's pattern (fields, rewards, one rendered prompt per role) and runs the audit on its rows (exit 1 on a failure).
 
 LoRA is a trainer plugin of `pgs train`, not a separate command: `pgs init lora`, then `pgs train --config lora.yaml` ([LoRA guide](../guides/lora.md)). In `pgs rl` it is the config's `lora:` section ([LoRA in RL](../guides/lora.md#lora-in-rl)).
 

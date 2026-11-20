@@ -50,6 +50,7 @@ class Scenario:
     oracle_floor: dict[str, float] = {}
     uses_rewards = False  # True: sessions are scored by the run's `rewards:` functions (patterns), given by `bind`
     fields: dict[str, str] = {}  # the row fields it reads: {name: what it holds}
+    check_rows = 200  # the rows `pgs scenario check` samples by default
 
     def __init__(self, weights: dict[str, dict[str, float]] | None = None):
         merged = {role: dict(components) for role, components in type(self).weights.items()}
@@ -96,11 +97,12 @@ class Scenario:
 
     # ------------------------------------------------------------------ audit
 
-    def audit(self, n: int = 200, seed: int = 0, rows: list[dict] | None = None) -> dict:
+    def audit(self, n: int = 200, seed: int = 0, rows: list[dict] | None = None, loop: Any = None) -> dict:
         """Play the scripted partners through the verifier on `n` generated rows (or on `rows`: a dataset of
         your own): the oracles together, then each degenerate partner in its role with oracles in the others.
         Returns {"oracle": {role: mean reward}, "degenerate": {"role/name": mean reward}, "failures": [...]}:
-        an oracle must earn more than 0.9 of its role's best reward, a degenerate partner at most 0 on average."""
+        an oracle must earn more than 0.9 of its role's best reward, a degenerate partner at most 0 on average.
+        `loop`: an event loop to play on (see `play`)."""
         rows = self.generate(n, seed) if rows is None else list(rows)
         self.prepare(rows)
         table = self.partners()
@@ -111,7 +113,7 @@ class Scenario:
 
         def means(partners: dict[str, Partner]) -> dict[str, float]:
             totals: dict[str, list[float]] = {role: [] for role in self.roles}
-            for episodes in play(self, rows, partners, seed):
+            for episodes in play(self, rows, partners, seed, loop=loop):
                 for episode in episodes:
                     for session in episode.sessions:
                         value = self.reward(session.role, session.rewards)

@@ -13,6 +13,11 @@ Any environment class with tool_schemas / call_tool / get_reward works the same 
 `executor_samples` executors start from the same plan, each in its own container (a branch: one comparison
 group). With `control: true` one more executor works without a plan.
 
+At most `max_concurrent` environments are alive at once, per trainer process (per rank under torchrun). An
+executor waiting for a free one is inside its episode, so the wait counts against `scenario.timeout`: keep
+max_concurrent at or above rollout.batch_prompts x rollout.group_size x the executors per episode, or raise the
+timeout. An episode that times out is left out of training, planner included.
+
 Roles: `planner`, `executor`.
 
 Reward components:
@@ -33,7 +38,9 @@ Reward hacking, by policy:
   the plan                  planner for tasks the executor solves alone. Turn `control` on and train the planner
                             on `lift` (weights: {planner: {executed: 0, lift: 1}}) when that matters; it costs
                             one more container per episode.
-  an empty or constant plan earns what the control earns: lift 0.
+  an empty plan             earns what the control earns: lift 0. A constant plan of generic advice ("read the
+                            task twice, run the tests") can earn a lift without planning anything: the
+                            control has no plan at all, so the lift also pays what any extra text adds.
   the tests                 are the task's own, with the single-agent holes they have (run `pgs harbor check`:
                             the oracle must pass, doing nothing must fail). This pattern adds none: the plan is
                             text, cut to `max_plan_chars`, and the tests never see it.
@@ -54,6 +61,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -79,6 +87,7 @@ PLAN = {
     "it": "\n\nIl piano di un collega per questo compito:\n{plan}",
 }
 SCRIPT = re.compile(r"```bash\n(.*?)\n```", re.S)
+logger = logging.getLogger(__name__)
 
 
 class PlanExecute(Scenario):
@@ -86,6 +95,7 @@ class PlanExecute(Scenario):
     roles = ("planner", "executor")
     outcome = "executor"
     weights = {"planner": {"executed": 1.0, "lift": 0.0}, "executor": {"tests": 1.0}}
+    check_rows = 5  # rows `pgs scenario check` plays by default: every executor session is a container
     fields = {
         "task_dir": "the Harbor task directory (what the environment's reset takes)",
         "messages": "the executor's conversation: [system,] the task's instruction (`pgs harbor rows` writes it)",
@@ -124,6 +134,7 @@ class PlanExecute(Scenario):
         self.language_field, self.default_language = language_field, language
         self._factory: Any = None
         self._slots: dict[Any, asyncio.Semaphore] = {}
+        self._closing: set = set()  # shutdowns in flight (kept referenced until they end)
 
     @classmethod
     def generate(cls, n: int, seed: int = 0, **params) -> list[dict]:
@@ -235,47 +246,71 @@ class PlanExecute(Scenario):
             self._slots = {loop: asyncio.Semaphore(self.max_concurrent)}
         return self._slots[loop]
 
+    @staticmethod
+    async def _shutdown(env: Any, reset: Any, slot_lock: asyncio.Semaphore) -> None:
+        from palingenesis.rl.env import call_sync_or_async
+
+        try:
+            if reset is not None:
+                await asyncio.gather(reset, return_exceptions=True)
+            closer = getattr(env, "aclose", None) or getattr(env, "close", None)
+            if closer is not None:
+                await call_sync_or_async(closer)
+        except Exception:  # noqa: BLE001 — nothing can be done about a close that fails, except saying so
+            logger.exception("plan_execute: closing the environment failed")
+        finally:
+            slot_lock.release()
+
     async def execute(self, episode: Episode, row: dict, plan: str, slot: str = "") -> tuple[Any, float | None]:
         """One executor session in an environment of its own: (session, the tests' reward or None)."""
         from palingenesis.rl.data import row_limit
         from palingenesis.rl.env import ToolFailed, call_sync_or_async, run_tool
 
-        async with self._slot():
+        slot_lock = self._slot()
+        await slot_lock.acquire()  # (waiting here counts against scenario.timeout: see max_concurrent)
+        env, reset = None, None
+        try:
             env = self._environment()
-            try:
-                opening = await call_sync_or_async(env.reset, **row)
-                if opening is not None:
-                    raise ScenarioError(
-                        "plan_execute: the environment's reset returned a conversation of its own (a harness "
-                        "profile?); the executor's conversation is the row's, with the plan."
-                    )
-
-                def tool(name: str, schema: dict):
-                    async def call(**arguments):
-                        result, failed = await run_tool(env, name, arguments, self.tool_timeout)
-                        if getattr(env, "done", False):  # a submit: the session takes no further turn
-                            raise EndSession(result if isinstance(result, str) else str(result))
-                        if failed:  # counted as a tool error, and worded "Error: ..." again by the turn loop
-                            raise ToolFailed(str(result).removeprefix("Error: "))
-                        return result
-
-                    call.schema = schema
-                    return call
-
-                schemas = await call_sync_or_async(env.tool_schemas)
-                tools = {schema["function"]["name"]: tool(schema["function"]["name"], schema) for schema in schemas}
-                limits = {"max_turns": row_limit(row, "max_turns") or self.max_turns}
-                if row_limit(row, "max_completion_tokens"):
-                    limits["max_completion_tokens"] = row_limit(row, "max_completion_tokens")
-                session = await episode.run(
-                    "executor", self.executor_messages(row, plan), tools=tools, slot=slot, **limits
+            # shielded: a reset that an episode's cancellation interrupted would start its container afterwards
+            reset = asyncio.ensure_future(call_sync_or_async(env.reset, **row))
+            opening = await asyncio.shield(reset)
+            if opening is not None:
+                raise ScenarioError(
+                    "plan_execute: the environment's reset returned a conversation of its own (a harness "
+                    "profile?); the executor's conversation is the row's, with the plan."
                 )
+
+            def tool(name: str, schema: dict):
+                async def call(**arguments):
+                    result, failed = await run_tool(env, name, arguments, self.tool_timeout)
+                    if getattr(env, "done", False):  # a submit: the session takes no further turn
+                        raise EndSession(result if isinstance(result, str) else str(result))
+                    if failed:  # counted as a tool error, and worded "Error: ..." again by the turn loop
+                        raise ToolFailed(str(result).removeprefix("Error: "))
+                    return result
+
+                call.schema = schema
+                return call
+
+            schemas = await call_sync_or_async(env.tool_schemas)
+            tools = {schema["function"]["name"]: tool(schema["function"]["name"], schema) for schema in schemas}
+            limits = {"max_turns": row_limit(row, "max_turns") or self.max_turns}
+            if row_limit(row, "max_completion_tokens"):
+                limits["max_completion_tokens"] = row_limit(row, "max_completion_tokens")
+            session = await episode.run("executor", self.executor_messages(row, plan), tools=tools, slot=slot, **limits)
+            try:  # as in single-agent RL: an environment that cannot score leaves the sample out, nothing more
                 wants_messages = bool(inspect.signature(env.get_reward).parameters)
                 value = await call_sync_or_async(env.get_reward, *((session.messages,) if wants_messages else ()))
-            finally:
-                closer = getattr(env, "aclose", None) or getattr(env, "close", None)
-                if closer is not None:  # shielded: a cancelled episode still stops its container
-                    await asyncio.shield(asyncio.ensure_future(call_sync_or_async(closer)))
+            except Exception:  # noqa: BLE001
+                logger.exception("plan_execute: the environment's get_reward failed; the executor is not scored")
+                value = None
+        finally:
+            # the environment is closed after its reset has finished, and its slot is freed after the close, also
+            # when the episode was cancelled (the shutdown then goes on in the background)
+            shutdown = asyncio.ensure_future(self._shutdown(env, reset, slot_lock))
+            self._closing.add(shutdown)
+            shutdown.add_done_callback(self._closing.discard)
+            await asyncio.shield(shutdown)
         components = value if isinstance(value, dict) else {"reward": value}
         failed = bool(components.get("metric/verifier_failed"))
         paid = [float(v) for k, v in components.items() if v is not None and not k.startswith("metric/")]

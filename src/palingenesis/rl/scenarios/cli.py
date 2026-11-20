@@ -1,7 +1,7 @@
 """`pgs scenario`: data, audits, exports and layouts for multi-role RL (palingenesis.rl.scenarios).
 
     pgs scenario patterns                             # patterns over your own RL dataset: roles, row fields, options
-    pgs scenario check --config rl.yaml [--n 200]     # your rows against the config's pattern, then the audit on them
+    pgs scenario check --config rl.yaml [--n N]       # your rows against the config's pattern, then the audit on them
     pgs scenario list
     pgs scenario generate take_away --n 2000 --seed 0 --out data/take_away.jsonl
     pgs scenario audit take_away [--n 500]            # oracle partners must earn the reward, degenerate ones must not
@@ -65,7 +65,7 @@ def opening(session) -> list[dict]:
     return out
 
 
-def check(path: str, n: int = 200, seed: int = 0, as_json: bool = False) -> int:
+def check(path: str, n: int | None = None, seed: int = 0, as_json: bool = False) -> int:
     """Validate the dataset of an RL config against its scenario: the fields each row needs, the rewards, one
     rendered prompt per role (and per language), then the audit on the rows themselves. 1 on any failure."""
     import asyncio
@@ -125,7 +125,8 @@ def check(path: str, n: int = 200, seed: int = 0, as_json: bool = False) -> int:
     except Exception as error:  # noqa: BLE001 — a missing file, an unreadable dataset
         failures.append(f"data.dataset {config.data.dataset!r}: {type(error).__name__}: {error}")
         return done()
-    picked = sorted(random.Random(seed).sample(range(len(rows)), min(n, len(rows))))
+    n = scenario.check_rows if n is None else n
+    picked = sorted(random.Random(seed).sample(range(len(rows)), max(0, min(n, len(rows)))))
     sample = [rows[i] for i in picked]
     problems = {i: scenario.check_row(rows[i]) for i in picked}
     valid = [rows[i] for i in picked if not problems[i]]
@@ -136,6 +137,8 @@ def check(path: str, n: int = 200, seed: int = 0, as_json: bool = False) -> int:
         failures.append(f"{len(bad)} of {len(sample)} rows do not fit; row {bad[0][0]}: {bad[0][1]}")
     report["warnings"] += scenario.advice(valid)
     if not valid:
+        if not bad:
+            failures.append("no rows to check (an empty dataset, or --n 0)")
         return done()
 
     table = scenario.partners()
@@ -143,13 +146,14 @@ def check(path: str, n: int = 200, seed: int = 0, as_json: bool = False) -> int:
     if not all(oracles.values()):
         failures.append(f"no oracle partner for {[r for r, p in oracles.items() if p is None]}")
         return done()
+    loop = asyncio.new_event_loop()  # one loop for every episode: a code sandbox belongs to the loop it starts on
     try:
         scenario.prepare(valid)
         shown: dict[str, dict] = {}
         for row in valid:  # one row per language the prompts are written in
             shown.setdefault(getattr(scenario, "language", lambda r: "")(row), row)
         for language, row in shown.items():
-            episode = play(scenario, [row], oracles, seed)[0][0]
+            episode = play(scenario, [row], oracles, seed, loop=loop)[0][0]
             first: dict[str, list] = {}
             for session in episode.sessions:
                 first.setdefault(session.role, opening(session))
@@ -161,7 +165,7 @@ def check(path: str, n: int = 200, seed: int = 0, as_json: bool = False) -> int:
                 ]:
                     say(f"[{message['role']}] {message.get('content')}")
         say("")
-        audit = scenario.audit(seed=seed, rows=valid)
+        audit = scenario.audit(seed=seed, rows=valid, loop=loop)
     except Exception as error:  # noqa: BLE001 — a reward reading a missing column, an environment that fails
         failures.append(
             f"the episodes could not be played: {type(error).__name__}: {error} (a reward or the scenario read "
@@ -171,9 +175,10 @@ def check(path: str, n: int = 200, seed: int = 0, as_json: bool = False) -> int:
     finally:
         if sandbox is not None:
             try:
-                asyncio.run(sandbox.close())
+                loop.run_until_complete(sandbox.close())
             except Exception:  # noqa: BLE001 — nothing depends on it
                 pass
+        loop.close()
     report["audit"] = audit
     for role, value in audit["oracle"].items():
         say(f"oracle      {role:<24} {value:+.3f}")
@@ -200,7 +205,9 @@ def main(argv: list[str] | None = None) -> int:
     pt.add_argument("--json", action="store_true")
     c = sub.add_parser("check", help="validate a config's dataset against its scenario, then audit it on those rows")
     c.add_argument("--config", required=True, help="the RL config (data, rewards, scenario)")
-    c.add_argument("--n", type=int, default=200, help="rows to check and to audit on")
+    c.add_argument(
+        "--n", type=int, default=None, help="rows to check and to audit on (default 200; 5 for plan_execute)"
+    )
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--json", action="store_true")
     g = sub.add_parser("generate", help="write a scenario's rows (seeded)")

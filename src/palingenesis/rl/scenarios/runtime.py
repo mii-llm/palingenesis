@@ -546,10 +546,18 @@ class PartnerHost(Host):
         return PartnerSession(session, self.partner(session.role), tools, turns, conversational, episode.row)
 
 
-def play(scenario: Any, rows: list[dict], partners: dict[str, Partner], seed: int = 0, episodes: int = 1) -> list:
+def play(
+    scenario: Any,
+    rows: list[dict],
+    partners: dict[str, Partner],
+    seed: int = 0,
+    episodes: int = 1,
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> list:
     """Run `scenario` on `rows` with every role a partner: [[Episode, ...] per row]. No model is involved, so
     this is how a scenario's verifier is audited (oracle partners must earn the reward, degenerate ones must
-    not) and how its rules are tested."""
+    not) and how its rules are tested. `loop`: an event loop to run on instead of a new one per call (several
+    calls that share something bound to a loop, such as a code sandbox)."""
 
     async def one(row: dict, group: int, index: int) -> Episode:
         episode = Episode(PartnerHost(partners), row, group, index, seed, training=False)
@@ -562,4 +570,4 @@ def play(scenario: Any, rows: list[dict], partners: dict[str, Partner], seed: in
     async def all_rows() -> list:
         return [[await one(row, g, k) for k in range(episodes)] for g, row in enumerate(rows)]
 
-    return asyncio.run(all_rows())
+    return loop.run_until_complete(all_rows()) if loop is not None else asyncio.run(all_rows())

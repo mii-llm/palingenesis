@@ -160,8 +160,9 @@ def test_no_constant_verdict_earns_anything_whatever_the_solver_does(solver):
     # the oracle checker earns in full in every case, and the pair ends right
     for (episode,) in play(scenario, rows, {"solver": solvers[solver], "checker": table["checker"]["oracle"]}):
         assert all(c.rewards["verdict"] == 1.0 for c in by_role(episode, "checker"))
-        first = by_role(episode, "solver")[0]
-        assert first.rewards["metric/team"] == (0.0 if solver == "silent" else 1.0) or solver == "silent"
+        # the pair ends right: by the solver's answer, or by the checker's correction of it (a silent solver's own
+        # answer is never shown, so the correction of its stand-in counts)
+        assert by_role(episode, "solver")[0].rewards["metric/team"] == 1.0
 
 
 def test_the_twin_is_another_attempt_when_one_is_wrong_and_the_gold_when_the_solver_is():
@@ -207,15 +208,52 @@ def test_wrong_twins_fall_back_to_distractors_and_other_rows_and_are_checked_by_
     assert by_role(episode, "checker") == [] and by_role(episode, "solver")[0].rewards["metric/checked"] == 0.0
 
 
-def test_a_candidate_cut_by_the_channel_is_scored_again():
+def test_a_candidate_has_one_class_from_its_text_alone_or_is_not_shown():
+    # too long to show: never a candidate (and never cut), whichever class it has
     rows = [
         {"id": "long", "prompt": "Name it.", "answer": "a very long reference answer"},
         {"id": "b", "prompt": "?", "answer": "b"},
     ]
     scenario = pattern("solve_check", {"max_candidate_chars": 6}, rows=rows, correct="exact")
     ((episode,),) = play(scenario, rows[:1], oracles(scenario))
-    # the cut answer is no longer right: the pair would be two wrong answers, so the checker is not asked
-    assert by_role(episode, "checker") == [] and any(e["cut"] for e in episode.log)
+    assert by_role(episode, "checker") == [] and episode.log == []
+    assert by_role(episode, "solver")[0].rewards["metric/checked"] == 0.0
+
+    # a reward that reads the session (here: it cannot score an answer a session wrote) must not give the solver's
+    # text one class and the same text, as the gold, another: candidates are classified as text
+    def session_blind(completion, answer, messages, **row):
+        from palingenesis.rl.rewards import SkipSample
+
+        if messages:
+            raise SkipSample("cannot score a session now")
+        return float(completion.strip() == str(answer))
+
+    rows = math_rows(4)
+    scenario = build_scenario("solve_check")
+    scenario.bind(resolve_rewards({}, {"correct": session_blind}))
+    scenario.prepare(rows)
+    for row, (episode,) in zip(rows, play(scenario, rows, oracles(scenario))):
+        first = by_role(episode, "solver")[0]
+        assert first.rewards["correct"] is None and first.rewards["metric/checked"] == 1.0  # unscored, still checked
+        shown = [entry["delivered"] for entry in episode.log]
+        assert len(set(shown)) == 2 and row["answer"] in shown and first.rewards["metric/twin_slip"] == 1.0
+        assert all(c.rewards["verdict"] == 1.0 for c in by_role(episode, "checker"))
+
+    # a reward that can score nothing leaves every candidate without a class: nothing is checked
+    def outage(completion, **row):
+        from palingenesis.rl.rewards import SkipSample
+
+        raise SkipSample("down")
+
+    scenario = build_scenario("solve_check")
+    scenario.bind(resolve_rewards({}, {"correct": outage}))
+    scenario.prepare(rows)
+    for (episode,) in play(scenario, rows, oracles(scenario)):
+        assert by_role(episode, "checker") == [] and by_role(episode, "solver")[0].rewards["metric/checked"] == 0.0
+
+    # a verdict from the candidate's length alone earns nothing with the answer line (candidates are answers)
+    report = pattern("solve_check").audit(rows=math_rows(8))
+    assert report["degenerate"]["checker/accept_short"] == 0.0
 
 
 # ------------------------------------------------------------------ the audit
@@ -366,10 +404,13 @@ def test_answers_are_scored_by_the_rewards_of_the_config_and_by_nothing_else():
 
         raise SkipSample("judge down")
 
+    def answering_lead(messages):
+        return "SUBTASK: halve nine" if "Split it" in messages[-1]["content"] else "ANSWER: 4.5"
+
     scenario = build_scenario("lead_workers")
     scenario.bind(resolve_rewards({}, {"judge": outage}))
-    ((episode,),) = play(scenario, rows, oracles(scenario))
-    assert all(scenario.reward(s.role, s.rewards) is None for s in episode.sessions)
+    ((episode,),) = play(scenario, rows, {"lead": answering_lead, "worker": lambda messages: "4.5"})
+    assert len(episode.sessions) == 8 and all(scenario.reward(s.role, s.rewards) is None for s in episode.sessions)
 
 
 # ------------------------------------------------------------------ handoff
@@ -427,6 +468,8 @@ def test_handoff_pays_the_writer_for_what_its_note_adds():
         and "best note is a copy" in pattern("handoff", {"max_note_chars": 5000}).advice(rows)[0]
     )
     assert "no 'answer' column" in scenario.advice([{k: v for k, v in rows[0].items() if k != "answer"}])[0]
+    joined = [{**row, "question": f"{row['context']}\n\n{row['question']}"} for row in rows]
+    assert "the question already contains the material" in scenario.advice(joined)[0]
 
 
 # ------------------------------------------------------------------ lead_workers
@@ -470,6 +513,12 @@ def test_lead_workers_delegates_merges_and_credits_each_stage_in_its_own_group()
     report = scenario.audit(rows=rows)
     assert report["failures"] == [] and report["degenerate"]["worker/silent"] == 0.0
     assert report["degenerate"]["lead/no_merge"] == 0.0
+    # golds that also occur in the merge prompt's own words and numbers ("Subtask 1", "I am not sure") pay no idle worker
+    short = [{"id": f"s{i}", "prompt": f"What is {i} plus 1?", "answer": str(i + 1)} for i in range(4)]
+    short.append({"id": "w", "prompt": "Which pronoun is the first person singular?", "answer": "I"})
+    report = pattern("lead_workers", correct="exact").audit(rows=short)
+    assert report["failures"] == [] and set(report["degenerate"].values()) == {0.0}
+    assert plan.rewards["metric/subtasks"] == 0.0
     assert scenario.subtasks("1. SUBTASK: a\n- **SUBTASK:** b\nSUBTASK:\nnot one") == ["a", "b"]
     only_two = pattern("lead_workers", {"max_workers": 2, "team_samples": 1, "merge_samples": 1, "control": False})
     ((episode,),) = play(only_two, rows[:1], oracles(only_two))
@@ -582,6 +631,49 @@ def test_plan_execute_runs_the_environment_as_it_is_and_the_tests_pay(tmp_path):
     with pytest.raises(ScenarioError, match="a conversation of its own"):
         play(refused, rows[:1], oracles(refused))
     assert StandInHarbor.instances[-1].closed  # closed on the failure path too
+
+
+class SlowHarbor(StandInHarbor):
+    """A reset that takes a while (a container starting), and tests that cannot run."""
+
+    def reset(self, task_dir, **row):
+        import time
+
+        time.sleep(0.3)
+        self.started = True
+        return None
+
+    def get_reward(self, messages=None):
+        raise RuntimeError("the verifier's container did not start")
+
+
+def test_plan_execute_closes_an_environment_cancelled_during_its_reset_and_survives_a_failed_verifier(tmp_path):
+    import asyncio
+
+    from palingenesis.rl.scenarios.runtime import Episode, PartnerHost
+
+    rows = harbor_rows(tmp_path, 1)
+    scenario = build_scenario(
+        "plan_execute", {"env": f"{__name__}:SlowHarbor", "executor_samples": 1, "max_concurrent": 1}
+    )
+    StandInHarbor.instances.clear()
+
+    async def cancelled_while_resetting():
+        episode = Episode(PartnerHost(oracles(scenario)), rows[0], training=False)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(scenario.run(episode, rows[0]), 0.1)
+        await asyncio.gather(*scenario._closing)  # the shutdown goes on after the cancellation
+        (env,) = StandInHarbor.instances
+        assert env.started and env.closed  # closed after its reset finished, not before
+        assert scenario._slot()._value == 1  # and its slot is free again
+
+    asyncio.run(cancelled_while_resetting())
+
+    # a verifier that fails leaves that executor unscored; the episode itself is kept
+    ((episode,),) = play(scenario, rows, oracles(scenario))
+    (executor,) = by_role(episode, "executor")
+    assert executor.rewards == {"tests": None} and scenario.reward("executor", executor.rewards) is None
+    assert by_role(episode, "planner")[0].rewards["executed"] is None and StandInHarbor.instances[-1].closed
 
 
 def test_a_trained_executor_calls_the_environments_tools_with_their_schemas(tmp_path):
@@ -819,6 +911,9 @@ def test_cli_lists_the_patterns_and_checks_a_dataset_against_one(tmp_path, capsy
     assert "Add a rewards: section" in capsys.readouterr().out
     assert main(["check", "--config", config("unknown.yaml", good, rewards="{c: {fn: 'nowhere.module:fn'}}")]) == 1
     assert "FAIL  rewards: ModuleNotFoundError" in capsys.readouterr().out
+
+    assert main(["check", "--config", config("zero.yaml", good), "--n", "0"]) == 1
+    assert "no rows to check" in capsys.readouterr().out
 
     reading = _write(tmp_path / "reading.jsonl", reading_rows())
     handoff = config(

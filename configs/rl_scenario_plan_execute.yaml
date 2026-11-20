@@ -5,7 +5,7 @@
 #
 #   pgs harbor check data/harbor_tasks
 #   pgs harbor rows  data/harbor_tasks data/harbor_rows.jsonl
-#   pgs scenario check --config configs/rl_scenario_plan_execute.yaml --n 5   # starts containers
+#   pgs scenario check --config configs/rl_scenario_plan_execute.yaml         # starts containers (5 rows)
 #   pgs rl --config configs/rl_scenario_plan_execute.yaml
 #
 # No rewards: section and no env: section: the scenario runs HarborEnv itself, one container per executor.
@@ -27,7 +27,8 @@ scenario:
     max_plan_chars: 4000
     max_turns: 16                  # the executor's; a row's own "max_turns" wins
     tool_timeout: 120
-    max_concurrent: 16             # containers alive at once
+    max_concurrent: 64             # containers alive at once: batch_prompts x group_size x executors, so
+                                   # that no executor spends its episode's timeout waiting for one
     control: false                 # true: one executor without a plan per episode, and a `lift` for the planner
     env_args: {}                   # HarborEnv arguments (tools, reward_key, workdir, images); no harness profiles
 

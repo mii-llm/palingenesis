@@ -18,8 +18,11 @@ Credit, by the rules of the guide (a baseline only among sessions that could hav
 
   lead, plan     total: the mean reward of every merge that followed the plan. Compared with the plans of the
                  row's other episodes, which started from the same prompt.
-                 lift: total minus the control's reward: what delegating added. Weight 0 by default; make it
-                 the plan's reward with weights: {lead: {total: 0, lift: 1}}.
+                 lift: total minus the control's reward: what the team stage added to one session of the
+                 lead alone. That is delegation, and also plain extra compute (the same task sent to three
+                 workers is a vote). Weight 0 by default; weights: {lead: {total: 0, lift: 1}} makes it the
+                 plan's reward, and then the run's `reward`, outcome/pass@1 and data.retire_above read a mix
+                 of the plans' lift and the merges' `correct`: do not retire rows with it.
                  metric/subtasks, metric/control are logged.
   lead, merge    correct: the rewards' weighted sum on its final answer. Compared with the other merges of the
                  same team, which read the same replies: a merge is not credited with its workers' luck.
@@ -90,6 +93,10 @@ NOTHING = {
     "en": "(no subtask was given, so there are no replies)",
     "it": "(nessun sottocompito, quindi nessuna risposta)",
 }
+# the replies of a merge prompt: what follows each "Reply i: " up to the next block or the closing instruction
+REPLIES = re.compile(
+    r"(?ms)^(?:Reply|Risposta) \d+: (.*?)(?=\n\n(?:Subtask|Sottocompito) \d+: |\n\n(?:Now give|Ora dai) )"
+)
 SUBTASK = re.compile(r"(?im)^[ \t>*_`\-\d.)]*SUBTASK\b[ \t*_`]*:[ \t]*(.+?)[ \t]*$")
 
 
@@ -150,18 +157,18 @@ class LeadWorkers(Pattern):
         def flat_task(row) -> str:
             return " ".join(self.task(row).split())
 
-        def oracle_lead(messages, row):
+        async def oracle_lead(messages, row):
             now, gold = stage(messages, row), self.gold(row)
             if now == "plan":  # the whole task to every worker
                 return "\n".join(f"SUBTASK: {flat_task(row)}" for _ in range(self.max_workers))
-            if now == "merge" and gold is not None:  # the answer only if a worker's reply holds it
-                replies = messages[-1]["content"].replace(flat_task(row)[: self.max_subtask_chars], "")
-                replies = replies.replace(self.answer_line(self.language(row)), "")
-                return self.say(gold) if gold.casefold() in replies.casefold() else ""
-            return ""  # the control: alone, it does not know
+            if now == "merge" and gold is not None:  # the answer only if a worker's reply is a right answer
+                for reply in REPLIES.findall(messages[-1]["content"]):
+                    if reply.strip() and self.right(await self.grade_text(reply.strip(), row)):
+                        return self.say(gold)
+            return ""  # alone (the control), or with no right reply, it does not know
 
-        def no_merge(messages, row):
-            return oracle_lead(messages, row) if stage(messages, row) == "plan" else ""
+        async def no_merge(messages, row):
+            return await oracle_lead(messages, row) if stage(messages, row) == "plan" else ""
 
         def oracle_worker(messages, row):
             return self.gold(row) or ""
@@ -186,7 +193,7 @@ class LeadWorkers(Pattern):
         handed = episode.channel("subtask", max_chars=self.max_subtask_chars)
         returned = episode.channel("reply", max_chars=self.max_reply_chars)
         subtasks = [handed.send(s, "lead", f"worker:{i}") for i, s in enumerate(found[: self.max_workers])]
-        plan.reward("metric/subtasks", len(found))
+        plan.reward("metric/subtasks", len(subtasks))
 
         async def team(branch: Episode) -> float | None:
             workers = await asyncio.gather(

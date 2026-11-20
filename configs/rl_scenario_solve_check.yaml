@@ -1,7 +1,8 @@
 # Multi-role RL on a dataset you already have: a solver and a checker over GSM8K-style rows, scored by the same
 # reward as single-agent RL (guides/multi-agent.md, "Your own RL dataset plus a pattern").
 #
-# Rows are single-agent rows, {"question": ..., "answer": ...}; nothing is generated and no Python is written.
+# Rows are single-agent rows, {"question" or "prompt": ..., "answer": the final number}; nothing is generated
+# and no Python is written.
 # The pattern (scenario.type) supplies the protocol, the rewards: section the verifier.
 #
 #   pgs scenario patterns                                             # the patterns, their row fields and options
