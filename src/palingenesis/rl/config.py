@@ -369,6 +369,11 @@ class RLTrainConfig:
     # optimizer state in CPU memory: the largest model a GPU can train, at PCIe speed.
     fsdp: bool = False
     cpu_offload: bool = False
+    # With lora.rank under torchrun: instead of FSDP, every rank holds the whole frozen base (bf16) and its own copy
+    # of the adapters, runs its rollouts and its forward / backward without any collective, and the adapters'
+    # gradients are summed over the ranks in one collective per step (megabytes), after which every rank takes
+    # the same optimizer step. Each rank folds and loads its own engine's weights. Not with fsdp / cpu_offload.
+    replicate_base: bool = False
     reshard_after_forward: bool = True
     # A group's rollouts share their prompt: "on" forwards it once per group (an exact tree
     # forward/backward, palingenesis.seco_tree) instead of once per rollout; "auto" does so
@@ -696,12 +701,18 @@ class RLConfig:
         if e.tool_parser not in TOOL_PARSERS:
             errors.append(f"env.tool_parser must be one of {TOOL_PARSERS}, got {e.tool_parser!r}.")
 
+        # the policy is sharded with FSDP2: train.fsdp, train.cpu_offload, and under torchrun unless the frozen base
+        # is replicated (train.replicate_base with lora.rank)
+        replicated = bool(t.replicate_base) and bool(self.lora.rank)
+        in_world = os.environ.get("WORLD_SIZE", "1") != "1" and not replicated
+        if t.replicate_base and not self.lora.rank:
+            errors.append("train.replicate_base replicates a frozen base: it needs lora.rank (adapters).")
+        if t.replicate_base and (t.fsdp or t.cpu_offload):
+            errors.append("train.replicate_base is the alternative to FSDP: not with train.fsdp or train.cpu_offload.")
         if self.scenario.type or self.roles or self.scenario != RLScenarioConfig():
             from palingenesis.rl.scenarios.config import validate as validate_scenario
 
-            errors += validate_scenario(
-                self, sharded=os.environ.get("WORLD_SIZE", "1") != "1" or t.fsdp or t.cpu_offload
-            )
+            errors += validate_scenario(self, sharded=in_world or t.fsdp or t.cpu_offload)
         elif loss.advantage_std == "role" or loss.advantage_std_floor:
             errors.append("loss.advantage_std role and loss.advantage_std_floor need a scenario (scenario.type).")
         if not self.rewards and not python_rewards and not custom_env and not self.scenario.type:
@@ -806,7 +817,7 @@ class RLConfig:
         if (loss.kl_coef > 0 or loss.kl_ref_reset > 0) and not loss.kl_ref:
             errors.append('loss.kl_coef / kl_ref_reset need loss.kl_ref ("start" or a checkpoint).')
         # FSDP2 shards the policy with train.fsdp, with train.cpu_offload and under torchrun (rl.parallel)
-        sharded = t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"
+        sharded = t.fsdp or t.cpu_offload or in_world
         if loss.kl_ref and sharded:
             errors.append("loss.kl_ref is not supported with FSDP yet (train.fsdp, train.cpu_offload, torchrun).")
         if not 0 < loss.eps_low < 1 or loss.eps_high <= 0:
@@ -835,7 +846,7 @@ class RLConfig:
             errors.append(f"train.lr_scheduler must be 'constant' or 'cosine', got {t.lr_scheduler!r}.")
         if t.prompt_sharing not in ("auto", "on", "off"):
             errors.append(f"train.prompt_sharing must be auto, on or off, got {t.prompt_sharing!r}.")
-        if t.prompt_sharing == "on" and (t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"):
+        if t.prompt_sharing == "on" and (t.fsdp or t.cpu_offload or in_world):
             errors.append("train.prompt_sharing on runs the tree forward on an unsharded model: not with FSDP.")
         if m.gradient_checkpointing not in ("auto", "none", "selective", "full"):
             errors.append(
@@ -844,7 +855,7 @@ class RLConfig:
         world = int(os.environ.get("WORLD_SIZE", "1"))
         if world > 1 and r.batch_prompts % world:
             errors.append(f"rollout.batch_prompts ({r.batch_prompts}) must be divisible by the {world} ranks.")
-        if world > 1 and r.backend == "hf":
+        if world > 1 and r.backend == "hf" and not replicated:
             errors.append(
                 "rollout.backend hf generates with the sharded model: under torchrun every rank would "
                 "run FSDP collectives inside generate() out of step. Use vllm (one engine per rank)."
@@ -857,9 +868,7 @@ class RLConfig:
             errors.append("rollout.backend hf generates with the sharded trainer model: max_staleness must be 0.")
         if t.optimizer not in ("adamw", "muon", "adamw8bit", "paged_adamw8bit"):
             errors.append(f"train.optimizer must be adamw, muon, adamw8bit or paged_adamw8bit, got {t.optimizer!r}.")
-        elif t.optimizer not in ("adamw", "muon") and (
-            t.fsdp or t.cpu_offload or os.environ.get("WORLD_SIZE", "1") != "1"
-        ):
+        elif t.optimizer not in ("adamw", "muon") and (t.fsdp or t.cpu_offload or in_world):
             errors.append(
                 f"train.optimizer {t.optimizer} (bitsandbytes) steps local tensors: not with FSDP or cpu_offload."
             )

@@ -8,7 +8,6 @@ import asyncio
 import itertools
 import json
 import sys
-import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,8 +20,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from test_rl import tiny_policy, tokenizer  # noqa: E402
 
 from palingenesis.rl.config import RLConfig, RLConfigError  # noqa: E402
-from palingenesis.rl.scenarios import Scenario, build_scenario, play  # noqa: E402
-from palingenesis.rl.scenarios import credit  # noqa: E402
+from palingenesis.rl.scenarios import (  # noqa: E402
+    Scenario,
+    build_scenario,
+    credit,  # noqa: E402
+    play,
+)
 from palingenesis.rl.scenarios.base import tagged_integer, tagged_word, user  # noqa: E402
 from palingenesis.rl.scenarios.runtime import (  # noqa: E402
     Episode,
@@ -303,7 +306,9 @@ def test_workers_are_judged_on_the_question_they_got():
         assert lead.rewards["total"] == 0.0 and lead.rewards["coverage"] == 0.0
         assert lead.rewards["metric/asks"] == len(row["ledgers"]) + 1  # the unknown region reached no clerk
         judged = [c for c in clerks if c.rewards["value"] is not None]
-        assert len(judged) == len(row["ledgers"]) and all(c.rewards["value"] == 1.0 for c in judged)  # right on what was asked
+        assert len(judged) == len(row["ledgers"]) and all(
+            c.rewards["value"] == 1.0 for c in judged
+        )  # right on what was asked
         (unjudged,) = [c for c in clerks if c.rewards["value"] is None]  # no listed item in the question
         assert scenario.reward("worker", unjudged.rewards) is None or unjudged.rewards["team"] == 0.0
         assert len(episode.log) == 2 * len(clerks)  # every question and every reply went through a channel
@@ -523,7 +528,9 @@ def test_a_game_is_one_token_exact_trajectory_per_player():
     def policy(prompt, call):  # the first player plays perfectly; the second always takes one
         if "move first" in prompt:
             turns = prompt.split("<|im_start|>")[1:]
-            messages = [{"role": t.split("\n", 1)[0], "content": t.split("\n", 1)[1].split("<|im_end|>")[0]} for t in turns]
+            messages = [
+                {"role": t.split("\n", 1)[0], "content": t.split("\n", 1)[1].split("<|im_end|>")[0]} for t in turns
+            ]
             return oracle([m for m in messages if m["role"] in ("system", "user")])
         return "TAKE: 1"
 
@@ -567,7 +574,9 @@ def test_a_lead_delegates_through_a_tool_and_partners_play_the_workers():
                 for region in regions
             ]
             return "".join(f"<tool_call>\n{c}\n</tool_call>\n" for c in calls)
-        values = [tagged_integer(part.split("</tool_response>")[0], "VALUE") for part in prompt.split("<tool_response>")[1:]]
+        values = [
+            tagged_integer(part.split("</tool_response>")[0], "VALUE") for part in prompt.split("<tool_response>")[1:]
+        ]
         return f"TOTAL: {sum(values) + (call % 2)}"  # every other answer is off by one: the group is informative
 
     roles = {"worker": {"partner": "scripted:oracle"}}
@@ -598,7 +607,12 @@ def test_a_failed_or_slow_episode_is_left_out_and_the_others_train():
         counts = dict(pipeline.episode_counts)
     finally:
         pipeline.close()
-    assert [t.scored for t in group] == [False, False, True, True] and [t.trained for t in group] == [False, False, True, True]
+    assert [t.scored for t in group] == [False, False, True, True] and [t.trained for t in group] == [
+        False,
+        False,
+        True,
+        True,
+    ]
     assert "verifier broke" in group[0].info["episode_error"] and "Timeout" in group[1].info["episode_error"]
     assert counts["episodes"] == 4 and counts["failed"] == 2 and group_is_informative(group)
     assert [t.reward for t in group[2:]] == [2.0, 3.0]
@@ -660,7 +674,9 @@ def test_stale_rows_are_dropped_whole():
         return group
 
     fresh, half, old = row(3, 2), row(3, 1), row(0, 0)
-    assert trainer._fresh([fresh, half, old]) == [fresh] and trainer.stale_groups == 2  # one stale session drops its row
+    assert (
+        trainer._fresh([fresh, half, old]) == [fresh] and trainer.stale_groups == 2
+    )  # one stale session drops its row
 
 
 # --------------------------------------------------------- trainer, end to end
@@ -734,7 +750,9 @@ def test_shared_policy_trains_on_every_role_and_dumps_exports_and_resumes(tmp_pa
     a = next(r for r in records if r["role"] == "a")
     assert [m["role"] for m in session_messages(a)] == ["user", "assistant"]
     rows = list(sft_rows(records, min_reward=None))
-    assert len(rows) == len([r for r in records if r["scored"]]) and {"messages", "role", "reward", "source"} <= set(rows[0])
+    assert len(rows) == len([r for r in records if r["scored"]]) and {"messages", "role", "reward", "source"} <= set(
+        rows[0]
+    )
     assert all(row["reward"] >= 0.1 for row in sft_rows(records, roles=["b"], min_reward=0.1))
     pairs = list(dpo_rows(records, margin=0.01))
     assert pairs and {p["role"] for p in pairs} <= {"a", "b"}  # sessions that answered one and the same prompt
@@ -765,7 +783,9 @@ def test_two_roles_train_their_own_adapters_on_one_base(tmp_path):
     modules = trainer.adapters.plugin.modules
     named = dict(trainer.model.named_parameters())
     trainable = {n for n, p in named.items() if p.requires_grad}
-    assert trainable and all(".roles.alpha." in n or ".roles.beta." in n for n in trainable)  # the default one is unused
+    assert trainable and all(
+        ".roles.alpha." in n or ".roles.beta." in n for n in trainable
+    )  # the default one is unused
     assert [len(g["params"]) for g in trainer.opt.param_groups] == [2 * len(modules)] * 2  # one group per adapter
     assert isinstance(trainer.engine, AdapterEngine) and set(trainer.pipeline.clients) == {"", "alpha", "beta"}
     # each role's sessions are generated and scored with its own adapter: after moving the two adapters apart,
@@ -789,6 +809,7 @@ def test_two_roles_train_their_own_adapters_on_one_base(tmp_path):
     steps = [m for kind, m in trainer.logged if kind == "step"]
     assert steps[0]["policy/mismatch_k3"] < 1e-6 and steps[0]["policy/abs_ratio_dev"] < 1e-3  # the right adapter each
     assert steps[0]["policy/kl_ref"] > 1e-4  # ... and far from the base, which the reference still is
+    assert steps[0]["grad_norm/alpha"] > 0 and steps[0]["grad_norm/beta"] > 0  # clipped, and logged, one by one
     after = dict(trainer.model.named_parameters())
     moved = {n for n in after if not torch.equal(after[n], before[n])}
     assert moved <= trainable and any(".roles.alpha." in n for n in moved) and any(".roles.beta." in n for n in moved)
@@ -796,7 +817,9 @@ def test_two_roles_train_their_own_adapters_on_one_base(tmp_path):
 
     # each adapter's fold is its own policy; the checkpoint holds every adapter, and a run resumes from them
     name, m = next(iter(modules.items()))
-    folds = {key: dict(trainer.adapters.engine_parameters(trainer.model, key))[f"{name}.weight"] for key in ("alpha", "beta")}
+    folds = {
+        key: dict(trainer.adapters.engine_parameters(trainer.model, key))[f"{name}.weight"] for key in ("alpha", "beta")
+    }
     for key, fold in folds.items():
         factors = m.roles[key]
         torch.testing.assert_close(fold, m.weight + m.scaling * (factors.lora_B @ factors.lora_A))
@@ -879,7 +902,9 @@ def test_the_planner_sizes_a_layout_and_says_what_does_not_fit():
     from palingenesis.rl.scenarios.placement import Cluster, Workload, plan, workload_of
 
     one = plan(Cluster(1, 1, 80), Workload(params_b=0.8), "rl.yaml")
-    assert one.ranks == 1 and one.mode == "single" and not one.errors and one.command.startswith("pgs rl --config rl.yaml")
+    assert (
+        one.ranks == 1 and one.mode == "single" and not one.errors and one.command.startswith("pgs rl --config rl.yaml")
+    )
     assert one.trainer_gb == pytest.approx(18 * 0.8 + 8) and one.engine_weights_gb == pytest.approx(1.6)
     adapters = plan(Cluster(1, 1, 80), Workload(params_b=0.8, lora_rank=16, engines=3))
     assert adapters.trainer_gb < one.trainer_gb and adapters.overrides["rollout.backend"] == "vllm_server"
@@ -892,7 +917,12 @@ def test_the_planner_sizes_a_layout_and_says_what_does_not_fit():
     assert cluster.trainer_gb == pytest.approx(16 * 4 / 16 + 2 * 4 + 8)
     assert plan(Cluster(1, 2, 80), Workload(params_b=0.8, lora_rank=16, engines=2)).errors
     config = RLConfig()
-    for key, value in {"scenario.type": "take_away", "lora.rank": 8, "roles.first.adapter": "p1", "roles.second.partner": "base"}.items():
+    for key, value in {
+        "scenario.type": "take_away",
+        "lora.rank": 8,
+        "roles.first.adapter": "p1",
+        "roles.second.partner": "base",
+    }.items():
         config.set(key, value)
     assert workload_of(config, 0.8).engines == 3
 
@@ -910,7 +940,10 @@ def test_the_planner_sizes_a_layout_and_says_what_does_not_fit():
         ({"roles.first.partner": "scripted:nobody"}, "has no such scripted partner"),
         ({"roles.first.adapter": "p1"}, "need lora.rank"),
         ({"roles.first.adapter": "p-1", "lora.rank": 4}, "letters, digits and underscores"),
-        ({"roles.first.adapter": "p1", "roles.first.partner": "base", "lora.rank": 4}, "partner and adapter are alternatives"),
+        (
+            {"roles.first.adapter": "p1", "roles.first.partner": "base", "lora.rank": 4},
+            "partner and adapter are alternatives",
+        ),
         ({"roles.first.partner": "base"}, "it needs lora.rank"),
         ({"roles.first.adapter": "p1", "lora.rank": 4, "rollout.backend": "vllm"}, "need a rollout engine each"),
         ({"roles.first.adapter": "p1", "lora.rank": 4, "lora.dora": True}, "not supported with lora.dora"),
@@ -965,3 +998,89 @@ def test_cli_generates_audits_and_plans(tmp_path, capsys):
     assert main(["plan", "--config", str(tmp_path / "rl.yaml"), "--params-b", "0.8"]) == 0
     assert json.loads(capsys.readouterr().out)["ranks"] == 1
     assert main(["list"]) == 0 and "checked_answer" in capsys.readouterr().out
+
+
+# ------------------------------------------------- several ranks, one frozen base
+
+
+def test_summed_gradients_keep_absent_parameters_absent(monkeypatch):
+    import torch.distributed as dist
+
+    from palingenesis.rl.parallel import Parallel
+
+    parallel = Parallel(fsdp=False)
+    seen = []
+
+    def all_reduce(tensor, op=None):  # two ranks with the same values: a sum doubles
+        seen.append(tensor.numel())
+        tensor.mul_(2)
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    a, b, c = (torch.nn.Parameter(torch.ones(2, 3)) for _ in range(3))
+    a.grad, c.grad = torch.full((2, 3), 0.5), None
+    b.grad = torch.arange(6.0).reshape(2, 3)
+    parallel.sum_gradients([a, b, c])
+    assert seen == [6 + 6 + 6 + 3]  # one collective for every gradient and the presence flags
+    torch.testing.assert_close(a.grad, torch.ones(2, 3))
+    torch.testing.assert_close(b.grad, 2 * torch.arange(6.0).reshape(2, 3))
+    assert c.grad is None  # no rank had a gradient for it: no replica may move it
+
+
+def test_two_ranks_with_a_replicated_base_stay_one_policy(tmp_path):
+    """train.replicate_base on two real ranks (CPU, gloo): each runs its own episodes and backward with no
+    collective, the adapters' gradients are summed once per step, and both ranks end with the same adapters and
+    the same optimizer state."""
+    import socket
+    import subprocess
+
+    from palingenesis.rl.adapters import ADAPTER_DIR
+
+    policy = tiny_policy(tmp_path)
+    (tmp_path / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in Chat.generate(24)))
+    (tmp_path / "rl.yaml").write_text(
+        f"model: {{policy: {policy}, use_liger_kernel: false, chat_template_kwargs: {{enable_thinking: false}}}}\n"
+        f"data: {{dataset: {tmp_path}/rows.jsonl}}\n"
+        "rollout: {backend: hf, batch_prompts: 4, group_size: 3, max_new_tokens: 8}\n"
+        f'scenario: {{type: "{CHAT}"}}\n'
+        "lora: {rank: 4, alpha: 8}\n"
+        "loss: {advantage_std: role, kl_ref: start}\n"
+        f"train: {{output_dir: {tmp_path}/run, steps: 3, learning_rate: 1.0e-2, warmup_steps: 1, save_steps: 3, "
+        "replicate_base: true}\n"
+    )
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    root = Path(__file__).parent.parent
+    environment = {
+        **__import__("os").environ,
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": str(port),
+        "WORLD_SIZE": "2",
+        "PYTHONPATH": f"{root / 'src'}:{root / 'tests'}",
+    }
+    ranks = [
+        subprocess.Popen(
+            [sys.executable, "-m", "palingenesis.rl.trainer", "--config", str(tmp_path / "rl.yaml")],
+            env={**environment, "RANK": str(rank), "LOCAL_RANK": str(rank)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for rank in range(2)
+    ]
+    try:
+        outputs = [process.communicate(timeout=240)[0] for process in ranks]
+    finally:
+        for process in ranks:
+            process.kill()
+    assert [process.returncode for process in ranks] == [0, 0], outputs[0][-2000:] + outputs[1][-2000:]
+    assert "step 3 |" in outputs[0] and "role/a/reward" in outputs[0]
+    step = tmp_path / "run" / "step_3"
+    assert (step / ADAPTER_DIR / "adapter_model.safetensors").exists() and (tmp_path / "run" / "final").exists()
+    states = [torch.load(step / f"rank{rank}.pt", weights_only=False)["optimizer"]["state"] for rank in range(2)]
+    assert len(states[0]) == len(states[1]) > 0
+    moved = 0
+    for key in states[0]:  # the same gradients reached both replicas at every step
+        torch.testing.assert_close(states[0][key]["exp_avg"], states[1][key]["exp_avg"], rtol=0, atol=0)
+        moved += bool(states[0][key]["exp_avg"].abs().sum() > 0)
+    assert moved > 0

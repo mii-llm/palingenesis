@@ -42,6 +42,8 @@ Equivalent to:
 torchrun --standalone --nproc_per_node=1 -m palingenesis.train --config configs/quickstart.yaml
 ```
 
+`pgs scenario` generates, audits and exports multi-role RL data and plans a cluster layout (`pgs scenario list | generate | audit | export | plan`; [Multi-Agent RL](../guides/multi-agent.md)); training on a scenario is `pgs rl` with a `scenario:` section.
+
 LoRA is a trainer plugin of `pgs train`, not a separate command: `pgs init lora`, then `pgs train --config lora.yaml` ([LoRA guide](../guides/lora.md)). In `pgs rl` it is the config's `lora:` section ([LoRA in RL](../guides/lora.md#lora-in-rl)).
 
 ### distill

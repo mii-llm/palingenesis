@@ -1,0 +1,57 @@
+# Multi-role RL: a solver and a verifier with separate LoRA adapters on one frozen base (guides/multi-agent.md).
+# One A100 80 GB, Qwen3.5-0.8B: one base in the trainer, two adapters of megabytes, and one vLLM server per
+# adapter (plus the default policy's), each fed its folded weights. Remove the two `adapter:` lines and set
+# rollout.backend vllm for one shared policy on the in-process engine.
+#
+#   pgs scenario generate checked_answer --n 4000 --seed 0 --out data/checked_answer.jsonl
+#   pgs scenario generate checked_answer --n 200 --seed 1 --out data/checked_answer_eval.jsonl
+#   pgs scenario audit checked_answer
+#   pgs rl --config configs/scenario_checked_answer.yaml
+#
+# CPU-tested only (hf backend). The vllm_server path with several servers has not been run.
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/checked_answer.jsonl
+  eval_dataset: data/checked_answer_eval.jsonl
+
+scenario:
+  type: checked_answer
+  args: {verifier_samples: 2}
+
+roles:
+  solver: {adapter: solver}
+  verifier: {adapter: verifier}
+
+lora:
+  rank: 16
+  alpha: 32
+
+rollout:
+  backend: vllm_server
+  batch_prompts: 32
+  group_size: 4                    # x (1 solver + 4 verifier sessions) per episode
+  max_new_tokens: 128
+  max_model_len: 2048
+  gpu_memory_utilization: 0.15     # per server: three servers
+  max_staleness: 1
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+  kl_ref: start                    # the base with the adapters off: no second model
+
+train:
+  output_dir: runs/scenario_checked_answer
+  steps: 200
+  learning_rate: 2.0e-5
+  eval_every: 25
+  eval_samples: 200
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 30

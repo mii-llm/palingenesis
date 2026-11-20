@@ -1,0 +1,56 @@
+# Multi-role RL on a cluster (for example 2 nodes x 8 GPUs): one shared policy trained as LoRA adapters on a
+# frozen base that every rank holds whole (train.replicate_base). Each rank runs its own vLLM engine, its own
+# episodes and its own forward / backward with no collective; the adapters' gradients are summed once per step.
+#
+#   pgs scenario plan --config configs/scenario_cluster.yaml --params-b 4 --nodes 2 --gpus-per-node 8
+#   torchrun --nnodes 2 --nproc_per_node 8 --rdzv_backend c10d --rdzv_endpoint $HEAD_NODE:29400 \
+#       -m palingenesis.rl.trainer --config configs/scenario_cluster.yaml
+#
+# Not run on any GPU yet (a two-rank CPU run is tested). Compare against the same config with
+# train.replicate_base false (FSDP) before relying on it.
+
+model:
+  policy: Qwen/Qwen3.5-4B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/ledger_sum.jsonl
+  eval_dataset: data/ledger_sum_eval.jsonl
+
+scenario:
+  type: ledger_sum
+
+roles:
+  lead: {max_turns: 8, max_completion_tokens: 1024}
+  worker: {max_new_tokens: 64}
+
+lora:
+  rank: 16
+  alpha: 32
+
+rollout:
+  backend: vllm
+  batch_prompts: 256               # the global batch: 16 per rank
+  group_size: 8
+  max_new_tokens: 384
+  max_completion_tokens: 1024
+  max_model_len: 4096
+  gpu_memory_utilization: 0.4
+  max_staleness: 1
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+
+train:
+  output_dir: runs/scenario_cluster
+  steps: 300
+  learning_rate: 2.0e-5
+  replicate_base: true
+  eval_every: 25
+  eval_samples: 512
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 30

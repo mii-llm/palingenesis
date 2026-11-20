@@ -1,0 +1,51 @@
+# Multi-role RL: a lead that delegates to workers whose sub-answers are checked one by one (guides/multi-agent.md).
+# One A100 80 GB, Qwen3.5-0.8B, one policy for both roles (shared weights). The lead calls the `ask` tool; each
+# call runs a worker session; the calls of one turn run in parallel.
+#
+#   pgs scenario generate ledger_sum --n 4000 --seed 0 --out data/ledger_sum.jsonl
+#   pgs scenario generate ledger_sum --n 200 --seed 1 --out data/ledger_sum_eval.jsonl
+#   pgs scenario audit ledger_sum
+#   pgs rl --config configs/scenario_ledger_sum.yaml
+#
+# CPU-tested only: not yet run on a GPU.
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/ledger_sum.jsonl
+  eval_dataset: data/ledger_sum_eval.jsonl
+
+scenario:
+  type: ledger_sum
+
+roles:
+  lead: {share: 1.0, max_turns: 8, max_completion_tokens: 1024}
+  worker: {share: 1.0, max_new_tokens: 64}
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 8
+  max_new_tokens: 384
+  max_completion_tokens: 1024
+  max_model_len: 4096
+  gpu_memory_utilization: 0.35
+  max_staleness: 1
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+
+train:
+  output_dir: runs/scenario_ledger_sum
+  steps: 200
+  learning_rate: 2.0e-6
+  eval_every: 25
+  eval_samples: 200
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 30

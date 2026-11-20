@@ -1,0 +1,52 @@
+# Multi-role RL: a two-player game with a known solution (palingenesis.rl.scenarios, guides/multi-agent.md).
+# One A100 80 GB, Qwen3.5-0.8B. The policy plays the first seat against a perfect, frozen opponent; switch the
+# second role to {} for self-play with shared weights.
+#
+#   pgs scenario generate take_away --n 4000 --seed 0 --out data/take_away.jsonl
+#   pgs scenario generate take_away --n 200 --seed 1 --out data/take_away_eval.jsonl
+#   pgs scenario audit take_away
+#   pgs rl --config configs/scenario_take_away.yaml
+#
+# CPU-tested only: not yet run on a GPU.
+
+model:
+  policy: Qwen/Qwen3.5-0.8B
+  chat_template_kwargs: {enable_thinking: false}
+
+data:
+  dataset: data/take_away.jsonl
+  eval_dataset: data/take_away_eval.jsonl
+
+scenario:
+  type: take_away
+  args: {weights: {first: {win: 1.0, optimal: 0.0}}}   # optimal: logged; give it a weight for a process reward
+
+roles:
+  first: {}
+  second: {partner: "scripted:oracle"}
+
+rollout:
+  backend: vllm
+  batch_prompts: 32
+  group_size: 8
+  max_new_tokens: 32               # one move
+  max_completion_tokens: 512       # a whole game
+  max_model_len: 2048
+  gpu_memory_utilization: 0.35
+  max_staleness: 1                 # the next batch's games run while the trainer steps
+
+loss:
+  advantage_std: role
+  advantage_std_floor: 0.05
+
+train:
+  output_dir: runs/scenario_take_away
+  steps: 200
+  learning_rate: 2.0e-6
+  eval_every: 25
+  eval_samples: 200
+  save_steps: 50
+
+logging:
+  dump_trajectories: 10
+  dump_groups: 30

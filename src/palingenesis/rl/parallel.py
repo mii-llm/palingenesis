@@ -38,18 +38,23 @@ def _free_port() -> int:
 
 
 class Parallel:
-    def __init__(self, fsdp: bool, cpu_offload: bool = False, reshard_after_forward: bool = True):
+    def __init__(
+        self, fsdp: bool, cpu_offload: bool = False, reshard_after_forward: bool = True, replicated: bool = False
+    ):
         self.world = int(os.environ.get("WORLD_SIZE", "1"))
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        self.fsdp = fsdp or cpu_offload or self.world > 1
+        # replicated (train.replicate_base, with LoRA adapters): no sharding; every rank holds the frozen base and
+        # a copy of the adapters, and only the adapters' gradients cross ranks (sum_gradients)
+        self.replicated = replicated and self.world > 1 and not fsdp and not cpu_offload
+        self.fsdp = fsdp or cpu_offload or (self.world > 1 and not self.replicated)
         self.cpu_offload = cpu_offload
         self.reshard_after_forward = reshard_after_forward
         cuda = torch.cuda.is_available()
         self.device_type = "cuda" if cuda else "cpu"
         if cuda:
             torch.cuda.set_device(self.local_rank)
-        if self.fsdp and not dist.is_initialized():
+        if (self.fsdp or self.replicated) and not dist.is_initialized():
             if self.world == 1:  # FSDP2 on one GPU (CPU offload) still needs a process group
                 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
                 os.environ.setdefault("MASTER_PORT", str(_free_port()))
@@ -114,6 +119,41 @@ class Parallel:
             yield name, tensor.to(device=self.device, dtype=torch.bfloat16)
 
     # ------------------------------------------------------------ collectives
+
+    @torch.no_grad()
+    def sum_gradients(self, params: list) -> None:
+        """Replicated layout: every parameter's gradient becomes the sum over the ranks, in one collective (the
+        loss normalisers are global already, so the sum is the batch's gradient). A parameter without a gradient
+        on this rank counts as zero; one without a gradient on any rank keeps none, on every rank alike (an
+        optimizer must not move it by momentum on some replicas only)."""
+        has = torch.tensor([float(p.grad is not None) for p in params], device=self.device)
+        parts = [(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1).float() for p in params]
+        flat = torch.cat([*parts, has])
+        dist.all_reduce(flat)
+        present = flat[len(flat) - len(params) :] > 0
+        offset = 0
+        for p, keep in zip(params, present.tolist()):
+            n = p.numel()
+            p.grad = flat[offset : offset + n].view_as(p).to(p.dtype).clone() if keep else None
+            offset += n
+
+    @torch.no_grad()
+    def replica_drift(self, params: list) -> float:
+        """Replicated layout: the largest difference between the ranks' parameter checksums (0: the replicas are
+        the same). When they differ, every rank takes rank 0's parameters (one broadcast)."""
+        local = torch.stack([p.double().sum() for p in params] + [p.double().abs().sum() for p in params])
+        low, high = local.clone(), local.clone()
+        dist.all_reduce(low, op=dist.ReduceOp.MIN)
+        dist.all_reduce(high, op=dist.ReduceOp.MAX)
+        drift = float((high - low).abs().max())
+        if drift > 0:
+            flat = torch.cat([p.reshape(-1).float() for p in params])
+            dist.broadcast(flat, src=0)
+            offset = 0
+            for p in params:
+                p.copy_(flat[offset : offset + p.numel()].view_as(p).to(p.dtype))
+                offset += p.numel()
+        return drift
 
     def sum(self, values: list[float]) -> list[float]:
         """Element-wise sum over ranks, in one collective."""

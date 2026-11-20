@@ -97,6 +97,13 @@ Training issue?
 │   ├── Alarms (exit 1): length_share > 0.2 (budget or rambling), turns_share > 0.2 (never finishes),
 │   │   tool_error_rate > 0.3 (schemas / arguments / timeouts), loop_share > 0.1, zero_variance_share > 0.5
 │   └── Rollout engine latency: vLLM OTLP traces via rollout.vllm_args (see the Observability guide)
+├── Multi-role RL (pgs rl with a scenario: section; CPU-tested only, GPU validation pending)
+│   ├── Before training: pgs scenario audit <name> (oracle partners must earn, degenerate ones must not; exit 1)
+│   ├── Watch per role: role/<r>/reward, role/<r>/advantage_std (0 = that role's groups carry no signal),
+│   │   role/<r>/truncated, episode/failed; pgs rollouts reports finish reasons, loops and rewards per role
+│   ├── Sessions end after one turn: rollout.max_completion_tokens is a session's whole budget (default: one turn)
+│   ├── One role dominates: loss.advantage_std: role + advantage_std_floor, roles.<name>.share
+│   └── Always run a single-agent control at equal sampled tokens (see the multi-agent guide)
 ├── Distilling a larger teacher on fixed data (off-policy KD in pgs train), or QAT while distilling
 │   ├── Setup: distill.enabled + distill.teachers.<name>: {model: ...} (online) or {cache: ...} (pgs distill-cache)
 │   ├── Check before: pgs profile --config ... (counts teacher weights and targets); the teacher must share

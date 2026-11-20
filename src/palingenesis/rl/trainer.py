@@ -93,6 +93,7 @@ logger = logging.getLogger(__name__)
 # below this; above it the two compute different distributions (weights not loaded, a chat template, stop token or
 # temperature difference, FP8 rollouts, kernels that disagree), and the importance weights correct a bug, not rounding.
 MISMATCH_K3_STEP0_WARN = 1e-2
+REPLICA_CHECK_EVERY = 50  # steps between checks that the replicas of a replicated base hold the same adapters
 
 # Statistics summed over data-parallel ranks (the rest are averaged)
 _SUMMED = {
@@ -151,7 +152,9 @@ class RLTrainer:
         self.config = config
         m, r, t = config.model, config.rollout, config.train
         check_visible_devices()
-        self.parallel = Parallel(t.fsdp, t.cpu_offload, t.reshard_after_forward)
+        self.parallel = Parallel(
+            t.fsdp, t.cpu_offload, t.reshard_after_forward, replicated=t.replicate_base and bool(config.lora.rank)
+        )
         rank, world = self.parallel.rank, self.parallel.world
         self.device = self.parallel.device
         self.rng = random.Random(t.seed + rank)
@@ -694,7 +697,8 @@ class RLTrainer:
                 micro_adapters += [name] * len(part)
         else:
             micro_batches = list(self._micro_batches(trajectories))
-        count = self.parallel.max(len(micro_batches))  # FSDP's gathers are collectives: same count on every rank
+        # FSDP's gathers are collectives: the same count on every rank (a replicated base has none in its forward)
+        count = len(micro_batches) if self.parallel.replicated else self.parallel.max(len(micro_batches))
         micro_batches += [None] * (count - len(micro_batches))
         device = self.device
         current = self._current_version()
@@ -990,6 +994,8 @@ class RLTrainer:
                 if self.dumps is not None and batch.dump is not None:  # advantages assigned: written off-thread
                     self.dumps.submit(step + 1, batch.dump, batch.timeline)
                 trained = self.parallel.sum([metrics.get("trained_sequences", 0.0)])[0]
+                if self.parallel.replicated:  # the batch's gradient: the ranks' summed, the same on every replica
+                    self.parallel.sum_gradients(self._trainable())
                 with self.weights.lock:
                     if self.adapters is not None and self.adapters.names:
                         # each adapter clipped by itself: one role's large gradient does not shrink another's
@@ -998,6 +1004,9 @@ class RLTrainer:
                             for group in self.opt.param_groups
                         ]
                         grad_norm = torch.stack([n.float() for n in norms]).norm()
+                        metrics.update(
+                            {f"grad_norm/{name}": float(n) for name, n in zip(self.adapters.group_names, norms)}
+                        )
                     else:
                         grad_norm = torch.nn.utils.clip_grad_norm_(self._trainable(), t.max_grad_norm)
                     grad_norm = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
@@ -1042,6 +1051,9 @@ class RLTrainer:
                     metrics[DROPPED_METRIC] = self.dumps.dropped
                 if self.adapters is not None:
                     metrics.update(self.adapters.metrics(self.model, step + 1))
+                if self.parallel.replicated and (step + 1) % REPLICA_CHECK_EVERY == 0:
+                    with self.weights.lock:  # the replicas must stay one policy: checked, and repaired from rank 0
+                        metrics["replica/drift"] = self.parallel.replica_drift(self._trainable())
                 metrics = self._combine(metrics)
                 if step == 0:
                     self._parity_check(metrics)
@@ -1173,6 +1185,8 @@ class RLTrainer:
             with self.master.fp32() if self.master is not None else contextlib.nullcontext():
                 if self.adapters is None:
                     _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
+                elif self.parallel.replicated and not self.parallel.main:
+                    pass  # every rank holds the same policy: rank 0 writes it
                 else:  # the folded model in float32 (a plain checkpoint) and <path>/adapter
                     export = self.adapters.export(path)
                     _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp, export)

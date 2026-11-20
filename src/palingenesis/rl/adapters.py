@@ -182,6 +182,7 @@ class PolicyAdapters:
         split_m = self.plugin.dora and self.ctx.config.train.weight_decay > 0
         if self.names:  # one group per adapter: each is clipped by itself (adapter_of names a parameter's adapter)
             order = ([""] if self.default_trains else []) + self.names
+            self.group_names = [name or "policy" for name in order]  # the optimizer groups' adapters, in order
             groups = [{"params": [p for p, n in zip(params, names) if adapter_of(n) == name]} for name in order]
             return groups, [1.0] * len(groups)
         if not split_b and not split_m:

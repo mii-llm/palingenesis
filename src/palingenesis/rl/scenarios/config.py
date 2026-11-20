@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -100,6 +101,11 @@ def validate(config: Any, sharded: bool) -> list[str]:
             errors.append(
                 "roles with their own adapter are not supported with loss.kl_ref_reset (kl_ref: start works)."
             )
+    if (names or based) and config.rollout.backend != "hf" and os.environ.get("WORLD_SIZE", "1") != "1":
+        errors.append(
+            "roles with their own adapter (or partner: base) run on one GPU for now: a vLLM server per adapter is "
+            "single-process. Under torchrun, share the weights between the roles."
+        )
     if (names or based) and config.rollout.backend == "vllm":
         errors.append(
             "roles with their own adapter (or partner: base) need a rollout engine each: use rollout.backend "

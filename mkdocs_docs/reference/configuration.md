@@ -182,6 +182,28 @@ Mixture-of-Experts models (ignored for dense models). The same section exists in
 
 RL configs also have a `lora:` section (`rank`, `alpha`, `rslora`, `dora`, `lr_ratio`, `targets`, `exclude`; `rank: 0` = off) that trains low-rank adapters instead of the full weights: see [LoRA in RL](../guides/lora.md#lora-in-rl).
 
+### RL: `scenario`, `roles` and replicated bases
+
+RL configs (`pgs rl`) run multi-role episodes when they have a `scenario:` section ([Multi-Agent RL](../guides/multi-agent.md)).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `scenario.type` | str | `""` | A built-in scenario (`take_away`, `ledger_sum`, `checked_answer`) or `module:Class` / `path/to/file.py:Class`. Empty: single-agent RL. |
+| `scenario.args` | dict | `{}` | The scenario's own options, e.g. `{weights: {lead: {coverage: 0.2}}}`. |
+| `scenario.timeout` | float | `600` | Seconds an episode may take; a slower one is cancelled and left out of training. |
+| `scenario.outcome` | str | `""` | The role whose reward is the task's outcome (retire / retry, `outcome/*`); empty: the scenario's. |
+| `roles.<name>.adapter` | str | `""` | A LoRA adapter of its own on the policy's base (needs `lora.rank`). |
+| `roles.<name>.partner` | str | `""` | A frozen partner: `base`, `scripted:<name>`, an endpoint URL or `module:callable`. |
+| `roles.<name>.partner_args` | dict | `{}` | Arguments for an endpoint or class partner. |
+| `roles.<name>.train` | bool | `true` | `false`: the policy plays the role, its tokens do not train. |
+| `roles.<name>.system_prompt` | str | `""` | Put before the scenario's instructions. |
+| `roles.<name>.max_turns` / `max_new_tokens` / `max_completion_tokens` | int | `0` | The role's limits (0: the scenario's or the rollout's). |
+| `roles.<name>.chat_template_kwargs` | dict | `{}` | Template arguments for this role's sessions. |
+| `roles.<name>.share` | float | `1.0` | The role's part of the loss, relative to the other trained roles. |
+| `loss.advantage_std` | str | `batch` | `role` (scenarios): the standard deviation of the same role's centred rewards over the batch. |
+| `loss.advantage_std_floor` | float | `0.0` | The least value `role` divides by. |
+| `train.replicate_base` | bool | `false` | With `lora.rank` under torchrun: every rank holds the whole frozen base; only the adapters' gradients are summed over ranks, once per step, instead of FSDP. |
+
 RL configs also have `rollout.routing_replay` (`auto` / `on` / `off`, default `off` until the vLLM path is verified on a GPU): train each token through the
 experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.md#rl-routing-replay).
 

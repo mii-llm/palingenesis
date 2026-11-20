@@ -385,7 +385,7 @@ Every rank owns a GPU, its shard of the prompts and a colocated vLLM engine; the
 | Slow steps on agentic tasks | size `rollout.max_completion_tokens` and turn budgets ([How it is made fast](#how-it-is-made-fast)); read `logging.dump_trajectories` with `pgs rollouts` before tuning |
 | `memory/host_rss_gb` keeps climbing | launch with `MALLOC_ARENA_MAX=4` ([Host memory](#multi-gpu-clusters-and-memory)) |
 
-See also: [Harbor Environments](harbor.md) and [Harness Profiles](harness-profiles.md) for agent tasks, the [CLI reference](../reference/cli.md) for `pgs rl`, and the [configuration reference](../reference/configuration.md).
+See also: [Multi-Agent RL](multi-agent.md) for episodes with several roles, [Harbor Environments](harbor.md) and [Harness Profiles](harness-profiles.md) for agent tasks, the [CLI reference](../reference/cli.md) for `pgs rl`, and the [configuration reference](../reference/configuration.md).
 
 ## Resuming
 
