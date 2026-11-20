@@ -57,6 +57,7 @@ reply-graded task must have the agent write its answer to a file the tests read.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
 import io
 import json
@@ -66,6 +67,7 @@ import shlex
 import subprocess
 import tarfile
 import threading
+import time
 import tomllib
 import uuid
 from dataclasses import dataclass, field
@@ -312,6 +314,8 @@ EXEC_LIMIT = 4 << 20  # tool command output read per stream (bytes), whatever th
 # trainer's heap for good (glibc keeps what it allocated)
 FILE_LIMIT_KB = 2 << 20  # largest file a command may write (ulimit -f, KiB): an agent's `yes > out` under a 300 s tool
 # timeout wrote tens of GB per container, and 128 containers filled the host disk mid-run
+_TOOL_CALL = threading.local()  # .deadline: time.monotonic() by which this thread's tool call must end (HarborEnv)
+EXEC_TAG = "PGS_EXEC"  # environment variable naming one tool command (see DockerRuntime._kill_tagged)
 GET_DIR_LIMIT = 2 << 30  # working directory tar stream copied to the verifier container (bytes; verify streams it)
 _live_lock = threading.Lock()
 _swept = False
@@ -482,7 +486,11 @@ class DockerRuntime:
     def exec(
         self, command: str, timeout: float = 60, env: dict | None = None, workdir: str | None = None
     ) -> ExecResult:
-        args = ["exec"]
+        deadline = getattr(_TOOL_CALL, "deadline", None)
+        if deadline is not None:  # inside a tool call: done by the trainer's deadline, whatever timeout was asked
+            timeout = max(1.0, min(timeout, deadline - time.monotonic()))
+        tag = uuid.uuid4().hex[:16]  # inherited by every process the command starts: what a timeout kills
+        args = ["exec", "-e", f"{EXEC_TAG}={tag}"]
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
         args += [
@@ -497,7 +505,7 @@ class DockerRuntime:
             limit = min(4 * self.max_output + 4096, EXEC_LIMIT)  # chars <= 4 bytes
             r = _docker(*args, timeout=timeout, check=False, limit=limit)
         except subprocess.TimeoutExpired:
-            _docker("exec", self.name, "bash", "-lc", "pkill -f -- 'bash -lc' || true", check=False, timeout=10)
+            self._kill_tagged(tag)
             return ExecResult(124, "", f"timed out after {timeout:g} s", True)
         cut = self.max_output
         out, err = r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
@@ -510,6 +518,33 @@ class DockerRuntime:
         elif len(out) > cut:
             out = out[: cut // 2] + f"\n... [{len(out) - cut} characters cut] ...\n" + out[-cut // 2 :]
         return ExecResult(r.returncode, out, err[-cut:])
+
+    def _kill_tagged(self, tag: str) -> None:
+        """Kill the processes of a timed-out command, children included, and nothing else. Killing the docker client
+        leaves the command running in the container, and `pkill -f 'bash -lc'` stopped only its shell: an agent's
+        `grep -r x /` kept a core busy for the rest of the episode, a new one started at every turn, and the training
+        step waited on episodes slowed by their own leftovers.
+
+        Each command carries its own EXEC_TAG in its environment, which children inherit, so the processes of other
+        commands and the task's own services are left alone. Reading /proc/<pid>/environ needs the same uid (or
+        CAP_SYS_PTRACE, which containers lack: root is refused on another user's processes), so the script runs as the
+        image's default user, the one the agent's commands run as, then as root for root images. Passes repeat until
+        none finds a tagged process, so a parent forking new children between reads is caught too. Processes that
+        clear their environment (env -i, sudo's env_reset, a hand-built env) escape. POSIX sh and /proc only."""
+        script = (
+            f"t={EXEC_TAG}={tag}; n=0; while [ $n -lt 5 ]; do found=0; for d in /proc/[0-9]*; do "
+            "tr '\\000' '\\n' 2>/dev/null < \"$d/environ\" | grep -qxF \"$t\" "
+            '&& { kill -9 "${d#/proc/}" 2>/dev/null; found=1; }; done; '
+            "[ $found = 0 ] && exit 0; n=$((n + 1)); done; exit 1"
+        )
+        for user in ((), ("-u", "0")):
+            try:
+                r = _docker("exec", *user, self.name, "sh", "-c", script, check=False, timeout=30)
+            except subprocess.TimeoutExpired:
+                r = None
+            if r is None or r.returncode != 0:
+                who = "root" if user else "the default user"
+                logger.warning("processes of a timed-out command in %s may survive (killer as %s)", self.name, who)
 
     def owner(self) -> tuple[int, int]:
         """uid / gid of the image's default user (what the agent's shell runs as)."""
@@ -701,6 +736,7 @@ class HarborEnv:
     behaviour is HarborEnv's own (the palingenesis-default@1 profile)."""
 
     episode_group = None  # the trainer sets the GRPO group id here before reset (harness profiles: one per group)
+    tool_deadline = None  # time.monotonic() at which the trainer stops waiting for the tool call it is issuing
 
     def __init__(
         self,
@@ -782,11 +818,31 @@ class HarborEnv:
         (the trainer's own message) otherwise."""
         if self.session is None or self.session.profile.legacy:
             return None
-        out = self.session.unknown_tool(name, arguments)  # harness profiles hook
+        with self._tool_call():
+            out = self.session.unknown_tool(name, arguments)  # harness profiles hook
         self.done = self.session.done
         return out
 
+    @contextlib.contextmanager
+    def _tool_call(self):
+        """The commands of a tool call end just before the trainer stops waiting for it (tool_deadline), whatever
+        timeout the policy or the harness asked for: a command still running after that would only be killed at its
+        own, possibly much longer, timeout, holding a worker thread and the CPU. The deadline counts from when the
+        trainer issued the call (time queued for a worker thread included) and holds for every command of the call;
+        it is per thread, so parallel calls and a call the trainer gave up on keep their own. A harness's timeout
+        message still quotes the timeout that was asked for, as the real harness would."""
+        d = self.tool_deadline
+        _TOOL_CALL.deadline = None if d is None else d - min(5.0, 0.1 * max(0.0, d - time.monotonic()))
+        try:
+            yield
+        finally:
+            _TOOL_CALL.deadline = None
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        with self._tool_call():
+            return self._call_tool(name, arguments)
+
+    def _call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         if self.session is not None and not self.session.profile.legacy:  # harness profiles hook
             out = self.session.call_tool(name, arguments)
             self.done = self.session.done

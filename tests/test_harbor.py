@@ -474,3 +474,125 @@ def test_exec_caps_the_size_of_files_a_command_writes(tmp_path, monkeypatch):
     out = tmp_path / "big"
     subprocess.run(["bash", "-lc", f"ulimit -f 4 2>/dev/null; head -c 100000 /dev/zero > {out}"], check=False)
     assert out.stat().st_size == 4096
+
+
+def test_a_timed_out_command_is_killed_with_its_children_and_nothing_else(tmp_path, monkeypatch):
+    """`grep -r x /` outlives a killed docker client and a killed shell; the timeout kills every process carrying the
+    command's own tag (children inherit it), as the agent's user then as root (root cannot read another uid's
+    environ in a container), and leaves other commands and the task's services alone."""
+    import os
+    import signal
+    import sys
+    import time
+
+    from palingenesis.rl.envs import harbor
+
+    calls = []
+
+    def docker(*args, input=None, timeout=None, check=True, limit=None):
+        calls.append(args)
+        if args[0] == "exec" and "-c" not in args:  # the agent's command (bash -lc ...), not a killer (sh -c)
+            raise subprocess.TimeoutExpired(cmd=list(args), timeout=timeout)
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(harbor, "_docker", docker)
+    rt = harbor.DockerRuntime(harbor.HarborTask.load(_capture_task(tmp_path, capture=False)))
+    rt.name = "pgs-test"
+    r = rt.exec("grep -r x /", timeout=1)
+    assert r.exit_code == 124 and "timed out" in r.stderr
+    agent = next(c for c in calls if c[0] == "exec" and "-c" not in c)
+    tag = next(a.split("=", 1)[1] for a in agent if a.startswith(f"{harbor.EXEC_TAG}="))
+    killers = [c for c in calls if "-c" in c]
+    assert [c[:-3] for c in killers] == [("exec", "pgs-test"), ("exec", "-u", "0", "pgs-test")]
+    script = killers[0][-1]
+    assert all(c[-3:-1] == ("sh", "-c") and c[-1] == script for c in killers) and f"{harbor.EXEC_TAG}={tag}" in script
+    if not sys.platform.startswith("linux"):  # the script reads /proc
+        return
+
+    def children(pid):
+        out = []
+        for d in os.listdir("/proc"):
+            try:
+                if d.isdigit() and int(open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()[1]) == pid:
+                    out.append(int(d))
+            except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+                pass
+        return out
+
+    def gone(pid):
+        try:
+            return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] == "Z"
+        except FileNotFoundError:
+            return True
+
+    env = dict(os.environ, **{harbor.EXEC_TAG: tag})
+    tree = subprocess.Popen(["sh", "-c", "sleep 300 & sleep 300 & wait"], env=env, start_new_session=True)
+    other = subprocess.Popen(["sleep", "300"], env=dict(os.environ, **{harbor.EXEC_TAG: "someone-else"}))
+    try:
+        deadline = time.monotonic() + 10
+        while len(kids := children(tree.pid)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(kids) == 2
+        assert subprocess.run(["sh", "-c", script], check=False, timeout=30).returncode == 0  # this user owns them
+        tree.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while not all(gone(p) for p in kids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert all(gone(p) for p in kids) and other.poll() is None
+    finally:
+        try:
+            os.killpg(tree.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        other.kill()
+        tree.wait()
+        other.wait()
+
+
+def test_a_tool_calls_commands_end_by_the_trainers_deadline(tmp_path, monkeypatch):
+    """The trainer stops waiting for a tool call tool_timeout after issuing it (queueing for a worker thread included);
+    a longer timeout asked by the policy or a harness must not keep the command, and the processes the kill would end,
+    running past that. The deadline is per thread and per call; outside a call (setup, verification) exec is uncapped."""
+    import asyncio
+    import threading
+    import time
+
+    from palingenesis.rl.env import run_tool
+    from palingenesis.rl.envs import harbor
+
+    seen = []
+
+    def docker(*args, input=None, timeout=None, check=True, limit=None):
+        seen.append(timeout)
+        if "boom" in args[-1]:
+            raise RuntimeError("boom")
+        return subprocess.CompletedProcess(args, 0, b"ok", b"")
+
+    monkeypatch.setattr(harbor, "_docker", docker)
+    env = HarborEnv()
+    env.rt = harbor.DockerRuntime(harbor.HarborTask.load(_capture_task(tmp_path, capture=False)))
+    out, failed = asyncio.run(run_tool(env, "bash", {"command": "grep -r x /", "timeout": 3600}, 300.0))
+    assert "ok" in out and not failed and 290 < seen[-1] <= 295  # the trainer set the deadline; 5 s of margin
+    env.tool_deadline = time.monotonic() + 20
+    env.call_tool("bash", {"command": "true", "timeout": 5})  # a shorter timeout is kept
+    assert seen[-1] == 5
+    env.tool_deadline = time.monotonic() + 0.5  # nearly out of time (e.g. queued for a thread): at least 1 s
+    env.call_tool("bash", {"command": "sleep 9", "timeout": 100})
+    assert seen[-1] == 1.0
+    with pytest.raises(RuntimeError):
+        env.call_tool("bash", {"command": "boom", "timeout": 100})
+    assert getattr(harbor._TOOL_CALL, "deadline", None) is None  # cleared even when the call raises
+    env.rt.exec("bash /tmp/setup.sh", timeout=900)  # outside a tool call: the caller's timeout
+    assert seen[-1] == 900
+    other = []  # another thread (a parallel call, or verification) does not see this thread's deadline
+    env.tool_deadline = time.monotonic() + 20
+    with env._tool_call():
+        t = threading.Thread(target=lambda: other.append(getattr(harbor._TOOL_CALL, "deadline", None)))
+        t.start()
+        t.join()
+    assert other == [None]
+    env.tool_deadline = None  # not set by a trainer: unchanged behaviour
+    env.call_tool("bash", {"command": "true", "timeout": 3600})
+    assert seen[-1] == 3600
+    env.rt = None
+    assert env.call_tool("submit", {}) == "Submitted."  # a call that needs no runtime still works

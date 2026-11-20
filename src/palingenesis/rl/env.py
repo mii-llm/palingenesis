@@ -28,6 +28,10 @@ An environment is any class. Per trajectory, the trainer takes an instance from 
         per group, the same for every sample of it: HarborEnv's harness profiles); a dict in episode_info after reset
         is added to the rollout's info (in the rollout dumps), and its "chat_template_kwargs" apply to the episode
         (over the model's; a row's own chat_template_kwargs win).
+    tool_deadline                                        optional attribute
+        An environment with a tool_deadline attribute gets, before each tool call, the time.monotonic() value at which
+        the trainer stops waiting for that call (env.tool_timeout after it was issued), so a synchronous tool, which
+        keeps running in its worker thread after that, can stop (and kill) what it started by then (HarborEnv does).
     unknown_tool(self, name, arguments) -> str           optional, sync or async
         The answer to a call of a tool the episode does not expose (None, or no method: "Error: unknown tool ...").
     observation_notes                                    optional attribute, read after each tool turn
@@ -86,6 +90,7 @@ import fnmatch
 import inspect
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -276,6 +281,8 @@ async def run_tool(
     """(result, failed): the tool's output for the policy (text, or a ToolOutput with images), or
     the error it caused.
     `exposed`: the episode's tools; anything else is refused before reaching the environment."""
+    if hasattr(env, "tool_deadline"):  # the environment ends the call's work by the time the trainer stops waiting
+        env.tool_deadline = time.monotonic() + timeout
     if exposed is not None and name not in exposed:
         if hasattr(env, "unknown_tool"):  # the environment words it (a harness's own message, or an alias it runs)
             try:
