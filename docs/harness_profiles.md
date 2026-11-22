@@ -135,6 +135,15 @@ stop and pass the task's tests are verified recovery data: the model's own token
 `t.info["stop_resamples"]` (one entry per discarded sample: the turn index and the message). Train on them without the
 option; the deployed model runs without it.
 
+**Replay** (a row's `replay_messages`): resume an episode from a recorded prefix, the assistant turns and tool results
+of an earlier episode of the same task under the same profile. The recorded calls run again in the environment, in
+order and through the same tool path as a sampled turn; the messages then join the prompt (nothing in them is sampled
+or trained) and `max_turns` counts the new turns only. `t.info["replay"]` counts the calls whose result differs from the
+recording (`mismatches`, `first_mismatch`; compared as an observation is shown, trailing whitespace aside). A call that
+fails where the recording did not, or an environment that ends the episode during the replay, gives `finish: error`
+and no sampled turn. Text-protocol profiles and environments are refused, and so is training (an evaluation and
+data-generation feature).
+
 ## `pgs harness` (recording real harnesses)
 
     pgs harness serve   --script turns.json --out requests.jsonl [--port 8000]

@@ -930,3 +930,224 @@ def test_a_tool_argument_named_fn_is_a_tool_error_not_a_crash():
     assert failed and text.startswith("Error:") and "fn" in text
     assert asyncio.run(run_tool(Env(), "apply", {"fn": "abs"}, 5)) == ("applied abs", False)
     assert asyncio.run(call_sync_or_async(lambda **row: sorted(row), fn=1, prompt="p")) == ["fn", "prompt"]
+
+
+class _Notes:
+    """Tools that change the environment's state (add a note) and one that ends the episode (submit); every reset,
+    call and generate request is appended to `log`, in order."""
+
+    log: list = []
+
+    def reset(self, **row):
+        self.done, self.notes = False, []
+        _Notes.log.append(("reset",))
+
+    def tool_schemas(self):
+        def schema(name, field):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {"type": "object", "properties": {field: {"type": "string"}}},
+                },
+            }
+
+        return [schema("add", "text"), schema("submit", "answer")]
+
+    def call_tool(self, name, arguments):
+        _Notes.log.append((name, dict(arguments), list(self.notes)))
+        if name == "add":
+            self.notes.append(arguments["text"])
+            return f"{len(self.notes)} notes   \n"  # trailing whitespace: normalised away in the comparison
+        self.done = True
+        return "submitted"
+
+    def get_reward(self):
+        return float(self.notes == ["a", "b"])
+
+
+class _LoggingEngine(_SequenceEngine):
+    def generate(self, prompts, max_new_tokens, temperature):
+        _Notes.log.extend(("generate", self.tok.decode(p)) for p in prompts)
+        return super().generate(prompts, max_new_tokens, temperature)
+
+
+def _replayed(rows, texts):
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.episodes import run_episodes
+    from tests.test_rl import tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    kwargs = {"enable_thinking": False}
+    _Notes.log = []
+    engine = _LoggingEngine(tok, end_of_turn_id(tok, kwargs), texts)
+    groups = run_episodes(engine, tok, rows, _Notes, chat_template_kwargs=kwargs, max_turns=2, max_new_tokens=64)
+    return [t for (t,) in groups], engine.n
+
+
+REPLAY = [
+    {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "First note.",
+        "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "add", "arguments": '{"text": "a"}'}}],
+    },
+    {"role": "tool", "tool_call_id": "c1", "name": "add", "content": "1 notes"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "add", "arguments": {"text": "b"}}}],
+    },
+    {"role": "tool", "tool_call_id": "c2", "name": "add", "content": "2 notes"},
+]
+SUBMIT = '<tool_call>\n{"name": "submit", "arguments": {"answer": "done"}}\n</tool_call>'
+
+
+def test_replay_runs_the_recorded_calls_and_prefixes_the_prompt():
+    [t], n = _replayed([{"prompt": "Add notes a and b, then submit.", "replay_messages": REPLAY}], [SUBMIT])
+    # the recorded calls ran in order, before the first sampled turn, which saw their state
+    assert [entry[:2] for entry in _Notes.log[:3]] == [("reset",), ("add", {"text": "a"}), ("add", {"text": "b"})]
+    assert _Notes.log[3][0] == "generate" and _Notes.log[4] == ("submit", {"answer": "done"}, ["a", "b"])
+    assert n == 1 and t.finish == "env_done" and t.reward == 1.0 and t.turns == 1
+    # the prefix is part of the prompt (encoded, and in the messages), arguments as objects
+    prompt = _Notes.log[3][1]
+    assert prompt.index("First note.") < prompt.index('"text": "b"') < prompt.index("2 notes")
+    assert [m["role"] for m in t.info["prompt"]] == ["user", "assistant", "tool", "assistant", "tool"]
+    assert t.messages[: len(t.info["prompt"])] == t.info["prompt"]
+    assert t.info["prompt"][3]["tool_calls"][0]["function"]["arguments"] == {"text": "b"}
+    assert t.info["prompt"][3]["content"] == ""
+    assert t.info["replay"] == {"messages": 4, "calls": 2, "mismatches": 0, "first_mismatch": None}
+    assert [m["role"] for m in t.messages[len(t.info["prompt"]) :]] == ["assistant", "tool"]
+    assert t.info["max_turns"] == 2  # max_turns counts the sampled turns only
+
+
+def test_replay_counts_mismatches_by_call_id():
+    # the results recorded in the other order: matched by tool_call_id, the second differs from what the env says
+    recorded = [dict(m) for m in REPLAY]
+    recorded[3] = {"role": "tool", "tool_call_id": "c2", "content": "two notes"}
+    [t], _ = _replayed([{"prompt": "Add notes.", "replay_messages": json.dumps(recorded)}], [SUBMIT])
+    assert t.finish == "env_done"
+    assert t.info["replay"]["calls"] == 2 and t.info["replay"]["mismatches"] == 1
+    assert t.info["replay"]["first_mismatch"] == {"call": "add", "expected": "two notes", "got": "2 notes   \n"}
+    # the recorded text is what the prompt carries
+    assert t.info["prompt"][4]["content"] == "two notes"
+
+
+def test_rows_without_replay_are_unchanged():
+    [t], n = _replayed([{"prompt": "Submit."}], [SUBMIT])
+    assert [entry[0] for entry in _Notes.log] == ["reset", "generate", "submit"]
+    assert "replay" not in t.info and [m["role"] for m in t.info["prompt"]] == ["user"]
+    assert t.finish == "env_done" and n == 1
+
+
+def test_replay_that_ends_the_episode_or_fails_is_an_error_without_generation():
+    ended = REPLAY[:2] + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "s", "function": {"name": "submit", "arguments": {"answer": "x"}}}],
+        },
+        {"role": "tool", "tool_call_id": "s", "content": "submitted"},
+    ]
+    unknown = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "u", "function": {"name": "nope", "arguments": {}}}],
+        },
+        {"role": "tool", "tool_call_id": "u", "content": "it worked"},
+    ]
+    [t_ended, t_unknown], n = _replayed(
+        [{"prompt": "a", "replay_messages": ended}, {"prompt": "b", "replay_messages": unknown}], [SUBMIT]
+    )
+    assert n == 0 and not any(entry[0] == "generate" for entry in _Notes.log)
+    assert t_ended.finish == "error" and "ended the episode during the replay" in t_ended.info["error"]
+    assert t_ended.info["replay"]["calls"] == 2 and [m["role"] for m in t_ended.messages] == ["user"]
+    assert t_unknown.finish == "error" and "(nope) failed" in t_unknown.info["error"]
+    assert t_unknown.info["replay"]["mismatches"] == 1
+
+
+def test_replay_refuses_text_protocol_environments_and_malformed_prefixes():
+    from palingenesis.rl.pipeline import _replay_plan
+
+    class TextNotes(_Notes):
+        def text_actions(self, text):
+            return []
+
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.episodes import run_episodes
+    from tests.test_rl import tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    engine = _SequenceEngine(tok, end_of_turn_id(tok, {}), [SUBMIT])
+    [[t]] = run_episodes(engine, tok, [{"prompt": "a", "replay_messages": REPLAY}], TextNotes, max_new_tokens=64)
+    assert t.finish == "error" and "text-protocol" in t.info["error"] and engine.n == 0
+    with pytest.raises(ValueError, match="1 tool call"):
+        _replay_plan(REPLAY[:1])
+    with pytest.raises(ValueError, match="only assistant and tool"):
+        _replay_plan([{"role": "user", "content": "x"}])
+
+
+def test_replay_reads_the_protocol_of_a_harness_session():
+    """An environment with a harness session (HarborEnv) defines text_actions for every profile: replay is refused
+    only when the session's profile speaks a text protocol."""
+    from types import SimpleNamespace
+
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.episodes import run_episodes
+    from tests.test_rl import tokenizer
+
+    def harness(native):
+        class Harness(_Notes):
+            def reset(self, **row):
+                super().reset(**row)
+                protocol = SimpleNamespace(native=native)
+                self.session = None if native is None else SimpleNamespace(profile=SimpleNamespace(protocol=protocol))
+
+            def text_actions(self, text):
+                return []
+
+        return Harness
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    rows = [{"prompt": "Add notes.", "replay_messages": REPLAY}]
+    for native, refused in ((True, False), (None, False), (False, True)):
+        engine = _SequenceEngine(tok, end_of_turn_id(tok, {}), [SUBMIT])
+        [[t]] = run_episodes(engine, tok, rows, harness(native), max_turns=2, max_new_tokens=64)
+        if refused:
+            assert t.finish == "error" and "text-protocol" in t.info["error"] and engine.n == 0
+        else:
+            assert t.finish == "env_done" and t.info["replay"]["calls"] == 2 and engine.n == 1
+
+
+def test_replay_is_refused_in_training():
+    import torch
+
+    from palingenesis.opd.orchestrator import PublishedWeights
+    from palingenesis.opd.teachers import end_of_turn_id
+    from palingenesis.rl.chat import ChatFormat
+    from palingenesis.rl.config import RLConfig
+    from palingenesis.rl.data import PromptSampler
+    from palingenesis.rl.env import EnvPool
+    from palingenesis.rl.pipeline import RLPipeline
+    from tests.test_rl import tokenizer
+
+    tok = tokenizer("Qwen/Qwen3-0.6B")
+    eot = end_of_turn_id(tok, {})
+    config = RLConfig()
+    for key, value in {"model.policy": "x", "rollout.max_new_tokens": 64, "rollout.max_model_len": 4096}.items():
+        config.set(key, value)
+    rows = [{"prompt": "Add notes.", "replay_messages": REPLAY}]
+    engine = _SequenceEngine(tok, eot, [SUBMIT])
+    _Notes.log = []
+    pipeline = RLPipeline(
+        tok, ChatFormat(tok, eot, {}), engine, PublishedWeights(torch.nn.Linear(1, 1)), config,
+        PromptSampler(rows), [], EnvPool(_Notes), None, (eot,),
+    )  # fmt: skip
+    try:
+        t, env = pipeline._await(pipeline._trajectory(rows[0], 0, 1.0, True))
+        pipeline._await(pipeline.env_pool.release(env))
+    finally:
+        pipeline.close()
+    assert t.finish == "error" and "not for training" in t.info["error"] and engine.n == 0
+    assert [entry[0] for entry in _Notes.log] == ["reset"]  # no recorded call ran

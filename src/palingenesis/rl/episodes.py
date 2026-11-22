@@ -16,6 +16,13 @@ VisionProcessor.from_pretrained(model, tokenizer))) and use an engine that takes
 VLLMColocateRollout); prompts may then carry image parts and tools may return rl.env.ToolOutput.
 stop_resample: a turn that would end the episode without a tool call is sampled again up to this many times, and the
 first sample that calls a tool is kept (rollout.stop_resample; the discarded samples are in t.info["stop_resamples"]).
+replay_messages (a row key): the assistant turns and tool results of an earlier episode of the same task and harness
+profile, after the prompt's user turn (OpenAI format, or its JSON string). Their calls run again in the environment,
+in order, and the messages join the prompt (not sampled, not trained); sampling resumes after them and max_turns counts
+the sampled turns only. t.info["replay"]: {messages, calls, mismatches, first_mismatch: {call, expected, got} or None},
+a result compared with the recorded one as an observation is shown (sanitized, truncated), trailing whitespace aside.
+A call that fails where the recording did not, or an environment that ends the episode during the replay, gives
+finish "error" with no turn sampled. Not for text-protocol profiles or environments; refused in training.
 """
 
 from __future__ import annotations

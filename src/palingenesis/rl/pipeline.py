@@ -340,11 +340,15 @@ class RLPipeline:
                     last["content"] = f"{last['content']}\n\n{start}" if last["content"] else start
                 elif isinstance(start, list):
                     messages[:] = [dict(m) for m in start]
-            trajectory.info["prompt"] = [dict(m) for m in messages]
             # the environment's tools (its methods, or tool_schemas() for this episode), else the row's own
             schemas = await self.env_pool.episode_schemas(env) if env is not None else None
             schemas = schemas or row_tools(row, config.data.tools_field)
             by_name = {s["function"]["name"]: s for s in schemas or []}
+            if row.get("replay_messages"):  # a recorded prefix: its calls run again, its messages join the prompt
+                if training:
+                    raise ValueError("replay_messages is for evaluation and data generation, not for training rows")
+                await self._replay(env, row["replay_messages"], set(by_name), messages, trajectory)
+            trajectory.info["prompt"] = [dict(m) for m in messages]
             # a row may carry its own template kwargs (thinking or not) and generation budgets
             # (the environment's episode kwargs, e.g. a harness profile's enable_thinking, under the row's own)
             episode = (
@@ -543,6 +547,44 @@ class RLPipeline:
             timing["end"] = clock() - self.rollout_start
             self.client.exit()
         return trajectory, env
+
+    async def _replay(
+        self, env: Any, recorded: Any, exposed: set[str], messages: list[dict], trajectory: Trajectory
+    ) -> None:
+        """Resume an episode from a recorded prefix (a row's replay_messages): run every recorded call in the
+        environment, in order and through the path a sampled turn takes, then append the recorded messages to the
+        prompt. Each result, normalised as a live observation is, is compared with the recorded one (trailing
+        whitespace aside) and the mismatches counted in trajectory.info["replay"]. Raises ReplayError when a call
+        fails where the recording did not, or when the environment ends the episode during the replay."""
+        if env is None:
+            raise ValueError("replay_messages needs an environment to run the recorded calls in")
+        if _text_protocol(env):
+            raise ValueError("replay_messages is not supported for text-protocol environments or harness profiles")
+        replayed, plan = _replay_plan(recorded)
+        e = self.config.env
+        info = trajectory.info["replay"] = {
+            "messages": len(replayed),
+            "calls": 0,
+            "mismatches": 0,
+            "first_mismatch": None,
+        }
+        for k, (name, arguments, expected) in enumerate(plan):
+            result, failed = await run_tool(env, name, arguments, e.tool_timeout, exposed)
+            text = result.text if isinstance(result, ToolOutput) else result
+            got = self.chat.truncate(self.chat.sanitize(text), e.max_tool_output_tokens)
+            info["calls"] += 1
+            matched = _trailing_stripped(got) == _trailing_stripped(expected)
+            if not matched:
+                info["mismatches"] += 1
+                if info["first_mismatch"] is None:
+                    info["first_mismatch"] = {"call": name, "expected": expected[:300], "got": got[:300]}
+            if failed and not matched:  # the recording did not fail this way: the state it led to is not there
+                raise ReplayError(f"replayed call {k + 1} of {len(plan)} ({name}) failed: {got[:300]}")
+            if getattr(env, "done", False):
+                raise ReplayError(
+                    f"the environment ended the episode during the replay (call {k + 1} of {len(plan)}: {name})"
+                )
+        messages.extend(replayed)
 
     @staticmethod
     def observation_patterns(exclude: list | None) -> list[re.Pattern]:
@@ -921,3 +963,75 @@ def row_family(row: dict, keys: list[str]) -> str:
         if value is not None and not isinstance(value, (dict, list)):
             return str(value)
     return "other"
+
+
+class ReplayError(RuntimeError):
+    """A recorded prefix (a row's replay_messages) could not be replayed: the episode is not sampled."""
+
+
+def _text_protocol(env: Any) -> bool:
+    """Whether the environment's actions are parsed from the assistant's text (not native tool calls). An environment
+    with a harness session (HarborEnv) defines text_actions for every profile: there the profile's protocol decides."""
+    if not hasattr(env, "text_actions"):
+        return False
+    if hasattr(env, "session"):
+        if env.session is None:  # no harness profile: native calls
+            return False
+        protocol = getattr(getattr(env.session, "profile", None), "protocol", None)
+        return protocol is not None and not getattr(protocol, "native", True)
+    return True
+
+
+def _trailing_stripped(text: str) -> str:
+    """`text` without trailing whitespace, on each line and at the end."""
+    return "\n".join(line.rstrip() for line in text.rstrip().splitlines())
+
+
+def _replay_plan(recorded: Any) -> tuple[list[dict], list[tuple[str, dict, str]]]:
+    """A row's replay_messages (a list of OpenAI-format messages, or its JSON string) as the messages to append (tool
+    call arguments as objects, as a sampled turn records them) and the calls to run: (name, arguments, the recorded
+    result's text) in order. A call's result is the tool message after it with its tool_call_id, else the one in its
+    position. Raises ValueError on anything that is not assistant turns followed by one result per call."""
+    if isinstance(recorded, str):
+        recorded = json.loads(recorded)
+    if not isinstance(recorded, list) or not all(isinstance(m, dict) for m in recorded):
+        raise ValueError("replay_messages must be a list of messages")
+    messages: list[dict] = []
+    plan: list[tuple[str, dict, str]] = []
+    blocks: list[tuple[list[dict], list[dict]]] = []  # (an assistant turn's calls, the tool messages after it)
+    for i, m in enumerate(recorded):
+        m = dict(m)
+        role = m.get("role")
+        if role == "assistant":
+            calls = []
+            for c in m.get("tool_calls") or []:
+                function = dict(c.get("function") or {})
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    arguments = json.loads(arguments) if arguments.strip() else {}
+                if not function.get("name") or not isinstance(arguments or {}, dict):
+                    raise ValueError(f"replay_messages[{i}]: a tool call needs a name and object arguments")
+                function["arguments"] = dict(arguments or {})
+                calls.append({**c, "type": c.get("type") or "function", "function": function})
+            if calls:
+                m["tool_calls"] = calls
+            if m.get("content") is None:
+                m["content"] = ""
+            blocks.append((calls, []))
+        elif role == "tool":
+            if not blocks:
+                raise ValueError(f"replay_messages[{i}]: a tool message before any assistant turn")
+            blocks[-1][1].append(m)
+        else:
+            raise ValueError(f"replay_messages[{i}]: role {role!r} (only assistant and tool messages are replayed)")
+        messages.append(m)
+    for calls, results in blocks:
+        if len(results) != len(calls):
+            raise ValueError(f"replay_messages: {len(calls)} tool call(s) followed by {len(results)} tool message(s)")
+        by_id = {r["tool_call_id"]: r for r in results if r.get("tool_call_id")}
+        for k, c in enumerate(calls):
+            result = by_id.get(c.get("id")) if c.get("id") else None
+            plan.append(
+                (c["function"]["name"], c["function"]["arguments"], "\n".join(message_texts(result or results[k])))
+            )
+    return messages, plan
