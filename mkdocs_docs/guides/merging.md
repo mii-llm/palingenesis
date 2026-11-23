@@ -152,4 +152,6 @@ save_hf_model(model, tok, out, source_layout=True, dtype=torch.bfloat16, roundin
   set to the merge, so later stages keep what it added.
 - **What did not transfer at 0.8B:** deltas from continued pretraining alone, and "chat vector" transfers that work at 70B,
   collapsed instruction following. Re-check such recipes at your scale before relying on them.
+- **Knowledge from raw text:** continued pretraining, then SFT, both from the base, added at a small lam; the recipe is in
+  [Pretraining and Continued Pretraining](pretraining.md#continued-pretraining-of-an-instruction-tuned-model).
 - Merge only checkpoints of the same architecture and the same origin (shared base or shared initialization).

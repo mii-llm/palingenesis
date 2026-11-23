@@ -124,6 +124,20 @@ pgs prepare --config configs/qwen35_4b/a100_80gb.yaml
 
 </div>
 
+<div class="pg-recipe" data-group="Train" data-keys="pretrain pretraining cpt continued continual raw text corpus domain language adaptation" markdown>
+
+### Continued pretraining
+
+Raw text with a loss on every token: a domain, a language or a corpus, from the base model, merged into the instruct model afterwards.
+
+```bash
+pgs train --config cpt.yaml
+```
+
+<p class="pg-more" markdown>[Pretraining](guides/pretraining.md) [Merging](guides/merging.md)</p>
+
+</div>
+
 <div class="pg-recipe" data-group="Train" data-keys="autopilot auto sweep learning rate lr profile" markdown>
 
 ### Autopilot
@@ -235,6 +249,20 @@ This shows you exactly what the model sees: tokenized text, which tokens have lo
 <p class="pg-fact" markdown><span>Fix</span> Reduce LR, enable `sym_noise`</p>
 
 <p class="pg-more" markdown>[Training dynamics troubleshooting](reference/health.md#training-dynamics-troubleshooting)</p>
+
+</div>
+
+<div class="pg-recipe" data-group="Fix" data-keys="forgetting forgot cpt pretrain pretraining continued tool calls instruct general" markdown>
+
+### Skills lost after continued pretraining
+
+**Forgetting.** General or chat skills drop while the domain loss falls.
+
+<p class="pg-fact" markdown><span>Diagnosis</span> `eval/<name>/loss` of a general held-out source rising</p>
+
+<p class="pg-fact" markdown><span>Fix</span> CPT the base, not the instruct model; replay general text; merge at small λ</p>
+
+<p class="pg-more" markdown>[Held-out loss and forgetting](guides/pretraining.md#held-out-loss-and-forgetting) [Instruction-tuned models](guides/pretraining.md#continued-pretraining-of-an-instruction-tuned-model)</p>
 
 </div>
 

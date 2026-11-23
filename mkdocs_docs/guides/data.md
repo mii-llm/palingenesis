@@ -10,6 +10,7 @@
     - **What gets loss**: [SFT masking](#what-gets-loss-sft-masking), [reasoning fields and tags](#reasoning-in-the-data-fields-baked-blocks-tags); agent traces and tool calls are in the [agentic guide](agentic-training.md).
     - **Run length, streaming and the [pre-tokenized cache](#pre-tokenized-cache)**.
     - **[Validation data](#validation-data)**, including per-source eval losses (`eval_sources`).
+    - **Raw text** (`mode: pretrain`, continued pretraining on a corpus): [Pretraining and Continued Pretraining](pretraining.md).
 
     Check the masking of any config with `pgs inspect --config <cfg> --num_samples 3` before training. Every key is in the [configuration reference](../reference/configuration.md); every command in the [CLI reference](../reference/cli.md).
 

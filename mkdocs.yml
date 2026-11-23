@@ -116,6 +116,7 @@ nav:
     - Training from a Notebook: getting-started/notebook.md
   - Guides:
     - Data Preparation: guides/data.md
+    - Pretraining & Continued Pretraining: guides/pretraining.md
     - Agentic & Reasoning Models: guides/agentic-training.md
     - Single GPU: guides/single-gpu.md
     - Long Sequences (SeCO): guides/long-sequences.md
