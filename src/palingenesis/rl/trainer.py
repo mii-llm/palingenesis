@@ -378,7 +378,14 @@ class RLTrainer:
         # with adapters there are no masters: the adapters stay float32 parameters (megabytes), so nothing trained
         # is rounded in the module (a bf16 DoRA magnitude would make the starting policy differ from the base)
         cuda = not fsdp and self.device.startswith("cuda")
-        self.master = MasterWeights(self.model) if cuda and self.adapters is None else None
+        bf16_optimizer = t.optimizer == "adamw_bf16"
+        self.master = MasterWeights(self.model) if cuda and self.adapters is None and not bf16_optimizer else None
+        if cuda and bf16_optimizer:
+            # train.optimizer adamw_bf16: the bf16 parameters are what the optimizer steps (stochastic rounding or
+            # Kahan compensation keeps the updates below a bf16 ulp): no fp32 masters, no fp32 gradients
+            for p in self.model.parameters():
+                if p.requires_grad:
+                    p.data = p.data.to(torch.bfloat16)
         if self.adapters is not None:
             self.adapters.start(self.model)  # logs the trainable-parameter count
         self.head = output_head(self.model)
@@ -1497,8 +1504,14 @@ def _optimizer(
 ) -> torch.optim.Optimizer:
     """AdamW over the trained parameters (the fp32 masters on one GPU), with fp32 or 8-bit moments; or Muon on the
     hidden matrices with AdamW on the rest (`names` route the parameters, palingenesis.muon)."""
-    eps = t.adam_eps or (1e-15 if t.optimizer in ("adamw", "muon") else 1e-8)
+    eps = t.adam_eps or (1e-15 if t.optimizer in ("adamw", "adamw_bf16", "muon") else 1e-8)
     kwargs = dict(lr=t.learning_rate, betas=(t.adam_beta1, t.adam_beta2), eps=eps, weight_decay=t.weight_decay)
+    if t.optimizer == "adamw_bf16":  # bf16 parameters and moments (palingenesis.bf16_adamw)
+        from palingenesis.bf16_adamw import BF16AdamW
+
+        params = list(params)
+        named = list(zip(names, params)) if names and len(names) == len(params) else None
+        return BF16AdamW(params, **kwargs, named=named, seed=t.seed, rounding=t.bf16_rounding)
     if t.optimizer == "muon":
         from palingenesis.muon import build_muon
 

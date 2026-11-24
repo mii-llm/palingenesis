@@ -360,8 +360,14 @@ class RLTrainConfig:
     adam_eps: float = 0.0
     # "adamw" (fp32 moments: 8 bytes per parameter), "adamw8bit" (bitsandbytes' blockwise 8-bit
     # moments: 2 bytes per parameter) or "paged_adamw8bit" (8-bit, paged to CPU memory under
-    # pressure). 8-bit states need one GPU without FSDP.
+    # pressure). 8-bit states need one GPU without FSDP. "adamw_bf16" (palingenesis.bf16_adamw): the policy's bf16
+    # parameters are stepped directly, with bf16 moments: no fp32 master copy and no fp32 gradients (one GPU, no
+    # FSDP, no adapters); gradients accumulate over micro-batches in bf16.
     optimizer: str = "adamw"
+    # adamw_bf16: "kahan" (a bf16 compensation buffer: no rounding noise, +2 bytes per parameter) or "stochastic".
+    # kahan by default here: at RL learning rates an update is ~1/100 of a bf16 ulp, where stochastic rounding's
+    # random walk outgrows the update itself.
+    bf16_rounding: str = "kahan"
     # Muon (optimizer: muon; palingenesis.muon). muon_ns: "gram" (Gram Newton-Schulz with a restart, ~half the FLOPs
     # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
     # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
@@ -927,13 +933,28 @@ class RLConfig:
             )
         if (t.fsdp or t.cpu_offload) and r.backend == "hf" and r.max_staleness:
             errors.append("rollout.backend hf generates with the sharded trainer model: max_staleness must be 0.")
-        if t.optimizer not in ("adamw", "muon", "adamw8bit", "paged_adamw8bit"):
-            errors.append(f"train.optimizer must be adamw, muon, adamw8bit or paged_adamw8bit, got {t.optimizer!r}.")
+        if t.bf16_rounding not in ("stochastic", "kahan"):
+            errors.append(f"train.bf16_rounding must be stochastic or kahan, got {t.bf16_rounding!r}.")
+        if t.optimizer not in ("adamw", "adamw_bf16", "muon", "adamw8bit", "paged_adamw8bit"):
+            errors.append(
+                f"train.optimizer must be adamw, adamw_bf16, muon, adamw8bit or paged_adamw8bit, got {t.optimizer!r}."
+            )
+        elif t.optimizer == "adamw_bf16":
+            if t.fsdp or t.cpu_offload or in_world:
+                errors.append(
+                    "train.optimizer adamw_bf16 replaces the fp32 masters of one GPU; FSDP keeps fp32 shards (and "
+                    "cpu_offload / several ranks run FSDP): use adamw there."
+                )
+            if self.lora.rank:
+                errors.append(
+                    "train.optimizer adamw_bf16 with lora.rank: the adapters are fp32 parameters already (megabytes); "
+                    "use adamw."
+                )
         elif t.optimizer not in ("adamw", "muon") and (t.fsdp or t.cpu_offload or in_world):
             errors.append(
                 f"train.optimizer {t.optimizer} (bitsandbytes) steps local tensors: not with FSDP or cpu_offload."
             )
-        if t.optimizer not in ("adamw", "muon") and 0 < t.adam_eps < 1e-8:
+        if t.optimizer in ("adamw8bit", "paged_adamw8bit") and 0 < t.adam_eps < 1e-8:
             errors.append(
                 f"train.adam_eps {t.adam_eps:g} with {t.optimizer}: 8-bit moments round small second moments to 0, "
                 "and an eps below 1e-8 then lets their updates explode. Leave adam_eps at 0 (auto: 1e-8) or set >= 1e-8."

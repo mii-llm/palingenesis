@@ -462,3 +462,42 @@ def test_config_bf16_rounding():
     model = _mlp(torch.bfloat16)
     opt = build_optimizer(model, 1e-3, 0.0, optimizer_name="adamw_bf16", bf16_rounding="kahan")
     assert opt.rounding == "kahan"
+
+
+# ── pgs rl ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _rl_config(**sets):
+    from palingenesis.rl.config import RLConfig
+
+    config = RLConfig()
+    for key, value in {"model.policy": "x", "data.dataset": "d.jsonl", "rewards.m.fn": "math", **sets}.items():
+        config.set(key, value)
+    return config
+
+
+def test_rl_validation():
+    from palingenesis.rl.config import RLConfigError
+
+    config = _rl_config(**{"train.optimizer": "adamw_bf16"})
+    assert config.train.bf16_rounding == "kahan"
+    config.validate()
+    for key, value, match in [
+        ("train.fsdp", True, "FSDP"),
+        ("lora.rank", 16, "adapters"),
+        ("train.bf16_rounding", "nearest", "bf16_rounding"),
+    ]:
+        with pytest.raises(RLConfigError, match=match):
+            _rl_config(**{"train.optimizer": "adamw_bf16", key: value}).validate()
+
+
+def test_rl_optimizer_is_bf16_adamw_with_rl_eps():
+    from palingenesis.rl.trainer import _optimizer
+
+    model = _mlp(torch.bfloat16)
+    config = _rl_config(**{"train.optimizer": "adamw_bf16"})
+    names = [n for n, _ in model.named_parameters()]
+    opt = _optimizer(list(model.parameters()), config.train, "cpu", names)
+    assert isinstance(opt, BF16AdamW) and opt.rounding == "kahan"
+    assert opt.param_groups[0]["eps"] == 1e-15
+    _run(model, opt, 2)
