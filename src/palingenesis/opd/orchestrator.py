@@ -210,12 +210,14 @@ class Pipeline:
                 {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
                 meta.get("tools"),
             ),
-            # meta["teacher_messages"]: the teacher's copy of the conversation, with context the student does not see
+            # meta["teacher_messages"]: the teacher's copy of the conversation, with context the student does not see;
+            # meta["teacher_tools"]: the tool schemas the teacher's prompt lists instead of meta["tools"] (None: none),
+            # when a privileged view changes them
             encode_prompt(
                 self.routes[teacher].tokenizer,
                 meta.get("teacher_messages", messages),
                 {**self.chat_template_kwargs, **meta.get("chat_template_kwargs", {})},
-                meta.get("tools"),
+                meta["teacher_tools"] if "teacher_tools" in meta else meta.get("tools"),
             ),
         )
 

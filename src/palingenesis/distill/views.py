@@ -75,7 +75,23 @@ class TeacherView:
             "messages_field": s.messages_field,
             "chat_template_kwargs": s.chat_template_kwargs,
             "view_fn": s.view_fn,
+            # only when set: caches built before these options keep their description
+            **({"tools": s.tools} if s.tools != "keep" else {}),
+            **({"tools_field": s.tools_field} if s.tools_field else {}),
         }
+
+    def tools(self, row: dict, own):
+        """The tool schemas the teacher's prompt lists for `row`: `own` (the row's, as the student's) unless the
+        row fills tools_field (that list; [] = None) or the view drops them (None)."""
+        s = self.spec
+        if s.tools_field and row.get(s.tools_field) not in (None, ""):
+            value = row[s.tools_field]
+            if isinstance(value, str):
+                value = json.loads(value)
+            if not isinstance(value, list) or not all(isinstance(t, dict) for t in value):
+                raise ValueError(f"{s.tools_field} must be a list of tool schemas, got {type(value).__name__}")
+            return value or None
+        return None if s.tools == "drop" else own
 
     def messages(self, row: dict, messages: list[dict]) -> list[dict] | None:
         """The teacher's conversation for `row` (whose student conversation is `messages`)."""

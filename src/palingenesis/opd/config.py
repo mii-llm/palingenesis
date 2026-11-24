@@ -104,6 +104,10 @@ class SourceConfig:
     # again: {question}"} or {name: system_facts, template: "{system}\n\n{content}"}. Each rollout draws one
     # applicable view by weight (held-out rows: one fixed view per row); rows with none are ordinary rows.
     # Logged per source as privileged/<view> (the share of the batch's rollouts).
+    # A view may also change the tool schemas the teacher's prompt lists (the student keeps the row's own):
+    # tools: drop (the teacher sees none; applies to rows that have tools) or tools_field: a row field with the
+    # teacher's own list (OpenAI schemas or their JSON string; applies where present, as `field`; [] = none). Such
+    # a view needs no template (context ablation: the teacher is the model without the tools that trigger a refusal).
     privileged_views: list = field(default_factory=list)
     # A row field holding that row's own template (same placeholders), used instead of the view's (or
     # privileged_template) where it is non-empty. Checked when the source loads.
@@ -195,16 +199,19 @@ class SourceConfig:
     cot_max_new_tokens: int = 300
 
     def privileged_view_list(self) -> list[dict]:
-        """The source's privileged views, normalized to {name, template, role, field, weight}: privileged_views, or
-        the single view of privileged_field / privileged_template / privileged_role ("privileged"), or none."""
+        """The source's privileged views, normalized to {name, template, role, field, weight, tools, tools_field}:
+        privileged_views, or the single view of privileged_field / privileged_template / privileged_role
+        ("privileged"), or none. template "" = the turn's text is unchanged (a view that changes the tools only)."""
         if self.privileged_views:
             return [
                 {
                     "name": str(v.get("name", "")),
-                    "template": v.get("template", ""),
+                    "template": v.get("template", "") or "",
                     "role": v.get("role", "user"),
                     "field": v.get("field", "") or "",
                     "weight": v.get("weight", 1.0),
+                    "tools": v.get("tools", "keep"),
+                    "tools_field": v.get("tools_field", "") or "",
                 }
                 for v in self.privileged_views
                 if isinstance(v, dict)
@@ -217,6 +224,8 @@ class SourceConfig:
                     "role": self.privileged_role,
                     "field": self.privileged_field,
                     "weight": 1.0,
+                    "tools": "keep",
+                    "tools_field": "",
                 }
             ]
         return []
@@ -757,7 +766,8 @@ def _failed_turn_errors(where: str, source, branch_weight: float) -> list[str]:
     return errors
 
 
-VIEW_KEYS = {"name", "template", "role", "field", "weight"}
+VIEW_KEYS = {"name", "template", "role", "field", "weight", "tools", "tools_field"}
+VIEW_TOOLS = ("keep", "drop")
 
 
 def privileged_errors(source, where: str) -> list[str]:
@@ -810,9 +820,28 @@ def privileged_errors(source, where: str) -> list[str]:
         if view["role"] not in ("user", "system"):
             label = f"{where}.privileged_views[{i}].role" if listed else f"{where}.privileged_role"
             errors.append(f"{label} must be 'user' or 'system', got {view['role']!r}.")
+        at = f"{where}.privileged_views[{i}]"
+        if view["tools"] not in VIEW_TOOLS:
+            errors.append(f"{at}.tools must be one of {VIEW_TOOLS}, got {view['tools']!r}.")
+        if not isinstance(view["tools_field"], str):
+            errors.append(f"{at}.tools_field must be a row field name, got {view['tools_field']!r}.")
+        if view["tools"] == "drop" and view["tools_field"]:
+            errors.append(
+                f"{at}: tools drop and tools_field contradict each other (tools_field gives the teacher its own list; "
+                "an empty list there drops them for that row)."
+            )
+        changes_tools = view["tools"] == "drop" or bool(view["tools_field"])
+        if listed and not view["template"]:
+            if not changes_tools:
+                errors.append(
+                    f"{at} changes nothing the teacher sees: give it a template, tools: drop or a tools_field."
+                )
+            if view["field"]:
+                errors.append(f"{at}.field {view['field']!r} needs a template to place it ({{privileged}}).")
+            continue
         problem = privileged_template_error(view["template"], with_field=bool(view["field"]))
         if problem:
-            label = f"{where}.privileged_views[{i}].template" if listed else f"{where}.privileged_template"
+            label = f"{at}.template" if listed else f"{where}.privileged_template"
             errors.append(f"{label} {problem}.")
     return errors
 

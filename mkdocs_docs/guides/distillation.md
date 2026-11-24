@@ -315,6 +315,32 @@ sources:
       - {name: reworded, field: reworded, template: "{privileged}"}
 ```
 
+#### Removing a trigger: the teacher without the tools
+
+A view may also change the tool schemas the teacher's prompt lists, while the student keeps the row's own:
+`tools: drop` (the teacher sees no tools; the view applies to rows that have tools) or `tools_field: <row field>` (the
+teacher's own list, OpenAI schemas or their JSON string, e.g. a subset or a corrected list; it applies where the row
+fills the field, like `field`, and `[]` means no tools). A view that changes the tools needs no template. This is
+context-ablation self-distillation: when unrelated tools attached to an ordinary request make the model refuse ("I
+have no tool for that, so I can't"), the same frozen model rendered without them answers, and the student, which
+sees the tools, is pulled towards that answer.
+
+```yaml
+teachers:
+  self: {model: runs/sft/final}
+sources:
+  tool_noise:
+    path: requests_with_unrelated_tools.jsonl   # rows: messages, tools (unrelated to the request), act_hint?
+    teacher: self
+    privileged_views:
+      - {name: no_tools, tools: drop, weight: 2}
+      - {name: act_hint, field: act_hint, template: "{content}\n\n{privileged}"}   # e.g. "Answer directly."
+```
+
+The trained turn must stay one the student could give with the tools in view (an answer, not a call to a tool only
+the teacher sees), so drop or replace tools only on rows where the right behaviour does not need them. Off-policy
+teacher views (`distill.teachers.<name>` in `pgs train`) take the same `tools: drop` / `tools_field`.
+
 To measure which kind carries signal, put each view in its own source over the same file (`eval/dev_kl/<source>` and
 `eval/dev_acc/<source>` then split by kind), or compare `kl/<teacher>` at step 0 between configs: a view whose teacher
 agrees with the student everywhere (step-0 KL near 0) teaches nothing. The privileged text must never reach the

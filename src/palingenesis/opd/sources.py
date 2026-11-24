@@ -191,10 +191,42 @@ class ChatMessagesSource:
         logger.info("Chat prompts: %d train / %d dev", len(self.train_rows), len(self.dev_rows))
         self.views = config.privileged_view_list()
         self._check_row_templates()
+        self._check_rows()
 
     def _applicable(self, row: dict) -> list[dict]:
-        """The privileged views that apply to a row: those without a field, and those whose field the row fills."""
-        return [v for v in self.views if not v["field"] or _present(row.get(v["field"]))]
+        """The privileged views that apply to a row: a view's field and tools_field must be filled in the row, and a
+        view whose only change is dropping the tools needs a row that has tools."""
+        return [
+            v
+            for v in self.views
+            if (not v["field"] or _present(row.get(v["field"])))
+            and (not v["tools_field"] or _present(row.get(v["tools_field"])))
+            and (v["template"] or v["tools_field"] or row.get("tools"))
+        ]
+
+    @staticmethod
+    def _tool_list(value, where: str) -> list[dict]:
+        """A tools_field value: a list of tool schemas (dicts), or its JSON string."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{where}: not a JSON list of tool schemas ({e})") from None
+        if not isinstance(value, list) or not all(isinstance(t, dict) for t in value):
+            raise ValueError(f"{where}: must be a list of tool schemas (objects), got {type(value).__name__}")
+        return value
+
+    def _check_rows(self) -> None:
+        """Every row's tools_field value of the views that may apply to it is a tool list."""
+        for split, rows in (("train", self.train_rows), ("dev", self.dev_rows)):
+            for i, row in enumerate(rows):
+                for view in self._applicable(row):
+                    if view["tools_field"]:
+                        self._tool_list(
+                            row[view["tools_field"]],
+                            f"{self.config.path}: {split} row {i}: {view['tools_field']} (privileged view "
+                            f"{view['name']!r})",
+                        )
 
     def _check_row_templates(self) -> None:
         """A row's own template (privileged_template_field) must be valid for every view that may draw it."""
@@ -251,12 +283,15 @@ class ChatMessagesSource:
                     rng = random.Random(question_hash(json.dumps(row["messages"], ensure_ascii=False, default=str)))
                 view = rng.choices(views, weights=[float(v["weight"]) for v in views], k=1)[0]
             own = row.get(self.config.privileged_template_field) if self.config.privileged_template_field else None
-            meta["teacher_messages"] = with_privileged(
-                row["messages"],
-                str(row[view["field"]]) if view["field"] else "",
-                own if _present(own) else view["template"],
-                view["role"],
-            )
+            template = own if _present(own) else view["template"]
+            if template:
+                meta["teacher_messages"] = with_privileged(
+                    row["messages"], str(row[view["field"]]) if view["field"] else "", template, view["role"]
+                )
+            if view["tools_field"]:  # the teacher's own tool list ([]: none)
+                meta["teacher_tools"] = self._tool_list(row[view["tools_field"]], view["tools_field"]) or None
+            elif view["tools"] == "drop":
+                meta["teacher_tools"] = None
             meta["_view"] = view["name"]
         return meta
 

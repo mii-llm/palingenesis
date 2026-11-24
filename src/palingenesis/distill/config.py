@@ -96,6 +96,10 @@ class TeacherSpec:
                            ({content}, {privileged}; also {question}: the last user turn, {system}: the
                            system turn) into the last user turn or the system turn (privileged_role);
                            rows without the field render as they are
+      tools                "keep" (the row's tool schemas, as the student sees them) or "drop" (the
+                           teacher's prompt lists none: context ablation of a trigger)
+      tools_field          row field with the teacher's own tool list (OpenAI schemas or their JSON
+                           string; [] = none); rows without it keep their own
       messages_field       row field with the teacher's own full conversation (its trained turns
                            must match the student's)
       chat_template_kwargs the teacher's template options (e.g. {enable_thinking: true})
@@ -121,6 +125,8 @@ class TeacherSpec:
     privileged_field: str = ""
     privileged_template: str = "{content}\n\n{privileged}"
     privileged_role: str = "user"
+    tools: str = "keep"
+    tools_field: str = ""
     messages_field: str = ""
     chat_template_kwargs: dict = field(default_factory=dict)
     view_fn: str = ""
@@ -136,6 +142,8 @@ class TeacherSpec:
             self.system_prompt
             or self.prefix_messages
             or self.privileged_field
+            or self.tools != "keep"
+            or self.tools_field
             or self.messages_field
             or self.chat_template_kwargs
             or self.view_fn
@@ -209,6 +217,12 @@ def distill_errors(config) -> list[str]:
             errors.append(f"{where}.weight must be > 0 (got {t.weight}).")
         if t.top_k < 1:
             errors.append(f"{where}.top_k must be >= 1 (got {t.top_k}).")
+        if t.tools not in ("keep", "drop"):
+            errors.append(f"{where}.tools must be 'keep' or 'drop' (got {t.tools!r}).")
+        if t.tools == "drop" and t.tools_field:
+            errors.append(
+                f"{where}: tools drop and tools_field contradict each other (an empty list there drops them)."
+            )
         if t.privileged_role not in ("user", "system"):
             errors.append(f"{where}.privileged_role must be 'user' or 'system' (got {t.privileged_role!r}).")
         if t.privileged_field:

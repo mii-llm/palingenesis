@@ -809,6 +809,8 @@ class ChatDataset(_Epochs, IterableDataset):
                 teacher_ds.messages_field: teacher_messages,
                 "chat_template_kwargs": {**row_kwargs, **view.spec.chat_template_kwargs},
             }
+            # the view's tool list (tools: drop, tools_field); the row's own otherwise
+            teacher_row[teacher_ds.tools_field] = view.tools(example, example.get(teacher_ds.tools_field))
             rendered = teacher_ds._process(teacher_row)
             if rendered is None:
                 return None

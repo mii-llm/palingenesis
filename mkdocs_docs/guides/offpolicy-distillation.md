@@ -290,6 +290,8 @@ Before a large run, `pgs profile --config kd.yaml` counts the teachers' weights 
 | `privileged_field` | str | `""` | View: a row field placed by `privileged_template` |
 | `privileged_template` | str | `{content}\n\n{privileged}` | Where the privileged text goes |
 | `privileged_role` | str | `user` | `user` (last user turn) or `system` |
+| `tools` | str | `keep` | View: `drop` renders the teacher's prompt without the row's tool schemas |
+| `tools_field` | str | `""` | View: a row field with the teacher's own tool list (`[]` = none); rows without it keep theirs |
 | `messages_field` | str | `""` | View: the teacher's own conversation field |
 | `chat_template_kwargs` | dict | `{}` | View: the teacher's template options |
 | `view_fn` | str | `""` | View: `module:function` (row, messages) → messages |
