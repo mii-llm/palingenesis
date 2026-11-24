@@ -177,7 +177,7 @@ def build_mesh(world_size: int, config: ParallelConfig) -> DeviceMesh | None:
     `parallel.cp_degree` sets cp (0: min(world_size, 8) when that divides world_size, else
     world_size; groups of up to 8 keep the K/V all-gathers on one node's NVLink).
     """
-    if world_size <= 1 and not (config.fsdp and config.cpu_offload):
+    if world_size <= 1 and not config.cpu_offload:
         return None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if world_size <= 1:  # one GPU with CPU offload: FSDP2 over a mesh of one rank

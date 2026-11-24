@@ -90,15 +90,17 @@ def test_offloaded_fsdp_on_one_rank_matches_plain_training(optimizer_name, dtype
 
 def test_build_mesh_without_offload_is_none_on_one_process():
     assert build_mesh(1, ParallelConfig()) is None
-    assert build_mesh(1, ParallelConfig(fsdp=False, cpu_offload=True)) is None
+    assert build_mesh(1, ParallelConfig(fsdp=False)) is None
 
 
 def test_validation():
     cfg = Config()
     cfg.parallel.cpu_offload = True
     assert cfg.validate() == []
+    cfg.parallel.fsdp = False  # one GPU: cpu_offload implies FSDP2 (shipped configs set fsdp: false with it)
+    assert cfg.validate() == []
     for section, key, value, match in [
-        ("parallel", "fsdp", False, "parallel.fsdp: false"),
+        ("memory", "seco", True, "memory.seco"),
         ("memory", "gradient_release", True, "gradient_release"),
     ]:
         cfg = Config()

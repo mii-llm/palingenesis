@@ -350,7 +350,7 @@ def _train(config: Config, run: dict) -> TrainResult:
 
     # ── Distributed ───────────────────────────────────────────────────────
     rank, local_rank, world_size = setup_distributed()
-    if world_size == 1 and config.parallel.fsdp and config.parallel.cpu_offload:
+    if world_size == 1 and config.parallel.cpu_offload:
         init_single_process_group()  # FSDP2's CPU offload on one GPU needs a (one-rank) process group
     setup_logging(rank)
     if not torch.cuda.is_available():
@@ -475,7 +475,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # ── Device mesh (FSDP2 / context parallel); sharded teachers use it too ──
     mesh = build_mesh(world_size, config.parallel)
     # FSDP2: several ranks, or one GPU with CPU offload (parameters, gradients and optimizer state in host memory)
-    is_fsdp = config.parallel.fsdp and mesh is not None
+    # (cpu_offload implies FSDP2, as in pgs rl: parallel.fsdp: false with cpu_offload on one GPU used to be a no-op)
+    is_fsdp = (config.parallel.fsdp or config.parallel.cpu_offload) and mesh is not None
     # Ranks that hold different data. The ranks of a context-parallel group split the same rows,
     # so they read the same shard of the data.
     if mesh is not None and "cp" in (mesh.mesh_dim_names or ()):

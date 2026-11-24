@@ -1187,7 +1187,6 @@ class Config:
             )
         if p.cpu_offload:
             unsupported = {
-                "parallel.fsdp: false (the offload is FSDP2's, also on one GPU)": not p.fsdp,
                 "memory.seco (its chunked backward runs on a plain module)": self.memory.seco,
                 "memory.gradient_release (it steps inside the backward, before FSDP has offloaded the gradient)": (
                     self.memory.gradient_release
