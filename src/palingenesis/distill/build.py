@@ -95,7 +95,9 @@ def iter_documents(config, tokenizer, views: list | None = None, rank: int = 0, 
         stages.append(source_stage(raw, tokenizer, data, None, rank, world_size, teacher_views=views))
     if data.pretrain_replay_dataset:
         replay = _load_dataset_source(data.pretrain_replay_dataset, "train", streaming=True)
-        stages.append(PretrainDataset(replay, tokenizer, data.max_seq_length, rank=rank, world_size=world_size))
+        stages.append(
+            PretrainDataset(replay, tokenizer, data.max_seq_length, rank=rank, world_size=world_size, append_eos=False)
+        )
         logger.warning("data.pretrain_replay_dataset: the whole replay corpus is scored (it is a stream)")
     for stage in stages:
         yield from stage

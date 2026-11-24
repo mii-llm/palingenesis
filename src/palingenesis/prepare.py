@@ -979,13 +979,16 @@ def prepare_text(
     seed: int = 42,
     tokenizer=None,
     bench=None,
+    decontaminate_fields: list[str] | tuple[str, ...] = (),
 ) -> Path:
     """Clean a raw-text dataset (a `mode: pretrain` source) without a model.
 
     1. Load the rows; drop the ones without text in `text_field` and, with min_chars, the
        documents shorter than that many characters
-    2. Drop the documents that share a word n-gram of `decontaminate_ngram` words with any
-       string of the `decontaminate` files (the evaluation sets you will report)
+    2. Drop the documents that share a word n-gram of `decontaminate_ngram` words with the
+       `decontaminate` files (the evaluation sets you will report): every string column, or
+       only `decontaminate_fields`; n-grams in more than 20% of a file's rows (a shared
+       instruction) are not matched
     3. Drop exact duplicates (dedupe: the same text up to case and whitespace) and, with
        near_dedupe > 0, near-duplicates (estimated Jaccard similarity of the word 5-gram sets
        at or above that value); the first document of a group is kept
@@ -1009,7 +1012,7 @@ def prepare_text(
     if not 0.0 <= near_dedupe <= 1.0:
         raise ValueError(f"near_dedupe must be in [0, 1] (a Jaccard similarity; 0 = off), got {near_dedupe}")
     if bench is None and decontaminate:
-        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram)
+        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram, decontaminate_fields)
         logger.info(
             f"Decontamination: {len(bench.hashes):,} {bench.n}-word n-grams from {bench.strings:,} strings in "
             f"{len(bench.files)} file(s) ({bench.too_short:,} strings shorter than {bench.n} words give none)"
@@ -1145,6 +1148,7 @@ def prepare_multi_source(
     decontaminate_ngram: int = 13,
     near_dedupe: float = 0.0,
     min_chars: int = 0,
+    decontaminate_fields: list[str] | tuple[str, ...] = (),
 ):
     """Prepare several data sources, each on its own (prepare_data per chat source,
     prepare_text per raw-text source, one model).
@@ -1169,14 +1173,15 @@ def prepare_multi_source(
             - messages_field: field containing messages (default "messages")
             - tools_field, last_turn_only: as in data.sources
             - mode: "sft" (default) or "pretrain": a raw-text source is cleaned by prepare_text
-              (text_field; near_dedupe, min_chars and eval_holdout may be set per source)
+              (text_field; dedupe, near_dedupe, min_chars, eval_holdout, max_samples and seed
+              may be set per source)
         output_path: Base output directory
         max_seq_length: Max sequence length
         budget_per_source: Default budget per source (None = use all)
         strategy: Selection strategy per source
         compute_hes, hes_top_k_pct, score, min_ppl, max_ppl, batch_size, max_batch_tokens,
             num_workers: as in prepare_data
-        decontaminate, decontaminate_ngram, near_dedupe, min_chars: for the raw-text sources,
+        decontaminate, decontaminate_ngram, decontaminate_fields, near_dedupe, min_chars: for the raw-text sources,
             as in prepare_text (the evaluation n-grams are read once for all of them)
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -1195,7 +1200,7 @@ def prepare_multi_source(
     if decontaminate and any(s.get("mode", "sft") == "pretrain" for s in sources):
         from palingenesis.text_clean import NgramIndex
 
-        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram)
+        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram, decontaminate_fields)
 
     for src_config in sources:
         name = src_config.get("name", src_config.get("dataset", "unknown"))
@@ -1216,6 +1221,9 @@ def prepare_multi_source(
                 text_field=src_config.get("text_field", "text"),
                 dataset_split=src_config.get("split", "train"),
                 output_format="jsonl",
+                max_samples=src_config.get("max_samples"),
+                dedupe=src_config.get("dedupe", True),
+                seed=src_config.get("seed", 42),
                 near_dedupe=src_config.get("near_dedupe", near_dedupe),
                 min_chars=src_config.get("min_chars", min_chars),
                 eval_holdout=src_config.get("eval_holdout", 0),
@@ -1365,7 +1373,9 @@ def prepare_text_sources_from_config(config) -> Path:
     if skipped:
         logger.warning(f"{skipped} chat source(s) of data.sources are not prepared here: use pgs prepare-multi")
     output_base = Path(pre.output_dir)
-    bench = NgramIndex.from_files(pre.decontaminate, pre.decontaminate_ngram) if pre.decontaminate else None
+    bench = None
+    if pre.decontaminate:
+        bench = NgramIndex.from_files(pre.decontaminate, pre.decontaminate_ngram, pre.decontaminate_fields)
     cleaned = []
     for i, src in text_sources:
         name = str(src.get("name") or Path(str(src["dataset"])).stem or f"source{i}")
@@ -1445,6 +1455,12 @@ def main():
         "with any string in them are dropped",
     )
     parser.add_argument("--decontaminate_ngram", type=int, default=13, help="Words per decontamination n-gram")
+    parser.add_argument(
+        "--decontaminate_fields",
+        nargs="*",
+        default=[],
+        help="Columns of the evaluation files to read (default: every string column)",
+    )
     parser.add_argument("--min_chars", type=int, default=0, help="--mode pretrain: drop documents shorter than this")
     parser.add_argument("--max_samples", type=int, help="Max samples to process")
     parser.add_argument("--max_seq_length", type=int, default=8192)
@@ -1521,6 +1537,7 @@ def main():
             near_dedupe=args.near_dedupe,
             decontaminate=args.decontaminate,
             decontaminate_ngram=args.decontaminate_ngram,
+            decontaminate_fields=args.decontaminate_fields,
             min_chars=args.min_chars,
             eval_holdout=args.eval_holdout,
             seed=args.seed,

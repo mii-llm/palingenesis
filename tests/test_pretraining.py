@@ -131,6 +131,60 @@ def test_replay_epoch_is_one_pass_over_the_target_rows(tmp_path):
     others = len(samples) - len(target)
     assert len(target) == chunks
     assert 0.15 < others / len(samples) < 0.35  # about the replay weight, per sequence
+    # replay text is trained as it always was: no end-of-document token (the EOS of a chat tokenizer is
+    # its end-of-turn token), while the raw-text source's documents each end with one
+    eos = TOK.eos_token_id
+    assert not any((s["input_ids"] == eos).any() for s in samples if _letter(s) == "r")
+    assert sum(int(s["input_ids"][-1]) == eos for s in target) == len(rows)
+    estimate = estimate_run(config, TOK, 1, 1)
+    assert abs(estimate.examples_per_epoch - len(samples)) / len(samples) < 0.12
+
+
+class _Rows(torch.utils.data.IterableDataset):
+    def __init__(self, n: int, tag: str):
+        self.n, self.tag = n, tag
+
+    def __iter__(self):
+        for _ in range(self.n):
+            yield {"input_ids": torch.zeros(4, dtype=torch.long), "s": self.tag}
+
+
+def test_epoch_ends_when_no_counted_source_is_left(caplog):
+    """The target yields nothing and is dropped: only the uncounted replay is left, and the epoch must end
+    instead of drawing replay for ever."""
+    import itertools
+
+    mix = MixedDataset(
+        [_Rows(0, "target"), _Rows(3, "replay")], [0.9, 0.1], epoch_draws=5, counted=[True, False], names=["t", "r"]
+    )
+    with caplog.at_level("WARNING"):
+        out = list(itertools.islice(mix, 200))
+    assert len(out) <= 3, len(out)
+    assert "No data source that counts towards the epoch is left" in caplog.text
+    # with a target that yields, replay restarts as often as needed and the epoch is the target's rows
+    mix = MixedDataset([_Rows(4, "target"), _Rows(3, "replay")], [0.5, 0.5], epoch_draws=8, counted=[True, False])
+    out = [x["s"] for x in itertools.islice(mix, 500)]
+    assert out.count("target") == 8 and len(out) < 100
+
+
+@needs_tok
+def test_default_eos_that_is_the_end_of_turn_token_warns(caplog):
+    from palingenesis import data
+
+    assert TOK.eos_token in TOK.chat_template  # the test tokenizer is a chat tokenizer
+    data._END_OF_TURN_WARNED.clear()
+    with caplog.at_level("WARNING"):
+        PretrainDataset([], TOK, 64)
+        PretrainDataset([], TOK, 64)
+    assert caplog.text.count("chat template's end-of-turn token") == 1  # once, and it names the fix
+    assert "<|endoftext|>" in caplog.text
+    caplog.clear()
+    data._END_OF_TURN_WARNED.clear()
+    with caplog.at_level("WARNING"):
+        PretrainDataset([], TOK, 64, append_eos="<|endoftext|>")
+        PretrainDataset([], TOK, 64, append_eos=False)
+        PretrainDataset([], H.tokenizer(), 64)  # EOS <|endoftext|>, not written in its template
+    assert "end-of-turn" not in caplog.text
 
 
 # ── end-of-document token ─────────────────────────────────────────────────────
@@ -174,6 +228,29 @@ def test_long_document_gets_eos_on_its_last_chunk_only():
     assert all((c["input_ids"] == eos).sum() == 0 for c in chunks[:-1])
     marks = [end for _, end in PretrainDataset([_doc("long", 0, 150), _doc("s", 1, 5)], TOK, 64).iter_marked()]
     assert marks == [False] * (len(chunks) - 1) + [True, True]
+
+
+@needs_tok
+def test_exact_multiple_of_max_seq_length_keeps_its_eos():
+    """A document of exactly k x max_seq_length tokens: the EOS would be a 1-token tail. It is kept, in a
+    last chunk that reaches back into the previous one; nothing of the document is lost."""
+    eos = TOK.eos_token_id
+    ids = TOK(" ".join(f"w{i}" for i in range(400)))["input_ids"][:128]
+    assert TOK(TOK.decode(ids))["input_ids"] == ids
+    for extra in (0, 1, 14):  # tails of 1, 2 and 15 tokens with the EOS
+        tokens = ids + ids[:extra]
+        assert TOK(TOK.decode(tokens))["input_ids"] == tokens
+        chunks = PretrainDataset([], TOK, 64)._process({"text": TOK.decode(tokens)})
+        assert [c["input_ids"].numel() for c in chunks] == [64, 64, 16]
+        last = chunks[-1]
+        assert int(last["input_ids"][-1]) == eos and last["labels"].tolist() == last["input_ids"].tolist()
+        assert last["input_ids"].tolist() == (tokens + [eos])[-16:]
+        assert sum(int((c["input_ids"] == eos).sum()) for c in chunks) == 1
+        # without the token the short tail is dropped, as before
+        plain = PretrainDataset([], TOK, 64, append_eos=False)._process({"text": TOK.decode(tokens)})
+        assert [c["input_ids"].numel() for c in plain] == [64, 64]
+    single = PretrainDataset([], TOK, 64)._process({"text": TOK.decode(ids[:64])})
+    assert [c["input_ids"].numel() for c in single] == [64, 16] and int(single[-1]["input_ids"][-1]) == eos
 
 
 @needs_tok
@@ -314,6 +391,84 @@ def test_random_init_is_seeded_and_leaves_the_generator_alone(tmp_path):
         model_init.random_init(str(path), seed=7, tokenizer=tok)
 
 
+def test_random_init_in_low_precision_matches_a_loaded_checkpoint(tmp_path, monkeypatch):
+    """bf16: built directly in bf16 (one copy in memory, as from_pretrained), parameters bf16 and the
+    float buffers (rotary frequencies) float32, as in a loaded checkpoint."""
+    import transformers
+
+    from palingenesis import model_init
+
+    tok = H.tokenizer()
+    path = _config_only(tmp_path, tok)
+    H.save_model(tmp_path / "trained", tok)
+    loaded = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "trained", dtype=torch.bfloat16)
+    reference = {name: b.dtype for name, b in loaded.named_buffers()}
+    assert any(d == torch.float32 for d in reference.values())  # the architecture has float buffers
+
+    calls = []
+    real = transformers.AutoModelForCausalLM.from_config
+
+    def spy(config, **kwargs):
+        calls.append(kwargs.get("dtype"))
+        return real(config, **kwargs)
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_config", spy)
+    model = model_init.random_init(str(path), seed=3, dtype=torch.bfloat16)
+    assert calls == [torch.bfloat16]  # never the float32 model first
+    assert all(p.dtype == torch.bfloat16 for p in model.parameters())
+    assert {name: b.dtype for name, b in model.named_buffers()} == reference
+
+    # an initialiser that cannot draw in bf16: float32, then the parameters only are cast
+    def failing(config, **kwargs):
+        calls.append(kwargs.get("dtype"))
+        if kwargs.get("dtype") != torch.float32:
+            raise RuntimeError("normal_ is not implemented for this dtype")
+        return real(config, **kwargs)
+
+    calls.clear()
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_config", failing)
+    fallback = model_init.random_init(str(path), seed=3, dtype=torch.bfloat16)
+    assert calls == [torch.bfloat16, torch.float32]
+    assert all(p.dtype == torch.bfloat16 for p in fallback.parameters())
+    assert {name: b.dtype for name, b in fallback.named_buffers()} == reference
+
+
+def test_random_init_forks_every_cuda_generator(tmp_path, monkeypatch):
+    """torch.manual_seed seeds CUDA too: the initialisation runs inside fork_rng over every CUDA device,
+    so each rank keeps the CUDA state its own seed + rank gave it."""
+    import contextlib
+
+    from palingenesis import model_init
+
+    path = _config_only(tmp_path, H.tokenizer())
+    forked = []
+    real = torch.random.fork_rng
+
+    @contextlib.contextmanager
+    def fork(devices=None, **kwargs):
+        forked.append(list(devices))
+        with real(devices=[]):
+            yield
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.random, "fork_rng", fork)
+    model_init.random_init(str(path), seed=7)
+    assert forked == [[0, 1]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_random_init_leaves_the_cuda_generator_alone(tmp_path):
+    from palingenesis import model_init
+
+    path = _config_only(tmp_path, H.tokenizer())
+    torch.cuda.manual_seed_all(123)
+    expected = torch.rand(3, device="cuda")
+    torch.cuda.manual_seed_all(123)
+    model_init.random_init(str(path), seed=7)
+    assert torch.equal(torch.rand(3, device="cuda"), expected)
+
+
 def test_random_init_is_refused_for_preference_training():
     from palingenesis.config import Config
 
@@ -420,6 +575,73 @@ def test_text_clean_checks():
     assert len(clean_documents(samples, report, dedupe=False)) == 24 and set(report.reasons) == {"empty_text"}
 
 
+def test_decontamination_reads_fields_and_ignores_shared_instructions(tmp_path):
+    """A benchmark whose every row repeats one instruction: the instruction must not remove the corpus
+    documents that quote it; only the items do. `fields` limits what is read."""
+    from palingenesis.text_clean import NgramIndex
+
+    instruction = (
+        "Answer the following multiple choice question by writing only the letter of the single correct option"
+    )
+    rng = random.Random(1)
+    stems = ["alpha", "beta", "gamma", "delta", "kappa"]
+
+    def item(i: int) -> str:
+        return f"Question {i}: " + " ".join(rng.choice(stems) + str(rng.randrange(50)) for _ in range(20))
+
+    items = [item(i) for i in range(30)]
+    rows = [
+        {"id": f"bench-{i:04d}", "system": instruction, "question": q, "meta": {"note": instruction}}
+        for i, q in enumerate(items)
+    ]
+    bench = _write_jsonl(tmp_path / "bench.jsonl", rows)
+    quoting = f"A study guide. {instruction}. That is how most exams phrase it, and it says nothing about the content."
+    leaked = f"Forum post: {items[4]} Does anyone know?"
+
+    index = NgramIndex.from_files([bench])
+    assert index.shared > 0 and index.summary()["shared_ngrams_ignored"] == index.shared
+    assert not index.contaminated(quoting) and index.contaminated(leaked)
+    # without the rule the instruction removes every document that quotes it
+    assert NgramIndex.from_files([bench], shared_row_share=1.0).contaminated(quoting)
+
+    by_field = NgramIndex.from_files([bench], fields=["question"], shared_row_share=1.0)
+    assert by_field.strings == 30 and by_field.summary()["fields"] == ["question"]
+    assert not by_field.contaminated(quoting) and by_field.contaminated(leaked)
+    with pytest.raises(ValueError, match="no row of .*bench.jsonl has any of the fields"):
+        NgramIndex.from_files([bench], fields=["prompt"])
+    # a small file (a handful of rows) is indexed whole: a repeated string there may be the item itself
+    small = _write_jsonl(tmp_path / "small.jsonl", rows[:3])
+    assert NgramIndex.from_files([small]).contaminated(quoting)
+
+
+def test_eval_reader_and_resume_warnings(caplog):
+    from palingenesis.config import Config
+    from palingenesis.train import _warn_stream_change, eval_reader
+
+    config = Config()
+    config.data.sources = [
+        {"dataset": "a.jsonl", "mode": "pretrain"},
+        {"dataset": "b.jsonl", "mode": "pretrain", "append_eos": False},
+    ]
+    with caplog.at_level("WARNING"):
+        eval_reader(config, H.tokenizer(), [])
+    assert "first source's text_field and append_eos" in caplog.text
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert _warn_stream_change(config, {"step": 10}) is True  # a checkpoint from before the change
+        assert _warn_stream_change(config, {"step": 10, "data_stream": 2}) is False
+        config.data.sources = [{"dataset": "chat.jsonl"}]
+        assert _warn_stream_change(config, {"step": 10}) is False  # no raw text: nothing changed
+    assert caplog.text.count("no end-of-document token") == 1
+
+
+def test_checkpoint_meta_records_the_stream_version(tmp_path):
+    from palingenesis.checkpoint import DATA_STREAM_VERSION, TRAINING_META_FILE, _save_meta
+
+    _save_meta(None, 3, 0, 5, tmp_path)
+    assert json.loads((tmp_path / TRAINING_META_FILE).read_text())["data_stream"] == DATA_STREAM_VERSION == 2
+
+
 def test_prepare_text_writes_data_report_and_holdout(tmp_path):
     from palingenesis.data import _load_dataset_source
     from palingenesis.prepare import PREPARED_META, find_prepared_eval, prepare_text
@@ -514,3 +736,11 @@ def test_prepare_config_and_cli_clean_raw_text_sources(tmp_path, monkeypatch, ca
     (source,) = manifest["sources"]
     assert source["mode"] == "pretrain" and source["num_samples"] == 20 and source["token_share"] == 1.0
     assert source["cleaning"]["dropped"]["near_duplicate"] == 1
+    # per-source dedupe / max_samples reach the raw-text cleaning
+    prepare.prepare_multi_source(
+        "fake",
+        [{"name": "text", "dataset": data, "mode": "pretrain", "dedupe": False, "max_samples": 26}],
+        str(tmp_path / "multi_keep"),
+    )
+    (source,) = json.loads((tmp_path / "multi_keep" / "manifest.json").read_text())["sources"]
+    assert "duplicate" not in source["cleaning"]["dropped"] and source["num_samples"] == 24

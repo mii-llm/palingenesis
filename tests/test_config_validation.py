@@ -375,3 +375,9 @@ def test_raw_text_cleaning_options(tmp_path):
     bad.preprocess.decontaminate = "bench.jsonl"
     with pytest.raises(ConfigError, match="preprocess.decontaminate must be a list"):
         bad.validate()
+    fields = Config()
+    fields.preprocess.decontaminate_fields = ["question", "answer"]
+    assert fields.validate() == []
+    fields.preprocess.decontaminate_fields = "question"
+    with pytest.raises(ConfigError, match="preprocess.decontaminate_fields must be a list"):
+        fields.validate()

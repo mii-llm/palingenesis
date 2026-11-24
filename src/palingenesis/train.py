@@ -264,6 +264,13 @@ def eval_reader(config, tokenizer, eval_ds):
 
     sources = config.data.sources or []
     if sources and all((src or {}).get("mode", "sft") == "pretrain" for src in sources):
+        first = (sources[0].get("text_field", "text"), sources[0].get("append_eos", True))
+        if any((s.get("text_field", "text"), s.get("append_eos", True)) != first for s in sources[1:]):
+            logger.warning(
+                "data.eval_dataset is read with the first source's text_field and append_eos "
+                f"({first[0]!r}, {first[1]!r}); the sources differ. Use data.eval_sources to read each held-out "
+                "set its own way."
+            )
         return PretrainDataset(
             eval_ds,
             tokenizer,
@@ -1133,6 +1140,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         # run continues with the next one, at the start of an accumulation window.
         start_micro = meta["micro_step"] + 1 if start_step > 0 and "micro_step" in meta else 0
         start_micro = _rescale_resume_position(start_micro, meta.get("data_ranks"), data_world)
+        _warn_stream_change(config, meta)
         logger.info(f"Resumed: step={start_step}, epoch={start_epoch}")
         if plugin_mgr:
             _load_plugin_state(plugin_mgr, resume_path)
@@ -2052,6 +2060,25 @@ def _resolve_resume(config: Config) -> str | None:
                 "train.output_dir (and train.resume_from) must be on a filesystem shared by every node."
             )
     return resume_path
+
+
+def _warn_stream_change(config: Config, meta: dict) -> bool:
+    """Warn when a run with raw text resumes from a checkpoint written before raw-text documents got an
+    end-of-document token and mix epochs counted every chunk: the saved position and the remaining
+    schedule were counted on another stream. Returns whether it warned."""
+    from palingenesis.checkpoint import DATA_STREAM_VERSION
+
+    raw_text = any(isinstance(s, dict) and s.get("mode") == "pretrain" for s in config.data.sources)
+    if not (raw_text or config.data.pretrain_replay_dataset) or meta.get("data_stream", 1) >= DATA_STREAM_VERSION:
+        return False
+    logger.warning(
+        "This checkpoint was written by a version in which raw-text documents had no end-of-document token and "
+        "an epoch counted one sequence per row. The stream differs now (append_eos, every chunk of a document, "
+        "replay drawn alongside the target), so the position resumed in the epoch is not the one the run stopped "
+        "at, and an epoch-sized schedule has another length. Set `append_eos: false` on the raw-text sources to "
+        "keep the old tokens, and fix the run length with train.max_steps."
+    )
+    return True
 
 
 def _rescale_resume_position(start_micro: int, saved_ranks: int | None, data_ranks: int) -> int:

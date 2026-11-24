@@ -16,7 +16,7 @@
 | `compile` | bool | `true` | `torch.compile` each transformer layer. First step is slow (compilation), then 20-40% faster on fixed-shape batches. Measure it on long rows of varying length: on Qwen3.5-0.8B with agentic traces of up to 16k tokens (H100) it was 15% slower than `compile: false` with Liger's kernels (19.4k vs 22.9k tokens/s over 400 steps). |
 | `compile_backend` | str | `inductor` | Compiler backend. `inductor` (default, fastest), `aot_eager` (debugging). |
 | `compile_mode` | str | `default` | Compile optimization level. `default`, `reduce-overhead` (small batches), `max-autotune` (5-15% faster, longer compile). |
-| `init` | str | `pretrained` | Where the weights come from. `pretrained`: the checkpoint at `name_or_path`. `random`: the architecture of `name_or_path`'s `config.json` with freshly initialised weights (training from scratch); the path then needs only `config.json` and the tokenizer files, and weights found there are ignored. `pgs train` only. Rejected with `dpo.enabled`, `multimodal.enabled`, `train.base_merge`, `train.freeze_non_attention`, `plugins.pre_rl` and model scoring in `preprocess`. See [Training from random weights](../guides/pretraining.md#training-from-random-weights). |
+| `init` | str | `pretrained` | Where the weights come from. `pretrained`: the checkpoint at `name_or_path`. `random`: the architecture of `name_or_path`'s `config.json` with freshly initialised weights (training from scratch); the path then needs only `config.json` and the tokenizer files, and weights found there are ignored. Each rank builds the model on the CPU in `torch_dtype` (host memory: one copy per rank, as when loading a checkpoint). `pgs train` only. Rejected with `dpo.enabled`, `multimodal.enabled`, `train.base_merge`, `train.freeze_non_attention`, `plugins.pre_rl` and model scoring in `preprocess`. See [Training from random weights](../guides/pretraining.md#training-from-random-weights). |
 | `init_seed` | int | `-1` | Seed of the random initialisation, the same on every rank. `-1` = `train.seed`. |
 
 ---
@@ -53,7 +53,7 @@
 | `eval_split` | str | `test` | Validation split. |
 | `eval_samples` | int | `200` | Number of validation samples (fixed subset). |
 | `eval_every` | int | `100` | Evaluate every N optimizer steps. |
-| `pretrain_replay_dataset` | str | `""` | Raw text (split `train`, field `text`, loss on every token, the tokenizer's EOS appended to every document) mixed into SFT. An epoch is one pass over the target data's rows, with the replay sequences drawn alongside. Empty = disabled. Not measured by us; for a chat model, replaying the model's own answers to general prompts (a second `sources` entry) reduced forgetting in our [measurements](../guides/data.md#what-the-measurements-say). |
+| `pretrain_replay_dataset` | str | `""` | Raw text (split `train`, field `text`, loss on every token; no end-of-document token is appended, unlike `mode: pretrain` sources) mixed into SFT. An epoch is one pass over the target data's rows, with the replay sequences drawn alongside. Empty = disabled. Not measured by us; for a chat model, replaying the model's own answers to general prompts (a second `sources` entry) reduced forgetting in our [measurements](../guides/data.md#what-the-measurements-say). |
 | `pretrain_replay_weight` | float | `0.1` | Per-sequence probability of drawing a replay sequence (not a token share: a replay document longer than `max_seq_length` is split into chunks of that length, each a sequence). |
 | `msft_tracking` | bool | `false` | **Not wired into training yet** (a warning is logged; weights stay fixed). Intended: adaptive per-source weight scheduling. |
 | `msft_eval_every` | int | `50` | Check per-source validation loss every N steps. |
@@ -72,7 +72,8 @@
     - **`mode: pretrain`**: `text_field` (default `text`) and `append_eos` (default `true`):
       the tokenizer's EOS token is appended to every document that does not already end
       with it, as the last token of the document's last chunk, and is trained like any
-      other token. `append_eos: "<|endoftext|>"` names another token of the vocabulary
+      other token (a warning is logged when that token is the chat template's end-of-turn
+      token). `append_eos: "<|endoftext|>"` names another token of the vocabulary
       (for a chat model whose EOS is its end-of-turn token); `false` appends nothing.
 
 !!! note "Reasoning / thinking modes"
@@ -277,7 +278,8 @@ Offline data preparation, driven by the **same config** as training (see the [Da
 | `max_samples` | int | `0` | Cap on samples read from the raw dataset. 0 = all. |
 | `dedupe` | bool | `true` | Drop exact duplicate conversations (same messages and tool definitions; whitespace runs collapsed). The first row is kept. Raw-text sources: documents whose text is the same up to case and whitespace. |
 | `near_dedupe` | float | `0.0` | Raw-text sources: also drop near-duplicate documents, those whose sets of word 5-grams have an estimated Jaccard similarity of at least this value (MinHash with 128 hashes; `0.8` is a common choice). The first document of a group is kept. 0 = off. Needs numpy. |
-| `decontaminate` | list | `[]` | Raw-text sources: files of the evaluation sets you will report (JSONL, JSON, parquet; any other file is read as plain text). A document that shares a run of `decontaminate_ngram` words with any string in them (every column, nested values included; case and punctuation ignored) is dropped. |
+| `decontaminate` | list | `[]` | Raw-text sources: files of the evaluation sets you will report (JSONL, JSON, parquet; any other file is read as plain text). A document that shares a run of `decontaminate_ngram` words with any string in them (every column, nested values included, or `decontaminate_fields`; case and punctuation ignored) is dropped. N-grams found in more than 20% of a file's rows (files of 10 rows or more: a shared instruction or system prompt) are not matched. |
+| `decontaminate_fields` | list | `[]` | Columns of the evaluation files to read, e.g. `[question, answer]`. Empty = every string column. A file without any of them is an error. |
 | `decontaminate_ngram` | int | `13` | Words per decontamination n-gram. Evaluation strings shorter than this give no n-gram and protect nothing (the report counts them): lower it for short items. |
 | `min_chars` | int | `0` | Raw-text sources: drop documents with fewer characters. 0 = keep all. |
 | `max_per_prompt` | int | `0` | Keep at most N rows that share a system prompt and first user turn (a seeded random draw). 0 = no cap. |

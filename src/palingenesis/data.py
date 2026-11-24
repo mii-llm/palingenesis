@@ -1968,6 +1968,7 @@ def document_end_id(tokenizer, append_eos: bool | str = True) -> int | None:
                 "token. Name one with the source's `append_eos: <token>`, or set `append_eos: false`."
             )
             return None
+        _warn_end_of_turn_eos(tokenizer)
         return int(eos)
     if not isinstance(append_eos, str) or not append_eos:
         raise ValueError(f"append_eos must be true, false or a token string, got {append_eos!r}.")
@@ -1979,6 +1980,27 @@ def document_end_id(tokenizer, append_eos: bool | str = True) -> int | None:
             "token, e.g. the tokenizer's eos_token)."
         )
     return token_id
+
+
+_END_OF_TURN_WARNED: set[str] = set()
+
+
+def _warn_end_of_turn_eos(tokenizer) -> None:
+    """Warn (once per token) when the tokenizer's EOS is written in its chat template, i.e. it is the
+    end-of-turn token of a chat model: raw documents closed with it teach that documents end like turns."""
+    token = getattr(tokenizer, "eos_token", None)
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(token, str) or not token or not isinstance(template, str) or token not in template:
+        return
+    if token in _END_OF_TURN_WARNED:
+        return
+    _END_OF_TURN_WARNED.add(token)
+    logger.warning(
+        f"append_eos: this tokenizer's EOS token {token!r} is its chat template's end-of-turn token, and every "
+        "raw-text document (mode: pretrain) will end with it. For a chat model name the end-of-text token "
+        'instead, e.g. append_eos: "<|endoftext|>" (Qwen) or "<|end_of_text|>" (Llama 3), or set '
+        "append_eos: false."
+    )
 
 
 def _marked(stage):
@@ -1994,14 +2016,18 @@ def _marked(stage):
 class PretrainDataset(_Epochs, IterableDataset):
     """Pretraining/CPT dataset: loss on ALL tokens (no masking). A document longer than
     max_seq_length becomes consecutive max_seq_length-token chunks (truncating it would drop
-    the rest of the text: a quarter of a typical CPT corpus at 4k tokens); a trailing chunk
-    shorter than MIN_CHUNK tokens is dropped.
+    the rest of the text: a quarter of a typical CPT corpus at 4k tokens).
 
     append_eos (see document_end_id): the end-of-document token appended to every document,
     unless its text already ends with it. It is the last token of the document's last chunk and
     a training target like any other, so the model learns where documents end; in a packed
     block it is what separates one document's text from the next (the loss never asks a
-    document's last token to predict the next document: loss.shift_labels)."""
+    document's last token to predict the next document: loss.shift_labels).
+
+    A trailing chunk shorter than MIN_CHUNK tokens: with an end-of-document token it reaches
+    back into the previous chunk to MIN_CHUNK tokens (those few tokens are trained twice), so
+    the document's end and its token are always trained, also when the text is an exact
+    multiple of max_seq_length; without one (append_eos false) it is dropped."""
 
     MIN_CHUNK = 16
 
@@ -2056,10 +2082,14 @@ class PretrainDataset(_Epochs, IterableDataset):
             ids.append(self.eos_id)
         ids = torch.tensor(ids, dtype=torch.long)
         chunks = []
+        floor = min(self.MIN_CHUNK, self.max_seq_length)
         for start in range(0, ids.numel(), self.max_seq_length):
             chunk = ids[start : start + self.max_seq_length]
             if chunk.numel() < self.MIN_CHUNK and start > 0:
-                break
+                if self.eos_id is None:
+                    break
+                if chunk.numel() < floor:  # keep the document's end: overlap the previous chunk
+                    chunk = ids[ids.numel() - floor :]
             # Pretraining: loss on ALL tokens (standard causal LM)
             chunks.append({"input_ids": chunk, "attention_mask": torch.ones_like(chunk), "labels": chunk.clone()})
         return chunks
@@ -2195,6 +2225,13 @@ class MixedDataset(_Epochs, IterableDataset):
                             self.names[idx],
                         )
                         active.remove(idx)
+                        if draws is not None and not any(self.counted[i] for i in active):
+                            # nothing left whose rows count towards the epoch: it would never end
+                            logger.warning(
+                                "No data source that counts towards the epoch is left in the mix (the target "
+                                "data yielded nothing): ending the epoch."
+                            )
+                            break
                         continue
                     if draws is None:
                         break  # first_exhausted: a non-empty source ran out → epoch boundary
@@ -2747,7 +2784,7 @@ def estimate_run(
         target_rows = _target_rows(config, loaded)
         if config.mix_epoch == "total" and target_rows is not None and w < 1:
             epoch_rows = math.ceil(target_rows / world_size)
-        replay_src = {"mode": "pretrain", "text_field": "text"}
+        replay_src = {"mode": "pretrain", "text_field": "text", "append_eos": False}
         sample = data_size.sample_rows(config.pretrain_replay_dataset, "train", k, config.seed + 97)
         replay = data_size.measure_source(
             f"replay:{config.pretrain_replay_dataset}",
@@ -2883,6 +2920,7 @@ def build_dataset(
             world_size=world_size,
             shuffle_buffer=10_000,
             shuffle_seed=config.seed,
+            append_eos=False,  # replay text is trained as it was before append_eos existed
         )
         # Mix: (1-w) * target_data + w * replay_data, per training sequence. An epoch is one pass
         # over the target (its rows; a raw-text document counts when its last chunk is drawn) plus
@@ -3063,7 +3101,7 @@ def _fingerprint_payload(config, tokenizer) -> dict:
         payload["mix_epoch"] = d.mix_epoch
     if getattr(d, "mix_weights", "sequences") != "sequences":  # what the sources' weights are shares of
         payload["mix_weights"] = d.mix_weights
-    if d.pretrain_replay_dataset:  # replay documents end with the EOS token; the epoch counts the target's rows
+    if d.pretrain_replay_dataset:  # the epoch counts the target's rows, replay is drawn alongside
         payload["replay_epoch"] = "target_rows"
     if getattr(d, "turn_scaling", "uniform") != "uniform":
         # the cache stores the per-token loss weights: one written without them must be rebuilt, not read as uniform

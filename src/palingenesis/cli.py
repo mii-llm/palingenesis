@@ -252,6 +252,12 @@ def _run_prepare_multi():
     )
     parser.add_argument("--decontaminate_ngram", type=int, default=13, help="Words per decontamination n-gram")
     parser.add_argument(
+        "--decontaminate_fields",
+        nargs="*",
+        default=[],
+        help="Columns of the evaluation files to read (default: every string column)",
+    )
+    parser.add_argument(
         "--near_dedupe",
         type=float,
         default=0.0,
@@ -284,6 +290,7 @@ def _run_prepare_multi():
         num_workers=args.num_workers,
         decontaminate=args.decontaminate,
         decontaminate_ngram=args.decontaminate_ngram,
+        decontaminate_fields=args.decontaminate_fields,
         near_dedupe=args.near_dedupe,
         min_chars=args.min_chars,
     )

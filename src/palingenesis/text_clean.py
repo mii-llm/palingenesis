@@ -117,42 +117,101 @@ def read_rows(path: str | Path) -> Iterator[Any]:
         yield path.read_text(encoding="utf-8", errors="replace")
 
 
+SHARED_ROW_SHARE = 0.2  # an n-gram in more than this share of a file's rows is shared scaffolding
+SHARED_MIN_ROWS = 10  # ...in files with at least this many rows
+
+
 @dataclass
 class NgramIndex:
-    """The word n-grams of the evaluation sets a corpus is decontaminated against."""
+    """The word n-grams of the evaluation sets a corpus is decontaminated against.
+
+    What is indexed, per file (from_files): every string of every row, or with `fields` only the
+    strings under those top-level columns (nested values included). An n-gram found in more than
+    `shared_row_share` of a file's rows is left out: it is the benchmark's scaffolding (a shared
+    instruction, a system prompt, a few-shot prefix), not an item, and indexing it would remove
+    every document that quotes the instruction."""
 
     n: int = 13
     hashes: set[int] = field(default_factory=set)
     files: list[str] = field(default_factory=list)
+    fields: list[str] | None = None
     strings: int = 0  # strings read from the files
     too_short: int = 0  # strings with fewer than n words: they give no n-gram and protect nothing
+    shared: int = 0  # n-grams left out because most rows of their file hold them
+    shared_row_share: float = SHARED_ROW_SHARE
     _word_hash: _WordHashes = field(default_factory=_WordHashes, repr=False)
 
     @classmethod
-    def from_files(cls, paths: Iterable[str | Path], n: int = 13) -> "NgramIndex":
-        """Every string of every row of the files (all columns, nested values included)."""
+    def from_files(
+        cls,
+        paths: Iterable[str | Path],
+        n: int = 13,
+        fields: Iterable[str] | None = None,
+        shared_row_share: float = SHARED_ROW_SHARE,
+    ) -> "NgramIndex":
+        """The index of the files' rows. fields: the columns to read (default: all). A file whose
+        rows have none of them is an error. shared_row_share: see the class (1.0 keeps every n-gram)."""
         if n < 1:
             raise ValueError(f"the decontamination n-gram must be >= 1 words, got {n}")
-        index = cls(n=n)
+        index = cls(n=n, fields=list(fields) if fields else None, shared_row_share=shared_row_share)
         for path in paths:
             index.files.append(str(path))
-            for row in read_rows(path):
-                for text in _strings(row):
-                    index.add(text)
+            index._add_file(path)
         if index.files and not index.hashes:
             logger.warning(
-                f"Decontamination: no {n}-word n-gram in {', '.join(index.files)} ({index.strings} strings, all "
-                f"shorter than {n} words): nothing will be removed. Lower the n-gram length for short items."
+                f"Decontamination: no {n}-word n-gram in {', '.join(index.files)} ({index.strings} strings, "
+                f"{index.too_short} shorter than {n} words, {index.shared} shared n-grams left out): nothing will "
+                "be removed. Lower the n-gram length for short items."
             )
         return index
 
-    def add(self, text: str) -> None:
+    def _row_strings(self, row: Any) -> Iterator[str]:
+        if self.fields is None or not isinstance(row, dict):
+            yield from _strings(row)
+            return
+        for name in self.fields:
+            if name in row:
+                yield from _strings(row[name])
+
+    def _add_file(self, path: str | Path) -> None:
+        rows = 0
+        matched = self.fields is None
+        counts: dict[int, int] = {}  # n-gram -> rows of this file that hold it
+        for row in read_rows(path):
+            rows += 1
+            matched = matched or not isinstance(row, dict) or any(name in row for name in self.fields)
+            in_row: set[int] = set()
+            for text in self._row_strings(row):
+                in_row.update(self._hashes(text))
+            for h in in_row:
+                counts[h] = counts.get(h, 0) + 1
+        if not matched:
+            raise ValueError(
+                f"decontamination: no row of {path} has any of the fields {self.fields} "
+                "(preprocess.decontaminate_fields / --decontaminate_fields)"
+            )
+        limit = self.shared_row_share * rows if rows >= SHARED_MIN_ROWS else rows
+        kept = {h for h, c in counts.items() if c <= limit}
+        dropped = len(counts) - len(kept)
+        if dropped:
+            self.shared += dropped
+            logger.info(
+                f"Decontamination: {dropped:,} n-grams of {path} are in more than {self.shared_row_share:.0%} of "
+                "its rows (a shared instruction or prompt) and are not matched against the corpus"
+            )
+        self.hashes |= kept
+
+    def _hashes(self, text: str) -> Iterator[int]:
         self.strings += 1
         tokens = words(text)
         if len(tokens) < self.n:
             self.too_short += 1
-            return
-        self.hashes.update(ngram_hashes(tokens, self.n, self._word_hash))
+            return iter(())
+        return ngram_hashes(tokens, self.n, self._word_hash)
+
+    def add(self, text: str) -> None:
+        """Index one string as it is (no shared-n-gram rule)."""
+        self.hashes.update(self._hashes(text))
 
     def contaminated(self, text: str) -> bool:
         """True when the text shares an n-gram with the evaluation sets."""
@@ -164,10 +223,12 @@ class NgramIndex:
     def summary(self) -> dict[str, Any]:
         return {
             "files": self.files,
+            "fields": self.fields,
             "ngram_words": self.n,
             "strings": self.strings,
             "strings_shorter_than_ngram": self.too_short,
             "ngrams": len(self.hashes),
+            "shared_ngrams_ignored": self.shared,
         }
 
 

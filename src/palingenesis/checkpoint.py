@@ -356,12 +356,18 @@ def _save_optimizer_sharded(optimizer, path: Path):
             torch.save(shard_meta, path / f"shard_{shard_idx:04d}_meta.pt")
 
 
+# Version of the training stream a checkpoint's position (epoch, micro_step) counts in. 2: raw-text
+# documents end with an end-of-document token and a mix epoch counts rows (every chunk of a document).
+DATA_STREAM_VERSION = 2
+
+
 def _save_meta(scheduler, step, epoch, micro_step, path, data_ranks=1):
     meta = {
         "step": step,
         "epoch": epoch,
         "micro_step": micro_step,
         "data_ranks": data_ranks,
+        "data_stream": DATA_STREAM_VERSION,
         "scheduler_state": scheduler.state_dict() if scheduler is not None else {},
     }
     # Written whole, then renamed: the file's presence marks a complete checkpoint, also for a

@@ -152,8 +152,8 @@ class DataConfig:
     # Each: {name, dataset, split, weight, samples, regression_floor, mode, messages_field|text_field}; dataset is
     # a local .jsonl / .json / .parquet file or a Hub dataset. A source that cannot be read is an error.
     eval_sources: list = field(default_factory=list)
-    # Pretraining replay: mix raw text (split "train", field "text", all-token loss) into SFT. An epoch is one
-    # pass over the target data's rows, with the replay sequences drawn alongside.
+    # Pretraining replay: mix raw text (split "train", field "text", all-token loss, no end-of-document token)
+    # into SFT. An epoch is one pass over the target data's rows, with the replay sequences drawn alongside.
     # Kotha & Liang (arXiv:2603.04964) find generic replay can also help the target task,
     # mostly in 150M-param pretraining simulations (best at 33-67% of fine-tuning steps).
     # Empty string disables.
@@ -417,6 +417,9 @@ class PreprocessConfig:
     # shares a word n-gram of decontaminate_ngram words with any string in them is dropped.
     decontaminate: list = field(default_factory=list)
     decontaminate_ngram: int = 13
+    # Columns of the evaluation files to read (e.g. [question, answer]); empty = every string column. An n-gram
+    # found in more than 20% of a file's rows (a shared instruction or system prompt) is never matched.
+    decontaminate_fields: list = field(default_factory=list)
     # Documents with fewer characters are dropped (0 = keep all).
     min_chars: int = 0
     # Keep at most N rows that share a prompt (system prompt + first user turn), e.g.
@@ -793,6 +796,10 @@ class Config:
             isinstance(f, str) and f for f in self.preprocess.decontaminate
         ):
             errors.append("preprocess.decontaminate must be a list of file paths.")
+        if not isinstance(self.preprocess.decontaminate_fields, list) or not all(
+            isinstance(f, str) and f for f in self.preprocess.decontaminate_fields
+        ):
+            errors.append("preprocess.decontaminate_fields must be a list of column names.")
         if self.model.init == "random" and self.train.learning_rate <= 1e-4:
             warnings.append(
                 f"model.init: random with train.learning_rate={self.train.learning_rate:g}: the defaults are tuned "

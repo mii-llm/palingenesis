@@ -218,7 +218,7 @@ pgs prepare --data raw_corpus.jsonl --output prepared/corpus --mode pretrain \
 | `--text_field` | The text column (default `text`) |
 | `--no_dedupe` | Keep exact duplicate documents (same text up to case and whitespace) |
 | `--near_dedupe T` | Drop near-duplicates at or above Jaccard similarity T of the word 5-gram sets (MinHash; 0 = off) |
-| `--decontaminate FILE...`, `--decontaminate_ngram N` | Drop documents sharing an N-word n-gram (default 13) with any string of the evaluation files |
+| `--decontaminate FILE...`, `--decontaminate_ngram N`, `--decontaminate_fields COL...` | Drop documents sharing an N-word n-gram (default 13) with the evaluation files (every string column, or the named ones; n-grams shared by more than 20% of a file's rows are not matched) |
 | `--min_chars N` | Drop documents shorter than N characters |
 | `--eval_holdout N` | Hold out N whole documents, drawn after deduplication (`eval_data.*`) |
 | `--model` | Optional: only to report token counts |
@@ -229,7 +229,7 @@ See the [Data Preparation guide](../guides/data.md) for the full workflow.
 
 ### prepare-multi
 
-Prepares each source of a sources file on its own and writes `manifest.json` with every source's rows, tokens and share of examples and of tokens at its weight. Raw-text sources (`mode: pretrain`) are cleaned like `pgs prepare --mode pretrain`: `--decontaminate`, `--decontaminate_ngram`, `--near_dedupe` and `--min_chars` apply to them (`near_dedupe`, `min_chars` and `eval_holdout` can also be set per source).
+Prepares each source of a sources file on its own and writes `manifest.json` with every source's rows, tokens and share of examples and of tokens at its weight. Raw-text sources (`mode: pretrain`) are cleaned like `pgs prepare --mode pretrain`: `--decontaminate`, `--decontaminate_ngram`, `--decontaminate_fields`, `--near_dedupe` and `--min_chars` apply to them (`dedupe`, `near_dedupe`, `min_chars`, `eval_holdout`, `max_samples` and `seed` can also be set per source).
 
 ```bash
 pgs prepare-multi --model Qwen/Qwen3.5-4B --sources sources.yaml --output prepared/

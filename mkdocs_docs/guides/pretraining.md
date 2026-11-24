@@ -51,7 +51,7 @@ A source with `mode: pretrain` reads one text column (`text_field`, default `tex
 - **Every token gets loss.** There is no chat template and no masking: the whole string is next-token prediction.
 - **The tokenizer adds what it always adds.** Documents are tokenized with `add_special_tokens=True`, so a tokenizer that prepends a BOS token (Llama) prepends it to every document; one that adds nothing (Qwen) adds nothing.
 - **Every document ends with an end-of-document token.** The tokenizer's EOS token is appended to each document (`append_eos`, on by default; a document whose text already ends with it keeps one). It is trained like any other token, so the model learns where documents end. See [The end-of-document token](#the-end-of-document-token) for chat models, whose EOS is the end-of-turn token.
-- **Long documents are split, not truncated.** A document longer than `data.max_seq_length` becomes consecutive `max_seq_length`-token chunks; a trailing chunk shorter than 16 tokens is dropped. Each chunk is its own training sequence: the second chunk of a document does not see the first. Only the document's last chunk carries the end-of-document token.
+- **Long documents are split, not truncated.** A document longer than `data.max_seq_length` becomes consecutive `max_seq_length`-token chunks; each chunk is its own training sequence: the second chunk of a document does not see the first. Only the document's last chunk carries the end-of-document token. A last chunk that would be shorter than 16 tokens (for a document of exactly two sequence lengths, the end-of-document token alone) reaches back into the previous chunk to 16 tokens, so the end of the document is always trained and at most 15 tokens are trained twice; with `append_eos: false` such a tail is dropped.
 - **Packing keeps sequences apart.** With `data.packing: true`, whole chunks and short documents are packed into blocks of up to `max_seq_length` tokens, and `position_ids` restart at every document, so no document attends to another ([packing](../getting-started/first-training.md#packing-when-to-use-it)). The loss never asks the last token of a document to predict the first token of the next one. For raw text, where most documents are shorter than the sequence length, packing fills each sequence instead of padding short documents.
 - **Only through `data.sources`.** The single `data.dataset` is always read as conversations. A list of one source is fine.
 
@@ -83,10 +83,11 @@ data:
 | a token string | That token; it must be exactly one token of the vocabulary, or the run stops with an error |
 | `false` | Nothing: the behaviour before this option existed |
 
-- **Chat models.** The EOS token of an instruction-tuned tokenizer is usually its end-of-turn token (`<|im_end|>` for Qwen chat models). Ending raw documents with it teaches that documents end like turns; name the base model's document separator instead (`append_eos: "<|endoftext|>"` for Qwen, `"<|end_of_text|>"` for Llama 3), and check with `pgs inspect` what the last token of a sequence is.
+- **Chat models.** The EOS token of an instruction-tuned tokenizer is usually its end-of-turn token (`<|im_end|>` for Qwen chat models). Ending raw documents with it teaches that documents end like turns, and the trainer logs a warning when the default resolves to a token written in the chat template; name the base model's document separator instead (`append_eos: "<|endoftext|>"` for Qwen, `"<|end_of_text|>"` for Llama 3), and check with `pgs inspect` what the last token of a sequence is.
 - **Packing.** In a packed block the token closes each document: `[doc A … EOS][doc B … EOS]`. Position ids restart at every document and attention stays inside it. EOS is predicted from its own document's last token, and no loss is placed on EOS predicting the first token of the next document.
 - **Held-out sets** read as raw text (`data.eval_dataset` in a raw-text run, `eval_sources` with `mode: pretrain`) get the same token, so the evaluated loss includes predicting the end of each document. A held-out loss measured before this option existed is not comparable to one measured with it: compare against the baseline the run prints before its first step.
-- A [pre-tokenized cache](data.md#pre-tokenized-cache) written without the token is rebuilt.
+- **Replay text** (`data.pretrain_replay_dataset`, raw text mixed into SFT) gets no end-of-document token: SFT runs use chat tokenizers, and the text is trained as it always was. Use a `mode: pretrain` source with `append_eos` when you want one.
+- A [pre-tokenized cache](data.md#pre-tokenized-cache) written without the token is rebuilt. Resuming a raw-text run from a checkpoint written by an earlier version logs a warning: the tokens and the epoch length have changed, so the position in the epoch is not the one the run stopped at (`append_eos: false` and `train.max_steps` keep the old stream's tokens and the run's length).
 
 ---
 
@@ -108,6 +109,7 @@ preprocess:
     - benchmarks/domain_qa.jsonl
     - benchmarks/general.parquet
   decontaminate_ngram: 13
+  decontaminate_fields: [question, answer]   # default: every string column
   min_chars: 200
   eval_holdout: 500            # whole documents, drawn after deduplication
 ```
@@ -127,12 +129,13 @@ What each check does, in the order they run:
 |---|---|---|
 | `empty_text` | Rows without a string in `text_field`, or only whitespace | always |
 | `too_short` | Documents with fewer than `min_chars` characters | `min_chars` |
-| `contaminated` | Documents that share a run of `decontaminate_ngram` words with any string of the `decontaminate` files (every column and nested value, so questions and answers both; case and punctuation ignored) | `decontaminate` |
+| `contaminated` | Documents that share a run of `decontaminate_ngram` words with the `decontaminate` files: every string column and nested value, so questions and answers both, or only the columns in `decontaminate_fields`; case and punctuation ignored. An n-gram found in more than 20% of a file's rows (files of 10 rows or more) is not matched: it is a shared instruction, system prompt or few-shot prefix, and matching it would remove every document that quotes it | `decontaminate` |
 | `duplicate` | Documents whose text is the same after Unicode normalisation, lower-casing and collapsing whitespace; the first is kept | `dedupe` |
 | `near_duplicate` | Documents whose sets of word 5-grams have an estimated Jaccard similarity of at least `near_dedupe` with an earlier kept document (MinHash, 128 hashes, candidates by locality-sensitive hashing) | `near_dedupe` |
 
 Read the report before training:
 
+- **Name the columns that hold the items.** By default every string of an evaluation row is read, ids and metadata included. `decontaminate_fields: [question, answer]` reads only those columns (a file without any of them is an error). `prepared_meta.json` reports how many shared n-grams were left out (`decontamination.shared_ngrams_ignored`).
 - **`contaminated` counts are usually small and matter most.** A domain corpus scraped from the web often contains the test sets of that domain. Evaluation strings shorter than the n-gram give no n-gram and protect nothing: `prepared_meta.json` counts them (`decontamination.strings_shorter_than_ngram`); lower `decontaminate_ngram` for benchmarks of short items, at the price of more false matches on common phrases.
 - **`near_dedupe` is an estimate.** With 128 hashes the similarity of a pair is known to about ±0.04 at 0.8, so pairs close to the threshold fall on either side. 0.8 removes mirrored pages and lightly edited copies; lower values start removing documents that share boilerplate (licence headers, templates), which may or may not be what you want: read a sample of `dropped.jsonl` first.
 - **Duplicates are removed inside a source, not across sources**, and held-out documents are drawn after deduplication, so no held-out text is trained on under another copy from the same source.
@@ -530,7 +533,8 @@ tokenizer.save_pretrained("arch")
 
 `name_or_path` can also be a released model, to train its architecture from scratch: its weights are ignored.
 
-- **Initialisation.** The weights are drawn by the architecture's own initialiser in `transformers` (for most decoders a normal distribution with the config's `initializer_range`), in float32, then cast to `model.torch_dtype`. Every rank draws the same weights from `init_seed`, and the run's own seeding (data order, dropout) is unchanged by it.
+- **Initialisation.** The weights are drawn by the architecture's own initialiser in `transformers` (for most decoders a normal distribution with the config's `initializer_range`), directly in `model.torch_dtype`, as a loaded checkpoint would be (parameters in that dtype, rotary-frequency buffers in float32). Every rank draws the same weights from `init_seed`, and the run's own seeding on CPU and GPU (data order, dropout) is unchanged by it.
+- **Host memory.** Every rank builds the model on the CPU before it moves to its GPU, as when a checkpoint is loaded: one copy in `model.torch_dtype` per rank (an 8B model in bf16: about 16 GB of host RAM per rank). Use `bfloat16` weights, or fewer ranks per node, when host memory is short.
 - **Checked at startup:** a tokenizer with more tokens than the config's `vocab_size` is refused. A multimodal checkpoint's config gives its language model alone.
 - **Rejected combinations:** `dpo.enabled`, `multimodal.enabled`, `train.base_merge`, `train.freeze_non_attention`, `plugins.pre_rl` and scoring data with the model in `preprocess`: each of them needs trained weights to start from.
 - **Resume and export** work as in any run: `resume_from: auto` continues from the last checkpoint, and `final/` loads with `from_pretrained`.
