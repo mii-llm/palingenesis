@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 # NOTE: FSDP2 symbols (fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy,
 # FSDPModule) are imported lazily inside the functions that use them. Those
 # names only exist under torch.distributed.fsdp in torch>=2.6, and are only
-# needed for multi-GPU (world_size>1) runs -- build_mesh() returns None for a
-# single GPU, so apply_fsdp() is never called there. Keeping them out of module
+# needed for multi-GPU (world_size>1) runs and single-GPU CPU offload -- build_mesh() returns None for a
+# single GPU otherwise, so apply_fsdp() is never called there. Keeping them out of module
 # scope lets this module import on older torch (e.g. 2.5.x) for single-GPU
 # training, where FSDP2 is unnecessary.
 
@@ -42,6 +42,23 @@ def setup_distributed() -> tuple[int, int, int]:
     if torch.cuda.is_available():
         torch.cuda.set_device(local_device_index(local_rank, torch.cuda.device_count()))
     return rank, local_rank, world_size
+
+
+def init_single_process_group() -> None:
+    """A process group of one rank, for FSDP2 on a single GPU (parallel.cpu_offload: FSDP2's CPU offload needs a
+    mesh even with nothing to shard). Gloo for CPU tensors and NCCL for CUDA ones: with offload the gradients and the
+    optimizer step live on the CPU."""
+    if dist.is_initialized():
+        return
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", str(port))
+    backend = "cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend, rank=0, world_size=1)
 
 
 def local_device_index(local_rank: int, visible: int) -> int:
@@ -150,7 +167,8 @@ def release_cuda_memory() -> None:
 def build_mesh(world_size: int, config: ParallelConfig) -> DeviceMesh | None:
     """The device mesh for FSDP2 and, optionally, context parallelism.
 
-    Without context parallelism: a 1-D mesh ("dp",) over every rank.
+    Without context parallelism: a 1-D mesh ("dp",) over every rank. One process: no mesh, except with
+    parallel.cpu_offload (FSDP2's CPU offload on a single GPU), which gets a mesh of one rank.
 
     With it: a 2-D mesh ("dp", "cp") of shape (world_size / cp, cp). The ranks of one "cp" row
     split the same sequences between them (palingenesis.context_parallel); the "dp" dimension
@@ -159,9 +177,11 @@ def build_mesh(world_size: int, config: ParallelConfig) -> DeviceMesh | None:
     `parallel.cp_degree` sets cp (0: min(world_size, 8) when that divides world_size, else
     world_size; groups of up to 8 keep the K/V all-gathers on one node's NVLink).
     """
-    if world_size <= 1:
+    if world_size <= 1 and not (config.fsdp and config.cpu_offload):
         return None
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if world_size <= 1:  # one GPU with CPU offload: FSDP2 over a mesh of one rank
+        return init_device_mesh(device, (1,), mesh_dim_names=("dp",))
 
     if config.context_parallel:
         cp_degree = config.cp_degree or min(world_size, 8)

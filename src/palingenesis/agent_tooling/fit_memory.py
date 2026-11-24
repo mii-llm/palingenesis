@@ -70,7 +70,7 @@ def apply_overrides(config: Config, overrides: dict[str, object]) -> Config:
 def candidates(config: Config) -> list[Candidate]:
     """The settings to measure, from the one expected to be fastest to the most frugal: the config as it is,
     the three activation-checkpointing modes, then SeCO at decreasing chunk sizes and with its K/V cache
-    offloaded. Settings the config cannot take (SeCO with DPO, ...) are listed as skipped."""
+    offloaded, then full checkpointing with parameters, gradients and optimizer state offloaded to the CPU. Settings the config cannot take (SeCO with DPO, ...) are listed as skipped."""
     out = [Candidate("as configured")]
     seco_on = config.memory.seco
     for mode in ("none", "selective", "full"):
@@ -89,6 +89,14 @@ def candidates(config: Config) -> list[Candidate]:
             Candidate(
                 f"SeCO, {chunks[-1]}-token chunks, K/V offloaded",
                 {"memory.seco": True, "memory.seco_chunk_size": chunks[-1], "memory.seco_kv_offload": True},
+            )
+        )
+    if not config.parallel.cpu_offload:
+        # the most frugal: parameters, gradients and optimizer state in host memory (FSDP2's offload, one GPU too)
+        out.append(
+            Candidate(
+                "full checkpointing, CPU offload",
+                {"train.gradient_checkpointing": "full", "memory.seco": False, "parallel.cpu_offload": True},
             )
         )
     for c in out:

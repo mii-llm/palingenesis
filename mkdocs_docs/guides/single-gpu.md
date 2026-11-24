@@ -51,7 +51,8 @@ pgs fit --config my.yaml --gpu 24   # budget: 24 GiB
 Each setting runs the real trainer for a few steps on worst-case rows (every row at `data.max_seq_length`) in its own process; the report gives the peak and the throughput of each, and recommends the fastest one under the budget with the options to set. The settings it measures:
 
 - the config as it is, then the three activation-checkpointing modes, `none`, `selective` and `full`;
-- SeCO at chunk sizes of 8192, 4096, 2048 and 1024 tokens (those shorter than `data.max_seq_length`), then the smallest chunk with its K/V cache offloaded (`memory.seco_kv_offload`). Settings the config cannot take (SeCO with DPO, for example) are listed as skipped.
+- SeCO at chunk sizes of 8192, 4096, 2048 and 1024 tokens (those shorter than `data.max_seq_length`), then the smallest chunk with its K/V cache offloaded (`memory.seco_kv_offload`);
+- full checkpointing with parameters, gradients and optimizer state in CPU memory (`parallel.cpu_offload`, [below](#models-larger-than-the-gpu-cpu-offload)), the most frugal and the slowest. Settings the config cannot take (SeCO with DPO, for example) are listed as skipped.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -153,6 +154,20 @@ The theory (Li et al., February 2026) derives LR schedules from functional scali
 train:
   lr_scheduler: power_decay
 ```
+
+### Models larger than the GPU: CPU offload
+
+When the weights, gradients and optimizer state do not fit the GPU at all (an 8B model with fp32 master weights needs about 128 GB for them), keep them in host memory:
+
+```yaml
+parallel:
+  cpu_offload: true          # parameters, gradients, optimizer state in pinned CPU memory
+train:
+  gradient_checkpointing: full
+  optimizer: adamw_bf16      # with model.torch_dtype: bfloat16: halves the host memory (8 B/param)
+```
+
+On one GPU this runs FSDP2 over a process group of one rank (started for you, no `torchrun` needed), as `pgs rl` does with `train.cpu_offload`: each layer's weights are copied to the GPU for its forward and backward, gradients go back to the CPU, and the optimizer steps there. The GPU holds one layer's weights and the activations. Budget host RAM of about 16 B/param with fp32 weights and `adamw`, 8 B/param with bf16 weights and `adamw_bf16`, plus pinned staging. Each step moves the weights over PCIe twice and the gradients once, so throughput is far below an in-GPU run: use it when nothing else fits (`pgs fit` tries it last). A run on one process with offload trains to the same weights as without (`tests/test_single_gpu_offload.py`, CPU). Measure it on your machine with `pgs fit --config my.yaml`, which reports its peak and tokens/s next to the other settings.
 
 ### Attention kernels on Hopper and Blackwell
 

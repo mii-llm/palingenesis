@@ -72,8 +72,7 @@ def build_optimizer(
 
     param_groups = _build_llrd_groups(model, lr, weight_decay, llrd_decay)
 
-    is_distributed = dist.is_initialized() and dist.get_world_size() > 1
-    use_fused = not is_distributed
+    use_fused = _fused_ok(model)
 
     optimizer = AdamW(
         param_groups,
@@ -188,10 +187,17 @@ def _build_bnb_optimizer(
     return optimizer
 
 
+def _fused_ok(model: torch.nn.Module) -> bool:
+    """torch's fused AdamW: one process and no FSDP2 CPU offload (offloaded shards are DTensors in host memory, which
+    the foreach implementation steps)."""
+    is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+    offloaded = any(hasattr(p, "to_local") and p.device.type == "cpu" for p in model.parameters())
+    return not is_distributed and not offloaded
+
+
 def _build_simple_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> AdamW:
     """Standard two-group optimizer (no LLRD)."""
-    is_distributed = dist.is_initialized() and dist.get_world_size() > 1
-    use_fused = not is_distributed
+    use_fused = _fused_ok(model)
 
     optimizer = AdamW(
         _decay_groups(model, weight_decay),

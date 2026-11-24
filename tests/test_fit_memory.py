@@ -31,6 +31,7 @@ def test_candidates_go_from_fastest_to_most_frugal():
         "SeCO, 2048-token chunks",
         "SeCO, 1024-token chunks",
         "SeCO, 1024-token chunks, K/V offloaded",
+        "full checkpointing, CPU offload",
     ]
     assert all(not c.skipped for c in candidates(_config()))
 

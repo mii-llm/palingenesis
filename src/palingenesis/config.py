@@ -1180,6 +1180,15 @@ class Config:
                 f"parallel.cp_rotate_method={p.cp_rotate_method!r}: only allgather is implemented (each attention "
                 "layer gathers the sequence's K/V from the context-parallel group)."
             )
+        if p.cpu_offload:
+            unsupported = {
+                "parallel.fsdp: false (the offload is FSDP2's, also on one GPU)": not p.fsdp,
+                "memory.seco (its chunked backward runs on a plain module)": self.memory.seco,
+                "memory.gradient_release (it steps inside the backward, before FSDP has offloaded the gradient)": (
+                    self.memory.gradient_release
+                ),
+            }
+            errors += [f"parallel.cpu_offload does not support {name}." for name, on in unsupported.items() if on]
         if p.context_parallel and not p.fsdp:
             errors.append(
                 "parallel.context_parallel needs parallel.fsdp: true (FSDP sums the gradients of the ranks that "
