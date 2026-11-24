@@ -12,6 +12,7 @@ Regimes (each on a freshly loaded model, in this process):
     fp32_master   model.torch_dtype float32 + bf16 autocast, torch AdamW (fused): the exact baseline, 16 B/param
     bf16_adamw    bf16 weights, torch AdamW (fused, moments bf16, round-to-nearest): what the default config runs
     adamw_bf16    bf16 weights, palingenesis.bf16_adamw.BF16AdamW (stochastic rounding, compiled update)
+    adamw_bf16_kahan  the same with compensated (Kahan) summation of the weight
     adamw8bit     bf16 weights, bitsandbytes AdamW8bit (if installed)
 
 Every timing is the median of 3 timed windows after warm-up (compilation included in warm-up). `train` also reports
@@ -28,16 +29,17 @@ import time
 
 import torch
 
-REGIMES = ("fp32_master", "bf16_adamw", "adamw_bf16", "adamw8bit")
+REGIMES = ("fp32_master", "bf16_adamw", "adamw_bf16", "adamw_bf16_kahan", "adamw8bit")
 
 
 def _optimizer(regime: str, params, lr: float):
     if regime in ("fp32_master", "bf16_adamw"):
         return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0, fused=True)
-    if regime == "adamw_bf16":
+    if regime.startswith("adamw_bf16"):
         from palingenesis.bf16_adamw import BF16AdamW
 
-        return BF16AdamW(params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0)
+        rounding = "kahan" if regime.endswith("kahan") else "stochastic"
+        return BF16AdamW(params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0, rounding=rounding)
     import bitsandbytes as bnb
 
     return bnb.optim.AdamW8bit(params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0)

@@ -47,16 +47,25 @@ The update reads $m$ and $v$ before they are rounded. Parameters that are not bf
 | `torch_dtype: float32` + `adamw` (fp32 masters) | 4 | 4 | 8 | 16 B |
 | `torch_dtype: bfloat16` + `adamw` (updates round away) | 2 | 2 | 4 | 8 B |
 | `torch_dtype: bfloat16` + `adamw_bf16` | 2 | 2 | 4 | **8 B** |
+| `torch_dtype: bfloat16` + `adamw_bf16`, `bf16_rounding: kahan` | 2 | 2 | 4 + 2 | **10 B** |
+
+**Stochastic or compensated (`train.bf16_rounding`).** Stochastic rounding (`stochastic`, the default) is unbiased, but each weight's rounding error is a random walk: after $N$ steps of an update $u$ much smaller than an ulp its spread is about $\text{ulp}\sqrt{N u / \text{ulp}}$, while the update itself only adds up to $N u$ when its sign is steady. With `kahan` a bf16 compensation buffer (+2 B/param) keeps what nearest rounding dropped from the weight, so weight + compensation carry about 16 significant bits and no noise, and the stored weight is the exact trajectory rounded to nearest, as a bf16 forward of fp32 masters sees it. Measured on CPU at an RL-sized learning rate (1e-6, gradients of random sign, 300 steps): stochastic rounding ends 4.2x the distance the fp32 weights moved away from them, `kahan` within 2% (`tests/test_bf16_adamw.py`). Use `kahan` for small learning rates (RL, DPO, late low-LR phases); `stochastic` when every byte counts and steps are a sizeable fraction of an ulp.
+
+```yaml
+train:
+  optimizer: adamw_bf16
+  bf16_rounding: kahan   # or stochastic (default)
+```
 
 **Reproducibility.** The rounding noise is a counter-based integer hash of (the element's position, a seed from `train.seed`, the parameter's name and its step count), not a random generator: runs are bit-for-bit reproducible, a resumed run rounds exactly as the uninterrupted one (the step count is in the optimizer state), data-parallel ranks holding the same parameter round it identically, and CPU and CUDA give the same bits.
 
 **Speed.** On CUDA each parameter's update is one fused kernel compiled by `torch.compile` (one read of weight, gradient and both moments, one write of weight and moments); per-step scalars and seeds reach the GPU in one non-blocking copy. Off CUDA it runs eagerly. Measure it on your GPU with `python scripts/bench_optimizers.py step --model <model>` (step time and state bytes per parameter against fused torch AdamW and bitsandbytes 8-bit) and `python scripts/bench_optimizers.py train --model <model>` (tokens/s, peak memory and the loss after a fixed number of steps against fp32 masters).
 
-**What is measured on CPU** (`tests/test_bf16_adamw.py`): 200 steps of updates of 1/16 ulp move weights by 100% ($\pm 2\%$) of the fp32-master drift, against under 50% for `adamw` on bf16; a small regression at lr 3e-4 ends within 5% of the fp32-master loss (plain bf16 AdamW: 37% higher); the second moment stays within 0.3% of its fp32 value where nearest rounding stalls 4% low.
+**What is measured on CPU** (`tests/test_bf16_adamw.py`): 200 steps of updates of 1/16 ulp move weights by 100% ($\pm 2\%$) of the fp32-master drift, against under 50% for `adamw` on bf16; a small regression at lr 3e-4 ends within 5% of the fp32-master loss (plain bf16 AdamW: 37% higher); the second moment stays within 0.3% of its fp32 value where nearest rounding stalls 4% low; the fused (compiled) update gives the same bits as the eager one, for both roundings.
 
 Composes with: LLRD, gradient clipping, `memory.gradient_release` (per-parameter step), Hyperball, FSDP2 (each rank steps its shard; the noise is keyed by the element's offset in the local shard, so a resume must keep the sharding layout to be bit-exact), checkpoints and resume. Not with: Schedule-Free (it replaces the optimizer). `pgs rl` and `pgs distill` keep their fp32-master optimizers.
 
-After: stochastic rounding for low-precision training (Gupta et al., [arXiv:1502.02551](https://arxiv.org/abs/1502.02551); Zamirai et al., [arXiv:2010.06192](https://arxiv.org/abs/2010.06192)); rounding only the second moment stochastically follows the design notes of the [Halo](https://github.com/whitecircle/halo) framework's AdamWBF16 (re-implemented, no code shared).
+After: stochastic rounding for low-precision training (Gupta et al., [arXiv:1502.02551](https://arxiv.org/abs/1502.02551); Zamirai et al., [arXiv:2010.06192](https://arxiv.org/abs/2010.06192), which also evaluates Kahan summation); Kahan-compensated bf16 optimizers as in [optimi](https://github.com/warner-benjamin/optimi) (MIT); rounding only the second moment stochastically follows the design notes of the [Halo](https://github.com/whitecircle/halo) framework's AdamWBF16 (re-implemented, no code shared).
 
 ---
 

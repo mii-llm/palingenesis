@@ -15,6 +15,10 @@ element's update in fp32, rounding only when it stores the results:
                     it (and with it sqrt(v), the effective step size) by tens of percent
     first moment    nearest: a signed, roughly zero-mean average, whose nearest rounding is already unbiased
 
+rounding="kahan" replaces the weight's stochastic rounding by compensated (Kahan) summation: a bf16 buffer keeps what
+nearest rounding dropped (8 B/param of weight and state), so the weight carries ~16 significant bits and no rounding
+noise, which matters at very small learning rates (stochastic rounding is unbiased, but its error is a random walk).
+
 The update reads the fp32 moments before they are rounded. Parameters that are not bf16 (fp32 adapters, norms kept
 in fp32) take the plain fp32 AdamW update, identical to torch.optim.AdamW.
 
@@ -29,7 +33,8 @@ kernel: one read of weight, gradient and moments and one write of weight and mom
 for bf16 gradients. Without compilation (CPU, or `compile=False`) the same function runs eagerly in chunks.
 
 After: stochastic rounding for low-precision training (Gupta et al. 2015, arXiv:1502.02551; Zamirai et al. 2020,
-arXiv:2010.06192, which finds bf16 weights with SR match fp32 masters); SR of the second moment only and nearest
+arXiv:2010.06192, which finds bf16 weights with SR or Kahan summation match fp32 masters; Kahan-compensated bf16
+optimizers as in the optimi library, MIT); SR of the second moment and nearest
 rounding of the first follows the design notes of the Halo framework's AdamWBF16 (Apache-2.0; re-implemented here,
 no code copied). The integer hash is a 32-bit avalanche mixer in the style of C. Wellons' "lowbias32" (public
 domain), with multipliers below 2^31 so that every product fits in int64.
@@ -83,6 +88,18 @@ def round_bf16(x: torch.Tensor, noise16: torch.Tensor) -> torch.Tensor:
     return torch.where(finite, out, x.to(torch.bfloat16))
 
 
+def round_bf16_nearest(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp32 -> bf16 with round-to-nearest-even, done on the bit pattern, and the same value as fp32. A cast followed
+    by an upcast (x.to(bf16).float()) is not used for the residual x - round(x): torch.compile may drop such
+    intermediate casts in a fused kernel, which would make the residual 0."""
+    bits = x.view(torch.int32).to(torch.int64)
+    finite = torch.isfinite(x)
+    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) & ~0xFFFF
+    as_f32 = torch.where(finite, rounded.to(torch.int32).view(torch.float32), x)
+    out = (rounded >> 16).to(torch.int16).view(torch.bfloat16)
+    return torch.where(finite, out, x.to(torch.bfloat16)), as_f32
+
+
 def _bf16_adamw_update(
     p: torch.Tensor,
     g: torch.Tensor,
@@ -106,6 +123,37 @@ def _bf16_adamw_update(
     p.copy_(round_bf16(pf, r & 0xFFFF))
     v.copy_(round_bf16(vf, r >> 16))
     m.copy_(mf.to(torch.bfloat16))
+
+
+def _bf16_adamw_kahan_update(
+    p: torch.Tensor,
+    g: torch.Tensor,
+    m: torch.Tensor,
+    v: torch.Tensor,
+    c: torch.Tensor,
+    hp: torch.Tensor,
+    seed: torch.Tensor,
+    offset: int = 0,
+) -> None:
+    """The same step with compensated (Kahan) summation of the weight instead of stochastic rounding: c holds what
+    the last nearest rounding of the weight dropped (in bf16), so the stored pair p + c carries about 16 significant
+    bits and every update is applied exactly up to that precision, with no rounding noise. The second moment is still
+    rounded stochastically, the first to nearest."""
+    decay, beta1, beta2, step_size, inv_bc2_sqrt, eps = hp[0], hp[1], hp[2], hp[3], hp[4], hp[5]
+    gf = g.float()
+    mf = m.float() * beta1 + gf * (1.0 - beta1)
+    vf = v.float() * beta2 + gf * gf * (1.0 - beta2)
+    pf = (p.float() + c.float()) * decay - step_size * mf / (vf.sqrt() * inv_bc2_sqrt + eps)
+    stored, stored_f32 = round_bf16_nearest(pf)
+    index = torch.arange(offset, offset + p.numel(), device=p.device, dtype=torch.int64)
+    r = hash32(index, seed)
+    p.copy_(stored)
+    c.copy_((pf - stored_f32).to(torch.bfloat16))
+    v.copy_(round_bf16(vf, r >> 16))
+    m.copy_(mf.to(torch.bfloat16))
+
+
+ROUNDINGS = ("stochastic", "kahan")
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -133,6 +181,11 @@ class BF16AdamW(torch.optim.Optimizer):
              so replicas and resumed runs round identically even if their parameter lists are ordered differently.
              Parameters without a name are keyed by their position in the groups.
     seed:    the optimizer's noise seed (the run's seed); changes every rounding decision, nothing else.
+    rounding: how the weight keeps updates below its ulp. "stochastic" (6 B/param of weight and state): unbiased,
+             but each element's rounding error is a random walk, about ulp * sqrt(steps * update / ulp) after many
+             steps of the same small update. "kahan" (8 B/param): a bf16 compensation buffer holds what nearest
+             rounding dropped, so the weight carries ~16 significant bits with no noise; preferable at very small
+             learning rates (RL at 1e-6, where an update is ~1/100 of an ulp).
     compile: "auto" (compile the fused update on CUDA), True, or False (eager everywhere).
     """
 
@@ -146,8 +199,11 @@ class BF16AdamW(torch.optim.Optimizer):
         *,
         named: Iterable[tuple[str, torch.Tensor]] | None = None,
         seed: int = 0,
+        rounding: str = "stochastic",
         compile: bool | str = "auto",
     ):
+        if rounding not in ROUNDINGS:
+            raise ValueError(f"rounding must be one of {', '.join(ROUNDINGS)}, got {rounding!r}")
         if lr < 0:
             raise ValueError(f"lr must be >= 0, got {lr}")
         if not (0.0 <= betas[0] < 1.0 and 0.0 <= betas[1] < 1.0):
@@ -160,6 +216,7 @@ class BF16AdamW(torch.optim.Optimizer):
             raise ValueError(f"compile must be True, False or 'auto', got {compile!r}")
         super().__init__(params, dict(lr=lr, betas=tuple(betas), eps=eps, weight_decay=weight_decay))
         self.seed = int(seed)
+        self.rounding = rounding
         self.compile = compile
         names = {id(p): n for n, p in named} if named is not None else {}
         self._keys: dict[int, int] = {}
@@ -178,8 +235,12 @@ class BF16AdamW(torch.optim.Optimizer):
         if not use:
             return None
         if self._compiled is None:
-            self._compiled = torch.compile(_bf16_adamw_update, dynamic=True, fullgraph=True)
+            self._compiled = torch.compile(self._update, dynamic=True, fullgraph=True)
         return self._compiled
+
+    @property
+    def _update(self):
+        return _bf16_adamw_kahan_update if self.rounding == "kahan" else _bf16_adamw_update
 
     def _init_state(self, p: torch.Tensor) -> dict:
         state = self.state[p]
@@ -188,7 +249,14 @@ class BF16AdamW(torch.optim.Optimizer):
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(p, dtype=moment, memory_format=torch.preserve_format)
             state["exp_avg_sq"] = torch.zeros_like(p, dtype=moment, memory_format=torch.preserve_format)
+            if self.rounding == "kahan" and p.dtype == torch.bfloat16:
+                state["compensation"] = torch.zeros_like(p, memory_format=torch.preserve_format)
         return state
+
+    def _tensors(self, p: torch.Tensor, state: dict) -> list[torch.Tensor]:
+        """The flat local tensors the update function takes, in order."""
+        names = ("exp_avg", "exp_avg_sq", "compensation") if self.rounding == "kahan" else ("exp_avg", "exp_avg_sq")
+        return [_local(t).view(-1) for t in (p, p.grad, *(state[n] for n in names))]
 
     def _key(self, p: torch.Tensor) -> int:
         key = self._keys.get(id(p))
@@ -230,15 +298,16 @@ class BF16AdamW(torch.optim.Optimizer):
             elif device.type != "cpu":
                 hp, seeds = hp.to(device), seeds.to(device)
             fn = self._update_fn(device)
+            update = self._update
             for i, (p, _, state) in enumerate(its):
-                flat = [_local(t).view(-1) for t in (p, p.grad, state["exp_avg"], state["exp_avg_sq"])]
+                flat = self._tensors(p, state)
                 if fn is not None:
                     fn(*flat, hp[i], seeds[i])
                 else:
                     n = flat[0].numel()
                     for start in range(0, n, EAGER_CHUNK):
                         part = [t[start : start + EAGER_CHUNK] for t in flat]
-                        _bf16_adamw_update(*part, hp[i], seeds[i], start)
+                        update(*part, hp[i], seeds[i], start)
 
     def _check(self, p: torch.Tensor) -> None:
         if p.grad.is_sparse:
@@ -298,6 +367,9 @@ class BF16AdamW(torch.optim.Optimizer):
                 state["step"] = int(state["step"].item())
 
 
-def state_bytes_per_param(dtype: torch.dtype) -> int:
-    """Optimizer state bytes per parameter (both moments) for a parameter of `dtype`."""
-    return 4 if dtype == torch.bfloat16 else 2 * torch.empty((), dtype=dtype).element_size()
+def state_bytes_per_param(dtype: torch.dtype, rounding: str = "stochastic") -> int:
+    """Optimizer state bytes per parameter (both moments, and the compensation buffer with "kahan") for a
+    parameter of `dtype`."""
+    if dtype != torch.bfloat16:
+        return 2 * torch.empty((), dtype=dtype).element_size()
+    return 6 if rounding == "kahan" else 4

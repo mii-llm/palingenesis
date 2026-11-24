@@ -358,3 +358,107 @@ def test_config_validation():
 def test_state_bytes_per_param():
     assert B.state_bytes_per_param(torch.bfloat16) == 4
     assert B.state_bytes_per_param(torch.float32) == 8
+
+
+# ── rounding="kahan" ────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _rl_like(rounding, steps=300, lr=1e-6, n=4096):
+    """RL-sized updates (~1/100 of a bf16 ulp, random signs). Returns (the stored bf16 weights, the value the optimizer
+    holds: with kahan the weights plus their compensation, the fp32-master weights, the start)."""
+    p, g = _pair(n=n)
+    start = p.detach().double().clone()
+    ref = nn.Parameter(p.detach().float().clone())
+    opt = BF16AdamW([p], lr=lr, betas=(0.9, 0.95), rounding=rounding)
+    ref_opt = torch.optim.AdamW([ref], lr=lr, betas=(0.9, 0.95), weight_decay=0.0, foreach=False)
+    for _ in range(steps):
+        grad = torch.randn(n, generator=g).to(torch.bfloat16)
+        p.grad, ref.grad = grad, grad.float()
+        opt.step()
+        ref_opt.step()
+    held = p.detach().double()
+    if rounding == "kahan":
+        held = held + opt.state[p]["compensation"].double()
+    return p.detach().double(), held, ref.detach().double(), start
+
+
+def test_kahan_tracks_fp32_masters_without_rounding_noise():
+    """At RL learning rates stochastic rounding's random walk is larger than the update itself (measured: 4x the
+    distance the fp32 weights moved); Kahan holds the fp32 trajectory (2%), and its stored bf16 weights are the
+    fp32 masters rounded to nearest, as a bf16 forward of fp32 masters would see them."""
+    stored, held, ref, start = _rl_like("kahan")
+    sr, _, ref_sr, _ = _rl_like("stochastic")
+    assert torch.equal(ref, ref_sr)
+    moved = (ref - start).norm()
+    assert ((held - ref).norm() / moved).item() < 0.05
+    assert ((sr - ref).norm() / moved).item() > 1.0
+    assert (stored == ref.float().to(torch.bfloat16).double()).float().mean().item() > 0.95
+
+
+def test_kahan_small_updates_and_state():
+    def bf16(params, lr):
+        return BF16AdamW(params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0, rounding="kahan")
+
+    drift = _drift(bf16, torch.bfloat16)
+    assert drift / (-200 * 1e-5) == pytest.approx(1.0, abs=0.03)  # the stored weights: within half an ulp
+    p = nn.Parameter(torch.zeros(8, dtype=torch.bfloat16))
+    opt = BF16AdamW([p], lr=1e-3, rounding="kahan")
+    p.grad = torch.ones(8, dtype=torch.bfloat16)
+    opt.step()
+    assert opt.state[p]["compensation"].dtype == torch.bfloat16
+    assert B.state_bytes_per_param(torch.bfloat16, "kahan") == 6
+    with pytest.raises(ValueError, match="rounding"):
+        BF16AdamW([p], rounding="nearest")
+
+
+def test_kahan_resume_is_bit_exact():
+    def build(model):
+        return BF16AdamW(model.parameters(), lr=1e-3, named=model.named_parameters(), rounding="kahan")
+
+    full = _mlp(torch.bfloat16)
+    _run(full, build(full), 6)
+    half = _mlp(torch.bfloat16)
+    opt = build(half)
+    g = torch.Generator().manual_seed(0)
+
+    def steps(model, optimizer, n):
+        for _ in range(n):
+            x = torch.randn(8, 32, generator=g).to(torch.bfloat16)
+            optimizer.zero_grad()
+            model(x).float().pow(2).mean().backward()
+            optimizer.step()
+
+    steps(half, opt, 3)
+    resumed = copy.deepcopy(half)
+    opt_resumed = build(resumed)
+    opt_resumed.load_state_dict(copy.deepcopy(opt.state_dict()))
+    steps(resumed, opt_resumed, 3)
+    assert all(torch.equal(a, b) for a, b in zip(full.parameters(), resumed.parameters()))
+
+
+def test_kahan_compiled_matches_eager():
+    p, g = _pair(n=5000)
+    q = nn.Parameter(p.detach().clone())
+    grad = (torch.randn(p.numel(), generator=g) * 1e-2).to(torch.bfloat16)
+    eager = BF16AdamW([p], lr=1e-3, rounding="kahan", compile=False)
+    try:
+        compiled = BF16AdamW([q], lr=1e-3, rounding="kahan", compile=True)
+        for _ in range(3):
+            p.grad, q.grad = grad.clone(), grad.clone()
+            eager.step()
+            compiled.step()
+    except Exception as e:
+        pytest.skip(f"torch.compile unavailable on CPU: {type(e).__name__}")
+    assert (p.detach() != q.detach()).float().mean().item() < 0.01
+
+
+def test_config_bf16_rounding():
+    cfg = Config()
+    cfg.train.optimizer, cfg.train.bf16_rounding = "adamw_bf16", "kahan"
+    assert cfg.validate() == []
+    cfg.train.bf16_rounding = "nearest"
+    with pytest.raises(ConfigError, match="bf16_rounding"):
+        cfg.validate()
+    model = _mlp(torch.bfloat16)
+    opt = build_optimizer(model, 1e-3, 0.0, optimizer_name="adamw_bf16", bf16_rounding="kahan")
+    assert opt.rounding == "kahan"

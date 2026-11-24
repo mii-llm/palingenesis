@@ -35,13 +35,15 @@ def build_optimizer(
     optimizer_name: str = "adamw",
     muon: dict | None = None,
     seed: int = 0,
+    bf16_rounding: str = "stochastic",
 ) -> torch.optim.Optimizer:
     """Build optimizer with optional LLRD, Muon, or 8-bit support.
 
     Options:
       - "adamw": standard AdamW (16 bytes/param with fp32 weights; moments in the weights' dtype)
       - "adamw_bf16": AdamW on bf16 weights with bf16 moments and stochastic rounding (palingenesis.bf16_adamw):
-        6 bytes/param of weights and state, updates below a bf16 ulp still accumulate; `seed` keys its rounding
+        6 bytes/param of weights and state (8 with bf16_rounding="kahan"), updates below a bf16 ulp still
+        accumulate; `seed` keys its rounding
       - "muon": Muon on hidden matrices (Gram Newton-Schulz, Moonlight RMS matching: same LR and weight decay as
         AdamW) + AdamW on embeddings / head / norms / thin matrices (palingenesis.muon); `muon` = its options
       - "adamw8bit": bitsandbytes 8-bit AdamW (6 bytes/param)
@@ -59,7 +61,7 @@ def build_optimizer(
         return _build_bnb_optimizer(model, lr, weight_decay, optimizer_name)
 
     if optimizer_name == "adamw_bf16":
-        return _build_bf16_adamw(model, lr, weight_decay, llrd_decay, seed)
+        return _build_bf16_adamw(model, lr, weight_decay, llrd_decay, seed, bf16_rounding)
 
     if any(p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters()):
         logger.info(
@@ -91,7 +93,7 @@ def build_optimizer(
 
 
 def _build_bf16_adamw(
-    model: torch.nn.Module, lr: float, weight_decay: float, llrd_decay: float, seed: int
+    model: torch.nn.Module, lr: float, weight_decay: float, llrd_decay: float, seed: int, rounding: str = "stochastic"
 ) -> torch.optim.Optimizer:
     """AdamW on bf16 weights with stochastic rounding (palingenesis.bf16_adamw), with the same parameter groups as
     "adamw" (decay / no decay, or LLRD's per-layer groups). Parameters that are not bf16 take plain fp32 AdamW."""
@@ -101,12 +103,15 @@ def _build_bf16_adamw(
         groups = _build_llrd_groups(model, lr, weight_decay, llrd_decay)
     else:
         groups = _decay_groups(model, weight_decay)
-    optimizer = BF16AdamW(groups, lr=lr, betas=(0.9, 0.95), named=model.named_parameters(), seed=seed)
+    optimizer = BF16AdamW(
+        groups, lr=lr, betas=(0.9, 0.95), named=model.named_parameters(), seed=seed, rounding=rounding
+    )
     trained = [p for g in groups for p in g["params"]]
     bf16 = sum(p.numel() for p in trained if p.dtype == torch.bfloat16)
     other = sum(p.numel() for p in trained) - bf16
     logger.info(
-        f"AdamW bf16 (stochastic rounding): {bf16 / 1e6:.1f}M bf16 params, ~{bf16 * 4 / 1e9:.2f} GB of moments"
+        f"AdamW bf16 ({rounding} rounding): {bf16 / 1e6:.1f}M bf16 params, "
+        f"~{bf16 * (6 if rounding == 'kahan' else 4) / 1e9:.2f} GB of optimizer state"
         + (f"; {other / 1e6:.1f}M non-bf16 params on plain AdamW" if other else "")
     )
     return optimizer

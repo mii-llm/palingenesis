@@ -210,6 +210,9 @@ class TrainConfig:
     # with stochastic rounding (palingenesis.bf16_adamw): updates below a bf16 ulp still accumulate, at 8 B/param with
     # the gradient against 16 for fp32 master weights. Needs model.torch_dtype: bfloat16.
     optimizer: str = "adamw"
+    # adamw_bf16: how the weight keeps updates below its ulp. "stochastic" (unbiased rounding; its error is a random
+    # walk) or "kahan" (a bf16 compensation buffer, +2 B/param: no rounding noise; for very small learning rates).
+    bf16_rounding: str = "stochastic"
     # Muon (optimizer: muon; palingenesis.muon). muon_ns: "gram" (Gram Newton-Schulz with a restart, ~half the FLOPs
     # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
     # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
@@ -793,6 +796,8 @@ class Config:
                     "train.muon_scale=spectral: Muon updates are not RMS-matched to AdamW, so the AdamW learning rate "
                     "is far too small for the Muon matrices (moonlight scaling avoids this)."
                 )
+        if self.train.bf16_rounding not in ("stochastic", "kahan"):
+            errors.append(f"train.bf16_rounding must be stochastic or kahan, got {self.train.bf16_rounding!r}.")
         if self.train.optimizer == "adamw_bf16":
             if self.model.torch_dtype != "bfloat16":
                 errors.append(
