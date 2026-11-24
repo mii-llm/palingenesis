@@ -36,6 +36,7 @@ Commands:
   harbor      Harbor task directories (Docker envs with tests): check oracle/nop, export RL rows
   scenario    Multi-role RL scenarios: generate rows, audit verifiers, export episodes, plan a cluster layout
   harness     Harness profiles for Harbor tasks: list, record a real harness's requests (capture)
+  quantize    Post-training FP4 / FP8 quantisation into a vLLM checkpoint (NVFP4, MXFP4, FP8; compressed-tensors)
   merge       Weight-space merging: interpolate, linear, soup, task-arithmetic, model-stock, ram, materialize
   surgery     Margin surgery: a minimal weight edit restoring a decision's margins (run, margins, span)
   internals   Read the model's internals: capture, probes, lenses, compare checkpoints, steering, patching
@@ -121,6 +122,11 @@ def main():
             from palingenesis.rl.envs.harness.capture import main as harness_main
 
             sys.exit(harness_main())
+
+        case "quantize":
+            from palingenesis.qat.compressed import main as quantize_main
+
+            sys.exit(quantize_main())
 
         case "merge":
             from palingenesis.merge import main as merge_main

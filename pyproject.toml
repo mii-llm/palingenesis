@@ -113,6 +113,7 @@ pgs = "palingenesis.cli:main"
 # Trainer plugins by short name (plugins.custom: [ternary-qat]); third-party packages register theirs here too.
 [project.entry-points."palingenesis.plugins"]
 ternary-qat = "palingenesis.qat:TernaryQAT"
+float-qat = "palingenesis.qat:FloatQAT"
 lora = "palingenesis.lora:LoRA"
 
 [project.urls]

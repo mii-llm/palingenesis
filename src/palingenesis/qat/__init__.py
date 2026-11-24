@@ -1,4 +1,10 @@
-"""Ternary quantisation-aware training, as a trainer plugin: a reference for writing your own.
+"""Quantisation-aware training plugins.
+
+    palingenesis.qat:FloatQAT     FP4 / FP8 (NVFP4, MXFP4, FP8 per row / 128 x 128 blocks), exported for vLLM
+                                  (palingenesis.qat.fp, .formats, .compressed)
+    palingenesis.qat:TernaryQAT   ternary weights (this module), a reference for writing your own
+
+Ternary quantisation-aware training, as a trainer plugin:
 
     plugins:
       custom:
@@ -406,3 +412,15 @@ class TernaryQAT(TrainerPlugin):
 
     def load_state_dict(self, state: dict) -> None:
         self._initial_codes = dict(state.get("initial_codes", {}))
+
+
+# FP4 / FP8 QAT (palingenesis.qat.fp), importable from here: palingenesis.qat:FloatQAT
+_FLOAT_NAMES = ("FloatQAT", "FloatQuantLinear", "FloatQuantEmbedding")
+
+
+def __getattr__(name: str):
+    if name in _FLOAT_NAMES:
+        from palingenesis.qat import fp
+
+        return getattr(fp, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
