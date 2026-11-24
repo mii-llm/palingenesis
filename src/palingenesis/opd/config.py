@@ -88,14 +88,26 @@ class SourceConfig:
     # ---- messages: privileged teacher context ----
     # Row field with text only the teacher sees (a reference solution, the verifier's expected output, a
     # task's solution script), added to the teacher's copy of the last user turn by `privileged_template`
-    # ({content}: that turn, {privileged}: the field). The student is scored by a teacher that knows the
-    # answer: on-policy self-distillation with privileged information (OPSD, 2602.04942) when the teacher
-    # is the student's own checkpoint. Empty = off; rows without the field are ordinary rows.
+    # ({content}: that turn, {privileged}: the field; also {question}: the last user turn, {system}: the system
+    # turn). The student is scored by a teacher that knows the answer: on-policy self-distillation with
+    # privileged information (OPSD, 2602.04942) when the teacher is the student's own checkpoint. Empty = off;
+    # rows without the field are ordinary rows.
     privileged_field: str = ""
     privileged_template: str = "{content}\n\n{privileged}"
     # "user": the template rewrites the last user turn; "system": it rewrites (or creates) the system turn, so the
     # teacher reads the note as an instruction to itself rather than as the user's words
     privileged_role: str = "user"
+    # Several kinds of privileged context in one source (instead of the three options above): a list of views
+    # {name, template, role: user | system, field: "", weight: 1}. A view with a `field` applies to the rows where
+    # that field is non-empty and places it with {privileged}; a view without one applies to every row and builds
+    # the teacher's turn from the conversation itself, e.g. {name: re2, template: "{content}\n\nRead the question
+    # again: {question}"} or {name: system_facts, template: "{system}\n\n{content}"}. Each rollout draws one
+    # applicable view by weight (held-out rows: one fixed view per row); rows with none are ordinary rows.
+    # Logged per source as privileged/<view> (the share of the batch's rollouts).
+    privileged_views: list = field(default_factory=list)
+    # A row field holding that row's own template (same placeholders), used instead of the view's (or
+    # privileged_template) where it is non-empty. Checked when the source loads.
+    privileged_template_field: str = ""
     # ---- rollout sampling of this source's prompts ----
     # A mixture drawn per rollout: [{weight, temperature, top_p, top_k, presence_penalty}, ...] (missing keys:
     # weight 1, temperature rollout.temperature, top_p 1, top_k 0, presence_penalty 0). E.g. half the non-thinking rollouts at the
@@ -181,6 +193,33 @@ class SourceConfig:
     # the fast template, cot_max_new_tokens to CoT).
     cot_fraction: float = 0.0
     cot_max_new_tokens: int = 300
+
+    def privileged_view_list(self) -> list[dict]:
+        """The source's privileged views, normalized to {name, template, role, field, weight}: privileged_views, or
+        the single view of privileged_field / privileged_template / privileged_role ("privileged"), or none."""
+        if self.privileged_views:
+            return [
+                {
+                    "name": str(v.get("name", "")),
+                    "template": v.get("template", ""),
+                    "role": v.get("role", "user"),
+                    "field": v.get("field", "") or "",
+                    "weight": v.get("weight", 1.0),
+                }
+                for v in self.privileged_views
+                if isinstance(v, dict)
+            ]
+        if self.privileged_field:
+            return [
+                {
+                    "name": "privileged",
+                    "template": self.privileged_template,
+                    "role": self.privileged_role,
+                    "field": self.privileged_field,
+                    "weight": 1.0,
+                }
+            ]
+        return []
 
 
 @dataclass(slots=True)
@@ -489,23 +528,7 @@ class OPDConfig:
                             f"{seen[topic]!r} and {teacher!r}."
                         )
                     seen[topic] = teacher
-            if source.privileged_field:
-                if source.format != "messages":
-                    errors.append(f"{where}.privileged_field applies to format 'messages' only.")
-                if source.privileged_role not in ("user", "system"):
-                    errors.append(
-                        f"{where}.privileged_role must be 'user' or 'system', got {source.privileged_role!r}."
-                    )
-                try:
-                    source.privileged_template.format(content="", privileged="")
-                    complete = all(f"{{{k}}}" in source.privileged_template for k in ("content", "privileged"))
-                except (KeyError, IndexError, ValueError):
-                    complete = False
-                if not complete:
-                    errors.append(
-                        f"{where}.privileged_template must contain {{content}} and {{privileged}} and no other "
-                        f"placeholder, got {source.privileged_template!r}."
-                    )
+            errors += privileged_errors(source, where)
             for entry in source.sampling_mix:
                 if not isinstance(entry, dict) or set(entry) - {
                     "weight",
@@ -606,7 +629,7 @@ class OPDConfig:
                     "one-turn trace); mcqa sources need a plain OPD run."
                 )
             for name, source in self.sources.items():
-                if source.format == "messages" and (source.sampling_mix or source.privileged_field):
+                if source.format == "messages" and (source.sampling_mix or source.privileged_view_list()):
                     errors.append(
                         f"sources.{name}: in an agent_traces run, messages sources are distilled as one-turn traces "
                         "at rollout.temperature, without sampling_mix or privileged context."
@@ -731,6 +754,66 @@ def _failed_turn_errors(where: str, source, branch_weight: float) -> list[str]:
         errors.append(f"{where}.error_branches needs loss.trace_branch_weight > 0 (they are regenerated).")
     if source.success_field and source.first_error_weight == 1:
         errors.append(f"{where}.success_field only selects where first_error_weight applies: set it too.")
+    return errors
+
+
+VIEW_KEYS = {"name", "template", "role", "field", "weight"}
+
+
+def privileged_errors(source, where: str) -> list[str]:
+    """The privileged-context options of a source: privileged_field / _template / _role, or privileged_views, and
+    privileged_template_field."""
+    import math
+
+    from palingenesis.privileged import privileged_template_error
+
+    errors = []
+    if source.privileged_views and (
+        source.privileged_field
+        or source.privileged_template != "{content}\n\n{privileged}"
+        or source.privileged_role != "user"
+    ):
+        errors.append(
+            f"{where}: privileged_views replaces privileged_field / privileged_template / privileged_role; "
+            "give each view its own field, template and role."
+        )
+    if not isinstance(source.privileged_views, list):
+        return errors + [f"{where}.privileged_views must be a list of views, got {source.privileged_views!r}."]
+    names = []
+    for i, view in enumerate(source.privileged_views):
+        if not isinstance(view, dict) or set(view) - VIEW_KEYS:
+            errors.append(
+                f"{where}.privileged_views[{i}] must be a mapping with keys {sorted(VIEW_KEYS)}, got {view!r}."
+            )
+            continue
+        name = view.get("name")
+        if not isinstance(name, str) or not name or not name.replace("_", "").replace("-", "").isalnum():
+            errors.append(f"{where}.privileged_views[{i}].name must be a short identifier (metrics), got {name!r}.")
+        names.append(name)
+        if not isinstance(view.get("field", ""), str):
+            errors.append(f"{where}.privileged_views[{i}].field must be a row field name, got {view.get('field')!r}.")
+        weight = view.get("weight", 1.0)
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
+            errors.append(f"{where}.privileged_views[{i}].weight must be a number > 0, got {weight!r}.")
+    if len(set(map(str, names))) != len(names):
+        errors.append(f"{where}.privileged_views: view names must be unique, got {names}.")
+    views = source.privileged_view_list()
+    if (views or source.privileged_template_field) and source.format != "messages":
+        errors.append(f"{where}: privileged context applies to format 'messages' only.")
+    if source.privileged_template_field and not views:
+        errors.append(
+            f"{where}.privileged_template_field gives rows their own template: it needs privileged_field or "
+            "privileged_views (which rows get privileged context, with what text)."
+        )
+    for i, view in enumerate(views):
+        listed = bool(source.privileged_views)
+        if view["role"] not in ("user", "system"):
+            label = f"{where}.privileged_views[{i}].role" if listed else f"{where}.privileged_role"
+            errors.append(f"{label} must be 'user' or 'system', got {view['role']!r}.")
+        problem = privileged_template_error(view["template"], with_field=bool(view["field"]))
+        if problem:
+            label = f"{where}.privileged_views[{i}].template" if listed else f"{where}.privileged_template"
+            errors.append(f"{label} {problem}.")
     return errors
 
 

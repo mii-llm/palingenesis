@@ -88,7 +88,7 @@ class TeacherView:
         else:
             out = [dict(m) for m in messages]
         if s.privileged_field and row.get(s.privileged_field) not in (None, ""):
-            from palingenesis.opd.formatting import with_privileged
+            from palingenesis.privileged import with_privileged
 
             out = with_privileged(out, str(row[s.privileged_field]), s.privileged_template, s.privileged_role)
         if s.system_prompt:

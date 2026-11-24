@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from palingenesis.multimodal import refuse_images
+from palingenesis.privileged import with_privileged  # noqa: F401  (re-exported: its former home)
 
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
 
@@ -75,28 +76,6 @@ def looped(text: str, finish: str) -> bool:
         return True
     tail = _TOOL_CALL.sub("", answer)[-1500:]
     return any(tail.count(tail[i : i + 60]) >= 4 for i in range(0, max(0, len(tail) - 60), 30))
-
-
-def with_privileged(messages: list[dict], privileged: str, template: str, role: str = "user") -> list[dict]:
-    """The teacher's copy of `messages` with the privileged text added by `template` ({content}, {privileged}).
-
-    role "user": the last user turn is rewritten. The last user turn, not the last message: in a mid-episode
-    state the conversation ends with a tool result, which must stay what the tool returned.
-    role "system": the system turn is rewritten ({content} = its text, "" without one, then a system turn is
-    inserted first). A note there reads as an instruction to the assistant, not as something the user said."""
-    if role == "system":
-        out = list(messages)
-        if out and out[0]["role"] == "system":
-            out[0] = {**out[0], "content": template.format(content=out[0]["content"], privileged=privileged)}
-        else:
-            out.insert(0, {"role": "system", "content": template.format(content="", privileged=privileged).strip()})
-        return out
-    last = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=None)
-    if last is None:
-        raise ValueError("privileged context needs a user turn to attach to")
-    out = list(messages)
-    out[last] = {**messages[last], "content": template.format(content=messages[last]["content"], privileged=privileged)}
-    return out
 
 
 def extract_number(text: str) -> str | None:

@@ -93,8 +93,9 @@ class TeacherSpec:
       prefix_messages      messages placed before the conversation (after the system turn): few-shot
                            examples; a list, or a path to a JSON / JSONL file of messages
       privileged_field     row field with text only the teacher sees, placed by privileged_template
-                           ({content}, {privileged}) into the last user turn or the system turn
-                           (privileged_role); rows without the field render as they are
+                           ({content}, {privileged}; also {question}: the last user turn, {system}: the
+                           system turn) into the last user turn or the system turn (privileged_role);
+                           rows without the field render as they are
       messages_field       row field with the teacher's own full conversation (its trained turns
                            must match the student's)
       chat_template_kwargs the teacher's template options (e.g. {enable_thinking: true})
@@ -211,13 +212,11 @@ def distill_errors(config) -> list[str]:
         if t.privileged_role not in ("user", "system"):
             errors.append(f"{where}.privileged_role must be 'user' or 'system' (got {t.privileged_role!r}).")
         if t.privileged_field:
-            try:
-                t.privileged_template.format(content="", privileged="")
-                ok = all(f"{{{k}}}" in t.privileged_template for k in ("content", "privileged"))
-            except (KeyError, IndexError, ValueError):
-                ok = False
-            if not ok:
-                errors.append(f"{where}.privileged_template must contain {{content}} and {{privileged}} only.")
+            from palingenesis.privileged import privileged_template_error
+
+            problem = privileged_template_error(t.privileged_template, with_field=True)
+            if problem:
+                errors.append(f"{where}.privileged_template {problem}.")
         unknown_sources = [s for s in t.sources if s not in source_names]
         if unknown_sources:
             errors.append(

@@ -443,6 +443,11 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `teacher` | str | `""` | Teacher of this source's prompts (empty = the first teacher). |
 | `topic_field` | str | `""` | Row field holding a topic (e.g. `domain`), for `topic_teachers`. |
 | `topic_teachers` | dict | `{}` | `{teacher: [topics]}`: rows whose topic is listed go to that teacher, the others to `teacher`. A topic may be listed under one teacher only. |
+| `privileged_field` | str | `""` | messages: a row field only the teacher sees (OPSD), placed by `privileged_template`; rows without it are ordinary rows. |
+| `privileged_template` | str | `{content}\n\n{privileged}` | Where the privileged text goes. Placeholders: `{content}` (the rewritten turn), `{privileged}` (the field, required), `{question}` (the last user turn), `{system}` (the system turn). |
+| `privileged_role` | str | `user` | `user` (rewrite the last user turn) or `system` (rewrite or create the system turn). |
+| `privileged_views` | list | `[]` | Several kinds of privileged context instead of the three options above: `[{name, template, role, field, weight}]`. A view with a `field` applies to rows that fill it; one without builds the teacher's turn from the conversation (RE2: `{content}\n\nRead the question again: {question}`). One applicable view per rollout, drawn by weight; logged as `privileged/<name>`. See [Privileged context](../guides/distillation.md#privileged-context-on-policy-self-distillation). |
+| `privileged_template_field` | str | `""` | A row field with the row's own template, used instead of the view's where non-empty; checked at load. |
 | `chat_template_kwargs` | dict | `{}` | Chat-template arguments for this source over `model.chat_template_kwargs` (e.g. `{enable_thinking: true}`). `messages` rows: a row's own kwargs win. `agent_traces` runs: every row of the source renders with them; a `messages` row that disagrees is an error. |
 | `messages_field` / `tools_field` | str | `messages` / `tools` | agent_traces: the columns holding the conversation and the tool schemas (lists or JSON strings). |
 | `branches_per_trace` | int | `8` | agent_traces: assistant turns regenerated per sampled trace (0 = all). |

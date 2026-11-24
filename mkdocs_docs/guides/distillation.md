@@ -276,6 +276,52 @@ sources:
     privileged_template: "{content}\n\n{privileged}"
 ```
 
+#### Kinds of privileged context
+
+The teacher's turn need not carry new facts. What the student lacks may be attention: it misreads a constraint, forgets
+a fact stated in the system prompt, or answers the question it expected instead of the one asked. A teacher that is the
+student itself, with the input made easier to read, then marks the tokens where the student goes wrong. Templates have
+four placeholders: `{content}` (the turn being rewritten), `{privileged}` (the row's field), `{question}` (the last user
+turn's text) and `{system}` (the system turn's text, empty without one).
+
+| Kind | Row field | Template | Role |
+|---|---|---|---|
+| the question read twice (RE2, arXiv:2309.06275) | none | `{content}\n\nRead the question again: {question}` | user |
+| a restated constraint | `constraint` | `{content}\n\nRemember: {privileged}` | user |
+| system facts repeated next to the question | none | `{system}\n\n{content}` | user |
+| a fact card | `facts` | `{content}\n\nFacts you can rely on:\n{privileged}` | system |
+| a trigger-free rewording (the same request without the words that mislead) | `reworded` | `{privileged}` | user |
+| a hint or the reference answer | `hint` | `{content}\n\nHint: {privileged}` | user or system |
+
+`privileged_views` puts several kinds in one source. A view with a `field` applies to the rows where that field is
+non-empty (0 counts, an empty string does not); a view without one applies to every row. Each rollout draws one
+applicable view by `weight`; held-out rows get one fixed view each, so dev metrics are comparable between evaluations.
+Rows no view applies to are ordinary rows (the teacher sees what the student sees). Steps log the share of each view as
+`privileged/<name>` (`privileged/none`: rows without a view). `privileged_template_field` names a row field holding that
+row's own template (same placeholders), used instead of the view's where non-empty, for data generated with
+per-row instructions; it is checked against every view that may apply to the row when the source loads.
+
+```yaml
+teachers:
+  self: {model: runs/sft/final}       # the student's own starting checkpoint, frozen
+sources:
+  constraints:
+    path: if_rows.jsonl               # rows: messages, and optionally constraint, facts, reworded
+    teacher: self
+    privileged_views:
+      - {name: re2, template: "{content}\n\nRead the question again: {question}", weight: 1}
+      - {name: constraint, field: constraint, template: "{content}\n\nRemember: {privileged}", weight: 2}
+      - {name: facts, field: facts, role: system, template: "{content}\n\nFacts you can rely on:\n{privileged}"}
+      - {name: reworded, field: reworded, template: "{privileged}"}
+```
+
+To measure which kind carries signal, put each view in its own source over the same file (`eval/dev_kl/<source>` and
+`eval/dev_acc/<source>` then split by kind), or compare `kl/<teacher>` at step 0 between configs: a view whose teacher
+agrees with the student everywhere (step-0 KL near 0) teaches nothing. The privileged text must never reach the
+student: check a few rendered teacher prompts against the student's before a long run. With the frozen starting
+checkpoint as teacher, the target does not move with the student; nothing in this library measures yet how far the
+student follows before the gap closes (watch `kl/<teacher>` fall and the held-out accuracy of the task).
+
 ## Measured
 
 Student Qwen3-0.6B, non-thinking, on GSM8K train prompts; one A100 80GB (vLLM 0.26, torch 2.11, cu129). Every run: 64 prompts per step, 512 new tokens, temperature 1, 60 steps, learning rate 3e-6 (5 warmup steps, cosine), `configs/distill_math.yaml` with the changes listed. Dev metrics on 200 GSM8K test questions: `dev_kl` is the on-policy sampled reverse-KL estimate per student token (on the teacher's own tokens for xtok, whitespace chunks excluded), accuracy is greedy with the last number after "Answer:". Greedy accuracy of the models alone on the same questions: Qwen3-0.6B 64.5%, Qwen3-1.7B 79.0%, Qwen3.5-0.8B 52.0%, SmolLM2-360M-Instruct 10.0%.

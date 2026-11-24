@@ -39,9 +39,9 @@ from palingenesis.opd.formatting import (
     extract_number,
     load_reference_shots,
     looped,
-    with_privileged,
 )
 from palingenesis.opd.pool import load_pool, question_hash, split_pool
+from palingenesis.privileged import privileged_template_error, with_privileged
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +189,30 @@ class ChatMessagesSource:
         if not self.train_rows:
             raise ValueError(f"{config.path}: no training rows left after holding out dev_size={config.dev_size}")
         logger.info("Chat prompts: %d train / %d dev", len(self.train_rows), len(self.dev_rows))
+        self.views = config.privileged_view_list()
+        self._check_row_templates()
+
+    def _applicable(self, row: dict) -> list[dict]:
+        """The privileged views that apply to a row: those without a field, and those whose field the row fills."""
+        return [v for v in self.views if not v["field"] or _present(row.get(v["field"]))]
+
+    def _check_row_templates(self) -> None:
+        """A row's own template (privileged_template_field) must be valid for every view that may draw it."""
+        name = self.config.privileged_template_field
+        if not name:
+            return
+        for split, rows in (("train", self.train_rows), ("dev", self.dev_rows)):
+            for i, row in enumerate(rows):
+                template = row.get(name)
+                if not _present(template):
+                    continue
+                for view in self._applicable(row):
+                    problem = privileged_template_error(template, with_field=bool(view["field"]))
+                    if problem:
+                        raise ValueError(
+                            f"{self.config.path}: {split} row {i}: its {name} (for the privileged view "
+                            f"{view['name']!r}) {problem}"
+                        )
 
     @staticmethod
     def _load(path: str) -> list[dict]:
@@ -209,23 +233,36 @@ class ChatMessagesSource:
             raise ValueError(f"No usable rows in {path}")
         return rows
 
-    def meta(self, row: dict) -> dict:
-        """A row's rollout meta: its tools, its template kwargs and, with privileged context, the
-        teacher's copy of the conversation."""
+    def meta(self, row: dict, rng: random.Random | None = None) -> dict:
+        """A row's rollout meta: its tools, its template kwargs and, with privileged context, the teacher's copy of
+        the conversation (teacher_messages) and the view that wrote it (_view). The view is drawn by weight with
+        `rng` (training rollouts), else fixed per row by its content (held-out rows: the same view at every
+        evaluation)."""
         meta = {"tools": row["tools"]} if row.get("tools") else {}
         kwargs = {**self.config.chat_template_kwargs, **(row.get("chat_template_kwargs") or {})}
         if kwargs:
             meta["chat_template_kwargs"] = kwargs
-        field = self.config.privileged_field
-        if field and row.get(field):
+        views = self._applicable(row) if self.views else []
+        if views:
+            if len(views) == 1:
+                view = views[0]
+            else:
+                if rng is None:
+                    rng = random.Random(question_hash(json.dumps(row["messages"], ensure_ascii=False, default=str)))
+                view = rng.choices(views, weights=[float(v["weight"]) for v in views], k=1)[0]
+            own = row.get(self.config.privileged_template_field) if self.config.privileged_template_field else None
             meta["teacher_messages"] = with_privileged(
-                row["messages"], str(row[field]), self.config.privileged_template, self.config.privileged_role
+                row["messages"],
+                str(row[view["field"]]) if view["field"] else "",
+                own if _present(own) else view["template"],
+                view["role"],
             )
+            meta["_view"] = view["name"]
         return meta
 
     def sample(self):
         row = self.rng.choice(self.train_rows)
-        return row["messages"], self.config.max_new_tokens, self.meta(row)
+        return row["messages"], self.config.max_new_tokens, self.meta(row, self.rng)
 
     def evaluate(self, engine: Engine) -> dict[str, float]:
         rows = self.dev_rows[: self.eval_samples]
@@ -250,7 +287,25 @@ class ChatMessagesSource:
         return metrics
 
     def batch_stats(self, rollouts):
-        return {}
+        """With privileged views: the share of the batch's rollouts each view wrote the teacher's context for
+        (privileged/<view>; privileged/none: rows no view applied to)."""
+        if not self.views or not rollouts:
+            return {}
+        counts: dict[str, int] = {}
+        for meta, _ in rollouts:
+            name = meta.get("_view", "none")
+            counts[name] = counts.get(name, 0) + 1
+        return {f"privileged/{name}": n / len(rollouts) for name, n in sorted(counts.items())}
+
+
+def _present(value) -> bool:
+    """A row field that holds something: not missing, not None, not "" or whitespace only, not a NaN (a missing cell
+    of a pandas-loaded column). 0 and False are values."""
+    if value is None:
+        return False
+    if isinstance(value, float) and value != value:
+        return False
+    return not (isinstance(value, str) and not value.strip())
 
 
 def _same_number(pred: str | None, gold: str) -> bool:
