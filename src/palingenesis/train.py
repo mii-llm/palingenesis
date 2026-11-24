@@ -558,9 +558,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # ── sdpa: fused attention kernels under autocast (see seco.use_chunk_attention) ──
     if config.model.attn_implementation == "sdpa":
         rerouted = use_chunk_attention(model)
+        kernel = accelerator.activate_flash_kernel(
+            config.model.flash_kernel, "sdpa", *accelerator.attention_heads(model.config), device=device
+        )
         logger.info(
             f"attention: {'fused (flash) path' if rerouted else 'sdpa as configured'} "
-            f"({getattr(model.config, '_attn_implementation', None)})"
+            f"({getattr(model.config, '_attn_implementation', None)}), flash kernel: {kernel}"
         )
 
     # ── Hybrid model freeze (DeltaNet/SSM layers frozen, only attention trains) ──

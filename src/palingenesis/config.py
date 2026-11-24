@@ -21,9 +21,14 @@ class ModelConfig:
     name_or_path: str = "meta-llama/Llama-3.1-8B-Instruct"
     trust_remote_code: bool = True
     torch_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
-    # sdpa | flash_attention_2 | flex_attention | eager, or a Hub kernel "org/repo[@rev]" loaded by
-    # transformers through the `kernels` package (AMD: "kernels-community/aiter-flash-attn@v2")
+    # sdpa | flash_attention_2 | flash_attention_3 | flash_attention_4 | flex_attention | eager, or a Hub kernel
+    # "org/repo[@rev]" loaded by transformers through the `kernels` package (AMD: "kernels-community/aiter-flash-attn@v2")
     attn_implementation: str = "sdpa"
+    # The flash kernel behind sdpa (dense and variable-length; packed rows and SeCO included): "builtin" (torch's
+    # FlashAttention-2), "fa3" (FlashAttention-3, Hopper), "fa4" (FlashAttention-4, Hopper / Blackwell) or "auto"
+    # (FA3 on Hopper, FA4 on Blackwell, when installed; else builtin). Probed at startup against the built-in kernel
+    # (palingenesis.accelerator.activate_flash_kernel). Only with attn_implementation: sdpa.
+    flash_kernel: str = "builtin"
     use_liger_kernel: bool = True  # used when compile is false (compile fuses the same ops)
     compile: bool = True
     compile_backend: str = "inductor"
@@ -666,14 +671,24 @@ class Config:
         warnings: list[str] = []
 
         # ── Hard incompatibilities (raise) ────────────────────────────────
-        from palingenesis.accelerator import is_hub_kernel
+        from palingenesis.accelerator import FLASH_ATTENTION_NAMES, FLASH_KERNELS, is_hub_kernel
         from palingenesis.validate_data import valid_think_tags
 
         attn = self.model.attn_implementation
-        if attn not in ("sdpa", "flash_attention_2", "flex_attention", "eager") and not is_hub_kernel(attn):
+        if attn not in ("sdpa", *FLASH_ATTENTION_NAMES, "flex_attention", "eager") and not is_hub_kernel(attn):
             errors.append(
-                f"model.attn_implementation={attn!r}: expected sdpa, flash_attention_2, flex_attention, eager "
-                'or a Hub kernel "org/repo[@rev]" (e.g. kernels-community/aiter-flash-attn@v2)'
+                f"model.attn_implementation={attn!r}: expected sdpa, {', '.join(FLASH_ATTENTION_NAMES)}, "
+                'flex_attention, eager or a Hub kernel "org/repo[@rev]" (e.g. kernels-community/aiter-flash-attn@v2)'
+            )
+        if self.model.flash_kernel not in FLASH_KERNELS:
+            errors.append(
+                f"model.flash_kernel must be one of {', '.join(FLASH_KERNELS)}, got {self.model.flash_kernel!r}."
+            )
+        elif self.model.flash_kernel in ("fa3", "fa4") and attn != "sdpa":
+            errors.append(
+                f"model.flash_kernel={self.model.flash_kernel} replaces the kernel behind sdpa; attn_implementation is "
+                f"{attn}. Use attn_implementation: sdpa, or flash_attention_3 / flash_attention_4 with flash_kernel: "
+                "builtin."
             )
 
         for where, tags in [("data.think_tags", self.data.think_tags)] + [

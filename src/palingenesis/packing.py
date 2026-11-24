@@ -76,7 +76,7 @@ def check_packing_support(model: torch.nn.Module, attn_implementation: str) -> N
     if attn_implementation not in ("sdpa", "eager", "flex_attention") and not is_flash_varlen(attn_implementation):
         raise ConfigError(
             f"data.packing is not supported with attn_implementation={attn_implementation!r}: use sdpa, "
-            "flash_attention_2, a Hub flash kernel (e.g. kernels-community/aiter-flash-attn@v2) or flex_attention."
+            "flash_attention_2 / 3 / 4, a Hub flash kernel (e.g. kernels-community/aiter-flash-attn@v2) or flex_attention."
         )
 
 

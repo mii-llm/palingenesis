@@ -154,6 +154,25 @@ train:
   lr_scheduler: power_decay
 ```
 
+### Attention kernels on Hopper and Blackwell
+
+With `attn_implementation: sdpa` (the default) every attention call, packed variable-length rows and SeCO chunks included, runs torch's built-in FlashAttention-2 kernel. On Hopper (H100, H200) FlashAttention-3 and on Blackwell (B200, B300) FlashAttention-4 are faster at long sequences (their papers report 1.5-2x the forward of FlashAttention-2 on H100 for FA3, and the Halo framework reports 1.2-3x for FA4 over FA2 on B300 at 32k-128k tokens under context parallelism; not measured here yet). torch can put either behind the same ops, so nothing else in the trainer changes:
+
+```yaml
+model:
+  attn_implementation: sdpa
+  flash_kernel: auto    # FA3 on Hopper, FA4 on Blackwell, when installed; otherwise the built-in kernel
+```
+
+At startup the chosen kernel runs a forward and backward of dense and variable-length attention on the model's head shape next to the built-in kernel; `auto` keeps the built-in kernel when a package is missing or the check fails, an explicit `fa3` / `fa4` stops with a config error instead. The log line `attention: ... flash kernel: fa3` says which one trains. Measure the gain on your GPU and model before a long run:
+
+```bash
+python scripts/bench_attention.py --model <model> --seqs 4096,16384,65536   # attention alone, fwd + bwd
+python scripts/bench_attention.py --model <model> --e2e --seq 16384          # the whole model
+```
+
+`flash_attention_3` and `flash_attention_4` are also accepted as `attn_implementation` (transformers' own flash path, like `flash_attention_2`).
+
 ---
 
 ## Which config for which GPU

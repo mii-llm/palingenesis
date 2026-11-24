@@ -271,12 +271,142 @@ def is_hub_kernel(attn_implementation: str) -> bool:
     return _HUB_KERNEL.match(attn_implementation) is not None
 
 
+FLASH_ATTENTION_NAMES = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+
+
 def is_flash_varlen(attn_implementation: str) -> bool:
     """Attention that transformers runs through its flash (variable-length) path: packed
     rows are flattened and documents separated by cu_seq_lens."""
-    return attn_implementation == "flash_attention_2" or (
+    return attn_implementation in FLASH_ATTENTION_NAMES or (
         is_hub_kernel(attn_implementation) and "flash" in attn_implementation
     )
+
+
+# ─── The flash kernel behind SDPA (model.flash_kernel) ───────────────────────────────────────────────────────────
+#
+# torch's SDPA flash backend and aten._flash_attention_forward (the variable-length kernel the sdpa path runs on
+# packed rows and SeCO chunks) are FlashAttention-2 by default. torch >= 2.11 can put FlashAttention-3 (Hopper) or
+# FlashAttention-4 (Hopper and Blackwell, CuTe DSL) behind the same ops
+# (torch.nn.attention.activate_flash_attention_impl), so every sdpa code path keeps working and runs the newer
+# kernel. The kernels come from the flash-attn-3 (`flash_attn_interface`) and flash-attn-4 (`flash_attn.cute`)
+# packages. torch marks the swap as a prototype, so it is checked at startup on the model's head shape against the
+# built-in kernel before training uses it.
+
+FLASH_KERNELS = ("builtin", "auto", "fa3", "fa4")
+_FLASH_MODULES = {"fa3": "flash_attn_interface", "fa4": "flash_attn.cute.interface"}
+_FLASH_ARCHS = {"fa3": (9,), "fa4": (9, 10)}  # compute-capability majors torch's registration accepts
+_FLASH_INSTALL = {
+    "fa3": "the flash-attn-3 package (FlashAttention's hopper/ build)",
+    "fa4": "the flash-attn-4 package (pip install flash-attn-4)",
+}
+
+
+def flash_kernel_candidates(choice: str, major: int | None) -> list[str]:
+    """The kernels to try for model.flash_kernel=`choice` on a GPU of compute-capability `major` (None: no NVIDIA
+    GPU), in order. "auto": FA3 then FA4 on Hopper (FA3 is the mature Hopper kernel), FA4 on datacenter Blackwell
+    (sm100); none elsewhere (consumer Blackwell, sm120, is not a target of either)."""
+    if choice not in FLASH_KERNELS:
+        raise ValueError(f"model.flash_kernel must be one of {', '.join(FLASH_KERNELS)}, got {choice!r}")
+    if choice == "builtin" or major is None:
+        return []
+    if choice == "auto":
+        return {9: ["fa3", "fa4"], 10: ["fa4"]}.get(major, [])
+    return [choice]
+
+
+def _flash_module_available(kernel: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(_FLASH_MODULES[kernel]) is not None
+    except (ImportError, ValueError):  # a parent package is missing ("flash_attn" of "flash_attn.cute.interface")
+        return False
+
+
+def _probe_flash_kernel(impl: str, heads: int, kv_heads: int, head_dim: int, device: torch.device) -> None:
+    """Forward and backward of the two ops training uses (dense causal SDPA and the variable-length kernel) on the
+    model's head shape, under `impl` and under the built-in kernel on the same inputs. Raises on failure or when
+    they disagree by more than bf16 rounding."""
+    from torch.nn import attention
+    from torch.nn.functional import scaled_dot_product_attention
+
+    g = torch.Generator(device="cpu").manual_seed(0)
+    q = torch.randn(1, heads, 256, head_dim, generator=g).to(device, torch.bfloat16)
+    k = torch.randn(1, kv_heads, 256, head_dim, generator=g).to(device, torch.bfloat16)
+    v = torch.randn(1, kv_heads, 256, head_dim, generator=g).to(device, torch.bfloat16)
+    cu = torch.tensor([0, 100, 256], dtype=torch.int32, device=device)
+
+    def run() -> list[torch.Tensor]:
+        qq, kk, vv = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
+        with attention.sdpa_kernel(attention.SDPBackend.FLASH_ATTENTION):
+            dense = scaled_dot_product_attention(qq, kk, vv, is_causal=True, enable_gqa=heads != kv_heads)
+        flat = [t[0].transpose(0, 1).contiguous() for t in (qq, kk, vv)]  # [L, heads, D], K/V heads grouped
+        varlen = torch.ops.aten._flash_attention_forward(*flat, cu, cu, 156, 156, 0.0, True, False)[0]
+        (dense.float().square().sum() + varlen.float().square().sum()).backward()
+        return [dense.float(), varlen.float(), qq.grad.float(), kk.grad.float(), vv.grad.float()]
+
+    attention.restore_flash_attention_impl(_raise_warn=False)
+    reference = run()
+    attention.activate_flash_attention_impl(impl)
+    for name, a, b in zip(("output", "varlen output", "dq", "dk", "dv"), run(), reference):
+        err = float((a - b).abs().max() / b.abs().max().clamp_min(1e-6))
+        if not err < 2e-2:
+            raise RuntimeError(f"{name} differs from the built-in kernel's by {err:.3g} of its largest value")
+
+
+def attention_heads(model_config) -> tuple[int, int, int]:
+    """(query heads, K/V heads, head dim) of a transformers model config (its text config for multimodal models)."""
+    text = model_config.get_text_config() if hasattr(model_config, "get_text_config") else model_config
+    heads = int(getattr(text, "num_attention_heads", 1) or 1)
+    kv_heads = int(getattr(text, "num_key_value_heads", None) or heads)
+    head_dim = int(getattr(text, "head_dim", None) or text.hidden_size // heads)
+    return heads, kv_heads, head_dim
+
+
+def activate_flash_kernel(
+    choice: str,
+    attn_implementation: str,
+    heads: int,
+    kv_heads: int,
+    head_dim: int,
+    device: torch.device | str = "cuda",
+) -> str:
+    """Put FlashAttention-3 / -4 behind SDPA's flash kernels for model.flash_kernel=`choice` (FLASH_KERNELS) and
+    return the kernel now in use: "builtin", "fa3" or "fa4". Only the sdpa path has a kernel to swap. "auto" falls
+    back to the built-in kernel quietly (and does nothing without an NVIDIA GPU); an explicit "fa3" / "fa4" that
+    cannot run raises ConfigError. Each candidate is first probed on the model's head shape (heads, kv_heads,
+    head_dim) against the built-in kernel."""
+    from palingenesis.config import ConfigError
+
+    if choice == "builtin" or attn_implementation != "sdpa":
+        return "builtin"
+    cuda = torch.cuda.is_available() and not is_rocm()
+    major = torch.cuda.get_device_capability(torch.device(device))[0] if cuda else None
+    explicit = choice != "auto"
+    if explicit and major is None:
+        raise ConfigError(f"model.flash_kernel={choice} needs an NVIDIA GPU; use builtin or auto.")
+    if explicit and major not in _FLASH_ARCHS[choice]:
+        archs = " or ".join(f"sm{a}0" for a in _FLASH_ARCHS[choice])
+        raise ConfigError(f"model.flash_kernel={choice} runs on {archs}; this GPU is sm{major}x. Use builtin or auto.")
+    from torch.nn import attention
+
+    if not hasattr(attention, "activate_flash_attention_impl"):
+        if explicit:
+            raise ConfigError(f"model.flash_kernel={choice} needs torch >= 2.11 (this is {torch.__version__}).")
+        return "builtin"
+    for kernel in flash_kernel_candidates(choice, major):
+        if not _flash_module_available(kernel):
+            if explicit:
+                raise ConfigError(f"model.flash_kernel={kernel} needs {_FLASH_INSTALL[kernel]}.")
+            continue
+        try:
+            _probe_flash_kernel(kernel.upper(), heads, kv_heads, head_dim, torch.device(device))
+            return kernel
+        except Exception as e:  # registration or probe failure: keep the built-in kernel
+            attention.restore_flash_attention_impl(_raise_warn=False)
+            if explicit:
+                raise ConfigError(f"model.flash_kernel={kernel} failed its startup check: {e}") from e
+    return "builtin"
 
 
 def aiter_supported(arch: str | None = None) -> bool:
@@ -322,6 +452,18 @@ def check_attn_implementation(attn_implementation: str) -> None:
             f"installed ({platform_name()}). `pip install flash-attn` (or `pip install kernels` for the Hub build), "
             "or set model.attn_implementation: sdpa."
         )
+    if attn_implementation in ("flash_attention_3", "flash_attention_4"):
+        from transformers.utils import import_utils
+
+        version = attn_implementation[-1]
+        if not getattr(import_utils, f"is_flash_attn_{version}_available", lambda: False)():
+            package = "flash-attn-3 (FlashAttention's hopper/ build)" if version == "3" else "flash-attn-4"
+            raise ConfigError(
+                f"model.attn_implementation={attn_implementation}, but {package} is not installed "
+                f"({platform_name()}). Install it, or use sdpa with model.flash_kernel: auto (sdpa then runs the "
+                "same kernel through torch)."
+            )
+        return
     if is_hub_kernel(attn_implementation) and not is_kernels_available():
         raise ConfigError(
             f"model.attn_implementation={attn_implementation!r} is a Hub kernel and needs the `kernels` package: "
