@@ -8,8 +8,9 @@ rules, truncation and environment rewards as an RL run, so an evaluation scores 
     # groups[i]: the k trajectories of rows[i] (t.reward, t.rewards, t.messages, t.finish, t.info)
 
 max_completion_tokens: the generated tokens of a whole episode (all turns); default max_new_tokens x max_turns (the
-context, max_model_len, still bounds it). engine: a rollout engine (palingenesis.opd.rollout: VLLMColocateRollout for vLLM in-process, or anything with
-generate(prompts, max_new_tokens, temperature)); temperature: a float or an opd.rollout.Sampling (top_p / top_k;
+context, max_model_len, still bounds it). engine: a rollout engine (palingenesis.opd.rollout: VLLMColocateRollout for vLLM in-process;
+palingenesis.opd.sglang_rollout: SGLangRollout for SGLang in-process, SGLangServerRollout for an SGLang server; or
+anything with generate(prompts, max_new_tokens, temperature)); temperature: a float or an opd.rollout.Sampling (top_p / top_k;
 streaming engines only). A group's k samples share the environment's per-group choices (a harness profile).
 Images: attach the policy's image processor to the tokenizer first (palingenesis.multimodal.attach(tokenizer,
 VisionProcessor.from_pretrained(model, tokenizer))) and use an engine that takes images (HFRollout(..., vision=...),

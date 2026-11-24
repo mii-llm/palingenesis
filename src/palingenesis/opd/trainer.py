@@ -44,6 +44,13 @@ from palingenesis.opd.formatting import encode_prompt
 from palingenesis.opd.fused_rkl import fused_full_rkl
 from palingenesis.opd.orchestrator import Batch, Orchestrator, Pipeline, PublishedWeights, Request, Sample, TeacherRoute
 from palingenesis.opd.rollout import HFRollout, Sampling, VLLMColocateRollout, VLLMServer, VLLMServerRollout
+from palingenesis.opd.sglang_rollout import (
+    SGLangRollout,
+    SGLangServer,
+    SGLangServerRollout,
+    engine_options,
+    server_option_errors,
+)
 from palingenesis.opd.sources import PromptSource, build_source
 from palingenesis.opd.teachers import (
     HFTeacher,
@@ -161,7 +168,7 @@ class OPDTrainer:
                 )
 
         # vLLM servers start before the trainer's models: they claim their share of free GPU memory.
-        self.servers: list[VLLMServer] = []
+        self.servers: list[VLLMServer | SGLangServer] = []
         teachers = {name: self._vllm_teacher(name, t) for name, t in config.teachers.items() if t.backend == "vllm"}
         rollout = config.rollout
         server = None
@@ -192,6 +199,8 @@ class OPDTrainer:
                     *(["--max-num-seqs", str(rollout.max_num_seqs)] if rollout.max_num_seqs > 0 else []),
                 ],
             )
+        elif rollout.backend == "sglang_server":
+            server = self._sglang_server()
 
         if config.model.use_liger_kernel and self.device == "cuda":  # patches classes: before any model loads
             for model_type in sorted(
@@ -236,6 +245,33 @@ class OPDTrainer:
                 prefix_caching=rollout.prefix_caching,
                 max_num_seqs=rollout_max_num_seqs(config),
             )
+        elif rollout.backend == "sglang":
+            try:
+                engine = SGLangRollout(
+                    config.model.student,
+                    self.stop_ids,
+                    gpu_memory_utilization=rollout.gpu_memory_utilization,
+                    max_model_len=rollout.max_model_len,
+                    enforce_eager=rollout.enforce_eager,
+                    seed=config.train.seed,
+                    sleep_mode=rollout.sleep and rollout.max_staleness == 0,
+                    prefix_caching=rollout.prefix_caching,
+                    max_num_seqs=rollout.max_num_seqs,
+                    engine_kwargs=rollout.sglang_args,
+                    bucket_mb=rollout.weight_bucket_mb,
+                )
+            except ValueError as e:
+                raise OPDConfigError(str(e)) from None
+        elif rollout.backend == "sglang_server":
+            engine = SGLangServerRollout(
+                server,
+                self.stop_ids,
+                model=config.model.student,
+                max_model_len=rollout.max_model_len,
+                weight_sync=rollout.weight_sync,
+                bucket_mb=rollout.weight_bucket_mb,
+                sync_dir=rollout.weight_sync_dir or os.path.join(config.train.output_dir, "rollout_weights"),
+            )
         else:
             engine = VLLMServerRollout(server, self.stop_ids)
 
@@ -271,7 +307,7 @@ class OPDTrainer:
         # with the in-process vLLM engine: next to the trainer's default-stream kernels it
         # hit illegal memory accesses (vLLM 0.26) that CUDA_LAUNCH_BLOCKING=1 made vanish,
         # a race between streams. On the default stream only its host work overlaps.
-        overlap = rollout.max_staleness > 0 and rollout.backend == "vllm_server" and self.device == "cuda"
+        overlap = rollout.max_staleness > 0 and rollout.backend.endswith("_server") and self.device == "cuda"
         self.pipeline = self._make_pipeline(engine, overlap)
         self.source = source or self._make_source()
         self.skipped_long = 0  # prompts too long for rollout.max_model_len (see _draw)
@@ -331,6 +367,38 @@ class OPDTrainer:
     def _server(self, model: str, url: str, role: str, args: list[str]) -> VLLMServer:
         server = VLLMServer(
             model, url=url, args=tuple(args), log_path=os.path.join(self.config.train.output_dir, f"vllm_{role}.log")
+        )
+        self.servers.append(server)
+        return server
+
+    def _sglang_server(self) -> SGLangServer:
+        """rollout.backend sglang_server: the student's SGLang server, at rollout.url or launched on this GPU."""
+        rollout = self.config.rollout
+        options: dict = {}
+        if not rollout.url:
+            try:
+                options = engine_options(
+                    self.config.model.student,
+                    gpu_memory_utilization=rollout.gpu_memory_utilization,
+                    max_model_len=rollout.max_model_len,
+                    enforce_eager=rollout.enforce_eager,
+                    seed=self.config.train.seed,
+                    prefix_caching=rollout.prefix_caching,
+                    max_num_seqs=rollout.max_num_seqs,
+                    extra=rollout.sglang_args,
+                )
+            except ValueError as e:
+                raise OPDConfigError(str(e)) from None
+            problems = server_option_errors(options)
+            if problems:
+                raise OPDConfigError(problems[0])
+            if torch.cuda.is_available():
+                options.setdefault("base_gpu_id", torch.cuda.current_device())
+        server = SGLangServer(
+            self.config.model.student,
+            url=rollout.url,
+            options=options,
+            log_path=os.path.join(self.config.train.output_dir, "sglang_rollout.log"),
         )
         self.servers.append(server)
         return server

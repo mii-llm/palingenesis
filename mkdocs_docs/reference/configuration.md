@@ -222,7 +222,7 @@ RL configs (`pgs rl`) run multi-role episodes when they have a `scenario:` secti
 | `roles.<name>.share` | float | `1.0` | The role's part of the loss, relative to the other trained roles. |
 | `loss.advantage_std` | str | `batch` | `role` (scenarios): the standard deviation of the same role's centred rewards over the batch. |
 | `loss.advantage_std_floor` | float | `0.0` | The least value `role` divides by. |
-| `rollout.backend` | str | `vllm` | `remote`: the engines are `palingenesis.rl.pool.worker` processes on other GPUs or nodes. |
+| `rollout.backend` | str | `vllm` | `remote`: the engines are `palingenesis.rl.pool.worker` processes on other GPUs or nodes (all backends: [RL engines](#rl-rollout-engines)). |
 | `rollout.engines` | list | `[]` | remote: the workers' `host:port` addresses; rank *r* generates with `engines[r::ranks]`, rank 0 sends the weights to all. |
 | `rollout.push` | str | `auto` | remote: what a weight update sends. `full`, `fold` (LoRA factors folded by each engine), `native` (LoRA factors as named adapters of the engine; not with `lora.dora`), `auto` (`native` when a role has its own adapter or `partner: base`, else `fold`). The first update also sends the frozen base. |
 | `train.replicate_base` | bool | `false` | With `lora.rank` under torchrun: every rank holds the whole frozen base; only the adapters' gradients are summed over ranks, once per step, instead of FSDP. |
@@ -231,6 +231,27 @@ RL configs also have `rollout.routing_replay` (`auto` / `on` / `off`, default `o
 experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.md#rl-routing-replay).
 
 ---
+
+### RL: rollout engines
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `rollout.backend` | str | `vllm` | `vllm` (in-process vLLM, asleep while training), `vllm_server` (a vLLM server fed weights over CUDA IPC), `sglang` (in-process SGLang engine, asleep while training), `sglang_server` (an SGLang server on this GPU or at `rollout.url`), `remote` (pool workers: `--backend vllm`, `sglang` or `hf`), `hf` (the trainer's `generate`). Feature table: [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang). |
+| `rollout.gpu_memory_utilization` | float | `0.3` | The engine's GPU share for weights and KV cache (vLLM's `gpu_memory_utilization`, SGLang's `mem_fraction_static`). |
+| `rollout.max_model_len` | int | `8192` | Prompt + completion tokens of a trajectory (SGLang's `context_length`). |
+| `rollout.max_num_seqs` | int | `0` | Concurrent sequences (vLLM: 0 = batch x group, at least 256; SGLang: 0 = sized by SGLang). |
+| `rollout.enforce_eager` | bool | `false` | No CUDA graphs. |
+| `rollout.prefix_caching` | bool | `true` | vLLM's prefix caching / SGLang's radix cache (flushed after every weight update). |
+| `rollout.sleep` | bool | `true` | `vllm` / `sglang` with `max_staleness: 0`: release the engine's memory while the trainer trains. |
+| `rollout.url` | str | `""` | `vllm_server` / `sglang_server`: a running server instead of launching one. |
+| `rollout.vllm_args` | dict | `{}` | Extra `vllm.LLM` arguments (`vllm`). |
+| `rollout.sglang_args` | dict | `{}` | Extra SGLang engine arguments (ServerArgs fields; `sglang`, `sglang_server`). Those set by the options here are refused. |
+| `rollout.weight_sync` | str | `auto` | `sglang_server`: `tensor` (CUDA IPC, same GPU), `distributed` (NCCL from the trainer), `disk` (a checkpoint in `weight_sync_dir`); `auto`: `tensor` for a launched server, `distributed` with `rollout.url`. |
+| `rollout.weight_sync_dir` | str | `""` | `weight_sync: disk`: a directory the server reads too (default `<output_dir>/rollout_weights`). |
+| `rollout.weight_bucket_mb` | int | `512` | SGLang backends: bf16 weights per update call (one CUDA IPC handle per bucket). |
+| `rollout.fp32_head` | bool | `false` | Logits in fp32 (vLLM `head_dtype`, SGLang `enable_fp32_lm_head`). |
+| `rollout.ssm_state_dtype` | str | `float32` | Recurrent state of hybrid models (vLLM `mamba_ssm_cache_dtype`, SGLang `mamba_ssm_dtype`; `auto`: the engine's choice). |
+| `rollout.kv_cache_dtype`, `rollout.quantization` | str | `""` | FP8 rollouts (`fp8`; SGLang `fp8_e4m3`). |
 
 ## memory
 
@@ -490,7 +511,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | str | `hf` | `hf` (the trainer's `generate`), `vllm` (in-process vLLM on the student's GPU, asleep while the trainer trains) or `vllm_server` (a vLLM server fed weights over CUDA IPC; experimental). |
+| `backend` | str | `hf` | `hf` (the trainer's `generate`), `vllm` (in-process vLLM on the student's GPU, asleep while the trainer trains), `vllm_server` (a vLLM server fed weights over CUDA IPC; experimental), `sglang` (in-process SGLang engine, asleep while the trainer trains) or `sglang_server` (an SGLang server on this GPU or at `url`). See [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang). |
 | `batch_prompts` | int | `32` | Prompts per optimizer step. |
 | `group_size` | int | `1` | Rollouts per prompt. |
 | `temperature` | float | `1.0` | Sampling temperature (the losses compare the teacher with the temperature-scaled student). |
@@ -501,7 +522,11 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `prefix_caching` | bool | `false` | vllm: automatic prefix caching. For agent traces: every turn of a trace reuses the trace's one prefill (Qwen3.5 hybrids included). |
 | `enforce_eager` | bool | `false` | vllm: no CUDA graphs. |
 | `sleep` | bool | `true` | vllm, `max_staleness: 0`: release the engine's weights and KV cache while the trainer trains. `false` keeps it resident (no wake-up each step) when its `gpu_memory_utilization` fits beside training. |
-| `url` | str | `""` | vllm_server: a running server (started with `--weight-transfer-config '{"backend": "ipc"}'` on the trainer's GPU). |
+| `url` | str | `""` | vllm_server: a running server (started with `--weight-transfer-config '{"backend": "ipc"}'` on the trainer's GPU); sglang_server: a running SGLang server (started with `--skip-tokenizer-init`). |
+| `sglang_args` | dict | `{}` | sglang backends: extra SGLang engine arguments (ServerArgs fields); those the options here set are refused. |
+| `weight_sync` | str | `auto` | sglang_server: `tensor`, `distributed` or `disk`, as in `pgs rl`. |
+| `weight_sync_dir` | str | `""` | `weight_sync: disk`: default `<output_dir>/rollout_weights`. |
+| `weight_bucket_mb` | int | `512` | sglang backends: bf16 weights per update call. |
 
 ### loss
 

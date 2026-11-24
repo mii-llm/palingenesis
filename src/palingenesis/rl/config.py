@@ -25,7 +25,7 @@ BASELINES = ("mean", "leave_one_out")
 ADVANTAGE_STD = ("batch", "group", "none", "role")
 AGGREGATIONS = ("prompt", "token", "constant")
 TRUNCATION = ("score", "mask")
-ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server", "remote")
+ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server", "sglang", "sglang_server", "remote")
 ENV_TYPES = ("single_turn", "tools")  # or "module:Class" / "path/to/file.py:Class"
 TOOL_PARSERS = ("auto", "hermes", "xml")
 SANDBOX_BACKENDS = ("docker", "agent_sandbox", "subprocess")
@@ -113,6 +113,8 @@ class RLRolloutConfig:
     # "hf": the trainer's model.generate (no dependency, slow; tests and debugging).
     # "vllm": an in-process vLLM engine on the policy's GPU (sleeps while training).
     # "vllm_server": a separate vLLM server fed weights over CUDA IPC.
+    # "sglang": an in-process SGLang engine on the policy's GPU (sleeps while training), "sglang_server": a separate
+    # SGLang server, on this GPU or (rollout.url) another one; see the RL guide's backend table.
     backend: str = "vllm"
     batch_prompts: int = 32  # groups per optimizer step
     group_size: int = 8  # rollouts per prompt
@@ -165,6 +167,16 @@ class RLRolloutConfig:
     # (smaller prefill chunks: decoding sequences wait less behind new prompts) or
     # {speculative_config: {method: ngram, num_speculative_tokens: 4, prompt_lookup_max: 4}}.
     vllm_args: dict = field(default_factory=dict)
+    # sglang / sglang_server: extra SGLang engine arguments (ServerArgs fields), e.g. {attention_backend: fa3},
+    # {enable_deterministic_inference: true} or {rl_on_policy_target: fsdp}. Those the options above set are refused.
+    sglang_args: dict = field(default_factory=dict)
+    # sglang_server: how the weights reach the server after each step. "tensor": CUDA IPC handles (the server on
+    # this GPU); "distributed": NCCL broadcast from the trainer (a server at rollout.url on another GPU or node);
+    # "disk": a safetensors checkpoint in weight_sync_dir (a file system the server reads too; default
+    # <output_dir>/rollout_weights). "auto": tensor for a server the trainer launches, distributed with rollout.url.
+    weight_sync: str = "auto"
+    weight_sync_dir: str = ""
+    weight_bucket_mb: int = 512  # sglang backends: weights sent per update call (bf16 copies of this size)
     micro_seqs: int = 64  # hf: sequences per generate() call
     # MoE policies: train each token through the experts the rollout engine routed it to (the engine returns them:
     # vLLM's enable_return_routed_experts; the hf backend records them), with gate values from the trainer's own
@@ -677,7 +689,23 @@ class RLConfig:
             errors.append("rollout.backend remote does not support model.multimodal or rollout.routing_replay yet.")
         if r.max_staleness > 0 and r.backend == "hf":
             errors.append(
-                "rollout.max_staleness > 0 needs a vLLM backend (hf generates with the trained model itself)."
+                "rollout.max_staleness > 0 needs an inference engine backend (vllm, sglang, ...): hf generates with "
+                "the trained model itself."
+            )
+        from palingenesis.opd.sglang_rollout import config_errors as sglang_errors
+
+        errors += sglang_errors(r, "rollout", m.multimodal)
+        if r.url and r.backend not in ("vllm_server", "sglang_server"):
+            errors.append("rollout.url (a running server) applies to rollout.backend vllm_server or sglang_server.")
+        if r.backend == "sglang_server" and r.url and r.routing_replay != "off":
+            warnings.append(
+                "rollout.routing_replay with rollout.url: a running SGLang server must have been started with "
+                "--enable-return-routed-experts."
+            )
+        if r.backend == "sglang_server" and r.url and (r.fp32_head or r.ssm_state_dtype != "float32"):
+            warnings.append(
+                "rollout.fp32_head / ssm_state_dtype with rollout.url: a running SGLang server keeps its own settings; "
+                "start it with --enable-fp32-lm-head (and --mamba-ssm-dtype for hybrid models)."
             )
         if r.max_staleness > 8:
             warnings.append(
@@ -706,7 +734,7 @@ class RLConfig:
                 "rollout.fp32_head with rollout.url: a running server keeps its own settings; start it with "
                 '--hf-overrides \'{"head_dtype": "float32"}\' (and --mamba-ssm-cache-dtype for hybrid models).'
             )
-        if r.backend == "vllm" and r.max_staleness == 0 and not r.sleep:
+        if r.backend in ("vllm", "sglang") and r.max_staleness == 0 and not r.sleep:
             warnings.append(
                 "rollout.sleep false with max_staleness 0: the engine keeps its memory while training; "
                 "fine only if gpu_memory_utilization leaves room for the trainer."
@@ -927,9 +955,10 @@ class RLConfig:
                 "rollout.backend hf generates with the sharded model: under torchrun every rank would "
                 "run FSDP collectives inside generate() out of step. Use vllm (one engine per rank)."
             )
-        if world > 1 and r.backend == "vllm_server":
+        if world > 1 and r.backend in ("vllm_server", "sglang_server"):
             errors.append(
-                "rollout.backend vllm_server is single-process; under torchrun use vllm (one engine per rank)."
+                f"rollout.backend {r.backend} is single-process; under torchrun use {r.backend.split('_')[0]} (one "
+                "engine per rank) or remote."
             )
         if (t.fsdp or t.cpu_offload) and r.backend == "hf" and r.max_staleness:
             errors.append("rollout.backend hf generates with the sharded trainer model: max_staleness must be 0.")

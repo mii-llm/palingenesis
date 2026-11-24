@@ -129,11 +129,11 @@ def validate(config: Any, sharded: bool, python_rewards: bool = False) -> list[s
             "roles with their own adapter (or partner: base) run on one GPU for now: a vLLM server per adapter is "
             "single-process. Under torchrun, share the weights between the roles."
         )
-    if (names or based) and config.rollout.backend == "vllm":
+    if (names or based) and config.rollout.backend in ("vllm", "sglang", "sglang_server"):
         errors.append(
             "roles with their own adapter (or partner: base) need a rollout engine each: use rollout.backend "
-            "vllm_server (one server per adapter, each fed its folded weights) or hf; the in-process vllm engine "
-            "holds one model."
+            f"vllm_server (one server per adapter, each fed its folded weights), remote or hf; the "
+            f"{config.rollout.backend} engine holds one model."
         )
     if (names or based) and config.rollout.backend == "vllm_server" and config.rollout.url:
         errors.append(

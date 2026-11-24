@@ -21,7 +21,7 @@ from palingenesis.validate_data import valid_think_tags
 LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok", "rs_kd")
 TOKEN_WEIGHTINGS = ("none", "sure", "entropy")
 SOURCE_FORMATS = ("messages", "mcqa", "agent_traces")
-ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server")
+ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server", "sglang", "sglang_server")
 TEACHER_BACKENDS = ("hf", "vllm")
 
 
@@ -236,6 +236,8 @@ class OPDRolloutConfig:
     # "hf": the trainer's own model.generate (always works, slow).
     # "vllm": an in-process vLLM engine on the student's GPU (sleeps while training).
     # "vllm_server": a separate vLLM server fed weights over CUDA IPC (experimental).
+    # "sglang": an in-process SGLang engine on the student's GPU (sleeps while training); "sglang_server": a
+    # separate SGLang server (this GPU, or rollout.url). See the RL guide's backend table.
     backend: str = "hf"
     batch_prompts: int = 32  # prompts per optimizer step
     group_size: int = 1  # rollouts per prompt
@@ -256,6 +258,14 @@ class OPDRolloutConfig:
     # vllm: sequences decoded concurrently. 0 = every sequence a step generates at once
     # (at least 256; vLLM's own default on an A100 is 256, which caps larger batches).
     max_num_seqs: int = 0
+    # sglang / sglang_server: extra SGLang engine arguments (ServerArgs fields); those set above are refused.
+    sglang_args: dict = field(default_factory=dict)
+    # sglang_server: how the weights reach the server: auto | tensor (CUDA IPC, same GPU) | distributed (NCCL, a
+    # server at rollout.url on another GPU or node) | disk (a checkpoint in weight_sync_dir, default
+    # <output_dir>/rollout_weights). As in pgs rl.
+    weight_sync: str = "auto"
+    weight_sync_dir: str = ""
+    weight_bucket_mb: int = 512  # sglang backends: weights sent per update call
 
 
 def rollout_max_num_seqs(config) -> int:
@@ -663,7 +673,7 @@ class OPDConfig:
                 if teacher.backend == "vllm" and self.loss.top_k < 1:
                     errors.append(f"teachers.{name}: a vllm teacher of agent traces needs loss.top_k >= 1.")
 
-            if rollout.backend in ("vllm", "vllm_server") and not rollout.prefix_caching:
+            if rollout.backend != "hf" and not rollout.prefix_caching:
                 warnings.append(
                     "agent_traces without rollout.prefix_caching: every regenerated turn prefills its "
                     "whole context; with it the turns of a trace share one prefill."
@@ -686,12 +696,15 @@ class OPDConfig:
         if rollout.max_staleness > 0 and rollout.backend == "hf":
             errors.append(
                 "rollout.max_staleness > 0 overlaps generation with training, which the hf backend "
-                "cannot do (it generates with the model being trained). Use a vllm backend."
+                "cannot do (it generates with the model being trained). Use a vllm or sglang backend."
             )
         if rollout.temperature <= 0:
             errors.append("rollout.temperature must be > 0 (distillation samples from the student).")
-        if rollout.url and rollout.backend != "vllm_server":
-            errors.append("rollout.url applies to the vllm_server backend only.")
+        if rollout.url and rollout.backend not in ("vllm_server", "sglang_server"):
+            errors.append("rollout.url applies to the vllm_server and sglang_server backends only.")
+        from palingenesis.opd.sglang_rollout import config_errors as sglang_errors
+
+        errors += sglang_errors(rollout, "rollout")
         if rollout.temperature != 1.0:
             warnings.append(
                 f"rollout.temperature={rollout.temperature}: rollouts visit the states of a temperature-scaled "

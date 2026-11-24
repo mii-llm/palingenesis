@@ -60,6 +60,13 @@ from palingenesis.opd.rollout import (
     precision_options,
     serve_flags,
 )
+from palingenesis.opd.sglang_rollout import (
+    SGLangRollout,
+    SGLangServer,
+    SGLangServerRollout,
+    server_option_errors,
+)
+from palingenesis.opd.sglang_rollout import engine_options as sglang_engine_options
 from palingenesis.opd.teachers import end_of_turn_id, load_causal_lm, right_pad
 from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, prunable_checkpoints, student_stop_ids
 from palingenesis.rl.adapters import PolicyAdapters, is_adapter_checkpoint
@@ -234,7 +241,7 @@ class RLTrainer:
         # A vLLM server starts before the policy loads: it claims its share of free GPU memory.
         self.server = None
         precision: dict = {}
-        if r.backend not in ("hf", "remote") and not (r.backend == "vllm_server" and r.url):  # (their own settings)
+        if r.backend in ("vllm", "vllm_server") and not (r.backend == "vllm_server" and r.url):  # (their own settings)
             try:  # the installed vLLM must support what is asked (an fp32 head)
                 overrides = r.vllm_args.get("hf_overrides") if r.backend == "vllm" else None
                 precision = precision_options(r.fp32_head, r.ssm_state_dtype, overrides)
@@ -244,7 +251,7 @@ class RLTrainer:
         self.routing_replay = r.routing_replay != "off" and config_is_moe(m.policy)
         if r.routing_replay == "on" and not self.routing_replay:
             raise RLConfigError(f"rollout.routing_replay: on, but {m.policy} has no MoE layers.")
-        if self.routing_replay and r.backend != "hf" and not r.prefix_caching:
+        if self.routing_replay and r.backend in ("vllm", "vllm_server") and not r.prefix_caching:
             if r.routing_replay == "on":
                 raise RLConfigError("rollout.routing_replay with a vLLM backend needs rollout.prefix_caching: true.")
             logger.warning("MoE policy without rollout.prefix_caching: vLLM cannot return routing; no routing replay")
@@ -285,6 +292,8 @@ class RLTrainer:
             self.server = launch()
             # one more server per engine key: each adapter's folded weights are a model of their own to vLLM
             self.servers = {key: launch(f"_{key}") for key in engine_keys}
+        if r.backend == "sglang_server":
+            self.server = self._sglang_server()
         model_type = model_type_of(m.policy) if m.match_vllm_norm or m.use_liger_kernel else None
         if m.use_liger_kernel and self.device.startswith("cuda") and model_type:
             apply_liger_kernel(model_type)  # patches classes: before the model loads
@@ -495,6 +504,19 @@ class RLTrainer:
             self.parallel.sum([0.0])
             if self.push_mode != "full" and self.parallel.main:
                 self.engine.payload = self._wire_frames
+        elif r.backend == "sglang":
+            self.engine = self._sglang_engine(rank)
+        elif r.backend == "sglang_server":
+            self.engine = SGLangServerRollout(
+                self.server,
+                self.stop_ids,
+                model=m.policy,
+                max_model_len=r.max_model_len,
+                weight_sync=r.weight_sync,
+                bucket_mb=r.weight_bucket_mb,
+                sync_dir=r.weight_sync_dir or os.path.join(t.output_dir, "rollout_weights"),
+                routing_replay=self.routing_replay,
+            )
         else:
             self.engine = VLLMServerRollout(self.server, self.stop_ids)
         named = self._engine_parameters if self.adapters is not None else None
@@ -548,6 +570,84 @@ class RLTrainer:
             )
 
     # ------------------------------------------------------------------ setup
+
+    def _sglang_options(self, routing_replay: bool) -> dict:
+        """SGLang server arguments from the rollout options (palingenesis.opd.sglang_rollout.engine_options)."""
+        r, t = self.config.rollout, self.config.train
+        try:
+            return sglang_engine_options(
+                self.config.model.policy,
+                gpu_memory_utilization=r.gpu_memory_utilization,
+                max_model_len=r.max_model_len,
+                enforce_eager=r.enforce_eager,
+                seed=t.seed,
+                sleep_mode=False,
+                prefix_caching=r.prefix_caching,
+                max_num_seqs=r.max_num_seqs,
+                fp32_head=r.fp32_head,
+                ssm_state_dtype=r.ssm_state_dtype,
+                kv_cache_dtype=r.kv_cache_dtype,
+                quantization=r.quantization,
+                routing_replay=routing_replay,
+                extra=r.sglang_args,
+            )
+        except ValueError as e:
+            raise RLConfigError(str(e)) from None
+
+    def _sglang_server(self) -> SGLangServer:
+        """rollout.backend sglang_server: a server at rollout.url, or one launched on this GPU (before the policy
+        loads: it claims its share of free GPU memory)."""
+        r, t = self.config.rollout, self.config.train
+        options: dict = {}
+        if not r.url:
+            replay = self.routing_replay and r.routing_replay == "auto"
+            if replay and server_option_errors({"enable_return_routed_experts": True}):
+                logger.warning("the installed SGLang cannot return the routed experts: no routing replay")
+                self.routing_replay = False
+            options = self._sglang_options(self.routing_replay)
+            problems = server_option_errors(options)
+            if problems:
+                raise RLConfigError(problems[0])
+            if torch.cuda.is_available():
+                options.setdefault("base_gpu_id", torch.cuda.current_device())
+        return SGLangServer(
+            self.config.model.policy, url=r.url, options=options, log_path=os.path.join(t.output_dir, "sglang.log")
+        )
+
+    def _sglang_engine(self, rank: int) -> SGLangRollout:
+        """rollout.backend sglang: an SGLang engine on this rank's GPU (palingenesis.opd.sglang_rollout)."""
+        r, m, t = self.config.rollout, self.config.model, self.config.train
+
+        def build(replay: bool) -> SGLangRollout:
+            return SGLangRollout(
+                m.policy,
+                self.stop_ids,
+                gpu_memory_utilization=r.gpu_memory_utilization,
+                max_model_len=r.max_model_len,
+                enforce_eager=r.enforce_eager,
+                seed=t.seed + rank,
+                sleep_mode=r.sleep and r.max_staleness == 0,
+                prefix_caching=r.prefix_caching,
+                max_num_seqs=r.max_num_seqs,
+                fp32_head=r.fp32_head,
+                ssm_state_dtype=r.ssm_state_dtype,
+                kv_cache_dtype=r.kv_cache_dtype,
+                quantization=r.quantization,
+                routing_replay=replay,
+                engine_kwargs=r.sglang_args,
+                bucket_mb=r.weight_bucket_mb,
+            )
+
+        try:
+            if self.routing_replay and r.routing_replay == "auto":
+                try:  # an SGLang without the option: train without replay
+                    return build(True)
+                except ValueError as e:
+                    logger.warning("SGLang cannot return the routed experts (%s): no routing replay", e)
+                    self.routing_replay = False
+            return build(self.routing_replay)
+        except ValueError as e:
+            raise RLConfigError(str(e)) from None
 
     def _env_pool(self, env: Callable | None) -> EnvPool | None:
         e = self.config.env
@@ -1096,7 +1196,7 @@ class RLTrainer:
         """FSDP: gather the new weights (one parameter at a time, on every rank) and load them into
         this rank's engine, on the trainer thread. Seconds spent."""
         start = time.perf_counter()
-        if isinstance(self.engine, VLLMColocateRollout):
+        if isinstance(self.engine, (VLLMColocateRollout, SGLangRollout, SGLangServerRollout)):
             # no batch is being collected and the engine does not step: partial rollouts (max_staleness > 0) keep
             # decoding between batches, and continue with the new weights
             with self.pipeline.lock, self.pipeline.client.paused():

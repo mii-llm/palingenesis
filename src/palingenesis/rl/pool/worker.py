@@ -1,6 +1,6 @@
 """An engine worker: one rollout engine in its own process, serving a trainer over TCP.
 
-    python -m palingenesis.rl.pool.worker --model Qwen/Qwen3.5-0.8B --port 7000 [--backend vllm]
+    python -m palingenesis.rl.pool.worker --model Qwen/Qwen3.5-0.8B --port 7000 [--backend vllm | sglang | hf]
         [--gpu-memory-utilization 0.9] [--max-model-len 8192] [--lora-rank 16] [--host 0.0.0.0]
 
 Generation. Every request joins the engine's own running batch (palingenesis.rl.generation) the moment it
@@ -391,6 +391,31 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
         for key in ("fp32_head", "max_model_len", "lora_rank"):  # vLLM's settings: the hf engine has none
             del identity[key]
         return HFWorkerEngine(model, stop_ids, pad_id), identity
+    if args.backend == "sglang":
+        from palingenesis.opd.sglang_rollout import SGLangRollout
+
+        extra = json.loads(args.sglang_args)
+        if args.lora_rank:  # native pushes: adapters served next to the base
+            extra = {
+                "enable_lora": True,
+                "max_loras_per_batch": args.max_loras,
+                "max_lora_rank": args.lora_rank,
+                "lora_target_modules": ["all"],
+                **extra,
+            }
+        engine = SGLangRollout(
+            args.model,
+            stop_ids,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            seed=args.seed,
+            prefix_caching=True,
+            max_num_seqs=args.max_num_seqs,
+            fp32_head=args.fp32_head,
+            ssm_state_dtype=args.ssm_state_dtype,
+            engine_kwargs=extra,
+        )
+        return engine, identity
     from palingenesis.opd.rollout import VLLMColocateRollout, precision_options
 
     extra = json.loads(args.vllm_args)
@@ -415,7 +440,7 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m palingenesis.rl.pool.worker", description=__doc__.split("\n\n")[0])
     parser.add_argument("--model", default="")
-    parser.add_argument("--backend", choices=("vllm", "hf"), default="vllm")
+    parser.add_argument("--backend", choices=("vllm", "sglang", "hf"), default="vllm")
     parser.add_argument("--engine", default="", help="module:factory of a RolloutEngine, instead of --model")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
@@ -429,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-loras", type=int, default=4)
     parser.add_argument("--adapter-dir", default="/dev/shm", help="vllm: where pushed adapters are written")
     parser.add_argument("--vllm-args", default="{}", help="JSON: extra vllm.LLM arguments")
+    parser.add_argument("--sglang-args", default="{}", help="JSON: extra sglang.Engine arguments (--backend sglang)")
     parser.add_argument("--chat-template-kwargs", default="{}")
     parser.add_argument("--stop-tokens", default="[]")
     parser.add_argument("--gate", default="", help="tests: pushes wait while this file exists")

@@ -650,7 +650,7 @@ def test_opd_config_validate():
     invalid("loss must be one of", teachers__big__loss="full_kl")
     invalid("hf backend cannot", rollout__max_staleness=1)
     invalid("not one of the teachers", sources__pool__teacher="nobody")
-    invalid("rollout.backend", rollout__backend="sglang")
+    invalid("rollout.backend", rollout__backend="tgi")
     invalid("device and offload apply to hf teachers", teachers__big__backend="vllm", teachers__big__offload=True)
     invalid("xtok_spread", loss__xtok_spread="evenly")
     invalid("rs_kd needs the teacher's full distribution", teachers__big__backend="vllm", teachers__big__loss="rs_kd")

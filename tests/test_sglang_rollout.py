@@ -1,0 +1,725 @@
+"""SGLang rollout engines (palingenesis.opd.sglang_rollout) on CPU: request building, output and log-prob
+alignment, engine arguments, weight bucketing, cache flushes after weight updates, sleep / wake, streaming,
+routing replay decoding, the server engine's weight sync, and the configuration checks. A scripted engine stands in
+for sglang.Engine; the GPU checks are scripts/gpu_checks/sglang.sh."""
+
+import asyncio
+import base64
+import os
+import pickle
+import sys
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, "src")
+
+torch = pytest.importorskip("torch")
+
+from palingenesis.opd.rollout import Sampling  # noqa: E402
+from palingenesis.opd.sglang_rollout import (  # noqa: E402
+    OWNED_OPTIONS,
+    SGLangRollout,
+    SGLangServerRollout,
+    build_request,
+    check_options,
+    clamp_budget,
+    decode_routed_experts,
+    engine_options,
+    finish_type,
+    launcher_env_removed,
+    moe_layer_indices,
+    output_tokens_and_logprobs,
+    sampling_params,
+    serialize_named_tensors,
+    server_flags,
+    weight_buckets,
+)
+
+STOP = (7, 9)
+
+
+def _output(prompt, n_tokens=3, stop=True, logprob=-0.5, trim_stop=False, **meta):
+    """An SGLang (skip_tokenizer_init) output for `prompt`: tokens prompt[-1]+1, +2, ..., ending with stop id 7."""
+    tokens = [prompt[-1] + 1 + k for k in range(n_tokens - 1)] + ([7] if stop else [prompt[-1] + n_tokens])
+    entries = [(logprob - 0.01 * k, t, None) for k, t in enumerate(tokens)]
+    info = {
+        "finish_reason": {"type": "stop", "matched": 7} if stop else {"type": "length", "length": n_tokens},
+        "prompt_tokens": len(prompt),
+        "cached_tokens": len(prompt) - 1,
+        "output_token_logprobs": entries,
+        **meta,
+    }
+    return {"output_ids": tokens[:-1] if trim_stop else tokens, "meta_info": info}
+
+
+class ScriptedEngine:
+    """The InProcessEngine calls, scripted. Like SGLang, a weight update waits for the requests in flight
+    (its model-update lock), and it runs on the engine's event loop."""
+
+    memory_tags = ["kv_cache", "weights", "cuda_graph"]
+
+    def __init__(self, respond=None, delay=0.0):
+        self.loop = asyncio.new_event_loop()
+        self.respond = respond or (lambda request: _output(request["input_ids"]))
+        self.delay = delay
+        self.requests: list[dict] = []
+        self.calls: list[tuple] = []
+        self.inflight = 0
+        self.gate: asyncio.Event | None = None
+
+    def run(self, coroutine):
+        return self.loop.run_until_complete(coroutine)
+
+    async def agenerate(self, request):
+        self.requests.append(request)
+        self.inflight += 1
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            await asyncio.sleep(self.delay)
+            return self.respond(request)
+        finally:
+            self.inflight -= 1
+
+    def update_weights_from_tensor(self, named, flush_cache):
+        async def drain():
+            while self.inflight:
+                await asyncio.sleep(0.001)
+
+        self.run(drain())
+        self.calls.append(("update", [n for n, _ in named], [tuple(t.shape) for _, t in named], flush_cache))
+        return True, "ok"
+
+    def release(self, tags):
+        self.calls.append(("release", list(tags)))
+
+    def resume(self, tags):
+        self.calls.append(("resume", list(tags)))
+
+    def flush_cache(self):
+        self.calls.append(("flush",))
+        return True
+
+    def load_lora_adapter(self, name, path):
+        self.calls.append(("load_lora", name, path))
+        return True, ""
+
+    def unload_lora_adapter(self, name):
+        self.calls.append(("unload_lora", name))
+        return True, ""
+
+    def close(self):
+        self.calls.append(("close",))
+
+
+def _engine(**kwargs):
+    scripted = kwargs.pop("engine", None) or ScriptedEngine()
+    defaults = dict(max_model_len=64, bucket_mb=1, engine=scripted)
+    return SGLangRollout("model", STOP, **{**defaults, **kwargs}), scripted
+
+
+# ------------------------------------------------------------------ requests
+
+
+def test_sampling_params_map_to_sglang():
+    params = sampling_params(Sampling(0.7, 0.9, 0, 1.5), 32, [9, 7])
+    assert params == {
+        "max_new_tokens": 32,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": -1,  # SGLang's "off"; 0 is refused there
+        "presence_penalty": 1.5,
+        "stop_token_ids": [7, 9],
+        "skip_special_tokens": False,
+        "no_stop_trim": True,
+        "n": 1,
+    }
+    assert sampling_params(Sampling(1.0, 1.0, 20), 8, STOP)["top_k"] == 20
+
+
+def test_requests_ask_for_logprobs_masks_and_routing_only_when_needed():
+    greedy = build_request([1, 2], 8, Sampling(0.0), STOP, 64)
+    assert greedy["return_logprob"] is False and "return_sampling_mask" not in greedy
+    plain = build_request([1, 2], 8, Sampling(1.0), STOP, 64)
+    assert plain["return_logprob"] is True and "return_sampling_mask" not in plain
+    truncated = build_request([1, 2], 8, Sampling(1.0, 0.95, 20), STOP, 64, routing=True, lora="a-v3")
+    assert truncated["return_sampling_mask"] is True and truncated["return_routed_experts"] is True
+    assert truncated["lora_path"] == "a-v3"
+
+
+def test_budget_is_clamped_to_the_context_like_vllm():
+    assert clamp_budget(10, 100, 64) == 54  # SGLang refuses prompt + max_new_tokens > context; vLLM stops there
+    assert clamp_budget(10, 20, 64) == 20
+    assert build_request(list(range(60)), 100, Sampling(1.0), STOP, 64)["sampling_params"]["max_new_tokens"] == 4
+    with pytest.raises(ValueError, match="no room"):
+        clamp_budget(64, 8, 64)
+
+
+def test_finish_reasons():
+    assert finish_type({"finish_reason": {"type": "stop", "matched": 7}}) == "stop"
+    assert finish_type({"finish_reason": {"type": "length", "length": 8}}) == "length"
+    assert finish_type({"finish_reason": "stop"}) == "stop"
+    with pytest.raises(RuntimeError, match="aborted"):
+        finish_type({"finish_reason": {"type": "abort", "message": "out of memory"}})
+
+
+# ------------------------------------------------------------------ log-prob alignment
+
+
+def test_logprobs_align_with_the_sampled_tokens():
+    out = _output([1, 2, 3])
+    tokens, logprobs = output_tokens_and_logprobs(out, True)
+    assert tokens == [4, 5, 7] and logprobs == pytest.approx([-0.5, -0.51, -0.52])
+    # output_ids without the matched stop token: the log-probs' ids are the completion
+    trimmed = _output([1, 2, 3], trim_stop=True)
+    assert output_tokens_and_logprobs(trimmed, True)[0] == [4, 5, 7]
+    # greedy: no log-probs asked for, none returned
+    assert output_tokens_and_logprobs({"output_ids": [4, 7], "meta_info": {}}, False) == ([4, 7], [])
+
+
+def test_misaligned_logprobs_are_an_error():
+    out = _output([1, 2, 3])
+    out["output_ids"] = [4, 6, 7]
+    with pytest.raises(RuntimeError, match="cannot be aligned"):
+        output_tokens_and_logprobs(out, True)
+    with pytest.raises(RuntimeError, match="return_logprob"):
+        output_tokens_and_logprobs({"output_ids": [4], "meta_info": {}}, True)
+
+
+def test_truncated_samplings_use_the_renormalised_logprobs(caplog):
+    out = _output([1, 2, 3], output_token_sampling_logprobs=[-0.1, -0.2, -0.3])
+    assert output_tokens_and_logprobs(out, True, truncated=True)[1] == [-0.1, -0.2, -0.3]
+    assert output_tokens_and_logprobs(out, True, truncated=False)[1] == pytest.approx([-0.5, -0.51, -0.52])
+    with caplog.at_level("WARNING"):  # an SGLang without return_sampling_mask: the untruncated ones, said once
+        assert output_tokens_and_logprobs(_output([1, 2]), True, truncated=True)[1] == pytest.approx(
+            [-0.5, -0.51, -0.52]
+        )
+
+
+# ------------------------------------------------------------------ engine arguments
+
+
+def test_engine_options_follow_the_rollout_options():
+    options = engine_options(
+        "Qwen/Qwen3-0.6B",
+        gpu_memory_utilization=0.3,
+        max_model_len=4096,
+        enforce_eager=True,
+        seed=3,
+        sleep_mode=True,
+        prefix_caching=False,
+        max_num_seqs=128,
+        fp32_head=True,
+        ssm_state_dtype="float32",
+        kv_cache_dtype="fp8",
+        routing_replay=True,
+        extra={"attention_backend": "fa3"},
+    )
+    assert options == {
+        "model_path": "Qwen/Qwen3-0.6B",
+        "dtype": "bfloat16",
+        "skip_tokenizer_init": True,
+        "mem_fraction_static": 0.3,
+        "context_length": 4096,
+        "random_seed": 3,
+        "disable_radix_cache": True,
+        "enable_memory_saver": True,
+        "disable_cuda_graph": True,
+        "max_running_requests": 128,
+        "enable_fp32_lm_head": True,
+        "mamba_ssm_dtype": "float32",
+        "kv_cache_dtype": "fp8_e4m3",
+        "enable_return_routed_experts": True,
+        "attention_backend": "fa3",
+    }
+    minimal = engine_options("m", gpu_memory_utilization=0.5, max_model_len=128, ssm_state_dtype="auto")
+    assert "mamba_ssm_dtype" not in minimal and "max_running_requests" not in minimal
+    assert minimal["disable_radix_cache"] is False
+
+
+def test_owned_engine_options_are_refused():
+    with pytest.raises(ValueError, match=r"rollout.sglang_args.mem_fraction_static is set by rollout.gpu_memory"):
+        engine_options("m", gpu_memory_utilization=0.5, max_model_len=128, extra={"mem_fraction_static": 0.9})
+    assert "enable_return_routed_experts" in OWNED_OPTIONS
+
+
+def test_unknown_engine_arguments_name_the_closest():
+    check_options({"mem_fraction_static": 0.3}, ["mem_fraction_static", "model_path"])
+    with pytest.raises(ValueError, match=r"enable_fp32_lm_heads \(did you mean enable_fp32_lm_head\?\)"):
+        check_options({"enable_fp32_lm_heads": True}, ["enable_fp32_lm_head"])
+
+
+def test_server_flags():
+    flags = server_flags(
+        {
+            "model_path": "m",
+            "skip_tokenizer_init": True,
+            "disable_radix_cache": False,
+            "context_length": 128,
+            "json_model_override_args": {"a": 1},
+            "random_seed": None,
+        }
+    )
+    assert flags == ["--skip-tokenizer-init", "--context-length", "128", "--json-model-override-args", '{"a": 1}']
+
+
+def test_launcher_variables_are_hidden_while_engines_spawn(monkeypatch):
+    monkeypatch.setenv("TORCHELASTIC_USE_AGENT_STORE", "True")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with launcher_env_removed():
+        assert "TORCHELASTIC_USE_AGENT_STORE" not in os.environ and "WORLD_SIZE" not in os.environ
+    assert os.environ["TORCHELASTIC_USE_AGENT_STORE"] == "True" and os.environ["WORLD_SIZE"] == "2"
+
+
+# ------------------------------------------------------------------ weights
+
+
+def test_weight_buckets_bound_size_cast_and_share_one_buffer():
+    torch.manual_seed(0)
+    named = [(f"w{i}", torch.randn(256, 256)) for i in range(5)]  # 128 KiB each in bf16
+    named.insert(2, ("big", torch.randn(1024, 1024)))  # 2 MiB: a bucket of its own
+    named.append(("steps", torch.arange(4)))  # not floating point: kept as it is
+    buckets = list(weight_buckets(iter(named), bucket_bytes=300 * 1024))
+    assert [[n for n, _ in b] for b in buckets] == [["w0", "w1"], ["big"], ["w2", "w3"], ["w4", "steps"]]
+    for bucket in buckets[:3]:
+        assert all(t.dtype == torch.bfloat16 for _, t in bucket)
+        storages = {t.untyped_storage().data_ptr() for _, t in bucket}
+        assert len(storages) == 1  # views of one flat buffer: one CUDA IPC handle per bucket
+    assert buckets[3][1][1].dtype == torch.int64  # mixed dtypes: not packed, not cast
+    sent = dict(kv for b in buckets for kv in b)
+    for name, tensor in named:
+        expected = tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor
+        assert torch.equal(sent[name], expected) and sent[name].shape == tensor.shape
+    assert list(weight_buckets(iter(()), 1024)) == []
+
+
+def test_serialized_tensors_unpickle_to_the_same_weights():
+    named = [("a", torch.arange(6, dtype=torch.bfloat16).view(2, 3)), ("b", torch.ones(4))]
+    payload = serialize_named_tensors(named)
+    restored = pickle.loads(base64.b64decode(payload))
+    assert [n for n, _ in restored] == ["a", "b"]
+    assert all(torch.equal(x, y) for (_, x), (_, y) in zip(restored, named))
+
+
+def test_weight_update_flushes_the_cache_with_its_last_bucket():
+    engine, scripted = _engine()
+    named = [(f"layer{i}.weight", torch.randn(512, 512)) for i in range(5)]  # 512 KiB each in bf16; 1 MiB buckets
+    engine.update_weights(iter(named), version=3)
+    updates = [c for c in scripted.calls if c[0] == "update"]
+    assert [c[1] for c in updates] == [
+        ["layer0.weight", "layer1.weight"],
+        ["layer2.weight", "layer3.weight"],
+        ["layer4.weight"],
+    ]
+    assert [c[3] for c in updates] == [False, False, True]  # the radix cache is flushed once, after the last
+    assert engine.version == 3
+
+
+def test_a_refused_weight_update_raises_and_keeps_the_version():
+    engine, scripted = _engine()
+    scripted.update_weights_from_tensor = lambda named, flush_cache: (False, "shape mismatch")
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        engine.update_weights([("w", torch.ones(2))], version=1)
+    assert engine.version == 0
+
+
+def test_sleep_releases_everything_and_wakes_after_an_update():
+    engine, scripted = _engine(sleep_mode=True)
+    engine.sleep()
+    assert scripted.calls == [("release", ["kv_cache", "weights", "cuda_graph"])]
+    assert engine.asleep and engine.version == -1
+    with pytest.raises(RuntimeError, match="update_weights before wake"):
+        engine.wake()
+    engine.update_weights([("w", torch.ones(2))], version=1)  # the weights' memory comes back before the load
+    engine.wake()
+    assert scripted.calls[1:] == [
+        ("resume", ["weights"]),
+        ("update", ["w"], [(2,)], True),
+        ("resume", ["kv_cache", "cuda_graph"]),
+    ]
+    assert not engine.asleep and engine.version == 1
+    engine.sleep()
+    engine.sleep()  # once
+    assert scripted.calls[-1] == ("release", ["kv_cache", "weights", "cuda_graph"])
+    assert sum(c[0] == "release" for c in scripted.calls) == 2
+
+
+def test_without_sleep_mode_the_engine_keeps_its_memory():
+    engine, scripted = _engine(sleep_mode=False)
+    engine.sleep()
+    engine.wake()
+    assert scripted.calls == [] and engine.version == 0
+
+
+# ------------------------------------------------------------------ generation
+
+
+def test_generate_returns_aligned_rollouts_with_versions_and_prefill_counts():
+    engine, scripted = _engine()
+    engine.version = 4
+    prompts = [[1, 2], [3, 4, 5], [1, 2]]
+    rollouts = engine.generate(prompts, [8, 8, 8], [Sampling(1.0), Sampling(1.0), Sampling(1.0)])
+    assert [r.completion_ids for r in rollouts] == [[3, 4, 7], [6, 7, 7], [3, 4, 7]]
+    assert all(len(r.logprobs) == len(r.completion_ids) for r in rollouts)
+    assert all(r.finish_reason == "stop" and r.policy_version == 4 and r.first_version is None for r in rollouts)
+    assert len(scripted.requests) == 3  # sampled duplicates are requests of their own (the radix cache shares them)
+    assert engine.prompt_tokens == 7 and engine.cached_tokens == 4
+    assert {tuple(r["sampling_params"]["stop_token_ids"]) for r in scripted.requests} == {(7, 9)}
+
+
+def test_greedy_duplicates_are_generated_once():
+    engine, scripted = _engine()
+    rollouts = engine.generate([[1, 2], [1, 2], [5]], [8, 8, 8], 0.0)
+    assert len(scripted.requests) == 2 and rollouts[0] is rollouts[1]
+    assert rollouts[0].logprobs == [] and rollouts[2].completion_ids == [6, 7, 7]
+
+
+def test_length_finish_and_images_refused():
+    engine, _ = _engine(engine=ScriptedEngine(lambda r: _output(r["input_ids"], stop=False)))
+    (rollout,) = engine.generate([[1]], [3], 1.0)
+    assert rollout.finish_reason == "length" and rollout.completion_ids == [2, 3, 4]
+    with pytest.raises(ValueError, match="token ids only"):
+        engine.generate([[1]], [3], 1.0, images=[["picture.png"]])
+
+
+def test_streaming_requests_join_and_return_as_they_finish():
+    engine, scripted = _engine(engine=ScriptedEngine(delay=0.01))
+    engine.stream_add("a", [1, 2], 8, 1.0, n=3)
+    engine.stream_add("b", [5], 8, 0.0, n=2)  # greedy: one request, its rollout shared by the n waiters
+    finished = {}
+    for _ in range(200):
+        for request_id, rollouts in engine.stream_step():
+            finished[request_id] = rollouts
+        if not engine.stream_pending() and len(finished) == 2:
+            break
+    assert len(finished["a"]) == 3 and len(finished["b"]) == 2
+    assert finished["b"][0] is finished["b"][1] and finished["b"][0].logprobs == []
+    assert len(scripted.requests) == 4
+    assert engine.streams == {}
+
+
+def test_a_weight_update_waits_for_requests_in_flight():
+    """SGLang loads new weights once the requests in flight have finished: they are tagged with the version that
+    sampled them all, and requests added afterwards with the new one."""
+    scripted = ScriptedEngine()
+    engine, _ = _engine(engine=scripted)
+    scripted.gate = asyncio.Event()
+    engine.stream_add("old", [1], 8, 1.0, n=1)
+    assert engine.stream_step() == []  # held at the gate
+    scripted.loop.call_later(0.01, scripted.gate.set)
+    engine.update_weights([("w", torch.ones(2))], version=1)  # drains: "old" finishes first, under version 0
+    engine.stream_add("new", [1], 8, 1.0, n=1)
+    finished = {}
+    while len(finished) < 2:
+        finished.update(dict(engine.stream_step()))
+    assert finished["old"][0].policy_version == 0 and finished["old"][0].first_version is None
+    assert finished["new"][0].policy_version == 1
+
+
+def test_a_failed_request_fails_the_step_and_clears_the_streams():
+    def respond(request):
+        if request["input_ids"] == [9]:
+            return {"output_ids": [], "meta_info": {"finish_reason": {"type": "abort", "message": "too long"}}}
+        return _output(request["input_ids"])
+
+    engine, _ = _engine(engine=ScriptedEngine(respond, delay=0.0))
+    engine.stream_add("ok", [1], 8, 1.0, n=1)
+    engine.stream_add("bad", [9], 8, 1.0, n=1)
+    with pytest.raises(RuntimeError, match="too long"):
+        for _ in range(50):
+            engine.stream_step()
+    assert engine.streams == {} and not engine.stream_pending()
+
+
+def test_generation_client_streams_through_the_sglang_engine():
+    from palingenesis.rl.generation import GenerationClient
+
+    engine, _ = _engine(engine=ScriptedEngine(delay=0.005))
+    client = GenerationClient(engine, merge=True)
+    assert client.streaming
+
+    async def main():
+        return await asyncio.gather(*(client.generate([1, k + 2], 8, 1.0) for k in range(4)))
+
+    try:
+        generations = asyncio.run(main())
+    finally:
+        client.close()
+    assert [g.ids for g in generations] == [[3, 4, 7], [4, 5, 7], [5, 6, 7], [6, 7, 7]]
+    assert all(len(g.logprobs) == 3 and g.finish == "stop" for g in generations)
+
+
+def test_adapters_load_by_version_and_requests_name_them():
+    engine, scripted = _engine()
+    engine.load_adapter("policy", "/adapters/policy/v1", 1)
+    engine.load_adapter("policy", "/adapters/policy/v2", 2)
+    assert scripted.calls == [
+        ("load_lora", "policy-v1", "/adapters/policy/v1"),
+        ("load_lora", "policy-v2", "/adapters/policy/v2"),
+        ("unload_lora", "policy-v1"),
+    ]
+    engine.generate([[1]], [4], 1.0, adapter="policy")
+    assert scripted.requests[-1]["lora_path"] == "policy-v2"
+    engine.generate([[1]], [4], 1.0, adapter="base")
+    assert "lora_path" not in scripted.requests[-1]
+    with pytest.raises(KeyError, match="not loaded"):
+        engine.generate([[1]], [4], 1.0, adapter="critic")
+
+
+# ------------------------------------------------------------------ routing replay
+
+
+def test_routed_experts_decode_to_the_moe_layers():
+    import numpy as np
+
+    positions, layers, top_k = 4, 3, 2
+    array = np.arange(positions * layers * top_k, dtype=np.int32).reshape(positions, layers, top_k)
+    encoded = base64.b64encode(array.tobytes()).decode()
+    assert np.array_equal(decode_routed_experts(encoded, positions, top_k), array)
+    assert np.array_equal(decode_routed_experts(encoded, positions, top_k, [1, 2]), array[:, [1, 2]])
+    assert np.array_equal(decode_routed_experts(array.tolist(), positions, top_k, [0, 1, 2]), array)
+    assert decode_routed_experts(encoded, positions + 1, top_k) is None  # not that layout: no replay
+    assert decode_routed_experts(None, positions, top_k) is None
+
+
+def test_moe_layer_indices():
+    qwen = SimpleNamespace(num_hidden_layers=4, num_experts=8, mlp_only_layers=[0], decoder_sparse_step=1)
+    assert moe_layer_indices(qwen) == [1, 2, 3]
+    deepseek = SimpleNamespace(num_hidden_layers=5, n_routed_experts=8, first_k_dense_replace=2, moe_layer_freq=1)
+    assert moe_layer_indices(deepseek) == [2, 3, 4]
+    assert moe_layer_indices(SimpleNamespace(num_hidden_layers=4)) is None
+    wrapped = SimpleNamespace(text_config=qwen)
+    assert moe_layer_indices(wrapped) == [1, 2, 3]
+
+
+def test_rollouts_carry_the_routing_of_every_forwarded_position():
+    import numpy as np
+
+    def respond(request):
+        out = _output(request["input_ids"])
+        positions = len(request["input_ids"]) + len(out["output_ids"]) - 1
+        routed = np.full((positions, 2, 2), 5, dtype=np.int32)
+        out["meta_info"]["routed_experts"] = base64.b64encode(routed.tobytes()).decode()
+        return out
+
+    engine, scripted = _engine(engine=ScriptedEngine(respond))
+    engine.routing = (2, [0, 1])
+    (rollout,) = engine.generate([[1, 2]], [8], 1.0)
+    assert rollout.routed_experts.shape == (2 + 3 - 1, 2, 2)
+    assert scripted.requests[0]["return_routed_experts"] is True
+
+
+# ------------------------------------------------------------------ server engine
+
+
+class ScriptedServer:
+    def __init__(self, launched=True, fail=""):
+        self.process = object() if launched else None
+        self.url = "http://127.0.0.1:30000"
+        self.posts: list[tuple[str, dict]] = []
+        self.fail = fail
+
+    def post(self, path, payload=None, timeout=0):
+        self.posts.append((path, payload))
+        if path == self.fail:
+            return {"success": False, "message": "refused"}
+        if path == "/generate":
+            return [_output(ids) for ids in payload["input_ids"]]
+        return {"success": True, "message": ""}
+
+    def info(self):
+        return {"tp_size": 1}
+
+
+def test_server_generates_in_parallel_batches_in_order():
+    server = ScriptedServer()
+    engine = SGLangServerRollout(server, STOP, model="m", max_model_len=64, parallel=2)
+    rollouts = engine.generate([[1], [2], [3]], [8, 8, 8], Sampling(1.0, 0.9, 0))
+    assert [r.completion_ids for r in rollouts] == [[2, 3, 7], [3, 4, 7], [4, 5, 7]]
+    sizes = sorted(len(p["input_ids"]) for path, p in server.posts if path == "/generate")
+    assert sizes == [1, 2]
+    assert all(p["return_sampling_mask"] == [True] * len(p["input_ids"]) for _, p in server.posts)
+    with pytest.raises(ValueError, match="one policy"):
+        engine.generate([[1]], [8], 1.0, adapter="critic")
+
+
+def test_server_tensor_sync_sends_buckets_and_flushes_last():
+    server = ScriptedServer()
+    engine = SGLangServerRollout(server, STOP, model="m", max_model_len=64, bucket_mb=1)
+    assert engine.weight_sync == "tensor"  # a launched server shares the trainer's GPU
+    named = [(f"w{i}", torch.randn(512, 512)) for i in range(3)]
+    engine.update_weights(named, version=2)
+    posts = [p for path, p in server.posts if path == "/update_weights_from_tensor"]
+    assert [p["flush_cache"] for p in posts] == [False, True]
+    restored = pickle.loads(base64.b64decode(posts[0]["serialized_named_tensors"][0]))
+    assert [n for n, _ in restored] == ["w0", "w1"] and restored[0][1].dtype == torch.bfloat16
+    assert engine.version == 2
+    failing = SGLangServerRollout(ScriptedServer(fail="/update_weights_from_tensor"), STOP, model="m", max_model_len=64)
+    with pytest.raises(RuntimeError, match="refused"):
+        failing.update_weights(named, version=3)
+    assert failing.version == 0
+
+
+def test_server_auto_sync_is_distributed_for_a_running_server():
+    engine = SGLangServerRollout(ScriptedServer(launched=False), STOP, model="m", max_model_len=64)
+    assert engine.weight_sync == "distributed"
+    with pytest.raises(ValueError, match="weight_sync_dir"):
+        SGLangServerRollout(ScriptedServer(), STOP, model="m", max_model_len=64, weight_sync="disk")
+
+
+def test_server_disk_sync_writes_a_checkpoint_and_drops_the_previous(tmp_path):
+    from safetensors.torch import load_file
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type": "toy"}')
+    server = ScriptedServer()
+    engine = SGLangServerRollout(
+        server, STOP, model=str(model), max_model_len=64, weight_sync="disk", sync_dir=str(tmp_path / "sync")
+    )
+    engine.update_weights([("w", torch.ones(2, 2))], version=1)
+    engine.update_weights([("w", torch.full((2, 2), 2.0))], version=2)
+    assert [p["model_path"] for path, p in server.posts] == [str(tmp_path / "sync/v1"), str(tmp_path / "sync/v2")]
+    assert not (tmp_path / "sync/v1").exists()
+    weights = load_file(str(tmp_path / "sync/v2/model.safetensors"))
+    assert torch.equal(weights["w"], torch.full((2, 2), 2.0, dtype=torch.bfloat16))
+    assert (tmp_path / "sync/v2/config.json").read_text() == '{"model_type": "toy"}'
+
+
+# ------------------------------------------------------------------ trainers and configuration
+
+
+def test_fsdp_weight_push_pauses_the_sglang_engine():
+    from palingenesis.rl.trainer import RLTrainer
+
+    engine_lock, held = threading.Lock(), []
+    trainer = object.__new__(RLTrainer)
+    trainer.engine = object.__new__(SGLangRollout)
+    trainer.engine.update_weights = lambda named, version: held.append((engine_lock.locked(), version))
+    trainer.model = torch.nn.Linear(1, 1)
+    trainer.parallel = SimpleNamespace(full_parameters=lambda model: iter(()))
+    trainer.pipeline = SimpleNamespace(lock=threading.RLock(), client=SimpleNamespace(paused=lambda: engine_lock))
+    trainer._push_weights(3)
+    assert held == [(True, 3)]
+
+
+def _rl(**options):
+    from palingenesis.rl.config import RLConfig
+
+    config = RLConfig()
+    for key, value in {"model.policy": "m", "data.dataset": "d.jsonl", "rewards.r.fn": "math"}.items():
+        config.set(key, value)
+    for key, value in options.items():
+        config.set(key, value)
+    return config
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"rollout.backend": "sglang", "rollout.sglang_args": {"mem_fraction_static": 0.5}}, "gpu_memory_utilization"),
+        ({"rollout.backend": "sglang", "rollout.vllm_args": {"max_num_batched_tokens": 512}}, "sglang_args"),
+        ({"rollout.backend": "vllm", "rollout.sglang_args": {"attention_backend": "fa3"}}, "need rollout.backend"),
+        ({"rollout.backend": "sglang", "rollout.weight_sync": "disk"}, "sglang_server only"),
+        ({"rollout.backend": "sglang_server", "rollout.weight_sync": "nfs"}, "weight_sync must be one of"),
+        ({"rollout.backend": "sglang_server", "rollout.weight_sync_dir": "/x"}, "weight_sync disk only"),
+        ({"rollout.backend": "sglang", "rollout.weight_bucket_mb": 0}, "weight_bucket_mb"),
+        ({"rollout.backend": "sglang", "model.multimodal": True}, "token ids only"),
+        ({"rollout.backend": "vllm", "rollout.url": "http://x:1"}, "rollout.url"),
+    ],
+)
+def test_rl_config_refuses_wrong_sglang_settings(options, message):
+    from palingenesis.rl.config import RLConfigError
+
+    with pytest.raises(RLConfigError, match=message):
+        _rl(**options).validate()
+
+
+def test_rl_config_accepts_the_sglang_backends(monkeypatch):
+    from palingenesis.rl.config import RLConfigError
+
+    _rl(**{"rollout.backend": "sglang", "rollout.sglang_args": {"attention_backend": "fa3"}}).validate()
+    _rl(
+        **{"rollout.backend": "sglang_server", "rollout.weight_sync": "disk", "rollout.weight_sync_dir": "/s"}
+    ).validate()
+    _rl(**{"rollout.backend": "sglang", "rollout.max_staleness": 1}).validate()
+    warnings = _rl(**{"rollout.backend": "sglang_server", "rollout.url": "http://h:1", "rollout.fp32_head": True})
+    assert any("enable-fp32-lm-head" in w for w in warnings.validate())
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.raises(RLConfigError, match="sglang_server is single-process"):
+        _rl(**{"rollout.backend": "sglang_server"}).validate()
+
+
+def test_opd_config_takes_the_sglang_backends():
+    from palingenesis.opd.config import OPDConfig, OPDConfigError
+
+    def config(**options):
+        c = OPDConfig()
+        base = {"model.student": "s", "teachers.t.model": "t", "sources.d.path": "d.jsonl", "sources.d.teacher": "t"}
+        for key, value in {**base, **options}.items():
+            c.set(key, value, "test")
+        return c
+
+    config(**{"rollout.backend": "sglang"}).validate()
+    config(**{"rollout.backend": "sglang_server", "rollout.url": "http://h:1"}).validate()
+    with pytest.raises(OPDConfigError, match="rollout.url applies"):
+        config(**{"rollout.backend": "sglang", "rollout.url": "http://h:1"}).validate()
+    with pytest.raises(OPDConfigError, match="context_length is set by rollout.max_model_len"):
+        config(**{"rollout.backend": "sglang", "rollout.sglang_args": {"context_length": 99}}).validate()
+
+
+def _recording(monkeypatch, module, name="SGLangRollout"):
+    """Replace `module.<name>` with a recorder whose calls must bind the real constructor's signature."""
+    import inspect
+
+    from palingenesis.opd import sglang_rollout
+
+    real = getattr(sglang_rollout, name)
+    calls = []
+
+    def build(*args, **kwargs):
+        inspect.signature(real).bind(*args, **kwargs)  # a wrong keyword fails here, as it would on a GPU
+        calls.append(kwargs)
+        return SimpleNamespace(kind=name, kwargs=kwargs)
+
+    monkeypatch.setattr(module, name, build)
+    return calls
+
+
+def test_trainers_and_screen_build_the_sglang_engines_with_their_options(monkeypatch, tmp_path):
+    from palingenesis.opd import sglang_rollout
+    from palingenesis.rl import screen
+    from palingenesis.rl import trainer as rl_trainer
+    from palingenesis.rl.trainer import RLTrainer
+
+    config = _rl(
+        **{
+            "rollout.backend": "sglang",
+            "rollout.sglang_args": {"attention_backend": "fa3"},
+            "rollout.weight_bucket_mb": 64,
+            "rollout.kv_cache_dtype": "fp8",
+            "train.output_dir": str(tmp_path),
+        }
+    )
+    calls = _recording(monkeypatch, rl_trainer)
+    trainer = object.__new__(RLTrainer)
+    trainer.config, trainer.stop_ids, trainer.routing_replay = config, (7,), False
+    trainer._sglang_engine(rank=1)
+    (kwargs,) = calls
+    assert kwargs["sleep_mode"] is True and kwargs["bucket_mb"] == 64 and kwargs["seed"] == config.train.seed + 1
+    assert kwargs["engine_kwargs"] == {"attention_backend": "fa3"} and kwargs["kv_cache_dtype"] == "fp8"
+
+    server_calls = _recording(monkeypatch, rl_trainer, "SGLangServer")
+    monkeypatch.setattr(rl_trainer, "server_option_errors", lambda options: [])
+    config.set("rollout.backend", "sglang_server")
+    trainer._sglang_server()
+    (server,) = server_calls
+    assert server["options"]["context_length"] == config.rollout.max_model_len
+    assert server["options"]["attention_backend"] == "fa3" and server["log_path"].endswith("sglang.log")
+
+    screen_calls = _recording(monkeypatch, sglang_rollout)
+    config.set("rollout.backend", "sglang")
+    screen._engine(config, "m", (7,), 0)
+    assert screen_calls and screen_calls[0]["engine_kwargs"] == {"attention_backend": "fa3"}

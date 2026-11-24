@@ -192,6 +192,7 @@ Sequence-level objectives (`gspo`, the sequence mask) treat each segment as a se
 | `hf` | Supported and tested on CPU |
 | `vllm` (in-process) | Wired: images go as `multi_modal_data` next to un-expanded tokens and the processor bounds are passed as `mm_processor_kwargs`. Not yet run against vLLM |
 | `vllm_server` | Refused: the server is driven through `/v1/completions`, which takes no images |
+| `sglang`, `sglang_server` | Refused: the SGLang engines take token ids only |
 
 `loss.kl_ref` and `train.prompt_sharing: on` are refused with a multimodal policy.
 

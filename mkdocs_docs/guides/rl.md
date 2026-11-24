@@ -1,13 +1,13 @@
 # Reinforcement Learning
 
-`pgs rl` trains a model against rewards: a checked math answer, code that passes hidden tests, an LLM judge, or any Python function. The policy samples groups of rollouts with vLLM on the same GPU, each group is scored, and one policy-gradient step follows. Rollouts can be multi-turn: the policy calls tools (a Python sandbox, your functions, your environment) between turns.
+`pgs rl` trains a model against rewards: a checked math answer, code that passes hidden tests, an LLM judge, or any Python function. The policy samples groups of rollouts with vLLM (or [SGLang](#rollout-engines-vllm-or-sglang)) on the same GPU, each group is scored, and one policy-gradient step follows. Rollouts can be multi-turn: the policy calls tools (a Python sandbox, your functions, your environment) between turns.
 
 !!! abstract "When to use it"
     - The task has a reward you can compute (a verifier, tests, a judge) and the model already solves it some of the time: groups where every rollout gets the same reward carry no gradient.
     - Start from an SFT checkpoint that still has output diversity: see [SFT → RL Transition](sft-to-rl.md).
     - To imitate a stronger model on the student's own samples instead of a reward, use [on-policy distillation](distillation.md); for preference pairs, [DPO](dpo.md).
 
-    Jump to: [Data](#data) · [Rewards](#rewards) · [Tools and environments](#tools-and-environments) · [The objective](#the-objective) (what to watch) · [Sampler/trainer agreement](#samplertrainer-agreement) · [Speed](#speed) · [Multi-GPU](#multi-gpu-clusters-and-memory) · [Resuming](#resuming)
+    Jump to: [Data](#data) · [Rewards](#rewards) · [Tools and environments](#tools-and-environments) · [The objective](#the-objective) (what to watch) · [Sampler/trainer agreement](#samplertrainer-agreement) · [Rollout engines](#rollout-engines-vllm-or-sglang) · [Speed](#speed) · [Multi-GPU](#multi-gpu-clusters-and-memory) · [Resuming](#resuming)
 
 ```bash
 pgs rl --config configs/rl_math.yaml
@@ -367,7 +367,70 @@ Options that bring the two closer:
 | `rollout.ssm_state_dtype` | `float32` | The recurrent state of hybrid models (Gated DeltaNet, Mamba layers) between decoding steps, passed to vLLM as `mamba_ssm_cache_dtype`. The trainer's chunked kernels carry the state in fp32 over the whole sequence, so `float32` matches them; `bfloat16` rounds it at every generated token (less memory, a warning: more mismatch on recurrent layers); `auto` leaves vLLM's choice (the model config's `mamba_ssm_dtype` when it has one, as Qwen3.5 does; fp32 for NemotronH; else the model dtype). The `float32` default raises the engine's state memory for models whose `auto` was bf16 (Qwen3-Next). Models without recurrent layers ignore it |
 | `model.match_vllm_norm` | `true` | The gated RMSNorm of linear-attention layers (Qwen3.5, Qwen3-Next, OLMo hybrid) in fp32 with one rounding, the operations of vLLM's `RMSNormGated`. transformers' pure-torch fallback rounds to bf16 after the normalization, again after the weight and once more after the gate (on random inputs about a third of its outputs differ from vLLM's by one bf16 step or more). With flash-linear-attention installed transformers uses its fused kernel, which already rounds once, and the patch changes nothing |
 
-With `rollout.url` (a server you started) these options cannot reach the server: start it with `--hf-overrides '{"head_dtype": "float32"}'` and `--mamba-ssm-cache-dtype float32`.
+With `rollout.url` (a server you started) these options cannot reach the server: start it with `--hf-overrides '{"head_dtype": "float32"}'` and `--mamba-ssm-cache-dtype float32`. With the SGLang backends the same options set `enable_fp32_lm_head` and `mamba_ssm_dtype` ([Rollout engines](#rollout-engines-vllm-or-sglang)).
+
+## Rollout engines: vLLM or SGLang
+
+`rollout.backend` picks what samples the rollouts. The trainer, the losses and the metrics are the same whichever engine it is: every engine implements one protocol (`palingenesis.opd.rollout.RolloutEngine`: `generate`, `update_weights`, `sleep`, `wake`, and the streaming calls for continuous batching), returns the sampled token ids with each token's log-probability under the sampling distribution, and is checked against the trainer by the same [agreement metrics](#samplertrainer-agreement).
+
+| `rollout.backend` | Engine | Weights after each step |
+|---|---|---|
+| `vllm` (default) | in-process vLLM on the policy's GPU; sleeps while the trainer trains | loaded in place (`load_weights`) |
+| `vllm_server` | a `vllm serve` process on the policy's GPU, or `rollout.url` | CUDA IPC (vLLM's weight-transfer endpoints) |
+| `sglang` | an `sglang.Engine` on the policy's GPU (its scheduler is a child process); sleeps while the trainer trains | CUDA IPC handles of bf16 copies, in buckets of `rollout.weight_bucket_mb` (`update_weights_from_tensor`) |
+| `sglang_server` | an SGLang server launched on the policy's GPU, or one at `rollout.url` on another GPU or node | `rollout.weight_sync`: `tensor` (CUDA IPC, same GPU), `distributed` (NCCL broadcast from the trainer), `disk` (a checkpoint in `rollout.weight_sync_dir`, loaded by the server) |
+| `remote` | `palingenesis.rl.pool.worker` processes on other GPUs or nodes (`--backend vllm`, `sglang` or `hf`) | staged in host memory, sent while the trainer steps ([multi-agent guide](multi-agent.md)) |
+| `hf` | the trainer's own `model.generate` | none (it is the trained model); slow, for tests |
+
+**Which one.** vLLM is the default and the most exercised path here: it is the one the speed figures below were measured with, it continues rollouts across weight updates (partial rollouts with `max_staleness > 0`), and it takes images. SGLang is the alternative when it is faster for the model and batch at hand (its radix cache shares long common prefixes, such as multi-turn agent contexts, across requests), when a model or kernel is available there first, or to keep the engine on another node with an NCCL weight push (`sglang_server` with `weight_sync: distributed`). Measure before switching: the [GPU checks](#checking-an-engine) report the throughput of both at an equal batch, and `policy/mismatch_k3_step0` of a few steps tells whether the engine's numerics agree with the trainer's.
+
+| | vLLM (`vllm`, `vllm_server`) | SGLang (`sglang`, `sglang_server`) |
+|---|---|---|
+| Sampling: temperature, `top_p`, `top_k`, `presence_penalty`, stop ids, per-turn budgets | yes | yes; a budget that would pass the context is cut to fit (SGLang refuses such a request, vLLM stops there: the same completion) |
+| Behaviour log-probs | after temperature and top-k / top-p (`processed_logprobs`) | after temperature; with top-k / top-p SGLang's renormalised `return_sampling_mask` log-probs (SGLang ≥ 0.5.12), else the untruncated ones, with a warning. RL training samples at plain temperature, where both are the same |
+| A group's identical prompts | one request with `n` samples (prefilled once) | `n` requests; the radix cache shares the prefill |
+| Continuous batching across turns | yes | yes (requests run as tasks on the engine's event loop while its scheduler decodes) |
+| Weight update | in place (`vllm`); CUDA IPC (`vllm_server`) | bucketed bf16 CUDA IPC (`sglang`); CUDA IPC, NCCL or disk (`sglang_server`) |
+| Prefix cache after an update | reset | flushed with the update's last bucket |
+| Requests in flight at an update (`max_staleness > 0`) | continue with the new weights (partial rollouts; `policy/stale_tokens`) | the update waits for them (SGLang's model-update lock): every completion is sampled by one version |
+| Sleep / wake (colocated, `max_staleness: 0`) | sleep level 2 | releases weights, KV cache and CUDA graphs (`release_memory_occupation`, via `torch_memory_saver`); the weights' memory comes back before the next update, the rest at wake |
+| `rollout.fp32_head` | `head_dtype` (vLLM ≥ 0.26) | `enable_fp32_lm_head` |
+| `rollout.ssm_state_dtype` (Qwen3.5, Qwen3-Next) | `mamba_ssm_cache_dtype` | `mamba_ssm_dtype` |
+| `rollout.kv_cache_dtype`, `rollout.quantization` | yes | yes (`fp8` is SGLang's `fp8_e4m3`) |
+| MoE routing replay (`rollout.routing_replay`) | `enable_return_routed_experts` (needs `prefix_caching`) | `enable_return_routed_experts`; SGLang returns every decoder layer, the MoE layers are kept. Not run on a GPU yet |
+| LoRA (`lora.rank`) | the folded weights after every step; named adapters on `remote` workers | the same; named adapters on `remote` workers through `load_lora_adapter` (not run on a GPU yet) |
+| Images (`model.multimodal`) | `vllm` | no: the SGLang engines take token ids (refused at startup) |
+| Roles with their own adapter (scenarios) | `vllm_server` (one server per adapter) | no (refused: use `vllm_server`, `remote` or `hf`) |
+| torchrun, one engine per rank | `vllm` | `sglang` (the engine on each rank's GPU; checked on one GPU only) |
+| Determinism | `seed` | `random_seed`; batch-invariant kernels with `rollout.sglang_args: {enable_deterministic_inference: true}` |
+| `pgs screen`, `run_episodes` | yes | `sglang` |
+| AMD GPUs | vLLM's ROCm build | not tested |
+
+**Installing SGLang.** SGLang pins its own torch and transformers, so it goes in an environment of its own, with palingenesis installed there: `pip install "sglang==0.5.17"` (the last release built on torch 2.11, which palingenesis' vLLM extra also uses; later releases need newer torch builds). Its PyPI wheels target CUDA 13; on a CUDA 12.9 driver swap in the cu129 builds as [SGLang's install guide](https://docs.sglang.ai/docs/get-started/install) shows (`scripts/gpu_checks/sglang.sh` does it in a fresh virtual environment). sglang is imported only when an SGLang backend is built.
+
+| Option | Default | |
+|---|---|---|
+| `rollout.sglang_args` | `{}` | Further SGLang engine arguments ([ServerArgs](https://docs.sglang.ai/docs/advanced_features/server_arguments) fields), e.g. `{attention_backend: fa3}`, `{enable_deterministic_inference: true}`, `{rl_on_policy_target: fsdp}`. Arguments the options above set (`mem_fraction_static`, `context_length`, `disable_radix_cache`, ...) are refused with the option to use instead; unknown ones are an error naming the closest |
+| `rollout.weight_bucket_mb` | `512` | Weights per update call: each bucket is one contiguous bf16 copy (one CUDA IPC handle); an update holds at most two buckets of copies at a time |
+| `rollout.weight_sync` | `auto` | `sglang_server`: `tensor`, `distributed`, `disk`; `auto` is `tensor` for a server the trainer launches and `distributed` for one at `rollout.url` |
+| `rollout.weight_sync_dir` | `<output_dir>/rollout_weights` | `weight_sync: disk`: where each version is written (a file system the server reads too); the previous version's files are deleted once the server has loaded the new one |
+
+`rollout.gpu_memory_utilization` becomes SGLang's `mem_fraction_static`: the engine's weights and KV cache take that fraction of the GPU minus what the trainer already holds when the engine starts, so the defaults that fit vLLM fit SGLang too. `rollout.max_num_seqs` becomes `max_running_requests` (0: SGLang sizes it, also from the recurrent-state slots of hybrid models), `rollout.enforce_eager` disables CUDA graphs. A server you start yourself (`rollout.url`) keeps its own settings: start it with `--skip-tokenizer-init` and, as needed, `--enable-fp32-lm-head`, `--mamba-ssm-dtype float32` and `--enable-return-routed-experts`.
+
+`weight_sync: distributed` joins the trainer (rank 0) and the server's ranks in an NCCL group of their own (SGLang's `init_weights_update_group`), then broadcasts each bucket while the server receives it. NCCL refuses two ranks on one GPU, so this is for a server on another GPU or node; on the trainer's own GPU use `tensor`. It has not run on a GPU yet (the GPU checks use one).
+
+The weight sync and memory patterns follow [slime](https://github.com/THUDM/slime) / [Miles](https://github.com/radixark/miles) and [verl](https://github.com/volcengine/verl) (all Apache-2.0), reimplemented against the engine protocol: bucketed CUDA IPC pushes into a colocated engine, release and resume of the engine's memory around each training step (weights resumed before the update, KV cache after it), and a dedicated NCCL group to a remote engine. The engine side is SGLang's RL API ([update_weights_from_tensor / from_distributed / from_disk, release / resume_memory_occupation](https://docs.sglang.ai/docs/advanced_features/sglang_for_rl)).
+
+### Checking an engine
+
+`scripts/gpu_checks/sglang.sh` (one NVIDIA GPU, models from the Hugging Face cache) creates its own SGLang environment and prints one JSON line per check: generation and log-prob parity with vLLM on fixed prompts (mean |Δ log-prob| of each engine against the trainer), a weight update that changes the outputs and samples the new weights' log-probs (and restores the original outputs, with the radix cache on), sleep / wake memory release, 10-step `pgs rl` and `pgs distill` runs, and decode throughput against vLLM at an equal batch:
+
+```bash
+PGS_SRC=$PWD/src SGLANG_VENV=/scratch/sglang-venv WORKDIR=/scratch/sglang-checks \
+  VLLM_PYTHON=$PWD/.venv/bin/python bash scripts/gpu_checks/sglang.sh
+```
+
+The SGLang backends are tested on CPU against a scripted engine (`tests/test_sglang_rollout.py`); their GPU validation is pending until that script's results are in.
 
 ## Speed
 

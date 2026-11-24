@@ -213,8 +213,26 @@ def _engine(config, model: str, stop_ids, pad_id: int):
             max_num_seqs=max_num_seqs(config),
             engine_kwargs=extra,
         )
+    if r.backend == "sglang":
+        from palingenesis.opd.sglang_rollout import SGLangRollout
+
+        return SGLangRollout(
+            model,
+            stop_ids,
+            gpu_memory_utilization=r.gpu_memory_utilization,
+            max_model_len=r.max_model_len,
+            enforce_eager=r.enforce_eager,
+            seed=config.train.seed,
+            prefix_caching=r.prefix_caching,
+            max_num_seqs=r.max_num_seqs,
+            fp32_head=r.fp32_head,
+            ssm_state_dtype=r.ssm_state_dtype,
+            kv_cache_dtype=r.kv_cache_dtype,
+            quantization=r.quantization,
+            engine_kwargs=r.sglang_args,
+        )
     raise SystemExit(
-        f"pgs screen: rollout.backend {r.backend!r} is not supported here; use vllm (in-process) or hf "
+        f"pgs screen: rollout.backend {r.backend!r} is not supported here; use vllm or sglang (in-process) or hf "
         "(--rollout.backend vllm)."
     )
 
