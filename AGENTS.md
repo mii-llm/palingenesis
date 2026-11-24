@@ -46,6 +46,9 @@ python -m palingenesis.agent_tooling.check_loss --log_file outputs/train.log
 
 # Full post-mortem
 python -m palingenesis.agent_tooling.diagnose --config configs/llama3_8b.yaml --mode post --log_file outputs/train.log
+
+# Did the candidate beat the baseline? Per-item results (JSONL: id + scores), paired tests, pass@k, exit 1 if not met
+pgs compare base.jsonl candidate.jsonl --require not_worse --margin 0.02
 ```
 
 ### 4. Deep Debugging (requires GPU)
@@ -96,6 +99,9 @@ Training issue?
 │   │   zero-variance share, tool error rate and latency per tool, loop share, slowest turns, worst trajectories)
 │   ├── Alarms (exit 1): length_share > 0.2 (budget or rambling), turns_share > 0.2 (never finishes),
 │   │   tool_error_rate > 0.3 (schemas / arguments / timeouts), loop_share > 0.1, zero_variance_share > 0.5
+│   ├── zero_variance_share high before the run: pgs screen --config <rl.yaml> --k 8 --output screened.jsonl
+│   │   (keeps 0 < pass rate < 1 rows in screened.kept.jsonl)
+│   ├── pass@1 up, pass@G down (sharpening): loss.pass_k (2 <= k < group_size), then a pass_k 1 stage
 │   └── Rollout engine latency: vLLM OTLP traces via rollout.vllm_args (see the Observability guide)
 ├── Multi-role RL (pgs rl with a scenario: section; CPU-tested only, GPU validation pending)
 │   ├── Data: an ordinary RL dataset plus a pattern (scenario.type solve_check | handoff | lead_workers, scored by
