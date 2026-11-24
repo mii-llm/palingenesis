@@ -12,6 +12,7 @@
 ## In short
 
 ```bash
+pgs prepare --config cpt.yaml                   # clean the corpus: duplicates, near-duplicates, benchmark leaks
 pgs inspect --config cpt.yaml --num_samples 3   # every token of a raw-text sequence has a label
 pgs fit --config cpt.yaml                       # the fastest memory setting that fits this GPU
 pgs train --config cpt.yaml                     # train; re-run the same command to resume
@@ -21,9 +22,10 @@ pgs train --config cpt.yaml                     # train; re-run the same command
 data:
   sources:
     - {dataset: data/corpus.jsonl, mode: pretrain, text_field: text}
-  mix_epoch: first_exhausted   # one epoch = one pass over every chunk of every document
   eval_dataset: data/heldout.jsonl
 ```
+
+One epoch is one pass over every chunk of every document.
 
 Raw text is a data **source** with `mode: pretrain`. The rest of the trainer (memory options, FSDP, checkpoints, resume, evaluation) is the one SFT uses. The full configs are [below](#a-minimal-config).
 
@@ -35,7 +37,7 @@ Raw text is a data **source** with `mode: pretrain`. The rest of the trainer (me
 |---|---|---|
 | Knowledge, vocabulary or fluency that lives in text you cannot turn into conversations (a technical domain, a language, an internal corpus) | **Continued pretraining** of the **base** model, then SFT on top, then [merge into the instruction-tuned model](#continued-pretraining-of-an-instruction-tuned-model) | Raw text teaches what to say; it does not teach how to answer, follow instructions or call tools |
 | A behaviour: answering, a format, tool calls, reasoning, refusals | **SFT** on conversations ([Data Preparation](data.md)), then RL or distillation | Loss only on the assistant's turns; the prompt is context, not a target |
-| A new model from random weights | Not what palingenesis is built for (see [Not in the library](#not-in-the-library)) | The trainer loads `model.name_or_path` with `from_pretrained`; there is no random-initialisation option and none of the defaults are tuned for it |
+| A new model from random weights | `model.init: random` ([Training from random weights](#training-from-random-weights)) | The architecture comes from a `config.json`, the weights from a seed. The trainer runs it like any other run, but none of the defaults are tuned for it and it has only been tested at toy scale |
 | A large teacher's knowledge on your corpus | [Off-policy distillation](offpolicy-distillation.md) with `mode: pretrain` sources | Pretraining-mode sources distill every token against the teacher's distribution |
 
 Continued pretraining usually trains on far more tokens than SFT, and its side effects are the ones a training loss hides best. Run it when the missing thing really is in raw text, and measure what it costs (see [Held-out loss and forgetting](#held-out-loss-and-forgetting)).
@@ -47,9 +49,10 @@ Continued pretraining usually trains on far more tokens than SFT, and its side e
 A source with `mode: pretrain` reads one text column (`text_field`, default `text`) from each row:
 
 - **Every token gets loss.** There is no chat template and no masking: the whole string is next-token prediction.
-- **The tokenizer adds what it always adds.** Documents are tokenized with `add_special_tokens=True`, so a tokenizer that prepends a BOS token (Llama) prepends it to every document; one that adds nothing (Qwen) adds nothing. **No end-of-document token is appended**: if the model should learn where documents end, put the tokenizer's EOS string at the end of each document when you write the data (see [Preparing the data](#preparing-the-data)).
-- **Long documents are split, not truncated.** A document longer than `data.max_seq_length` becomes consecutive `max_seq_length`-token chunks; a trailing chunk shorter than 16 tokens is dropped. Each chunk is its own training sequence: the second chunk of a document does not see the first.
-- **Packing keeps sequences apart.** With `data.packing: true`, whole chunks and short documents are packed into blocks of up to `max_seq_length` tokens, and `position_ids` restart at every document, so no document attends to another ([packing](../getting-started/first-training.md#packing-when-to-use-it)). For raw text, where most documents are shorter than the sequence length, packing fills each sequence instead of padding short documents.
+- **The tokenizer adds what it always adds.** Documents are tokenized with `add_special_tokens=True`, so a tokenizer that prepends a BOS token (Llama) prepends it to every document; one that adds nothing (Qwen) adds nothing.
+- **Every document ends with an end-of-document token.** The tokenizer's EOS token is appended to each document (`append_eos`, on by default; a document whose text already ends with it keeps one). It is trained like any other token, so the model learns where documents end. See [The end-of-document token](#the-end-of-document-token) for chat models, whose EOS is the end-of-turn token.
+- **Long documents are split, not truncated.** A document longer than `data.max_seq_length` becomes consecutive `max_seq_length`-token chunks; a trailing chunk shorter than 16 tokens is dropped. Each chunk is its own training sequence: the second chunk of a document does not see the first. Only the document's last chunk carries the end-of-document token.
+- **Packing keeps sequences apart.** With `data.packing: true`, whole chunks and short documents are packed into blocks of up to `max_seq_length` tokens, and `position_ids` restart at every document, so no document attends to another ([packing](../getting-started/first-training.md#packing-when-to-use-it)). The loss never asks the last token of a document to predict the first token of the next one. For raw text, where most documents are shorter than the sequence length, packing fills each sequence instead of padding short documents.
 - **Only through `data.sources`.** The single `data.dataset` is always read as conversations. A list of one source is fine.
 
 !!! warning "Don't feed a rendered conversation as `text`"
@@ -64,21 +67,83 @@ pgs validate --config cpt.yaml --num_samples 200  # masking statistics
 
 `pgs validate` (and the masking check of `pgs diagnose --mode pre`) warns that the samples "train on ALL tokens" and that the train ratio is very high. For raw text that is the expected result, not a masking bug; the exit code stays 0.
 
+### The end-of-document token
+
+```yaml
+data:
+  sources:
+    - {dataset: data/corpus.jsonl, mode: pretrain}                               # the tokenizer's EOS (default)
+    - {dataset: data/corpus.jsonl, mode: pretrain, append_eos: "<|endoftext|>"}  # a named token
+    - {dataset: data/corpus.jsonl, mode: pretrain, append_eos: false}            # nothing appended
+```
+
+| `append_eos` | Appended to every document |
+|---|---|
+| `true` (default) | `tokenizer.eos_token`. A tokenizer without one appends nothing and logs a warning |
+| a token string | That token; it must be exactly one token of the vocabulary, or the run stops with an error |
+| `false` | Nothing: the behaviour before this option existed |
+
+- **Chat models.** The EOS token of an instruction-tuned tokenizer is usually its end-of-turn token (`<|im_end|>` for Qwen chat models). Ending raw documents with it teaches that documents end like turns; name the base model's document separator instead (`append_eos: "<|endoftext|>"` for Qwen, `"<|end_of_text|>"` for Llama 3), and check with `pgs inspect` what the last token of a sequence is.
+- **Packing.** In a packed block the token closes each document: `[doc A … EOS][doc B … EOS]`. Position ids restart at every document and attention stays inside it. EOS is predicted from its own document's last token, and no loss is placed on EOS predicting the first token of the next document.
+- **Held-out sets** read as raw text (`data.eval_dataset` in a raw-text run, `eval_sources` with `mode: pretrain`) get the same token, so the evaluated loss includes predicting the end of each document. A held-out loss measured before this option existed is not comparable to one measured with it: compare against the baseline the run prints before its first step.
+- A [pre-tokenized cache](data.md#pre-tokenized-cache) written without the token is rebuilt.
+
 ---
 
 ## Preparing the data
 
 **Format.** A JSONL or parquet file with a text column, a directory of them on the Hub, or any Hugging Face dataset: `dataset` takes the same values as for chat data. Extra columns are ignored. With `data.streaming: true` (the default) local JSONL and parquet files are read as many shards in parallel; write parquet with several row groups so it can be split ([Run length and streaming](data.md#run-length-and-streaming)).
 
-**Cleaning happens before palingenesis.** `pgs prepare` and `pgs prepare-multi` clean and deduplicate conversations; they skip `mode: pretrain` sources. Do at least the following yourself:
+**Clean the corpus with `pgs prepare`.** For `mode: pretrain` sources it works on documents, without loading a model:
 
-- **Deduplicate.** Repeated documents (boilerplate, mirrored pages, licence headers) are trained as many times as they occur. Exact deduplication on normalised text is cheap; near-duplicate detection (MinHash) needs a dedicated tool for large corpora.
-- **Decontaminate.** Drop every document that shares a long n-gram (13 words is a common choice) with the benchmarks you will report, questions and answers both. A domain corpus scraped from the web often contains the test sets of that domain.
-- **Filter.** Very short documents, other languages than the one you want, and extraction debris (navigation menus, tables flattened into noise) cost tokens and teach nothing.
-- **Hold out documents, not chunks.** Take the evaluation set from whole documents removed from the training data, after deduplication, so that no held-out text was trained on under another copy.
-- **Mark document ends** if you want the model to learn them: append the tokenizer's EOS string (for example `<|endoftext|>` for Qwen models, `<|end_of_text|>` for Llama 3) to every document, and check with `pgs inspect` that it comes out as a single token.
+```yaml title="cpt.yaml"
+data:
+  sources:
+    - {dataset: data/raw_corpus.jsonl, name: corpus, mode: pretrain, text_field: text}
+preprocess:
+  output_dir: ./prepared
+  dedupe: true                 # exact duplicates (the default)
+  near_dedupe: 0.8             # near-duplicates: Jaccard similarity of word 5-gram sets (0 = off)
+  decontaminate:               # the evaluation sets you will report
+    - benchmarks/domain_qa.jsonl
+    - benchmarks/general.parquet
+  decontaminate_ngram: 13
+  min_chars: 200
+  eval_holdout: 500            # whole documents, drawn after deduplication
+```
 
-A starting point in plain Python (exact duplicates, 13-gram decontamination, a held-out split of 500 documents):
+```bash
+pgs prepare --config cpt.yaml
+# or without a config:
+pgs prepare --data data/raw_corpus.jsonl --output prepared/corpus --mode pretrain \
+    --near_dedupe 0.8 --decontaminate benchmarks/*.jsonl --min_chars 200 --eval_holdout 500
+```
+
+Each source is written to `prepared/<name>/`: `scored_data.parquet` (the kept documents, every column), `eval_data.parquet` (the held-out documents), `dropped.jsonl` (every removed row with its reason and, for a duplicate, the row that was kept) and `prepared_meta.json` with the counts. The command logs the `data.sources` entries to train on; a source can point at the directory (`dataset: prepared/corpus`) and the held-out file goes in `data.eval_dataset` or an `eval_sources` entry. In a sources file for `pgs prepare-multi`, `mode: pretrain` entries are cleaned the same way next to the chat sources (`--decontaminate`, `--near_dedupe`, `--min_chars`).
+
+What each check does, in the order they run:
+
+| Reason in the report | Removed | Option |
+|---|---|---|
+| `empty_text` | Rows without a string in `text_field`, or only whitespace | always |
+| `too_short` | Documents with fewer than `min_chars` characters | `min_chars` |
+| `contaminated` | Documents that share a run of `decontaminate_ngram` words with any string of the `decontaminate` files (every column and nested value, so questions and answers both; case and punctuation ignored) | `decontaminate` |
+| `duplicate` | Documents whose text is the same after Unicode normalisation, lower-casing and collapsing whitespace; the first is kept | `dedupe` |
+| `near_duplicate` | Documents whose sets of word 5-grams have an estimated Jaccard similarity of at least `near_dedupe` with an earlier kept document (MinHash, 128 hashes, candidates by locality-sensitive hashing) | `near_dedupe` |
+
+Read the report before training:
+
+- **`contaminated` counts are usually small and matter most.** A domain corpus scraped from the web often contains the test sets of that domain. Evaluation strings shorter than the n-gram give no n-gram and protect nothing: `prepared_meta.json` counts them (`decontamination.strings_shorter_than_ngram`); lower `decontaminate_ngram` for benchmarks of short items, at the price of more false matches on common phrases.
+- **`near_dedupe` is an estimate.** With 128 hashes the similarity of a pair is known to about ±0.04 at 0.8, so pairs close to the threshold fall on either side. 0.8 removes mirrored pages and lightly edited copies; lower values start removing documents that share boilerplate (licence headers, templates), which may or may not be what you want: read a sample of `dropped.jsonl` first.
+- **Duplicates are removed inside a source, not across sources**, and held-out documents are drawn after deduplication, so no held-out text is trained on under another copy from the same source.
+- **Memory and time.** Everything is held in memory and runs in one process: one hash per evaluation n-gram, one signature per kept document. Sized for corpora of up to a few million documents; for a web-scale crawl use a dedicated tool and feed its output here.
+
+Still yours to do:
+
+- **Filter.** Other languages than the one you want and extraction debris (navigation menus, tables flattened into noise) cost tokens and teach nothing; `min_chars` only removes the shortest documents.
+- **Document ends** are added at training time ([The end-of-document token](#the-end-of-document-token)): do not write the EOS string into the text.
+
+The same checks in plain Python, as a starting point when you need to change them (exact duplicates, 13-gram decontamination, a held-out split of 500 documents):
 
 ```python title="clean_corpus.py"
 import hashlib, json, random, re
@@ -135,15 +200,28 @@ data:
     - {dataset: data/general.parquet, name: general, mode: pretrain, text_field: text, weight: 0.2}
 ```
 
-- **`weight` is a share of training sequences, not of tokens.** Each draw takes one sequence (a document, or one `max_seq_length` chunk of a long one) from a source chosen by weight. A source of long documents contributes about `max_seq_length` tokens per draw, one of short documents far fewer, so with sources of different lengths the token shares differ from the weights. The startup log gives each source's share, rows and passes per epoch.
+- **`weight` is by default a share of training sequences, not of tokens.** Each draw takes one sequence (a document, or one `max_seq_length` chunk of a long one) from a source chosen by weight. A source of long documents contributes about `max_seq_length` tokens per draw, one of short documents far fewer, so with sources of different lengths the token shares differ from the weights.
+- **`data.mix_weights: tokens` makes the weights shares of the tokens.** Replay ratios in the literature, and budgets, are stated in tokens. With `mix_weights: tokens` the example above trains 80% of its tokens on the domain corpus whatever the lengths of the documents (see the table below). Every source needs a `weight`.
+- **Without weights the mix is one shuffled concatenation.** Each source is drawn in proportion to the training sequences it holds (its rows, times the chunks its documents give), so every source gets about one pass per epoch.
+- The startup log gives each source's share (`of sequences`, `of tokens` or `of rows`) and its rows.
+
+| `data.mix_weights` | `weight: 0.8` means | A source is drawn with probability proportional to | Use when |
+|---|---|---|---|
+| `sequences` (default) | 80% of the training sequences | its weight | sequences are the unit you reason in (conversations in SFT), or the sources have similar lengths |
+| `tokens` | 80% of the tokens trained on | its weight ÷ the mean length of its sequences | raw text of different lengths: replay shares, token budgets |
+
+How `tokens` is computed: the mean sequence length of each source is measured on the sequences drawn from it so far in the epoch (per data-loading worker), and the draw probabilities follow it. Until a source has been drawn once it takes the mean of the others, so the first few draws of an epoch are slightly off and the shares converge within a few hundred sequences. Every token of a sequence counts (for a conversation source in the mix, the prompt too, not only the trained tokens). The size estimate that sets the LR schedule uses the same rule.
 - **Replay general text.** A share of text like the model's original pretraining data (a general web or encyclopedic corpus in the languages the model already serves) slows the loss of general ability. Ibrahim et al. ([arXiv:2403.08763](https://arxiv.org/abs/2403.08763)) report that 5% replay was enough for a mild distribution shift and that a stronger one (a new language) needed about 25%. These are their numbers, not measured here: measure your own trade-off with a general held-out set (next sections).
 - **Conversations in the mix** (`mode: sft` sources next to raw text) keep the chat behaviour of a model that has one. See [Continued pretraining of an instruction-tuned model](#continued-pretraining-of-an-instruction-tuned-model) for why that is usually not enough.
 
-!!! warning "What an epoch is with long documents"
-    With the default `data.mix_epoch: total`, an epoch is as many sequences as the sources have **rows**. A raw-text row that is split into several chunks still counts once, so an epoch over a corpus of long documents trains on only part of it (a corpus whose documents give three chunks each: a third of the chunks per epoch). Choose the run length explicitly:
+!!! note "What an epoch is"
+    With the default `data.mix_epoch: total`, an epoch is as many **rows** as the sources hold together, and a document counts when its last chunk has been drawn. A document split into several chunks therefore counts once, with all its chunks:
 
-    - **One raw-text source:** `data.mix_epoch: first_exhausted`. The epoch ends when the source runs out, which is one pass over every chunk of every document, and the LR schedule is sized from the same count.
-    - **A mix:** set the budget in steps, `train.max_steps`, with `train.epochs` large enough that the step limit ends the run (each epoch restarts every source in a new order).
+    - **One raw-text source:** an epoch is one pass over every chunk of every document (10 documents of 3 chunks each: 30 sequences). `mix_epoch: first_exhausted` gives the same epoch.
+    - **A mix without weights:** about one pass over every source.
+    - **A mix with weights:** the same number of rows, distributed by the weights: a source weighted above its share is repeated in a new order, one below it contributes a random subset that changes every epoch. To fix the budget in tokens instead, set `train.max_steps`, with `train.epochs` large enough that the step limit ends the run.
+
+    Earlier versions counted one sequence per row, so an epoch over a corpus of long documents read only part of it (a third when documents gave three chunks each). A run sized in epochs on long documents is now longer by that factor; a run with `train.max_steps` is unchanged.
 
 ---
 
@@ -161,7 +239,6 @@ data:
       name: corpus
       mode: pretrain
       text_field: text
-  mix_epoch: first_exhausted         # one pass over every chunk
   max_seq_length: 4096
   packing: true
   streaming: true
@@ -186,7 +263,7 @@ logging:
   use_trackio: false
 ```
 
-`data.eval_dataset` is read as raw text (all-token loss, `text_field` of the first source) only when **every** training source is `mode: pretrain`. In a run that also has conversation sources it is read as conversations; use `data.eval_sources` with `mode: pretrain` instead (next section).
+One epoch is one pass over every chunk of every document. `data.eval_dataset` is read as raw text (all-token loss, `text_field` and `append_eos` of the first source) only when **every** training source is `mode: pretrain`. In a run that also has conversation sources it is read as conversations; use `data.eval_sources` with `mode: pretrain` instead (next section).
 
 Before the first run:
 
@@ -211,14 +288,15 @@ data:
   sources:
     - {dataset: data/domain.parquet, name: domain, mode: pretrain, text_field: text, weight: 0.8}
     - {dataset: data/general.parquet, name: general, mode: pretrain, text_field: text, weight: 0.2}
+  mix_weights: tokens   # 80% / 20% of the tokens, whatever the documents' lengths
   max_seq_length: 8192
   packing: true
   streaming: true
   num_workers: 8
   eval_every: 250
   eval_sources:
-    - {name: domain, dataset: data/domain_heldout.jsonl, mode: pretrain, text_field: text, weight: 0.5, samples: 200}
-    - {name: general, dataset: data/general_heldout.jsonl, mode: pretrain, text_field: text, weight: 0.5, samples: 200}
+    - {name: domain, dataset: data/domain_heldout.parquet, mode: pretrain, text_field: text, weight: 0.5, samples: 200}
+    - {name: general, dataset: data/general_heldout.parquet, mode: pretrain, text_field: text, weight: 0.5, samples: 200}
 
 train:
   output_dir: ./runs/cpt_8b
@@ -248,7 +326,7 @@ torchrun --standalone --nproc_per_node=8 -m palingenesis.train --config cpt_8b.y
 
 Launching on several GPUs and nodes is in [Multi-GPU](multi-gpu.md#launch) and [Multi-Node & SLURM](multi-node.md).
 
-**Pre-tokenized cache.** `data.pretokenize: true` tokenizes, chunks, mixes and packs the stream once and reads tensors on later runs ([pre-tokenized cache](data.md#pre-tokenized-cache)). It stores **one epoch** of the stream and reshuffles that same set every later epoch, so use it when an epoch is the whole budget (one source with `mix_epoch: first_exhausted`), not with the `max_steps` plus many epochs pattern above, where every epoch would repeat the cached subset.
+**Pre-tokenized cache.** `data.pretokenize: true` tokenizes, chunks, mixes and packs the stream once and reads tensors on later runs ([pre-tokenized cache](data.md#pre-tokenized-cache)). It stores **one epoch** of the stream and reshuffles that same set every later epoch, so use it when an epoch is the whole budget (one source, or a mix without weights), not with the `max_steps` plus many epochs pattern above, where every epoch would repeat the cached subset.
 
 ---
 
@@ -299,8 +377,8 @@ data:
 - **General** (`mode: pretrain`): text like the model's original data, in the languages it serves. It rises at the start of the run (re-warming) and should settle. A steady rise is forgetting: lower the LR, add replay, or stop earlier.
 - **Chat** (`mode: sft`, only if the model has one): assistant-only loss on conversations. Weight 0 keeps it out of the composite that picks `best/`, while its loss is still logged.
 
-!!! warning "`eval_sources` files: JSONL or a Hub dataset"
-    An `eval_sources` entry is loaded as a Hub dataset (its `split`, default `test`) or, failing that, as a local JSONL file. A local parquet file is not read (the log warns `MultiEval: error loading source` and the source is skipped): write held-out sets for `eval_sources` as JSONL. `data.eval_dataset` reads parquet and JSONL alike.
+!!! note "`eval_sources` files"
+    An `eval_sources` entry is a local `.jsonl`, `.json` or `.parquet` file, a `pgs prepare` output directory, or a Hub dataset (its `split`, default `test`). A source that cannot be read, has an unknown `mode` or gives no usable sample (a wrong `text_field`, say) stops the run with a config error that names it: a configured evaluation set is never skipped.
 
 What you get:
 
@@ -386,21 +464,78 @@ Rules that held at small scale (re-check them at yours):
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| The run ends after a fraction of the corpus | `mix_epoch: total` counts rows, and long documents are split into several chunks | `data.mix_epoch: first_exhausted` (one source), or `train.max_steps` with a large `train.epochs` ([above](#mixing-sources)) |
+| An epoch is several times longer than in an earlier version | An epoch now covers every chunk of every document; it used to count one sequence per row | Expected ([What an epoch is](#mixing-sources)); fix the budget with `train.max_steps` |
+| A weighted source takes far more (or fewer) tokens than its weight | Weights are shares of sequences by default | `data.mix_weights: tokens` |
 | `Data source '…' yielded 0 usable examples` | Wrong `text_field`, an empty file, or a source without `mode: pretrain` (read as conversations) | Check the column name with `pgs inspect`; set `mode: pretrain` |
 | Raw-text eval set gives no `eval/loss` in a mixed run | `data.eval_dataset` is read as conversations unless every training source is `mode: pretrain` | `data.eval_sources` with `mode: pretrain` |
 | General held-out loss jumps in the first steps | Re-warming the learning rate | Expected if it settles; if not, lower `learning_rate` or lengthen `warmup_ratio` |
 | General held-out loss keeps rising | LR too high, too little replay, or too many tokens | Lower LR, raise the replay weight, adopt an earlier checkpoint (`best/` with a general-weighted composite) |
 | Chat model lost tool calls or instruction following | Continued pretraining on the instruction-tuned checkpoint | CPT the base, SFT it, merge at small λ ([above](#continued-pretraining-of-an-instruction-tuned-model)) |
-| Generations never end | No document ends in the data, or a base model that was never fine-tuned to stop | Append the EOS string to every document; SFT for chat use |
+| Generations never end | `append_eos: false`, or a base model that was never fine-tuned to stop | Keep `append_eos` on ([above](#the-end-of-document-token)); SFT for chat use |
+| A chat model ends its turns badly after raw-text training | Documents were closed with the tokenizer's EOS, which is the end-of-turn token | `append_eos: "<|endoftext|>"` (the base model's document separator) |
+| `append_eos: … is not a token of this tokenizer's vocabulary` | The named string is not exactly one token | Use a token of the tokenizer (`tokenizer.eos_token`, a special token) |
 | `pgs validate` warns "train on ALL tokens" | Expected for raw text | Nothing to fix |
-| `pgs diagnose` warns that the LR is "very high for SFT" | LR above `1e-3` | Far above the continued-pretraining starting points: lower it unless you are deliberately pretraining from scratch |
+| `pgs diagnose` warns that the LR is "very high for SFT" | LR above `1e-3` | Far above the continued-pretraining starting points: lower it unless you are deliberately [training from random weights](#training-from-random-weights) |
 | OOM at the target `max_seq_length` | Activations grow with the sequence | `pgs fit`; `memory.seco` on one GPU, context parallelism on several |
 | Packing refused on a hybrid model | Linear-attention packing kernels missing | Install the `hybrid` extra |
 | Context parallelism refused | Packing is on | `data.packing: false` with context parallelism |
 | Restart after a crash takes long before the first step | The resumed epoch reads and skips the data already trained on | Expected; `data.pretokenize: true` makes it fast when one epoch is the whole budget |
 | Every epoch trains on the same subset | Pre-tokenized cache with several epochs of a mixed stream | Turn `pretokenize` off for `max_steps`-bounded mixes |
-| `MultiEval: error loading source` for an `eval_sources` entry | A local parquet file (only JSONL or Hub datasets are read there) | Write that held-out set as JSONL |
+| `data.eval_sources: source '…' …` stops the run | The file is missing or of another format, the `mode` is unknown, or no row gives a sample (wrong `text_field` / `messages_field`) | Fix the entry: the message names the source and the cause |
+| `model.init: random` warns about the learning rate | `train.learning_rate` at or below `1e-4`, a fine-tuning value | Raise it for training from scratch ([below](#training-from-random-weights)) |
+| `pgs prepare` removes almost nothing as `contaminated` although the benchmark is in the corpus | Benchmark items shorter than the n-gram (`strings_shorter_than_ngram` in `prepared_meta.json`) | Lower `preprocess.decontaminate_ngram` |
+
+---
+
+## Training from random weights
+
+`model.init: random` builds the architecture described by `model.name_or_path`'s `config.json` and initialises its weights from a seed, instead of loading a checkpoint:
+
+```yaml title="scratch.yaml"
+model:
+  name_or_path: ./arch     # config.json + the tokenizer files; no weights needed
+  init: random
+  init_seed: 0             # -1 (default): train.seed
+  torch_dtype: float32
+
+data:
+  sources:
+    - {dataset: data/corpus.parquet, mode: pretrain, text_field: text}
+  max_seq_length: 2048
+  packing: true
+
+train:
+  learning_rate: 6.0e-4
+  min_learning_rate: 6.0e-5
+  warmup_ratio: 0.02
+  weight_decay: 0.1
+  max_steps: 100000
+  epochs: 1000
+```
+
+Make the directory from any architecture `transformers` knows, with a tokenizer whose size fits the config:
+
+```python
+from transformers import AutoTokenizer, LlamaConfig
+
+tokenizer = AutoTokenizer.from_pretrained("my-tokenizer")
+config = LlamaConfig(
+    vocab_size=len(tokenizer), hidden_size=768, intermediate_size=3072,
+    num_hidden_layers=12, num_attention_heads=12, max_position_embeddings=2048,
+    bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
+)
+config.save_pretrained("arch")
+tokenizer.save_pretrained("arch")
+```
+
+`name_or_path` can also be a released model, to train its architecture from scratch: its weights are ignored.
+
+- **Initialisation.** The weights are drawn by the architecture's own initialiser in `transformers` (for most decoders a normal distribution with the config's `initializer_range`), in float32, then cast to `model.torch_dtype`. Every rank draws the same weights from `init_seed`, and the run's own seeding (data order, dropout) is unchanged by it.
+- **Checked at startup:** a tokenizer with more tokens than the config's `vocab_size` is refused. A multimodal checkpoint's config gives its language model alone.
+- **Rejected combinations:** `dpo.enabled`, `multimodal.enabled`, `train.base_merge`, `train.freeze_non_attention`, `plugins.pre_rl` and scoring data with the model in `preprocess`: each of them needs trained weights to start from.
+- **Resume and export** work as in any run: `resume_from: auto` continues from the last checkpoint, and `final/` loads with `from_pretrained`.
+- **The defaults are fine-tuning defaults.** A learning rate at or below `1e-4` logs a warning: training from scratch usually takes a peak between `1e-4` and `1e-3` with AdamW, a real warmup, and a token budget far beyond anything in this guide ([how many tokens](#learning-rate-warmup-schedule-and-token-budget)). `pgs diagnose` checks its learning-rate range for fine-tuning and will flag such a rate.
+- **Scope.** `pgs train` only (`pgs rl` and `pgs distill` start from a trained model). Tested here on toy models on CPU; nothing in the library is tuned or benchmarked for pretraining at scale, and there is no tokenizer training.
 
 ---
 
@@ -408,9 +543,6 @@ Rules that held at small scale (re-check them at yours):
 
 What a pretraining user might expect and palingenesis does not provide:
 
-- **Training from random weights.** There is no option to initialise a model from a config. A model saved with `transformers` (`AutoModelForCausalLM.from_config(...)`, then `save_pretrained` with its tokenizer) can be pointed to by `model.name_or_path`, but that path is not tested here and none of the defaults are tuned for it.
-- **Raw-text cleaning.** Deduplication, near-duplicate detection, decontamination and quality filtering of `mode: pretrain` sources are left to you ([Preparing the data](#preparing-the-data)); `pgs prepare` covers conversations only.
-- **Document separators.** No EOS token is inserted between documents; write it into the text.
-- **Mixing by token share.** Source weights are per sequence; convert a target token share into weights from the average sequence length of each source.
-- **Parquet held-out sets in `eval_sources`.** Only JSONL files and Hub datasets are read there ([above](#held-out-loss-and-forgetting)).
+- **A pretraining recipe.** `model.init: random` gives the mechanism ([above](#training-from-random-weights)); schedules, initialisation variants, tokenizer training and data pipelines for web-scale corpora are not provided or tuned.
+- **Web-scale cleaning and quality filtering.** `pgs prepare` deduplicates and decontaminates corpora that fit in memory ([Preparing the data](#preparing-the-data)); language identification, quality classifiers and distributed deduplication are left to dedicated tools.
 - **Cross-document context.** Packed documents never attend to each other, and the chunks of a long document are trained independently: there is no option to train on one concatenated stream.

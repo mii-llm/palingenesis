@@ -265,7 +265,11 @@ def eval_reader(config, tokenizer, eval_ds):
     sources = config.data.sources or []
     if sources and all((src or {}).get("mode", "sft") == "pretrain" for src in sources):
         return PretrainDataset(
-            eval_ds, tokenizer, config.data.max_seq_length, text_field=sources[0].get("text_field", "text")
+            eval_ds,
+            tokenizer,
+            config.data.max_seq_length,
+            text_field=sources[0].get("text_field", "text"),
+            append_eos=sources[0].get("append_eos", True),
         )
     return ChatDataset(
         eval_ds,
@@ -425,16 +429,29 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
     # flash_attention_2 / Hub kernels: a clear error now, not an ImportError deep in from_pretrained
     accelerator.check_attn_implementation(config.model.attn_implementation)
-    logger.info(f"Loading model: {config.model.name_or_path}")
     # multimodal: the checkpoint's own architecture (language model + vision tower + projector)
     load_model = multimodal.load_model if vision is not None else AutoModelForCausalLM.from_pretrained
-    model = load_model(
-        config.model.name_or_path,
-        torch_dtype=model_dtype,
-        attn_implementation=config.model.attn_implementation,
-        trust_remote_code=config.model.trust_remote_code,
-        low_cpu_mem_usage=True,  # Load shard-by-shard, no 2x RAM spike
-    )
+    if config.model.init == "random":
+        # training from scratch: the architecture of the config, fresh weights, the same on every rank
+        from palingenesis import model_init
+
+        model = model_init.random_init(
+            config.model.name_or_path,
+            seed=model_init.init_seed(config),
+            dtype=model_dtype,
+            attn_implementation=config.model.attn_implementation,
+            trust_remote_code=config.model.trust_remote_code,
+            tokenizer=tokenizer,
+        )
+    else:
+        logger.info(f"Loading model: {config.model.name_or_path}")
+        model = load_model(
+            config.model.name_or_path,
+            torch_dtype=model_dtype,
+            attn_implementation=config.model.attn_implementation,
+            trust_remote_code=config.model.trust_remote_code,
+            low_cpu_mem_usage=True,  # Load shard-by-shard, no 2x RAM spike
+        )
     if vision is not None:
         multimodal.check_model(model, vision)
         multimodal.set_vision_trainable(model, config.multimodal.train_vision_tower, config.multimodal.train_projector)

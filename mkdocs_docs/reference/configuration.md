@@ -16,6 +16,8 @@
 | `compile` | bool | `true` | `torch.compile` each transformer layer. First step is slow (compilation), then 20-40% faster on fixed-shape batches. Measure it on long rows of varying length: on Qwen3.5-0.8B with agentic traces of up to 16k tokens (H100) it was 15% slower than `compile: false` with Liger's kernels (19.4k vs 22.9k tokens/s over 400 steps). |
 | `compile_backend` | str | `inductor` | Compiler backend. `inductor` (default, fastest), `aot_eager` (debugging). |
 | `compile_mode` | str | `default` | Compile optimization level. `default`, `reduce-overhead` (small batches), `max-autotune` (5-15% faster, longer compile). |
+| `init` | str | `pretrained` | Where the weights come from. `pretrained`: the checkpoint at `name_or_path`. `random`: the architecture of `name_or_path`'s `config.json` with freshly initialised weights (training from scratch); the path then needs only `config.json` and the tokenizer files, and weights found there are ignored. `pgs train` only. Rejected with `dpo.enabled`, `multimodal.enabled`, `train.base_merge`, `train.freeze_non_attention`, `plugins.pre_rl` and model scoring in `preprocess`. See [Training from random weights](../guides/pretraining.md#training-from-random-weights). |
+| `init_seed` | int | `-1` | Seed of the random initialisation, the same on every rank. `-1` = `train.seed`. |
 
 ---
 
@@ -26,7 +28,8 @@
 | `dataset` | str | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset name, local `.jsonl`/`.json`/`.parquet` file, or a prepared-output directory from `pgs prepare`. |
 | `dataset_split` | str | `train_sft` | Dataset split to use. |
 | `streaming` | bool | `true` | Stream the data instead of loading it (Arrow, memory-mapped). Local JSONL and parquet files stream as many shards read in parallel by ranks and workers; the run is still sized from the files' metadata. |
-| `mix_epoch` | str | `"total"` | What an epoch of `sources` is: `total` = as many examples as the sources hold together, drawn by weight (a source without a weight gets its share of the rows; sources above their share repeat, those below contribute a fresh random subset each epoch); `first_exhausted` = until a source runs out. |
+| `mix_epoch` | str | `"total"` | What an epoch of `sources` is: `total` = as many rows as the sources hold together, drawn by weight (a source without a weight gets its share of the rows; sources above their share repeat, those below contribute a fresh random subset each epoch). A row counts when its last training sequence is drawn, so a raw-text document that is split into several chunks counts once, with all its chunks: one raw-text source gives one pass over every chunk of every document. `first_exhausted` = until a source runs out. |
+| `mix_weights` | str | `"sequences"` | What a source's `weight` is a share of. `sequences`: of the training sequences drawn, so a source of long sequences takes a larger share of the tokens than its weight. `tokens`: of the tokens trained on: each source is drawn in proportion to its weight divided by the mean length of its sequences, measured on the sequences read so far in the epoch, so `weight: 0.8` is 80% of the tokens whatever the documents' lengths (every token of a sequence counts, a conversation's prompt included). `tokens` needs a weight on every source. Sources without any weight are mixed by their rows either way. See [Mixing sources](../guides/pretraining.md#mixing-sources). |
 | `max_seq_length` | int | `8192` | Maximum sequence length. Longer = more memory. Packing fills to this length. |
 | `messages_field` | str | `messages` | JSON field containing chat messages. Also tries: `conversations`, `chat`, `dialogue`, `turns`. |
 | `num_workers` | int | `4` | DataLoader worker processes. Increase if data loading is the bottleneck. |
@@ -46,12 +49,12 @@
 | `stop_unlikelihood` | float | `0.0` | Weight of $-\log(1 - p)$ on starting another tool call in the final reply of a trace that used tools (the call opener at the reply start and after each separator, the separator at the end of the turn). The opener and separator are derived from the chat template (an added or special token is required, otherwise the term is off with a warning). Same requirements as `repeat_unlikelihood`; logged as `train/stop_p`, `train/stop_targets`. |
 | `last_turn_only` | bool | `false` | Mask every assistant turn except the final one — in training, loss only on the last answer; in `eval_sources`, score only the last answer. Phase-neutral name (no `train_`/`eval_` prefix) since the same mask serves both. Use when earlier assistant turns are a fixed context you must not fit/score (e.g. few-shot exemplar answers in eval-format SFT). No-op for single-turn data. Overridable per source in `sources`/`eval_sources`. |
 | `eval_dataset` | str | `""` | Single validation dataset. Enables best-model tracking. Empty = no validation. Superseded by `eval_sources` when set. |
-| `eval_sources` | list | `[]` | Per-capability eval: each source is scored independently (no cross-contamination) and combined into a weighted composite for best-model tracking. Logged as `eval/<name>/loss` next to the composite `eval/loss`, and on the console log line as `eval=<composite> eval_sources=<name>:<loss>,...`. Per-source keys below. |
+| `eval_sources` | list | `[]` | Per-capability eval: each source is scored independently (no cross-contamination) and combined into a weighted composite for best-model tracking. Logged as `eval/<name>/loss` next to the composite `eval/loss`, and on the console log line as `eval=<composite> eval_sources=<name>:<loss>,...`. A source that cannot be read, has an unknown `mode` or gives no usable sample stops the run with a config error (it is never skipped). Per-source keys below. |
 | `eval_split` | str | `test` | Validation split. |
 | `eval_samples` | int | `200` | Number of validation samples (fixed subset). |
 | `eval_every` | int | `100` | Evaluate every N optimizer steps. |
-| `pretrain_replay_dataset` | str | `""` | Raw text (split `train`, field `text`, loss on every token) mixed into SFT. Empty = disabled. Not measured by us; for a chat model, replaying the model's own answers to general prompts (a second `sources` entry) reduced forgetting in our [measurements](../guides/data.md#what-the-measurements-say). |
-| `pretrain_replay_weight` | float | `0.1` | Per-example probability of drawing a replay document (not a token share: replay documents run up to `max_seq_length` tokens). |
+| `pretrain_replay_dataset` | str | `""` | Raw text (split `train`, field `text`, loss on every token, the tokenizer's EOS appended to every document) mixed into SFT. An epoch is one pass over the target data's rows, with the replay sequences drawn alongside. Empty = disabled. Not measured by us; for a chat model, replaying the model's own answers to general prompts (a second `sources` entry) reduced forgetting in our [measurements](../guides/data.md#what-the-measurements-say). |
+| `pretrain_replay_weight` | float | `0.1` | Per-sequence probability of drawing a replay sequence (not a token share: a replay document longer than `max_seq_length` is split into chunks of that length, each a sequence). |
 | `msft_tracking` | bool | `false` | **Not wired into training yet** (a warning is logged; weights stay fixed). Intended: adaptive per-source weight scheduling. |
 | `msft_eval_every` | int | `50` | Check per-source validation loss every N steps. |
 | `msft_decay_factor` | float | `0.7` | Weight multiplier when a source overfits. |
@@ -59,6 +62,18 @@
 | `msft_floor_ratio` | float | `0.1` | Minimum weight (fraction of original). Never fully excludes a source. |
 | `pretokenize` | bool | `false` | Materialize the fully-assembled stream (tokenize → mask → mix → pack) to disk once, then load the tensors directly on later runs — skips all per-step tokenization **and** gives the exact step count from the cache's row count. A fingerprint over tokenizer/template/`max_seq_length`/sources/masking auto-rebuilds a stale cache. Incompatible with `msft_tracking` (it changes the stream during training → hard error). |
 | `pretokenize_path` | str | `./pretokenized` | Directory for the pre-tokenized cache (`train.parquet` + `pretokenized_meta.json`). Must be on a shared filesystem for multi-node: rank 0 builds it, every rank reads it. |
+
+!!! note "`sources` per-source keys"
+    Each entry in `sources` accepts: `dataset`, `split` (default `train`), `name`, `weight`
+    (see `mix_weights`), `mode` (`sft`, the default, or `pretrain`), and per mode:
+
+    - **`mode: sft`**: `messages_field`, `tools_field`, `last_turn_only`, `think_tags`,
+      `chat_template_kwargs` (each overrides the `data` option of the same name).
+    - **`mode: pretrain`**: `text_field` (default `text`) and `append_eos` (default `true`):
+      the tokenizer's EOS token is appended to every document that does not already end
+      with it, as the last token of the document's last chunk, and is trained like any
+      other token. `append_eos: "<|endoftext|>"` names another token of the vocabulary
+      (for a chat model whose EOS is its end-of-turn token); `false` appends nothing.
 
 !!! note "Reasoning / thinking modes"
     `train_on_reasoning` is the **only** training-time control for `<think>` content:
@@ -84,11 +99,12 @@
     define a thinking branch?) and the `enable_thinking=` argument in your eval harness.
 
 !!! note "`eval_sources` per-source keys — and pick the right `mode`"
-    Each entry in `eval_sources` accepts: `name`, `dataset`, `split`, `weight`
+    Each entry in `eval_sources` accepts: `name`, `dataset` (a local `.jsonl`, `.json` or
+    `.parquet` file, a `pgs prepare` output directory, or a Hub dataset), `split`, `weight`
     (composite importance), `samples` (fixed subset size), `regression_floor`
     (optional alarm), and — mirroring the training `sources` — a **`mode`**:
 
-    - **`mode: pretrain`** (+ `text_field`): raw-text, all-token CE/ppl, **no chat
+    - **`mode: pretrain`** (+ `text_field`, `append_eos`): raw-text, all-token CE/ppl, **no chat
       template**. Use this for language-modeling eval (e.g. held-out Italian docs). It
       matches how CPT actually trains, so the number is a true next-token perplexity.
     - **`mode: sft`** (default, + `messages_field`, optional `last_turn_only`):
@@ -107,7 +123,6 @@
 |-----------|------|---------|-------------|
 | `output_dir` | str | `./checkpoints` | Where to save checkpoints and final model. Must be shared filesystem for multi-node. |
 | `resume_from` | str\|null | `null` | Checkpoint path to resume from. `"auto"` finds the latest valid checkpoint in `output_dir`. |
-| `stop_at` | int | `0` | Stop after this step (0 = run to `steps`). The LR schedule stays the one of `steps`, so a run can be done in chunks (`stop_at: 50`, then `resume_from: auto` with `stop_at: 100`, …) and follow one schedule; the stop step is evaluated and saved as a resumable `step_<stop_at>`, and `final` is written only at `steps`. |
 | `epochs` | int | `1` | Number of training epochs. |
 | `max_steps` | int | `-1` | Maximum optimizer steps. Overrides epochs if positive. When unset, the LR-schedule horizon (warmup + decay) is **estimated** from the data's row counts and a sample of rows through the pipeline (a few seconds, typically ±1–2%; streaming included), so training starts at once; see the data guide's "Run length and streaming". A Hub stream without published sizes, or a `ga_ramp`, needs `max_steps`. |
 | `exact_steps` | bool | `false` | Scan the whole assembled pipeline once to count the steps exactly instead of estimating them (an extra pass over the data before training; not possible when streaming). |
@@ -252,7 +267,7 @@ experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.
 
 ## preprocess
 
-Offline data preparation, driven by the **same config** as training (see the [Data Preparation guide](../guides/data.md)). `pgs prepare --config <file>` reuses `model.name_or_path`, `data.dataset`, `data.dataset_split`, `data.messages_field`, `data.max_seq_length` and the masking options of `data` — this section controls cleaning, selection and output. Nothing here runs the model unless `score` is set or a perplexity option needs it.
+Offline data preparation, driven by the **same config** as training (see the [Data Preparation guide](../guides/data.md)). With `mode: pretrain` entries in `data.sources`, `pgs prepare --config <file>` cleans each of them (exact and near-duplicate documents, n-gram decontamination, `min_chars`, `eval_holdout`, `max_samples`, `format`) into `output_dir/<source name>/` without loading a model, and logs the `data.sources` entries to train on; the other options of this section apply to conversations. See [Preparing the data](../guides/pretraining.md#preparing-the-data). `pgs prepare --config <file>` reuses `model.name_or_path`, `data.dataset`, `data.dataset_split`, `data.messages_field`, `data.max_seq_length` and the masking options of `data` — this section controls cleaning, selection and output. Nothing here runs the model unless `score` is set or a perplexity option needs it.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -260,7 +275,11 @@ Offline data preparation, driven by the **same config** as training (see the [Da
 | `output_dir` | str | `./prepared` | Where `pgs prepare` writes `scored_data.parquet`, `prepared_meta.json` and `dropped.jsonl`, and where training looks for the data. |
 | `format` | str | `parquet` | Output format. `parquet` (order-preserving, fast; falls back to jsonl if the sample schema can't be unified) or `jsonl`. |
 | `max_samples` | int | `0` | Cap on samples read from the raw dataset. 0 = all. |
-| `dedupe` | bool | `true` | Drop exact duplicate conversations (same messages and tool definitions; whitespace runs collapsed). The first row is kept. |
+| `dedupe` | bool | `true` | Drop exact duplicate conversations (same messages and tool definitions; whitespace runs collapsed). The first row is kept. Raw-text sources: documents whose text is the same up to case and whitespace. |
+| `near_dedupe` | float | `0.0` | Raw-text sources: also drop near-duplicate documents, those whose sets of word 5-grams have an estimated Jaccard similarity of at least this value (MinHash with 128 hashes; `0.8` is a common choice). The first document of a group is kept. 0 = off. Needs numpy. |
+| `decontaminate` | list | `[]` | Raw-text sources: files of the evaluation sets you will report (JSONL, JSON, parquet; any other file is read as plain text). A document that shares a run of `decontaminate_ngram` words with any string in them (every column, nested values included; case and punctuation ignored) is dropped. |
+| `decontaminate_ngram` | int | `13` | Words per decontamination n-gram. Evaluation strings shorter than this give no n-gram and protect nothing (the report counts them): lower it for short items. |
+| `min_chars` | int | `0` | Raw-text sources: drop documents with fewer characters. 0 = keep all. |
 | `max_per_prompt` | int | `0` | Keep at most N rows that share a system prompt and first user turn (a seeded random draw). 0 = no cap. |
 | `group_field` | str | `""` | Row column that names a row's group (e.g. `source`). The group caps apply per value, and `prepared_meta.json` profiles each group (rows, tokens, mean response tokens; when scored, median response NLL and familiarity buckets) before and after caps and selection. |
 | `max_per_group` | int | `0` | Keep at most N rows per `group_field` value. 0 = no cap. |
@@ -506,6 +525,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `tree_branch_tokens` | int | `8192` | agent_traces: padded tokens per batched forward of regenerated turns (0 = one at a time). |
 | `tree_min_gap` | int | `1024` | agent_traces: the context is cut at a turn only this far past the previous cut; turns in between re-read the gap in their batched forward (fewer, larger passes; exact). |
 | `resume_from` | str | `""` | A `step_*` checkpoint dir, or `auto`: the newest complete one in `output_dir`, starting fresh if there is none. |
+| `stop_at` | int | `0` | Stop after this step (0 = run to `steps`). The LR schedule stays the one of `steps`, so a run can be done in chunks (`stop_at: 50`, then `resume_from: auto` with `stop_at: 100`, …) and follow one schedule; the stop step is evaluated and saved as a resumable `step_<stop_at>`, and `final` is written only at `steps`. |
 
 ### logging
 

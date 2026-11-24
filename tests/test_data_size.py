@@ -301,8 +301,9 @@ def test_pretraining_splits_long_documents_and_the_estimate_counts_the_chunks(tm
 
     doc = " ".join(f"parola{i % 50}" for i in range(3000))  # several max_seq_length chunks
     chunks = PretrainDataset([], TOK, 256)._process({"text": doc})
-    ids = TOK(doc)["input_ids"]
+    ids = TOK(doc)["input_ids"] + [TOK.eos_token_id]  # the end-of-document token (append_eos, on by default)
     assert sum(c["input_ids"].numel() for c in chunks) == len(ids)  # nothing dropped
+    assert chunks[-1]["input_ids"][-1] == TOK.eos_token_id and chunks[-1]["labels"][-1] == TOK.eos_token_id
     assert all(c["input_ids"].numel() <= 256 for c in chunks) and len(chunks) == -(-len(ids) // 256)
 
     monkeypatch.setenv("PALINGENESIS_SIZE_SAMPLE", "400")

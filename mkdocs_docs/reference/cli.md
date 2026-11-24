@@ -206,11 +206,30 @@ Clean training data with the tokenizer alone: drop the rows training would drop 
     | `--budget N`, `--token_budget N` | Random subset of N rows / N tokens |
     | `--score`, `--min_ppl`, `--max_ppl`, `--strategy`, `--hes` | Scoring with the model: [experimental](../guides/data.md#scoring-with-the-model-experimental), off by default |
 
+Raw text (`mode: pretrain` sources) is cleaned without a model:
+
+```bash
+pgs prepare --data raw_corpus.jsonl --output prepared/corpus --mode pretrain \
+    --near_dedupe 0.8 --decontaminate benchmarks/*.jsonl --min_chars 200 --eval_holdout 500
+```
+
+| Flag | Raw text (`--mode pretrain`) |
+|------|------|
+| `--text_field` | The text column (default `text`) |
+| `--no_dedupe` | Keep exact duplicate documents (same text up to case and whitespace) |
+| `--near_dedupe T` | Drop near-duplicates at or above Jaccard similarity T of the word 5-gram sets (MinHash; 0 = off) |
+| `--decontaminate FILE...`, `--decontaminate_ngram N` | Drop documents sharing an N-word n-gram (default 13) with any string of the evaluation files |
+| `--min_chars N` | Drop documents shorter than N characters |
+| `--eval_holdout N` | Hold out N whole documents, drawn after deduplication (`eval_data.*`) |
+| `--model` | Optional: only to report token counts |
+
+`pgs prepare --config cpt.yaml` does the same for every `mode: pretrain` entry of `data.sources`, with the options of the [`preprocess`](configuration.md#preprocess) section. See the [pretraining guide](../guides/pretraining.md#preparing-the-data).
+
 See the [Data Preparation guide](../guides/data.md) for the full workflow.
 
 ### prepare-multi
 
-Prepares each source of a sources file on its own and writes `manifest.json` with every source's rows, tokens and share of examples and of tokens at its weight.
+Prepares each source of a sources file on its own and writes `manifest.json` with every source's rows, tokens and share of examples and of tokens at its weight. Raw-text sources (`mode: pretrain`) are cleaned like `pgs prepare --mode pretrain`: `--decontaminate`, `--decontaminate_ngram`, `--near_dedupe` and `--min_chars` apply to them (`near_dedupe`, `min_chars` and `eval_holdout` can also be set per source).
 
 ```bash
 pgs prepare-multi --model Qwen/Qwen3.5-4B --sources sources.yaml --output prepared/

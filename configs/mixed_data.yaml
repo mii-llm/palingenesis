@@ -37,6 +37,9 @@ data:
       weight: 0.05
       mode: pretrain
       text_field: text
+      # every document ends with this token; the default is the tokenizer's EOS, which for an
+      # instruction-tuned tokenizer is the end-of-turn token
+      append_eos: "<|end_of_text|>"
 
 train:
   output_dir: ./checkpoints/mixed-agentic

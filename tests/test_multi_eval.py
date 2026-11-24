@@ -96,12 +96,17 @@ def test_multi_eval_with_real_model():
     device = torch.device("cpu")
     model = TinyModel(vocab=tokenizer.vocab_size, hidden=32)
 
-    evaluator = MultiEvaluator(eval_sources, tokenizer, max_seq_length=128, device=device)
+    if not getattr(tokenizer, "chat_template", None):
+        # GPT-2 has no chat template: no row can be rendered, and a configured source that gives
+        # nothing is an error, not a silently missing evaluation
+        import pytest
 
-    if not evaluator.sources or not evaluator.sources[0]["batches"]:
-        print("  Skipped (tokenizer lacks chat template — expected for GPT-2)")
-        print("✓ test_multi_eval_with_real_model SKIPPED\n")
+        from palingenesis.config import ConfigError
+
+        with pytest.raises(ConfigError, match="source .test_source.*(could not be read|no usable sample)"):
+            MultiEvaluator(eval_sources, tokenizer, max_seq_length=128, device=device)
         return
+    evaluator = MultiEvaluator(eval_sources, tokenizer, max_seq_length=128, device=device)
 
     result = evaluator.evaluate(model, dtype=torch.float32)
 
@@ -164,26 +169,78 @@ def test_multi_eval_pretrain_mode():
     print("✓ test_multi_eval_pretrain_mode PASSED\n")
 
 
-def test_multi_eval_unknown_mode_skips():
-    """An unknown mode is skipped gracefully rather than crashing."""
+def _gpt2():
+    import pytest
+    from transformers import AutoTokenizer
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    except Exception:
+        pytest.skip("gpt2 tokenizer not cached (offline)")
+    tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def test_multi_eval_misconfigured_sources_are_errors(tmp_path):
+    """A configured eval source is never skipped: an unknown mode, a missing file, a file of another
+    format and a wrong text field are ConfigErrors that name the source."""
     import json
-    import tempfile
+
+    import pytest
+
+    from palingenesis.config import ConfigError
 
     class FakeTok:
         pad_token_id = 0
+        eos_token_id = 1
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-        f.write(json.dumps({"text": "x"}) + "\n")
-        p = f.name
+    path = tmp_path / "docs.jsonl"
+    path.write_text(json.dumps({"text": "x"}) + "\n")
 
-    ev = MultiEvaluator(
-        [{"name": "bad", "dataset": p, "mode": "nonsense", "weight": 1.0, "samples": 1, "split": "train"}],
-        FakeTok(),
-        max_seq_length=32,
-        device=torch.device("cpu"),
-    )
-    assert ev.sources[0]["batches"] == []
-    print("✓ test_multi_eval_unknown_mode_skips PASSED\n")
+    def build(tokenizer=None, **src):
+        entry = {"name": "bad", "dataset": str(path), "weight": 1.0, "samples": 1, "split": "train", **src}
+        return MultiEvaluator([entry], tokenizer or FakeTok(), max_seq_length=32, device=torch.device("cpu"))
+
+    with pytest.raises(ConfigError, match="source 'bad' has mode 'nonsense'"):
+        build(mode="nonsense")
+    with pytest.raises(ConfigError, match="source 'bad'.*cannot load"):
+        build(mode="pretrain", dataset=str(tmp_path / "missing.jsonl"))
+    other = tmp_path / "docs.csv"
+    other.write_text("text\nx\n")
+    with pytest.raises(ConfigError, match="not a .jsonl, .json or .parquet file"):
+        build(mode="pretrain", dataset=str(other))
+    with pytest.raises(ConfigError, match="gives no usable sample.*text_field"):
+        build(tokenizer=_gpt2(), mode="pretrain", text_field="body")
+
+
+def test_multi_eval_reads_local_parquet_and_json(tmp_path):
+    """Held-out sets in parquet (and a JSON list) are read like JSONL: the same batches, the same loss."""
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tokenizer = _gpt2()
+    docs = [{"text": f"Il documento numero {i} parla di treni e di stazioni. " * 3, "id": i} for i in range(6)]
+    jsonl = tmp_path / "held.jsonl"
+    jsonl.write_text("".join(json.dumps(d) + "\n" for d in docs))
+    parquet = tmp_path / "held.parquet"
+    pq.write_table(pa.Table.from_pylist(docs), parquet, row_group_size=2)
+    as_json = tmp_path / "held.json"
+    as_json.write_text(json.dumps(docs))
+
+    model = TinyModel(vocab=tokenizer.vocab_size, hidden=32)
+    losses = {}
+    for path in (jsonl, parquet, as_json):
+        source = {"name": "held", "dataset": str(path), "mode": "pretrain", "weight": 1.0, "samples": 6}
+        evaluator = MultiEvaluator([source], tokenizer, max_seq_length=128, device=torch.device("cpu"))
+        assert sum(b["input_ids"].shape[0] for b in evaluator.sources[0]["batches"]) == 6
+        result = evaluator.evaluate(model, dtype=torch.float32)
+        losses[path.suffix] = (result.per_source["held"], result.tokens_total)
+    assert losses[".parquet"] == losses[".jsonl"] == losses[".json"]
+    # every document ends with the EOS token, and it is scored
+    last = evaluator.sources[0]["batches"][0]
+    assert (last["labels"] == tokenizer.eos_token_id).sum() == last["input_ids"].shape[0]
 
 
 def test_multi_eval_best_model_integration():
@@ -223,7 +280,6 @@ if __name__ == "__main__":
     test_multi_eval_regression_detection()
     test_multi_eval_with_real_model()
     test_multi_eval_pretrain_mode()
-    test_multi_eval_unknown_mode_skips()
     test_multi_eval_best_model_integration()
 
     print("=" * 60)

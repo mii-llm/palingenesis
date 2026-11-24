@@ -963,6 +963,149 @@ def prepare_data(
     return out_file
 
 
+def prepare_text(
+    data_path: str,
+    output_path: str,
+    text_field: str = "text",
+    max_samples: int | None = None,
+    dataset_split: str = "train",
+    output_format: str = "parquet",
+    dedupe: bool = True,
+    near_dedupe: float = 0.0,
+    decontaminate: list[str] | tuple[str, ...] = (),
+    decontaminate_ngram: int = 13,
+    min_chars: int = 0,
+    eval_holdout: int = 0,
+    seed: int = 42,
+    tokenizer=None,
+    bench=None,
+) -> Path:
+    """Clean a raw-text dataset (a `mode: pretrain` source) without a model.
+
+    1. Load the rows; drop the ones without text in `text_field` and, with min_chars, the
+       documents shorter than that many characters
+    2. Drop the documents that share a word n-gram of `decontaminate_ngram` words with any
+       string of the `decontaminate` files (the evaluation sets you will report)
+    3. Drop exact duplicates (dedupe: the same text up to case and whitespace) and, with
+       near_dedupe > 0, near-duplicates (estimated Jaccard similarity of the word 5-gram sets
+       at or above that value); the first document of a group is kept
+    4. Reserve eval_holdout whole documents, drawn at random after deduplication, as a
+       held-out set
+    5. Save the dataset (parquet or jsonl), prepared_meta.json (the counts per reason, text
+       and token totals) and dropped.jsonl (every removed row, its reason and, for a
+       duplicate, the row that was kept)
+
+    The checks are palingenesis.text_clean's. tokenizer: optional, only to report token
+    counts (each kept document is tokenized once). bench: a text_clean.NgramIndex built
+    already (prepare_multi_source shares one across sources) instead of `decontaminate`.
+
+    Returns the path to the prepared dataset file; a data source can point at the output
+    directory (`dataset: <output_path>`).
+    """
+    from palingenesis.data_clean import ROW_INDEX, CleanReport
+    from palingenesis.text_clean import NgramIndex, clean_documents, words
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    if not 0.0 <= near_dedupe <= 1.0:
+        raise ValueError(f"near_dedupe must be in [0, 1] (a Jaccard similarity; 0 = off), got {near_dedupe}")
+    if bench is None and decontaminate:
+        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram)
+        logger.info(
+            f"Decontamination: {len(bench.hashes):,} {bench.n}-word n-grams from {bench.strings:,} strings in "
+            f"{len(bench.files)} file(s) ({bench.too_short:,} strings shorter than {bench.n} words give none)"
+        )
+
+    logger.info(f"Loading raw text from: {data_path} (split={dataset_split}, field={text_field!r})")
+    samples = load_samples(str(data_path), dataset_split, max_samples)
+    for i, s in enumerate(samples):
+        s[ROW_INDEX] = i
+    report = CleanReport(loaded=len(samples))
+    samples = clean_documents(
+        samples,
+        report,
+        text_field=text_field,
+        dedupe=dedupe,
+        near_dedupe=near_dedupe,
+        bench=bench,
+        min_chars=min_chars,
+        seed=seed,
+    )
+    if not samples:
+        raise ValueError(
+            f"Preparation produced 0 documents after cleaning (loaded {report.loaded}, removed: "
+            f"{dict(report.reasons)}). Check that text_field={text_field!r} names the text column."
+        )
+
+    eval_samples: list[dict] = []
+    if eval_holdout:
+        if eval_holdout >= len(samples):
+            raise ValueError(
+                f"eval_holdout={eval_holdout} is not below the {len(samples)} documents left after cleaning"
+            )
+        held = set(random.Random(seed).sample(range(len(samples)), eval_holdout))
+        eval_samples = [s for i, s in enumerate(samples) if i in held]
+        samples = [s for i, s in enumerate(samples) if i not in held]
+
+    out_file = save_prepared(samples, output_path, output_format)
+    eval_file: Path | None = None
+    if eval_samples:
+        eval_file = save_prepared(eval_samples, output_path, output_format, basename=EVAL_BASENAME)
+        logger.info(f"Eval holdout: {eval_file} ({len(eval_samples)} documents)")
+    dropped_file = report.write(output_path)
+
+    tokens: dict = {}
+    if tokenizer is not None:
+        lengths: list[int] = []
+        for start in range(0, len(samples), 1000):
+            batch = [s[text_field] for s in samples[start : start + 1000]]
+            lengths.extend(len(ids) for ids in tokenizer(batch, add_special_tokens=True)["input_ids"])
+        lengths.sort()
+        tokens = {
+            "total": sum(lengths),
+            "trained": sum(lengths),
+            "trained_share": 1.0,
+            "length_p50": lengths[len(lengths) // 2],
+            "length_p95": lengths[min(int(len(lengths) * 0.95), len(lengths) - 1)],
+            "length_max": lengths[-1],
+        }
+    meta = {
+        "mode": "pretrain",
+        "source_dataset": str(data_path),
+        "dataset_split": dataset_split,
+        "text_field": text_field,
+        "seed": seed,
+        "num_samples": len(samples),
+        "format": out_file.suffix.lstrip("."),
+        "output_file": str(out_file),
+        "scored": False,
+        "cleaning": report.summary(),
+        "dropped_file": str(dropped_file),
+        "dedupe": dedupe,
+        "near_dedupe": near_dedupe,
+        "min_chars": min_chars,
+        "decontamination": bench.summary() if bench is not None else None,
+        "text": {
+            "chars": sum(len(s[text_field]) for s in samples),
+            "words": sum(len(words(s[text_field])) for s in samples),
+        },
+        "tokens": tokens,
+        "eval_holdout": len(eval_samples),
+        "eval_file": str(eval_file) if eval_file else None,
+    }
+    with (Path(output_path) / PREPARED_META).open("w") as f:
+        json.dump(meta, f, indent=2)
+    logger.info(
+        f"Cleaning: {report.loaded} loaded, removed {dict(sorted(report.reasons.items())) or 'none'} "
+        f"(every removed row: {dropped_file})"
+    )
+    logger.info(
+        f"Output: {out_file} ({len(samples)} documents, {meta['text']['words']:,} words"
+        + (f", {tokens['total']:,} tokens" if tokens else "")
+        + ")"
+    )
+    return out_file
+
+
 def compute_hes_scores(
     model_name: str,
     samples: list[dict],
@@ -998,8 +1141,13 @@ def prepare_multi_source(
     batch_size: int = 4,
     max_batch_tokens: int = 16384,
     num_workers: int = 0,
+    decontaminate: list[str] | tuple[str, ...] = (),
+    decontaminate_ngram: int = 13,
+    near_dedupe: float = 0.0,
+    min_chars: int = 0,
 ):
-    """Prepare several data sources, each on its own (prepare_data per source, one model).
+    """Prepare several data sources, each on its own (prepare_data per chat source,
+    prepare_text per raw-text source, one model).
 
     Creates:
       - {output_path}/{source_name}/scored_data.jsonl (+ prepared_meta.json, dropped.jsonl)
@@ -1020,12 +1168,16 @@ def prepare_multi_source(
             - budget: per-source budget override (optional)
             - messages_field: field containing messages (default "messages")
             - tools_field, last_turn_only: as in data.sources
+            - mode: "sft" (default) or "pretrain": a raw-text source is cleaned by prepare_text
+              (text_field; near_dedupe, min_chars and eval_holdout may be set per source)
         output_path: Base output directory
         max_seq_length: Max sequence length
         budget_per_source: Default budget per source (None = use all)
         strategy: Selection strategy per source
         compute_hes, hes_top_k_pct, score, min_ppl, max_ppl, batch_size, max_batch_tokens,
             num_workers: as in prepare_data
+        decontaminate, decontaminate_ngram, near_dedupe, min_chars: for the raw-text sources,
+            as in prepare_text (the evaluation n-grams are read once for all of them)
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     if strategy not in STRATEGIES:
@@ -1039,6 +1191,11 @@ def prepare_multi_source(
         "sources": [],
     }
     scorer = Scorer(model_name)
+    bench = None
+    if decontaminate and any(s.get("mode", "sft") == "pretrain" for s in sources):
+        from palingenesis.text_clean import NgramIndex
+
+        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram)
 
     for src_config in sources:
         name = src_config.get("name", src_config.get("dataset", "unknown"))
@@ -1047,13 +1204,38 @@ def prepare_multi_source(
 
         logger.info(f"\n{'=' * 60}")
         logger.info(f"Processing source: {name} (dataset={dataset_id}, weight={weight})")
-        if src_config.get("mode", "sft") != "sft":
-            logger.warning(
-                f"  Source '{name}' is mode={src_config['mode']}: only chat (sft) sources are prepared, skipped"
-            )
-            continue
+        mode = src_config.get("mode", "sft")
+        if mode not in ("sft", "pretrain"):
+            raise ValueError(f"Source '{name}': mode must be sft or pretrain, got {mode!r}")
 
         src_output = output_base / name.replace("/", "_").replace(" ", "_")
+        if mode == "pretrain":
+            out_file = prepare_text(
+                dataset_id,
+                str(src_output),
+                text_field=src_config.get("text_field", "text"),
+                dataset_split=src_config.get("split", "train"),
+                output_format="jsonl",
+                near_dedupe=src_config.get("near_dedupe", near_dedupe),
+                min_chars=src_config.get("min_chars", min_chars),
+                eval_holdout=src_config.get("eval_holdout", 0),
+                tokenizer=scorer.tokenizer,
+                bench=bench,
+            )
+            meta = json.loads((src_output / PREPARED_META).read_text())
+            manifest["sources"].append(
+                {
+                    "name": name,
+                    "dataset": dataset_id,
+                    "mode": "pretrain",
+                    "output_path": str(out_file),
+                    "num_samples": meta["num_samples"],
+                    "weight": weight,
+                    "tokens": meta["tokens"],
+                    "cleaning": meta["cleaning"],
+                }
+            )
+            continue
         out_file = prepare_data(
             model_name,
             dataset_id,
@@ -1116,8 +1298,13 @@ def prepare_from_config(config) -> Path:
     data.max_seq_length, the data options that decide how a row is rendered and masked,
     and the preprocess: section. Training with preprocess.enabled=true then picks the
     output up automatically from preprocess.output_dir.
+
+    A config with data.sources: its raw-text sources are cleaned instead
+    (prepare_text_sources_from_config).
     """
     pre = config.preprocess
+    if any(isinstance(s, dict) and s.get("mode") == "pretrain" for s in config.data.sources):
+        return prepare_text_sources_from_config(config)
     return prepare_data(
         model_name=config.model.name_or_path,
         data_path=config.data.dataset,
@@ -1157,6 +1344,53 @@ def prepare_from_config(config) -> Path:
     )
 
 
+def prepare_text_sources_from_config(config) -> Path:
+    """Clean every `mode: pretrain` entry of data.sources (prepare_text) into
+    preprocess.output_dir/<source name>/, with the preprocess: options dedupe, near_dedupe,
+    decontaminate, decontaminate_ngram, min_chars, max_samples, eval_holdout, format. Chat
+    sources are left to `pgs prepare-multi`. Logs the data.sources entries to train on (the
+    same entries, `dataset` pointing at the cleaned output) and returns the output directory.
+    """
+    from palingenesis.text_clean import NgramIndex
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    pre = config.preprocess
+    text_sources = [(i, s) for i, s in enumerate(config.data.sources) if s.get("mode", "sft") == "pretrain"]
+    if not text_sources:
+        raise ValueError(
+            "pgs prepare --config: data.sources has no `mode: pretrain` source to clean. Chat sources are "
+            "prepared with `pgs prepare-multi --sources <yaml>` (or one dataset through data.dataset)."
+        )
+    skipped = len(config.data.sources) - len(text_sources)
+    if skipped:
+        logger.warning(f"{skipped} chat source(s) of data.sources are not prepared here: use pgs prepare-multi")
+    output_base = Path(pre.output_dir)
+    bench = NgramIndex.from_files(pre.decontaminate, pre.decontaminate_ngram) if pre.decontaminate else None
+    cleaned = []
+    for i, src in text_sources:
+        name = str(src.get("name") or Path(str(src["dataset"])).stem or f"source{i}")
+        src_output = output_base / name.replace("/", "_").replace(" ", "_")
+        prepare_text(
+            src["dataset"],
+            str(src_output),
+            text_field=src.get("text_field", "text"),
+            max_samples=pre.max_samples or None,
+            dataset_split=src.get("split", "train"),
+            output_format=pre.format,
+            dedupe=pre.dedupe,
+            near_dedupe=pre.near_dedupe,
+            min_chars=pre.min_chars,
+            eval_holdout=pre.eval_holdout,
+            seed=config.data.seed,
+            bench=bench,
+        )
+        cleaned.append({**src, "dataset": str(src_output)})
+    logger.info("Cleaned raw-text sources; train on them with these data.sources entries:")
+    for entry in cleaned:
+        logger.info(f"  - {json.dumps(entry, ensure_ascii=False)}")
+    return output_base
+
+
 def main():
     """CLI entry point for data preparation.
 
@@ -1179,10 +1413,39 @@ def main():
         description="Clean SFT data (broken rows, duplicates), hold out an eval set and select a budget; "
         "optionally score it with the model (response perplexity)"
     )
-    parser.add_argument("--model", required=True, help="Model name/path (its tokenizer; its weights only for scoring)")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model name/path (its tokenizer; its weights only for scoring). Optional with --mode pretrain, "
+        "where it is only used to report token counts",
+    )
     parser.add_argument("--data", required=True, help="Data path (JSONL, JSON, parquet, or HF dataset)")
     parser.add_argument("--output", default="./prepared", help="Output directory")
     parser.add_argument("--messages_field", default="messages", help="Field containing messages")
+    parser.add_argument(
+        "--mode",
+        default="sft",
+        choices=["sft", "pretrain"],
+        help="sft: conversations (default). pretrain: raw text (--text_field): exact and near-duplicate "
+        "documents, n-gram decontamination; no model needed",
+    )
+    parser.add_argument("--text_field", default="text", help="Text column of a raw-text dataset (--mode pretrain)")
+    parser.add_argument(
+        "--near_dedupe",
+        type=float,
+        default=0.0,
+        help="--mode pretrain: drop near-duplicate documents at or above this Jaccard similarity of their word "
+        "5-gram sets (MinHash; 0 = off, 0.8 is a common choice)",
+    )
+    parser.add_argument(
+        "--decontaminate",
+        nargs="*",
+        default=[],
+        help="--mode pretrain: evaluation files (JSONL, JSON, parquet, text); documents sharing a word n-gram "
+        "with any string in them are dropped",
+    )
+    parser.add_argument("--decontaminate_ngram", type=int, default=13, help="Words per decontamination n-gram")
+    parser.add_argument("--min_chars", type=int, default=0, help="--mode pretrain: drop documents shorter than this")
     parser.add_argument("--max_samples", type=int, help="Max samples to process")
     parser.add_argument("--max_seq_length", type=int, default=8192)
     parser.add_argument("--budget", type=int, help="Target number of samples to select")
@@ -1240,6 +1503,34 @@ def main():
         help="PPL score used by the outlier filter (response=assistant tokens only, full=all tokens)",
     )
     args = parser.parse_args()
+
+    if args.mode == "pretrain":
+        tokenizer = None
+        if args.model:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        prepare_text(
+            args.data,
+            args.output,
+            text_field=args.text_field,
+            max_samples=args.max_samples,
+            dataset_split=args.split,
+            output_format=args.format,
+            dedupe=not args.no_dedupe,
+            near_dedupe=args.near_dedupe,
+            decontaminate=args.decontaminate,
+            decontaminate_ngram=args.decontaminate_ngram,
+            min_chars=args.min_chars,
+            eval_holdout=args.eval_holdout,
+            seed=args.seed,
+            tokenizer=tokenizer,
+        )
+        return
+    if not args.model:
+        parser.error("--model is required (except with --mode pretrain)")
+    if args.near_dedupe or args.decontaminate or args.min_chars:
+        parser.error("--near_dedupe, --decontaminate and --min_chars clean raw text: add --mode pretrain")
 
     prepare_data(
         model_name=args.model,

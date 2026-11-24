@@ -428,7 +428,6 @@ def test_prepare_multi_reports_row_and_token_shares(tmp_path, monkeypatch):
     sources = [
         {"name": "short", "dataset": str(short), "weight": 1.0},
         {"name": "long", "dataset": _write(tmp_path, long_rows), "weight": 1.0, "budget": 4},
-        {"name": "text", "dataset": "unused", "mode": "pretrain"},
     ]
     prepare.prepare_multi_source("fake", sources, str(tmp_path / "out"))
 

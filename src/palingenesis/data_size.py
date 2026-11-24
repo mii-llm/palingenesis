@@ -477,6 +477,15 @@ class SourceEstimate:
     examples_error: float = 0.0  # standard error of examples_per_row
     tokens_per_row: float = 0.0  # tokens a row yields (all its examples)
     tokens_error: float = 0.0
+    yield_share: float = 1.0  # share of the rows that yield at least one example
+    counted: bool = True  # its rows count towards the epoch of a mix (false: replay drawn alongside)
+
+    @property
+    def sequences_per_row(self) -> float:
+        """Examples a row that yields any gives: 1 for chat rows, the chunks of a raw-text document."""
+        if self.examples_per_row <= 0 or self.yield_share <= 0:
+            return 1.0
+        return max(1.0, self.examples_per_row / self.yield_share)
 
     def draw_rows(self, rng: random.Random, n: int) -> list[list[int]]:
         """n rows' example lengths, drawn as the population's rows would be: a size bin by its
@@ -521,17 +530,33 @@ class StepEstimate:
         return "; ".join(parts)
 
 
+def sequence_weight(source: SourceEstimate, unit: str) -> float:
+    """The source's weight as a share of the training sequences, given what it is a share of
+    (palingenesis.data.MixedDataset.weight_unit): "sequences" (as it is), "tokens" (divided by
+    the mean tokens of a sequence) or "rows" (times the sequences a row gives)."""
+    if unit == "tokens":
+        return source.weight * source.examples_per_row / source.tokens_per_row if source.tokens_per_row > 0 else 0.0
+    if unit == "rows":
+        return source.weight * source.sequences_per_row
+    return source.weight
+
+
 def mixture_epoch(
-    sources: list[SourceEstimate], world_size: int, epoch_examples: float | None = None
+    sources: list[SourceEstimate], world_size: int, epoch_rows: float | None = None
 ) -> tuple[float, list[float]]:
-    """(examples per rank per epoch, mixture probabilities). `epoch_examples` given (the
-    MixedDataset draws of data.mix_epoch "total"): that. Otherwise the epoch ends when the
-    first source with a known size runs out: source i lasts rows_i * examples_per_row_i / p_i
-    draws."""
+    """(examples per rank per epoch, mixture probabilities). The weights are shares of the
+    examples (sequence_weight converts the other units). `epoch_rows` given (the MixedDataset
+    rows of data.mix_epoch "total", per rank): the examples drawn until that many rows of the
+    counted sources are finished, a row of source i taking sequences_per_row_i draws from it.
+    Otherwise the epoch ends when the first source with a known size runs out: source i lasts
+    rows_i * examples_per_row_i / p_i draws."""
     total = sum(s.weight for s in sources if s.examples_per_row > 0)
     probs = [(s.weight / total if s.examples_per_row > 0 else 0.0) for s in sources]
-    if epoch_examples is not None:
-        return epoch_examples, probs
+    if epoch_rows is not None:
+        rows_per_draw = sum(p / s.sequences_per_row for s, p in zip(sources, probs) if s.counted)
+        if rows_per_draw <= 0:
+            raise ValueError("no data source yields a training example: check the sources' fields and formats")
+        return epoch_rows / rows_per_draw, probs
     lasts = [
         s.rows * s.examples_per_row / world_size / p for s, p in zip(sources, probs) if p > 0 and s.rows is not None
     ]
@@ -572,9 +597,9 @@ def estimate_steps(
     packing: bool,
     max_len: int,
     seed: int = 0,
-    epoch_examples: float | None = None,
+    epoch_rows: float | None = None,
 ) -> StepEstimate:
-    examples, probs = mixture_epoch(sources, world_size, epoch_examples)
+    examples, probs = mixture_epoch(sources, world_size, epoch_rows)
     live = [(s, p) for s, p in zip(sources, probs) if p > 0]
     if packing:
         # sequences = tokens / (max_len * fill): tokens per example from the stratified
@@ -623,6 +648,7 @@ def measure_source(
         sample = Sample(sample.rows[:n], sample.sizes[:n], sample.weights[:n], sample.uniform)
     examples, examples_error = stratified_mean(sample, [len(r) for r in per_row], population)
     tokens, tokens_error = stratified_mean(sample, [sum(r) for r in per_row], population)
+    yield_share, _ = stratified_mean(sample, [float(bool(r)) for r in per_row], population)
     lengths = [n for r in per_row for n in r]
     return SourceEstimate(
         name,
@@ -637,6 +663,7 @@ def measure_source(
         examples_error,
         tokens,
         tokens_error,
+        yield_share,
     )
 
 

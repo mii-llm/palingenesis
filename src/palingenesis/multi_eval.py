@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
+from palingenesis.config import ConfigError
 from palingenesis.logits import scored_ce_sum
 from palingenesis.loss import shift_labels
 from palingenesis.multimodal import forward_kwargs
@@ -23,6 +24,70 @@ from palingenesis.multimodal import forward_kwargs
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
+
+
+class _JsonlRows:
+    """Rows of a local JSONL file, read again on every iteration."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __iter__(self):
+        import json
+
+        with self.path.open() as f:
+            for line in f:
+                if line.strip():
+                    yield json.loads(line)
+
+
+class _ParquetRows:
+    """Rows of a local parquet file, read batch by batch (pyarrow, imported when read)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __iter__(self):
+        import pyarrow.parquet as pq
+
+        for batch in pq.ParquetFile(self.path).iter_batches(batch_size=256):
+            yield from batch.to_pylist()
+
+
+def open_eval_rows(dataset: str, split: str = "test", name: str = ""):
+    """The rows of an eval source: a local .jsonl, .json (a list of rows) or .parquet file, a
+    directory written by `pgs prepare`, or a Hub dataset (its `split`). Raises ConfigError
+    when there is nothing to read there."""
+    from pathlib import Path
+
+    label = f"source '{name or dataset}'"
+    if not dataset:
+        raise ConfigError(f"data.eval_sources: {label} has no `dataset`.")
+    path = Path(dataset)
+    if path.is_file():
+        if path.suffix == ".parquet":
+            return _ParquetRows(path)
+        if path.suffix == ".jsonl":
+            return _JsonlRows(path)
+        if path.suffix == ".json":
+            import json
+
+            rows = json.loads(path.read_text())
+            if not isinstance(rows, list):
+                raise ConfigError(f"data.eval_sources: {label}: {path} must hold a list of rows.")
+            return rows
+        raise ConfigError(
+            f"data.eval_sources: {label}: {path} is not a .jsonl, .json or .parquet file (got {path.suffix!r})."
+        )
+    try:
+        from palingenesis.data import _load_dataset_source
+
+        return _load_dataset_source(dataset, split, streaming=True)
+    except Exception as e:
+        raise ConfigError(
+            f"data.eval_sources: {label}: cannot load {dataset!r} (split {split!r}) as a local file or a Hub "
+            f"dataset: {type(e).__name__}: {e}"
+        ) from e
 
 
 @dataclass(slots=True)
@@ -98,35 +163,15 @@ class MultiEvaluator:
         logger.info(f"MultiEvaluator: {len(self.sources)} sources: {list(zip(source_names, source_weights))}")
 
     def _load_source(self, src_config: dict, tokenizer, max_seq_length: int, max_samples: int) -> list[dict]:
-        """Load and pre-collect eval batches for one source."""
+        """Load and pre-collect eval batches for one source.
+
+        A source that cannot be read, has an unknown mode or gives no usable sample is a
+        ConfigError: an evaluation set that was configured and silently left out would let a
+        run report a composite that is not the one asked for."""
         from palingenesis.data import ChatDataset, _collate_fn
 
-        dataset_path = src_config.get("dataset", "")
-        split = src_config.get("split", "test")
-
-        try:
-            from datasets import load_dataset
-
-            raw = load_dataset(dataset_path, split=split, streaming=True)
-        except Exception:
-            # Try as local JSONL
-            import json
-            from pathlib import Path
-
-            path = Path(dataset_path)
-            if path.exists():
-
-                class LocalDataset:
-                    def __iter__(self_inner):
-                        with path.open() as f:
-                            for line in f:
-                                if line.strip():
-                                    yield json.loads(line)
-
-                raw = LocalDataset()
-            else:
-                logger.warning(f"MultiEval: cannot load source '{dataset_path}', skipping")
-                return []
+        name = src_config.get("name", src_config.get("dataset", "?"))
+        raw = open_eval_rows(src_config.get("dataset", ""), src_config.get("split", "test"), name)
 
         # mode mirrors the training `sources`: "sft" = chat-templated messages with
         # assistant-only loss; "pretrain" = raw text with all-token loss (no template).
@@ -143,6 +188,7 @@ class MultiEvaluator:
                 text_field=src_config.get("text_field", "text"),
                 rank=0,
                 world_size=1,
+                append_eos=src_config.get("append_eos", True),
             )
         elif mode == "sft":
             ds = ChatDataset(
@@ -156,23 +202,26 @@ class MultiEvaluator:
                 tools_field=src_config.get("tools_field", "tools"),
             )
         else:
-            logger.warning(f"MultiEval: unknown mode '{mode}' for source '{src_config.get('name', '?')}', skipping")
-            return []
+            raise ConfigError(f"data.eval_sources: source '{name}' has mode {mode!r}; use sft or pretrain.")
 
         batches = []
-        count = 0
         try:
             for sample in ds:
                 batches.append(sample)
-                count += 1
-                if count >= max_samples:
+                if len(batches) >= max_samples:
                     break
         except Exception as e:
-            logger.warning(f"MultiEval: error loading source '{src_config.get('name', '?')}': {e}")
-            return []
+            raise ConfigError(
+                f"data.eval_sources: source '{name}' ({src_config.get('dataset', '')}) could not be read: "
+                f"{type(e).__name__}: {e}"
+            ) from e
 
         if not batches:
-            return []
+            field_name = "text_field" if mode == "pretrain" else "messages_field"
+            raise ConfigError(
+                f"data.eval_sources: source '{name}' ({src_config.get('dataset', '')}) gives no usable sample "
+                f"in mode {mode}. Check its {field_name}, mode and split."
+            )
 
         # Collate into mini-batches of 4
         pad_id = tokenizer.pad_token_id or 0

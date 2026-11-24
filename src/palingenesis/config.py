@@ -28,6 +28,12 @@ class ModelConfig:
     compile: bool = True
     compile_backend: str = "inductor"
     compile_mode: str = "default"  # "default", "reduce-overhead", or "max-autotune"
+    # Where the weights come from. "pretrained": the checkpoint at name_or_path. "random": the architecture of
+    # name_or_path's config.json with freshly initialised weights (training from scratch); name_or_path then needs
+    # only config.json and the tokenizer files, and any weights there are ignored. `pgs train` only.
+    init: str = "pretrained"
+    # Seed of the random initialisation (the same on every rank). -1: train.seed.
+    init_seed: int = -1
 
 
 @dataclass(slots=True)
@@ -51,14 +57,24 @@ class DataConfig:
     length_group_buffer: int = 512
     seed: int = 42
     # Multi-dataset mode: list of source dicts
-    # Each: {dataset, split, weight, mode("sft"|"pretrain"), messages_field|text_field}
+    # Each: {dataset, split, weight, mode("sft"|"pretrain"), messages_field|text_field}. Raw text (mode: pretrain)
+    # also takes append_eos: true (default: the tokenizer's EOS token ends every document), a token string
+    # (that token instead, e.g. "<|endoftext|>"), or false.
     sources: list = field(default_factory=list)
-    # What an epoch of data.sources is. "total": as many examples as the sources hold together,
+    # What an epoch of data.sources is. "total": as many rows as the sources hold together,
     # drawn by weight (a source weighted above its share of the rows is repeated, one below
     # it contributes a fresh random subset each epoch); a source without a weight gets its
-    # share of the rows, so unweighted sources behave like one shuffled concatenation.
+    # share of the rows, so unweighted sources behave like one shuffled concatenation. A row
+    # counts when its last training sequence is drawn: a raw-text document split into several
+    # chunks counts once, with all its chunks (one raw-text source: one pass over every chunk).
     # "first_exhausted": the epoch ends when a source runs out (sizes unknown fall back to it).
     mix_epoch: str = "total"
+    # What the `weight` of a data source is a share of. "sequences": of the training sequences drawn (a source of
+    # long sequences then takes a larger share of the tokens than its weight). "tokens": of the tokens trained on:
+    # each source is drawn in proportion to its weight divided by the mean length of its sequences (measured as the
+    # run reads them), so `weight: 0.8` is 80% of the tokens whatever the documents' lengths. Needs a weight on
+    # every source. Sources without any weight are mixed by their rows (one shuffled concatenation) either way.
+    mix_weights: str = "sequences"
     # Observation loss: the text of tool / environment messages gets loss too (never the template's wrapper: role
     # headers, <tool_response> tags), so the model is also trained to predict what the environment returns. After
     # ECHO (arXiv:2605.24517), which adds this loss with weight 0.05 to GRPO on the policy's own rollouts (pgs rl:
@@ -133,15 +149,17 @@ class DataConfig:
     eval_every: int = 100  # Evaluate every N optimizer steps
     # Multi-eval: separate eval sets per capability dimension (arxiv:2603.21606 improved)
     # When defined, replaces single eval_dataset for best-model tracking AND MSFT signals.
-    # Each: {name, dataset, split, weight, samples, regression_floor, messages_field}
+    # Each: {name, dataset, split, weight, samples, regression_floor, mode, messages_field|text_field}; dataset is
+    # a local .jsonl / .json / .parquet file or a Hub dataset. A source that cannot be read is an error.
     eval_sources: list = field(default_factory=list)
-    # Pretraining replay: mix raw text (split "train", field "text", all-token loss) into SFT.
+    # Pretraining replay: mix raw text (split "train", field "text", all-token loss) into SFT. An epoch is one
+    # pass over the target data's rows, with the replay sequences drawn alongside.
     # Kotha & Liang (arXiv:2603.04964) find generic replay can also help the target task,
     # mostly in 150M-param pretraining simulations (best at 33-67% of fine-tuning steps).
     # Empty string disables.
     pretrain_replay_dataset: str = ""
-    # Per-EXAMPLE sampling probability of a replay document (not a token share: replay
-    # documents are up to max_seq_length tokens, so their token share is usually larger).
+    # Per-sequence sampling probability of replay text (not a token share: replay
+    # sequences are up to max_seq_length tokens, so their token share is usually larger).
     pretrain_replay_weight: float = 0.1
     # MSFT per-source adaptive weight scheduling (arxiv:2603.21606, improved)
     # When sources are defined, track per-source validation loss and dynamically
@@ -390,6 +408,17 @@ class PreprocessConfig:
     # tokens, the unit training cost is paid in. Applied after `budget`; strategy random only.
     token_budget: int = 0
     dedupe: bool = True  # drop exact duplicate conversations (same messages and tools)
+    # Raw-text sources (data.sources entries with mode: pretrain; `pgs prepare --config` cleans each into
+    # output_dir/<name>/). dedupe drops documents whose normalised text (case, whitespace) is the same.
+    # near_dedupe > 0 also drops near-duplicates: documents whose word 5-gram sets have an estimated Jaccard
+    # similarity of at least this value (MinHash; 0.8 is a common choice), keeping the first of each group.
+    near_dedupe: float = 0.0
+    # Decontamination: files (JSONL, JSON, parquet, .txt) of the evaluation sets you will report. A document that
+    # shares a word n-gram of decontaminate_ngram words with any string in them is dropped.
+    decontaminate: list = field(default_factory=list)
+    decontaminate_ngram: int = 13
+    # Documents with fewer characters are dropped (0 = keep all).
+    min_chars: int = 0
     # Keep at most N rows that share a prompt (system prompt + first user turn), e.g.
     # several trajectories of one task. 0 = no cap.
     max_per_prompt: int = 0
@@ -747,6 +776,29 @@ class Config:
             )
         if self.data.mix_epoch not in ("total", "first_exhausted"):
             errors.append(f"data.mix_epoch must be total or first_exhausted, got {self.data.mix_epoch!r}.")
+        errors += self._source_errors()
+        errors += self._init_errors()
+        if not 0.0 <= self.preprocess.near_dedupe <= 1.0:
+            errors.append(
+                f"preprocess.near_dedupe must be in [0, 1] (a Jaccard similarity; 0 = off), got "
+                f"{self.preprocess.near_dedupe}."
+            )
+        if self.preprocess.decontaminate_ngram < 1:
+            errors.append(
+                f"preprocess.decontaminate_ngram must be >= 1 (words), got {self.preprocess.decontaminate_ngram}."
+            )
+        if self.preprocess.min_chars < 0:
+            errors.append(f"preprocess.min_chars must be >= 0, got {self.preprocess.min_chars}.")
+        if not isinstance(self.preprocess.decontaminate, list) or not all(
+            isinstance(f, str) and f for f in self.preprocess.decontaminate
+        ):
+            errors.append("preprocess.decontaminate must be a list of file paths.")
+        if self.model.init == "random" and self.train.learning_rate <= 1e-4:
+            warnings.append(
+                f"model.init: random with train.learning_rate={self.train.learning_rate:g}: the defaults are tuned "
+                "for fine-tuning a trained model. Training from random weights usually needs a much higher peak "
+                "learning rate (1e-4 to 1e-3 with AdamW), a longer warmup and far more tokens."
+            )
         strategies = ("optimal", "balanced", "medium_focus", "curriculum", "hard_focus", "flow", "random")
         if self.preprocess.strategy not in strategies:
             errors.append(f"preprocess.strategy={self.preprocess.strategy!r} is not one of {', '.join(strategies)}.")
@@ -992,6 +1044,88 @@ class Config:
                 errors.append(f"dpo.enabled=true does not support {name}; disable it for preference training.")
         return errors
 
+    def _source_errors(self) -> list[str]:
+        """data.sources / data.eval_sources entries, and data.mix_weights."""
+        errors: list[str] = []
+        for section in ("sources", "eval_sources"):
+            entries = getattr(self.data, section)
+            if not isinstance(entries, list):
+                errors.append(f"data.{section} must be a list of sources.")
+                continue
+            for i, src in enumerate(entries):
+                where = f"data.{section}[{i}]"
+                if not isinstance(src, dict):
+                    errors.append(f"{where} must be a mapping (dataset, mode, weight, ...), got {src!r}.")
+                    continue
+                mode = src.get("mode", "sft")
+                if mode not in ("sft", "pretrain"):
+                    errors.append(f"{where}.mode must be sft or pretrain, got {mode!r}.")
+                if "append_eos" in src:
+                    eos = src["append_eos"]
+                    if mode != "pretrain":
+                        errors.append(
+                            f"{where}.append_eos applies to raw text (mode: pretrain): a conversation ends with "
+                            "the chat template's own end-of-turn token."
+                        )
+                    elif not isinstance(eos, bool) and not (isinstance(eos, str) and eos):
+                        errors.append(
+                            f"{where}.append_eos must be true (the tokenizer's EOS token), false, or a token "
+                            f"string such as '<|endoftext|>', got {eos!r}."
+                        )
+                weight = src.get("weight")
+                if weight is not None and (
+                    isinstance(weight, bool)
+                    or not isinstance(weight, (int, float))
+                    or not math.isfinite(weight)
+                    or weight < 0
+                ):
+                    errors.append(f"{where}.weight must be a finite number >= 0, got {weight!r}.")
+        if self.data.mix_weights not in ("sequences", "tokens"):
+            errors.append(f"data.mix_weights must be sequences or tokens, got {self.data.mix_weights!r}.")
+        elif self.data.mix_weights == "tokens":
+            sources = [s for s in self.data.sources if isinstance(s, dict)]
+            if not sources:
+                errors.append("data.mix_weights: tokens applies to data.sources, and there are none.")
+            missing = [source_label(s, i) for i, s in enumerate(sources) if s.get("weight") is None]
+            if missing:
+                errors.append(
+                    "data.mix_weights: tokens needs a weight (its share of the tokens) on every source; none on "
+                    f"{', '.join(missing)}."
+                )
+            if self.data.msft_tracking:
+                errors.append("data.mix_weights: tokens is not supported with data.msft_tracking.")
+        return errors
+
+    def _init_errors(self) -> list[str]:
+        """model.init / model.init_seed, and what cannot start from random weights."""
+        m = self.model
+        errors: list[str] = []
+        if m.init not in ("pretrained", "random"):
+            errors.append(f"model.init must be pretrained or random, got {m.init!r}.")
+        if isinstance(m.init_seed, bool) or not isinstance(m.init_seed, int) or m.init_seed < -1:
+            errors.append(f"model.init_seed must be an integer >= 0, or -1 for train.seed, got {m.init_seed!r}.")
+        if m.init != "random":
+            return errors
+        unsupported = {
+            "dpo.enabled (the reference policy would be the untrained model)": self.dpo.enabled,
+            "multimodal.enabled (the vision tower and projector would be untrained too)": self.multimodal.enabled,
+            "train.base_merge (it pulls the weights back to the random initialisation)": self.train.base_merge,
+            "plugins.pre_rl (its KL term keeps the model near the random initialisation)": self.plugins.pre_rl,
+            "train.freeze_non_attention (the frozen layers would stay random)": self.train.freeze_non_attention,
+            "preprocess.score / a perplexity bound or strategy (scores from an untrained model)": (
+                self.preprocess.enabled
+                and (
+                    self.preprocess.score
+                    or self.preprocess.hes
+                    or self.preprocess.min_ppl > 0
+                    or self.preprocess.max_ppl > 0
+                    or self.preprocess.strategy != "random"
+                )
+            ),
+        }
+        errors += [f"model.init: random does not support {name}." for name, on in unsupported.items() if on]
+        return errors
+
     def _context_parallel_errors(self) -> list[str]:
         p = self.parallel
         errors: list[str] = []
@@ -1081,6 +1215,11 @@ class Config:
             if on:
                 errors.append(f"memory.seco=true does not support {name}.")
         return errors
+
+
+def source_label(src: dict, index: int) -> str:
+    """How messages name a data.sources entry: its name, else its dataset, else its position."""
+    return str(src.get("name") or src.get("dataset") or f"source[{index}]")
 
 
 class ConfigError(Exception):

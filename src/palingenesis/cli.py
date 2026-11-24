@@ -40,7 +40,8 @@ Commands:
   surgery     Margin surgery: a minimal weight edit restoring a decision's margins (run, margins, span)
   internals   Read the model's internals: capture, probes, lenses, compare checkpoints, steering, patching
   autopilot   Autonomous training: profile, sweep LR, train, monitor, stop
-  prepare     Clean data (broken rows, duplicates), hold out an eval set, select a budget
+  prepare     Clean data (broken rows, duplicates), hold out an eval set, select a budget;
+              raw text (--mode pretrain): duplicates, near-duplicates, n-gram decontamination
   prepare-multi  Prepare several sources, each on its own, with a row/token share manifest
   s0-tune     S0 Tuning: zero-overhead adaptation for hybrid models (Qwen3.5, FalconH1)
   diagnose    Run health diagnostics (pre/post/full)
@@ -242,6 +243,21 @@ def _run_prepare_multi():
         default=0,
         help="Processes that tokenize the rows (0 = the CPUs available, at most 8; 1 = in this process)",
     )
+    parser.add_argument(
+        "--decontaminate",
+        nargs="*",
+        default=[],
+        help="Raw-text sources (mode: pretrain): evaluation files (JSONL, JSON, parquet, text); documents "
+        "sharing a word n-gram with any string in them are dropped",
+    )
+    parser.add_argument("--decontaminate_ngram", type=int, default=13, help="Words per decontamination n-gram")
+    parser.add_argument(
+        "--near_dedupe",
+        type=float,
+        default=0.0,
+        help="Raw-text sources: drop near-duplicate documents at or above this Jaccard similarity (0 = off)",
+    )
+    parser.add_argument("--min_chars", type=int, default=0, help="Raw-text sources: drop documents shorter than this")
     args = parser.parse_args()
 
     from pathlib import Path
@@ -266,6 +282,10 @@ def _run_prepare_multi():
         batch_size=args.batch_size,
         max_batch_tokens=args.max_batch_tokens,
         num_workers=args.num_workers,
+        decontaminate=args.decontaminate,
+        decontaminate_ngram=args.decontaminate_ngram,
+        near_dedupe=args.near_dedupe,
+        min_chars=args.min_chars,
     )
 
 

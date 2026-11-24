@@ -1952,11 +1952,56 @@ class ChatDataset(_Epochs, IterableDataset):
         return messages[: ends[i]]
 
 
+def document_end_id(tokenizer, append_eos: bool | str = True) -> int | None:
+    """The token id a raw-text source appends to every document (a source's `append_eos`).
+
+    True: the tokenizer's EOS token (None, with a warning, when it has none). A string: that
+    token, which must be one token of the vocabulary (e.g. "<|endoftext|>" for a chat model whose
+    EOS is its end-of-turn token). False: nothing is appended."""
+    if append_eos is False or append_eos is None:
+        return None
+    if append_eos is True:
+        eos = getattr(tokenizer, "eos_token_id", None)
+        if eos is None:
+            logger.warning(
+                "append_eos: the tokenizer has no EOS token, so raw-text documents get no end-of-document "
+                "token. Name one with the source's `append_eos: <token>`, or set `append_eos: false`."
+            )
+            return None
+        return int(eos)
+    if not isinstance(append_eos, str) or not append_eos:
+        raise ValueError(f"append_eos must be true, false or a token string, got {append_eos!r}.")
+    token_id = tokenizer.convert_tokens_to_ids(append_eos)
+    unknown = getattr(tokenizer, "unk_token_id", None)
+    if not isinstance(token_id, int) or token_id < 0 or (token_id == unknown and append_eos != tokenizer.unk_token):
+        raise ValueError(
+            f"append_eos: {append_eos!r} is not a token of this tokenizer's vocabulary (it must be exactly one "
+            "token, e.g. the tokenizer's eos_token)."
+        )
+    return token_id
+
+
+def _marked(stage):
+    """(sample, ends_row) pairs of a data stage: `ends_row` is true on the last training sequence
+    a row of the data gives. Stages that split a row into several sequences (PretrainDataset)
+    say so through `iter_marked`; for every other stage a sequence is a row."""
+    marked = getattr(stage, "iter_marked", None)
+    if marked is not None:
+        return marked()
+    return ((sample, True) for sample in stage)
+
+
 class PretrainDataset(_Epochs, IterableDataset):
     """Pretraining/CPT dataset: loss on ALL tokens (no masking). A document longer than
     max_seq_length becomes consecutive max_seq_length-token chunks (truncating it would drop
     the rest of the text: a quarter of a typical CPT corpus at 4k tokens); a trailing chunk
-    shorter than MIN_CHUNK tokens is dropped."""
+    shorter than MIN_CHUNK tokens is dropped.
+
+    append_eos (see document_end_id): the end-of-document token appended to every document,
+    unless its text already ends with it. It is the last token of the document's last chunk and
+    a training target like any other, so the model learns where documents end; in a packed
+    block it is what separates one document's text from the next (the loss never asks a
+    document's last token to predict the next document: loss.shift_labels)."""
 
     MIN_CHUNK = 16
 
@@ -1971,11 +2016,13 @@ class PretrainDataset(_Epochs, IterableDataset):
         shuffle_buffer: int = 0,
         shuffle_seed: int = 0,
         shuffle: bool = False,
+        append_eos: bool | str = True,
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.text_field = text_field
+        self.eos_id = document_end_id(tokenizer, append_eos)
         self.rank = rank
         self.world_size = world_size
         self.shuffle_buffer = shuffle_buffer
@@ -1989,12 +2036,25 @@ class PretrainDataset(_Epochs, IterableDataset):
         for example in dataset:
             yield from self._process(example)
 
+    def iter_marked(self):
+        """(chunk, ends_row): the flag is true on a document's last chunk (see _marked)."""
+        dataset = _shard_then_shuffle(
+            self.dataset, self.rank, self.world_size, self.shuffle_buffer, self.shuffle_seed, self.shuffle, self.epoch
+        )
+        for example in dataset:
+            chunks = self._process(example)
+            for i, chunk in enumerate(chunks):
+                yield chunk, i == len(chunks) - 1
+
     def _process(self, example: dict[str, Any]) -> list[dict[str, torch.Tensor]]:
         """The document's chunks (none for an empty one)."""
         text = example.get(self.text_field, "")
         if not text:
             return []
-        ids = torch.tensor(self.tokenizer(text, add_special_tokens=True)["input_ids"], dtype=torch.long)
+        ids = list(self.tokenizer(text, add_special_tokens=True)["input_ids"])
+        if self.eos_id is not None and (not ids or ids[-1] != self.eos_id):
+            ids.append(self.eos_id)
+        ids = torch.tensor(ids, dtype=torch.long)
         chunks = []
         for start in range(0, ids.numel(), self.max_seq_length):
             chunk = ids[start : start + self.max_seq_length]
@@ -2010,15 +2070,35 @@ class PretrainDataset(_Epochs, IterableDataset):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class MixedDataset(_Epochs, IterableDataset):
-    """Weighted interleaving of multiple datasets: each example comes from source i with
-    probability proportional to its weight.
+WEIGHT_UNITS = ("sequences", "tokens", "rows")
 
-    An epoch is `epoch_draws` examples per rank (split across DataLoader workers): as many as
-    the sources hold together (data.mix_epoch "total"). A source that runs out before the
-    epoch ends starts a new pass in a new order (weighted above its share: upsampled); one
-    weighted below its share contributes a fresh random subset every epoch. epoch_draws None
-    (data.mix_epoch "first_exhausted", or sizes unknown): the epoch ends when a source runs out.
+
+class MixedDataset(_Epochs, IterableDataset):
+    """Weighted interleaving of multiple datasets: each training sequence comes from source i
+    with a probability set by its weight.
+
+    weight_unit says what the weights are shares of:
+      * "sequences" (the default): of the training sequences. The probability of source i is its
+        weight, whatever the length of its sequences.
+      * "tokens": of the tokens. The probability of source i is its weight divided by the mean
+        length of its sequences, measured on the sequences it has given so far in this epoch, so
+        a source of short sequences is drawn more often and the token shares follow the weights.
+      * "rows": of the rows of the data. The probability is the weight times the mean number of
+        sequences a row of the source gives (a raw-text document split into chunks gives
+        several): with weights equal to the sources' row counts the mix is one shuffled
+        concatenation of the sources.
+    Until a source has given a sequence (tokens) or finished a row (rows), its factor is the mean
+    of the other sources' (1 when none is known).
+
+    An epoch is `epoch_draws` rows per rank (split across DataLoader workers): as many as the
+    sources hold together (data.mix_epoch "total"). A row counts when its last sequence is drawn,
+    so every chunk of a raw-text document is part of the epoch: one source of 10 documents of 3
+    chunks each gives 30 sequences, not 10. A source that runs out before the epoch ends starts
+    a new pass in a new order (weighted above its share: upsampled); one weighted below its
+    share contributes a fresh random subset every epoch. epoch_draws None (data.mix_epoch
+    "first_exhausted", or sizes unknown): the epoch ends when a source runs out. `counted`
+    (one flag per source, default all true): a source whose rows do not count towards
+    epoch_draws is drawn alongside the others (pretraining replay next to the target data).
 
     A source that yields nothing at all is a misconfiguration and is dropped with a warning.
     Each source can be SFT (chat masking) or pretraining text (all-token loss).
@@ -2037,9 +2117,13 @@ class MixedDataset(_Epochs, IterableDataset):
         names: list[str] | None = None,
         epoch_draws: int | None = None,
         rank: int = 0,
+        weight_unit: str = "sequences",
+        counted: list[bool] | None = None,
     ):
         assert len(sources) == len(weights)
         assert all(w >= 0 for w in weights)
+        if weight_unit not in WEIGHT_UNITS:
+            raise ValueError(f"weight_unit must be one of {', '.join(WEIGHT_UNITS)}, got {weight_unit!r}.")
         total = sum(weights)
         self.sources = sources
         self.probs = [w / total for w in weights]
@@ -2047,33 +2131,59 @@ class MixedDataset(_Epochs, IterableDataset):
         self.names = names or [f"source[{i}]" for i in range(len(sources))]
         self.epoch_draws = epoch_draws
         self.rank = rank
+        self.weight_unit = weight_unit
+        self.counted = list(counted) if counted is not None else [True] * len(sources)
+        assert len(self.counted) == len(sources)
 
     def _restart(self, i: int, passes: int):
         """Source i's next pass, in its own order (a seed no epoch uses)."""
         stage = self.sources[i]
         if isinstance(stage, _Epochs):
             stage.set_epoch(self.epoch + 1_000_003 * passes)
-        return iter(stage)
+        return _marked(stage)
 
     def __iter__(self):
+        for sample, _ in self.iter_marked():
+            yield sample
+
+    def iter_marked(self):
+        """(sample, ends_row) pairs (see _marked): a mix of mixes counts rows through both."""
         info = torch.utils.data.get_worker_info()
         workers, wid = (info.num_workers, info.id) if info is not None else (1, 0)
         # rank 0's first worker keeps seed + epoch (one process: the order it always had)
         stream = self.rank * workers + wid
         rng = random.Random(self.seed + self.epoch if stream == 0 else f"{self.seed}:{self.epoch}:{self.rank}:{wid}")
-        iterators = [iter(s) for s in self.sources]
-        active = list(range(len(self.sources)))
-        yielded = [0] * len(self.sources)  # in the current pass
-        passes = [0] * len(self.sources)
+        n = len(self.sources)
+        iterators = [_marked(s) for s in self.sources]
+        active = list(range(n))
+        yielded = [0] * n  # in the current pass
+        passes = [0] * n
+        # what the weight units are measured on (this epoch, this worker)
+        sequences, tokens = [0] * n, [0] * n  # drawn from each source
+        rows_done, row_sequences = [0] * n, [0] * n  # finished rows, and the sequences they gave
         if self.epoch_draws is None:
             draws = None
         else:
             draws = self.epoch_draws // workers + (wid < self.epoch_draws % workers)
+
+        def factor(i: int) -> float | None:
+            if self.weight_unit == "tokens":
+                return sequences[i] / tokens[i] if tokens[i] else None
+            return row_sequences[i] / rows_done[i] if rows_done[i] else None
+
+        def probabilities() -> list[float]:
+            if self.weight_unit == "sequences":
+                return [self.probs[i] for i in active]
+            factors = [factor(i) for i in active]
+            known = [f for f in factors if f is not None]
+            default = sum(known) / len(known) if known else 1.0
+            return [self.probs[i] * (default if f is None else f) for i, f in zip(active, factors)]
+
         try:
             while active and (draws is None or draws > 0):
-                idx = rng.choices(active, weights=[self.probs[i] for i in active], k=1)[0]
+                idx = rng.choices(active, weights=probabilities(), k=1)[0]
                 try:
-                    item = next(iterators[idx])
+                    item, ends_row = next(iterators[idx])
                 except StopIteration:
                     if yielded[idx] == 0:
                         # A source that produced NOTHING is a misconfiguration (wrong
@@ -2093,9 +2203,15 @@ class MixedDataset(_Epochs, IterableDataset):
                     iterators[idx] = self._restart(idx, passes[idx])
                     continue
                 yielded[idx] += 1
-                if draws is not None:
-                    draws -= 1
-                yield item
+                sequences[idx] += 1
+                if self.weight_unit == "tokens":
+                    tokens[idx] += int(item["input_ids"].numel())
+                if ends_row:
+                    rows_done[idx] += 1
+                    row_sequences[idx] = sequences[idx]
+                    if draws is not None and self.counted[idx]:
+                        draws -= 1
+                yield item, ends_row
         finally:
             for i, stage in enumerate(self.sources):  # the next epoch starts from set_epoch's order
                 if passes[i] and isinstance(stage, _Epochs):
@@ -2378,12 +2494,13 @@ collate_fn = _collate_fn
 
 
 def mixture_plan(config: DataConfig, world_size: int, dataset=None) -> tuple[list[float], list, int | None]:
-    """(weights, rows per source, examples per rank per epoch or None) of data.sources, or
+    """(weights, rows per source, rows per rank per epoch or None) of data.sources, or
     of the single dataset when there are none (one weight 1.0).
 
     A source without a weight gets its share of all rows; explicit weights are relative on
-    the same scale. The epoch (data.mix_epoch "total") is as many examples as the sources
-    hold together; None when that is first_exhausted, or a size is unknown."""
+    the same scale (mix_weight_unit says what they are shares of). The epoch (data.mix_epoch
+    "total") is as many rows as the sources hold together, a raw-text document counting once
+    with all its chunks; None when that is first_exhausted, or a size is unknown."""
     from palingenesis import data_size
 
     if not config.sources:
@@ -2404,20 +2521,37 @@ def mixture_plan(config: DataConfig, world_size: int, dataset=None) -> tuple[lis
     return weights, rows, math.ceil(sum(rows) / world_size)
 
 
-def _log_mixture(names: list[str], weights: list[float], rows: list, draws: int | None, world_size: int) -> None:
+def mix_weight_unit(config: DataConfig) -> str:
+    """What the weights of data.sources are shares of (MixedDataset.weight_unit).
+
+    No source has a weight: "rows". Every source then weighs its share of the rows, and the mix
+    is one shuffled concatenation of the sources, the chunks of long raw-text documents
+    included. Otherwise data.mix_weights: "sequences" (the default) or "tokens"."""
+    if not any(src.get("weight") is not None for src in config.sources):
+        return "rows"
+    return getattr(config, "mix_weights", "sequences")
+
+
+def _log_mixture(
+    names: list[str], weights: list[float], rows: list, draws: int | None, world_size: int, unit: str = "sequences"
+) -> None:
     total = sum(weights)
     for name, w, n in zip(names, weights, rows):
         share = w / total
-        if draws is not None and n:
+        if draws is not None and n and unit != "tokens":
+            # exact for rows; for sequences, when every row gives one sequence (chat data)
             passes = share * draws * world_size / n
             note = "upsampled" if passes > 1.05 else "subsampled" if passes < 0.95 else "one pass"
-            logger.info(f"  mix {name}: {share:.1%} of examples, {n:,} rows, {passes:.2f} passes/epoch ({note})")
+            logger.info(f"  mix {name}: {share:.1%} of {unit}, {n:,} rows, {passes:.2f} passes/epoch ({note})")
         else:
-            logger.info(f"  mix {name}: {share:.1%} of examples, {n if n is not None else 'unknown'} rows")
+            logger.info(f"  mix {name}: {share:.1%} of {unit}, {n if n is not None else 'unknown'} rows")
     if draws is None:
         logger.info("  mix epoch: ends when a source runs out (data.mix_epoch first_exhausted, or sizes unknown)")
     else:
-        logger.info(f"  mix epoch: {draws * world_size:,} examples (the sources' rows together)")
+        logger.info(
+            f"  mix epoch: {draws * world_size:,} rows (the sources' rows together; a raw-text document counts "
+            "once, with all its chunks)"
+        )
 
 
 def source_name(src: dict, index: int) -> str:
@@ -2454,6 +2588,7 @@ def source_stage(
             shuffle_buffer=shuffle_buffer,
             shuffle_seed=config.seed,
             shuffle=shuffle,
+            append_eos=src.get("append_eos", True),
         )
     if mode != "sft":
         raise ValueError(f"Unknown data mode: {mode}. Use 'sft' or 'pretrain'.")
@@ -2504,9 +2639,14 @@ class SourceTagged(_Epochs, IterableDataset):
         self.index = index
 
     def __iter__(self):
-        for sample in self.base:
-            sample["source_ids"] = torch.full_like(sample["input_ids"], self.index)
+        for sample, _ in self.iter_marked():
             yield sample
+
+    def iter_marked(self):
+        """The base stage's (sample, ends_row) pairs (see _marked), tagged."""
+        for sample, ends_row in _marked(self.base):
+            sample["source_ids"] = torch.full_like(sample["input_ids"], self.index)
+            yield sample, ends_row
 
 
 def estimate_pretokenized(cache_dir, world_size: int, batch_size: int):
@@ -2584,6 +2724,10 @@ def estimate_run(
         # rounds of rows until this source's yield is known to data_size.target_error()
         _, (estimate, _) = data_size.sequential(draw, evaluate, population=rows, deadline=deadline)
         sources.append(estimate)
+    if config.sources:  # the weights as shares of the training sequences (what the mix draws)
+        unit = mix_weight_unit(config)
+        for source in sources:
+            source.weight = data_size.sequence_weight(source, unit)
     for source in sources:
         if source.examples_per_row == 0 and source.rows:
             logger.warning(
@@ -2592,29 +2736,29 @@ def estimate_run(
                 source.name,
                 min(k, source.rows),
             )
-    epoch_examples = draws if config.sources else None  # None: one source, sized by its own rows
+    epoch_rows = draws if config.sources else None  # None: one source, sized by its own rows
     if config.pretrain_replay_dataset:
         # replay mixes (1 - w) of the target with w of replay text: an epoch is one pass over
-        # the target plus the replay drawn alongside (data.mix_epoch "total")
+        # the target's rows plus the replay drawn alongside (data.mix_epoch "total")
         w = config.pretrain_replay_weight
         target = sum(t.weight for t in sources)
         for t in sources:
             t.weight *= (1.0 - w) / target
         target_rows = _target_rows(config, loaded)
         if config.mix_epoch == "total" and target_rows is not None and w < 1:
-            epoch_examples = target_rows / world_size / (1.0 - w)
+            epoch_rows = math.ceil(target_rows / world_size)
         replay_src = {"mode": "pretrain", "text_field": "text"}
         sample = data_size.sample_rows(config.pretrain_replay_dataset, "train", k, config.seed + 97)
-        sources.append(
-            data_size.measure_source(
-                f"replay:{config.pretrain_replay_dataset}",
-                data_size.count_rows(config.pretrain_replay_dataset, "train"),
-                w,
-                sample,
-                data_size.census(config.pretrain_replay_dataset, "train"),
-                lambda raw: source_stage(raw, tokenizer, config, replay_src, 0, 1),
-            )
+        replay = data_size.measure_source(
+            f"replay:{config.pretrain_replay_dataset}",
+            data_size.count_rows(config.pretrain_replay_dataset, "train"),
+            w,
+            sample,
+            data_size.census(config.pretrain_replay_dataset, "train"),
+            lambda raw: source_stage(raw, tokenizer, config, replay_src, 0, 1),
         )
+        replay.counted = False  # drawn alongside: the epoch is counted on the target's rows
+        sources.append(replay)
     return data_size.estimate_steps(
         sources,
         world_size,
@@ -2622,7 +2766,7 @@ def estimate_run(
         config.packing,
         config.max_seq_length,
         seed=config.seed,
-        epoch_examples=epoch_examples,
+        epoch_rows=epoch_rows,
     )
 
 
@@ -2689,10 +2833,11 @@ def build_dataset(
             )
             source_datasets.append(SourceTagged(stage, len(names)) if tag_sources else stage)
             names.append(source_name(src, len(names)))
+        unit = mix_weight_unit(config)
         if rank == 0:
-            _log_mixture(names, weights, rows, draws, world_size)
+            _log_mixture(names, weights, rows, draws, world_size, unit)
         final_ds: IterableDataset = MixedDataset(
-            source_datasets, weights, seed=config.seed, names=names, epoch_draws=draws, rank=rank
+            source_datasets, weights, seed=config.seed, names=names, epoch_draws=draws, rank=rank, weight_unit=unit
         )
     elif hasattr(dataset_or_config, "__iter__") and not isinstance(dataset_or_config, DataConfig):
         # Pre-loaded HF dataset object passed directly. The caller decides whether to
@@ -2739,15 +2884,16 @@ def build_dataset(
             shuffle_buffer=10_000,
             shuffle_seed=config.seed,
         )
-        # Mix: (1-w) * target_data + w * replay_data. An epoch is one pass over the target
-        # (its rows) plus the replay examples drawn alongside: target rows / (1 - w) draws.
+        # Mix: (1-w) * target_data + w * replay_data, per training sequence. An epoch is one pass
+        # over the target (its rows; a raw-text document counts when its last chunk is drawn) plus
+        # the replay sequences drawn alongside: about target sequences * w / (1 - w) of them.
         w = config.pretrain_replay_weight
         if tag_sources:  # replay text belongs to no data.sources entry
             replay_ds = SourceTagged(replay_ds, -1)
         target_rows = _target_rows(config, dataset_or_config)
         draws = None
         if config.mix_epoch == "total" and target_rows is not None and w < 1:
-            draws = math.ceil(target_rows / world_size / (1.0 - w))
+            draws = math.ceil(target_rows / world_size)
         final_ds = MixedDataset(
             [final_ds, replay_ds],
             [1.0 - w, w],
@@ -2755,6 +2901,7 @@ def build_dataset(
             names=["target_mix", f"replay:{config.pretrain_replay_dataset} (text_field='text')"],
             epoch_draws=draws,
             rank=rank,
+            counted=[True, False],
         )
 
     # Optional packing
@@ -2875,6 +3022,11 @@ def _fingerprint_payload(config, tokenizer) -> dict:
         }
         if src.get("tools_field") is not None:  # only when set: existing caches stay valid
             sig["tools_field"] = src["tools_field"]
+        if sig["mode"] == "pretrain":
+            # raw text: the end-of-document token, and epochs that count a document once with all its chunks
+            # (a cache written before either holds another stream and is rebuilt)
+            sig["append_eos"] = src.get("append_eos", True)
+            sig["row_epochs"] = True
         return sig
 
     if d.sources:
@@ -2909,6 +3061,10 @@ def _fingerprint_payload(config, tokenizer) -> dict:
         payload["tools_field"] = d.tools_field
     if getattr(d, "mix_epoch", "total") != "total":  # how many examples an epoch of the mix draws
         payload["mix_epoch"] = d.mix_epoch
+    if getattr(d, "mix_weights", "sequences") != "sequences":  # what the sources' weights are shares of
+        payload["mix_weights"] = d.mix_weights
+    if d.pretrain_replay_dataset:  # replay documents end with the EOS token; the epoch counts the target's rows
+        payload["replay_epoch"] = "target_rows"
     if getattr(d, "turn_scaling", "uniform") != "uniform":
         # the cache stores the per-token loss weights: one written without them must be rebuilt, not read as uniform
         payload["loss_weights"] = True

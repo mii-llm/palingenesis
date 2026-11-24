@@ -232,14 +232,14 @@ Real projects have multiple data sources: agentic traces, general instruction-fo
 pgs prepare-multi --model Qwen/Qwen3.5-4B --sources sources.yaml --output prepared/
 ```
 
-Each source is prepared on its own (same cleaning as `pgs prepare`, duplicates removed inside a source, not across sources) into `prepared/<name>/scored_data.jsonl`, and `prepared/manifest.json` lists per source the rows, tokens, what cleaning removed, and what the weights amount to: `normalized_weight` (share of examples) and `token_share` (share of tokens). The two differ whenever sources differ in length, which is the usual case with agentic traces next to chat data. Point `data.sources` at the per-source files to train on them. Raw-text sources (`mode: pretrain`) are skipped. `--score`, `--min_ppl`, `--max_ppl`, `--strategy` and `--hes` behave as in `pgs prepare` and are [experimental](#scoring-with-the-model-experimental).
+Each source is prepared on its own (same cleaning as `pgs prepare`, duplicates removed inside a source, not across sources) into `prepared/<name>/scored_data.jsonl`, and `prepared/manifest.json` lists per source the rows, tokens, what cleaning removed, and what the weights amount to: `normalized_weight` (share of examples) and `token_share` (share of tokens). The two differ whenever sources differ in length, which is the usual case with agentic traces next to chat data. Point `data.sources` at the per-source files to train on them. Raw-text sources (`mode: pretrain`) are cleaned as documents instead (exact and near-duplicates, n-gram decontamination: [Preparing the data](pretraining.md#preparing-the-data)). `--score`, `--min_ppl`, `--max_ppl`, `--strategy` and `--hes` behave as in `pgs prepare` and are [experimental](#scoring-with-the-model-experimental).
 
 How the mix behaves in training (`data.sources`):
 
-- **An epoch is as many examples as the sources hold together**, drawn by weight (`data.mix_epoch: total`). `weight` is a relative **per-conversation** sampling probability, not a token share: a source of long conversations contributes more tokens than its weight suggests.
+- **An epoch is as many rows as the sources hold together**, drawn by weight (`data.mix_epoch: total`). A conversation is one row and one training sequence; a raw-text document split into several chunks counts once, when its last chunk is drawn. `weight` is a relative **per-sequence** sampling probability, not a token share: a source of long conversations contributes more tokens than its weight suggests. `data.mix_weights: tokens` makes the weights shares of the tokens instead (each source is drawn in proportion to its weight divided by the mean length of its sequences; every source then needs a weight).
 - **A source without a weight gets its share of the rows**, so a mix without weights is one shuffled concatenation of its sources, one pass per epoch. A source weighted above its share is repeated (a new order every pass); one weighted below it contributes a fresh random subset every epoch.
-- The log gives every source's share, rows and passes per epoch at startup, e.g. `mix math: 50.0% of examples, 20,000 rows, 2.50 passes/epoch (upsampled)`.
-- `data.mix_epoch: first_exhausted` ends the epoch when a source runs out instead (the former rule; also what happens when a source's size cannot be read from its metadata). Replay (`pretrain_replay_dataset`) adds its share on top of one pass over the target data.
+- The log gives every source's share, rows and passes per epoch at startup, e.g. `mix math: 50.0% of sequences, 20,000 rows, 2.50 passes/epoch (upsampled)` (`of rows` when no source has a weight, `of tokens` with `mix_weights: tokens`).
+- `data.mix_epoch: first_exhausted` ends the epoch when a source runs out instead (the former rule; also what happens when a source's size cannot be read from its metadata). Replay (`pretrain_replay_dataset`) is drawn alongside one pass over the target data's rows.
 
 !!! warning "`data.msft_tracking` has no effect yet"
     `msft.AdaptiveSourceTracker` (per-source weight decay when a source's validation loss rises, after mSFT, arXiv:2603.21606) exists but is not wired into the training loop. Setting `msft_tracking: true` logs a warning and the weights stay fixed. Watch per-source losses with `eval_sources` instead.
@@ -393,9 +393,9 @@ step=… eval=<composite> eval_sources=lm:<loss>,mcqa:<loss>
 
 The baseline evaluation before the first step is printed the same way, marked `(before training)`.
 
-Per-source keys: `name`, `dataset`, `split`, `weight` (composite importance), `samples` (subset size), `regression_floor` (optional alarm), and **`mode`**:
+Per-source keys: `name`, `dataset` (a local `.jsonl`, `.json` or `.parquet` file, a `pgs prepare` output directory, or a Hub dataset with its `split`), `weight` (composite importance), `samples` (subset size), `regression_floor` (optional alarm), and **`mode`**. A source that cannot be read, has an unknown mode or gives no usable sample stops the run with a config error: a configured evaluation set is never skipped.
 
-- **`mode: pretrain`** (+ `text_field`): raw-text, all-token CE/ppl, no chat template. Matches how CPT actually trains, so the number is a true next-token perplexity. Use it for held-out LM text.
+- **`mode: pretrain`** (+ `text_field`, `append_eos`): raw-text, all-token CE/ppl, no chat template, the end-of-document token included as in training. Matches how CPT actually trains, so the number is a true next-token perplexity. Use it for held-out LM text.
 - **`mode: sft`** (default, + `messages_field`, optional `last_turn_only`): chat-templated, assistant-only CE. Use for genuine chat/MCQA tasks.
 
 !!! warning "Measure raw LM as `text`, not as a fake assistant turn"

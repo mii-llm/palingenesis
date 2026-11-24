@@ -34,11 +34,22 @@ def check_gradients(config: Config) -> dict:
     model_dtype = dtype_map[config.model.torch_dtype]
 
     print(f"Loading model: {config.model.name_or_path} ({model_dtype})", file=sys.stderr)
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model.name_or_path,
-        dtype=model_dtype,
-        trust_remote_code=config.model.trust_remote_code,
-    ).to(device)
+    if config.model.init == "random":  # training from scratch: the gradients of the initialisation the run starts from
+        from palingenesis import model_init
+
+        model = model_init.random_init(
+            config.model.name_or_path,
+            seed=model_init.init_seed(config),
+            dtype=model_dtype,
+            trust_remote_code=config.model.trust_remote_code,
+            tokenizer=tokenizer,
+        ).to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model.name_or_path,
+            dtype=model_dtype,
+            trust_remote_code=config.model.trust_remote_code,
+        ).to(device)
     model.config.use_cache = False
     model.train()
 

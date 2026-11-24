@@ -279,3 +279,99 @@ def test_keep_checkpoints_must_be_non_negative():
     cfg.train.keep_checkpoints = -1
     with pytest.raises(ConfigError, match="train.keep_checkpoints"):
         cfg.validate()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RAW-TEXT TRAINING: sources, token-share weights, random initialisation, cleaning
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _sources(*sources, **data):
+    cfg = Config()
+    cfg.data.sources = list(sources)
+    for key, value in data.items():
+        setattr(cfg.data, key, value)
+    return cfg
+
+
+def test_source_entries_are_checked():
+    text = {"dataset": "corpus.jsonl", "mode": "pretrain"}
+    assert _sources(text, {"dataset": "chat.jsonl"}).validate() == []
+    assert _sources({**text, "append_eos": False}, {**text, "append_eos": "<|endoftext|>"}).validate() == []
+    with pytest.raises(ConfigError, match=r"data.sources\[1\].mode must be sft or pretrain, got 'cpt'"):
+        _sources(text, {"dataset": "x", "mode": "cpt"}).validate()
+    with pytest.raises(ConfigError, match=r"data.sources\[0\].append_eos must be true"):
+        _sources({**text, "append_eos": 3}).validate()
+    with pytest.raises(ConfigError, match=r"data.sources\[0\].append_eos applies to raw text"):
+        _sources({"dataset": "chat.jsonl", "append_eos": True}).validate()
+    with pytest.raises(ConfigError, match=r"data.sources\[0\].weight must be a finite number >= 0"):
+        _sources({**text, "weight": -1}).validate()
+    with pytest.raises(ConfigError, match=r"data.sources\[0\] must be a mapping"):
+        _sources("corpus.jsonl").validate()
+    cfg = Config()
+    cfg.data.eval_sources = [{"name": "held", "dataset": "held.parquet", "mode": "raw"}]
+    with pytest.raises(ConfigError, match=r"data.eval_sources\[0\].mode must be sft or pretrain"):
+        cfg.validate()
+
+
+def test_mix_weights_by_token_share_needs_weights():
+    a, b = {"dataset": "a.jsonl", "mode": "pretrain", "weight": 0.8}, {"dataset": "b.jsonl", "mode": "pretrain"}
+    assert Config().data.mix_weights == "sequences"
+    assert _sources(a, {**b, "weight": 0.2}, mix_weights="tokens").validate() == []
+    with pytest.raises(ConfigError, match="mix_weights: tokens needs a weight .* none on b.jsonl"):
+        _sources(a, b, mix_weights="tokens").validate()
+    with pytest.raises(ConfigError, match="mix_weights: tokens applies to data.sources"):
+        _sources(mix_weights="tokens").validate()
+    with pytest.raises(ConfigError, match="data.mix_weights must be sequences or tokens, got 'rows'"):
+        _sources(a, mix_weights="rows").validate()
+
+
+def test_random_initialisation_options():
+    cfg = Config()
+    assert cfg.model.init == "pretrained" and cfg.model.init_seed == -1
+    cfg.model.init = "random"
+    warnings = cfg.validate()
+    assert any("model.init: random" in w and "learning_rate" in w for w in warnings)
+    cfg.train.learning_rate = 3e-4
+    assert cfg.validate() == []
+    cfg.model.init = "scratch"
+    with pytest.raises(ConfigError, match="model.init must be pretrained or random, got 'scratch'"):
+        cfg.validate()
+    cfg.model.init = "random"
+    cfg.model.init_seed = -2
+    with pytest.raises(ConfigError, match="model.init_seed"):
+        cfg.validate()
+    # dpo.enabled is refused too (tests/test_pretraining.py: validating a DPO config imports transformers)
+    for section, option in (
+        ("multimodal", "enabled"),
+        ("train", "base_merge"),
+        ("plugins", "pre_rl"),
+        ("train", "freeze_non_attention"),
+    ):
+        bad = Config()
+        bad.model.init, bad.train.learning_rate = "random", 3e-4
+        setattr(getattr(bad, section), option, True)
+        with pytest.raises(ConfigError, match=f"model.init: random does not support {section}.{option}"):
+            bad.validate()
+
+
+def test_raw_text_cleaning_options(tmp_path):
+    cfg = Config()
+    assert cfg.preprocess.near_dedupe == 0.0 and cfg.preprocess.decontaminate == []
+    assert cfg.preprocess.decontaminate_ngram == 13
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "preprocess:\n  near_dedupe: 0.8\n  decontaminate: [bench.jsonl]\n  decontaminate_ngram: 8\n  min_chars: 200\n"
+    )
+    loaded = Config.from_yaml(path)
+    assert loaded.preprocess.near_dedupe == 0.8 and loaded.preprocess.decontaminate == ["bench.jsonl"]
+    assert loaded.validate() == []
+    for option, value in (("near_dedupe", 1.5), ("decontaminate_ngram", 0), ("min_chars", -1)):
+        bad = Config()
+        setattr(bad.preprocess, option, value)
+        with pytest.raises(ConfigError, match=f"preprocess.{option}"):
+            bad.validate()
+    bad = Config()
+    bad.preprocess.decontaminate = "bench.jsonl"
+    with pytest.raises(ConfigError, match="preprocess.decontaminate must be a list"):
+        bad.validate()
