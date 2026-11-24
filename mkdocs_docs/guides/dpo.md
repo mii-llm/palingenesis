@@ -131,6 +131,23 @@ or implicit, with both sides written out as full conversations:
 
 The rejected side is truncated (its start kept) when `dpo.truncate_rejected: true`, the default. That suits degenerate rejections such as repetition loops, which can run to thousands of tokens. With `false`, such pairs are dropped too. Pairs whose two sides render identically are dropped, since there is no preference to learn. Drop and truncation counts are logged when the eval set loads.
 
+### Contrastive twin pairs
+
+Twins are prompts that differ by a small edit and need different answers: "the store closes at 18:00" and "the store closes at 17:00", a negated condition, a swapped unit, an added constraint. A model that misreads one twin as the other gives its sibling's answer. That answer is the most informative rejected side a prompt can have: chosen and rejected then differ exactly where the two prompts differ, and no length, style or fluency cue separates them for the model to learn instead. Written in both directions (P: A over A', and P': A' over A), the pair teaches reading the prompt, not preferring one answer.
+
+```bash
+# twins.jsonl: {"twin": "store-1", "prompt": "...", "answer": "Yes"}, rows sharing `twin` are siblings
+pgs pairs build twins.jsonl -o twin_pairs.jsonl
+pgs pairs build twins.jsonl -o misread.jsonl --prediction_field model_answer --only_misread
+pgs pairs check dpo_rows.jsonl --require_balanced
+```
+
+`build` writes every ordered pair of siblings as a DPO row (`prompt`, `chosen`: its own answer, `rejected`: the sibling's, plus `twin`, `direction`, `prompt_edit_words`, and the row's `tools`, `chat_template_kwargs` and `sft_weight`). A pair is dropped and counted when the two answers are equal after whitespace and case folding, when the prompts are the same, or when the prompts differ by more than `--max_edit` (share of changed words and punctuation marks, default 0.5) or `--max_edit_words`. With `--prediction_field` (the model's own answer to each prompt, from your evaluation), a pair records `misread: true` when the model answered its prompt with the sibling's answer; `--only_misread` keeps those pairs only: on-policy pairs whose rejected side is the model's actual error.
+
+`check` reads any DPO file (explicit or implicit prompts) and reports rows whose two sides are the same text, contradictions (a pair and its exact reverse on the same prompt), duplicates, the twin pairs it finds (a row whose rejected answer is the chosen answer of another row with a near-identical prompt; a twin is visible only when its sibling's answer is a chosen side somewhere in the file) and those without their reverse direction. Exit code 1 on identical sides or contradictions, and with `--require_balanced` on unbalanced twins.
+
+The rejected side is a fluent answer that is right for the sibling prompt, so the margin can only grow by attending to the edited words. When the two answers are long and differ in one span ("the store is open" / "closed"), most of their tokens are shared and `sft_scope: edits` (below) puts the SFT anchor on the span that differs. Balance the directions, and the categories, as `check` reports: one-directional twins teach a preference for one answer instead of reading the prompt.
+
 ## Objectives
 
 $\Delta$ is the policy's log-ratio of chosen minus that of rejected, both relative to the reference; $\Delta_{\text{avg}}$ uses per-token averages instead of sums:

@@ -15,6 +15,7 @@
 | read what RL / distillation rollouts do | [`pgs rollouts`](#rollouts) |
 | compare two checkpoints' evaluations (intervals, paired tests, pass@k) | [`pgs compare`](#compare) |
 | keep the RL prompts the policy solves sometimes | [`pgs screen`](#screen) |
+| build or check contrastive twin preference pairs | [`pgs pairs`](#pairs) |
 | on-policy distillation / RL | [`pgs distill`](#distill), [`pgs rl`](#rl) |
 
 ---
@@ -333,6 +334,15 @@ Difficulty screening of an RL prompt pool: k rollouts per row with the RL config
 
 ```bash
 pgs screen --config configs/rl_math.yaml --k 8 --output pool_screened.jsonl
+```
+
+### pairs
+
+Contrastive twin pairs for preference training: prompts that differ by a small edit and need different answers, each pair's rejected side being the sibling's answer, in both directions. `check` reports identical sides, contradictions, duplicates, twin pairs and their direction balance in any DPO file. See [Contrastive twin pairs](../guides/dpo.md#contrastive-twin-pairs).
+
+```bash
+pgs pairs build twins.jsonl -o twin_pairs.jsonl [--prediction_field model_answer --only_misread]
+pgs pairs check dpo_rows.jsonl --require_balanced
 ```
 
 ### version

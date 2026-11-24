@@ -54,6 +54,7 @@ Commands:
   rollouts    Read RL / distillation rollout dumps: finish reasons, rewards, tool errors, loops, slowest, worst
   compare     Evaluation results with intervals; two checkpoints on the same items: paired tests, pass@k
   screen      RL pool difficulty: k rollouts per row with the RL config's rewards, keep rows with 0 < pass rate < 1
+  pairs       Preference pairs: build contrastive twin pairs (minimal prompt edits), check a pair file
   version     Show version info
 
 Usage:
@@ -198,6 +199,11 @@ def main():
             from palingenesis.rl.screen import main as screen_main
 
             sys.exit(screen_main())
+
+        case "pairs":
+            from palingenesis.pairs import main as pairs_main
+
+            sys.exit(pairs_main())
 
         case "gradients":
             _run_agent_tool("palingenesis.agent_tooling.check_gradients")
