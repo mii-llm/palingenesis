@@ -263,6 +263,13 @@ def _run_prepare_multi():
         default=0.0,
         help="Raw-text sources: drop near-duplicate documents at or above this Jaccard similarity (0 = off)",
     )
+    parser.add_argument(
+        "--decontaminate_shared_share",
+        type=float,
+        default=-1.0,
+        help="N-grams in more than this share of an evaluation file's rows are not matched (0 = match all; "
+        "default: 0.2, or off with --decontaminate_fields)",
+    )
     parser.add_argument("--min_chars", type=int, default=0, help="Raw-text sources: drop documents shorter than this")
     args = parser.parse_args()
 
@@ -291,6 +298,7 @@ def _run_prepare_multi():
         decontaminate=args.decontaminate,
         decontaminate_ngram=args.decontaminate_ngram,
         decontaminate_fields=args.decontaminate_fields,
+        decontaminate_shared_share=args.decontaminate_shared_share,
         near_dedupe=args.near_dedupe,
         min_chars=args.min_chars,
     )

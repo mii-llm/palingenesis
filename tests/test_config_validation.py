@@ -381,3 +381,17 @@ def test_raw_text_cleaning_options(tmp_path):
     fields.preprocess.decontaminate_fields = "question"
     with pytest.raises(ConfigError, match="preprocess.decontaminate_fields must be a list"):
         fields.validate()
+    share = Config()
+    assert share.preprocess.decontaminate_shared_share == -1
+    for value in (0, 0.2, 1):
+        share.preprocess.decontaminate_shared_share = value
+        assert share.validate() == []
+    share.preprocess.decontaminate_shared_share = 1.5
+    with pytest.raises(ConfigError, match="preprocess.decontaminate_shared_share"):
+        share.validate()
+
+
+def test_data_stream_version_is_importable_without_heavy_dependencies():
+    from palingenesis.config import DATA_STREAM_VERSION
+
+    assert DATA_STREAM_VERSION == 2

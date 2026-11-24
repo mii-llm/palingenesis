@@ -138,7 +138,7 @@ class NgramIndex:
     strings: int = 0  # strings read from the files
     too_short: int = 0  # strings with fewer than n words: they give no n-gram and protect nothing
     shared: int = 0  # n-grams left out because most rows of their file hold them
-    shared_row_share: float = SHARED_ROW_SHARE
+    shared_row_share: float = SHARED_ROW_SHARE  # 0 or 1: off
     _word_hash: _WordHashes = field(default_factory=_WordHashes, repr=False)
 
     @classmethod
@@ -147,12 +147,18 @@ class NgramIndex:
         paths: Iterable[str | Path],
         n: int = 13,
         fields: Iterable[str] | None = None,
-        shared_row_share: float = SHARED_ROW_SHARE,
+        shared_row_share: float | None = None,
     ) -> "NgramIndex":
         """The index of the files' rows. fields: the columns to read (default: all). A file whose
-        rows have none of them is an error. shared_row_share: see the class (1.0 keeps every n-gram)."""
+        rows have none of them is an error. shared_row_share: see the class; None or a negative
+        value: SHARED_ROW_SHARE when every column is read, off when `fields` names the columns
+        (they hold the items, not the scaffolding); 0 or 1: off, every n-gram is matched."""
         if n < 1:
             raise ValueError(f"the decontamination n-gram must be >= 1 words, got {n}")
+        if shared_row_share is None or shared_row_share < 0:
+            shared_row_share = 0.0 if fields else SHARED_ROW_SHARE
+        if shared_row_share > 1:
+            raise ValueError(f"the shared n-gram share must be in [0, 1], got {shared_row_share}")
         index = cls(n=n, fields=list(fields) if fields else None, shared_row_share=shared_row_share)
         for path in paths:
             index.files.append(str(path))
@@ -190,7 +196,8 @@ class NgramIndex:
                 f"decontamination: no row of {path} has any of the fields {self.fields} "
                 "(preprocess.decontaminate_fields / --decontaminate_fields)"
             )
-        limit = self.shared_row_share * rows if rows >= SHARED_MIN_ROWS else rows
+        active = 0.0 < self.shared_row_share < 1.0 and rows >= SHARED_MIN_ROWS
+        limit = self.shared_row_share * rows if active else rows
         kept = {h for h, c in counts.items() if c <= limit}
         dropped = len(counts) - len(kept)
         if dropped:
@@ -228,6 +235,7 @@ class NgramIndex:
             "strings": self.strings,
             "strings_shorter_than_ngram": self.too_short,
             "ngrams": len(self.hashes),
+            "shared_row_share": self.shared_row_share,
             "shared_ngrams_ignored": self.shared,
         }
 

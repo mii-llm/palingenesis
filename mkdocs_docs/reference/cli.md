@@ -218,7 +218,8 @@ pgs prepare --data raw_corpus.jsonl --output prepared/corpus --mode pretrain \
 | `--text_field` | The text column (default `text`) |
 | `--no_dedupe` | Keep exact duplicate documents (same text up to case and whitespace) |
 | `--near_dedupe T` | Drop near-duplicates at or above Jaccard similarity T of the word 5-gram sets (MinHash; 0 = off) |
-| `--decontaminate FILE...`, `--decontaminate_ngram N`, `--decontaminate_fields COL...` | Drop documents sharing an N-word n-gram (default 13) with the evaluation files (every string column, or the named ones; n-grams shared by more than 20% of a file's rows are not matched) |
+| `--decontaminate FILE...`, `--decontaminate_ngram N`, `--decontaminate_fields COL...` | Drop documents sharing an N-word n-gram (default 13) with the evaluation files (every string column, or the named ones) |
+| `--decontaminate_shared_share S` | N-grams in more than share S of an evaluation file's rows are not matched (default 0.2, off with `--decontaminate_fields`; 0 = match all) |
 | `--min_chars N` | Drop documents shorter than N characters |
 | `--eval_holdout N` | Hold out N whole documents, drawn after deduplication (`eval_data.*`) |
 | `--model` | Optional: only to report token counts |

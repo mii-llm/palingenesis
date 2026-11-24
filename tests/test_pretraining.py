@@ -187,6 +187,79 @@ def test_default_eos_that_is_the_end_of_turn_token_warns(caplog):
     assert "end-of-turn" not in caplog.text
 
 
+class _TemplateTok:
+    """A tokenizer stub: an EOS token, a vocabulary, and a template that ends assistant turns with `turn_end`."""
+
+    def __init__(self, eos: str, turn_end: str, vocab: list[str], template_extra: str = ""):
+        self.eos_token, self.eos_token_id = eos, vocab.index(eos)
+        self.turn_end, self.vocab = turn_end, vocab
+        self.chat_template = "{{ messages }}" + turn_end + template_extra
+
+    def get_vocab(self):
+        return {t: i for i, t in enumerate(self.vocab)}
+
+    def apply_chat_template(self, messages, tokenize=False):
+        return "".join(
+            f"[{m['role']}] {m['content']}{self.turn_end if m['role'] == 'assistant' else ''}\n" for m in messages
+        )
+
+
+def test_end_of_turn_warning_matches_the_token_exactly(caplog):
+    from palingenesis import data
+
+    def warned(tok) -> bool:
+        data._END_OF_TURN_WARNED.clear()
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            assert data.document_end_id(tok, True) == tok.eos_token_id
+        return "end-of-turn token" in caplog.text
+
+    # Mistral / Llama 2: </s> ends turns and is the end of text too: the right token, no warning
+    assert not warned(_TemplateTok("</s>", " </s>", ["<s>", "</s>", "<unk>"]))
+    # the EOS only appears somewhere in the template (a substring match would flag it); turns end with another token
+    assert not warned(_TemplateTok("<eos>", "<end_of_turn>", ["<eos>", "<end_of_turn>", "<|endoftext|>"], "<eos>"))
+    # a chat model whose EOS is the end-of-turn token while the vocabulary has an end-of-text token
+    assert warned(_TemplateTok("<|im_end|>", "<|im_end|>", ["<|im_end|>", "<|endoftext|>"]))
+    assert 'append_eos: "<|endoftext|>"' in caplog.text
+    assert warned(_TemplateTok("<|eot_id|>", "<|eot_id|>", ["<|eot_id|>", "<|end_of_text|>"]))
+    assert 'append_eos: "<|end_of_text|>"' in caplog.text
+
+
+@needs_tok
+def test_pretokenized_cache_of_raw_text_from_an_older_version_is_rebuilt(tmp_path):
+    """The fingerprint carries the raw-text stream version: a cache written before documents got their
+    end-of-document token (and tails, replay and epochs changed) is not reused; chat-only caches are."""
+    import hashlib
+
+    from palingenesis.config import DATA_STREAM_VERSION, Config
+    from palingenesis.data import PRETOK_DATA, PRETOK_META, _fingerprint_payload, pretokenized_cache_valid
+
+    def old_fingerprint(config) -> str:
+        """The fingerprint as computed before the stream version existed."""
+        payload = _fingerprint_payload(config, TOK)
+        payload.pop("data_stream", None)
+        for source in payload["sources"]:
+            source.pop("append_eos", None)
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+    text = Config()
+    text.data.sources = [{"dataset": "corpus.jsonl", "mode": "pretrain"}]
+    replay = Config()
+    replay.data.pretrain_replay_dataset = "replay.jsonl"
+    chat = Config()
+    for config in (text, replay):
+        assert _fingerprint_payload(config, TOK)["data_stream"] == DATA_STREAM_VERSION == 2
+        cache = tmp_path / str(id(config))
+        cache.mkdir()
+        (cache / PRETOK_DATA).write_bytes(b"")
+        (cache / PRETOK_META).write_text(json.dumps({"fingerprint": old_fingerprint(config)}))
+        assert pretokenized_cache_valid(cache, pretokenize_fingerprint(config, TOK))[0] is False
+        (cache / PRETOK_META).write_text(json.dumps({"fingerprint": pretokenize_fingerprint(config, TOK)}))
+        assert pretokenized_cache_valid(cache, pretokenize_fingerprint(config, TOK))[0] is True
+    assert "data_stream" not in _fingerprint_payload(chat, TOK)
+    assert old_fingerprint(chat) == pretokenize_fingerprint(chat, TOK)
+
+
 # ── end-of-document token ─────────────────────────────────────────────────────
 
 
@@ -430,6 +503,19 @@ def test_random_init_in_low_precision_matches_a_loaded_checkpoint(tmp_path, monk
     fallback = model_init.random_init(str(path), seed=3, dtype=torch.bfloat16)
     assert calls == [torch.bfloat16, torch.float32]
     assert all(p.dtype == torch.bfloat16 for p in fallback.parameters())
+    # ...and the fallback is the clean seeded float32 draw, whatever the failed attempt consumed
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_config", real)
+    clean = model_init.random_init(str(path), seed=3, dtype=torch.float32).state_dict()
+
+    def failing_after_drawing(config, **kwargs):
+        if kwargs.get("dtype") != torch.float32:
+            torch.rand(1000)
+            raise RuntimeError("normal_ is not implemented for this dtype")
+        return real(config, **kwargs)
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_config", failing_after_drawing)
+    redrawn = model_init.random_init(str(path), seed=3, dtype=torch.bfloat16)
+    assert all(torch.equal(p, clean[name].to(torch.bfloat16)) for name, p in redrawn.named_parameters())
     assert {name: b.dtype for name, b in fallback.named_buffers()} == reference
 
 
@@ -604,14 +690,65 @@ def test_decontamination_reads_fields_and_ignores_shared_instructions(tmp_path):
     # without the rule the instruction removes every document that quotes it
     assert NgramIndex.from_files([bench], shared_row_share=1.0).contaminated(quoting)
 
-    by_field = NgramIndex.from_files([bench], fields=["question"], shared_row_share=1.0)
+    assert NgramIndex.from_files([bench], shared_row_share=0).contaminated(quoting)  # 0: the rule is off
+    by_field = NgramIndex.from_files([bench], fields=["question"])
     assert by_field.strings == 30 and by_field.summary()["fields"] == ["question"]
+    # named columns hold the items: the rule is off by default there, on when a share is given
+    assert by_field.shared_row_share == 0 and by_field.shared == 0
+    assert NgramIndex.from_files([bench], fields=["system"]).contaminated(quoting)
+    explicit = NgramIndex.from_files([bench], fields=["system", "question"], shared_row_share=0.2)
+    assert explicit.shared > 0 and not explicit.contaminated(quoting) and explicit.contaminated(leaked)
+    with pytest.raises(ValueError, match="shared n-gram share"):
+        NgramIndex.from_files([bench], shared_row_share=1.5)
     assert not by_field.contaminated(quoting) and by_field.contaminated(leaked)
     with pytest.raises(ValueError, match="no row of .*bench.jsonl has any of the fields"):
         NgramIndex.from_files([bench], fields=["prompt"])
     # a small file (a handful of rows) is indexed whole: a repeated string there may be the item itself
     small = _write_jsonl(tmp_path / "small.jsonl", rows[:3])
     assert NgramIndex.from_files([small]).contaminated(quoting)
+
+
+def test_shared_share_reaches_prepare_from_config_and_cli(tmp_path, monkeypatch):
+    import sys
+
+    import yaml
+
+    from palingenesis import prepare
+
+    instruction = (
+        "Answer the following question by writing only the letter of the single correct option and nothing else"
+    )
+    rows = [{"system": instruction, "question": f"What is item number {i} of the list?"} for i in range(20)]
+    bench = _write_jsonl(tmp_path / "bench.jsonl", rows)
+    docs = [{"text": f"Guide {i}. {instruction}. Then check your work twice."} for i in range(3)]
+    docs += [{"text": f"Plain document number {i} about gardens and rivers and bridges."} for i in range(3)]
+    data = _write_jsonl(tmp_path / "corpus.jsonl", docs)
+
+    def run_config(**preprocess) -> dict:
+        out = tmp_path / f"out{len(list(tmp_path.glob('out*')))}"
+        config = {
+            "data": {"sources": [{"dataset": data, "name": "c", "mode": "pretrain"}]},
+            "preprocess": {"output_dir": str(out), "format": "jsonl", "decontaminate": [bench], **preprocess},
+        }
+        (tmp_path / "c.yaml").write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(sys, "argv", ["pgs", "--config", str(tmp_path / "c.yaml")])
+        prepare.main()
+        return json.loads((out / "c" / prepare.PREPARED_META).read_text())
+
+    assert run_config()["num_samples"] == 6  # default: the shared instruction is not matched
+    off = run_config(decontaminate_shared_share=0)
+    assert off["num_samples"] == 3 and off["decontamination"]["shared_row_share"] == 0
+    assert run_config(decontaminate_fields=["system"])["num_samples"] == 3  # named columns: matched
+    assert run_config(decontaminate_fields=["system"], decontaminate_shared_share=0.2)["num_samples"] == 6
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["pgs", "--data", data, "--output", str(tmp_path / "cli"), "--mode", "pretrain", "--format", "jsonl"]
+        + ["--decontaminate", bench, "--decontaminate_shared_share", "0"],
+    )
+    prepare.main()
+    assert json.loads((tmp_path / "cli" / prepare.PREPARED_META).read_text())["num_samples"] == 3
 
 
 def test_eval_reader_and_resume_warnings(caplog):

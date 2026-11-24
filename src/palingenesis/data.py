@@ -52,7 +52,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import PreTrainedTokenizerBase
 
-from palingenesis.config import DataConfig
+from palingenesis.config import DATA_STREAM_VERSION, DataConfig
 from palingenesis.multimodal import (
     PIXEL_FIELDS,
     POSITION_FIELD,
@@ -1986,21 +1986,51 @@ _END_OF_TURN_WARNED: set[str] = set()
 
 
 def _warn_end_of_turn_eos(tokenizer) -> None:
-    """Warn (once per token) when the tokenizer's EOS is written in its chat template, i.e. it is the
-    end-of-turn token of a chat model: raw documents closed with it teach that documents end like turns."""
+    """Warn (once per token) when the tokenizer's EOS is exactly what its chat template ends an assistant
+    turn with, and the vocabulary has another token for the end of text: raw documents closed with the
+    end-of-turn token teach that documents end like turns."""
     token = getattr(tokenizer, "eos_token", None)
-    template = getattr(tokenizer, "chat_template", None)
-    if not isinstance(token, str) or not token or not isinstance(template, str) or token not in template:
+    if not isinstance(token, str) or not token or token in _END_OF_TURN_WARNED:
         return
-    if token in _END_OF_TURN_WARNED:
+    if _end_of_turn_token(tokenizer) != token:
         return
+    end_of_text = _end_of_text_token(tokenizer)
+    if end_of_text is None or end_of_text == token:
+        return  # the EOS is the end of text too (</s> tokenizers): the right token to close a document with
     _END_OF_TURN_WARNED.add(token)
     logger.warning(
         f"append_eos: this tokenizer's EOS token {token!r} is its chat template's end-of-turn token, and every "
-        "raw-text document (mode: pretrain) will end with it. For a chat model name the end-of-text token "
-        'instead, e.g. append_eos: "<|endoftext|>" (Qwen) or "<|end_of_text|>" (Llama 3), or set '
-        "append_eos: false."
+        "raw-text document (mode: pretrain) will end with it. Name the end-of-text token instead, "
+        f'append_eos: "{end_of_text}", or set append_eos: false.'
     )
+
+
+_END_OF_TEXT_TOKENS = ("<|endoftext|>", "<|end_of_text|>")
+
+
+def _end_of_turn_token(tokenizer) -> str | None:
+    """What the chat template writes right after an assistant turn's content (None without a template)."""
+    if not isinstance(getattr(tokenizer, "chat_template", None), str):
+        return None
+    probe = "ASSISTANT-REPLY-PROBE"
+    try:
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "q"}, {"role": "assistant", "content": probe}], tokenize=False
+        )
+    except Exception:  # noqa: BLE001 - a template that cannot render this conversation: nothing to compare
+        return None
+    if not isinstance(text, str) or probe not in text:
+        return None
+    return text.rsplit(probe, 1)[1].strip() or None
+
+
+def _end_of_text_token(tokenizer) -> str | None:
+    """The vocabulary's end-of-text token, when it has one under a usual name."""
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:  # noqa: BLE001
+        return None
+    return next((t for t in _END_OF_TEXT_TOKENS if t in vocab), None)
 
 
 def _marked(stage):
@@ -3061,10 +3091,7 @@ def _fingerprint_payload(config, tokenizer) -> dict:
         if src.get("tools_field") is not None:  # only when set: existing caches stay valid
             sig["tools_field"] = src["tools_field"]
         if sig["mode"] == "pretrain":
-            # raw text: the end-of-document token, and epochs that count a document once with all its chunks
-            # (a cache written before either holds another stream and is rebuilt)
             sig["append_eos"] = src.get("append_eos", True)
-            sig["row_epochs"] = True
         return sig
 
     if d.sources:
@@ -3101,8 +3128,11 @@ def _fingerprint_payload(config, tokenizer) -> dict:
         payload["mix_epoch"] = d.mix_epoch
     if getattr(d, "mix_weights", "sequences") != "sequences":  # what the sources' weights are shares of
         payload["mix_weights"] = d.mix_weights
-    if d.pretrain_replay_dataset:  # the epoch counts the target's rows, replay is drawn alongside
-        payload["replay_epoch"] = "target_rows"
+    if d.pretrain_replay_dataset or any(sig["mode"] == "pretrain" for sig in sources_sig):
+        # raw text in the stream: how documents end, how they are cut into chunks and what an epoch of them is
+        # (config.DATA_STREAM_VERSION). A cache written under another version holds another stream and is
+        # rebuilt; caches of chat-only data are untouched.
+        payload["data_stream"] = DATA_STREAM_VERSION
     if getattr(d, "turn_scaling", "uniform") != "uniform":
         # the cache stores the per-token loss weights: one written without them must be rebuilt, not read as uniform
         payload["loss_weights"] = True

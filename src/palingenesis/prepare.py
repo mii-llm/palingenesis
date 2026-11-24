@@ -980,6 +980,7 @@ def prepare_text(
     tokenizer=None,
     bench=None,
     decontaminate_fields: list[str] | tuple[str, ...] = (),
+    decontaminate_shared_share: float = -1.0,
 ) -> Path:
     """Clean a raw-text dataset (a `mode: pretrain` source) without a model.
 
@@ -987,8 +988,9 @@ def prepare_text(
        documents shorter than that many characters
     2. Drop the documents that share a word n-gram of `decontaminate_ngram` words with the
        `decontaminate` files (the evaluation sets you will report): every string column, or
-       only `decontaminate_fields`; n-grams in more than 20% of a file's rows (a shared
-       instruction) are not matched
+       only `decontaminate_fields`; n-grams in more than `decontaminate_shared_share` of a
+       file's rows (a shared instruction; -1: 20% when every column is read, off with fields;
+       0: off) are not matched
     3. Drop exact duplicates (dedupe: the same text up to case and whitespace) and, with
        near_dedupe > 0, near-duplicates (estimated Jaccard similarity of the word 5-gram sets
        at or above that value); the first document of a group is kept
@@ -1012,7 +1014,9 @@ def prepare_text(
     if not 0.0 <= near_dedupe <= 1.0:
         raise ValueError(f"near_dedupe must be in [0, 1] (a Jaccard similarity; 0 = off), got {near_dedupe}")
     if bench is None and decontaminate:
-        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram, decontaminate_fields)
+        bench = NgramIndex.from_files(
+            decontaminate, decontaminate_ngram, decontaminate_fields, decontaminate_shared_share
+        )
         logger.info(
             f"Decontamination: {len(bench.hashes):,} {bench.n}-word n-grams from {bench.strings:,} strings in "
             f"{len(bench.files)} file(s) ({bench.too_short:,} strings shorter than {bench.n} words give none)"
@@ -1149,6 +1153,7 @@ def prepare_multi_source(
     near_dedupe: float = 0.0,
     min_chars: int = 0,
     decontaminate_fields: list[str] | tuple[str, ...] = (),
+    decontaminate_shared_share: float = -1.0,
 ):
     """Prepare several data sources, each on its own (prepare_data per chat source,
     prepare_text per raw-text source, one model).
@@ -1181,7 +1186,8 @@ def prepare_multi_source(
         strategy: Selection strategy per source
         compute_hes, hes_top_k_pct, score, min_ppl, max_ppl, batch_size, max_batch_tokens,
             num_workers: as in prepare_data
-        decontaminate, decontaminate_ngram, decontaminate_fields, near_dedupe, min_chars: for the raw-text sources,
+        decontaminate, decontaminate_ngram, decontaminate_fields, decontaminate_shared_share, near_dedupe,
+            min_chars: for the raw-text sources,
             as in prepare_text (the evaluation n-grams are read once for all of them)
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -1200,7 +1206,9 @@ def prepare_multi_source(
     if decontaminate and any(s.get("mode", "sft") == "pretrain" for s in sources):
         from palingenesis.text_clean import NgramIndex
 
-        bench = NgramIndex.from_files(decontaminate, decontaminate_ngram, decontaminate_fields)
+        bench = NgramIndex.from_files(
+            decontaminate, decontaminate_ngram, decontaminate_fields, decontaminate_shared_share
+        )
 
     for src_config in sources:
         name = src_config.get("name", src_config.get("dataset", "unknown"))
@@ -1375,7 +1383,9 @@ def prepare_text_sources_from_config(config) -> Path:
     output_base = Path(pre.output_dir)
     bench = None
     if pre.decontaminate:
-        bench = NgramIndex.from_files(pre.decontaminate, pre.decontaminate_ngram, pre.decontaminate_fields)
+        bench = NgramIndex.from_files(
+            pre.decontaminate, pre.decontaminate_ngram, pre.decontaminate_fields, pre.decontaminate_shared_share
+        )
     cleaned = []
     for i, src in text_sources:
         name = str(src.get("name") or Path(str(src["dataset"])).stem or f"source{i}")
@@ -1461,6 +1471,13 @@ def main():
         default=[],
         help="Columns of the evaluation files to read (default: every string column)",
     )
+    parser.add_argument(
+        "--decontaminate_shared_share",
+        type=float,
+        default=-1.0,
+        help="N-grams in more than this share of an evaluation file's rows are not matched (0 = match all; "
+        "default: 0.2, or off with --decontaminate_fields)",
+    )
     parser.add_argument("--min_chars", type=int, default=0, help="--mode pretrain: drop documents shorter than this")
     parser.add_argument("--max_samples", type=int, help="Max samples to process")
     parser.add_argument("--max_seq_length", type=int, default=8192)
@@ -1538,6 +1555,7 @@ def main():
             decontaminate=args.decontaminate,
             decontaminate_ngram=args.decontaminate_ngram,
             decontaminate_fields=args.decontaminate_fields,
+            decontaminate_shared_share=args.decontaminate_shared_share,
             min_chars=args.min_chars,
             eval_holdout=args.eval_holdout,
             seed=args.seed,

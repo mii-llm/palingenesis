@@ -21,13 +21,14 @@ def init_seed(config) -> int:
     return config.train.seed if config.model.init_seed < 0 else config.model.init_seed
 
 
-def _build(config, dtype: torch.dtype, kwargs: dict) -> torch.nn.Module:
+def _build(config, dtype: torch.dtype, kwargs: dict, seed: int) -> torch.nn.Module:
     """The model of `config`, built under `dtype` as from_pretrained builds one: parameters are created
-    in it, buffers the architecture computes in float32 (rotary frequencies) stay float32, and a rank
+    in it from `seed`, buffers the architecture computes in float32 (rotary frequencies) stay float32, and a rank
     never holds more than one copy of the model in `dtype`. An architecture whose initialiser cannot
     draw in a low-precision dtype is built in float32 and its parameters (only) are cast."""
     from transformers import AutoModelForCausalLM
 
+    torch.manual_seed(seed)
     try:
         return AutoModelForCausalLM.from_config(config, dtype=dtype, **kwargs)
     except (RuntimeError, NotImplementedError) as e:
@@ -37,6 +38,7 @@ def _build(config, dtype: torch.dtype, kwargs: dict) -> torch.nn.Module:
             f"Random initialisation in {dtype} failed ({type(e).__name__}: {e}); initialising in float32 and "
             "casting the parameters (this needs the float32 model in host memory on every rank)."
         )
+    torch.manual_seed(seed)  # the failed attempt may have drawn: the fallback is a clean seeded float32 draw
     model = AutoModelForCausalLM.from_config(config, dtype=torch.float32, **kwargs)
     with torch.no_grad():
         for parameter in model.parameters():
@@ -79,16 +81,14 @@ def random_init(
     # same CUDA state whatever seed + rank it had set
     devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     with torch.random.fork_rng(devices=devices):
-        torch.manual_seed(seed)
         try:
-            model = _build(model_config, dtype, kwargs)
+            model = _build(model_config, dtype, kwargs, seed)
         except ValueError:
             # a multimodal checkpoint's config: its language model is the causal LM
             text_config = model_config.get_text_config() if hasattr(model_config, "get_text_config") else model_config
             if text_config is model_config:
                 raise
-            torch.manual_seed(seed)
-            model = _build(text_config, dtype, kwargs)
+            model = _build(text_config, dtype, kwargs, seed)
             # nothing to follow at export: the source holds another architecture (checkpoint._source_checkpoint)
             model.config._name_or_path = ""
     params = sum(p.numel() for p in model.parameters())

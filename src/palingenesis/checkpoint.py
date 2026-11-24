@@ -22,6 +22,7 @@ import torch.distributed as dist
 from safetensors.torch import load_file as safetensors_load
 from safetensors.torch import save_file as safetensors_save
 
+from palingenesis.config import DATA_STREAM_VERSION
 from palingenesis.distributed import barrier, main_value, release_cuda_memory
 
 logger = logging.getLogger(__name__)
@@ -354,11 +355,6 @@ def _save_optimizer_sharded(optimizer, path: Path):
             safetensors_save(shard_tensors, str(path / f"shard_{shard_idx:04d}.safetensors"))
         if shard_meta:
             torch.save(shard_meta, path / f"shard_{shard_idx:04d}_meta.pt")
-
-
-# Version of the training stream a checkpoint's position (epoch, micro_step) counts in. 2: raw-text
-# documents end with an end-of-document token and a mix epoch counts rows (every chunk of a document).
-DATA_STREAM_VERSION = 2
 
 
 def _save_meta(scheduler, step, epoch, micro_step, path, data_ranks=1):
