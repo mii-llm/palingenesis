@@ -38,6 +38,7 @@ from transformers import AutoTokenizer
 
 from palingenesis import multimodal
 from palingenesis.accelerator import check_visible_devices
+from palingenesis.hooks import PolicyPlugins
 from palingenesis.kernels import (
     apply_activation_checkpointing,
     apply_liger_kernel,
@@ -136,6 +137,8 @@ class RLTrainer:
     eval_dataset   held-out rows replacing data.eval_dataset / data.eval_size
     """
 
+    plugins = PolicyPlugins([], None, "rl")  # replaced in __init__ (a default for partly built trainers)
+
     # lora.rank > 0: the policy's low-rank adapters (palingenesis.rl.adapters); None: every weight trains
     adapters: PolicyAdapters | None = None
     lr_scales: tuple[float, ...] = ()  # per optimizer group, with adapters (LoRA+); empty: one rate for all
@@ -164,6 +167,20 @@ class RLTrainer:
         )
         rank, world = self.parallel.rank, self.parallel.world
         self.device = self.parallel.device
+        # trainer plugins (palingenesis.hooks.PolicyPlugins), e.g. quantisation-aware training; no optimizer-step
+        # hooks or parameter groups: the optimizer steps fp32 masters (or FSDP shards), not the module's parameters
+        self.plugins = PolicyPlugins(
+            config.plugins.custom,
+            config,
+            "rl",
+            rank=rank,
+            world_size=world,
+            device=torch.device(self.device),
+            output_dir=t.output_dir,
+            total_steps=t.steps,
+            is_fsdp=t.fsdp,
+            optimizer_hooks=False,
+        )
         self.rng = random.Random(t.seed + rank)
         torch.manual_seed(t.seed + rank)
         os.makedirs(t.output_dir, exist_ok=True)
@@ -335,6 +352,7 @@ class RLTrainer:
             self.model = self.adapters.apply(load_causal_lm(m.policy, torch.float32), self.resume_path)
         else:
             self.model = load_causal_lm(self.resume_path or m.policy, torch.float32)
+        self.model = self.plugins.transform_model(self.model)  # before sharding, masters and checkpointing
         if self.resume_path:
             # exports follow the layout of the checkpoint the model was loaded from (checkpoint.save_hf_model,
             # source_layout): after a resume that would be a step_* dir, which checkpoint rotation deletes
@@ -520,6 +538,13 @@ class RLTrainer:
         else:
             self.engine = VLLMServerRollout(self.server, self.stop_ids)
         named = self._engine_parameters if self.adapters is not None else None
+        if self.plugins.transforms_rollout_weights():  # the engine samples from what the policy computes with
+
+            def named():
+                return checkpoint_named_parameters(
+                    self.model, self.plugins.rollout_weights(self.model.named_parameters())
+                )
+
         if getattr(self.engine, "payload", None) is not None or (r.backend == "remote" and not self.parallel.main):
             named = tuple  # nothing to fold here: the adapters travel as they are (or this rank does not push)
         self.weights = PublishedWeights(self.model, named)
@@ -548,6 +573,7 @@ class RLTrainer:
             self.opt = _optimizer(groups, t, self.device)
         else:
             self.opt = _optimizer(self._trainable(), t, self.device, self._trainable_names())
+        self.plugins.param_groups(self.model, self.opt)  # refused here (see above): a clear error at startup
         self.cmr = None
         if config.cmr.enabled:  # common-mode rejection on the parameters the optimizer steps (fp32 masters)
             from palingenesis.cmr import CommonModeRejection
@@ -556,6 +582,7 @@ class RLTrainer:
         self.start_step, self.stale_groups, wandb_id = 0, 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
+            self.plugins.load_state(self.resume_path)
         self.stop_requested = False
         # metrics: wandb, trackio, logging.trackers (rank 0); the run id is saved with each checkpoint
         self.tracker = Tracker.for_run(config.logging, config.to_dict(), t.output_dir, wandb_id, self.parallel.main)
@@ -1200,13 +1227,13 @@ class RLTrainer:
             # no batch is being collected and the engine does not step: partial rollouts (max_staleness > 0) keep
             # decoding between batches, and continue with the new weights
             with self.pipeline.lock, self.pipeline.client.paused():
-                full = self.parallel.full_parameters(self.model)
+                full = self.plugins.rollout_weights(self.parallel.full_parameters(self.model))
                 if self.adapters is not None:  # gathered on every rank (collectives), folded as they arrive
                     full = self.adapters.fold_stream(full, measure=True)
                 named = checkpoint_named_parameters(self.model, full)
                 self.engine.update_weights(named, version)
         elif hasattr(self.engine, "make_client"):  # remote engines: every rank gathers, rank 0 stages and sends
-            full = self.parallel.full_parameters(self.model)
+            full = self.plugins.rollout_weights(self.parallel.full_parameters(self.model))
             if self.adapters is not None:
                 full = self.adapters.fold_stream(full, measure=True)
             self.engine.update_weights(checkpoint_named_parameters(self.model, full), version)
@@ -1222,6 +1249,15 @@ class RLTrainer:
         failed = True  # until the run ends normally (a stop request included)
         if self.start_step >= t.steps:
             logger.warning("the checkpoint is at step %d of %d: nothing to train", self.start_step, t.steps)
+        self.plugins.on_train_start(self.model, self.start_step)  # every rank (a plugin may gather)
+        if self.plugins.transforms_rollout_weights() and self.start_step == 0:
+            # the engine started from the checkpoint: it samples from the plugins' weights from the first rollout
+            # (a resumed run syncs anyway: its engine is behind the restored policy version)
+            if self.parallel.fsdp:
+                self._push_weights(self.weights.version)
+            else:
+                with self.weights.lock:
+                    self.engine.update_weights(self.weights.named(), self.weights.version)
         if self.parallel.fsdp and self.engine.version < self.weights.version:
             self._push_weights(self.weights.version)  # resumed: the engine holds the initial weights
         previous = {sig: signal.signal(sig, self._request_stop) for sig in (signal.SIGUSR1, signal.SIGTERM)}
@@ -1242,6 +1278,7 @@ class RLTrainer:
                 t1 = time.perf_counter()
                 if self.cmr is not None:  # its own forward / backward on the twins; grads cleared before the task's
                     self.cmr.pre_step()
+                self.plugins.on_step_start(self.model, step)
                 metrics = self._train_step(groups)
                 if self.dumps is not None and batch.dump is not None:  # advantages assigned: written off-thread
                     self.dumps.submit(step + 1, batch.dump, batch.timeline)
@@ -1308,6 +1345,8 @@ class RLTrainer:
                 if self.parallel.replicated and (step + 1) % REPLICA_CHECK_EVERY == 0:
                     with self.weights.lock:  # the replicas must stay one policy: checked, and repaired from rank 0
                         metrics["replica/drift"] = self.parallel.replica_drift(self._trainable())
+                if self.plugins and step % config.logging.log_every == 0:  # every rank: plugin metrics may gather
+                    metrics.update(self.plugins.metrics(self.model, step + 1))
                 metrics = self._combine(metrics)
                 if step == 0:
                     self._parity_check(metrics)
@@ -1329,6 +1368,7 @@ class RLTrainer:
                 if t.save_steps and (step + 1) % t.save_steps == 0:
                     self.save(f"step_{step + 1}", step + 1)
             self._log("eval", self.evaluate(), t.steps)
+            self.plugins.on_train_end(self.model)
             if t.save_final:
                 self.save("final")
             failed = False
@@ -1448,7 +1488,13 @@ class RLTrainer:
             self.parallel.reshard(self.model)
             with self.master.fp32() if self.master is not None else contextlib.nullcontext():
                 if self.adapters is None:
-                    _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
+                    if self.plugins:  # final: the plugins' export; resume checkpoints: the architecture's tensors
+                        export = (
+                            self.plugins.export(self.model, path) if step is None else self.plugins.checkpoint_state
+                        )
+                        _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp, export)
+                    else:
+                        _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp)
                 elif self.parallel.replicated and not self.parallel.main:
                     path.mkdir(parents=True, exist_ok=True)  # every rank holds the same policy: rank 0 writes it
                 else:  # the folded model in float32 (a plain checkpoint) and <path>/adapter
@@ -1456,6 +1502,8 @@ class RLTrainer:
                     _save_gathered_or_local(self.model, self.tok, path, self.parallel.fsdp, export)
                     if self.parallel.main:
                         _set_config_dtype(path / "config.json", torch.float32)  # the live base may be bf16
+            if step is not None and self.plugins:
+                self.plugins.save_state(path, self.parallel.main)  # every rank (a state may gather)
             if step is not None and self.parallel.fsdp:
                 from torch.distributed.checkpoint import save as dcp_save
                 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict

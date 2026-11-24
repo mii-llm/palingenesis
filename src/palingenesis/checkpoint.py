@@ -695,7 +695,8 @@ def save_final(model, tokenizer, output_dir: str, is_fsdp: bool = False, export=
     Intermediate checkpoints use sharded DCP (fast, zero extra memory).
 
     export: a function state_dict -> state_dict applied to the full state before it is written
-    (trainer plugins' export_state_dict: fold quantised weights, drop training-only modules).
+    (trainer plugins' export_state_dict: fold quantised weights, drop training-only modules); its
+    optional attribute `after_save(path)` runs once the model is written (on_export_saved).
     Resume checkpoints never go through it.
     """
     path = Path(output_dir) / "final"
@@ -721,12 +722,22 @@ def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool, export=
             if export is not None:
                 state = export(hf_state_dict(state))
             save_hf_model(model, tokenizer, path, state=state, source_layout=True)
+            _after_save(export, path)
         del state
         release_cuda_memory()  # the gather's GPU blocks, before the barrier's NCCL allocation
         barrier()
     else:
         state = export(hf_state_dict(model.state_dict())) if export is not None else None
         save_hf_model(model, tokenizer, path, state=state, source_layout=True)
+        _after_save(export, path)
+
+
+def _after_save(export, path: Path) -> None:
+    """An export function's `after_save(path)`, once the exported model is written (trainer plugins'
+    on_export_saved: a quantised copy next to it)."""
+    after = getattr(export, "after_save", None)
+    if after is not None:
+        after(path)
 
 
 def find_latest_checkpoint(output_dir: str) -> str | None:

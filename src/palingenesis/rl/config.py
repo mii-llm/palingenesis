@@ -19,6 +19,7 @@ import yaml
 
 from palingenesis.cmr import CMRConfig
 from palingenesis.config import MoEConfig
+from palingenesis.hooks import PolicyPluginsConfig
 
 LOSSES = ("masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce")
 BASELINES = ("mean", "leave_one_out")
@@ -521,6 +522,8 @@ class RLConfig:
     lora: RLLoRAConfig = field(
         default_factory=RLLoRAConfig
     )  # low-rank adapters instead of full weights; off by default
+    # trainer plugins (palingenesis.hooks.PolicyPlugins), e.g. palingenesis.qat:FloatQAT: plugins: {custom: [...]}
+    plugins: PolicyPluginsConfig = field(default_factory=PolicyPluginsConfig)
 
     # ------------------------------------------------------------------ loading
 
@@ -790,6 +793,13 @@ class RLConfig:
         in_world = os.environ.get("WORLD_SIZE", "1") != "1" and not replicated
         if t.replicate_base and not self.lora.rank:
             errors.append("train.replicate_base replicates a frozen base: it needs lora.rank (adapters).")
+        if not isinstance(self.plugins.custom, list):
+            errors.append("plugins.custom must be a list of plugin entries (module:Class or {class, args}).")
+        elif self.plugins.custom and self.lora.rank:
+            errors.append(
+                "plugins.custom with lora.rank: trainer plugins run on full-weight RL only (the adapters replace "
+                "the layers a plugin would change)."
+            )
         if t.replicate_base and (t.fsdp or t.cpu_offload):
             errors.append("train.replicate_base is the alternative to FSDP: not with train.fsdp or train.cpu_offload.")
         if self.scenario.type or self.roles or self.scenario != RLScenarioConfig():

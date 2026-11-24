@@ -1164,6 +1164,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             finally:
                 plugin_ctx.export_dir = ""
 
+        if plugin_mgr:
+            export.after_save = plugin_mgr.on_export_saved  # files next to the written model (a quantised copy)
         return export
 
     _best_tracker = (

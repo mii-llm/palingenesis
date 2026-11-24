@@ -25,6 +25,8 @@ Where each hook runs in a training step, in order:
     on_after_optimizer_step(model, optimizer, ctx)   after optimizer.step()
     metrics(model, ctx)                at logging steps: scalars to log (as plugins/<name>/<key>)
     export_state_dict(state, model, ctx)   when a model is exported (final, best): fold / rename weights
+    on_export_saved(path, ctx)         after that export is written: files next to it (a quantised copy)
+    rollout_weights(named, ctx)        pgs rl / pgs distill: the weights a rollout engine loads (quantised ones)
     state_dict() / load_state_dict()   plugin state saved with every checkpoint, restored on resume
     on_train_end(model, ctx)           once, before the final save
 
@@ -41,7 +43,7 @@ import importlib.util
 import logging
 import math
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,8 +74,10 @@ class PluginContext:
     output_dir: str = ""
     # set by the trainer once the teachers exist (off-policy distillation), else None
     distiller: Any = None
-    # during export_state_dict: the directory the exported model is written to (final/, best/model/), else ""
+    # during export_state_dict / on_export_saved: the directory the exported model is written to, else ""
     export_dir: str = ""
+    # the trainer running the plugin: "train" (pgs train), "distill" (pgs distill) or "rl" (pgs rl)
+    trainer: str = "train"
     _logged: dict[str, float] = field(default_factory=dict)
 
     @property
@@ -208,6 +212,17 @@ class TrainerPlugin:
         fold quantised weights, drop training-only tensors. `state` is a full (gathered) state dict
         under the architecture's names. Return the new dict or None (changed in place). Under FSDP it
         runs on rank 0 only; files written next to the model go under `ctx.export_dir`."""
+
+    def on_export_saved(self, path: Path, ctx: PluginContext) -> None:
+        """After an exported model is written to `path` (final / best; rank 0 only): write files next to it,
+        e.g. a packed quantised copy built from what export_state_dict computed."""
+
+    def rollout_weights(self, named: Iterable[tuple[str, torch.Tensor]], ctx: PluginContext) -> Iterable | None:
+        """pgs rl / pgs distill: change the (name, tensor) pairs a rollout engine loads at a weight push (the
+        trainer's parameter names, full tensors; every rank iterates under FSDP). Return a new iterable (lazy is
+        fine: keep the stream one tensor at a time) or None for no change. A plugin whose forward differs from
+        the plain architecture's (fake quantisation) returns what that forward computes with, so the engine
+        samples from the policy being trained."""
 
     def state_dict(self) -> dict:
         """Plugin state to save with each checkpoint (picklable)."""
@@ -483,6 +498,27 @@ class PluginManager:
                 state = out
         return state
 
+    def on_export_saved(self, path) -> None:
+        self.ctx.export_dir = str(path)
+        try:
+            for p in self.plugins:
+                hook = getattr(p, "on_export_saved", None)
+                if hook is not None:
+                    hook(Path(path), self.ctx)
+        finally:
+            self.ctx.export_dir = ""
+
+    def rollout_weights(self, named: Iterable) -> Iterable:
+        for p in self.plugins:
+            hook = getattr(p, "rollout_weights", None)
+            out = hook(named, self.ctx) if hook is not None else None
+            if out is not None:
+                named = out
+        return named
+
+    def transforms_rollout_weights(self) -> bool:
+        return bool(self.implementing("rollout_weights"))
+
     def state_dict(self) -> dict:
         return {self._name(p): p.state_dict() for p in self.plugins}
 
@@ -558,3 +594,174 @@ def apply_param_groups(optimizer: torch.optim.Optimizer, model: nn.Module, overr
             moved_total += len(params)
     optimizer.param_groups[:] = [g for g in optimizer.param_groups if g["params"]]
     return moved_total
+
+
+# ─────────────────────────────────────────────────────────────── policy trainers (pgs distill, pgs rl)
+
+
+@dataclass(slots=True)
+class PolicyPluginsConfig:
+    """`plugins:` of pgs distill and pgs rl: trainer plugins, as `plugins.custom` in pgs train."""
+
+    custom: list = field(default_factory=list)
+
+
+PLUGIN_STATE_FILE = "plugins.pt"
+
+
+class PolicyPlugins:
+    """Trainer plugins inside the on-policy trainers (pgs distill, pgs rl).
+
+    These trainers compute their own losses on sampled completions, so the hooks that act on pgs train's loss
+    (loss, transform_targets, feature_requests) are refused at startup; so are the optimizer hooks and parameter
+    groups where the trainer steps something other than the module's parameters (pgs rl's fp32 masters).
+    Everything else runs: setup, transform_model (before sharding), on_train_start, on_forward_start (once per
+    optimizer step, with an empty batch), metrics, export_state_dict / on_export_saved (final export),
+    rollout_weights (every weight push to the rollout engine), state_dict / load_state_dict (checkpoints),
+    on_train_end. Resume checkpoints keep the architecture's tensors only: what a plugin adds (parameters,
+    buffers) goes through its state_dict.
+    """
+
+    def __init__(
+        self,
+        specs: list,
+        config: Any,
+        trainer: str,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        device: torch.device | None = None,
+        output_dir: str = "",
+        total_steps: int = 0,
+        is_fsdp: bool = False,
+        optimizer_hooks: bool = True,
+    ):
+        ctx = PluginContext(
+            config=config,
+            total_steps=total_steps,
+            rank=rank,
+            world_size=world_size,
+            dp_world_size=world_size,
+            device=device,
+            is_fsdp=is_fsdp,
+            output_dir=output_dir,
+            trainer=trainer,
+        )
+        self.trainer = trainer
+        self.optimizer_hooks = optimizer_hooks
+        self.mgr = PluginManager(load_plugins(specs), ctx)
+        self.ctx = ctx
+        self._base_keys: set[str] | None = None
+        command = f"pgs {trainer}"
+        for hook in ("loss", "transform_targets"):
+            names = [PluginManager._name(p) for p in self.mgr.implementing(hook)]
+            if names:
+                raise PluginError(f"{command} runs no {hook} hook (plugins {names}): it is a pgs train hook")
+        for p in self.mgr:
+            if p.feature_requests(ctx):
+                raise PluginError(
+                    f"{command}: plugin {PluginManager._name(p)} asks for hidden-state targets "
+                    "(feature_requests), which only pgs train's distillation computes"
+                )
+        if not optimizer_hooks:
+            names = [
+                PluginManager._name(p)
+                for hook in ("on_before_optimizer_step", "on_after_optimizer_step")
+                for p in self.mgr.implementing(hook)
+            ]
+            if names:
+                raise PluginError(
+                    f"{command}: plugins {sorted(set(names))} use optimizer-step hooks, which this trainer cannot "
+                    "run (its optimizer steps fp32 master copies, not the module's parameters)"
+                )
+        if self.mgr:
+            logger.info(f"{command} plugins: {', '.join(PluginManager._name(p) for p in self.mgr)}")
+            self.mgr.setup()
+
+    def __bool__(self) -> bool:
+        return bool(self.mgr)
+
+    def transform_model(self, model: nn.Module) -> nn.Module:
+        from palingenesis.checkpoint import hf_state_dict
+
+        if not self.mgr:
+            return model
+        self._base_keys = set(hf_state_dict(model.state_dict()))
+        return self.mgr.transform_model(model)
+
+    def param_groups(self, model: nn.Module, optimizer) -> None:
+        overrides = self.mgr.param_groups(model) if self.mgr else []
+        if not overrides:
+            return
+        if not self.optimizer_hooks:
+            raise PluginError(
+                f"pgs {self.trainer}: plugin parameter groups are not supported (the optimizer steps fp32 master "
+                "copies); e.g. float_qat scales: learned -> use scales: mse"
+            )
+        moved = apply_param_groups(optimizer, model, overrides)
+        logger.info(f"plugin parameter groups: {moved} parameters moved")
+
+    def on_train_start(self, model: nn.Module, step: int) -> None:
+        self.ctx.step = step
+        self.mgr.on_train_start(model)
+
+    def on_step_start(self, model: nn.Module, step: int) -> None:
+        """Before an optimizer step's forwards (`step` steps done)."""
+        self.ctx.step = step
+        self.mgr.on_forward_start(model, {})
+
+    def on_before_optimizer_step(self, model: nn.Module, optimizer) -> None:
+        self.mgr.on_before_optimizer_step(model, optimizer)
+
+    def on_after_optimizer_step(self, model: nn.Module, optimizer, step: int) -> None:
+        self.mgr.on_after_optimizer_step(model, optimizer)
+        self.ctx.step = step
+
+    def metrics(self, model: nn.Module, step: int) -> dict[str, float]:
+        self.ctx.step = step
+        return self.mgr.metrics(model) if self.mgr else {}
+
+    def rollout_weights(self, named: Iterable) -> Iterable:
+        return self.mgr.rollout_weights(named) if self.mgr else named
+
+    def transforms_rollout_weights(self) -> bool:
+        return bool(self.mgr) and self.mgr.transforms_rollout_weights()
+
+    def checkpoint_state(self, state: dict) -> dict:
+        """A resume checkpoint's tensors: the architecture's only (what plugins added is in their state)."""
+        if self._base_keys is None:
+            return state
+        return {k: v for k, v in state.items() if k in self._base_keys}
+
+    def export(self, model: nn.Module, path) -> Callable[[dict], dict]:
+        """The export function of a final model saved at `path` (checkpoint._save_gathered_or_local's `export`):
+        the plugins' export_state_dict, then their on_export_saved once the model is written."""
+
+        def run(state: dict) -> dict:
+            self.ctx.export_dir = str(path)
+            try:
+                return self.mgr.export_state_dict(state, model)
+            finally:
+                self.ctx.export_dir = ""
+
+        run.after_save = self.mgr.on_export_saved  # type: ignore[attr-defined]
+        return run
+
+    def save_state(self, path, main: bool) -> None:
+        """The plugins' state into <path>/plugins.pt (every rank calls: a state may gather; the main rank writes)."""
+        state = self.mgr.state_dict() if self.mgr else {}
+        if main and any(state.values()):
+            Path(path).mkdir(parents=True, exist_ok=True)
+            torch.save(state, Path(path) / PLUGIN_STATE_FILE)
+
+    def load_state(self, path) -> None:
+        file = Path(path) / PLUGIN_STATE_FILE
+        if file.exists():
+            self.mgr.load_state_dict(torch.load(file, map_location="cpu", weights_only=False))
+            logger.info(f"Plugin state restored from {file}")
+        elif self.mgr.implementing("state_dict"):
+            logger.warning(f"No plugin state in {path}: plugins resume from their initial state")
+
+    def on_train_end(self, model: nn.Module) -> None:
+        if self.mgr:
+            self.mgr.on_train_end(model)

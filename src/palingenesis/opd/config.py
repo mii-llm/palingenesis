@@ -16,6 +16,7 @@ import yaml
 
 from palingenesis.cmr import CMRConfig
 from palingenesis.config import MoEConfig
+from palingenesis.hooks import PolicyPluginsConfig
 from palingenesis.validate_data import valid_think_tags
 
 LOSSES = ("full_rkl", "topk_kl", "sampled_rkl", "xtok", "rs_kd")
@@ -404,6 +405,8 @@ class OPDConfig:
     logging: OPDLoggingConfig = field(default_factory=OPDLoggingConfig)
     cmr: CMRConfig = field(default_factory=CMRConfig)  # common-mode rejection (palingenesis.cmr); off by default
     moe: MoEConfig = field(default_factory=MoEConfig)  # MoE students: router balancing (palingenesis.moe)
+    # trainer plugins (palingenesis.hooks), e.g. palingenesis.qat:FloatQAT: plugins: {custom: [...]}
+    plugins: PolicyPluginsConfig = field(default_factory=PolicyPluginsConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "OPDConfig":

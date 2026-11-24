@@ -32,6 +32,7 @@ from torch import Tensor
 from transformers import AutoTokenizer
 
 from palingenesis.accelerator import check_visible_devices
+from palingenesis.hooks import PolicyPlugins
 from palingenesis.kernels import apply_liger_kernel, model_type_of
 from palingenesis.logging import Tracker
 from palingenesis.logits import final_hidden_states, output_head, verify_output_head
@@ -112,6 +113,8 @@ class OPDTrainer:
     cover; its prompts go to the first teacher unless its meta carries "_src" of
     a configured source.
     """
+
+    plugins = PolicyPlugins([], None, "distill")  # replaced in __init__ (a default for partly built trainers)
 
     def __init__(self, config: OPDConfig, source: PromptSource | None = None):
         for warning in config.validate():
@@ -213,8 +216,17 @@ class OPDTrainer:
                 apply_liger_kernel(model_type)
         self.resume_path = resolve_resume(config.train.resume_from, config.train.output_dir)
         student_path = self.resume_path or config.model.student
+        # trainer plugins (palingenesis.hooks.PolicyPlugins): e.g. quantisation-aware training
+        self.plugins = PolicyPlugins(
+            config.plugins.custom,
+            config,
+            "distill",
+            device=torch.device(self.device),
+            output_dir=config.train.output_dir,
+            total_steps=config.train.steps,
+        )
         logger.info("Loading student %s (fp32 master weights, bf16 autocast) on %s", student_path, self.device)
-        self.student = load_causal_lm(student_path, torch.float32).to(self.device)
+        self.student = self.plugins.transform_model(load_causal_lm(student_path, torch.float32).to(self.device))
         # MoE students: router balancing and routing statistics. No routing replay: the loss scores the student's
         # current distribution on its own samples, it has no importance ratio against the rollout engine.
         self.router_balancer = RouterBalancer.attach(self.student, config.moe)
@@ -302,7 +314,17 @@ class OPDTrainer:
             for name, a in aligners.items()
             if isinstance(a, ByteChunkAligner)
         }
-        self.weights = PublishedWeights(self.student)
+        named = None
+        if self.plugins.transforms_rollout_weights():  # the engine samples from what the student computes with
+            from palingenesis.opd.rollout import checkpoint_named_parameters
+
+            def named():
+                return checkpoint_named_parameters(
+                    self.student, self.plugins.rollout_weights(self.student.named_parameters())
+                )
+
+        self.weights = PublishedWeights(self.student, named)
+        self.rollout_engine = engine
         # Rollouts overlapping training run on their own CUDA stream (see Pipeline), except
         # with the in-process vLLM engine: next to the trainer's default-stream kernels it
         # hit illegal memory accesses (vLLM 0.26) that CUDA_LAUNCH_BLOCKING=1 made vanish,
@@ -325,6 +347,7 @@ class OPDTrainer:
 
             cls = bnb.optim.PagedAdamW8bit if config.train.optimizer == "paged_adamw8bit" else bnb.optim.AdamW8bit
             self.opt = cls(self.student.parameters(), lr=config.train.learning_rate, weight_decay=0.0)
+        self.plugins.param_groups(self.student, self.opt)
         self.cmr = None
         if config.cmr.enabled:  # common-mode rejection: hold the twins' common decision margin (palingenesis.cmr)
             from palingenesis.cmr import CommonModeRejection
@@ -339,6 +362,7 @@ class OPDTrainer:
         self.start_step, wandb_id = 0, None
         if self.resume_path:
             wandb_id = self._load_state(self.resume_path)
+            self.plugins.load_state(self.resume_path)
         # metrics: wandb, trackio, logging.trackers; the run id is saved with each checkpoint
         self.tracker = Tracker.for_run(config.logging, dataclasses.asdict(config), config.train.output_dir, wandb_id)
         self.dumps = None  # logging.dump_trajectories: the completions' writer (palingenesis.rollouts)
@@ -681,6 +705,11 @@ class OPDTrainer:
         end = stop_at if 0 < stop_at < config.train.steps else config.train.steps
         if self.start_step >= end:
             logger.warning("the checkpoint is at step %d, the run stops at %d: nothing to train", self.start_step, end)
+        self.plugins.on_train_start(self.student, self.start_step)  # before the first rollout uses the student
+        if self.weights.named is not None and config.rollout.backend != "hf" and self.start_step == 0:
+            # the engine started from the checkpoint: it samples from the plugins' weights from the first rollout
+            with self.weights.lock:
+                self.rollout_engine.update_weights(self.weights.named(), self.weights.version)
         self.orchestrator.start(end=end)
         failed = True  # until the run ends normally
         dumps = self.dumps
@@ -706,10 +735,13 @@ class OPDTrainer:
                 every = config.logging.dump_trajectories
                 if dumps is not None and (step + 1) % every == 0:  # plain values: the batch's tensors are not kept
                     dumps.submit(step + 1, self._dump_items(batch, step + 1))
+                self.plugins.on_step_start(self.student, step)
                 stats = self._scores(batch, train=True)
                 with self.weights.lock:
+                    self.plugins.on_before_optimizer_step(self.student, self.opt)
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), config.train.max_grad_norm)
                     self.opt.step()
+                    self.plugins.on_after_optimizer_step(self.student, self.opt, step + 1)
                     moe_stats = {}
                     if self.router_balancer is not None:
                         moe_stats = self.router_balancer.metrics()
@@ -740,6 +772,7 @@ class OPDTrainer:
                 if dumps is not None:
                     metrics[DROPPED_METRIC] = dumps.dropped
                 if step % config.logging.log_every == 0:
+                    metrics.update(self.plugins.metrics(self.student, step + 1))
                     self._log("step", metrics, step + 1)
                 if (
                     config.train.eval_every
@@ -758,6 +791,7 @@ class OPDTrainer:
             else:
                 if config.train.eval_every:
                     self._log("eval", self.evaluate(), config.train.steps)
+                self.plugins.on_train_end(self.student)
                 self.save("final")
             failed = False
         finally:
@@ -909,12 +943,21 @@ class OPDTrainer:
         A resumable checkpoint adds the optimizer, the policy version and the random
         states. trainer_state.pt is written last and atomically, so a checkpoint with
         it is complete; `final` is the model export only."""
-        from palingenesis.checkpoint import save_hf_model
+        from palingenesis.checkpoint import hf_state_dict, save_hf_model
 
         path = Path(self.config.train.output_dir) / name
         logger.info("Saving checkpoint -> %s", path)
         with self.weights.lock:  # a rollout engine may be copying the weights (max_staleness > 0)
-            save_hf_model(self.student, self.tok, path, source_layout=True)
+            if not self.plugins:
+                save_hf_model(self.student, self.tok, path, source_layout=True)
+            elif step is None:  # the final export: the plugins' export (e.g. quantised weights and a packed copy)
+                export = self.plugins.export(self.student, path)
+                save_hf_model(self.student, self.tok, path, export(hf_state_dict(self.student.state_dict())), True)
+                export.after_save(path)
+            else:  # resume checkpoint: the architecture's tensors (plugin state goes to plugins.pt)
+                state = self.plugins.checkpoint_state(hf_state_dict(self.student.state_dict()))
+                save_hf_model(self.student, self.tok, path, state, True)
+                self.plugins.save_state(path, main=True)
         with open(path / "opd_config.json", "w") as f:
             json.dump(dataclasses.asdict(self.config), f, indent=2)
         if step is not None:
