@@ -201,7 +201,10 @@ class TrainConfig:
     warmup_ratio: float = 0.05
     max_grad_norm: float = 1.0
     lr_scheduler: Literal["cosine", "linear", "constant", "power_decay", "wsd"] = "cosine"
-    optimizer: str = "adamw"  # "adamw", "muon", "adamw8bit", "lion8bit", "paged_adamw8bit"
+    # "adamw", "adamw_bf16", "muon", "adamw8bit", "lion8bit", "paged_adamw8bit". adamw_bf16: bf16 weights and moments
+    # with stochastic rounding (palingenesis.bf16_adamw): updates below a bf16 ulp still accumulate, at 8 B/param with
+    # the gradient against 16 for fp32 master weights. Needs model.torch_dtype: bfloat16.
+    optimizer: str = "adamw"
     # Muon (optimizer: muon; palingenesis.muon). muon_ns: "gram" (Gram Newton-Schulz with a restart, ~half the FLOPs
     # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
     # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
@@ -774,6 +777,17 @@ class Config:
                 warnings.append(
                     "train.muon_scale=spectral: Muon updates are not RMS-matched to AdamW, so the AdamW learning rate "
                     "is far too small for the Muon matrices (moonlight scaling avoids this)."
+                )
+        if self.train.optimizer == "adamw_bf16":
+            if self.model.torch_dtype != "bfloat16":
+                errors.append(
+                    f"train.optimizer=adamw_bf16 steps bfloat16 weights with stochastic rounding; model.torch_dtype is "
+                    f"{self.model.torch_dtype}. Set model.torch_dtype: bfloat16, or use optimizer: adamw (float32 "
+                    "weights are fp32 masters already)."
+                )
+            if self.plugins.schedule_free:
+                errors.append(
+                    "train.optimizer=adamw_bf16 with plugins.schedule_free: Schedule-Free replaces the optimizer."
                 )
         if self.train.lr_scheduler not in ("cosine", "linear", "constant", "power_decay", "wsd"):
             errors.append(

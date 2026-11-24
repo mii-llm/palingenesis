@@ -819,6 +819,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             use_muon=(config.train.optimizer == "muon"),
             optimizer_name=config.train.optimizer,
             muon=config.train.muon_options(),
+            seed=config.train.seed,
         )
         _override_groups(optimizer)
         scheduler = build_scheduler(

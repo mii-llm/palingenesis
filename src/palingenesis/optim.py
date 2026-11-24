@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 
-OPTIMIZERS = ("adamw", "muon", "adamw8bit", "lion8bit", "paged_adamw8bit")
+OPTIMIZERS = ("adamw", "adamw_bf16", "muon", "adamw8bit", "lion8bit", "paged_adamw8bit")
 
 
 def build_optimizer(
@@ -34,11 +34,14 @@ def build_optimizer(
     use_muon: bool = False,
     optimizer_name: str = "adamw",
     muon: dict | None = None,
+    seed: int = 0,
 ) -> torch.optim.Optimizer:
     """Build optimizer with optional LLRD, Muon, or 8-bit support.
 
     Options:
-      - "adamw": standard AdamW (16 bytes/param)
+      - "adamw": standard AdamW (16 bytes/param with fp32 weights; moments in the weights' dtype)
+      - "adamw_bf16": AdamW on bf16 weights with bf16 moments and stochastic rounding (palingenesis.bf16_adamw):
+        6 bytes/param of weights and state, updates below a bf16 ulp still accumulate; `seed` keys its rounding
       - "muon": Muon on hidden matrices (Gram Newton-Schulz, Moonlight RMS matching: same LR and weight decay as
         AdamW) + AdamW on embeddings / head / norms / thin matrices (palingenesis.muon); `muon` = its options
       - "adamw8bit": bitsandbytes 8-bit AdamW (6 bytes/param)
@@ -54,6 +57,15 @@ def build_optimizer(
 
     if optimizer_name in ("adamw8bit", "lion8bit", "paged_adamw8bit"):
         return _build_bnb_optimizer(model, lr, weight_decay, optimizer_name)
+
+    if optimizer_name == "adamw_bf16":
+        return _build_bf16_adamw(model, lr, weight_decay, llrd_decay, seed)
+
+    if any(p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters()):
+        logger.info(
+            "AdamW on bfloat16 weights: updates below half a bf16 ulp round away. train.optimizer: adamw_bf16 keeps "
+            "them (stochastic rounding, same memory); model.torch_dtype: float32 keeps fp32 master weights."
+        )
 
     if llrd_decay >= 1.0:
         return _build_simple_optimizer(model, lr, weight_decay)
@@ -77,6 +89,41 @@ def build_optimizer(
     logger.info(f"LLRD optimizer: {num_groups} groups, LR range [{min_lr:.2e}, {max_lr:.2e}], decay={llrd_decay}")
 
     return optimizer
+
+
+def _build_bf16_adamw(
+    model: torch.nn.Module, lr: float, weight_decay: float, llrd_decay: float, seed: int
+) -> torch.optim.Optimizer:
+    """AdamW on bf16 weights with stochastic rounding (palingenesis.bf16_adamw), with the same parameter groups as
+    "adamw" (decay / no decay, or LLRD's per-layer groups). Parameters that are not bf16 take plain fp32 AdamW."""
+    from palingenesis.bf16_adamw import BF16AdamW
+
+    if llrd_decay < 1.0:
+        groups = _build_llrd_groups(model, lr, weight_decay, llrd_decay)
+    else:
+        groups = _decay_groups(model, weight_decay)
+    optimizer = BF16AdamW(groups, lr=lr, betas=(0.9, 0.95), named=model.named_parameters(), seed=seed)
+    trained = [p for g in groups for p in g["params"]]
+    bf16 = sum(p.numel() for p in trained if p.dtype == torch.bfloat16)
+    other = sum(p.numel() for p in trained) - bf16
+    logger.info(
+        f"AdamW bf16 (stochastic rounding): {bf16 / 1e6:.1f}M bf16 params, ~{bf16 * 4 / 1e9:.2f} GB of moments"
+        + (f"; {other / 1e6:.1f}M non-bf16 params on plain AdamW" if other else "")
+    )
+    return optimizer
+
+
+def _decay_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
+    """Two groups: weight decay on matrices, none on biases, norms and embeddings."""
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1 or any(k in name.lower() for k in ("bias", "norm", "embed")):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [{"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0.0}]
 
 
 def _build_bnb_optimizer(
@@ -143,20 +190,11 @@ def _build_bnb_optimizer(
 
 def _build_simple_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> AdamW:
     """Standard two-group optimizer (no LLRD)."""
-    decay, no_decay = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim <= 1 or any(k in name.lower() for k in ("bias", "norm", "embed")):
-            no_decay.append(p)
-        else:
-            decay.append(p)
-
     is_distributed = dist.is_initialized() and dist.get_world_size() > 1
     use_fused = not is_distributed
 
     optimizer = AdamW(
-        [{"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
+        _decay_groups(model, weight_decay),
         lr=lr,
         betas=(0.9, 0.95),
         fused=use_fused,

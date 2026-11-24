@@ -206,7 +206,9 @@ class GradientRelease:
         Dispatches to the correct algorithm based on detected optimizer type.
         AdamW and Lion are both element-wise, so per-param stepping is exact.
         """
-        if self._optimizer_type == "lion":
+        if hasattr(self.optimizer, "step_parameter"):  # optimizers with their own per-parameter step (BF16AdamW)
+            self.optimizer.step_parameter(param, group)
+        elif self._optimizer_type == "lion":
             self._step_lion(param, group)
         else:
             self._step_adamw(param, group)

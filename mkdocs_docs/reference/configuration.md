@@ -136,7 +136,7 @@
 | `warmup_ratio` | float | `0.05` | Fraction of total steps for linear LR warmup. |
 | `max_grad_norm` | float | `1.0` | Global gradient clipping norm. Disabled when `adagc: true`. |
 | `lr_scheduler` | str | `cosine` | LR schedule. `power_decay` (recommended), `wsd` (long runs), `cosine`, `linear`, `constant`. |
-| `optimizer` | str | `adamw` | Optimizer. `adamw`, `muon`, `lion8bit`, `adamw8bit`, `paged_adamw8bit`. |
+| `optimizer` | str | `adamw` | Optimizer. `adamw`, `adamw_bf16`, `muon`, `lion8bit`, `adamw8bit`, `paged_adamw8bit`. `adamw_bf16`: AdamW on bf16 weights and bf16 moments with stochastic rounding, so updates smaller than a bf16 ulp still accumulate (needs `model.torch_dtype: bfloat16`; see [Optimizers](optimizers.md#adamw-bf16)). |
 | `seed` | int | `42` | Training random seed. |
 | `save_steps` | int | `500` | Save a resumable checkpoint (`step-N/`) every N steps. Old ones are deleted after each save, keeping the newest `keep_checkpoints`. |
 | `keep_checkpoints` | int | `5` | Step checkpoints kept on disk; the oldest are deleted after each save. `best/` and `final/` are never deleted. `0` keeps all. A full checkpoint holds the weights and the optimizer state (about 3× the fp32 weights for AdamW): size the disk for `keep_checkpoints` of them. |

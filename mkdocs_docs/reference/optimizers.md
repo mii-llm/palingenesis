@@ -10,9 +10,53 @@ All of these are set under `train:` (`optimizer`, `hyperball`, `mona`, `lr_sched
 
 | Situation | Choose | Why |
 |---|---|---|
+| bf16 weights (`model.torch_dtype: bfloat16`, the default) | `adamw_bf16` | Plain `adamw` on bf16 weights rounds most fine-tuning updates away; `adamw_bf16` keeps them at the same memory |
 | Memory tight (single GPU, ≤40 GB) | `lion8bit` + `memory.gradient_release` | 4 bytes/param, 0 gradient memory |
 | Memory abundant (multi-GPU FSDP) | `adamw`, or `muon` (+ `hyperball`) to experiment | Muon/Hyperball speedups are reported for pretraining, not measured here for fine-tuning |
 | Maximum simplicity | `adamw` | reliable baseline, 16 bytes/param |
+
+---
+
+## AdamW bf16
+
+AdamW for bf16 weights, with bf16 moments and **stochastic rounding** (`palingenesis.bf16_adamw.BF16AdamW`).
+
+```yaml
+model:
+  torch_dtype: bfloat16
+train:
+  optimizer: adamw_bf16
+```
+
+**The problem it fixes.** A bf16 weight has 8 significant bits: one ulp is $2^{-8}$ to $2^{-7}$ of $|w|$. AdamW at a fine-tuning learning rate of 2e-5 moves a weight of magnitude 0.02 by about $10^{-3}$ of its size per step, below half an ulp, so round-to-nearest returns the old weight. `optimizer: adamw` on bf16 weights (torch's AdamW keeps its moments in the weights' dtype) therefore leaves most weights unchanged at most steps. The usual fix, `model.torch_dtype: float32`, keeps fp32 master weights at twice the memory and with an fp32 residual stream under autocast.
+
+**What it does.** Every element's update is computed in fp32 from the stored bf16 values; only the stores round:
+
+| Stored | Rounding | Why |
+|---|---|---|
+| weight | stochastic | $\mathbb{E}[\text{stored}] = $ the fp32 result: an update of 1/16 of an ulp moves the weight by one ulp with probability 1/16, so small updates accumulate over steps |
+| second moment $v$ | stochastic | a non-negative running average near its own rounding floor, where nearest rounding stalls it (and biases $\sqrt{v}$, the step size) |
+| first moment $m$ | nearest | signed and roughly zero-mean: nearest rounding is already unbiased |
+
+The update reads $m$ and $v$ before they are rounded. Parameters that are not bf16 (fp32 adapters, an fp32 head) take the exact fp32 AdamW update.
+
+**Memory per trained parameter** (weights + gradient + optimizer state):
+
+| Regime | Weight | Gradient | Moments | Total |
+|---|:-:|:-:|:-:|:-:|
+| `torch_dtype: float32` + `adamw` (fp32 masters) | 4 | 4 | 8 | 16 B |
+| `torch_dtype: bfloat16` + `adamw` (updates round away) | 2 | 2 | 4 | 8 B |
+| `torch_dtype: bfloat16` + `adamw_bf16` | 2 | 2 | 4 | **8 B** |
+
+**Reproducibility.** The rounding noise is a counter-based integer hash of (the element's position, a seed from `train.seed`, the parameter's name and its step count), not a random generator: runs are bit-for-bit reproducible, a resumed run rounds exactly as the uninterrupted one (the step count is in the optimizer state), data-parallel ranks holding the same parameter round it identically, and CPU and CUDA give the same bits.
+
+**Speed.** On CUDA each parameter's update is one fused kernel compiled by `torch.compile` (one read of weight, gradient and both moments, one write of weight and moments); per-step scalars and seeds reach the GPU in one non-blocking copy. Off CUDA it runs eagerly. Measure it on your GPU with `python scripts/bench_optimizers.py step --model <model>` (step time and state bytes per parameter against fused torch AdamW and bitsandbytes 8-bit) and `python scripts/bench_optimizers.py train --model <model>` (tokens/s, peak memory and the loss after a fixed number of steps against fp32 masters).
+
+**What is measured on CPU** (`tests/test_bf16_adamw.py`): 200 steps of updates of 1/16 ulp move weights by 100% ($\pm 2\%$) of the fp32-master drift, against under 50% for `adamw` on bf16; a small regression at lr 3e-4 ends within 5% of the fp32-master loss (plain bf16 AdamW: 37% higher); the second moment stays within 0.3% of its fp32 value where nearest rounding stalls 4% low.
+
+Composes with: LLRD, gradient clipping, `memory.gradient_release` (per-parameter step), Hyperball, FSDP2 (each rank steps its shard; the noise is keyed by the element's offset in the local shard, so a resume must keep the sharding layout to be bit-exact), checkpoints and resume. Not with: Schedule-Free (it replaces the optimizer). `pgs rl` and `pgs distill` keep their fp32-master optimizers.
+
+After: stochastic rounding for low-precision training (Gupta et al., [arXiv:1502.02551](https://arxiv.org/abs/1502.02551); Zamirai et al., [arXiv:2010.06192](https://arxiv.org/abs/2010.06192)); rounding only the second moment stochastically follows the design notes of the [Halo](https://github.com/whitecircle/halo) framework's AdamWBF16 (re-implemented, no code shared).
 
 ---
 
