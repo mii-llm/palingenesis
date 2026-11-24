@@ -206,6 +206,8 @@ Mixture-of-Experts models (ignored for dense models). The same section exists in
 | `log_layers` | bool | `false` | Also log the loads and router entropy of every MoE layer (`moe/layer_<i>/...`). |
 | `experts_implementation` | str | `auto` | Expert compute: `auto` (transformers' default, a grouped GEMM where torch has one), `grouped` or `padded` (this library's forwards), or a transformers name (`eager`, `grouped_mm`, `batched_mm`). `pgs train`. Measure with `scripts/bench_moe_experts.py`. |
 
+RL and distillation configs also have a `plugins:` section (`custom`: trainer plugins, as `plugins.custom` in `pgs train`, e.g. [`palingenesis.qat:FloatQAT`](../guides/qat.md)); the hooks they run are listed in [Plugins](plugins.md#in-pgs-distill-and-pgs-rl). Not with `lora.rank`.
+
 RL configs also have a `lora:` section (`rank`, `alpha`, `rslora`, `dora`, `lr_ratio`, `targets`, `exclude`; `rank: 0` = off) that trains low-rank adapters instead of the full weights: see [LoRA in RL](../guides/lora.md#lora-in-rl).
 
 ### RL: `scenario`, `roles` and replicated bases

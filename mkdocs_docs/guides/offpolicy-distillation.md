@@ -224,6 +224,8 @@ What it does, hook by hook:
 | `metrics` | `codes_changed` (share of codes different from the start), `zero_share`, `strength`, `grid_reg` |
 | `export_state_dict` | `folded`: the exported model holds `W_q` in the original layout (any loader reads it); `latent`: the latents as trained |
 
+For FP4 / FP8 (NVFP4, MXFP4, FP8) use `palingenesis.qat:FloatQAT`: same mechanics, the formats vLLM serves, and a packed checkpoint next to every export ([Quantisation-Aware Training](qat.md)).
+
 The plugin is also registered as the entry point `ternary-qat` (`plugins.custom: [ternary-qat]` runs it with its defaults). The defaults are a starting point, not a tuned recipe. Write your own plugin for other quantisers (learned scales, LSQ, 2-/4-bit grids, Hessian-weighted rounding), inserted modules (extra norms before output projections), calibration passes before training, or per-block reconstruction targets.
 
 ## How to check it worked

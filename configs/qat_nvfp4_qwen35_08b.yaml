@@ -1,0 +1,56 @@
+# NVFP4 quantisation-aware training with knowledge distillation (QAD): Qwen3.5-0.8B against its own bf16 weights.
+# One GPU (an A100 trains it: the forward fake-quantises; vLLM serves final-nvfp4/ with 4-bit weights).
+#
+#   pgs quantize --model Qwen/Qwen3.5-0.8B --format nvfp4 --scales mse --out runs/ptq-nvfp4   # the PTQ gap first
+#   pgs train --config configs/qat_nvfp4_qwen35_08b.yaml
+#   vllm serve runs/qat_nvfp4/final-nvfp4
+#
+# Data: the model's own answers to varied prompts (messages rows), or your SFT mix. See the QAT guide.
+# The defaults below are a starting point, not a tuned recipe.
+
+model:
+  name_or_path: Qwen/Qwen3.5-0.8B
+  torch_dtype: float32            # fp32 latent weights, bf16 compute: QAT's small updates survive
+  attn_implementation: sdpa
+  compile: false
+  use_liger_kernel: false
+
+data:
+  dataset: data/self_generated.jsonl
+  streaming: false
+  max_seq_length: 1024
+  packing: false
+
+train:
+  output_dir: runs/qat_nvfp4
+  max_steps: 1000
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  warmup_ratio: 0.05
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  save_steps: 250
+  bf16: true
+  gradient_checkpointing: none
+
+distill:
+  enabled: true
+  temperature: 1.0
+  kd_weight: 1.0
+  ce_weight: 0.0                  # pure KL to the full-precision model
+  teachers:
+    bf16: {model: Qwen/Qwen3.5-0.8B, dtype: bfloat16}
+
+plugins:
+  custom:
+    - class: palingenesis.qat:FloatQAT
+      args:
+        format: nvfp4             # nvfp4 | mxfp4 | fp8 | fp8_block
+        activations: none         # weight-only (any GPU serves it); nvfp4: W4A4 on Blackwell
+        scales: mse               # MSE-optimal clipping searched before the first step
+        freeze_scales_at: 0.9     # the last 10% of steps train on the exported grid
+
+logging:
+  use_wandb: false

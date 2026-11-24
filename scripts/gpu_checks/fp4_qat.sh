@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# FP4 / FP8 quantisation-aware training: GPU checks on ONE NVIDIA A100 80GB (no FP4 / FP8 tensor cores: the
+# training forward fake-quantises; vLLM serves the packed checkpoints through its Marlin weight-only kernels).
+#
+#   PGS_PY=/path/to/venv/bin/python PGS_SRC=/path/to/palingenesis/src bash scripts/gpu_checks/fp4_qat.sh
+#
+# Environment (all optional but PGS_PY / PGS_SRC):
+#   PGS_PY       python with torch, transformers, vllm (default: python)
+#   PGS_SRC      palingenesis/src (default: ../../src from this script)
+#   WORK         working directory (default: a new /tmp/pgs_fp4_qat.XXXXXX); keep it to read the logs
+#   MODEL        default Qwen/Qwen3.5-0.8B (from the HF cache: HF_HUB_OFFLINE=1)
+#   STEPS        QAT steps per format (default 300)
+#   QAT_FORMATS  formats trained with QAT + KD (default "nvfp4 mxfp4")
+#   EVAL_ITEMS   accuracy-proxy items (default 200)
+#
+# Output: one JSON line per check on stdout, {"check": ..., "status": "PASS" | "FAIL" | "INFO", ...numbers}; the
+# last line is a summary. Logs of every step are in $WORK/logs. Expected run time on an A100 80GB: ~60-80 min
+# (data generation ~5 min, 9 vLLM evaluations ~1-2 min each, 2 QAT runs ~10-15 min each, vLLM loads, benchmarks).
+#
+# Checks
+#   (1) ptq/<fmt>/<scales>   PTQ of MODEL (nvfp4, mxfp4, fp8, fp8_block; max scales, and mse for the FP4 formats):
+#                            KL(bf16 || quantised) per token on held-out text, top-1 agreement, accuracy proxy
+#                            (GSM8K test if cached, else ARC-Easy, else synthetic arithmetic; greedy, non-thinking)
+#   (1b) exact/<fmt>         the dequantized export computes exactly what the fake-quantised forward computes
+#   (2) qat/<fmt>            pgs train, QAT with KD to the bf16 model (forward KL), STEPS steps on self-generated
+#                            text, from MSE-clipped scales, frozen at 90%: KL and accuracy vs PTQ (recovered share)
+#   (3) vllm/<run>           the packed compressed-tensors checkpoint loads in vLLM (Marlin on A100) and generates
+#                            like its dequantized twin (accuracy within 0.05, share of identical answers)
+#   (4) overhead/<mode>      forward + backward time with fake quantisation vs the plain model (bf16, 4 x 1024)
+set -uo pipefail
+
+PGS_PY=${PGS_PY:-python}
+PGS_SRC=${PGS_SRC:-$(cd "$(dirname "$0")/../../src" && pwd)}
+MODEL=${MODEL:-Qwen/Qwen3.5-0.8B}
+STEPS=${STEPS:-300}
+QAT_FORMATS=${QAT_FORMATS:-"nvfp4 mxfp4"}
+EVAL_ITEMS=${EVAL_ITEMS:-200}
+WORK=${WORK:-$(mktemp -d /tmp/pgs_fp4_qat.XXXXXX)}
+export PYTHONPATH="$PGS_SRC${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-WARNING}
+mkdir -p "$WORK/logs" "$WORK/results"
+START=$(date +%s)
+
+emit() { echo "$1" | tee -a "$WORK/results/checks.jsonl"; }
+fail() { emit "{\"check\": \"$1\", \"status\": \"FAIL\", \"error\": \"$2\", \"log\": \"$3\"}"; }
+
+cat > "$WORK/fp4_check.py" <<'PY'
+"""Helpers of scripts/gpu_checks/fp4_qat.sh (written by it into $WORK)."""
+
+import json
+import math
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+TOPICS = [
+    "photosynthesis", "the French Revolution", "black holes", "compound interest", "the immune system",
+    "volcanoes", "machine learning", "the Roman Empire", "climate change", "the water cycle", "jazz music",
+    "plate tectonics", "vaccines", "the stock market", "renewable energy", "the printing press", "honey bees",
+    "quantum computing", "the human brain", "coral reefs", "the Silk Road", "electric cars", "sleep",
+    "the moon landing", "inflation", "DNA", "the Olympic Games", "rainforests", "cryptography", "earthquakes",
+    "the Renaissance", "antibiotics", "ocean currents", "the internet", "glaciers", "chess strategy",
+    "nutrition", "the solar system", "democracy", "recycling", "the Great Wall of China", "bread baking",
+    "airplanes", "memory and learning", "mushrooms", "the Industrial Revolution", "tides", "batteries",
+]
+HELD_OUT = [
+    "lighthouses", "origami", "the Hubble telescope", "beekeeping history", "bridges", "desert ecosystems",
+    "public libraries", "submarines", "wind turbines", "the Aztecs", "migratory birds", "coffee",
+    "railways", "penguins", "the periodic table", "marathon training",
+]
+TEMPLATES = [
+    "Explain {t} in a short paragraph.",
+    "Give three interesting facts about {t}.",
+    "Explain {t} to a ten-year-old.",
+    "Write a short story that involves {t}.",
+    "What are the main advantages and disadvantages of {t}?",
+    "Summarize the history of {t} in a few sentences.",
+    "Write a short dialogue between two friends discussing {t}.",
+    "What are common misconceptions about {t}?",
+]
+
+
+def arithmetic_prompts(rng, n):
+    out = []
+    for _ in range(n):
+        a, b, c = rng.randint(3, 60), rng.randint(2, 30), rng.randint(1, 99)
+        out.append(
+            f"A store has {a} boxes with {b} items each. It sells {c} items. "
+            "How many items are left? Think step by step, then give the final number."
+        )
+    return out
+
+
+def chat(tok, prompt):
+    return tok.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+
+
+def vllm_engine(model, quantized=False):
+    from vllm import LLM
+
+    kwargs = dict(
+        model=model,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.45,
+        max_model_len=2048,
+        enforce_eager=True,
+        seed=0,
+    )
+    try:
+        return LLM(**kwargs, limit_mm_per_prompt={"image": 0, "video": 0})
+    except TypeError:
+        return LLM(**kwargs)
+
+
+def cmd_data(work, model, n_train, n_eval):
+    from transformers import AutoTokenizer
+
+    rng = random.Random(0)
+    tok = AutoTokenizer.from_pretrained(model)
+    train_prompts = [tpl.format(t=t) for t in TOPICS for tpl in TEMPLATES] + arithmetic_prompts(rng, 400)
+    rng.shuffle(train_prompts)
+    held_prompts = [tpl.format(t=t) for t in HELD_OUT for tpl in TEMPLATES]
+    prompts = train_prompts + held_prompts
+    try:
+        from vllm import SamplingParams
+
+        llm = vllm_engine(model)
+        params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=384)  # repeated prompts: new samples
+        repeats = max(1, math.ceil(n_train / len(train_prompts)))
+        texts = [chat(tok, p) for p in train_prompts] * repeats + [chat(tok, p) for p in held_prompts]
+        outs = llm.generate(texts, params)
+        completions = [o.outputs[0].text for o in outs]
+        used = "vllm"
+    except Exception as e:  # noqa: BLE001
+        print(f"vLLM generation failed ({e!r}); HF generate", file=sys.stderr)
+        completions, used = hf_generate(model, tok, prompts, 384), "hf"
+        repeats = 1
+    train_all = (train_prompts * repeats)[: len(completions) - len(held_prompts)]
+    rows = [
+        {"messages": [{"role": "user", "content": p}, {"role": "assistant", "content": c}]}
+        for p, c in zip(train_all, completions)
+        if c.strip()
+    ][:n_train]
+    held = [
+        {"messages": [{"role": "user", "content": p}, {"role": "assistant", "content": c}]}
+        for p, c in zip(held_prompts, completions[-len(held_prompts) :])
+        if c.strip()
+    ]
+    Path(work, "train.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    Path(work, "heldout.jsonl").write_text("".join(json.dumps(r) + "\n" for r in held))
+    items, source = eval_items(rng, n_eval)
+    Path(work, "eval.jsonl").write_text("".join(json.dumps(r) + "\n" for r in items))
+    print(json.dumps({"train_rows": len(rows), "heldout_rows": len(held), "eval_items": len(items),
+                      "eval_source": source, "generator": used}))
+
+
+def hf_generate(model, tok, prompts, max_new):
+    from transformers import AutoModelForCausalLM
+
+    m = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16).cuda().eval()
+    tok.padding_side = "left"
+    out = []
+    for i in range(0, len(prompts), 64):
+        batch = tok([chat(tok, p) for p in prompts[i : i + 64]], return_tensors="pt", padding=True).to("cuda")
+        with torch.no_grad():
+            gen = m.generate(**batch, max_new_tokens=max_new, do_sample=True, temperature=0.8, top_p=0.95)
+        out += tok.batch_decode(gen[:, batch.input_ids.shape[1] :], skip_special_tokens=True)
+    del m
+    torch.cuda.empty_cache()
+    return out
+
+
+def eval_items(rng, n):
+    try:
+        from datasets import load_dataset
+
+        for name, config in (("openai/gsm8k", "main"), ("gsm8k", "main")):
+            try:
+                ds = load_dataset(name, config, split="test")
+                items = [
+                    {"prompt": r["question"] + "\nPlease reason step by step, and put your final answer within \\boxed{}.",
+                     "answer": r["answer"].split("####")[-1].strip().replace(",", ""), "kind": "number"}
+                    for r in ds
+                ]
+                return items[:n], "gsm8k"
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="test")
+            items = []
+            for r in ds:
+                choices = "\n".join(f"{lab}. {txt}" for lab, txt in zip(r["choices"]["label"], r["choices"]["text"]))
+                items.append({"prompt": f"{r['question']}\n{choices}\nAnswer with the letter of the correct option only.",
+                              "answer": r["answerKey"], "kind": "letter"})
+            return items[:n], "arc_easy"
+        except Exception:  # noqa: BLE001
+            pass
+    except ImportError:
+        pass
+    items = []
+    for _ in range(n):
+        a, b, c = rng.randint(11, 99), rng.randint(3, 19), rng.randint(10, 999)
+        items.append({"prompt": f"Compute {a} * {b} + {c}. Reply with the number only.",
+                      "answer": str(a * b + c), "kind": "number"})
+    return items, "synthetic_arithmetic"
+
+
+def extract(text, kind):
+    if kind == "letter":
+        m = re.search(r"\b([A-E])\b", text.strip())
+        return m.group(1) if m else ""
+    boxed = re.findall(r"\\boxed\{([^{}]*)\}", text)
+    cand = boxed[-1] if boxed else text
+    nums = re.findall(r"-?\d[\d,]*\.?\d*", cand)
+    if not nums:
+        return ""
+    v = nums[-1].replace(",", "").rstrip(".")
+    try:
+        f = float(v)
+        return str(int(f)) if f == int(f) else str(f)
+    except ValueError:
+        return v
+
+
+def cmd_acc(work, model, out, tokenizer=None):
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+
+    items = [json.loads(line) for line in Path(work, "eval.jsonl").read_text().splitlines()]
+    tok = AutoTokenizer.from_pretrained(tokenizer or model)
+    t0 = time.time()
+    llm = vllm_engine(model)
+    load = time.time() - t0
+    max_tokens = 8 if items[0]["kind"] == "letter" else 512
+    outs = llm.generate([chat(tok, it["prompt"]) for it in items], SamplingParams(temperature=0.0, max_tokens=max_tokens))
+    texts = [o.outputs[0].text for o in outs]
+    correct = [extract(t, it["kind"]) == it["answer"] for t, it in zip(texts, items)]
+    result = {"accuracy": sum(correct) / len(correct), "items": len(items), "load_s": round(load, 1)}
+    Path(out).write_text(json.dumps({**result, "texts": texts}))
+    print(json.dumps(result))
+
+
+def load_hf(path):
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
+
+
+def heldout_batches(tok, work, limit=128):
+    rows = [json.loads(line) for line in Path(work, "heldout.jsonl").read_text().splitlines()][:limit]
+    for r in rows:
+        text = tok.apply_chat_template(r["messages"], tokenize=False, enable_thinking=False)
+        yield tok(text, return_tensors="pt", truncation=True, max_length=1024).input_ids.cuda()
+
+
+@torch.no_grad()
+def cmd_kl(work, reference, candidates, out):
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(reference)
+    ref = load_hf(reference)
+    results = {}
+    for cand in candidates:
+        model = load_hf(cand)
+        kl_sum = agree = tokens = 0.0
+        for ids in heldout_batches(tok, work):
+            lp = torch.log_softmax(ref(input_ids=ids).logits[0, :-1].float(), -1)
+            lq = torch.log_softmax(model(input_ids=ids).logits[0, :-1].float(), -1)
+            kl_sum += float((lp.exp() * (lp - lq)).sum())
+            agree += float((lp.argmax(-1) == lq.argmax(-1)).sum())
+            tokens += lp.shape[0]
+        results[cand] = {"kl": kl_sum / tokens, "top1_agreement": agree / tokens, "tokens": int(tokens)}
+        del model
+        torch.cuda.empty_cache()
+    Path(out).write_text(json.dumps(results))
+    print(json.dumps(results))
+
+
+@torch.no_grad()
+def cmd_exact(work, model_name, fmt, dequantized_dir, out):
+    """The fake-quantised forward (plugin on the bf16 model, the same arguments as pgs quantize) against the
+    dequantized export loaded as a plain model: identical logits expected (the same bf16 weights)."""
+    from transformers import AutoTokenizer
+
+    from palingenesis.hooks import PluginContext
+    from palingenesis.qat import FloatQAT
+
+    tok = AutoTokenizer.from_pretrained(model_name)
+    fake = load_hf(model_name)
+    plugin = FloatQAT(format=fmt, scales="mse")
+    ctx = PluginContext(config=None, device=torch.device("cuda"))
+    plugin.transform_model(fake, ctx)
+    plugin.on_train_start(fake, ctx)
+    plain = load_hf(dequantized_dir)
+    worst, n = 0.0, 0
+    for ids in heldout_batches(tok, work, limit=8):
+        a, b = fake(input_ids=ids).logits.float(), plain(input_ids=ids).logits.float()
+        worst = max(worst, float((a - b).abs().max()))
+        n += ids.shape[1]
+    Path(out).write_text(json.dumps({"max_abs_logit_diff": worst, "tokens": n}))
+    print(json.dumps({"max_abs_logit_diff": worst, "tokens": n}))
+
+
+def cmd_bench(model_name, out):
+    from palingenesis.hooks import PluginContext
+    from palingenesis.qat import FloatQAT
+
+    torch.manual_seed(0)
+    results = {}
+    modes = [("plain", None), ("nvfp4", ("nvfp4", "none")), ("mxfp4", ("mxfp4", "none")), ("fp8", ("fp8", "none")),
+             ("fp8_block", ("fp8_block", "none")), ("nvfp4_w4a4", ("nvfp4", "nvfp4")), ("fp8_w8a8", ("fp8", "fp8"))]
+    for name, setting in modes:
+        model = load_hf(model_name).train()
+        if setting is not None:
+            plugin = FloatQAT(format=setting[0], activations=setting[1])
+            plugin.transform_model(model, PluginContext(config=None))
+        vocab = model.config.get_text_config().vocab_size
+        ids = torch.randint(0, vocab, (4, 1024), device="cuda")
+        times = []
+        for i in range(13):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            loss = model(input_ids=ids, labels=ids).loss
+            loss.backward()
+            torch.cuda.synchronize()
+            if i >= 3:
+                times.append(time.perf_counter() - t0)
+            model.zero_grad(set_to_none=True)
+        times.sort()
+        results[name] = times[len(times) // 2]
+        del model
+        torch.cuda.empty_cache()
+    base = results["plain"]
+    report = {k: {"step_s": round(v, 4), "ratio": round(v / base, 3)} for k, v in results.items()}
+    Path(out).write_text(json.dumps(report))
+    print(json.dumps(report))
+
+
+if __name__ == "__main__":
+    cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "data":
+        cmd_data(args[0], args[1], int(args[2]), int(args[3]))
+    elif cmd == "acc":
+        cmd_acc(args[0], args[1], args[2], args[3] if len(args) > 3 else None)
+    elif cmd == "kl":
+        cmd_kl(args[0], args[1], args[3:], args[2])
+    elif cmd == "exact":
+        cmd_exact(args[0], args[1], args[2], args[3], args[4])
+    elif cmd == "bench":
+        cmd_bench(args[0], args[1])
+    else:
+        raise SystemExit(f"unknown command {cmd}")
+PY
+
+H="$PGS_PY $WORK/fp4_check.py"
+R="$WORK/results"
+jget() { "$PGS_PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print(d$2)" "$1" 2>/dev/null; }
+
+# ── environment
+"$PGS_PY" - > "$R/env.json" 2> "$WORK/logs/env.log" <<'PY'
+import json, torch
+info = {"torch": torch.__version__, "cuda": torch.cuda.is_available()}
+if torch.cuda.is_available():
+    info["gpu"] = torch.cuda.get_device_name(0)
+    info["capability"] = ".".join(map(str, torch.cuda.get_device_capability(0)))
+try:
+    import vllm
+    info["vllm"] = vllm.__version__
+except Exception as e:  # noqa: BLE001
+    info["vllm"] = f"unavailable: {e!r}"
+import transformers
+info["transformers"] = transformers.__version__
+print(json.dumps(info))
+PY
+emit "{\"check\": \"env\", \"status\": \"INFO\", \"work\": \"$WORK\", \"model\": \"$MODEL\", \"info\": $(cat "$R/env.json" 2>/dev/null || echo null)}"
+
+# ── data: self-generated training / held-out text, accuracy items
+if ! $H data "$WORK" "$MODEL" 2400 "$EVAL_ITEMS" > "$R/data.json" 2> "$WORK/logs/data.log"; then
+    fail data "data generation failed" "$WORK/logs/data.log"
+    exit 1
+fi
+emit "{\"check\": \"data\", \"status\": \"INFO\", $(tail -c +2 "$R/data.json")"
+
+# ── (1) PTQ baselines
+PTQ_RUNS=()
+for spec in nvfp4:max mxfp4:max fp8:max fp8_block:max nvfp4:mse mxfp4:mse; do
+    fmt=${spec%%:*}; scales=${spec##*:}; run="ptq_${fmt}_${scales}"
+    if $PGS_PY -m palingenesis.cli quantize --model "$MODEL" --format "$fmt" --scales "$scales" \
+        --out "$WORK/$run/packed" --dequantized "$WORK/$run/dequantized" \
+        > "$R/$run.quantize.json" 2> "$WORK/logs/$run.quantize.log"; then
+        PTQ_RUNS+=("$run")
+    else
+        fail "ptq/$fmt/$scales" "pgs quantize failed" "$WORK/logs/$run.quantize.log"
+    fi
+done
+CANDIDATES=()
+for run in "${PTQ_RUNS[@]}"; do CANDIDATES+=("$WORK/$run/dequantized"); done
+
+# (1b) the dequantized export == the fake-quantised forward
+for fmt in nvfp4 mxfp4; do
+    run="ptq_${fmt}_mse"
+    [ -d "$WORK/$run/dequantized" ] || continue
+    if $H exact "$WORK" "$MODEL" "$fmt" "$WORK/$run/dequantized" "$R/exact_$fmt.json" > /dev/null 2> "$WORK/logs/exact_$fmt.log"; then
+        diff=$(jget "$R/exact_$fmt.json" "['max_abs_logit_diff']")
+        status=$("$PGS_PY" -c "print('PASS' if float('$diff') == 0.0 else 'FAIL')")
+        emit "{\"check\": \"exact/$fmt\", \"status\": \"$status\", \"max_abs_logit_diff\": $diff}"
+    else
+        fail "exact/$fmt" "exact check crashed" "$WORK/logs/exact_$fmt.log"
+    fi
+done
+
+# ── (2) QAT with KD to the bf16 model
+QAT_RUNS=()
+for fmt in $QAT_FORMATS; do
+    run="qat_${fmt}"
+    cat > "$WORK/$run.yaml" <<YAML
+model:
+  name_or_path: $MODEL
+  torch_dtype: float32            # fp32 latent weights, bf16 compute (train.bf16)
+  attn_implementation: sdpa
+  compile: false
+  use_liger_kernel: false
+data:
+  dataset: $WORK/train.jsonl
+  streaming: false
+  max_seq_length: 1024
+  num_workers: 2
+  packing: false
+train:
+  output_dir: $WORK/$run
+  max_steps: $STEPS
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  warmup_ratio: 0.05
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  save_steps: 0
+  bf16: true
+  gradient_checkpointing: none
+  spike_detection: false
+distill:
+  enabled: true
+  temperature: 1.0
+  kd_weight: 1.0
+  ce_weight: 0.0
+  teachers:
+    bf16: {model: $MODEL, dtype: bfloat16}
+plugins:
+  custom:
+    - class: palingenesis.qat:FloatQAT
+      args:
+        format: $fmt
+        scales: mse
+        freeze_scales_at: 0.9
+        metrics_every: 50
+logging:
+  use_wandb: false
+  use_trackio: false
+YAML
+    t0=$(date +%s)
+    if $PGS_PY -m palingenesis.cli train --config "$WORK/$run.yaml" > "$WORK/logs/$run.log" 2>&1 \
+        && [ -d "$WORK/$run/final" ]; then
+        QAT_RUNS+=("$run")
+        CANDIDATES+=("$WORK/$run/final")
+        echo "{\"seconds\": $(( $(date +%s) - t0 ))}" > "$R/$run.time.json"
+    else
+        fail "qat/$fmt" "pgs train failed" "$WORK/logs/$run.log"
+    fi
+done
+
+# ── KL of every candidate vs bf16 on held-out text (one process: the reference loads once)
+if ! $H kl "$WORK" "$MODEL" "$R/kl.json" "${CANDIDATES[@]}" > /dev/null 2> "$WORK/logs/kl.log"; then
+    fail kl "KL evaluation crashed" "$WORK/logs/kl.log"
+fi
+
+# ── accuracy proxy (vLLM, greedy): bf16, every dequantized candidate
+acc() {  # acc <name> <model dir> [tokenizer]
+    if $H acc "$WORK" "$2" "$R/acc_$1.json" ${3:-} > /dev/null 2> "$WORK/logs/acc_$1.log"; then
+        jget "$R/acc_$1.json" "['accuracy']"
+    else
+        echo "null"
+    fi
+}
+ACC_BF16=$(acc bf16 "$MODEL")
+emit "{\"check\": \"bf16\", \"status\": \"INFO\", \"accuracy\": $ACC_BF16}"
+for run in "${PTQ_RUNS[@]}"; do
+    a=$(acc "$run" "$WORK/$run/dequantized")
+    kl=$(jget "$R/kl.json" "['$WORK/$run/dequantized']['kl']" || echo null)
+    agree=$(jget "$R/kl.json" "['$WORK/$run/dequantized']['top1_agreement']" || echo null)
+    err=$(jget "$R/$run.quantize.json" "['relative_error_mean']" || echo null)
+    fmt=$(echo "$run" | sed -E 's/^ptq_(.*)_(max|mse)$/\1/'); scales=${run##*_}
+    status=PASS; [ "$a" = "null" ] || [ -z "$kl" ] && status=FAIL
+    emit "{\"check\": \"ptq/$fmt/$scales\", \"status\": \"$status\", \"kl\": ${kl:-null}, \"top1_agreement\": ${agree:-null}, \"accuracy\": $a, \"accuracy_bf16\": $ACC_BF16, \"weight_rel_error\": ${err:-null}}"
+done
+for run in "${QAT_RUNS[@]}"; do
+    fmt=${run#qat_}
+    a=$(acc "$run" "$WORK/$run/final")
+    "$PGS_PY" - "$R" "$WORK" "$run" "$fmt" "$a" "$ACC_BF16" > "$R/$run.summary.json" <<'PY'
+import json, sys
+from pathlib import Path
+R, work, run, fmt, acc, acc_bf16 = sys.argv[1:7]
+kl = json.loads(Path(R, "kl.json").read_text())
+get = lambda d: kl.get(str(Path(work, d)), {}).get("kl")
+q = get(f"{run}/final")
+p_max, p_mse = get(f"ptq_{fmt}_max/dequantized"), get(f"ptq_{fmt}_mse/dequantized")
+acc = None if acc == "null" else float(acc)
+acc_bf16 = None if acc_bf16 == "null" else float(acc_bf16)
+def accp(name):
+    try:
+        return json.loads(Path(R, f"acc_{name}.json").read_text())["accuracy"]
+    except Exception:
+        return None
+a_max, a_mse = accp(f"ptq_{fmt}_max"), accp(f"ptq_{fmt}_mse")
+out = {"check": f"qat/{fmt}", "kl": q, "kl_ptq_max": p_max, "kl_ptq_mse": p_mse, "accuracy": acc,
+       "accuracy_ptq_max": a_max, "accuracy_ptq_mse": a_mse, "accuracy_bf16": acc_bf16}
+if q is not None and p_max:
+    out["kl_recovered_vs_ptq_max"] = round(1 - q / p_max, 3)
+if acc is not None and acc_bf16 is not None and a_max is not None and acc_bf16 > a_max:
+    out["accuracy_gap_recovered_vs_ptq_max"] = round((acc - a_max) / (acc_bf16 - a_max), 3)
+try:
+    out["train_seconds"] = json.loads(Path(R, f"{run}.time.json").read_text())["seconds"]
+except Exception:
+    pass
+ok = q is not None and p_max is not None and q < p_max and (p_mse is None or q < p_mse)
+out["status"] = "PASS" if ok else "FAIL"
+print(json.dumps(out))
+PY
+    emit "$(cat "$R/$run.summary.json")"
+done
+
+# ── (3) the packed checkpoints in vLLM (compressed-tensors; Marlin weight-only kernels on A100)
+vllm_check() {  # vllm_check <name> <packed dir> <dequantized twin name>
+    local name=$1 dir=$2 twin=$3
+    if [ ! -f "$dir/config.json" ]; then fail "vllm/$name" "no packed checkpoint" "$dir"; return; fi
+    if $H acc "$WORK" "$dir" "$R/acc_packed_$name.json" "$MODEL" > /dev/null 2> "$WORK/logs/vllm_$name.log"; then
+        "$PGS_PY" - "$R/acc_packed_$name.json" "$R/acc_$twin.json" "$name" > "$R/vllm_$name.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+try:
+    d = json.load(open(sys.argv[2]))
+except Exception:  # the dequantized twin was not evaluated
+    d = None
+out = {"check": f"vllm/{sys.argv[3]}", "loaded": True, "accuracy_packed": p["accuracy"], "load_s": p["load_s"]}
+if d is not None:
+    out["accuracy_dequantized"] = d["accuracy"]
+    out["identical_answers"] = round(sum(a == b for a, b in zip(p["texts"], d["texts"])) / len(p["texts"]), 3)
+    out["status"] = "PASS" if abs(p["accuracy"] - d["accuracy"]) <= 0.05 else "FAIL"
+else:
+    out["status"] = "PASS"
+print(json.dumps(out))
+PY
+        emit "$(cat "$R/vllm_$name.json")"
+    else
+        reason=$(grep -E "Error|error" "$WORK/logs/vllm_$name.log" | tail -n 1 | head -c 300 | tr '"\\' "' ")
+        fail "vllm/$name" "vLLM could not load or run it: $reason" "$WORK/logs/vllm_$name.log"
+    fi
+}
+for run in "${PTQ_RUNS[@]}"; do
+    case $run in *_max) vllm_check "$run" "$WORK/$run/packed" "$run" ;; esac
+done
+for run in "${QAT_RUNS[@]}"; do
+    vllm_check "$run" "$WORK/$run/final-${run#qat_}" "$run"
+done
+
+# ── (4) step-time overhead of fake quantisation
+if $H bench "$MODEL" "$R/bench.json" > /dev/null 2> "$WORK/logs/bench.log"; then
+    "$PGS_PY" - "$R/bench.json" > "$R/bench_lines.jsonl" <<'PY'
+import json, sys
+for mode, r in json.load(open(sys.argv[1])).items():
+    if mode == "plain":
+        print(json.dumps({"check": "overhead/plain", "status": "INFO", **r}))
+    else:
+        print(json.dumps({"check": f"overhead/{mode}", "status": "PASS" if r["ratio"] < 2.5 else "FAIL", **r}))
+PY
+    while read -r line; do emit "$line"; done < "$R/bench_lines.jsonl"
+else
+    fail overhead "benchmark crashed" "$WORK/logs/bench.log"
+fi
+
+# ── summary
+"$PGS_PY" - "$R/checks.jsonl" "$(( $(date +%s) - START ))" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+counts = {}
+for r in rows:
+    counts[r.get("status")] = counts.get(r.get("status"), 0) + 1
+print(json.dumps({"check": "summary", "status": "FAIL" if counts.get("FAIL") else "PASS", "counts": counts,
+                  "seconds": int(sys.argv[2])}))
+PY

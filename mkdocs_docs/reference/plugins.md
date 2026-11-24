@@ -2,12 +2,13 @@
 
 *Opt-in training enhancements. Each backed by a specific paper. All compose with torch.compile.*
 
-This page has two parts: the built-in switches under `plugins:` (DEFT, SymNoise, Pre-RL, DFT / CADFT / InfoSFT, Schedule-Free), and [trainer plugins](#trainer-plugins), your own code (or a shipped plugin) inside `pgs train`. Two trainer plugins ship with the library:
+This page has two parts: the built-in switches under `plugins:` (DEFT, SymNoise, Pre-RL, DFT / CADFT / InfoSFT, Schedule-Free), and [trainer plugins](#trainer-plugins), your own code (or a shipped plugin) inside `pgs train` (and, with [some hooks](#in-pgs-distill-and-pgs-rl), `pgs distill` and `pgs rl`). Three trainer plugins ship with the library:
 
 | Plugin | Entry point | What it does | Guide |
 |---|---|---|---|
 | `palingenesis.lora:LoRA` | `lora` | low-rank adapters on a frozen base, folded export and PEFT adapter | [LoRA](../guides/lora.md) |
 | `palingenesis.qat:TernaryQAT` | `ternary-qat` | ternary quantisation-aware training | [Off-Policy Distillation](../guides/offpolicy-distillation.md#quantisation-aware-training-while-distilling) |
+| `palingenesis.qat:FloatQAT` | `float-qat` | FP4 / FP8 quantisation-aware training (NVFP4, MXFP4, FP8), checkpoints for vLLM | [Quantisation-Aware Training](../guides/qat.md) |
 
 ---
 
@@ -125,10 +126,12 @@ my-registered-plugin = "my_package.plugins:MyPlugin"
 | `on_after_optimizer_step(model, optimizer, ctx)` | each step, after `optimizer.step()` | clamp or project weights |
 | `metrics(model, ctx)` | logging steps | return scalars (logged as `plugins/<name>/<key>`); `ctx.log(key, value)` from any hook |
 | `export_state_dict(state, model, ctx)` | final and best-model exports (never resume checkpoints) | fold quantised weights, rename, drop training-only tensors; `state` is the full state dict under the architecture's names |
+| `on_export_saved(path, ctx)` | after each of those exports is written (rank 0) | write files next to it, e.g. a packed quantised copy (`ctx.export_dir` is the export's directory) |
+| `rollout_weights(named, ctx)` | `pgs distill` / `pgs rl`: every weight push to the rollout engine | return the (name, tensor) pairs the engine loads (the weights the plugin's forward computes with) |
 | `state_dict()` / `load_state_dict(state)` | every checkpoint / resume | plugin state, saved as `plugins.pt` next to the checkpoint |
 | `on_train_end(model, ctx)` | after the last step, before the final save | final statistics |
 
-`ctx` (`PluginContext`) carries the config, `step` (optimizer steps done), `total_steps`, `progress` (0 to 1), `rank`, `world_size`, `dp_world_size`, `device`, `is_fsdp`, `output_dir` and, when distilling, the `distiller` (its teachers and caches). `palingenesis.hooks.Ramp(start, end, start_value, end_value, shape)` is a schedule over `progress` (`linear`, `cosine`, `step`); `Ramp.parse` accepts a number or a mapping, so ramps can come straight from plugin arguments.
+`ctx` (`PluginContext`) carries the config, `trainer` (`train`, `distill` or `rl`), `step` (optimizer steps done), `total_steps`, `progress` (0 to 1), `rank`, `world_size`, `dp_world_size`, `device`, `is_fsdp`, `output_dir` and, when distilling, the `distiller` (its teachers and caches). `palingenesis.hooks.Ramp(start, end, start_value, end_value, shape)` is a schedule over `progress` (`linear`, `cosine`, `step`); `Ramp.parse` accepts a number or a mapping, so ramps can come straight from plugin arguments.
 
 ### `loss` inputs and scaling
 
@@ -173,3 +176,25 @@ class L2ToStart(TrainerPlugin):
 ```
 
 `palingenesis.qat.TernaryQAT` is a complete example (layer substitution, a straight-through quantiser, a strength ramp, a grid regulariser, latent clamping, optimizer groups, hidden-state targets, folded export): see [Quantisation-aware training while distilling](../guides/offpolicy-distillation.md#quantisation-aware-training-while-distilling).
+
+### In pgs distill and pgs rl
+
+The on-policy trainers run trainer plugins from their own `plugins:` section (`plugins: {custom: [...]}`, the same
+entries as `plugins.custom` here), with the hooks that make sense there:
+
+| Hook | pgs distill | pgs rl |
+|---|---|---|
+| `setup`, `transform_model` (before sharding), `on_train_start`, `metrics`, `state_dict` / `load_state_dict`, `on_train_end` | yes | yes |
+| `on_forward_start` | once per optimizer step, before its forwards, with an empty batch | same |
+| `export_state_dict`, `on_export_saved` | the `final` export | the `final` export |
+| `rollout_weights(named, ctx)` | every weight push to a vLLM engine | every weight push (FSDP: gathered, every rank) |
+| `param_groups`, `on_before_optimizer_step`, `on_after_optimizer_step` | yes | refused (the optimizer steps fp32 masters) |
+| `loss`, `transform_targets`, `feature_requests` | refused | refused |
+
+`rollout_weights` returns the (name, tensor) pairs the engine loads: a plugin whose forward differs from the plain
+architecture (fake quantisation) returns what its forward computes with, so the engine samples from the model being
+trained. The engine also receives them before the first rollout. Resume checkpoints (`step_*`) hold the architecture's
+tensors only; what a plugin adds lives in `plugins.pt` through its `state_dict`. Plugins are refused with `lora.rank`
+in `pgs rl`. Two hooks are new for every trainer: `on_export_saved(path, ctx)` runs after an export is written (rank
+0; `palingenesis.qat:FloatQAT` writes the packed checkpoint next to it) and `rollout_weights`.
+

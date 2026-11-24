@@ -130,7 +130,9 @@ Training issue?
 │   ├── "no teacher target" error: the cache was built from other data / masking -> rebuild it from the
 │   │   training config, or distill.missing: skip (uncovered tokens get only ce_weight * CE)
 │   ├── OOM from the teacher: teachers.<name>.placement: shard (multi-GPU), dtype: bfloat16, or cache it
-│   └── QAT: plugins.custom: palingenesis.qat:TernaryQAT (watch plugins/ternary_qat/codes_changed, strength)
+│   ├── QAT: plugins.custom: palingenesis.qat:TernaryQAT (watch plugins/ternary_qat/codes_changed, strength)
+│   └── FP4 / FP8 QAT: palingenesis.qat:FloatQAT (format nvfp4|mxfp4|fp8|fp8_block), teacher = the bf16 model;
+│       PTQ gap first: pgs quantize; watch plugins/float_qat/qerr_mean, saturated_blocks; vLLM: final-<format>/
 ├── MoE model (Qwen3-MoE, Qwen3.5-MoE, Mixtral, GPT-OSS, DeepSeek-V3 family): routers collapse, RL unstable
 │   ├── Watch: moe/load_max (1 = balanced), moe/dead_experts, moe/router_entropy in the log line (moe[...])
 │   ├── Balancing is on by default (moe.balance_loss_coef: the model config's router_aux_loss_coef, load measured
@@ -188,4 +190,5 @@ Use `--json` flag (where available) for structured output suitable for programma
 | MoE routers collapse (`moe/load_max` rising, `moe/router_entropy` falling) | `moe.balance_loss_coef: 0.01`, `moe.z_loss_coef: 0.001` (see the MoE guide) |
 | Rollouts slow with vLLM, or an engine on another node | `rollout.backend: sglang` (in-process) or `sglang_server` (+ `rollout.weight_sync`); check `policy/mismatch_k3_step0` and `rollout_tok_s` against the vLLM run (RL guide, Rollout engines) |
 | MoE policy in RL: noisy ratios | `rollout.routing_replay: auto` with `rollout.prefix_caching: true` (vLLM returns the routed experts) |
+| Quality lost after FP4 / FP8 quantisation (PTQ) | QAT with KD to the bf16 model: `plugins.custom: [{class: palingenesis.qat:FloatQAT, args: {format: nvfp4, scales: mse, freeze_scales_at: 0.9}}]` + `distill.teachers.<name>.model: <the bf16 model>`, `model.torch_dtype: float32`; serve `final-nvfp4/` (see the QAT guide) |
 | Off-policy KD: student copies the teacher's tail / rambles | `distill.divergence: reverse_kl` or `jsd`, add `distill.ce_weight` |

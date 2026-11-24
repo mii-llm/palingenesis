@@ -111,6 +111,21 @@ pgs harness serve   --script turns.json --out requests.jsonl [--port 8000] [--mo
 pgs harness capture opencode --task task_steps/ --script turns.json --out captures/opencode [--harbor 0.24.0]
 ```
 
+### quantize
+
+Post-training FP4 / FP8 quantisation (round to nearest, max or MSE-optimal scales) into the compressed-tensors
+checkpoint vLLM loads, and optionally its dequantized bf16 twin. See [Quantisation-Aware Training](../guides/qat.md).
+
+```bash
+pgs quantize --model Qwen/Qwen3.5-0.8B --format nvfp4 --scales mse --out ptq-nvfp4 [--dequantized ptq-nvfp4-bf16]
+pgs quantize --model M --format fp8 --activations fp8 --out m-fp8      # W8A8, dynamic per-token activations
+pgs quantize --model M --format nvfp4 --activations nvfp4 --calibration texts.txt --out m-w4a4
+```
+
+Options: `--format {nvfp4,mxfp4,fp8,fp8_block}`, `--activations {none,fp8,nvfp4,mxfp4}`, `--scales {max,mse}`,
+`--mx_rounding {floor,even,ceil}`, `--exclude REGEX ...`, `--calibration FILE` (NVFP4 activations' static scale),
+`--device`. Prints one JSON line (layers, mean and max relative weight error).
+
 ### merge
 
 Weight-space merging of checkpoints that share an architecture. See [Model Merging](../guides/merging.md).
