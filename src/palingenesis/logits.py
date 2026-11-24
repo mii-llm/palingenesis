@@ -183,6 +183,7 @@ def scored_ce_sum(
     chunk_bytes: float = 1e9,
     position_ids: torch.Tensor | None = None,
     forward_kwargs: dict | None = None,
+    collective: bool = False,
 ) -> tuple[float, int]:
     """Summed cross-entropy over the scored positions, and their count, for evaluation.
 
@@ -192,14 +193,15 @@ def scored_ce_sum(
     (8 GB in bf16 for 4 x 4096 tokens at a 248k vocabulary, twice that once
     upcast), which dominated the trainer's peak memory at evaluation time.
     `position_ids` (optional) go to the forward (a context-parallel slice of the rows), as do
-    `forward_kwargs` (a multimodal batch's pixels and positions).
+    `forward_kwargs` (a multimodal batch's pixels and positions). `collective`: the forward runs collectives
+    (tensor parallelism), so it runs even when this rank's slice has nothing to score.
     """
     kwargs = dict(forward_kwargs or {})
     if position_ids is not None:
         kwargs["position_ids"] = position_ids
     valid = shifted_labels != ignore_index
     count = int(valid.sum())
-    if count == 0 and position_ids is None:  # a context-parallel slice still runs: the group's attention needs it
+    if count == 0 and position_ids is None and not collective:  # a split sequence still runs: the group needs it
         return 0.0, 0
     head = output_head(model)
     try:

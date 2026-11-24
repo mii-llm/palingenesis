@@ -291,6 +291,8 @@ class RouterBalancer:
         self._bias_masters: dict[int, Tensor] = {}
         # expert parallelism: ranks the experts are split over (contiguous blocks), for moe/rank_load_max
         self.expert_ranks = 1
+        # tensor parallelism: ranks that route the same tokens (each counts them; the all-reduce divides them out)
+        self.replicas = 1
         self._token: contextvars.Token | None = None
         for layer in layers:
             self._handles.append(layer.router.register_forward_hook(self._router_hook(layer)))
@@ -401,6 +403,8 @@ class RouterBalancer:
         batch = self._local
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(batch, op=dist.ReduceOp.SUM)
+            if self.replicas > 1:
+                batch /= self.replicas
         self._batch = batch
         self._buffer = batch.clone() if self._buffer is None else self._buffer + batch
         e = self.max_experts

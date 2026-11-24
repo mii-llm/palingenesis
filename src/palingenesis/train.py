@@ -67,6 +67,8 @@ from palingenesis.distributed import (
     barrier,
     build_mesh,
     cleanup_distributed,
+    clip_grad_norm_,
+    data_coordinates,
     fsdp_mesh,
     init_single_process_group,
     is_main,
@@ -143,6 +145,7 @@ from palingenesis.plugins import (
     pre_rl_loss,
 )
 from palingenesis.seco import PACKED_VARLEN, chunkwise_forward_backward, use_chunk_attention
+from palingenesis.tensor_parallel import TensorParallelError
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +419,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         logger.info(
             "Liger Kernel not applied: model.compile fuses the same ops (set model.compile: false to use Liger)"
         )
+    elif config.model.use_liger_kernel and config.parallel.tp_degree > 1:
+        # its fused norm / SwiGLU / RoPE autograd functions take plain tensors; tensor-parallel norms run on DTensors
+        logger.info("Liger Kernel not applied: parallel.tp_degree > 1 (use model.compile to fuse the same ops)")
     elif config.model.use_liger_kernel:
         apply_liger_kernel(model_type_of(config.model.name_or_path, config.model.trust_remote_code))
 
@@ -494,12 +500,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # FSDP2: several ranks, or one GPU with CPU offload (parameters, gradients and optimizer state in host memory)
     # (cpu_offload implies FSDP2, as in pgs rl: parallel.fsdp: false with cpu_offload on one GPU used to be a no-op)
     is_fsdp = (config.parallel.fsdp or config.parallel.cpu_offload) and mesh is not None
-    # Ranks that hold different data. The ranks of a context-parallel group split the same rows,
-    # so they read the same shard of the data.
-    if mesh is not None and "cp" in (mesh.mesh_dim_names or ()):
-        data_rank, data_world = mesh["dp"].get_local_rank(), mesh["dp"].size()
-    else:
-        data_rank, data_world = rank, world_size
+    # Ranks that hold different data. The ranks of a context-, tensor- or pipeline-parallel group split the
+    # same rows, so they read the same shard of the data.
+    data_rank, data_world = data_coordinates(mesh, rank, world_size)
     plugin_ctx.is_fsdp = is_fsdp
     plugin_ctx.dp_world_size = _dp_world_size(mesh) if is_fsdp else 1
 
@@ -561,6 +564,17 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             if n:
                 logger.info(f"DPO: disabled {n} dropout module(s) in the policy")
 
+    # ── Tensor parallel: split every layer over the "tp" group (before AC, compile and FSDP, as torchtitan) ──
+    tp = None
+    if config.parallel.tp_degree > 1:
+        from palingenesis.tensor_parallel import apply_tensor_parallel
+
+        tp = apply_tensor_parallel(model, mesh["tp"])
+        if router_balancer is not None:
+            router_balancer.replicas = tp.size
+        if config.parallel.async_tp:
+            _enable_async_tp(tp)
+
     # ── Float8 Training (H100+ speedup, before AC and FSDP) ─────────────
     if config.memory.float8_training:
         from palingenesis.float8 import apply_float8_training
@@ -587,8 +601,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     # ── sdpa: fused attention kernels under autocast (see seco.use_chunk_attention) ──
     if config.model.attn_implementation == "sdpa":
         rerouted = use_chunk_attention(model)
+        heads, kv_heads, head_dim = accelerator.attention_heads(model.config)
+        split = tp.size if tp is not None else 1  # this rank's heads under tensor parallelism
         kernel = accelerator.activate_flash_kernel(
-            config.model.flash_kernel, "sdpa", *accelerator.attention_heads(model.config), device=device
+            config.model.flash_kernel, "sdpa", heads // split, kv_heads // split, head_dim, device=device
         )
         logger.info(
             f"attention: {'fused (flash) path' if rerouted else 'sdpa as configured'} "
@@ -1082,6 +1098,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
         def export(state: dict) -> dict:
             state = {k: v for k, v in state.items() if not _is_aux(k)}
+            if tp is not None:  # the rank-by-rank parameters (linear-attention q/k/v, experts) back in order
+                state = tp.canonical_state_dict(state)
             if not plugin_mgr:
                 return state
             plugin_ctx.export_dir = str(path)
@@ -1203,7 +1221,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     resume_path = _resolve_resume(config)
 
     if resume_path:
-        meta = load_checkpoint(model, optimizer, scheduler, resume_path, is_fsdp, device)
+        meta = load_checkpoint(
+            model, optimizer, scheduler, resume_path, is_fsdp, device, layout=tp.layout() if tp is not None else None
+        )
         start_step = meta.get("step", 0)
         start_epoch = meta.get("epoch", 0)
         # The checkpoint records the index of the LAST micro-batch it trained on: the
@@ -1275,7 +1295,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 config.train.bf16,
             )
         if eval_batches:
-            loss = _compute_eval_loss(model, eval_batches, device, compute_dtype, config.train.bf16, cp=cp)
+            loss = _compute_eval_loss(model, eval_batches, device, compute_dtype, config.train.bf16, cp=cp, tp=tp)
             return {"eval/loss": loss, "eval/ppl": math.exp(min(loss, 20.0))}
         if _multi_evaluator is not None:
             me = _multi_evaluator.evaluate(model, dtype=compute_dtype)
@@ -1317,7 +1337,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     if plugin_mgr:
         plugin_mgr.on_train_start(model)
     # gradients are summed over every rank FSDP shards over (data- and context-parallel)
-    plugin_loss_scale = 1.0 / (plugin_ctx.dp_world_size * (cp.size if cp is not None else 1))
+    plugin_loss_scale = 1.0 / (
+        plugin_ctx.dp_world_size * (cp.size if cp is not None else 1) * (tp.size if tp is not None else 1)
+    )
     model.train()
 
     global_step = start_step
@@ -1404,6 +1426,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             raw_input_ids = input_ids
             kd_reshape = None  # per-token batch fields -> the layout the student sees
             if position_ids is not None:
+                if tp is not None:  # a multiple of tp tokens per row; the padding is a document of its own
+                    input_ids, labels = tp.pad(input_ids), tp.pad(labels, IGNORE_INDEX)
+                    position_ids = tp.pad_positions(position_ids)
+                    loss_weights = tp.pad(loss_weights) if loss_weights is not None else None
+                    observed = tp.pad(observed) if observed is not None else None
                 # Packed: forward arguments that keep the documents apart (palingenesis.packing)
                 packed = PackedBatch.build(
                     input_ids, labels, position_ids, flatten_packed, config.model.attn_implementation, loss_weights
@@ -1412,6 +1439,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 fwd_kwargs = {"input_ids": input_ids, **packed.forward_kwargs}
                 if flatten_packed:
                     kd_reshape = _flatten_rows
+                if tp is not None:  # this rank's slice of the (flattened) rows: where its hidden states are
+                    observed = tp.shard(observed.reshape(labels.shape)) if observed is not None else None
+                    labels = tp.shard(labels, IGNORE_INDEX)
+                    loss_weights = tp.shard(loss_weights) if loss_weights is not None else None
             else:
                 # Right padding only (the collator's): no mask. Padding after a row's tokens cannot
                 # reach them under causal attention (linear-attention layers included), and its
@@ -1446,6 +1477,19 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         "position_ids": cp.position_ids(seq_len, input_ids.shape[0], input_ids.device),
                     }
                     cp.activate(seq_len, input_ids.device)
+                # ── Tensor parallel: the model gets the whole rows (padded to a multiple of tp tokens) and
+                # returns this rank's slice of the final hidden states; the labels follow that slice.
+                if tp is not None:
+                    if attention_mask is not None and not right_padded:
+                        raise TensorParallelError(
+                            "tensor parallelism needs right-padded rows (causal attention keeps the padding inert); "
+                            "this batch has padding before real tokens."
+                        )
+                    fwd_kwargs["input_ids"] = input_ids = tp.pad(input_ids)
+                    fwd_kwargs["attention_mask"] = None
+                    labels = tp.shard(labels, IGNORE_INDEX)
+                    loss_weights = tp.shard(loss_weights) if loss_weights is not None else None
+                    observed = tp.shard(observed) if observed is not None else None
             # images: pixels in row order and M-RoPE positions (per document under packing)
             fwd_kwargs = multimodal.forward_kwargs(batch, fwd_kwargs, position_ids is not None and flatten_packed)
 
@@ -1496,7 +1540,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 plugin_mgr.on_forward_start(model, batch)
             if router_balancer is not None:  # real tokens of this forward (under context parallel, of this slice)
                 router_balancer.begin(
-                    attention_mask if cp is not None and attention_mask is not None else batch["attention_mask"],
+                    attention_mask
+                    if cp is not None and attention_mask is not None
+                    # tensor parallel: every rank routes the whole padded rows
+                    else (tp.pad(batch["attention_mask"]) if tp is not None else batch["attention_mask"]),
                     grad_accum=current_ga,
                 )
             # a flattened packed row: variable-length attention over its documents (seco.PACKED_VARLEN)
@@ -1774,6 +1821,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             # this process's tokens (under context parallel, its slice of the rows)
             _input_mask = attention_mask if cp is not None and attention_mask is not None else batch["attention_mask"]
             _n_valid, _n_input = torch.stack([local_valid, _input_mask.sum()]).tolist()
+            if tp is not None:  # the tensor-parallel group shares the rows: this rank's share of their tokens
+                _n_input /= tp.size
             accum_tokens += _n_input
             accum_trained += _n_valid
             tokens_total += _n_input
@@ -1807,6 +1856,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         # train.fused_optimizer: the norm in one launch per dtype, the clip factor applied inside
                         # the optimizer's kernel (no pass rescaling the gradients; .grad keeps unclipped values)
                         grad_norm = optimizer.clip_grad_norm_(config.train.max_grad_norm)
+                    elif tp is not None:  # parameters on several meshes (palingenesis.distributed.clip_grad_norm_)
+                        grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
                     elif config.train.max_grad_norm > 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
                     else:
@@ -2013,6 +2064,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         micro_step=micro_step,
                         keep_latest_k=config.train.keep_checkpoints,
                         data_ranks=data_world,
+                        layout=tp.layout() if tp is not None else None,
                     )
 
                 # ── Base Model Merge (SFA: anti-forgetting) ───────────
@@ -2085,6 +2137,22 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _enable_async_tp(tp) -> None:
+    """parallel.async_tp: inductor splits each tensor-parallel all-gather / reduce-scatter and the matmul next to it
+    into chunks over symmetric memory, so communication overlaps compute (torch's micro-pipelined TP, as
+    torchtitan's enable_async_tensor_parallel). Takes effect in the compiled layers."""
+    import torch._inductor.config as inductor_config
+
+    inductor_config._micro_pipeline_tp = True
+    try:
+        from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+
+        enable_symm_mem_for_group(tp.group.group_name)
+    except (ImportError, AttributeError):  # newer torch: symmetric memory needs no per-group opt-in
+        pass
+    logger.info("Async tensor parallel: micro-pipelined all-gather / reduce-scatter matmuls (compiled layers)")
 
 
 def _ensure_pretokenized(cache_dir, fingerprint: str, materialize, wait_s: float = 60.0) -> None:
@@ -2420,6 +2488,7 @@ def _compute_eval_loss(
     dtype: torch.dtype,
     bf16: bool,
     cp: ContextParallel | None = None,
+    tp=None,
 ) -> float:
     """Compute average CE loss over pre-collected eval batches. No gradient.
 
@@ -2442,17 +2511,30 @@ def _compute_eval_loss(
             input_ids, labels = cp.shard(input_ids), cp.shard(labels, pad_value=IGNORE_INDEX)
             attention_mask = None
             cp.activate(seq_len, device)
+        if tp is not None:  # the whole (padded) rows in, this rank's slice of the hidden states out
+            if not right_padded:
+                raise TensorParallelError("tensor parallelism needs right-padded evaluation rows")
+            input_ids, labels, attention_mask = tp.pad(input_ids), tp.shard(labels, pad_value=IGNORE_INDEX), None
         try:
             # Logits only at scored positions, in slices (palingenesis.logits): the
             # model's own forward would materialise the full [B, S, V] logits.
             loss, valid = scored_ce_sum(
-                model, input_ids, attention_mask, labels, dtype, autocast=bf16, forward_kwargs=kwargs
+                model,
+                input_ids,
+                attention_mask,
+                labels,
+                dtype,
+                autocast=bf16,
+                forward_kwargs=kwargs,
+                collective=tp is not None,
             )
         finally:
             if cp is not None:
                 cp.deactivate()
         if cp is not None and right_padded:
             loss, valid = cp.all_reduce_sum([loss, valid], device)
+        if tp is not None:
+            loss, valid = tp.all_reduce_sum([loss, valid], device)
         total_loss += loss
         total_tokens += valid
 

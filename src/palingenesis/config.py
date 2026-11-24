@@ -300,6 +300,27 @@ class ParallelConfig:
     # divides the number of experts. STATUS: experimental (gradients tested equal to one process on
     # CPU ranks; not measured on several GPUs).
     expert_parallel: bool = False
+    # Tensor parallelism (palingenesis.tensor_parallel): every layer's attention heads, linear-attention
+    # heads and MLP columns split over tp_degree ranks (Megatron-style column / row parallel linears with
+    # sequence parallelism between them). The ranks of a group read the same rows; FSDP2 shards over the
+    # other dimensions. 1 = off. Must divide the number of processes and the (key / value) head counts.
+    tp_degree: int = 1
+    # Overlap the tensor-parallel all-gathers / reduce-scatters with the matmuls next to them (async TP:
+    # torch's micro-pipelined collectives over symmetric memory). Needs model.compile and NVLink GPUs.
+    async_tp: bool = False
+    # Pipeline parallelism (palingenesis.pipeline_parallel): the layers split into pp_degree stages, one
+    # per rank group, with micro-batches flowing through them. 1 = off.
+    pp_degree: int = 1
+    # gpipe, 1f1b, interleaved_1f1b, looped_bfs, interleaved_zero_bubble, zbv (zero bubble, V-shaped).
+    pp_schedule: str = "1f1b"
+    # Pipeline micro-batches per train.per_device_batch_size rows (must divide it); 0 = one row each.
+    pp_microbatches: int = 0
+    # Stages per pipeline rank: 1 for gpipe / 1f1b, 2 or more for the interleaved / looped / zero-bubble
+    # schedules (zbv: exactly 2). 0 = the schedule's default.
+    pp_stages_per_rank: int = 0
+    # Layers the first / last stage gives up for the embeddings / output head (balance the stages).
+    pp_first_stage_less_layers: int = 1
+    pp_last_stage_less_layers: int = 1
 
 
 @dataclass(slots=True)
@@ -885,6 +906,7 @@ class Config:
             )
 
         errors += self._context_parallel_errors()
+        errors += self._model_parallel_errors()
         errors += self.moe.validate()
 
         if self.data.packing and self.parallel.context_parallel:
@@ -1228,6 +1250,94 @@ class Config:
                 "parallel.cpu_offload": p.cpu_offload,
             }
             errors += [f"parallel.expert_parallel does not support {name}." for name, on in unsupported.items() if on]
+        return errors
+
+    def _model_parallel_errors(self) -> list[str]:
+        """parallel.tp_degree / pp_degree and what they compose with (the world size is checked at startup:
+        palingenesis.distributed.build_mesh)."""
+        p = self.parallel
+        errors: list[str] = []
+        for name in ("tp_degree", "pp_degree"):
+            value = getattr(p, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                errors.append(f"parallel.{name} must be an integer >= 1 (1 = off), got {value!r}.")
+        for name in (
+            "pp_microbatches",
+            "pp_stages_per_rank",
+            "pp_first_stage_less_layers",
+            "pp_last_stage_less_layers",
+        ):
+            value = getattr(p, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append(f"parallel.{name} must be an integer >= 0, got {value!r}.")
+        if errors:
+            return errors
+        tp, pp = p.tp_degree > 1, p.pp_degree > 1
+        if p.async_tp and not tp:
+            errors.append("parallel.async_tp overlaps tensor-parallel collectives: it needs parallel.tp_degree > 1.")
+        if p.async_tp and not self.model.compile:
+            errors.append(
+                "parallel.async_tp needs model.compile: true (inductor rewrites each all-gather / reduce-scatter and "
+                "its matmul into a micro-pipelined pair)."
+            )
+        if not (tp or pp):
+            return errors
+        if not p.fsdp:
+            errors.append(
+                "parallel.tp_degree / pp_degree need parallel.fsdp: true (FSDP2 is the data-parallel dimension and "
+                "sums the gradients of the ranks that hold different tokens; with one data-parallel rank it shards "
+                "nothing and costs nothing)."
+            )
+        # what the sharded layers or the pipeline cannot run (both: one row of the composition table)
+        shared = {
+            "parallel.cpu_offload (offload is a single-GPU memory path; use more ranks instead)": p.cpu_offload,
+            "parallel.expert_parallel (experts would need a tensor-parallel and an expert-parallel layout at once)": (
+                p.expert_parallel
+            ),
+            "memory.seco (its chunked forward runs a plain module on one process)": self.memory.seco,
+            "dpo.enabled (sequence log-probabilities and the reference model are not split yet)": self.dpo.enabled,
+            "distill.enabled (teacher targets are not split yet)": self.distill.enabled,
+            "multimodal.enabled (the vision tower is not split)": self.multimodal.enabled,
+            "memory.float8_training (float8 layouts are not split)": self.memory.float8_training,
+            "memory.gradient_release (it steps inside the backward, per parameter)": self.memory.gradient_release,
+            "plugins.pre_rl (its per-rank normalisation and reference logits assume whole sequences)": (
+                self.plugins.pre_rl
+            ),
+            "train.optimizer=muon (it orthogonalises whole matrices)": self.train.optimizer == "muon",
+            "train.adagc (per-tensor clipping state assumes unsplit tensors)": self.train.adagc,
+            "train.hyperball (norm constraints on unsplit matrices)": self.train.hyperball,
+            "train.mona": self.train.mona,
+            "plugins.schedule_free": self.plugins.schedule_free,
+            "data.eval_sources (the multi-source evaluator scores whole sequences; use data.eval_dataset)": bool(
+                self.data.eval_sources
+            ),
+        }
+        which = " / ".join(name for name, on in (("parallel.tp_degree", tp), ("parallel.pp_degree", pp)) if on)
+        errors += [f"{which} > 1 does not support {name}." for name, on in shared.items() if on]
+        if pp:
+            from palingenesis.parallel_dims import PP_SCHEDULES, schedule_errors
+
+            if p.pp_schedule not in PP_SCHEDULES:
+                errors.append(f"parallel.pp_schedule must be one of {', '.join(PP_SCHEDULES)}, got {p.pp_schedule!r}.")
+            else:
+                errors += schedule_errors(p.pp_schedule, p.pp_stages_per_rank)
+            bs = self.train.per_device_batch_size
+            if p.pp_microbatches and bs % p.pp_microbatches:
+                errors.append(
+                    f"parallel.pp_microbatches={p.pp_microbatches} must divide train.per_device_batch_size={bs} "
+                    "(every pipeline micro-batch has the same shape)."
+                )
+            pp_unsupported = {
+                "parallel.context_parallel (not validated with pipeline stages)": p.context_parallel,
+                "plugins.dft / cadft / deft / info_sft (their losses are not computed on the last stage)": (
+                    self.plugins.dft or self.plugins.cadft or self.plugins.deft or self.plugins.info_sft
+                ),
+                "logging.rl_readiness (it needs the final hidden states on every rank)": self.logging.rl_readiness,
+                "train.ema / train.base_merge (their weight copies are not split by stage)": (
+                    self.train.ema or self.train.base_merge
+                ),
+            }
+            errors += [f"parallel.pp_degree > 1 does not support {name}." for name, on in pp_unsupported.items() if on]
         return errors
 
     def _observation_errors(self) -> list[str]:

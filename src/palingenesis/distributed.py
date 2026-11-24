@@ -165,51 +165,99 @@ def release_cuda_memory() -> None:
 
 
 def build_mesh(world_size: int, config: ParallelConfig) -> DeviceMesh | None:
-    """The device mesh for FSDP2 and, optionally, context parallelism.
+    """The device mesh for FSDP2 and, optionally, context, tensor and pipeline parallelism.
 
-    Without context parallelism: a 1-D mesh ("dp",) over every rank. One process: no mesh, except with
-    parallel.cpu_offload (FSDP2's CPU offload on a single GPU), which gets a mesh of one rank.
+    Dimensions, outermost first (palingenesis.parallel_dims): "pp" (pipeline stages), "dp" (different data),
+    "cp" (ranks splitting the same sequences, palingenesis.context_parallel) and "tp" (ranks splitting every
+    layer, palingenesis.tensor_parallel; innermost, so a group is one node's consecutive GPUs). "dp" is always
+    there (FSDP2 shards over it, also when it has one rank); the others only when enabled.
 
-    With it: a 2-D mesh ("dp", "cp") of shape (world_size / cp, cp). The ranks of one "cp" row
-    split the same sequences between them (palingenesis.context_parallel); the "dp" dimension
-    holds different data. FSDP2 shards parameters over both dimensions flattened (see
-    `fsdp_mesh`): every rank computes gradients from different tokens, and all of them are summed.
-    `parallel.cp_degree` sets cp (0: min(world_size, 8) when that divides world_size, else
-    world_size; groups of up to 8 keep the K/V all-gathers on one node's NVLink).
+    Without context, tensor or pipeline parallelism: a 1-D mesh ("dp",) over every rank. One process: no mesh,
+    except with parallel.cpu_offload (FSDP2's CPU offload on a single GPU), which gets a mesh of one rank.
+
+    FSDP2 shards the layers over "dp" x "cp" flattened (`fsdp_mesh`): every rank of it computes gradients from
+    different tokens, and all of them are summed. `parallel.cp_degree` sets cp (0: min(world_size, 8) when that
+    divides world_size, else world_size; groups of up to 8 keep the K/V all-gathers on one node's NVLink).
     """
+    from palingenesis.config import ConfigError
+    from palingenesis.parallel_dims import ParallelDims
+
+    tp, pp = config.tp_degree, config.pp_degree
     if world_size <= 1 and not config.cpu_offload:
+        if tp > 1 or pp > 1:
+            raise ConfigError(
+                f"parallel.tp_degree={tp} / pp_degree={pp} need that many processes (torchrun --nproc_per_node); "
+                "this run has one."
+            )
         return None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if world_size <= 1:  # one GPU with CPU offload: FSDP2 over a mesh of one rank
         return init_device_mesh(device, (1,), mesh_dim_names=("dp",))
 
+    cp_degree = 1
     if config.context_parallel:
-        cp_degree = config.cp_degree or min(world_size, 8)
-        if not config.cp_degree and world_size % cp_degree:
-            cp_degree = world_size
+        rest = world_size // max(tp * pp, 1) if world_size % max(tp * pp, 1) == 0 else world_size
+        cp_degree = config.cp_degree or min(rest, 8)
+        if not config.cp_degree and rest % cp_degree:
+            cp_degree = rest
         if cp_degree < 1 or world_size % cp_degree:
-            from palingenesis.config import ConfigError
-
             raise ConfigError(
                 f"parallel.cp_degree={config.cp_degree} must divide the number of processes ({world_size})."
             )
-        return init_device_mesh(device, (world_size // cp_degree, cp_degree), mesh_dim_names=("dp", "cp"))
-    return init_device_mesh(device, (world_size,), mesh_dim_names=("dp",))
+    dims = ParallelDims(world_size, tp=tp, pp=pp, cp=cp_degree)
+    if errors := dims.errors():
+        raise ConfigError(errors[0])
+    if tp == 1 and pp == 1:
+        if config.context_parallel:
+            return init_device_mesh(device, (dims.dp, cp_degree), mesh_dim_names=("dp", "cp"))
+        return init_device_mesh(device, (world_size,), mesh_dim_names=("dp",))
+    shape, names = [], []
+    for name, size in (("pp", pp), ("dp", dims.dp), ("cp", cp_degree), ("tp", tp)):
+        if size > 1 or name == "dp" or (name == "cp" and config.context_parallel):
+            shape.append(size)
+            names.append(name)
+    logger.info(f"Device mesh: {dims.describe()} ({world_size} processes)")
+    return init_device_mesh(device, tuple(shape), mesh_dim_names=tuple(names))
+
+
+def _flat(mesh: DeviceMesh, names: tuple[str, ...]) -> DeviceMesh:
+    """`mesh` restricted to the dimensions `names`, flattened to one dimension (the same one every call)."""
+    if len(names) == 1:
+        return mesh[names[0]] if len(mesh.mesh_dim_names or ()) > 1 else mesh
+    flat = "_".join(names)
+    try:
+        return mesh[flat]  # flattened before (the student and a sharded teacher share it)
+    except (KeyError, RuntimeError, ValueError):
+        return mesh[names]._flatten(flat)
 
 
 def fsdp_mesh(mesh: DeviceMesh) -> DeviceMesh:
-    """The mesh FSDP2 shards over: the whole mesh, flattened to one dimension.
+    """The mesh FSDP2 shards the layers over: "dp" and "cp", flattened to one dimension.
 
     Under context parallelism the ranks of a "cp" group hold different tokens of the same
     sequences, so their gradients must be summed like those of data-parallel ranks; sharding over
-    "dp" alone would leave each cp rank with the gradient of its own slice only."""
+    "dp" alone would leave each cp rank with the gradient of its own slice only. Tensor-parallel
+    ranks hold different slices of the same parameters (the "tp" dimension of their DTensors) and
+    pipeline ranks different layers: neither is part of it."""
     names = mesh.mesh_dim_names or ()
-    if "cp" not in names:
-        return mesh
-    try:
-        return mesh["dp_cp"]  # flattened before (the student and a sharded teacher share it)
-    except (KeyError, RuntimeError, ValueError):
-        return mesh["dp", "cp"]._flatten("dp_cp")
+    return _flat(mesh, tuple(n for n in ("dp", "cp") if n in names))
+
+
+def sequence_mesh(mesh: DeviceMesh) -> DeviceMesh:
+    """The mesh of the parameters every rank of a pipeline stage uses whole on its own tokens: "dp", "cp" and
+    "tp" flattened. Under tensor parallelism the embeddings, final norm and output head are not split
+    (palingenesis.tensor_parallel): each tensor-parallel rank applies them to its slice of the sequence, so
+    their gradients are summed over the tensor-parallel group as well, and FSDP2 shards them over all of it."""
+    names = mesh.mesh_dim_names or ()
+    return _flat(mesh, tuple(n for n in ("dp", "cp", "tp") if n in names))
+
+
+def data_coordinates(mesh: DeviceMesh | None, rank: int, world_size: int) -> tuple[int, int]:
+    """(index, count) of this rank's data shard: the ranks of a context-, tensor- or pipeline-parallel group
+    read the same rows; only the "dp" dimension holds different data."""
+    if mesh is None or len(mesh.mesh_dim_names or ()) <= 1:
+        return rank, world_size
+    return mesh["dp"].get_local_rank(), mesh["dp"].size()
 
 
 def apply_fsdp(
@@ -239,6 +287,10 @@ def apply_fsdp(
 
     # Every rank (data- and context-parallel): their gradients come from different tokens
     dp_mesh = fsdp_mesh(mesh)
+    # Tensor parallelism: the root's parameters (embeddings, final norm, head) are whole on every tensor-parallel
+    # rank, which applies them to its own slice of the sequence (palingenesis.tensor_parallel): FSDP shards them
+    # over the tensor-parallel group too, and sums their gradients over it.
+    root_mesh = sequence_mesh(mesh) if "tp" in (mesh.mesh_dim_names or ()) else dp_mesh
 
     # bf16=False: parameters stay in the model's dtype (no float16: without a
     # gradient scaler, fp16 training over/underflows)
@@ -278,7 +330,7 @@ def apply_fsdp(
     # The losses reach the head outside the model's forward (chunked CE, DPO), after a
     # root forward (logits.final_hidden_states) has gathered these parameters; the root
     # keeps them gathered until its backward.
-    fully_shard(model, **{**fsdp_kwargs, "reshard_after_forward": False})
+    fully_shard(model, **{**fsdp_kwargs, "mesh": root_mesh, "reshard_after_forward": False})
 
     # The loss is already normalised by the global valid-token count: gradients are
     # summed across ranks, not averaged (divide factor 1, plain SUM reduction).
@@ -311,3 +363,57 @@ def _find_transformer_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
         if isinstance(module, torch.nn.ModuleList) and len(module) > len(largest):
             largest = list(module)
     return largest
+
+
+def clip_grad_norm_(parameters, max_norm: float = 0.0, plain_copies: int = 1) -> torch.Tensor:
+    """The global L2 norm of the gradients (and, when max_norm > 0, the gradients scaled down to it) for
+    parameters split in several ways at once: DTensors over different meshes (tensor-parallel layers next to
+    the whole embeddings and head of palingenesis.tensor_parallel), and different parameters on different
+    pipeline stages.
+
+    torch.nn.utils.clip_grad_norm_ needs one mesh for every DTensor and knows nothing of pipeline stages
+    (torchtitan reduces the norm over the pipeline group itself for that reason, distributed/utils.py). Here
+    every rank adds the squares of the gradient values it holds, each divided by the number of ranks holding the
+    same values (the replicated dimensions of its placement; `plain_copies` for plain tensors), and one
+    all-reduce over every process adds them up: one collective, and no gradient is ever gathered.
+    Returns the norm before clipping."""
+    from torch.distributed.tensor import DTensor
+
+    groups: dict[tuple, list[torch.Tensor]] = {}
+    for p in parameters:
+        g = p.grad
+        if g is None:
+            continue
+        if isinstance(g, DTensor):
+            if any(pl.is_partial() for pl in g.placements):  # never after FSDP's reduce-scatter
+                g = g.redistribute(placements=[pl if not pl.is_partial() else _replicate() for pl in g.placements])
+            copies = 1
+            for dim, pl in enumerate(g.placements):
+                if pl.is_replicate():
+                    copies *= g.device_mesh.size(dim)
+            local = g.to_local()
+        else:
+            copies, local = plain_copies, g
+        groups.setdefault((local.device, local.dtype, copies), []).append(local)
+    if not groups:
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else "cpu"
+        total = torch.zeros((), device=device, dtype=torch.float32)
+    else:
+        total = sum(
+            torch.stack(torch._foreach_norm(grads)).float().pow(2).sum() / copies
+            for (_, _, copies), grads in groups.items()
+        )
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    norm = total.sqrt()
+    if max_norm > 0:
+        coef = (max_norm / (norm + 1e-6)).clamp(max=1.0)
+        for (device, _, _), grads in groups.items():
+            torch._foreach_mul_(grads, coef.to(device))
+    return norm
+
+
+def _replicate():
+    from torch.distributed.tensor import Replicate
+
+    return Replicate()

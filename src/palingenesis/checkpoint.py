@@ -224,6 +224,7 @@ def save_checkpoint(
     micro_step: int = 0,
     keep_latest_k: int = DEFAULT_KEEP_LATEST_K,
     data_ranks: int = 1,
+    layout: dict | None = None,
 ):
     """Save a full training checkpoint, then purge old ones.
 
@@ -235,11 +236,14 @@ def save_checkpoint(
 
     data_ranks: the ranks that read different data (recorded: `micro_step` counts each one's
     micro-batches, so a resume with another number of them rescales it).
+
+    layout: how the parameters are split (palingenesis.tensor_parallel.TensorParallel.layout), recorded so a
+    resume with a split that stores them differently is refused instead of loading scrambled weights.
     """
     path = Path(output_dir) / f"step-{step}"
 
     if is_fsdp and dist.is_initialized() and dist.get_world_size() > 1:
-        _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks)
+        _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks, layout)
     else:
         _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks)
 
@@ -268,7 +272,7 @@ def _save_single(model, tokenizer, optimizer, scheduler, step, epoch, micro_step
     _save_meta(scheduler, step, epoch, micro_step, path, data_ranks)
 
 
-def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks=1):
+def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, path, data_ranks=1, layout=None):
     """FSDP2 save via Distributed Checkpoint (sharded, no gathering).
 
     Each rank saves only its local shard — zero extra memory, scales to any model size.
@@ -308,7 +312,7 @@ def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, 
     # Only rank 0 saves non-distributed state (tokenizer, metadata)
     if dist.get_rank() == 0:
         tokenizer.save_pretrained(path / "tokenizer")
-        _save_meta(scheduler, step, epoch, micro_step, path, data_ranks)
+        _save_meta(scheduler, step, epoch, micro_step, path, data_ranks, layout)
     barrier()
 
 
@@ -357,7 +361,7 @@ def _save_optimizer_sharded(optimizer, path: Path):
             torch.save(shard_meta, path / f"shard_{shard_idx:04d}_meta.pt")
 
 
-def _save_meta(scheduler, step, epoch, micro_step, path, data_ranks=1):
+def _save_meta(scheduler, step, epoch, micro_step, path, data_ranks=1, layout=None):
     meta = {
         "step": step,
         "epoch": epoch,
@@ -366,6 +370,8 @@ def _save_meta(scheduler, step, epoch, micro_step, path, data_ranks=1):
         "data_stream": DATA_STREAM_VERSION,
         "scheduler_state": scheduler.state_dict() if scheduler is not None else {},
     }
+    if layout:
+        meta["parallel_layout"] = layout
     # Written whole, then renamed: the file's presence marks a complete checkpoint, also for a
     # reader on another node and after the process is stopped in the middle of the write.
     tmp = path / (TRAINING_META_FILE + ".tmp")
@@ -399,9 +405,11 @@ def load_checkpoint(
     checkpoint_dir: str,
     is_fsdp: bool = False,
     device: torch.device | None = None,
+    layout: dict | None = None,
 ) -> dict:
     """Load checkpoint for resume. Low-memory: loads shards one at a time.
 
+    `layout`: this run's parameter split (see save_checkpoint); a checkpoint stored in another one is refused.
     Returns metadata dict with step, epoch, micro_step.
     """
     path = Path(checkpoint_dir)
@@ -416,6 +424,8 @@ def load_checkpoint(
 
     with open(meta_path) as f:
         meta = json.load(f)
+
+    check_layout(meta.get("parallel_layout") or {}, layout or {}, path)
 
     # The two layouts do not load into each other; skipping the weights would continue the saved step
     # count on the pretrained model.
@@ -450,6 +460,20 @@ def load_checkpoint(
 
     logger.info(f"Resumed from step={meta['step']}, epoch={meta['epoch']}")
     return meta
+
+
+def check_layout(saved: dict, current: dict, path) -> None:
+    """Raise when the checkpoint stores some parameters rank by rank for another tensor-parallel degree (the
+    linear-attention q / k / v and the experts' gate / up projections, palingenesis.tensor_parallel.Sections):
+    their sharded state would load into the wrong rows. Everything else reshards freely."""
+    rank_by_rank = bool(saved.get("rank_by_rank") or current.get("rank_by_rank"))
+    if rank_by_rank and saved.get("tp_degree", 1) != current.get("tp_degree", 1):
+        raise RuntimeError(
+            f"{path} was saved with parallel.tp_degree={saved.get('tp_degree', 1)}; this run has "
+            f"{current.get('tp_degree', 1)}. This model's linear-attention / expert projections are stored per "
+            "tensor-parallel rank in sharded checkpoints: resume with the same tp_degree, or start a new run from "
+            "an exported model (final/ or best/model, HF format)."
+        )
 
 
 def _saved_names(model, own: dict[str, str]) -> dict[str, str]:
