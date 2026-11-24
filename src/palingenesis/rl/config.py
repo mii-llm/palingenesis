@@ -289,6 +289,16 @@ class RLLossConfig:
     # direction, and a different estimator only where n varies between groups (failed rollouts) or the scale is kept
     # (advantage_std none); advantage_std group cancels it (refused).
     baseline: str = "mean"
+    # Train for pass@k instead of pass@1 (PKPO, arXiv:2505.15201; Pass@k Training, arXiv:2508.10751): before the
+    # baseline, each rollout's reward becomes (n / k) x the mean, over the k-subsets of its group's n scored rollouts
+    # that contain it, of the subset's best reward. The group's mean is then the unbiased pass@k estimate (0 / 1
+    # rewards; E[best of k] for others) and the policy gradient is the unbiased gradient of pass@k: a failure next to
+    # successes is pushed down less than under pass@1 (with 0 / 1 rewards and c successes in n, a failure scores
+    # 1 - C(n-c-1, k-1) / C(n-1, k-1), a success 1), so exploration that solves a prompt some of the time is kept. A
+    # group whose pass@k is certain carries no gradient (dynamic sampling refills it), and a group with at most k
+    # scored rollouts too. 1 = off (pass@1); otherwise 2 <= pass_k < rollout.group_size. Logged as outcome/pass@<k>
+    # (unbiased). The papers anneal k back to 1 later in training (a second stage, or resume with pass_k 1).
+    pass_k: int = 1
     # Advantage = reward - baseline, divided by the std of the batch / of the group / not. "role" (scenarios): the
     # std of the same role's centred rewards over the batch, never less than advantage_std_floor, so one role's
     # reward scale does not set another's gradient and a role whose rewards hardly differ is not scaled up to
@@ -792,6 +802,16 @@ class RLConfig:
                 "is n / (n - 1) x the mean-baseline one, and the group's std divides that factor out. Use "
                 "advantage_std batch or none."
             )
+        if isinstance(loss.pass_k, bool) or not isinstance(loss.pass_k, int) or loss.pass_k < 1:
+            errors.append(f"loss.pass_k must be an integer >= 1 (1 = pass@1, off), got {loss.pass_k!r}.")
+        elif loss.pass_k > 1:
+            if loss.pass_k >= r.group_size:
+                errors.append(
+                    f"loss.pass_k {loss.pass_k} needs rollout.group_size > pass_k (got {r.group_size}): with k = n "
+                    "every rollout of a group is credited with the group's best reward, and no advantage is left."
+                )
+            if self.scenario.type:
+                errors.append("loss.pass_k is not supported with a multi-role scenario (scenario.type).")
         if loss.type == "reinforce":
             if r.max_staleness > 0:
                 errors.append(

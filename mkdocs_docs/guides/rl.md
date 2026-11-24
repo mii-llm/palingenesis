@@ -279,6 +279,7 @@ With ρ = π_θ/μ the ratio of the trained policy to the sampler on a token, A 
 | `loss.baseline` | `mean` (default), `leave_one_out` | The mean reward of the group's scored rollouts, or of the other ones. For n scored rollouts the leave-one-out advantage is n / (n - 1) times the mean-baseline one: the same direction. It is a different estimator only where n differs between groups (failed rollouts) or the scale is kept (`advantage_std: none`); with `advantage_std: group` it changes nothing and is refused |
 | `loss.advantage_std` | `batch` (default), `group`, `none` | Divide the advantage by the batch's std (ScaleRL, REINFORCE++ 2501.03262), the group's (GRPO), or not (Dr. GRPO 2503.20783: the group's std up-weights prompts that are nearly all right or all wrong) |
 | `loss.aggregation` | `prompt` (default), `token`, `constant` | Token mean per prompt, then over prompts (ScaleRL); mean over all tokens (DAPO); sum over a constant budget (Dr. GRPO: no length bias) |
+| `loss.pass_k` | `1` (off) | Train for pass@k: each rollout's reward is replaced by its pass@k credit before the baseline (PKPO 2505.15201, Pass@k Training 2508.10751); `2 <= pass_k < rollout.group_size`, see [below](#training-for-passk) |
 | `loss.seq_mask` | `0.1` | Drop a trajectory whose mean \|ρ - 1\| exceeds this (Trust Region Masking 2512.23075, Dec 2025; its suggested range is 0.03 to 0.10) |
 | `loss.kl_ref`, `kl_coef`, `kl_ref_reset` | off | KL to a frozen reference, optionally reset every N steps (DeepSeek-R1 keeps 0.001 with resets; ProRL 2505.24864 resets when progress stalls) |
 | `loss.observation_weight`, `observation_exclude` | `0` (off), `[]` | The observation loss: λ × the NLL of the environment's output in the policy's own multi-turn trajectories, added to the policy loss (ECHO 2605.24517, which used λ = 0.05); see [below](#observation-loss) |
@@ -290,6 +291,26 @@ Why the defaults: ScaleRL, the one large comparison across recipes, found that t
 What is verified: each objective's gradient is tested against a hand-computed value, and on samples of the policy itself all six give the exact policy gradient of the expected reward (`tests/test_rl.py`); the trainer runs end to end with each switch on CPU. `reinforce`, `ipo` and `leave_one_out` have no GPU benchmark behind them in this repository yet. Not implemented, because they need a second model or a different loop: learned or Monte Carlo value baselines (VinePPO 2410.01679: better credit assignment at 2 to 5 times the cost per step), a decoupled proximal policy for high staleness (AReaL 2505.24298), sequence-level tapered weights for offline data (TOPR 2503.14286).
 
 Every step logs what to watch: `reward` and `rewards/*`, `policy/abs_ratio_dev` and `policy/mismatch_k3` (sampler/trainer agreement; a rise precedes collapse), `policy/clipped`, `policy/seq_masked`, `policy/entropy`, `groups/zero_variance`, `truncated`, `skipped`, and the time split (`time/rollout`, `time/train`). Rollout diagnostics: `engine/seqs_mean` (sequences decoding at once), `engine/tail_s` (time with under a quarter of the peak left), `engine/prefix_hit` and `engine/prefill_tokens`, `groups/continued`. `logging.dump_trajectories: N` writes every Nth batch (turns, tool calls and outputs, rewards and their components, advantages, per-turn and per-tool timing, zero-variance groups too; `logging.dump_groups` samples groups) and the engine's concurrency timeline to `<output_dir>/rollouts/`, on a background thread. Read it before tuning anything: `pgs rollouts --dir <output_dir>` reports finish reasons, tool errors and latency, loops and the worst trajectories ([Observability](observability.md)). `pgs monitor` and `pgs loss` read the step lines of the log; `logging.use_wandb`, `logging.use_trackio` and `logging.trackers` send the metrics to a tracker.
+
+### Training for pass@k
+
+```yaml
+rollout:
+  group_size: 16
+loss:
+  pass_k: 4          # 1 (the default): pass@1
+```
+
+GRPO-style training maximises pass@1. On prompts the policy solves only sometimes, it pushes every failed sample down as hard as a success is pushed up: exploration narrows, and pass@k at large k can fall while pass@1 rises (the sharpening signature: `outcome/pass@<G>` falling under a rising `outcome/pass@1`). `loss.pass_k: k` optimises the probability that at least one of k samples succeeds instead. Before the baseline, the reward of rollout i of a group of n scored rollouts becomes
+
+$$
+r'_i = \frac{n}{k} \cdot \frac{1}{\binom{n}{k}} \sum_{S \ni i,\ |S| = k} \max_{j \in S} r_j
+$$
+
+the mean best reward of the k-subsets of the group that contain it, times their share. The group mean of $r'$ is the unbiased estimate of the expected best of k samples (pass@k for 0 / 1 rewards), and $\sum_i r'_i \nabla \log \pi(y_i)$ is (n / k times) the unbiased estimate of its gradient: PKPO ([arXiv:2505.15201](https://arxiv.org/abs/2505.15201)). For 0 / 1 rewards with c successes it is the closed form of Pass@k Training ([arXiv:2508.10751](https://arxiv.org/abs/2508.10751)): a success scores 1 and a failure $1 - \binom{n-c-1}{k-1} / \binom{n-1}{k-1}$, so a failure next to successes costs less than under pass@1.
+{: .pg-where }
+
+The baseline, `advantage_std` and the aggregation then apply as usual. A group whose pass@k is certain (fewer than k failures) has equal $r'$ and carries no gradient, so dynamic sampling refills it; so does a group with at most k scored rollouts. Steps log `outcome/pass@<k>` (unbiased, at `data.success_threshold`) next to `outcome/pass@1`. Both papers report pass@k gains with pass@1 kept or improved when k is annealed back to 1 later in training: run a second stage with `pass_k: 1` (or resume with it). Neither the gain nor the schedule has been measured with this library yet; the transform is tested against brute force over subsets (`tests/test_evalstats.py`, `tests/test_rl_pass_k.py`). Not with a multi-role scenario.
 
 ### Observation loss
 

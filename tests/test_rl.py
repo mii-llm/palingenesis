@@ -1001,7 +1001,9 @@ def test_outcome_stats_cover_every_group_and_family():
     groups = [[traj("a", 1.0), traj("a", 1.0)], [traj("a", 0.0), traj("a", 0.0)], [traj("b", 1.0), traj("b", 0.0)]]
     fake = SimpleNamespace(
         config=SimpleNamespace(
-            data=SimpleNamespace(success_threshold=0.5, metrics_key=["task"]), rollout=SimpleNamespace(group_size=2)
+            data=SimpleNamespace(success_threshold=0.5, metrics_key=["task"]),
+            rollout=SimpleNamespace(group_size=2),
+            loss=SimpleNamespace(pass_k=1),
         ),
         sampler=SimpleNamespace(queue_on=True),
     )

@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from palingenesis.accelerator import on_current_device
+from palingenesis.evalstats import pass_at_k
 from palingenesis.multimodal import MultimodalError, has_image_parts, load_image, split_images, vision_of
 from palingenesis.opd.orchestrator import PublishedWeights
 from palingenesis.opd.rollout import RolloutEngine
@@ -201,7 +202,7 @@ class RLPipeline:
             finished.append(group)
             if any(t.rewards.get("env/metric/verifier_failed") for t in group):
                 counts["verifier_failed"] += 1  # a broken verifier, not a failure of the policy (the queue skips it)
-            if group_is_informative(group):
+            if group_is_informative(group, pass_k=self.config.loss.pass_k):
                 return True
             counts["zero_variance"] += 1
             dropped_tokens += sum(t.sampled_tokens for t in group)
@@ -822,10 +823,20 @@ class RLPipeline:
         d = self.config.data
         threshold = d.success_threshold
 
+        k = self.config.loss.pass_k
+
         def summarize(gs: list[list[Trajectory]]) -> dict[str, float]:
             ts = [t for g in gs for t in g]
             sampled = [lp for t in ts for lp, m in zip(t.logprobs, t.mask) if m]
+            extra = {}
+            if k > 1:  # loss.pass_k: the trained objective, unbiased, over the groups with at least k scored rollouts
+                full = [g for g in gs if len(g) >= k]
+                if full:
+                    extra[f"pass@{k}"] = sum(
+                        pass_at_k(len(g), sum(t.reward >= threshold for t in g), k) for g in full
+                    ) / len(full)
             return {
+                **extra,
                 "reward_all": sum(t.reward for t in ts) / len(ts),
                 "pass@1": sum(t.reward >= threshold for t in ts) / len(ts),
                 f"pass@{self.config.rollout.group_size}": sum(any(t.reward >= threshold for t in g) for g in gs)

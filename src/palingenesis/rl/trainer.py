@@ -772,7 +772,11 @@ class RLTrainer:
             )
         else:
             advantage_stats = assign_advantages(
-                groups, loss_config.advantage_std, reduce=reduce, baseline=loss_config.baseline
+                groups,
+                loss_config.advantage_std,
+                reduce=reduce,
+                baseline=loss_config.baseline,
+                pass_k=loss_config.pass_k,
             )
             weights = token_weights(
                 groups,

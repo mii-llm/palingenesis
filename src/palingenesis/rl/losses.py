@@ -37,6 +37,7 @@ import math
 import torch
 from torch import Tensor, nn
 
+from palingenesis.evalstats import pass_at_k_rewards
 from palingenesis.opd.fused_rkl import Head, unwrap
 from palingenesis.opd.losses import SLICE_ELEMENTS
 from palingenesis.rl import head_kernels
@@ -361,23 +362,34 @@ def mismatch_metrics(values: dict[str, float]) -> dict[str, float]:
 # ------------------------------------------------------- advantages & weights
 
 
+def group_rewards(scored, pass_k: int = 1) -> list[float]:
+    """The rewards a group's scored rollouts are compared on: their own (pass_k 1), or the pass@k rewards of
+    evalstats.pass_at_k_rewards (loss.pass_k), with k capped at the number of scored rollouts."""
+    rewards = [t.reward for t in scored]
+    if pass_k <= 1 or not rewards:
+        return rewards
+    return pass_at_k_rewards(rewards, min(pass_k, len(rewards)))
+
+
 def assign_advantages(
-    groups, std: str = "batch", eps: float = 1e-6, reduce=None, baseline: str = "mean"
+    groups, std: str = "batch", eps: float = 1e-6, reduce=None, baseline: str = "mean", pass_k: int = 1
 ) -> dict[str, float]:
     """Group-relative advantages in place: reward minus the group's baseline, divided by the batch's std of those
     values ("batch"), the group's ("group"), or not. The baseline is the mean reward of the group's scored rollouts
     ("mean") or of the other scored rollouts ("leave_one_out": n / (n - 1) x the former; a rollout alone in its
     group has no baseline and gets 0). `reduce` sums a list of floats over data-parallel ranks (the batch spans them).
+    pass_k > 1 (loss.pass_k): the rewards are first replaced by their pass@k rewards (group_rewards).
     """
     centered = []
     for group in groups:
         scored = [t for t in group if t.scored]
         if not scored:
             continue
-        mean = sum(t.reward for t in scored) / len(scored)
+        rewards = dict(zip(map(id, scored), group_rewards(scored, pass_k)))
+        mean = sum(rewards.values()) / len(scored)
         scale = len(scored) / (len(scored) - 1) if baseline == "leave_one_out" and len(scored) > 1 else 1.0
         for t in group:
-            t.advantage = (t.reward - mean) * scale if t.scored else 0.0
+            t.advantage = (rewards[id(t)] - mean) * scale if t.scored else 0.0
         if std == "group":
             sd = math.sqrt(sum(t.advantage**2 for t in scored) / len(scored))
             for t in scored:

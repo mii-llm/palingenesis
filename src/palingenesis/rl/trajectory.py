@@ -250,11 +250,16 @@ class Trajectory:
         return ""
 
 
-def group_is_informative(group: list[Trajectory], tol: float = 1e-6) -> bool:
+def group_is_informative(group: list[Trajectory], tol: float = 1e-6, pass_k: int = 1) -> bool:
     """Whether a group's scored rollouts disagree on reward (and one of them trains): with
-    equal rewards every advantage is 0 and the group carries no gradient."""
+    equal rewards every advantage is 0 and the group carries no gradient. pass_k > 1 (loss.pass_k): on their pass@k
+    rewards, which are all equal once pass@k is certain (or with at most k scored rollouts)."""
     parts = getattr(group, "comparison_groups", None)
     if parts is not None:  # a row's episodes of several roles (scenarios): informative if any role's group is
         return any(group_is_informative(part, tol) for part in parts)
     rewards = [t.reward for t in group if t.scored]
+    if pass_k > 1 and len(rewards) >= 2:
+        from palingenesis.evalstats import pass_at_k_rewards
+
+        rewards = pass_at_k_rewards(rewards, min(pass_k, len(rewards)))
     return (len(rewards) >= 2 and max(rewards) - min(rewards) > tol) and any(t.trained for t in group)
