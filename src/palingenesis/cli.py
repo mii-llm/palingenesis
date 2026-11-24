@@ -52,6 +52,8 @@ Commands:
   monitor     Check status of a running training
   loss        Analyze loss curve from log file
   rollouts    Read RL / distillation rollout dumps: finish reasons, rewards, tool errors, loops, slowest, worst
+  compare     Evaluation results with intervals; two checkpoints on the same items: paired tests, pass@k
+  screen      RL pool difficulty: k rollouts per row with the RL config's rewards, keep rows with 0 < pass rate < 1
   version     Show version info
 
 Usage:
@@ -186,6 +188,16 @@ def main():
 
         case "rollouts":
             _run_agent_tool("palingenesis.agent_tooling.rollouts")
+
+        case "compare":
+            from palingenesis.agent_tooling.compare import main as compare_main
+
+            sys.exit(compare_main())
+
+        case "screen":
+            from palingenesis.rl.screen import main as screen_main
+
+            sys.exit(screen_main())
 
         case "gradients":
             _run_agent_tool("palingenesis.agent_tooling.check_gradients")

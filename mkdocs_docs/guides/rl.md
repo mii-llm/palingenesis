@@ -47,6 +47,20 @@ With the queue on, success is the raw task reward (before `loss.group_shaping` a
 | `data.format` | `auto` | `chat` (palingenesis rows) or `nemo_gym` (NVIDIA NeMo Gym / Nemotron-RL rows, prompt in `responses_create_params`), detected |
 | `data.tools_field` | `tools` | A column of per-row tool schemas (OpenAI or Responses-API form), used when the environment has none |
 
+### Screening the pool before the run
+
+A group whose rollouts all succeed or all fail has zero advantages: rows the policy always or never solves cost rollouts and teach nothing. Dynamic sampling drops such groups during training, after paying for them. `pgs screen` spends k rollouts per row once, with the RL config's own rendering, environment and rewards, and keeps the rows the policy solves sometimes:
+
+```bash
+pgs screen --config configs/rl_math.yaml --k 8 --output pool_screened.jsonl
+# then train on pool_screened.kept.jsonl:   --data.dataset pool_screened.kept.jsonl
+pgs screen --config rl.yaml --k 16 --max_rate 0.9 --model runs/sft/final --rollout.backend hf
+```
+
+A row is kept when `--min_rate` < pass rate < `--max_rate` (defaults 0 and 1); a success is a reward at or above `data.success_threshold`. `<output>` holds every screened row with a `screen` record (samples, scored, successes, pass rate with its 95% Wilson interval, mean reward, finish reasons, mean completion tokens) and is appended chunk by chunk, so re-running the same command resumes; `<output>.kept.jsonl` holds the kept rows unchanged. The summary gives the rows per band (unsolved, partial, solved, failed: no rollout could be scored), the pass-rate histogram and, with `data.metrics_key`, the same per family. Other `--section.option` arguments override the config (`--rollout.backend hf` for a small model without vLLM; `--split eval` screens the held-out rows). Exit code 1 when nothing is kept.
+
+Screen with the checkpoint you will train (`--model`), at the training temperature (the default, `rollout.temperature`). With k samples a row at true pass rate p looks unsolved with probability $(1-p)^k$: 43% for p = 0.1 at k = 8, so hard pools need a larger k, or keep a share of the unsolved rows for later stages. Tülu 3 removed the prompts its SFT model always solved before RLVR; Polaris and Skywork-OR1 trained on pass-rate bands. Not for multi-role scenarios (`pgs scenario audit` checks their rows) or multimodal policies yet.
+
 NeMo Gym rows (all the `nvidia/Nemotron-RL-*` datasets) are converted at load: `instructions` + `input` become chat messages, Responses items become tool calls and tool results, flat tool schemas become chat-template ones; the verifier's columns (`ground_truth`, `expected_answer`, ...) stay as columns for the rewards. A row may carry a `verifier` column (a name or a list): it is then scored only by the rewards it names, so one mixed dataset can hold math, multiple-choice and code rows.
 
 ## Rewards

@@ -14,6 +14,7 @@ TOOLS = {
     "profile_memory": "palingenesis.agent_tooling.profile_memory",
     "monitor_run": "palingenesis.agent_tooling.monitor_run",
     "rollouts": "palingenesis.agent_tooling.rollouts",
+    "compare": "palingenesis.agent_tooling.compare",
 }
 
 HELP = """
@@ -31,6 +32,7 @@ Available tools:
     profile_memory    Estimate peak GPU memory from config
     monitor_run       Monitor active training from log output
     rollouts          Read RL / distillation rollout dumps (finish reasons, tool errors, loops, worst)
+    compare           Evaluation results with intervals; paired tests between two checkpoints (pass@k)
 
 Examples:
     python -m palingenesis.agent_tooling diagnose --config configs/llama3_8b.yaml --mode pre
@@ -57,7 +59,9 @@ def main():
     import importlib
 
     module = importlib.import_module(TOOLS[tool])
-    module.main()
+    code = module.main()
+    if isinstance(code, int):
+        sys.exit(code)
 
 
 if __name__ == "__main__":

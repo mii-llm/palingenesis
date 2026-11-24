@@ -13,6 +13,8 @@
 | check data, masking and config before a run | [`pgs diagnose`](#diagnose), [`pgs inspect`](#inspect), [`pgs validate`](#validate) |
 | follow a running training | [`pgs monitor`](#monitor), [`pgs loss`](#loss) |
 | read what RL / distillation rollouts do | [`pgs rollouts`](#rollouts) |
+| compare two checkpoints' evaluations (intervals, paired tests, pass@k) | [`pgs compare`](#compare) |
+| keep the RL prompts the policy solves sometimes | [`pgs screen`](#screen) |
 | on-policy distillation / RL | [`pgs distill`](#distill), [`pgs rl`](#rl) |
 
 ---
@@ -311,6 +313,26 @@ Read the trajectory dumps of `pgs rl` / `pgs distill` (`logging.dump_trajectorie
 
 ```bash
 pgs rollouts --dir outputs/rl --since 200 --json
+```
+
+### compare
+
+Score an evaluation with intervals, or compare two checkpoints on the same items. Input: JSONL result files, one row per item with an `id` and its samples' scores (`scores: [1, 0, 1]`, or one `correct` / `score` / `reward`), optionally a `cluster` (items that are not independent: paraphrases, translations, one task's variants resample together).
+
+```bash
+pgs compare results_a.jsonl                                   # mean score and pass@k with bootstrap intervals
+pgs compare base.jsonl candidate.jsonl --k 1,4,8 --json       # paired on the common ids
+pgs compare base.jsonl candidate.jsonl --require not_worse --margin 0.02    # exit 1 unless met
+```
+
+Per file: the mean score (per item, then over items) and the unbiased pass@k (Chen et al. 2021, `1 - C(n-c, k) / C(n, k)` per item) for every k up to the smallest sample count, each with a percentile bootstrap interval over items or clusters. For two files: B - A of each metric with a paired bootstrap interval and p-value, a sign-flip permutation p-value (exact up to 20 items or clusters), and the exact McNemar test when both have one 0 / 1 sample per item. Items in only one file are counted and left out (`--strict`: an error). `--require better` needs the interval of the mean-score difference above 0; `--require not_worse` its lower end above `-margin`. The statistics are in `palingenesis.evalstats` (standard library only) for use from scripts.
+
+### screen
+
+Difficulty screening of an RL prompt pool: k rollouts per row with the RL config's rendering, environment and rewards; rows with `--min_rate` < pass rate < `--max_rate` go to `<output>.kept.jsonl`. Resumable. See [Screening the pool](../guides/rl.md#screening-the-pool-before-the-run).
+
+```bash
+pgs screen --config configs/rl_math.yaml --k 8 --output pool_screened.jsonl
 ```
 
 ### version
