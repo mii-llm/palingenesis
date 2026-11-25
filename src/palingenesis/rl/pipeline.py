@@ -66,6 +66,7 @@ class RLBatch:
 
 class RLPipeline:
     vision = None  # a multimodal policy's image processor (palingenesis.multimodal), from the tokenizer
+    allowance: TokenAllowance | None = None  # rollout.token_allowance (None: off)
     _warned_images = False
 
     def __init__(
