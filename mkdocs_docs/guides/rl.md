@@ -507,6 +507,52 @@ a 20-step `pgs rl` smoke per mode:
 PGS_PY=.venv/bin/python PGS_SRC=src bash scripts/gpu_checks/rl_packing.sh /tmp/rl_packing_check
 ```
 
+### Rollout concurrency
+
+With a vLLM server (`rollout.backend: vllm_server`) or engine workers (`remote`), every turn a rollout asks for is
+sent at once by default (`rollout.concurrency: fixed`): the engine admits the requests, and when the running
+sequences outgrow its KV cache it preempts some and recomputes them later. `rollout.concurrency: kv` keeps a cap on
+the requests in flight to each engine and moves it with the engine's own load, read from its metrics (a server's
+`/metrics`; a worker reports its in-process scheduler's numbers):
+
+- **Start.** KV-cache tokens / `rollout.max_model_len`: as many requests as fit at full length (an engine that does
+  not report its KV-cache size starts at `rollout.concurrency_max`).
+- **Cut.** KV-cache usage above `rollout.kv_usage_high` (0.8), or requests waiting in the engine's queue on two polls
+  in a row: the cap x 0.7, once per drain (running requests go on; new ones wait at the gate).
+- **Raise.** Usage below `rollout.kv_usage_low` (0.6), nothing waiting, requests waited at the gate since the last
+  poll, and a cap's worth of requests answered since the last change: the cap x 1.25.
+
+The cap stays within `rollout.concurrency_min` and `rollout.concurrency_max` (0: the engine's sequence limit,
+`rollout.max_num_seqs` or its default) and is re-read every `rollout.concurrency_poll_s` seconds. A poll whose
+metrics are missing changes nothing (a renamed metric would read as an idle engine). With several workers a request
+goes to the engine with the most room under its cap. The controller follows TRL's `AsyncGRPOTrainer`
+([TRL](https://github.com/huggingface/trl), `_init_kv_cap` and `_control_loop`), whose thresholds and factors these
+are; pgs adds the cut on a waiting queue and raises only while the cap binds. Not yet measured against `fixed` on a
+GPU in pgs.
+
+| Metric | Meaning |
+|---|---|
+| `rollout/concurrency_cap` | The caps, summed over the engines |
+| `rollout/concurrency`, `rollout/concurrency_peak` | Requests in flight at the end of the batch, and the most at once |
+| `rollout/kv_usage` | The engines' highest KV-cache usage at the last poll (a fraction) |
+| `rollout/requests_waiting`, `rollout/requests_running` | The engines' own queue and running batch |
+| `rollout/preemptions` | Preemptions the engines counted during the batch (vLLM servers) |
+| `rollout/gate_waits`, `rollout/gate_wait_s` | Requests that waited at the gate, and their total wait |
+| `rollout/cap_cuts`, `rollout/cap_raises` | Changes since the start |
+
+`rollout/concurrency` at the cap with `rollout/kv_usage` low and `gate_wait_s` high: raise `rollout.concurrency_min`
+or `kv_usage_low`. Many `rollout/preemptions` under `fixed`: try `kv`.
+
+**Token allowance.** Groups are launched speculatively (`missing / (1 - expected zero-variance rate)` at once), and
+with `rollout.max_staleness > 0` the surplus is carried into later batches and partial rollouts keep generating
+across weight updates. `rollout.token_allowance: λ` (0 = off) bounds that in tokens: a launch beyond what the batch
+still needs starts only while the tokens the pipeline holds (kept and carried groups) plus its groups in flight
+(estimated at `group_size` x the mean prompt + completion tokens of the rollouts finished so far) stay within
+(1 + λ) x one batch's tokens. The launches a batch needs are never held back, so it always fills; until a rollout has
+finished only those start. Logged as `rollout/ahead_tokens`, `rollout/tokens_per_rollout` and
+`rollout/launches_deferred`. After TRL `AsyncGRPOTrainer`'s token allowance, which bounds how far generation runs
+ahead of the trainer in tokens rather than in policy versions. Any backend.
+
 ## How it is made fast
 
 Measured on Qwen3.5-0.8B, GSM8K, one A100 (32 prompts x 8 rollouts per step): 92 s per step in the first version, about 18 s now: 11 s of rollouts (15.5k generated tokens/s) and 6 s for the policy step, which runs at 44% MFU (bf16 peak, model FLOPs: no recompute, no padding). Its matrix multiplies run at about 80% of peak; the rest is Qwen3.5's linear-attention kernels, norms and activations.

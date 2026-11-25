@@ -234,6 +234,11 @@ RL configs (`pgs rl`) run multi-role episodes when they have a `scenario:` secti
 | `rollout.backend` | str | `vllm` | `remote`: the engines are `palingenesis.rl.pool.worker` processes on other GPUs or nodes (all backends: [RL engines](#rl-rollout-engines)). |
 | `rollout.engines` | list | `[]` | remote: the workers' `host:port` addresses; rank *r* generates with `engines[r::ranks]`, rank 0 sends the weights to all. |
 | `rollout.push` | str | `auto` | remote: what a weight update sends. `full`, `fold` (LoRA factors folded by each engine), `native` (LoRA factors as named adapters of the engine; not with `lora.dora`), `auto` (`native` when a role has its own adapter or `partner: base`, else `fold`). The first update also sends the frozen base. |
+| `rollout.concurrency` | str | `fixed` | vllm_server, remote: `kv` caps the requests in flight to each engine from its KV-cache use (start at KV tokens / `max_model_len`, cut above `kv_usage_high`, raise below `kv_usage_low`); see [Rollout concurrency](../guides/rl.md#rollout-concurrency). |
+| `rollout.concurrency_min` / `concurrency_max` | int | `4` / `0` | `kv`: the cap's bounds per engine (`0`: the engine's sequence limit, `rollout.max_num_seqs` or its default). |
+| `rollout.kv_usage_low` / `kv_usage_high` | float | `0.6` / `0.8` | `kv`: KV-cache usage below which the cap grows by 25%, above which it is cut by 30%. |
+| `rollout.concurrency_poll_s` | float | `5.0` | `kv`: seconds between reads of the engines' metrics. |
+| `rollout.token_allowance` | float | `0.0` | Speculative group launches start only while held and in-flight tokens stay within (1 + this) x a batch's tokens; `0` = off. Any backend. |
 | `train.replicate_base` | bool | `false` | With `lora.rank` under torchrun: every rank holds the whole frozen base; only the adapters' gradients are summed over ranks, once per step, instead of FSDP. |
 
 RL configs also have `rollout.routing_replay` (`auto` / `on` / `off`, default `off` until the vLLM path is verified on a GPU): train each token through the
