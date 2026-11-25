@@ -181,7 +181,8 @@ async def audit_async(
                 ("tool_spam", tool_spam(schemas_of)),
             ):
                 policies.setdefault(name, policy)
-        allowed = spec.chance * len(rows) + 1e-9
+        # with a chance level, one lucky row is not a hole however few rows are audited
+        allowed = max(spec.chance * len(rows), 1.0 if spec.chance > 0 else 0.0) + 1e-9
         for name, policy in policies.items():
             episodes, summary = await run(policy)
             report["degenerate"][name] = summary
