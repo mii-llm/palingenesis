@@ -261,6 +261,8 @@ def test_validation_errors():
         ({"clip_steps": 0}, "clip_steps"),
         ({"clip_lr": -1}, "clip_lr"),
         ({"freeze_scales_at": 1.5}, "freeze_scales_at"),
+        # the static NVFP4 input scale is the largest activation seen: frozen before the first forward it is 0
+        ({"activations": "nvfp4", "freeze_scales_at": 0.0}, "freeze_scales_at 0 with nvfp4 activations"),
         ({"include": "layers"}, "list of regular expressions"),
         ({"exclude": ["("]}, "invalid regular expression"),
         ({"mx_rounding": "up"}, "mx_rounding"),

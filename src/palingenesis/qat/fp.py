@@ -381,6 +381,12 @@ class FloatQAT(TrainerPlugin):
         ):
             raise ValueError(f"float_qat: freeze_scales_at must be null or in [0, 1], got {freeze_scales_at!r}")
         self.freeze_scales_at = None if freeze_scales_at is None else float(freeze_scales_at)
+        if self.freeze_scales_at == 0.0 and self.activation_spec is not None and self.activation_spec.has_global_scale:
+            raise ValueError(
+                "float_qat: freeze_scales_at 0 with nvfp4 activations: their static input scale is the largest "
+                "activation observed before the freeze, and none is before the first step (the export would fail "
+                "at the end of training); use a value > 0"
+            )
         groups = FUSED_GROUPS if fused_groups is None else fused_groups
         if not all(isinstance(g, (list, tuple)) and all(isinstance(n, str) for n in g) for g in groups):
             raise ValueError(f"float_qat: fused_groups must be a list of lists of layer names, got {fused_groups!r}")
