@@ -32,6 +32,12 @@ TOOL_PARSERS = ("auto", "hermes", "xml")
 SANDBOX_BACKENDS = ("docker", "agent_sandbox", "subprocess")
 SSM_STATE_DTYPES = ("float32", "bfloat16", "auto")
 PACKING_MODES = ("padded", "varlen", "tree")  # train.packing (palingenesis.tree_packing)
+SCORE_CENTERING = ("off", "topk")
+MAX_TOP_K = 1024
+# Candidates the engine returns beyond rollout.top_k: vLLM keeps every token tied with the k-th logit in the
+# support, so it can hold more than top_k tokens; a token whose support fills all the candidates may miss some
+# and is left out of the loss (logged as sampling/support_incomplete).
+CANDIDATE_SLACK = 8
 
 
 @dataclass(slots=True)
@@ -120,7 +126,15 @@ class RLRolloutConfig:
     backend: str = "vllm"
     batch_prompts: int = 32  # groups per optimizer step
     group_size: int = 8  # rollouts per prompt
-    temperature: float = 1.0  # sampling is plain temperature: top-p/top-k would bias the ratios
+    temperature: float = 1.0
+    # Truncated sampling: nucleus top_p (1 = off) and top_k (0 = off). The sampler then draws from the policy
+    # renormalised over its support (the tokens top-k / top-p keep), and the trainer renormalises over the same support
+    # so the importance ratios stay exact: the engine returns the support of every sampled token (the top_k + 8 most
+    # likely tokens' processed log-probs, finite ones). top_p needs top_k (it bounds the support the engine returns);
+    # each candidate costs 4 bytes of ids and 4 of log-probs per sampled token, and vLLM's per-token log-prob output,
+    # so keep top_k small (Qwen3's recommended 20). Off: plain temperature, as before.
+    top_p: float = 1.0
+    top_k: int = 0
     max_new_tokens: int = 2048  # per assistant turn
     # Tokens the policy may generate over a whole trajectory, all turns (0 = max_new_tokens).
     max_completion_tokens: int = 0
@@ -376,6 +390,14 @@ class RLLossConfig:
     # writes where it cuts an output, and what the environment declares as its own text (observation_notes;
     # HarborEnv: the harness profile's, e.g. terminus-2's warning prefix).
     observation_exclude: list = field(default_factory=list)
+    # Score centering (arXiv:2609.20807, Appendix A.2; TRL AsyncGRPOTrainer): subtract from each token's policy
+    # gradient its expectation under the sampler, E_μ[f(ρ_v) ∇log π(v)], estimated over the sampler's
+    # score_centering_k most likely tokens (their processed log-probs, returned by the engine) and one ratio for the
+    # rest, so that a constant advantage does not pull the policy toward the sampler (see palingenesis.rl.losses).
+    # "off" or "topk"; token-level ratio losses only (masked_is, cispo, icepop, ipo). Unvalidated in pgs: A/B it
+    # against "off" before relying on it.
+    score_centering: str = "off"
+    score_centering_k: int = 8
 
 
 @dataclass(slots=True)
@@ -686,6 +708,59 @@ class RLConfig:
             )
         if not r.temperature > 0:
             errors.append(f"rollout.temperature must be > 0 for training rollouts, got {r.temperature}.")
+        if isinstance(r.top_p, bool) or not isinstance(r.top_p, int | float) or not 0 < r.top_p <= 1:
+            errors.append(f"rollout.top_p must be in (0, 1] (1 = off), got {r.top_p!r}.")
+        elif isinstance(r.top_k, bool) or not isinstance(r.top_k, int) or r.top_k < 0:
+            errors.append(f"rollout.top_k must be an integer >= 0 (0 = off), got {r.top_k!r}.")
+        elif r.top_p < 1 and r.top_k == 0:
+            errors.append(
+                "rollout.top_p < 1 needs rollout.top_k > 0: the trainer renormalises over the support every token was "
+                "sampled from, which the engine returns as its top_k most likely tokens (e.g. top_k: 20, top_p: 0.95)."
+            )
+        elif r.top_k > MAX_TOP_K:
+            errors.append(
+                f"rollout.top_k {r.top_k}: the engine returns top_k + {CANDIDATE_SLACK} log-probs per sampled token "
+                f"for the trainer to renormalise over; at most {MAX_TOP_K}."
+            )
+        elif r.top_k > 64:
+            warnings.append(
+                f"rollout.top_k {r.top_k}: every sampled token carries its {r.top_k + CANDIDATE_SLACK} most likely "
+                "tokens' log-probs from the engine to the trainer; vLLM's log-prob output slows generation as k grows."
+            )
+        if loss.score_centering not in SCORE_CENTERING:
+            errors.append(f"loss.score_centering must be one of {SCORE_CENTERING}, got {loss.score_centering!r}.")
+        elif loss.score_centering != "off":
+            if (
+                isinstance(loss.score_centering_k, bool)
+                or not isinstance(loss.score_centering_k, int)
+                or not 1 <= loss.score_centering_k <= MAX_TOP_K
+            ):
+                errors.append(
+                    f"loss.score_centering_k must be an integer in [1, {MAX_TOP_K}], got {loss.score_centering_k!r}."
+                )
+            if loss.type not in ("masked_is", "cispo", "icepop", "ipo"):
+                errors.append(
+                    f"loss.score_centering centers a token-level importance-weighted gradient: not defined for "
+                    f"loss.type {loss.type!r} (use masked_is, cispo, icepop or ipo)."
+                )
+        try:
+            candidates = sampler_candidates(self)
+        except TypeError:  # a malformed top_p / top_k / score_centering_k, reported above
+            candidates = 0
+        if candidates:
+            what = "rollout.top_p / top_k" if truncated_sampling(self) else "loss.score_centering"
+            if loss.kl_ref:
+                errors.append(
+                    f"{what} with loss.kl_ref is not supported yet: the reference is scored over the whole vocabulary, "
+                    "the policy over the sampler's candidates."
+                )
+            if self.scenario.type:
+                errors.append(f"{what} is not supported with a multi-role scenario (scenario.type) yet.")
+            if r.backend == "vllm_server" and r.url:
+                warnings.append(
+                    f"{what} with rollout.url: the running server must have been started with --logprobs-mode "
+                    f"processed_logprobs and --max-logprobs >= {candidates}."
+                )
         if r.max_new_tokens < 1:
             errors.append("rollout.max_new_tokens must be >= 1.")
         if r.max_completion_tokens and r.max_completion_tokens < r.max_new_tokens:
@@ -1129,6 +1204,33 @@ def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
 
 class RLConfigError(Exception):
     """Raised when the RL config has settings that would train wrongly or not at all."""
+
+
+def truncated_sampling(config: RLConfig) -> bool:
+    """Whether training rollouts sample with top-p / top-k (the trainer renormalises over each token's support)."""
+    return config.rollout.top_p < 1 or config.rollout.top_k > 0
+
+
+def sampler_candidates(config: RLConfig) -> int:
+    """The sampler's most likely tokens the engine returns per sampled token of a training rollout (0 = none):
+    rollout.top_k + CANDIDATE_SLACK with truncated sampling (the whole support), loss.score_centering_k with score
+    centering, the larger of the two with both."""
+    need = config.rollout.top_k + CANDIDATE_SLACK if truncated_sampling(config) else 0
+    if config.loss.score_centering != "off":
+        need = max(need, config.loss.score_centering_k)
+    return need
+
+
+def training_sampling(config: RLConfig):
+    """How training rollouts are sampled: rollout.temperature (a float) for plain sampling, as before; an
+    opd.rollout.Sampling with top_p / top_k and the candidates the trainer needs otherwise."""
+    r = config.rollout
+    candidates = sampler_candidates(config)
+    if not candidates:
+        return r.temperature
+    from palingenesis.opd.rollout import Sampling
+
+    return Sampling(r.temperature, r.top_p, r.top_k, candidates=candidates)
 
 
 def max_num_seqs(config: RLConfig) -> int:

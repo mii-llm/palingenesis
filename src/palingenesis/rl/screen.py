@@ -12,7 +12,8 @@ filtering, retirement).
     pgs screen --config rl.yaml --k 16 --max_rate 0.9 --model runs/sft/final --rollout.backend hf
 
 Rollouts go through the RL pipeline itself (palingenesis.rl.pipeline): the same prompt rendering, tool calls,
-environments, harness profiles, budgets and rewards as training, at rollout.temperature unless --temperature is given.
+environments, harness profiles, budgets and rewards as training, at rollout.temperature unless --temperature is given
+(and rollout.top_p / top_k).
 The policy is model.policy unless --model is given. Every row of data.dataset is screened (--split eval: the held-out
 rows, data.eval_dataset or the eval_size split; all: both), --rows N takes the first N.
 
@@ -352,7 +353,12 @@ def main(argv: list[str] | None = None) -> int:
                     f.write(json.dumps({**row, "screen": record}, ensure_ascii=False, default=str) + "\n")
                     f.flush()
 
-                fresh = screen(pipeline, todo, args.k, temperature, threshold, args.min_rate, args.max_rate,
+                sampling = temperature
+                if config.rollout.top_p < 1 or config.rollout.top_k > 0:  # truncated as in training
+                    from palingenesis.opd.rollout import Sampling
+
+                    sampling = Sampling(temperature, config.rollout.top_p, config.rollout.top_k)
+                fresh = screen(pipeline, todo, args.k, sampling, threshold, args.min_rate, args.max_rate,
                                args.chunk, sink)  # fmt: skip
             for row, record in fresh:
                 done[row_key(row)] = (row, record)

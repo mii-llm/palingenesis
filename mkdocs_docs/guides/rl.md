@@ -336,6 +336,48 @@ loss:
 
 With a multi-turn environment, the policy is also trained to predict what its actions return: the tool results' tokens in its own trajectories get a cross-entropy term, added to the policy loss of any `loss.type`. Per trajectory the term is the summed NLL of its targets divided by its observation length (all its tool-result tokens, targets or not), and the step adds λ × the mean over its trajectories that have observations: ECHO's $\mathcal{L}_{\text{GRPO}} + \lambda \mathcal{L}_{\text{Env}}$ ([arXiv:2605.24517](https://arxiv.org/abs/2605.24517); the paper does not state the batch average). The targets are the text of the tool results as the chat template renders it, never the template's markup or an image placeholder; the trainer's own messages (the answer to a malformed call, a format error), the truncation marker of `env.max_tool_output_tokens`, text the environment declares in `observation_notes` (HarborEnv: its harness profile's, e.g. terminus-2's warning prefix) and `loss.observation_exclude` matches count in the length but are not targets. Steps log `loss/observation` (mean NLL per target token) and `observation_tokens`. The paper reports gains from base models on terminal tasks and small ones from an SFT'd policy, at λ = 0.05 (0.01–0.05 worked, 0.1 degraded, 0.2 could collapse); nothing has been measured with it here. Details and the SFT counterpart: [Agentic training](agentic-training.md#observation-loss-include_observations).
 
+### Truncated sampling (top-p, top-k)
+
+```yaml
+rollout:
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 20          # required with top_p: it bounds the support the engine returns
+```
+
+Top-k and top-p draw each token from the policy renormalised over a support $S_t$, the tokens they keep. The sampler's log-prob $\mu(y_t)$ (vLLM's processed log-probs) is that of the renormalised distribution, so the trainer has to renormalise over the same set; scored over the whole vocabulary, $\pi_\theta(y_t)$ is smaller by $\pi_\theta(S_t)$ and every ratio is biased low ([DeepSeek-V3.2](https://arxiv.org/abs/2512.02556), section 3.1). With `top_p < 1` or `top_k > 0` the engine returns, with every sampled token, its `top_k + 8` most likely tokens and their processed log-probs; the finite ones are $S_t$, and the trainer computes
+
+$$
+\log \pi_S(y_t) = z_{y_t} - \log \sum_{v \in S_t} e^{z_v}, \qquad z = \text{logits} / T
+$$
+
+from $|S_t|$ gathered rows of the output head (no pass over the vocabulary), with its gradient through the normaliser. `policy/entropy` is then the entropy of $\pi_S$. On the policy's own samples the ratio is 1 (`tests/test_rl_sampling_support.py` checks it against the hf engine's recorded log-probs and end to end).
+{: .pg-where }
+
+The support is shipped as token ids, not recomputed: the trainer's logits differ slightly from the engine's, and a token at the boundary of its own top-k would change the set. vLLM keeps every token tied with the k-th logit, so the support can exceed `top_k`; the 8 extra candidates cover that, and a token whose support fills all of them (it may miss some) or does not contain the sampled token is left out of the loss and counted in `sampling/support_incomplete` (expected 0). `sampling/support_size` is the mean support. A think-skip token (`rollout.think_skip`) has no support and is scored over the vocabulary.
+
+Cost: 8 bytes per candidate per sampled token in host memory and on the wire, and vLLM's per-token log-prob output, which grows with k (a warning above `top_k: 64`; Qwen3's recommended `top_k: 20` is cheap). The engines are set up for it: the colocated engine and a launched `vllm_server` get `max_logprobs` raised when more than vLLM's 20 are needed; a server you started (`rollout.url`) needs `--logprobs-mode processed_logprobs` and `--max-logprobs`, and pool workers (`rollout.backend: remote`) `--max-logprobs` (checked when the trainer connects). The hf engine records the support itself. Evaluation keeps `train.eval_temperature`, untruncated. Not with `loss.kl_ref` (the reference is scored over the vocabulary) or a multi-role scenario yet. Follows TRL's `AsyncGRPOTrainer` ("Top-k and top-p sampling"), which needs vLLM's `--return-sampling-mask`; here the support comes from the top log-probs every vLLM version returns.
+
+### Score centering
+
+```yaml
+loss:
+  type: masked_is          # or cispo, icepop, ipo
+  score_centering: topk    # off (the default)
+  score_centering_k: 8
+```
+
+!!! warning "Unvalidated in palingenesis"
+    The math is tested on CPU (hand-computed values, TRL's formula, a zero-mean check); its effect on training has not been measured here. A/B it against `off` at equal steps before relying on it.
+
+Each objective above is $-A \cdot f(\rho_t)\, \nabla \log \pi_\theta(y_t)$, with $f(\rho) = \rho\, g(\rho)$ and $g$ the loss type's clip mask and cap. Under the sampler its expectation at a position is $\sum_v \pi_\theta(v)\, g(\rho_v)\, \nabla \log \pi_\theta(v)$, which is not 0 once ratios are clipped or capped: a constant advantage then still moves the policy, toward the sampler. Score centering ([arXiv:2609.20807](https://arxiv.org/abs/2609.20807), appendix A.2; TRL's `AsyncGRPOTrainer` default) subtracts that expectation, estimated over the sampler's `score_centering_k` most likely tokens $V_t$ and one ratio for the rest:
+
+$$
+c_t = \sum_{v \in V_t} \operatorname{sg}\!\big(p_v\, (g(\rho_v) - g(\rho_{\text{tail}}))\big) \log \pi_\theta(v), \qquad \rho_{\text{tail}} = \frac{1 - \sum_{V_t} p_v}{1 - \sum_{V_t} q_v}
+$$
+
+where $p_v = \pi_\theta(v)$, $q_v = \mu(v)$ (the engine's processed log-probs) and $\rho_v = p_v / q_v$; the tail term uses $\sum_{\text{tail}} \pi \nabla \log \pi = -\sum_{V_t} p_v \nabla \log \pi(v)$. The loss becomes $-\sum w\, S\, (\operatorname{sg}(\text{coef}_t) \log \pi_\theta(y_t) - A\, c_t)$. With `icepop` it is TRL's formula. The centered gradient averages to exactly 0 over the sampler when $V_t$ holds the support or the ratio is constant on the tail. With top-p / top-k, $\pi_\theta$ is the renormalised $\pi_S$. Logged: `sampling/sampler_mass` (the mean $\sum_{V_t} q_v$: how much of the sampler the estimate sees). Costs the same candidates as truncated sampling (`score_centering_k` log-probs per sampled token). Not for `gspo` (sequence-level) or `reinforce` (no ratio).
+
 ## Sampler/trainer agreement
 
 vLLM and the trainer compute the same policy with different kernels, so the log-probability of a sampled token differs slightly between them even with identical weights. The importance ratio $\rho = \pi_\theta / \mu$ absorbs the difference, but every unit of it is noise in the gradient, and it grows on long sequences and recurrent layers. The two agreement metrics are, over the trained tokens,

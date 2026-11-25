@@ -51,6 +51,7 @@ from palingenesis.lora import set_adapter
 from palingenesis.memory import trim_host_memory
 from palingenesis.moe import RouterBalancer, config_is_moe
 from palingenesis.multimodal import VisionProcessor
+from palingenesis.opd.fused_rkl import unwrap
 from palingenesis.opd.orchestrator import Orchestrator, PublishedWeights
 from palingenesis.opd.rollout import (
     HFRollout,
@@ -72,17 +73,27 @@ from palingenesis.opd.teachers import end_of_turn_id, load_causal_lm, right_pad
 from palingenesis.opd.trainer import TRAINER_STATE_FILE, checkpoint_steps, prunable_checkpoints, student_stop_ids
 from palingenesis.rl.adapters import PolicyAdapters, is_adapter_checkpoint
 from palingenesis.rl.chat import ChatFormat
-from palingenesis.rl.config import RLConfig, RLConfigError, max_num_seqs
+from palingenesis.rl.config import (
+    RLConfig,
+    RLConfigError,
+    max_num_seqs,
+    sampler_candidates,
+    training_sampling,
+    truncated_sampling,
+)
 from palingenesis.rl.data import PromptSampler, check_row_limits, load_rows, prompt_messages, split_rows
 from palingenesis.rl.env import EnvPool, ToolEnv, row_tools
 from palingenesis.rl.formats import convert
 from palingenesis.rl.losses import (
     LowPrecisionWeight,
+    SamplerCandidates,
     assign_advantages,
     mismatch_by_bucket,
     mismatch_metrics,
     observation_weights,
     policy_loss,
+    sampled_logprobs,
+    sampling_metrics,
     target_logprobs,
     token_weights,
 )
@@ -157,6 +168,10 @@ class RLTrainer:
     scenario = None
     role_specs: dict = {}
     servers: dict = {}  # further vLLM servers: one per adapter with its own engine, one for the frozen base
+    # rollout.top_p / top_k, loss.score_centering: the sampler's candidates per sampled token (0 = none), and whether
+    # the policy is renormalised over them (truncated sampling)
+    candidates: int = 0
+    renormalise: bool = False
 
     def __init__(
         self,
@@ -293,6 +308,10 @@ class RLTrainer:
                     "launches needs ray. Install it with: pip install 'palingenesis[vllm-server]'"
                 )
 
+            # the sampler's candidates (rollout.top_p / top_k, loss.score_centering): above vLLM's default of 20
+            wanted = sampler_candidates(config)
+            logprob_flags = ["--max-logprobs", str(wanted)] if wanted > 20 else []
+
             def launch(tag: str = "") -> VLLMServer:
                 return VLLMServer(
                     m.policy,
@@ -314,6 +333,7 @@ class RLTrainer:
                         *(["--quantization", r.quantization] if r.quantization else []),
                         *(["--enable-return-routed-experts"] if self.routing_replay else []),
                         *serve_flags(precision),
+                        *logprob_flags,
                     ),
                 )
 
@@ -433,6 +453,15 @@ class RLTrainer:
         # so the trainer scores logits / T: the fp32 logits of the plain linear head are scaled (target_logprobs'
         # scale). Before, T != 1 compared an unscaled policy with a scaled sampler.
         self.inv_temperature = 1.0 / config.rollout.temperature
+        # rollout.top_p / top_k, loss.score_centering: the sampler's candidates per sampled token (0 = none), scored
+        # through gathered rows of the head (losses.sampled_logprobs), which needs a plain linear head
+        self.candidates = sampler_candidates(config)
+        self.renormalise = truncated_sampling(config)
+        if self.candidates and unwrap(self.head) is None:
+            raise RLConfigError(
+                "rollout.top_p / top_k and loss.score_centering need a plain linear output head (no bias): the trainer "
+                "scores the sampler's candidates through gathered rows of its weight."
+            )
         if self.inv_temperature != 1.0 and not _plain_linear(self.head):
             raise RLConfigError(
                 f"rollout.temperature={config.rollout.temperature} needs a plain linear output head (no bias, no logit "
@@ -479,6 +508,8 @@ class RLTrainer:
                 }
             extra.update(r.vllm_args)
             extra.update(precision)
+            if sampler_candidates(config) > 20:  # vLLM's default max_logprobs
+                extra.setdefault("max_logprobs", sampler_candidates(config))
 
             def colocated(engine_kwargs):
                 return VLLMColocateRollout(
@@ -529,6 +560,8 @@ class RLTrainer:
                     "chat_template_kwargs": dict(m.chat_template_kwargs or {}),
                     "max_model_len": r.max_model_len,
                     "fp32_head": bool(r.fp32_head),
+                    # the worker's --max-logprobs must cover the sampler's candidates (rollout.top_p / top_k, ...)
+                    **({"max_logprobs": sampler_candidates(config)} if sampler_candidates(config) else {}),
                     **({"lora_rank": config.lora.rank} if self.push_mode == "native" else {}),
                 },
             )
@@ -581,7 +614,10 @@ class RLTrainer:
             self.pipeline = RLPipeline(*pipeline_args)
         else:
             self.pipeline = self._scenario_pipeline(pipeline_args, engine_keys)
-        self.orchestrator = Orchestrator(self.pipeline, lambda: self.batch_prompts, r.temperature, r.max_staleness)
+        # training rollouts: plain temperature, or a Sampling with top-p / top-k and the sampler's candidates
+        self.orchestrator = Orchestrator(
+            self.pipeline, lambda: self.batch_prompts, training_sampling(config), r.max_staleness
+        )
         if self.adapters is not None:
             groups, scales = self.adapters.param_groups(self._trainable(), self._trainable_names())
             self.lr_scales = tuple(scales)
@@ -1054,6 +1090,7 @@ class RLTrainer:
                 else:
                     where[row, [index[row][p] for p in before] if index else before] = True
 
+            candidates = []  # the sampler's candidates of the trained tokens (rollout.top_p / top_k, centering)
             for row, t in enumerate(micro):
                 if echo and id(t) in observed and t.observation_targets:
                     select(echo_positions, row, [len(t.prompt_ids) + j - 1 for j in t.observation_targets])
@@ -1069,6 +1106,8 @@ class RLTrainer:
                 advantage += [t.advantage] * len(sampled)
                 weight += [weights[id(t)]] * len(sampled)
                 seq += [row] * len(sampled)
+                if self.candidates:
+                    candidates.append(_candidates_of(t, sampled))
             floats = torch.tensor([behaviour, advantage, weight], dtype=torch.float32).to(device, non_blocking=True)
             longs = torch.tensor([targets, seq, completion_pos, sampled_by], dtype=torch.long).to(
                 device, non_blocking=True
@@ -1090,12 +1129,20 @@ class RLTrainer:
                         ]
                 del states
             inv_t = getattr(self, "inv_temperature", 1.0)  # applied to the fp32 logits
-            lp, entropy = target_logprobs(
-                hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight, scale=inv_t
-            )
+            scored = None
+            if self.candidates:  # log π renormalised over the sampler's support; the candidates' log-probs
+                sampler = SamplerCandidates.build(candidates, self.candidates, self.renormalise, device)
+                scored = sampled_logprobs(
+                    hidden, self.head, longs[0], sampler, loss_config.log_entropy, self.head_weight, scale=inv_t
+                )
+                lp, entropy = scored.lp, scored.entropy
+            else:
+                lp, entropy = target_logprobs(
+                    hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight, scale=inv_t
+                )
             forced_t = torch.tensor(forced, dtype=torch.bool).to(device, non_blocking=True) if any(forced) else None
             loss, stats = policy_loss(
-                lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config, forced_t
+                lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config, forced_t, scored
             )
             stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], forced_t))
             reference_lp = torch.cat([self.ref_lp[id(t)] for t in micro]) if self.ref_lp else None
@@ -1134,6 +1181,7 @@ class RLTrainer:
             "trained_tokens": values["tokens"],
             "trained_sequences": values["sequences"],
             **mismatch_metrics(values),
+            **sampling_metrics(values),
             **advantage_stats,
         }
         if self.scenario is not None:
@@ -1248,9 +1296,19 @@ class RLTrainer:
                     device=device,
                 )
                 inv_t = getattr(self, "inv_temperature", 1.0)  # applied to the fp32 logits
-                lp, entropy = target_logprobs(
-                    rows, self.head, targets, loss_config.log_entropy, self.head_weight, scale=inv_t
-                )
+                scored = None
+                if self.candidates:  # log π renormalised over the sampler's support; the candidates' log-probs
+                    sampler = SamplerCandidates.build(
+                        [_candidates_of(t, sampled)], self.candidates, self.renormalise, device
+                    )
+                    scored = sampled_logprobs(
+                        rows, self.head, targets, sampler, loss_config.log_entropy, self.head_weight, scale=inv_t
+                    )
+                    lp, entropy = scored.lp, scored.entropy
+                else:
+                    lp, entropy = target_logprobs(
+                        rows, self.head, targets, loss_config.log_entropy, self.head_weight, scale=inv_t
+                    )
                 seq = torch.zeros(len(sampled), dtype=torch.long, device=device)
                 seq_len = torch.tensor([float(len(sampled))], device=device)
                 forced = (
@@ -1258,7 +1316,9 @@ class RLTrainer:
                     if t.forced
                     else None
                 )
-                loss, stats = policy_loss(lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced)
+                loss, stats = policy_loss(
+                    lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced, scored
+                )
                 where = torch.tensor([sampled, _sampled_by(t, sampled, current)], dtype=torch.long, device=device)
                 stats.update(mismatch_by_bucket(lp, floats[0], where[0], where[1], forced))
                 if self.scenario is not None:
@@ -1687,6 +1747,15 @@ def _sampled_by(t: Trajectory, sampled: list[int], current: int) -> list[int]:
     older version sampled any of it, -1 when unknown (see Trajectory.token_versions)."""
     versions = t.token_versions()
     return [-1 if versions[j] < 0 else int(versions[j] < current) for j in sampled]
+
+
+def _candidates_of(t: Trajectory, sampled: list[int]):
+    """The sampler's candidates at a trajectory's trained tokens `sampled` (none where it recorded none)."""
+    from palingenesis.opd.rollout import Candidates
+
+    if t.candidates is None:
+        return Candidates.empty(len(sampled))
+    return t.candidates.select(sampled)
 
 
 def _accumulate(totals: dict[str, torch.Tensor], stats: dict, loss: torch.Tensor, entropy: torch.Tensor) -> None:

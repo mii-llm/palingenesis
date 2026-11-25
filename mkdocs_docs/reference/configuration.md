@@ -249,6 +249,17 @@ RL configs lay out the policy step's micro-batches with `train.packing` (`padded
 shared prefix is forwarded once; `train.micro_tokens` then bounds the packed (unique) tokens. Same log-probs and gradients as `padded`. Needs
 `sdpa` attention and full-attention / Gated DeltaNet layers; not with `model.multimodal`. See [RL: packing micro-batches](../guides/rl.md#packing-micro-batches).
 
+### RL: truncated sampling and score centering
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `rollout.top_p` | float | `1.0` | Nucleus sampling of training rollouts (1 = off). Needs `rollout.top_k`. The trainer renormalises the policy over each token's support, returned by the engine. See [RL: truncated sampling](../guides/rl.md#truncated-sampling-top-p-top-k). |
+| `rollout.top_k` | int | `0` | Top-k sampling of training rollouts (0 = off), at most 1024; the engine returns `top_k + 8` log-probs per sampled token. |
+| `loss.score_centering` | str | `off` | `topk`: subtract each token's expected policy gradient under the sampler, over its top `score_centering_k` tokens (arXiv:2609.20807). `masked_is`, `cispo`, `icepop`, `ipo` only. Unvalidated in palingenesis: A/B it before use. See [RL: score centering](../guides/rl.md#score-centering). |
+| `loss.score_centering_k` | int | `8` | The sampler's most likely tokens per position the centering is estimated over. |
+
+Neither works with `loss.kl_ref` or a `scenario:` yet. With `rollout.backend: remote`, start the workers with `--max-logprobs` at least the log-probs requested (`top_k + 8`, or `score_centering_k`).
+
 ---
 
 ### RL: rollout engines

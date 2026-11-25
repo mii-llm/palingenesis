@@ -30,9 +30,30 @@ gradient is.
 The observation loss (loss.observation_weight, ECHO) is added to any of them: λ x the mean over trajectories of
 the summed NLL of the environment's output tokens divided by the trajectory's observation length
 (observation_weights gives each target its weight).
+
+Truncated sampling (rollout.top_p / top_k). The sampler draws y_t from the policy renormalised over its support S_t
+(the tokens top-k / top-p keep), and μ is that renormalised distribution. The ratio then needs the trained policy
+renormalised over the same S_t (sampled_logprobs, from the sampler's candidates):
+
+  log π_S(y_t) = z_y - logsumexp_{v ∈ S_t} z_v        (z = logits / temperature)
+
+which only needs the |S_t| logits of the support (one gathered row of the head per candidate, not the vocabulary).
+The full-vocabulary log π(y_t) is smaller by log π(S_t) and biases every ratio low (DeepSeek-V3.2, arXiv:2512.02556,
+section 3.1; TRL AsyncGRPOTrainer, "Top-k and top-p sampling").
+
+Score centering (loss.score_centering topk; arXiv:2609.20807, Appendix A.2, as in TRL AsyncGRPOTrainer). The token
+objectives above are -A · f(ρ_t) ∇log π(y_t) with f(ρ) = ρ g(ρ) (g: the clip mask and cap of the loss type). Its
+expectation under the sampler at a position is not 0 when π ≠ μ: E_μ[f(ρ_v) ∇log π(v)] = Σ_v π(v) g(ρ_v) ∇log π(v),
+so a constant advantage still pulls π toward μ. Centering subtracts that expectation, estimated from the sampler's
+top-k candidates V_t (q_v = μ(v), p_v = π(v)) and one ratio for the tail outside them,
+ρ_tail = (1 - Σ_V p) / (1 - Σ_V q), on which Σ_tail π(v) ∇log π(v) = -Σ_V p_v ∇log π(v):
+
+  correction_t = Σ_{v ∈ V_t} sg(p_v (g(ρ_v) - g(ρ_tail))) · log π(v)
+  loss         -Σ w · S · (sg(coef_t) · lp_t - A · correction_t)
 """
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
@@ -223,6 +244,229 @@ def target_logprobs(
     return _TargetLogProbs.apply(hidden, targets, head, rows, entropy, float(scale), *head.parameters())
 
 
+# ------------------------------------------------- the sampler's candidates
+
+
+@dataclass
+class SamplerCandidates:
+    """The sampler's candidates at a micro-batch's trained tokens, padded to [N, K] (most likely first).
+
+    ids, logprobs: [N, K] token ids (0 at padding) and the sampler's processed log-probs μ(v) (-inf at padding).
+    support: the candidates are the sampler's support (rollout.top_p / top_k): the policy is renormalised over them.
+    complete: [N] bool, the token's support was seen whole: fewer candidates than requested (with exactly as many,
+        tokens tied at the k-th logit may be missing; such tokens are left out of the loss). All True without support.
+    present: [N] bool, the token has candidates (a forced token has none: it is scored over the whole vocabulary).
+    """
+
+    ids: Tensor
+    logprobs: Tensor
+    support: bool
+    complete: Tensor
+    present: Tensor
+
+    @classmethod
+    def build(cls, parts, requested: int, support: bool, device) -> "SamplerCandidates":
+        """From opd.rollout.Candidates of the micro-batch's trained tokens, in token order (one part per row)."""
+        import numpy as np
+
+        counts = np.concatenate([p.counts for p in parts]).astype(np.int64) if parts else np.zeros(0, np.int64)
+        flat_ids = np.concatenate([p.ids for p in parts]) if parts else np.zeros(0, np.int32)
+        flat_lp = np.concatenate([p.logprobs for p in parts]) if parts else np.zeros(0, np.float32)
+        n, width = len(counts), max(1, int(counts.max()) if len(counts) else 1)
+        rows = np.repeat(np.arange(n), counts)
+        cols = np.arange(len(flat_ids)) - np.repeat(np.cumsum(counts) - counts, counts)
+        ids = np.zeros((n, width), np.int64)
+        logprobs = np.full((n, width), -np.inf, np.float32)
+        ids[rows, cols] = flat_ids
+        logprobs[rows, cols] = flat_lp
+        present = counts > 0
+        complete = counts < requested if support else np.ones(n, bool)
+        return cls(
+            torch.from_numpy(ids).to(device, non_blocking=True),
+            torch.from_numpy(logprobs).to(device, non_blocking=True),
+            support,
+            torch.from_numpy(complete).to(device, non_blocking=True),
+            torch.from_numpy(present).to(device, non_blocking=True),
+        )
+
+
+@dataclass
+class SampledLogProbs:
+    """sampled_logprobs' result. lp: [N] log-prob of each trained token under the distribution the sampler drew it
+    from (renormalised over the support with top-p / top-k), differentiable; entropy: [N] that distribution's
+    entropy (or [0]); candidate_lp: [N, K] log-probs of the candidates under the same distribution, differentiable
+    (-inf at padding); valid: [N] bool, False for tokens to leave out of the loss (support possibly incomplete, or the
+    sampled token missing from it); sampler: the candidates."""
+
+    lp: Tensor
+    entropy: Tensor
+    candidate_lp: Tensor
+    valid: Tensor
+    sampler: SamplerCandidates
+
+
+class _GatheredLogits(torch.autograd.Function):
+    """z[n, j] = hidden[n] · weight[ids[n, j]]: the raw projection of a few chosen tokens per row (computed in fp32,
+    or fp64 for fp64 inputs, from the head's low-precision copy, as the full-vocabulary path accumulates bf16 GEMMs
+    in fp32), a slice of rows at a time; the backward recomputes the gathered rows instead of keeping them."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight, ids, w_low, rows):
+        dtype = torch.promote_types(torch.promote_types(w_low.dtype, hidden.dtype), torch.float32)
+        z = torch.empty(ids.shape, dtype=dtype, device=hidden.device)
+        for a in range(0, ids.shape[0], rows):
+            gathered = w_low[ids[a : a + rows]].to(dtype)  # [r, J, H]
+            z[a : a + rows] = torch.bmm(gathered, hidden[a : a + rows].detach().to(dtype).unsqueeze(-1)).squeeze(-1)
+        ctx.save_for_backward(hidden, ids)
+        ctx.w_low, ctx.rows, ctx.weight_shape, ctx.dtype = w_low, rows, weight.shape, dtype
+        return z
+
+    @staticmethod
+    def backward(ctx, grad_z):
+        hidden, ids = ctx.saved_tensors
+        w_low, rows = ctx.w_low, ctx.rows
+        want_hidden, want_weight = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        grad_hidden = torch.zeros(hidden.shape, dtype=hidden.dtype, device=hidden.device) if want_hidden else None
+        grad_weight = torch.zeros(ctx.weight_shape, dtype=ctx.dtype, device=hidden.device) if want_weight else None
+        for a in range(0, ids.shape[0], rows):
+            g = grad_z[a : a + rows].to(ctx.dtype)
+            if want_hidden:
+                gathered = w_low[ids[a : a + rows]].to(ctx.dtype)
+                grad_hidden[a : a + rows] = torch.bmm(g.unsqueeze(1), gathered).squeeze(1).to(hidden.dtype)
+            if want_weight:
+                h = hidden[a : a + rows].to(ctx.dtype)
+                grad_weight.index_add_(
+                    0, ids[a : a + rows].reshape(-1), (g.unsqueeze(-1) * h.unsqueeze(1)).flatten(0, 1)
+                )
+        return grad_hidden, grad_weight, None, None, None
+
+
+GATHER_ELEMENTS = 2**25  # fp32 elements of gathered head rows per slice (128 MiB)
+
+
+def candidate_logits(hidden: Tensor, head: nn.Module, ids: Tensor, low=None, scale: float = 1.0) -> Tensor:
+    """[N, J] logits (the model's: multiplier, soft-capping) of the tokens `ids` [N, J] at each row of `hidden`
+    [N, H], times `scale`, in fp32 (fp64 for fp64 inputs) and differentiable. Needs a bias-free linear head (opd.fused_rkl.unwrap)."""
+    linear = unwrap(head)
+    if linear is None:
+        raise ValueError(
+            "renormalising over the sampler's candidates (rollout.top_p / top_k, loss.score_centering) needs a plain "
+            "linear output head (no bias)"
+        )
+    w_low = (low or LowPrecisionWeight()).get(linear.weight)
+    rows = max(1, GATHER_ELEMENTS // max(1, ids.shape[1] * w_low.shape[1]))
+    with torch.autocast(hidden.device.type, enabled=False):
+        y = _GatheredLogits.apply(hidden, linear.weight, ids, w_low, rows)
+        if linear.multiplier != 1.0:
+            y = y * linear.multiplier
+        if linear.softcap:
+            y = linear.softcap * torch.tanh(y / linear.softcap)
+        return y * scale if scale != 1.0 else y
+
+
+def sampled_logprobs(
+    hidden: Tensor,
+    head: nn.Module,
+    targets: Tensor,
+    sampler: SamplerCandidates,
+    entropy: bool = False,
+    low: LowPrecisionWeight | None = None,
+    scale: float = 1.0,
+) -> SampledLogProbs:
+    """target_logprobs for tokens sampled with candidates: log π_S(y_t) = z_y - logsumexp_{v ∈ S_t} z_v over the
+    sampler's support S_t when `sampler.support` (z = logits x scale; its gradient flows through the
+    renormalisation; the entropy is that of π_S), the full-vocabulary log π(y_t) otherwise and for tokens without
+    candidates. Also the log-probs of every candidate under the same distribution (score centering): over the support
+    z_v - logsumexp_S z, over the vocabulary log π(y) + z_v - z_y (exact, and the gradient of the normaliser flows
+    through log π(y))."""
+    n = targets.shape[0]
+    device = hidden.device
+    pad = torch.isneginf(sampler.logprobs)  # [N, K]
+    z = candidate_logits(hidden, head, torch.cat([targets[:, None], sampler.ids], 1), low, scale)
+    z_y, z_c = z[:, 0], z[:, 1:]
+    renormalised = sampler.present if sampler.support else torch.zeros(n, dtype=torch.bool, device=device)
+    member = ((sampler.ids == targets[:, None]) & ~pad).any(1)
+    valid = ~renormalised | (sampler.complete & member)
+    lp = torch.zeros(n, dtype=z.dtype, device=device)
+    ent = torch.zeros(n if entropy else 0, dtype=z.dtype, device=device)
+    candidate_lp = torch.full(z_c.shape, float("-inf"), dtype=z.dtype, device=device)
+    over = renormalised.nonzero().squeeze(1)
+    full = (~renormalised).nonzero().squeeze(1)
+    if over.numel():
+        zs = z_c.index_select(0, over).masked_fill(pad.index_select(0, over), float("-inf"))
+        lse = torch.logsumexp(zs, -1)
+        lp = lp.index_copy(0, over, z_y.index_select(0, over) - lse)
+        candidate_lp = candidate_lp.index_copy(0, over, zs - lse[:, None])
+        if entropy:
+            with torch.no_grad():
+                probs = (zs - lse[:, None]).exp()
+                ent[over] = lse - (probs * zs.masked_fill(pad.index_select(0, over), 0.0)).sum(-1)
+    if full.numel():
+        lp_full, ent_full = target_logprobs(
+            hidden.index_select(0, full), head, targets.index_select(0, full), entropy, low, scale
+        )
+        lp_full = lp_full.to(z.dtype)
+        lp = lp.index_copy(0, full, lp_full)
+        shift = z_c.index_select(0, full) - z_y.index_select(0, full)[:, None]
+        candidate_lp = candidate_lp.index_copy(
+            0, full, (lp_full[:, None] + shift).masked_fill(pad.index_select(0, full), float("-inf"))
+        )
+        if entropy:
+            ent[full] = ent_full.to(z.dtype)
+    return SampledLogProbs(lp, ent, candidate_lp, valid, sampler)
+
+
+def _keep_factor(config, ratio: Tensor, advantage: Tensor, p: Tensor | None = None, q: Tensor | None = None) -> Tensor:
+    """g(ρ) = f(ρ) / ρ of the loss type's token coefficient f (its clip mask and cap; ρ = 0 is finite): the factor
+    score centering weighs each candidate's π(v) ∇log π(v) by. `advantage` broadcasts against `ratio`; `p`, `q`: the
+    policy's and the sampler's probabilities (ipo's mask)."""
+    capped = torch.where(ratio > config.is_cap, config.is_cap / ratio.clamp(min=1e-30), torch.ones_like(ratio))
+    if config.type == "masked_is":
+        clipped = ((advantage > 0) & (ratio > 1 + config.eps_high)) | ((advantage < 0) & (ratio < 1 - config.eps_low))
+        return (~clipped).float() * capped
+    if config.type == "cispo":
+        return capped
+    if config.type == "icepop":
+        return ((ratio >= config.icepop_low) & (ratio <= config.icepop_high)).float()
+    if config.type == "ipo":
+        return ((p - q).abs() <= config.ipo_eps).float() * capped
+    raise ValueError(f"loss.score_centering is not defined for loss.type {config.type!r}")
+
+
+def centering_correction(sampled: SampledLogProbs, advantage: Tensor, config) -> tuple[Tensor, dict[str, Tensor]]:
+    """Score centering's per-token term Σ_v sg(p_v (g(ρ_v) - g(ρ_tail))) log π(v) over the sampler's top
+    loss.score_centering_k candidates (see the module docstring), differentiable through log π(v); and statistics
+    (sampler_mass: Σ_V q summed over tokens, the share of the sampler's mass the candidates cover)."""
+    k = config.score_centering_k
+    lp_v = sampled.candidate_lp[:, :k]
+    mu_v = sampled.sampler.logprobs[:, :k]
+    with torch.no_grad():
+        q = mu_v.exp()  # 0 at padding
+        p = lp_v.detach().exp()
+        ratio = p / q.clamp(min=torch.finfo(q.dtype).tiny)
+        a = advantage[:, None]
+        g_v = _keep_factor(config, ratio, a, p, q)
+        rest_q, rest_p = (1 - q.sum(-1)).clamp(min=0.0), (1 - p.sum(-1)).clamp(min=0.0)
+        tail_ratio = rest_p / rest_q.clamp(min=torch.finfo(q.dtype).tiny)
+        g_tail = _keep_factor(config, tail_ratio[:, None], a, rest_p[:, None], rest_q[:, None])
+        g_tail = g_tail.masked_fill((rest_q <= 1e-6)[:, None], 0.0)  # no tail: the candidates hold the whole support
+        residual = torch.where(q > 0, p * (g_v - g_tail), torch.zeros_like(p))
+        stats = {"sampler_mass": q.sum(), "centered_tokens": (q > 0).any(1).sum().float()}
+    correction = (residual * lp_v.masked_fill(q <= 0, 0.0)).sum(-1)
+    return correction, stats
+
+
+def sampling_metrics(values: dict[str, float]) -> dict[str, float]:
+    """The step's candidate statistics (sampled_logprobs, score centering) as per-token means."""
+    metrics = {}
+    if values.get("support_tokens"):
+        metrics["sampling/support_incomplete"] = values.get("support_incomplete", 0.0) / values["support_tokens"]
+        metrics["sampling/support_size"] = values.get("support_size", 0.0) / values["support_tokens"]
+    if values.get("centered_tokens"):
+        metrics["sampling/sampler_mass"] = values.get("sampler_mass", 0.0) / values["centered_tokens"]
+    return metrics
+
+
 # ------------------------------------------------------------------ objective
 
 
@@ -236,15 +480,32 @@ def policy_loss(
     seq_len: Tensor,
     config,
     forced: Tensor | None = None,
+    sampled: SampledLogProbs | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
     """The loss over a micro-batch's trained tokens.
 
     lp, behaviour, advantage, weight, seq: [N] per token (seq: the token's sequence index in
     0..n_seq-1); seq_len: [n_seq] trained tokens per sequence; config: the RLLossConfig; forced: [N] bool or None,
     tokens whose behaviour log-prob is a forcing probability (think-skip): their ratio is an intended importance
-    weight, so it stays out of the sampler-mismatch statistics and the sequence mask.
+    weight, so it stays out of the sampler-mismatch statistics and the sequence mask. sampled: sampled_logprobs'
+    result when the tokens came with the sampler's candidates (lp is then sampled.lp): tokens it marks invalid are
+    left out of the loss, and loss.score_centering uses its candidates.
     Returns the loss (to backward) and summed statistics as 0-d tensors (no host sync).
     """
+    centering = getattr(config, "score_centering", "off") != "off"
+    if centering and sampled is None:
+        raise ValueError("loss.score_centering needs the sampler's candidates (sampled_logprobs)")
+    candidate_stats = {}
+    if sampled is not None:
+        weight = weight * sampled.valid
+        if sampled.sampler.support:
+            with torch.no_grad():
+                counted = sampled.sampler.present
+                candidate_stats = {
+                    "support_tokens": counted.sum().float(),
+                    "support_incomplete": (counted & ~sampled.valid).sum().float(),
+                    "support_size": (~torch.isneginf(sampled.sampler.logprobs) & counted[:, None]).sum().float(),
+                }
     with torch.no_grad():
         log_ratio = lp.detach() - behaviour
         ratio = log_ratio.exp()
@@ -270,6 +531,7 @@ def policy_loss(
             ).sum(),
             "seq_masked": (~keep_seq).sum().float(),
             "sequences": torch.tensor(float(n_seq), device=lp.device),
+            **candidate_stats,
         }
 
     if config.type == "gspo":
@@ -307,6 +569,10 @@ def policy_loss(
             raise ValueError(f"unknown loss.type {config.type!r}")
         coef = coef * s_mask
         stats["clipped"] = clipped.sum().float()
+    if centering:
+        correction, centering_stats = centering_correction(sampled, advantage, config)
+        stats.update(centering_stats)
+        return -(weight * (coef * lp - s_mask * advantage * correction)).sum(), stats
     return -(weight * coef * lp).sum(), stats
 
 
