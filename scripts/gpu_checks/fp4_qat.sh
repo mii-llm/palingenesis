@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # FP4 / FP8 quantisation-aware training: GPU checks on ONE NVIDIA A100 80GB (no FP4 / FP8 tensor cores: the
-# training forward fake-quantises; vLLM serves the packed checkpoints through its Marlin weight-only kernels).
+# training forward fake-quantises; vLLM serves the packed checkpoints through its weight-only kernels).
 #
 #   PGS_PY=/path/to/venv/bin/python PGS_SRC=/path/to/palingenesis/src bash scripts/gpu_checks/fp4_qat.sh
 #
@@ -8,14 +8,22 @@
 #   PGS_PY       python with torch, transformers, vllm (default: python)
 #   PGS_SRC      palingenesis/src (default: ../../src from this script)
 #   WORK         working directory (default: a new /tmp/pgs_fp4_qat.XXXXXX); keep it to read the logs
+#   NEED_GB      free space required in WORK before starting (default 8; see "Disk" below)
+#   KEEP         1 keeps every checkpoint (about 30 GB for the default model instead of the peak below)
 #   MODEL        default Qwen/Qwen3.5-0.8B (from the HF cache: HF_HUB_OFFLINE=1)
 #   STEPS        QAT steps per format (default 300)
 #   QAT_FORMATS  formats trained with QAT + KD (default "nvfp4 mxfp4")
 #   EVAL_ITEMS   accuracy-proxy items (default 200)
 #
-# Output: one JSON line per check on stdout, {"check": ..., "status": "PASS" | "FAIL" | "INFO", ...numbers}; the
-# last line is a summary. Logs of every step are in $WORK/logs. Expected run time on an A100 80GB: ~60-80 min
+# Output: one JSON line per check on stdout, {"check": ..., "status": "PASS" | "FAIL" | "SKIP" | "INFO", ...numbers};
+# the last line is a summary. Logs of every step are in $WORK/logs. Expected run time on an A100 80GB: ~60-80 min
 # (data generation ~5 min, 9 vLLM evaluations ~1-2 min each, 2 QAT runs ~10-15 min each, vLLM loads, benchmarks).
+#
+# Disk: one run's checkpoints at a time. Each run is measured (KL, accuracy, vLLM) and its weight files are then
+# deleted (the files this script wrote, one by one; configs, reports, logs and results stay). The peak for a 0.8B
+# model is one QAT run: final/ (the dequantized model in the run's float32, ~3.5 GB) + final-<format>/ (packed,
+# ~1 GB); a PTQ run is ~1.8 GB (dequantized bf16) + ~1-1.3 GB (packed). The script prints the space it needs and
+# what WORK has, and stops before any work if there is less.
 #
 # Checks
 #   (1) ptq/<fmt>/<scales>   PTQ of MODEL (nvfp4, mxfp4, fp8, fp8_block; max scales, and mse for the FP4 formats):
@@ -24,8 +32,12 @@
 #   (1b) exact/<fmt>         the dequantized export computes exactly what the fake-quantised forward computes
 #   (2) qat/<fmt>            pgs train, QAT with KD to the bf16 model (forward KL), STEPS steps on self-generated
 #                            text, from MSE-clipped scales, frozen at 90%: KL and accuracy vs PTQ (recovered share)
-#   (3) vllm/<run>           the packed compressed-tensors checkpoint loads in vLLM (Marlin on A100) and generates
-#                            like its dequantized twin (accuracy within 0.05, share of identical answers)
+#   (3) vllm/<run>           the packed compressed-tensors checkpoint loads in vLLM (weight-only kernels on A100)
+#                            and generates like its dequantized twin (accuracy within 0.05; share of identical
+#                            answers and of the answer both share before they diverge). If vLLM's default kernel
+#                            fails (its Humming kernels are compiled at the first forward), one retry without
+#                            them (Marlin); the line says which kernels served. SKIP: no vLLM, or a GPU below the
+#                            scheme's minimum compute capability (7.5).
 #   (4) overhead/<mode>      forward + backward time with fake quantisation vs the plain model (bf16, 4 x 1024)
 set -uo pipefail
 
@@ -36,14 +48,16 @@ STEPS=${STEPS:-300}
 QAT_FORMATS=${QAT_FORMATS:-"nvfp4 mxfp4"}
 EVAL_ITEMS=${EVAL_ITEMS:-200}
 WORK=${WORK:-$(mktemp -d /tmp/pgs_fp4_qat.XXXXXX)}
+NEED_GB=${NEED_GB:-8}
+KEEP=${KEEP:-0}
 export PYTHONPATH="$PGS_SRC${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-WARNING}
 mkdir -p "$WORK/logs" "$WORK/results"
+: > "$WORK/results/checks.jsonl"   # a rerun in the same WORK starts its own list
 START=$(date +%s)
 
 emit() { echo "$1" | tee -a "$WORK/results/checks.jsonl"; }
-fail() { emit "{\"check\": \"$1\", \"status\": \"FAIL\", \"error\": \"$2\", \"log\": \"$3\"}"; }
 
 cat > "$WORK/fp4_check.py" <<'PY'
 """Helpers of scripts/gpu_checks/fp4_qat.sh (written by it into $WORK)."""
@@ -119,7 +133,7 @@ def vllm_engine(model, quantized=False):
         return LLM(**kwargs)
 
 
-def cmd_data(work, model, n_train, n_eval):
+def cmd_data(work, model, n_train, n_eval, out):
     from transformers import AutoTokenizer
 
     rng = random.Random(0)
@@ -157,8 +171,10 @@ def cmd_data(work, model, n_train, n_eval):
     Path(work, "heldout.jsonl").write_text("".join(json.dumps(r) + "\n" for r in held))
     items, source = eval_items(rng, n_eval)
     Path(work, "eval.jsonl").write_text("".join(json.dumps(r) + "\n" for r in items))
-    print(json.dumps({"train_rows": len(rows), "heldout_rows": len(held), "eval_items": len(items),
-                      "eval_source": source, "generator": used}))
+    result = {"train_rows": len(rows), "heldout_rows": len(held), "eval_items": len(items),
+              "eval_source": source, "generator": used}
+    Path(out).write_text(json.dumps(result))  # a file: vLLM logs to stdout
+    print(json.dumps(result))
 
 
 def hf_generate(model, tok, prompts, max_new):
@@ -269,6 +285,7 @@ def cmd_kl(work, reference, candidates, out):
     results = {}
     for cand in candidates:
         model = load_hf(cand)
+        cand = Path(cand).parent.name if Path(cand).name in ("dequantized", "final") else cand  # the run's name
         kl_sum = agree = tokens = 0.0
         for ids in heldout_batches(tok, work):
             lp = torch.log_softmax(ref(input_ids=ids).logits[0, :-1].float(), -1)
@@ -343,10 +360,117 @@ def cmd_bench(model_name, out):
     print(json.dumps(report))
 
 
+def cmd_reason(log):
+    """Why vLLM failed, from its log: the engine process's exception (with the `assert` line of a bare
+    AssertionError), else the last exception line."""
+    lines = [re.sub(r"^\(EngineCore[^)]*\)\s?", "", ln).rstrip() for ln in Path(log).read_text(errors="replace").splitlines()]
+    found = ""
+    for i, line in enumerate(lines):
+        if re.match(r"^[A-Za-z_][\w.]*(Error|Exception)\b", line) and "Engine core initialization failed" not in line:
+            found = line
+            if line.strip() == "AssertionError":
+                source = [ln.strip() for ln in lines[max(0, i - 4) : i] if ln.strip().startswith("assert")]
+                where = [ln.strip() for ln in lines[max(0, i - 6) : i] if ln.strip().startswith("File ")]
+                found = "AssertionError: " + (source[-1] if source else "") + (f" ({where[-1]})" if where else "")
+            break
+    if not found:
+        errors = [ln for ln in lines if re.search(r"(Error|Exception)\b", ln)]
+        found = errors[-1] if errors else "no exception in the log"
+    print(found.strip()[:300])
+
+
+def cmd_line(check, status, *pairs):
+    """One result line; pairs are key=value (values parsed as JSON when they are JSON)."""
+    out = {"check": check, "status": status}
+    for pair in pairs:
+        key, _, value = pair.partition("=")
+        try:
+            out[key] = json.loads(value)
+        except ValueError:
+            out[key] = value
+    print(json.dumps(out))
+
+
+def cmd_vllm(packed_file, twin_file, name, kernels):
+    """The packed checkpoint's answers (vLLM) against its dequantized twin's."""
+    p = json.loads(Path(packed_file).read_text())
+    try:
+        d = json.loads(Path(twin_file).read_text())
+    except Exception:  # noqa: BLE001 — the dequantized twin was not evaluated
+        d = None
+    out = {"check": f"vllm/{name}", "loaded": True, "kernels": kernels, "accuracy_packed": p["accuracy"],
+           "load_s": p["load_s"]}
+    if d is not None:
+        pairs = list(zip(p["texts"], d["texts"]))
+        shared = []
+        for a, b in pairs:
+            n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+            shared.append(n / max(len(a), len(b), 1))
+        out["accuracy_dequantized"] = d["accuracy"]
+        out["identical_answers"] = round(sum(a == b for a, b in pairs) / len(pairs), 3)
+        out["shared_prefix"] = round(sum(shared) / len(shared), 3)  # share of an answer before the two diverge
+        out["status"] = "PASS" if abs(p["accuracy"] - d["accuracy"]) <= 0.05 else "FAIL"
+    else:
+        out["status"] = "PASS"
+    print(json.dumps(out))
+
+
+def cmd_qat_summary(results, run, fmt, acc, acc_bf16):
+    def load(name):
+        try:
+            return json.loads(Path(results, name).read_text())
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def kl(name):
+        return load(f"kl_{name}.json").get(name, {}).get("kl")
+
+    q, p_max, p_mse = kl(run), kl(f"ptq_{fmt}_max"), kl(f"ptq_{fmt}_mse")
+    acc = None if acc == "null" else float(acc)
+    acc_bf16 = None if acc_bf16 == "null" else float(acc_bf16)
+    a_max, a_mse = load(f"acc_ptq_{fmt}_max.json").get("accuracy"), load(f"acc_ptq_{fmt}_mse.json").get("accuracy")
+    out = {"check": f"qat/{fmt}", "kl": q, "kl_ptq_max": p_max, "kl_ptq_mse": p_mse, "accuracy": acc,
+           "accuracy_ptq_max": a_max, "accuracy_ptq_mse": a_mse, "accuracy_bf16": acc_bf16}
+    if q is not None and p_max:
+        out["kl_recovered_vs_ptq_max"] = round(1 - q / p_max, 3)
+    if acc is not None and acc_bf16 is not None and a_max is not None and acc_bf16 > a_max:
+        out["accuracy_gap_recovered_vs_ptq_max"] = round((acc - a_max) / (acc_bf16 - a_max), 3)
+    seconds = load(f"{run}.time.json").get("seconds")
+    if seconds is not None:
+        out["train_seconds"] = seconds
+    ok = q is not None and p_max is not None and q < p_max and (p_mse is None or q < p_mse)
+    out["status"] = "PASS" if ok else "FAIL"
+    print(json.dumps(out))
+
+
+def cmd_summary(checks, seconds):
+    counts = {}
+    for line in Path(checks).read_text().splitlines():
+        try:
+            status = json.loads(line).get("status")
+        except ValueError:
+            status = "FAIL"  # a line that is not JSON is a broken check
+        counts[status] = counts.get(status, 0) + 1
+    failed = bool(counts.get("FAIL"))
+    print(json.dumps({"check": "summary", "status": "FAIL" if failed else "PASS", "counts": counts,
+                      "seconds": int(seconds)}))
+    raise SystemExit(1 if failed else 0)
+
+
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "reason":
+        raise SystemExit(cmd_reason(args[0]))
+    if cmd == "line":
+        raise SystemExit(cmd_line(*args))
+    if cmd == "vllm":
+        raise SystemExit(cmd_vllm(*args))
+    if cmd == "qat_summary":
+        raise SystemExit(cmd_qat_summary(*args))
+    if cmd == "summary":
+        cmd_summary(*args)
     if cmd == "data":
-        cmd_data(args[0], args[1], int(args[2]), int(args[3]))
+        cmd_data(args[0], args[1], int(args[2]), int(args[3]), args[4])
     elif cmd == "acc":
         cmd_acc(args[0], args[1], args[2], args[3] if len(args) > 3 else None)
     elif cmd == "kl":
@@ -362,6 +486,31 @@ PY
 H="$PGS_PY $WORK/fp4_check.py"
 R="$WORK/results"
 jget() { "$PGS_PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print(d$2)" "$1" 2>/dev/null; }
+line() { emit "$($H line "$@")"; }   # line <check> <status> key=value ... (JSON-escaped)
+
+# Weight files of a run this script wrote, deleted one by one once the run is measured (configs, reports and
+# logs stay). KEEP=1 keeps them.
+drop_weights() {
+    [ "$KEEP" = "1" ] && return 0
+    local dir f
+    for dir in "$@"; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*.safetensors; do
+            [ -f "$f" ] && rm -f -- "$f"
+        done
+    done
+    return 0
+}
+
+# ── disk: what the run needs (one run's checkpoints at a time) against what WORK has
+free_gb() { df -Pk "$WORK" | LC_ALL=C awk 'NR==2 {printf "%.1f", $4 / 1048576}'; }   # C locale: a decimal point
+FREE_GB=$(free_gb)
+echo "fp4_qat.sh: needs about ${NEED_GB} GB free in $WORK (peak: one QAT run's final/ in float32 + its packed copy); ${FREE_GB} GB free" >&2
+if [ "$("$PGS_PY" -c "print(int(float('$FREE_GB') < float('$NEED_GB')))")" = "1" ]; then
+    line disk FAIL work="$WORK" needed_gb="$NEED_GB" free_gb="$FREE_GB" error="not enough free space in WORK: free some, or point WORK at a larger filesystem"
+    exit 1
+fi
+line disk INFO work="$WORK" needed_gb="$NEED_GB" free_gb="$FREE_GB" keep="$KEEP"
 
 # ── environment
 "$PGS_PY" - > "$R/env.json" 2> "$WORK/logs/env.log" <<'PY'
@@ -379,45 +528,95 @@ import transformers
 info["transformers"] = transformers.__version__
 print(json.dumps(info))
 PY
-emit "{\"check\": \"env\", \"status\": \"INFO\", \"work\": \"$WORK\", \"model\": \"$MODEL\", \"info\": $(cat "$R/env.json" 2>/dev/null || echo null)}"
+line env INFO work="$WORK" model="$MODEL" info="$(cat "$R/env.json" 2>/dev/null || echo null)"
+CAPABILITY=$(jget "$R/env.json" "['capability']" || echo 0)
+VLLM_VERSION=$(jget "$R/env.json" "['vllm']" || echo "unavailable")
 
 # ── data: self-generated training / held-out text, accuracy items
-if ! $H data "$WORK" "$MODEL" 2400 "$EVAL_ITEMS" > "$R/data.json" 2> "$WORK/logs/data.log"; then
-    fail data "data generation failed" "$WORK/logs/data.log"
+if ! $H data "$WORK" "$MODEL" 2400 "$EVAL_ITEMS" "$R/data.json" > "$WORK/logs/data.log" 2>&1; then
+    line data FAIL error="data generation failed" log="$WORK/logs/data.log"
     exit 1
 fi
-emit "{\"check\": \"data\", \"status\": \"INFO\", $(tail -c +2 "$R/data.json")"
+line data INFO result="$(cat "$R/data.json")"
 
-# ── (1) PTQ baselines
-PTQ_RUNS=()
+# accuracy proxy (vLLM, greedy): acc <name> <model dir> [tokenizer] -> the accuracy, or null
+acc() {
+    if $H acc "$WORK" "$2" "$R/acc_$1.json" ${3:-} > "$WORK/logs/acc_$1.log" 2>&1; then
+        jget "$R/acc_$1.json" "['accuracy']"
+    else
+        echo "null"
+    fi
+}
+# KL(bf16 || run) per token on held-out text: kl <run> <model dir>
+kl() {
+    $H kl "$WORK" "$MODEL" "$R/kl_$1.json" "$2" > "$WORK/logs/kl_$1.log" 2>&1
+}
+
+# ── (3) a packed checkpoint in vLLM (compressed-tensors; weight-only kernels on A100)
+HUMMING="HummingFP8ScaledMMLinearKernel,HummingNvFp4LinearKernel,HummingMxFp4LinearKernel,HummingLinearKernel"
+vllm_check() {  # vllm_check <name> <packed dir> <dequantized twin name>
+    local name=$1 dir=$2 twin=$3 kernels="default" first second log="$WORK/logs/vllm_$1.log"
+    case $VLLM_VERSION in unavailable*)
+        line "vllm/$name" SKIP reason="vLLM is not installed in this environment ($VLLM_VERSION)"; return ;;
+    esac
+    if [ "$("$PGS_PY" -c "print(int(float('${CAPABILITY:-0}') < 7.5))")" = "1" ]; then
+        line "vllm/$name" SKIP reason="compute capability $CAPABILITY: vLLM's weight-only FP4 / FP8 kernels need 7.5 or higher"
+        return
+    fi
+    if [ ! -f "$dir/config.json" ]; then
+        line "vllm/$name" FAIL error="no packed checkpoint" log="$dir"; return
+    fi
+    if ! $H acc "$WORK" "$dir" "$R/acc_packed_$name.json" "$MODEL" > "$log" 2>&1; then
+        # vLLM's Humming kernels are compiled at the first forward (NVRTC); Marlin is the precompiled alternative
+        first=$($H reason "$log")
+        log="$WORK/logs/vllm_$name.marlin.log"
+        if ! VLLM_DISABLED_KERNELS=$HUMMING $H acc "$WORK" "$dir" "$R/acc_packed_$name.json" "$MODEL" > "$log" 2>&1; then
+            second=$($H reason "$log")
+            line "vllm/$name" FAIL error="vLLM could not load or run it. Default kernels: $first. Without the Humming kernels: $second" \
+                log="$WORK/logs/vllm_$name.log" log_marlin="$log"
+            return
+        fi
+        kernels="marlin (VLLM_DISABLED_KERNELS=Humming*; the default kernels failed: $first)"
+    fi
+    emit "$($H vllm "$R/acc_packed_$name.json" "$R/acc_$twin.json" "$name" "$kernels")"
+}
+
+ACC_BF16=$(acc bf16 "$MODEL")
+line bf16 INFO accuracy="$ACC_BF16"
+
+# ── (1) PTQ baselines, one at a time: quantise, measure, delete the weights
 for spec in nvfp4:max mxfp4:max fp8:max fp8_block:max nvfp4:mse mxfp4:mse; do
     fmt=${spec%%:*}; scales=${spec##*:}; run="ptq_${fmt}_${scales}"
-    if $PGS_PY -m palingenesis.cli quantize --model "$MODEL" --format "$fmt" --scales "$scales" \
+    if ! $PGS_PY -m palingenesis.cli quantize --model "$MODEL" --format "$fmt" --scales "$scales" \
         --out "$WORK/$run/packed" --dequantized "$WORK/$run/dequantized" \
         > "$R/$run.quantize.json" 2> "$WORK/logs/$run.quantize.log"; then
-        PTQ_RUNS+=("$run")
-    else
-        fail "ptq/$fmt/$scales" "pgs quantize failed" "$WORK/logs/$run.quantize.log"
+        line "ptq/$fmt/$scales" FAIL error="pgs quantize failed" log="$WORK/logs/$run.quantize.log"
+        drop_weights "$WORK/$run/packed" "$WORK/$run/dequantized"
+        continue
     fi
-done
-CANDIDATES=()
-for run in "${PTQ_RUNS[@]}"; do CANDIDATES+=("$WORK/$run/dequantized"); done
-
-# (1b) the dequantized export == the fake-quantised forward
-for fmt in nvfp4 mxfp4; do
-    run="ptq_${fmt}_mse"
-    [ -d "$WORK/$run/dequantized" ] || continue
-    if $H exact "$WORK" "$MODEL" "$fmt" "$WORK/$run/dequantized" "$R/exact_$fmt.json" > /dev/null 2> "$WORK/logs/exact_$fmt.log"; then
-        diff=$(jget "$R/exact_$fmt.json" "['max_abs_logit_diff']")
-        status=$("$PGS_PY" -c "print('PASS' if float('$diff') == 0.0 else 'FAIL')")
-        emit "{\"check\": \"exact/$fmt\", \"status\": \"$status\", \"max_abs_logit_diff\": $diff}"
-    else
-        fail "exact/$fmt" "exact check crashed" "$WORK/logs/exact_$fmt.log"
+    [ "$scales" = "max" ] || drop_weights "$WORK/$run/packed"   # only the max-scale packed copies go to vLLM
+    # (1b) the dequantized export == the fake-quantised forward
+    if [ "$scales" = "mse" ]; then
+        if $H exact "$WORK" "$MODEL" "$fmt" "$WORK/$run/dequantized" "$R/exact_$fmt.json" > "$WORK/logs/exact_$fmt.log" 2>&1; then
+            diff=$(jget "$R/exact_$fmt.json" "['max_abs_logit_diff']")
+            status=$("$PGS_PY" -c "print('PASS' if float('$diff') == 0.0 else 'FAIL')")
+            line "exact/$fmt" "$status" max_abs_logit_diff="$diff"
+        else
+            line "exact/$fmt" FAIL error="exact check crashed" log="$WORK/logs/exact_$fmt.log"
+        fi
     fi
+    kl "$run" "$WORK/$run/dequantized" || line "kl/$run" FAIL error="KL evaluation crashed" log="$WORK/logs/kl_$run.log"
+    a=$(acc "$run" "$WORK/$run/dequantized")
+    k=$(jget "$R/kl_$run.json" "['$run']['kl']" || echo null)
+    agree=$(jget "$R/kl_$run.json" "['$run']['top1_agreement']" || echo null)
+    err=$(tail -n 1 "$R/$run.quantize.json" | "$PGS_PY" -c "import json,sys; print(json.loads(sys.stdin.read())['relative_error_mean'])" 2>/dev/null || echo null)
+    status=PASS; { [ "$a" = "null" ] || [ -z "$k" ] || [ "$k" = "null" ]; } && status=FAIL
+    line "ptq/$fmt/$scales" "$status" kl="${k:-null}" top1_agreement="${agree:-null}" accuracy="$a" accuracy_bf16="$ACC_BF16" weight_rel_error="${err:-null}"
+    [ "$scales" = "max" ] && vllm_check "$run" "$WORK/$run/packed" "$run"
+    drop_weights "$WORK/$run/packed" "$WORK/$run/dequantized"
 done
 
-# ── (2) QAT with KD to the bf16 model
-QAT_RUNS=()
+# ── (2) QAT with KD to the bf16 model, one format at a time
 for fmt in $QAT_FORMATS; do
     run="qat_${fmt}"
     cat > "$WORK/$run.yaml" <<YAML
@@ -443,7 +642,7 @@ train:
   warmup_ratio: 0.05
   weight_decay: 0.0
   max_grad_norm: 1.0
-  save_steps: 0
+  save_steps: 0                   # no resume checkpoints: the run writes final/ and final-$fmt/ only
   bf16: true
   gradient_checkpointing: none
   spike_detection: false
@@ -469,110 +668,21 @@ YAML
     t0=$(date +%s)
     if $PGS_PY -m palingenesis.cli train --config "$WORK/$run.yaml" > "$WORK/logs/$run.log" 2>&1 \
         && [ -d "$WORK/$run/final" ]; then
-        QAT_RUNS+=("$run")
-        CANDIDATES+=("$WORK/$run/final")
         echo "{\"seconds\": $(( $(date +%s) - t0 ))}" > "$R/$run.time.json"
+        kl "$run" "$WORK/$run/final" || line "kl/$run" FAIL error="KL evaluation crashed" log="$WORK/logs/kl_$run.log"
+        a=$(acc "$run" "$WORK/$run/final")
+        emit "$($H qat_summary "$R" "$run" "$fmt" "$a" "$ACC_BF16")"
+        vllm_check "$run" "$WORK/$run/final-$fmt" "$run"
     else
-        fail "qat/$fmt" "pgs train failed" "$WORK/logs/$run.log"
+        reason=$(grep -E "Error|No space left" "$WORK/logs/$run.log" | tail -n 1 | head -c 300)
+        line "qat/$fmt" FAIL error="pgs train failed: ${reason:-see the log}" log="$WORK/logs/$run.log" \
+            free_gb="$(free_gb)"
     fi
-done
-
-# ── KL of every candidate vs bf16 on held-out text (one process: the reference loads once)
-if ! $H kl "$WORK" "$MODEL" "$R/kl.json" "${CANDIDATES[@]}" > /dev/null 2> "$WORK/logs/kl.log"; then
-    fail kl "KL evaluation crashed" "$WORK/logs/kl.log"
-fi
-
-# ── accuracy proxy (vLLM, greedy): bf16, every dequantized candidate
-acc() {  # acc <name> <model dir> [tokenizer]
-    if $H acc "$WORK" "$2" "$R/acc_$1.json" ${3:-} > /dev/null 2> "$WORK/logs/acc_$1.log"; then
-        jget "$R/acc_$1.json" "['accuracy']"
-    else
-        echo "null"
-    fi
-}
-ACC_BF16=$(acc bf16 "$MODEL")
-emit "{\"check\": \"bf16\", \"status\": \"INFO\", \"accuracy\": $ACC_BF16}"
-for run in "${PTQ_RUNS[@]}"; do
-    a=$(acc "$run" "$WORK/$run/dequantized")
-    kl=$(jget "$R/kl.json" "['$WORK/$run/dequantized']['kl']" || echo null)
-    agree=$(jget "$R/kl.json" "['$WORK/$run/dequantized']['top1_agreement']" || echo null)
-    err=$(jget "$R/$run.quantize.json" "['relative_error_mean']" || echo null)
-    fmt=$(echo "$run" | sed -E 's/^ptq_(.*)_(max|mse)$/\1/'); scales=${run##*_}
-    status=PASS; [ "$a" = "null" ] || [ -z "$kl" ] && status=FAIL
-    emit "{\"check\": \"ptq/$fmt/$scales\", \"status\": \"$status\", \"kl\": ${kl:-null}, \"top1_agreement\": ${agree:-null}, \"accuracy\": $a, \"accuracy_bf16\": $ACC_BF16, \"weight_rel_error\": ${err:-null}}"
-done
-for run in "${QAT_RUNS[@]}"; do
-    fmt=${run#qat_}
-    a=$(acc "$run" "$WORK/$run/final")
-    "$PGS_PY" - "$R" "$WORK" "$run" "$fmt" "$a" "$ACC_BF16" > "$R/$run.summary.json" <<'PY'
-import json, sys
-from pathlib import Path
-R, work, run, fmt, acc, acc_bf16 = sys.argv[1:7]
-kl = json.loads(Path(R, "kl.json").read_text())
-get = lambda d: kl.get(str(Path(work, d)), {}).get("kl")
-q = get(f"{run}/final")
-p_max, p_mse = get(f"ptq_{fmt}_max/dequantized"), get(f"ptq_{fmt}_mse/dequantized")
-acc = None if acc == "null" else float(acc)
-acc_bf16 = None if acc_bf16 == "null" else float(acc_bf16)
-def accp(name):
-    try:
-        return json.loads(Path(R, f"acc_{name}.json").read_text())["accuracy"]
-    except Exception:
-        return None
-a_max, a_mse = accp(f"ptq_{fmt}_max"), accp(f"ptq_{fmt}_mse")
-out = {"check": f"qat/{fmt}", "kl": q, "kl_ptq_max": p_max, "kl_ptq_mse": p_mse, "accuracy": acc,
-       "accuracy_ptq_max": a_max, "accuracy_ptq_mse": a_mse, "accuracy_bf16": acc_bf16}
-if q is not None and p_max:
-    out["kl_recovered_vs_ptq_max"] = round(1 - q / p_max, 3)
-if acc is not None and acc_bf16 is not None and a_max is not None and acc_bf16 > a_max:
-    out["accuracy_gap_recovered_vs_ptq_max"] = round((acc - a_max) / (acc_bf16 - a_max), 3)
-try:
-    out["train_seconds"] = json.loads(Path(R, f"{run}.time.json").read_text())["seconds"]
-except Exception:
-    pass
-ok = q is not None and p_max is not None and q < p_max and (p_mse is None or q < p_mse)
-out["status"] = "PASS" if ok else "FAIL"
-print(json.dumps(out))
-PY
-    emit "$(cat "$R/$run.summary.json")"
-done
-
-# ── (3) the packed checkpoints in vLLM (compressed-tensors; Marlin weight-only kernels on A100)
-vllm_check() {  # vllm_check <name> <packed dir> <dequantized twin name>
-    local name=$1 dir=$2 twin=$3
-    if [ ! -f "$dir/config.json" ]; then fail "vllm/$name" "no packed checkpoint" "$dir"; return; fi
-    if $H acc "$WORK" "$dir" "$R/acc_packed_$name.json" "$MODEL" > /dev/null 2> "$WORK/logs/vllm_$name.log"; then
-        "$PGS_PY" - "$R/acc_packed_$name.json" "$R/acc_$twin.json" "$name" > "$R/vllm_$name.json" <<'PY'
-import json, sys
-p = json.load(open(sys.argv[1]))
-try:
-    d = json.load(open(sys.argv[2]))
-except Exception:  # the dequantized twin was not evaluated
-    d = None
-out = {"check": f"vllm/{sys.argv[3]}", "loaded": True, "accuracy_packed": p["accuracy"], "load_s": p["load_s"]}
-if d is not None:
-    out["accuracy_dequantized"] = d["accuracy"]
-    out["identical_answers"] = round(sum(a == b for a, b in zip(p["texts"], d["texts"])) / len(p["texts"]), 3)
-    out["status"] = "PASS" if abs(p["accuracy"] - d["accuracy"]) <= 0.05 else "FAIL"
-else:
-    out["status"] = "PASS"
-print(json.dumps(out))
-PY
-        emit "$(cat "$R/vllm_$name.json")"
-    else
-        reason=$(grep -E "Error|error" "$WORK/logs/vllm_$name.log" | tail -n 1 | head -c 300 | tr '"\\' "' ")
-        fail "vllm/$name" "vLLM could not load or run it: $reason" "$WORK/logs/vllm_$name.log"
-    fi
-}
-for run in "${PTQ_RUNS[@]}"; do
-    case $run in *_max) vllm_check "$run" "$WORK/$run/packed" "$run" ;; esac
-done
-for run in "${QAT_RUNS[@]}"; do
-    vllm_check "$run" "$WORK/$run/final-${run#qat_}" "$run"
+    drop_weights "$WORK/$run/final" "$WORK/$run/final-$fmt"
 done
 
 # ── (4) step-time overhead of fake quantisation
-if $H bench "$MODEL" "$R/bench.json" > /dev/null 2> "$WORK/logs/bench.log"; then
+if $H bench "$MODEL" "$R/bench.json" > "$WORK/logs/bench.log" 2>&1; then
     "$PGS_PY" - "$R/bench.json" > "$R/bench_lines.jsonl" <<'PY'
 import json, sys
 for mode, r in json.load(open(sys.argv[1])).items():
@@ -581,18 +691,11 @@ for mode, r in json.load(open(sys.argv[1])).items():
     else:
         print(json.dumps({"check": f"overhead/{mode}", "status": "PASS" if r["ratio"] < 2.5 else "FAIL", **r}))
 PY
-    while read -r line; do emit "$line"; done < "$R/bench_lines.jsonl"
+    while read -r l; do emit "$l"; done < "$R/bench_lines.jsonl"
 else
-    fail overhead "benchmark crashed" "$WORK/logs/bench.log"
+    line overhead FAIL error="benchmark crashed" log="$WORK/logs/bench.log"
 fi
 
-# ── summary
-"$PGS_PY" - "$R/checks.jsonl" "$(( $(date +%s) - START ))" <<'PY'
-import json, sys
-rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
-counts = {}
-for r in rows:
-    counts[r.get("status")] = counts.get(r.get("status"), 0) + 1
-print(json.dumps({"check": "summary", "status": "FAIL" if counts.get("FAIL") else "PASS", "counts": counts,
-                  "seconds": int(sys.argv[2])}))
-PY
+# ── summary (exit 1 when a check failed)
+$H summary "$R/checks.jsonl" "$(( $(date +%s) - START ))" | tee -a "$R/summary.json"
+exit "${PIPESTATUS[0]}"
