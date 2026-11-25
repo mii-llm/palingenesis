@@ -12,8 +12,9 @@
 # part loads anything; a part that runs out of memory retries with smaller micro-batches, then reports SKIP.
 #
 # Pre-registered (the `speedup` lines): tree >= 1.5x the fastest padded layout at prompt shares >= 70% is PASS;
-# below 1.2x, or an `equality` gradient cosine below 0.999, is FAIL (the feature is dropped); in between, INFO with
-# target_met false.
+# below 1.2x is FAIL (the feature is dropped); in between, INFO with target_met false. Equality was pre-registered
+# as a gradient cosine >= 0.999; in bf16 two padded layouts of the same pairs differ by more than that, so the
+# `equality` lines are judged against that measured floor, and a float32 pass against tight absolute bounds.
 #
 # Options (environment):
 #   MODELS="Qwen/Qwen3.5-0.8B Qwen/Qwen3.5-2B"     equality and throughput models
@@ -21,7 +22,8 @@
 #   PADDED_TOKENS=32768                            padded tokens of a throughput micro-batch ([2P, S]; sets P)
 #   CHECKPOINTING=selective                        train.gradient_checkpointing of the measured policy
 #   SMOKE_MODEL=Qwen/Qwen3.5-0.8B  SMOKE_STEPS=20  the `pgs train` smoke runs (padded and tree)
-#   SKIP="equality throughput compiled smoke"      parts to leave out
+#   FP32_MODELS="Qwen/Qwen3.5-0.8B"  FP32_PAIRS=1  the float32 equality pass (tight absolute bounds)
+#   SKIP="equality equality_fp32 throughput compiled smoke"   parts to leave out
 #   CUDA_VISIBLE_DEVICES                           the GPU (default 0)
 set -uo pipefail
 
@@ -123,6 +125,16 @@ for model in $MODELS; do
   tag="${model//\//_}"
   run_part "equality_$tag" 2400 "${CHECK[@]}" equality --model "$model" --pairs "${EQUALITY_PAIRS:-6}" \
     --checkpointing "$CHECKPOINTING" "${DEVICE_ARGS[@]}"
+done
+# float32, no autocast: tight absolute bounds (bf16 noise cannot hide a real error); packed attention has no flash
+# kernel there and runs on an explicit [N, N] mask, so few pairs, on the small model
+for model in ${FP32_MODELS-Qwen/Qwen3.5-0.8B}; do
+  skipped equality && break
+  skipped equality_fp32 && break
+  [ "${CHECK_DEVICE:-cuda:0}" = "cpu" ] && break
+  tag="${model//\//_}"
+  run_part "equality_fp32_$tag" 2400 "${CHECK[@]}" equality --model "$model" --pairs "${FP32_PAIRS:-1}" \
+    --precision float32 --checkpointing "$CHECKPOINTING" "${DEVICE_ARGS[@]}"
 done
 
 for model in $MODELS; do

@@ -9,7 +9,10 @@ Called by scripts/gpu_checks/dpo_tree.sh; every result is one JSON line on stdou
                             tree against the padded rows (fp32 weights, bf16 autocast, selective checkpointing: as
                             the trainer runs), judged against the noise between two padded layouts on the
                             mean / p99 / signed mean of the per-token differences, the loss and the gradient
-                            cosine (>= 0.999); fewer pairs when little memory is free
+                            cosine, each relative to that floor; fewer pairs when little memory is free.
+             --precision float32: the same without autocast (TF32 off), against tight absolute bounds: bf16
+                            noise cannot hide a real error there. Without a flash kernel packed attention then
+                            runs on an explicit [N, N] mask: few pairs
   throughput --model M      micro-step time (reference forward + policy forward + loss + backward), pair tokens/s and
              --share S      peak memory per layout on synthesised pairs whose shared prompt is S of each sequence
              [--compiled]   (median of --repeats timed steps after a warm-up); --compiled: the compiled padded
@@ -28,6 +31,8 @@ Layouts measured:
                     which dpo.packing refuses: measured in its own process, on the same pairs
 Pre-registered: tree >= 1.5x the fastest padded layout's step speed at prompt shares >= 70% (PASS); below 1.2x, or
 a gradient cosine below 0.999, the feature is dropped (FAIL); in between, INFO with target_met false.
+The cosine rule was revised after the first run: in bf16 two padded layouts of the same pairs already differ by
+more (0.9983 on Qwen3.5-0.8B), so equality is judged against that floor, and in float32 against absolute bounds.
 """
 
 import argparse
@@ -40,6 +45,7 @@ import sys
 import time
 
 DEVICE = "cuda:0"  # --device cpu: a dry run of the script's logic on a tiny random model (no flash kernels)
+PRECISION = "bf16"  # the forwards' precision on the GPU: bf16 autocast (as the trainer), or float32 (no autocast)
 TARGET_SPEEDUP, KILL_SPEEDUP, TARGET_SHARE, MIN_COSINE = 1.5, 1.2, 0.7, 0.999
 
 
@@ -261,7 +267,7 @@ def dpo_step(policy, reference, supports, pairs: list[dict], layout: str, vocab:
     num_pairs = ids.shape[0] // 2
     head = _get_lm_head(policy)
     packed = None
-    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda()):
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda() and PRECISION == "bf16"):
         if packed_layout:
             packed = PackedPairs.build(ids, mask, labels, share=layout == "tree")
             chunks = _dynamic_num_chunks(packed.num_terms, vocab)
@@ -345,9 +351,20 @@ def compare_grads(ref: list, model) -> dict:
 # offset (a token reading the wrong context, a state carried across sequences) moves the bulk: the mean and the
 # 99th percentile of |delta|, the signed mean (noise is centred, an offset is not), the loss, and the gradient.
 # Bounds are FLOOR_FACTOR times what two padded layouts of the same pairs differ by (padded_alt), with an
-# absolute allowance for a floor that happens to be tiny. The gradient is judged by the pre-registered cosine;
-# its relative L2 error is bounded only by what that cosine implies (sqrt(2 (1 - cos)): 0.045 at 0.999).
+# absolute allowance for a floor that happens to be tiny. The gradient is judged against the same floor (see judge);
+# a float32 pass with absolute bounds (--precision float32) is what rules out a real error.
 FLOOR_FACTOR = 3.0
+COSINE_SLACK = 0.001  # bf16: how far below the floor's gradient cosine a packed layout's may be
+# the float32 pass: absolute bounds (per-token log-probs, the loss, the gradient)
+FP32_BOUNDS = {
+    "token_logprob_mean_abs_diff": 1e-4,
+    "token_logprob_p99_abs_diff": 1e-3,
+    "token_logprob_max_abs_diff": 1e-2,
+    "token_logprob_signed_mean_diff": 2e-5,
+    "loss_diff": 1e-3,
+    "grad_rel_l2": 1e-2,
+    "grad_cosine": 0.9999,
+}
 ALLOWANCE = {"mean": 0.005, "p99": 0.05, "signed_mean": 0.002, "loss": 0.01}
 
 
@@ -376,24 +393,39 @@ def logprob_stats(got, base) -> dict:
 
 
 def judge(values: dict, floor: dict, tree: bool) -> list[str]:
-    """The criteria a packed layout fails (none: PASS)."""
+    """The criteria a packed layout fails (none: PASS).
 
-    def bound(key: str, allowance: float) -> float:
-        return max(FLOOR_FACTOR * abs(floor[key]), allowance)
+    bf16: everything relative to the measured floor (two padded layouts of the same pairs). The gradient too: a
+    DPO gradient is a difference of the chosen and the rejected side's terms, so rounding noise in the forward
+    is a larger share of it than of an SFT gradient, and two padded layouts already differ by more than the
+    pre-registered cosine of 0.999 allowed (0.9983 on Qwen3.5-0.8B). A packed layout passes when its cosine is at
+    least 0.999, or within COSINE_SLACK of the floor's, and its relative L2 error within 1.5x the floor's + 0.01.
 
+    float32 (no autocast, TF32 off): tight absolute bounds, so that a real error cannot hide in bf16 noise; the
+    float32 floor is reported next to them."""
     failed = []
-    if values["grad_cosine"] < MIN_COSINE:
-        failed.append(f"grad_cosine {values['grad_cosine']:.5f} < {MIN_COSINE}")
-    checks = [
-        ("token_logprob_mean_abs_diff", ALLOWANCE["mean"]),
-        ("token_logprob_p99_abs_diff", ALLOWANCE["p99"]),
-        ("token_logprob_signed_mean_diff", ALLOWANCE["signed_mean"]),
-        ("loss_diff", ALLOWANCE["loss"]),
-        ("grad_rel_l2", math.sqrt(2 * (1 - MIN_COSINE))),
-    ]
-    for key, allowance in checks:
-        if abs(values[key]) > bound(key, allowance):
-            failed.append(f"{key} {values[key]:.4g} > {bound(key, allowance):.4g}")
+    if PRECISION == "float32":
+        if values["grad_cosine"] < FP32_BOUNDS["grad_cosine"]:
+            failed.append(f"grad_cosine {values['grad_cosine']:.6f} < {FP32_BOUNDS['grad_cosine']}")
+        for key, limit in FP32_BOUNDS.items():
+            if key != "grad_cosine" and abs(values[key]) > limit:
+                failed.append(f"{key} {values[key]:.4g} > {limit:.4g}")
+    else:
+        cosine_bound = min(MIN_COSINE, floor["grad_cosine"] - COSINE_SLACK)
+        if values["grad_cosine"] < cosine_bound:
+            failed.append(f"grad_cosine {values['grad_cosine']:.5f} < {cosine_bound:.5f}")
+        bounds = {
+            "token_logprob_mean_abs_diff": max(FLOOR_FACTOR * floor["token_logprob_mean_abs_diff"], ALLOWANCE["mean"]),
+            "token_logprob_p99_abs_diff": max(FLOOR_FACTOR * floor["token_logprob_p99_abs_diff"], ALLOWANCE["p99"]),
+            "token_logprob_signed_mean_diff": max(
+                FLOOR_FACTOR * abs(floor["token_logprob_signed_mean_diff"]), ALLOWANCE["signed_mean"]
+            ),
+            "loss_diff": FLOOR_FACTOR * floor["loss_diff"] + ALLOWANCE["loss"],
+            "grad_rel_l2": 1.5 * floor["grad_rel_l2"] + 0.01,
+        }
+        for key, limit in bounds.items():
+            if abs(values[key]) > limit:
+                failed.append(f"{key} {values[key]:.4g} > {limit:.4g}")
     if tree and cuda() and values["tree_levels"] != 2:
         failed.append(f"the row was not a tree ({values['tree_levels']} level(s))")
     return failed
@@ -404,6 +436,10 @@ def equality(model_name: str, pairs_count: int, checkpointing: str) -> None:
 
     free, total = free_memory()  # read before anything is loaded: someone else may hold part of the GPU
     low = free is not None and free < LOW_MEMORY_GIB
+    if PRECISION == "float32" and cuda():  # float32 is float32: no TensorFloat-32 matmuls or convolutions
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
     if low:  # two fp32 models, the policy's gradient and a copy of the padded one: fewer pairs, the copy on the host
         pairs_count = max(2, pairs_count // 2)
     policy, reference, supports, vocab = load_models(model_name, checkpointing)
@@ -417,6 +453,7 @@ def equality(model_name: str, pairs_count: int, checkpointing: str) -> None:
         "checkpointing": checkpointing,
         "gpu_free_gib": free,
         "low_memory": low,
+        "precision": PRECISION if cuda() else "float32",
     }
 
     def run(layout: str, pairs: list[dict]) -> dict:
@@ -470,7 +507,8 @@ def equality(model_name: str, pairs_count: int, checkpointing: str) -> None:
                 keys = ("mean_abs", "p99_abs", "max_abs", "signed_mean")
                 extra = {
                     "failed_criteria": failed,
-                    "min_cosine": MIN_COSINE,
+                    "preregistered_cosine": MIN_COSINE,
+                    "floor_below_preregistered_cosine": floor["grad_cosine"] < MIN_COSINE,
                     "floor_factor": FLOOR_FACTOR,
                     "noise_floor_grad_rel_l2": floor["grad_rel_l2"],
                     "noise_floor_grad_cosine": floor["grad_cosine"],
@@ -740,10 +778,11 @@ def main() -> None:
     parser.add_argument("--log", default="")
     parser.add_argument("--results", default="")
     parser.add_argument("--compiled", action="store_true")
+    parser.add_argument("--precision", default="bf16", choices=["bf16", "float32"])
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
-    global DEVICE
-    DEVICE = args.device
+    global DEVICE, PRECISION
+    DEVICE, PRECISION = args.device, args.precision
     if not cuda() and args.checkpointing == "selective":
         # off the GPU scaled_dot_product_attention runs as separate operations, which torch's selective
         # checkpointing does not replay on small CPU builds: the dry run checks the script's logic without it
