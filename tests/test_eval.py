@@ -282,6 +282,25 @@ def test_join_and_json_lines_with_json_extension(tmp_path):
         build_items(task)
 
 
+def test_offline_dataset_from_the_hub_cache(tmp_path, monkeypatch):
+    """Offline with an empty datasets cache: the split's file in the Hub cache snapshot is read directly."""
+    datasets = pytest.importorskip("datasets")
+    hub = pytest.importorskip("huggingface_hub")
+
+    def offline(*args, **kwargs):
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(datasets, "load_dataset", offline)
+    (tmp_path / "main").mkdir()
+    _write(tmp_path / "main" / "test.jsonl", [{"question": "2 + 2?", "answer": "#### 4"}])
+    _write(tmp_path / "main" / "train.jsonl", [{"question": "1 + 1?", "answer": "#### 2"}] * 3)
+    monkeypatch.setattr(hub, "snapshot_download", lambda repo, **kwargs: str(tmp_path))
+    (item,) = build_items(load_task("gsm8k"))
+    assert item.row["answer"] == "4" and item.row["messages"][0]["content"].startswith("2 + 2?")
+    with pytest.raises(EvalConfigError, match="cannot load openai/gsm8k .*split validation.*ConnectionError: offline"):
+        build_items(load_task({"task": "gsm8k", "split": "validation"}))
+
+
 # -------------------------------------------------------------------- scorers
 
 
