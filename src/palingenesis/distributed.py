@@ -384,7 +384,8 @@ def clip_grad_norm_(parameters, max_norm: float = 0.0, plain_copies: int = 1) ->
     every rank adds the squares of the gradient values it holds, each divided by the number of ranks holding the
     same values (the replicated dimensions of its placement; `plain_copies` for plain tensors), and one
     all-reduce over every process adds them up: one collective, and no gradient is ever gathered.
-    Returns the norm before clipping."""
+    The gradients are scaled where they are stored; one with a Partial placement is refused (RuntimeError, before
+    anything is scaled). Returns the norm before clipping."""
     from torch.distributed.tensor import DTensor
 
     groups: dict[tuple, list[torch.Tensor]] = {}
@@ -393,8 +394,14 @@ def clip_grad_norm_(parameters, max_norm: float = 0.0, plain_copies: int = 1) ->
         if g is None:
             continue
         if isinstance(g, DTensor):
-            if any(pl.is_partial() for pl in g.placements):  # never after FSDP's reduce-scatter
-                g = g.redistribute(placements=[pl if not pl.is_partial() else _replicate() for pl in g.placements])
+            if any(pl.is_partial() for pl in g.placements):
+                # never after FSDP's reduce-scatter (the gradients it leaves are sharded); a pending sum over
+                # ranks has no stored value to scale: redistributing it gives a copy, and p.grad would stay unclipped
+                raise RuntimeError(
+                    f"clip_grad_norm_: a gradient with a Partial placement {tuple(g.placements)} (a sum over ranks "
+                    "that was not reduced). Reduce it before clipping (FSDP2's reduce-scatter does; a hand-built "
+                    "DTensor gradient: grad.redistribute to Shard or Replicate and assign it to the parameter)."
+                )
             copies = 1
             for dim, pl in enumerate(g.placements):
                 if pl.is_replicate():
@@ -419,9 +426,3 @@ def clip_grad_norm_(parameters, max_norm: float = 0.0, plain_copies: int = 1) ->
         for (device, _, _), grads in groups.items():
             torch._foreach_mul_(grads, coef.to(device))
     return norm
-
-
-def _replicate():
-    from torch.distributed.tensor import Replicate
-
-    return Replicate()

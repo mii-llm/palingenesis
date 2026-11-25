@@ -215,6 +215,40 @@ def test_local_parameters_come_back_when_the_forward_raises():
             dist.destroy_process_group()
 
 
+def test_clip_grad_norm_scales_dtensor_gradients_in_place_and_refuses_partial_ones():
+    """Gradients are clipped where they are stored. A Partial gradient (a sum over ranks not reduced yet) has no
+    stored value to scale: redistributing it gives a copy, and scaling that would leave p.grad unclipped."""
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from palingenesis.distributed import clip_grad_norm_, init_single_process_group
+
+    created = not dist.is_initialized()
+    if created:
+        init_single_process_group()
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+        sharded = SimpleNamespace(grad=DTensor.from_local(torch.full((2, 2), 3.0), mesh, [Shard(0)], run_check=False))
+        whole = SimpleNamespace(grad=DTensor.from_local(torch.full((4,), 4.0), mesh, [Replicate()], run_check=False))
+        plain = SimpleNamespace(grad=torch.zeros(3))
+        norm = clip_grad_norm_([sharded, whole, plain, SimpleNamespace(grad=None)], max_norm=1.0)
+        assert float(norm) == pytest.approx(10.0)  # sqrt(4 x 9 + 4 x 16)
+        torch.testing.assert_close(sharded.grad.to_local(), torch.full((2, 2), 0.3), rtol=1e-5, atol=0)
+        torch.testing.assert_close(whole.grad.to_local(), torch.full((4,), 0.4), rtol=1e-5, atol=0)
+        partial = SimpleNamespace(grad=DTensor.from_local(torch.ones(2, 2), mesh, [Partial()], run_check=False))
+        with pytest.raises(RuntimeError, match="Partial"):
+            clip_grad_norm_([sharded, partial], max_norm=1.0)
+        torch.testing.assert_close(partial.grad.to_local(), torch.ones(2, 2))  # nothing was scaled
+        torch.testing.assert_close(sharded.grad.to_local(), torch.full((2, 2), 0.3), rtol=1e-5, atol=0)
+    finally:
+        if created:
+            dist.destroy_process_group()
+
+
 def test_layout_check():
     from palingenesis.checkpoint import check_layout
 
