@@ -663,6 +663,45 @@ def test_no_request_starts_between_the_buckets_of_an_update():
     assert len(finished["a"]) == 2 and not engine.stream_pending()
 
 
+@pytest.mark.parametrize("copies", [1, 2])
+def test_a_weight_update_waits_for_every_request_when_one_of_them_failed(copies):
+    """A request in flight that fails must not end the drain: the others still decode, and a bucket pushed then
+    would give them weights of two versions. The failure surfaces at the next stream_step, as before."""
+
+    class OneFails(ScriptedEngine):  # the first request for [9] fails at once; every other one takes a while
+        failed = False
+
+        async def agenerate(self, request):
+            self.inflight += 1
+            try:
+                if request["input_ids"] == [9] and not self.failed:
+                    self.failed = True
+                    raise ValueError("refused")
+                await asyncio.sleep(0.05)
+                return self.respond(request)
+            finally:
+                self.inflight -= 1
+
+        def update_weights_from_tensor(self, named, flush_cache):  # as SGLang: no wait for what has not started
+            self.calls.append(("update", self.inflight, flush_cache))
+            return True, "ok"
+
+    scripted = OneFails()
+    engine, _ = _engine(engine=scripted)
+    if copies == 1:
+        engine.stream_add("bad", [9], 8, 1.0, n=1)
+        engine.stream_add("slow", [1], 8, 1.0, n=1)
+    else:  # one request, two samples: the first fails while its sibling still decodes
+        engine.stream_add("bad", [9], 8, 1.0, n=2)
+    named = [(f"w{i}", torch.randn(512, 512)) for i in range(3)]  # two buckets of 1 MiB
+    engine.update_weights(named, version=1)
+    assert scripted.calls == [("update", 0, False), ("update", 0, True)]  # nothing in flight at either bucket
+    assert engine.version == 1
+    with pytest.raises(ValueError, match="refused"):
+        engine.stream_step()
+    assert engine.streams == {}
+
+
 def test_generate_reports_the_first_failure_and_a_dead_engine(monkeypatch):
     def respond(request):
         if request["input_ids"] == [9]:

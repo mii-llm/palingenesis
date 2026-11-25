@@ -977,14 +977,23 @@ class SGLangRollout(_Completions):
             if any(not task.cancelled() and task.exception() is not None for task in done):
                 return
 
+    async def _drain(self, tasks: list) -> None:
+        """Wait until every one of `tasks` is done, failed ones included (their errors are raised where their
+        results are read: stream_step); raises when the engine's scheduler died meanwhile."""
+        pending = set(tasks)
+        while pending:
+            _, pending = await asyncio.wait(pending, timeout=self.POLL_SECONDS)
+            self._alive()
+
     def update_weights(self, named_tensors, version: int) -> None:
         with self.lock:
             # The requests in flight finish first, under the weights that started them. SGLang's model-update lock
             # does this for one call; an update is several (one per bucket), and a request that had not started
-            # could otherwise run between two of them, on weights of two versions.
+            # could otherwise run between two of them, on weights of two versions. Every one of them: a request
+            # that failed does not end the wait for those still decoding.
             inflight = [task for task, _, _ in self.streams.values() if not task.done()]
             if inflight:
-                self.calls.run(self._all(inflight))
+                self.calls.run(self._drain(inflight))
             if self.weights_released:
                 torch.cuda.empty_cache()  # the trainer's cached blocks back to the driver for the engine to map
                 self.calls.resume(["weights"])
@@ -1108,7 +1117,12 @@ class SGLangRollout(_Completions):
         request = self._request(prompt, max_new_tokens, sampling, adapter)
 
         async def run():
-            outs = await asyncio.gather(*(self.calls.agenerate(request) for _ in range(copies)))
+            # every sample finishes before the request does, also when one of them failed (the first failure is
+            # then raised): a weight update waits for this task, and no sample may still decode behind it
+            outs = await asyncio.gather(*(self.calls.agenerate(request) for _ in range(copies)), return_exceptions=True)
+            for out in outs:
+                if isinstance(out, BaseException):
+                    raise out
             return outs, self.version  # the version that finished it (updates wait for requests in flight)
 
         with self.lock:
