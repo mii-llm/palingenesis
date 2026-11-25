@@ -161,7 +161,7 @@ class PipelineParallel:
         local = stage_indices(self.rank, self.size, self.per_rank, self.v_shape)
         self.plans = [StagePlan(s, split[s], s == 0, s == self.num_stages - 1) for s in local]
         owned = {i for plan in self.plans for i in plan.layers}
-        first = any(p.first for p in self.plans)
+        first = self.has_first = any(p.first for p in self.plans)
         last = any(p.last for p in self.plans)
 
         # This rank's part of the model (every local stage's layers; the others are stand-ins): what the trainer
@@ -277,7 +277,11 @@ class PipelineParallel:
         args, kwargs = self._inputs(input_ids, labels, position_ids, loss_weights)
         losses: list = []
         target = torch.zeros(input_ids.shape[0], device=input_ids.device)
-        self.schedule.step(args, target=target, losses=losses, return_outputs=False, **kwargs)
+        # Only the rank with the first stage feeds the pipeline (torchtitan's convention): the others receive their
+        # inputs, and torch 2.11 refuses positional inputs on them ("Can't supply input args for shape inference
+        # on non-first stage"). The per-token fields every stage needs travel as keyword arguments.
+        feed = (args,) if self.has_first else ()
+        self.schedule.step(*feed, target=target, losses=losses, return_outputs=False, **kwargs)
         return float(sum(loss.detach().float() for loss in losses)) if losses else 0.0
 
     @torch.no_grad()
