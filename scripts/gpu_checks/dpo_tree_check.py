@@ -7,7 +7,9 @@ Called by scripts/gpu_checks/dpo_tree.sh; every result is one JSON line on stdou
   env                       versions, the GPU's free memory, the kernels the packed paths will use
   equality   --model M      per-token / per-sequence log-probs, loss and gradients of one DPO micro-step, varlen and
                             tree against the padded rows (fp32 weights, bf16 autocast, selective checkpointing: as
-                            the trainer runs); FAIL when the gradient cosine is below 0.999
+                            the trainer runs), judged against the noise between two padded layouts on the
+                            mean / p99 / signed mean of the per-token differences, the loss and the gradient
+                            cosine (>= 0.999); fewer pairs when little memory is free
   throughput --model M      micro-step time (reference forward + policy forward + loss + backward), pair tokens/s and
              --share S      peak memory per layout on synthesised pairs whose shared prompt is S of each sequence
              [--compiled]   (median of --repeats timed steps after a warm-up); --compiled: the compiled padded
@@ -300,17 +302,30 @@ def dpo_step(policy, reference, supports, pairs: list[dict], layout: str, vocab:
     }
 
 
-def take_grads(model) -> list:
-    """The parameters' gradients as fp32 clones (on the GPU), in parameter order; clears them."""
-    grads = [p.grad.detach().float().clone() for p in model.parameters() if p.grad is not None]
-    model.zero_grad(set_to_none=True)
-    return grads
+LOW_MEMORY_GIB = 70  # equality: below this much free memory, fewer pairs and the padded gradient kept on the host
 
 
-def compare_grads(ref: list, got: list) -> dict:
-    """Relative L2 error and cosine of two gradients."""
+def take_grads(model, device=None) -> list:
+    """The parameters' gradients as fp32 copies (on `device`, default where they are), in parameter order."""
+    import torch
+
+    return [p.grad.detach().to(device or p.grad.device, torch.float32, copy=True) for p in _with_grad(model)]
+
+
+def _with_grad(model) -> list:
+    return [p for p in model.parameters() if p.grad is not None]
+
+
+def compare_grads(ref: list, model) -> dict:
+    """Relative L2 error and cosine of the model's current gradients against `ref` (take_grads), one parameter at a
+    time: no second copy of the gradient is held."""
     num = den = dot = norm = 0.0
-    for g, h in zip(ref, got, strict=True):
+    params = _with_grad(model)
+    if len(params) != len(ref):
+        raise RuntimeError(f"{len(params)} parameters have a gradient, the padded step gave {len(ref)}")
+    for g, p in zip(ref, params):
+        h = p.grad.detach().float()
+        g = g.to(h.device)
         num += float((h - g).pow(2).sum())
         den += float(g.pow(2).sum())
         dot += float((h * g).sum())
@@ -323,24 +338,92 @@ def compare_grads(ref: list, got: list) -> dict:
 
 # ── equality ───────────────────────────────────────────────────────────────────
 
+# A packed layout against the padded rows, judged on statistics that do not hinge on one token. In bf16 two
+# forwards of the same tokens through different kernels (or the same kernel on another batch shape) differ per
+# token by rounding noise with a heavy tail: the maximum over thousands of scored tokens is one draw from that
+# tail and moves by tens of percent between layouts that are equally exact, so it is reported, not judged. A real
+# offset (a token reading the wrong context, a state carried across sequences) moves the bulk: the mean and the
+# 99th percentile of |delta|, the signed mean (noise is centred, an offset is not), the loss, and the gradient.
+# Bounds are FLOOR_FACTOR times what two padded layouts of the same pairs differ by (padded_alt), with an
+# absolute allowance for a floor that happens to be tiny. The gradient is judged by the pre-registered cosine;
+# its relative L2 error is bounded only by what that cosine implies (sqrt(2 (1 - cos)): 0.045 at 0.999).
+FLOOR_FACTOR = 3.0
+ALLOWANCE = {"mean": 0.005, "p99": 0.05, "signed_mean": 0.002, "loss": 0.01}
+
+
+def logprob_stats(got, base) -> dict:
+    """Per-token log-prob differences over the scored tokens ([2P, S] tensors, 0 where nothing is scored)."""
+    import torch
+
+    scored = (got != 0) | (base != 0)
+    delta = (got - base)[scored].double().cpu()
+    if delta.numel() == 0:
+        return {"scored_tokens": 0}
+    size = delta.abs()
+    quantiles = torch.quantile(size, torch.tensor([0.5, 0.9, 0.99, 0.999], dtype=torch.float64)).tolist()
+    return {
+        "scored_tokens": int(delta.numel()),
+        "token_logprob_mean_abs_diff": float(size.mean()),
+        "token_logprob_p50_abs_diff": quantiles[0],
+        "token_logprob_p90_abs_diff": quantiles[1],
+        "token_logprob_p99_abs_diff": quantiles[2],
+        "token_logprob_p999_abs_diff": quantiles[3],
+        "token_logprob_max_abs_diff": float(size.max()),
+        "token_logprob_signed_mean_diff": float(delta.mean()),
+        "tokens_above_0.05": int((size > 0.05).sum()),
+        "tokens_above_0.1": int((size > 0.1).sum()),
+    }
+
+
+def judge(values: dict, floor: dict, tree: bool) -> list[str]:
+    """The criteria a packed layout fails (none: PASS)."""
+
+    def bound(key: str, allowance: float) -> float:
+        return max(FLOOR_FACTOR * abs(floor[key]), allowance)
+
+    failed = []
+    if values["grad_cosine"] < MIN_COSINE:
+        failed.append(f"grad_cosine {values['grad_cosine']:.5f} < {MIN_COSINE}")
+    checks = [
+        ("token_logprob_mean_abs_diff", ALLOWANCE["mean"]),
+        ("token_logprob_p99_abs_diff", ALLOWANCE["p99"]),
+        ("token_logprob_signed_mean_diff", ALLOWANCE["signed_mean"]),
+        ("loss_diff", ALLOWANCE["loss"]),
+        ("grad_rel_l2", math.sqrt(2 * (1 - MIN_COSINE))),
+    ]
+    for key, allowance in checks:
+        if abs(values[key]) > bound(key, allowance):
+            failed.append(f"{key} {values[key]:.4g} > {bound(key, allowance):.4g}")
+    if tree and cuda() and values["tree_levels"] != 2:
+        failed.append(f"the row was not a tree ({values['tree_levels']} level(s))")
+    return failed
+
 
 def equality(model_name: str, pairs_count: int, checkpointing: str) -> None:
     import torch
 
-    free, _ = free_memory()  # read before anything is loaded
+    free, total = free_memory()  # read before anything is loaded: someone else may hold part of the GPU
+    low = free is not None and free < LOW_MEMORY_GIB
+    if low:  # two fp32 models, the policy's gradient and a copy of the padded one: fewer pairs, the copy on the host
+        pairs_count = max(2, pairs_count // 2)
     policy, reference, supports, vocab = load_models(model_name, checkpointing)
     torch.manual_seed(0)
     with torch.no_grad():  # the policy off the reference: non-trivial ratios (1% relative noise on the matrices)
         for p in policy.parameters():
             if p.ndim >= 2:
                 p.mul_(1 + 0.01 * torch.randn_like(p))
-    pairs = make_pairs(pairs_count, 0.8, vocab, seed=0, edge_cases=True)
-    results = {}
-    # padded_alt: the same pairs in another padded layout (reversed order, no padding multiple, no mask): the
-    # numerical noise between two padded forwards in bf16, which the packed layouts must stay within
-    for layout in ("padded", "padded_alt", "varlen", "tree"):
+    common = {
+        "model": model_name,
+        "checkpointing": checkpointing,
+        "gpu_free_gib": free,
+        "low_memory": low,
+    }
+
+    def run(layout: str, pairs: list[dict]) -> dict:
         policy.zero_grad(set_to_none=True)
         if layout == "padded_alt":
+            # the same pairs in another padded layout (reversed order, no padding multiple, no mask): the numerical
+            # noise between two padded forwards in bf16, which the packed layouts are judged against
             out = dpo_step(policy, reference, supports, pairs[::-1], "padded_nomask", vocab, detail=True)
             half = len(pairs)
             order = list(range(half - 1, -1, -1)) + list(range(2 * half - 1, half - 1, -1))
@@ -348,49 +431,73 @@ def equality(model_name: str, pairs_count: int, checkpointing: str) -> None:
         else:
             out = dpo_step(policy, reference, supports, pairs, layout, vocab, detail=True)
         sync()
-        results[layout] = (out, take_grads(policy))
-    base, base_grads = results["padded"]
-    width = min(out["logps"].shape[1] for out, _ in results.values())
-    floor = None
-    for layout in ("padded_alt", "varlen", "tree"):
-        out, grads = results[layout]
-        diff = (out["logps"][:, :width] - base["logps"][:, :width]).abs()
-        sequence = (out["logps"].sum(1) - base["logps"].sum(1)).abs()
-        values = {
-            "model": model_name,
-            "layout": layout,
-            "pairs": len(pairs),
-            "checkpointing": checkpointing,
-            "gpu_free_gib": free,
-            "forwarded_tokens": out["forwarded_tokens"],
-            "padded_tokens": base["forwarded_tokens"],
-            "tree_levels": out["levels"],
-            "token_logprob_max_abs_diff": float(diff.max()),
-            "token_logprob_mean_abs_diff": float(diff.mean()),
-            "sequence_logprob_max_abs_diff": float(sequence.max()),
-            "loss": out["loss"],
-            "loss_diff": abs(out["loss"] - base["loss"]),
-            "margin_diff": abs(out["metrics"]["rewards/margins"] - base["metrics"]["rewards/margins"]),
-            **compare_grads(base_grads, grads),
-        }
-        if layout == "padded_alt":
-            floor = values
-            emit("equality_noise_floor", "INFO", **values)
-            continue
-        ok = (
-            values["grad_cosine"] >= MIN_COSINE
-            and values["token_logprob_max_abs_diff"] <= max(3 * floor["token_logprob_max_abs_diff"], 0.05)
-            and values["grad_rel_l2"] <= max(3 * floor["grad_rel_l2"], 0.02)
-            and (layout != "tree" or not cuda() or out["levels"] == 2)  # the row really was a tree
-        )
-        emit(
-            "equality",
-            "PASS" if ok else "FAIL",
-            **values,
-            min_cosine=MIN_COSINE,
-            noise_floor_grad_rel_l2=floor["grad_rel_l2"],
-            noise_floor_token_logprob=floor["token_logprob_max_abs_diff"],
-        )
+        out["logps"] = out["logps"].cpu()
+        return out
+
+    # Out of memory: half the pairs (the two edge-case pairs stay), down to one, then SKIP with the reason.
+    count, reason, done = pairs_count, "", False
+    while not done:
+        pairs = make_pairs(count, 0.8, vocab, seed=0, edge_cases=True)
+        base_grads, lines = None, []  # (the lines are printed once every layout ran: a retry starts over)
+        try:
+            base = run("padded", pairs)
+            # only this copy of a gradient is kept: every other layout is compared from the parameters' .grad
+            base_grads = take_grads(policy, "cpu" if low else None)
+            floor = None
+            for layout in ("padded_alt", "varlen", "tree"):
+                out = run(layout, pairs)
+                width = min(out["logps"].shape[1], base["logps"].shape[1])
+                values = {
+                    **common,
+                    "layout": layout,
+                    "pairs": len(pairs),
+                    "forwarded_tokens": out["forwarded_tokens"],
+                    "padded_tokens": base["forwarded_tokens"],
+                    "tree_levels": out["levels"],
+                    **logprob_stats(out["logps"][:, :width], base["logps"][:, :width]),
+                    "sequence_logprob_max_abs_diff": float((out["logps"].sum(1) - base["logps"].sum(1)).abs().max()),
+                    "loss": out["loss"],
+                    "loss_diff": abs(out["loss"] - base["loss"]),
+                    "margin_diff": abs(out["metrics"]["rewards/margins"] - base["metrics"]["rewards/margins"]),
+                    **compare_grads(base_grads, policy),
+                }
+                policy.zero_grad(set_to_none=True)
+                if layout == "padded_alt":
+                    floor = values
+                    lines.append(("equality_noise_floor", "INFO", values))
+                    continue
+                failed = judge(values, floor, tree=layout == "tree")
+                keys = ("mean_abs", "p99_abs", "max_abs", "signed_mean")
+                extra = {
+                    "failed_criteria": failed,
+                    "min_cosine": MIN_COSINE,
+                    "floor_factor": FLOOR_FACTOR,
+                    "noise_floor_grad_rel_l2": floor["grad_rel_l2"],
+                    "noise_floor_grad_cosine": floor["grad_cosine"],
+                    "noise_floor_loss_diff": floor["loss_diff"],
+                    **{f"noise_floor_token_logprob_{k}": floor[f"token_logprob_{k}_diff"] for k in keys},
+                }
+                lines.append(("equality", "FAIL" if failed else "PASS", {**values, **extra}))
+            for check, status, values in lines:
+                emit(check, status, **values)
+            done = True
+        except torch.OutOfMemoryError as error:
+            reason = str(error)[:300]
+            del base_grads
+            policy.zero_grad(set_to_none=True)
+            sync(empty=True)
+            if count <= 1:
+                emit(
+                    "equality",
+                    "SKIP",
+                    **common,
+                    gpu_total_gib=total,
+                    reason=f"out of memory down to {count + 2} pairs ({reason})",
+                )
+                return
+            count //= 2
+            low = True  # the padded gradient on the host from here on
+            emit("equality_retry", "INFO", **common, pairs=count + 2, out_of_memory_at=reason)
 
 
 # ── throughput ─────────────────────────────────────────────────────────────────

@@ -269,21 +269,33 @@ dpo:
 
 `scripts/gpu_checks/dpo_tree.sh` measures one micro-step (reference forward, policy forward, loss, backward)
 on synthesised pairs (answers of 100 to 700 tokens, the prompt sized to the share), against the fastest
-padded layout, compiled layers included. Pre-registered target: at least 1.5x at prompt shares of 70% and
-above; below 1.2x the feature is dropped.
+padded layout that ran, compiled layers included. Pre-registered target: at least 1.5x at prompt shares of
+70% and above; below 1.2x the feature is dropped. One A100 80GB (about 15 GB held by another job), fp32
+weights, bf16 autocast, selective checkpointing, median of 3 steps:
 
-| Model | Prompt share | Pairs | Padded step (s) | Tree step (s) | Speed-up | Peak memory padded / tree (GiB) | Gradient cosine |
-|---|---|---|---|---|---|---|---|
-| Qwen3.5-0.8B | 50% | TBD | TBD | TBD | TBD | TBD | TBD |
-| Qwen3.5-0.8B | 80% | TBD | TBD | TBD | TBD | TBD | TBD |
-| Qwen3.5-0.8B | 95% | TBD | TBD | TBD | TBD | TBD | TBD |
-| Qwen3.5-2B | 50% | TBD | TBD | TBD | TBD | TBD | TBD |
-| Qwen3.5-2B | 80% | TBD | TBD | TBD | TBD | TBD | TBD |
-| Qwen3.5-2B | 95% | TBD | TBD | TBD | TBD | TBD | TBD |
+| Model | Prompt share | Tree speed-up over the fastest padded layout |
+|---|---|---|
+| Qwen3.5-0.8B | 50% | 1.50x |
+| Qwen3.5-0.8B | 80% | ~2.0x |
+| Qwen3.5-0.8B | 95% | ~1.9x |
+| Qwen3.5-2B | 50% | 1.57x |
+| Qwen3.5-2B | 80% | not recorded |
+| Qwen3.5-2B | 95% | 2.1x |
 
-Not measured yet (GPU validation pending): the table is filled from the check's `throughput`, `speedup` and
-`equality` lines. On CPU, float64 tiny Qwen3 and Qwen3.5 models match the padded path to 1e-10 on
-log-probs and loss and 1e-6 (relative) on gradients (`tests/test_dpo_packing.py`).
+The target is met at every share measured at 70% or above. `varlen` alone (no padding, no sharing) gave
+1.66x at a 50% share on the 0.8B model: with unsorted pairs, much of the gain at low prompt shares is the
+padding that is no longer forwarded. Step times, pairs per micro-batch and peak memory per layout are in the
+check's `throughput` lines.
+
+Equality on the GPU (Qwen3.5-0.8B, bf16): per-token log-probs of the packed layouts differ from the padded
+rows by 0.0025 on average, as two padded layouts of the same pairs do; the largest difference over all
+scored tokens was 0.146 (varlen) and 0.150 (tree) against 0.131 between the two padded layouts. That maximum
+is one draw from the tail of bf16 rounding noise, so the check judges the mean, the 99th percentile and the
+signed mean of the differences, the loss and the gradient cosine (at least 0.999) against that measured
+noise floor, and reports the maximum. The gradient cosine on the GPU and the 2B equality (which ran out of
+memory in the first run; the check now sizes itself to the free memory) are pending a re-run. On CPU,
+float64 tiny Qwen3 and Qwen3.5 models match the padded path to 1e-10 on log-probs and loss and 1e-6
+(relative) on gradients (`tests/test_dpo_packing.py`).
 
 ## Metrics
 
