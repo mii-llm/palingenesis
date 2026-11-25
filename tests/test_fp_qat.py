@@ -284,6 +284,23 @@ def test_validation_errors():
     assert FloatQAT(format="fp8_block", activations="fp8").activation_spec.name == "fp8_group"
 
 
+@pytest.mark.parametrize("leaf, group", [("k_proj", "q_proj, k_proj, v_proj"), ("up_proj", "gate_proj, up_proj")])
+def test_an_exclusion_covering_part_of_a_fused_group_is_refused(leaf, group):
+    """An engine fuses q / k / v (and gate / up) into one matmul: a user exclusion of one of them would leave a
+    half-quantised fused layer the packed checkpoint cannot describe."""
+    plugin = FloatQAT(format="nvfp4", exclude=[rf"\.{leaf}$"])
+    with pytest.raises(ValueError, match=rf"{leaf} .*fused group \({group}\)"):
+        plugin.transform_model(H.tiny_llama(64, hidden=64), _ctx())
+    whole = FloatQAT(format="nvfp4", exclude=[rf"\.({'|'.join(group.split(', '))})$"])
+    model = whole.transform_model(H.tiny_llama(64, hidden=64), _ctx())  # the whole group excluded: fine
+    assert type(getattr(model.model.layers[0].self_attn if leaf == "k_proj" else model.model.layers[0].mlp, leaf)) is (
+        torch.nn.Linear
+    )
+    assert FloatQAT(format="nvfp4", exclude=[rf"\.{leaf}$"], fused_groups=[]).transform_model(
+        H.tiny_llama(64, hidden=64), _ctx()
+    )  # no fused groups declared: the exclusion stands
+
+
 def test_substitution_selection_and_identity():
     model = H.tiny_llama(64, hidden=64)
     reference = H.tiny_llama(64, hidden=64)

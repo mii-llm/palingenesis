@@ -464,11 +464,21 @@ class FloatQAT(TrainerPlugin):
                 self.skipped[name] = problem
                 del chosen[name]
         # a fused layer is quantised whole or not at all (an engine cannot mix schemes inside one matmul)
+        linears = {name for name, module in model.named_modules() if type(module) is nn.Linear}
         for name in list(chosen):
             parent, _, leaf = name.rpartition(".")
             for group in self.fused_groups:
                 if leaf in group:
                     members = [f"{parent}.{m}" if parent else m for m in group]
+                    # left out by include / exclude (not by its shape): the user's choice covers part of the group
+                    left_out = [m for m in members if m in linears and m not in chosen and m not in self.skipped]
+                    if left_out:
+                        raise ValueError(
+                            f"float_qat: {left_out[0]} is excluded but {name} is quantised, and they belong to one "
+                            f"fused group ({', '.join(group)}) that an inference engine runs as one layer: it is "
+                            "quantised whole or not at all. Exclude every layer of the group (or none), or change "
+                            "fused_groups."
+                        )
                     gone = [m for m in members if m in self.skipped]
                     if gone and name in chosen:
                         self.skipped[name] = f"its fused partner {gone[0]} is not quantised"
