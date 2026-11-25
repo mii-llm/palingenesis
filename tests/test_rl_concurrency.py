@@ -788,6 +788,8 @@ def _config(**overrides) -> RLConfig:
         ({"rollout.concurrency": "adaptive"}, "rollout.concurrency must be one of"),
         ({"rollout.concurrency": "kv", "rollout.backend": "vllm"}, "admits and preempts by itself"),
         ({"rollout.concurrency": "kv", "rollout.backend": "hf"}, "generates with the trainer's model"),
+        ({"rollout.concurrency": "kv", "rollout.backend": "sglang"}, "SGLang admits by itself"),
+        ({"rollout.concurrency": "kv", "rollout.backend": "sglang_server"}, "SGLang's metrics are not vLLM's"),
         ({"rollout.concurrency": "kv", "rollout.concurrency_min": 0}, "concurrency_min must be an integer >= 1"),
         ({"rollout.concurrency": "kv", "rollout.concurrency_max": -1}, "concurrency_max must be an integer >= 0"),
         (

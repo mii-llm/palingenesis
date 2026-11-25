@@ -1211,11 +1211,12 @@ def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
             errors.append(
                 f"rollout.concurrency kv sizes the requests sent to a vLLM server or to engine workers from their "
                 f"KV-cache use (rollout.backend vllm_server or remote); rollout.backend {r.backend} "
-                + (
-                    "adds every request to its own engine's batch, where vLLM admits and preempts by itself."
-                    if r.backend == "vllm"
-                    else "generates with the trainer's model."
-                )
+                + {
+                    "vllm": "adds every request to its own engine's batch, where vLLM admits and preempts by itself.",
+                    "sglang": "adds every request to its own engine's queue, where SGLang admits by itself.",
+                    "sglang_server": "is not read for its load yet (SGLang's metrics are not vLLM's): bound the "
+                    "requests in flight with rollout.max_num_seqs.",
+                }.get(r.backend, "generates with the trainer's model.")
             )
         if isinstance(r.concurrency_min, bool) or not isinstance(r.concurrency_min, int) or r.concurrency_min < 1:
             errors.append(f"rollout.concurrency_min must be an integer >= 1, got {r.concurrency_min!r}.")
