@@ -477,7 +477,7 @@ class Episode:
             )
             for i in range(n)
         ]
-        return list(await asyncio.gather(*(fn(sub) for sub in subs)))
+        return await together(*(fn(sub) for sub in subs))
 
     def spawn(self, work: Awaitable) -> asyncio.Task:
         """Start `work` (a coroutine: a sub-agent's session and what follows it) without waiting for it. The
@@ -522,6 +522,21 @@ class Episode:
             "sessions": [s.record(content) for s in self.sessions],
             "channels": self.log if content else len(self.log),
         }
+
+
+async def together(*work: Awaitable) -> list:
+    """`asyncio.gather` for the parts of one episode: when one part fails (or the caller is cancelled) the
+    others are cancelled and waited for before the error goes on, so nothing of a failed episode is left
+    running: a part that holds something to release (an environment, a slot) has released it by then, also
+    when the event loop ends right after (`play`)."""
+    tasks = [asyncio.ensure_future(w) for w in work]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 # ------------------------------------------------------------- without a model

@@ -676,6 +676,33 @@ def test_plan_execute_closes_an_environment_cancelled_during_its_reset_and_survi
     assert by_role(episode, "planner")[0].rewards["executed"] is None and StandInHarbor.instances[-1].closed
 
 
+class LateHarbor(StandInHarbor):
+    """The first environment's reset fails the episode at once; the others are still starting then."""
+
+    def reset(self, task_dir, **row):
+        import time
+
+        if self is not StandInHarbor.instances[0]:
+            time.sleep(0.3)
+        self.started = True
+        return [{"role": "user", "content": "a harness's own conversation"}]
+
+    def close(self):
+        self.closed_after_reset = getattr(self, "started", False)
+        self.closed = True
+
+
+def test_plan_execute_closes_the_environments_of_the_other_executors_when_one_fails_the_episode(tmp_path):
+    scenario = build_scenario("plan_execute", {"env": f"{__name__}:LateHarbor", "executor_samples": 3, "control": True})
+    StandInHarbor.instances.clear()
+    with pytest.raises(ScenarioError, match="a conversation of its own"):
+        play(scenario, harbor_rows(tmp_path, 1), oracles(scenario))
+    # the episode's error waits for every executor: each environment is closed, after its reset has finished
+    assert len(StandInHarbor.instances) == 4
+    assert all(env.closed and env.closed_after_reset for env in StandInHarbor.instances)
+    assert not scenario._closing
+
+
 def test_a_trained_executor_calls_the_environments_tools_with_their_schemas(tmp_path):
     rows = harbor_rows(tmp_path, 1)
 

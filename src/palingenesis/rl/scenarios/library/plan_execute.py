@@ -68,7 +68,7 @@ from typing import Any
 
 from palingenesis.rl.scenarios.base import LANGUAGES, Scenario, user
 from palingenesis.rl.scenarios.library.patterns import mean
-from palingenesis.rl.scenarios.runtime import EndSession, Episode, ScenarioError
+from palingenesis.rl.scenarios.runtime import EndSession, Episode, ScenarioError, together
 
 PLANNER = {
     "en": (
@@ -305,12 +305,20 @@ class PlanExecute(Scenario):
                 logger.exception("plan_execute: the environment's get_reward failed; the executor is not scored")
                 value = None
         finally:
-            # the environment is closed after its reset has finished, and its slot is freed after the close, also
-            # when the episode was cancelled (the shutdown then goes on in the background)
+            # the environment is closed after its reset has finished, and its slot is freed after the close. A
+            # cancellation (the episode failed elsewhere, or ran out of time) does not interrupt the shutdown and
+            # is passed on once it is over: whoever waits for this session then knows its environment is closed
             shutdown = asyncio.ensure_future(self._shutdown(env, reset, slot_lock))
             self._closing.add(shutdown)
             shutdown.add_done_callback(self._closing.discard)
-            await asyncio.shield(shutdown)
+            cancelled = None
+            while not shutdown.done():
+                try:
+                    await asyncio.shield(shutdown)
+                except asyncio.CancelledError as stop:
+                    cancelled = stop
+            if cancelled is not None:
+                raise cancelled
         components = value if isinstance(value, dict) else {"reward": value}
         failed = bool(components.get("metric/verifier_failed"))
         paid = [float(v) for k, v in components.items() if v is not None and not k.startswith("metric/")]
@@ -343,7 +351,7 @@ class PlanExecute(Scenario):
         if not self.control:
             planner.reward("executed", mean(await executors))
             return
-        rewards, baseline = await asyncio.gather(executors, unplanned())
+        rewards, baseline = await together(executors, unplanned())
         executed = mean(rewards)
         planner.reward("executed", executed)
         planner.reward("metric/control", baseline)
