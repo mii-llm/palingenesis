@@ -459,6 +459,35 @@ def test_engines_start_without_variables_that_change_the_logprobs(monkeypatch, c
     assert os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] == "1" and os.environ["MASTER_PORT"] == "29500"
 
 
+def test_sleep_mode_engines_start_with_torchs_cuda_runtime_first(monkeypatch, tmp_path):
+    """torch_memory_saver's preloaded hook needs libcudart and takes the first the loader finds: a system
+    toolkit's would then be torch's too, and torch 2.11 + cu129 does not import with an older one. The wheel's
+    directory goes first while the engine's processes are spawned, and the variable is put back."""
+    import importlib.util
+
+    from palingenesis.opd import sglang_rollout
+
+    lib = tmp_path / "nvidia" / "cuda_runtime" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libcudart.so.12").write_bytes(b"")
+    spec = SimpleNamespace(submodule_search_locations=[str(lib.parent)])
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: spec if name == "nvidia.cuda_runtime" else None)
+    assert sglang_rollout.cuda_runtime_library_dirs() == [str(lib)]
+    monkeypatch.setenv("LD_LIBRARY_PATH", f"/usr/local/cuda/lib64{os.pathsep}{lib}")
+    with sglang_rollout.memory_saver_library_path():
+        assert os.environ["LD_LIBRARY_PATH"] == f"{lib}{os.pathsep}/usr/local/cuda/lib64"
+    assert os.environ["LD_LIBRARY_PATH"] == f"/usr/local/cuda/lib64{os.pathsep}{lib}"
+    monkeypatch.delenv("LD_LIBRARY_PATH")
+    with sglang_rollout.memory_saver_library_path():
+        assert os.environ["LD_LIBRARY_PATH"] == str(lib)
+    assert "LD_LIBRARY_PATH" not in os.environ
+    with sglang_rollout.memory_saver_library_path(False):  # no sleep mode: nothing is preloaded
+        assert "LD_LIBRARY_PATH" not in os.environ
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)  # a torch on the system CUDA
+    with sglang_rollout.memory_saver_library_path():
+        assert "LD_LIBRARY_PATH" not in os.environ
+
+
 def test_results_of_engine_calls_carry_their_message():
     """Weight updates return (success, message); the LoRA calls an object whose text is error_message."""
     assert _ok((False, "shape mismatch")) == (False, "shape mismatch")
@@ -1194,3 +1223,60 @@ def test_gpu_check_install_verify_names_what_is_wrong(tmp_path, capsys, monkeypa
     err = capsys.readouterr().err
     assert stopped.value.code == 1 and "import sglang: " in err and "None in sys.modules" in err
     assert f"torch {torch.__version__} does not see a GPU (driver too old for cu129?)" in err
+
+
+def _report(checks, tmp_path, capsys, check, record, **options):
+    import json
+
+    path = tmp_path / f"{check}.json"
+    path.write_text(json.dumps(record))
+    args = SimpleNamespace(check=check, inputs=[str(path)], max_delta=0.08, min_ratio=0.7, exit_code=0, **options)
+    checks.report(args)
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def test_gpu_check_weight_update_is_judged_by_logprobs_not_by_identical_greedy_text(tmp_path, capsys):
+    """Greedy completions do not repeat exactly with the same weights (batches change with timing, bf16 logits
+    tie): on the first GPU run 62% did. A restored engine is one that samples the original log-probs again, and a
+    perturbation counts only when the trainer's own log-probs moved by it."""
+    checks = _checks()
+    record = {
+        "model": "m",
+        "mode": "colocated",
+        "changed_share": 1.0,
+        "repeat_share": 0.625,
+        "restored_share": 0.625,
+        "perturbation_dlogprob": 0.45,
+        "mean_abs_dlogprob_new_weights": 0.02,
+        "mean_abs_dlogprob_old_weights": 0.42,
+        "mean_abs_dlogprob_restored": 0.011,
+    }
+    assert _report(checks, tmp_path, capsys, "update", record)["status"] == "PASS"
+    for change in (
+        {"perturbation_dlogprob": 0.03},  # a perturbation the log-probs cannot tell from the bf16 mismatch
+        {"mean_abs_dlogprob_new_weights": 0.3},  # the engine does not sample the new weights
+        {"mean_abs_dlogprob_restored": 0.3},  # nor the old ones after they are pushed back
+        {"restored_share": 0.2},  # far below what the same weights repeat
+    ):
+        assert _report(checks, tmp_path, capsys, "update", {**record, **change})["status"] == "FAIL", change
+
+
+def test_gpu_check_sleep_lines(tmp_path, capsys):
+    checks = _checks()
+    saver = {"model": "m", "tokens": 16, "released_gib": 20.0, "resumed_gib": 20.0}
+    assert _report(checks, tmp_path, capsys, "saver", saver) == {"check": "0_memory_saver", "status": "PASS", **saver}
+    assert _report(checks, tmp_path, capsys, "saver", {**saver, "released_gib": 0.0})["status"] == "FAIL"
+    sleep = {
+        "model": "m",
+        "repeat_share": 0.625,
+        "released_share": 0.95,
+        "same_greedy_share": 0.5,
+        "released_again_share": 0.93,
+        "same_greedy_again_share": 0.625,
+        "mean_abs_dlogprob_after_wake": 0.012,
+    }
+    assert _report(checks, tmp_path, capsys, "sleep", sleep)["status"] == "PASS"
+    assert (
+        _report(checks, tmp_path, capsys, "sleep", {**sleep, "mean_abs_dlogprob_after_wake": 0.5})["status"] == "FAIL"
+    )
+    assert _report(checks, tmp_path, capsys, "sleep", {**sleep, "released_again_share": 0.3})["status"] == "FAIL"

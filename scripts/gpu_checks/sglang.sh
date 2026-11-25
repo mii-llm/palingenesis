@@ -18,6 +18,7 @@
 #            a CUDA toolkit, where its just-in-time build fails), LOG_TAIL (40: lines of a failed step's log printed)
 #
 # Prints one JSON line per check ({"check", "status": PASS|FAIL, numbers...}), also in $WORKDIR/results.jsonl:
+#   0 install, environment, a sleep-mode engine starts (torch_memory_saver's hook with torch's CUDA runtime)
 #   1 generation and log-prob parity with vLLM (each model)   2 weight updates (colocated; server tensor and disk)
 #   3 sleep / wake memory release                              4 10-step pgs rl and pgs distill smokes
 #   5 decode throughput vs vLLM at an equal batch (median of 3)
@@ -292,6 +293,22 @@ fi
 VLLM_PYTHON="${VLLM_PYTHON:-}"
 
 OUT="$WORKDIR/out"
+
+# ------------------------------------------------------------------ 0 sleep mode starts
+
+# Sleep mode preloads torch_memory_saver's hook into the engine's scheduler; the hook needs libcudart, and with a
+# system CUDA toolkit on the loader's path torch would get that one too (palingenesis puts torch's own first: see
+# memory_saver_library_path). What the loader would find without that, for the log:
+{
+  echo "[sglang-checks] libcudart on this machine (LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}):"
+  { ldconfig -p 2>/dev/null | grep -i libcudart; ls "$SGLANG_VENV"/lib/python*/site-packages/nvidia/cuda_runtime/lib/libcudart* 2>/dev/null; } \
+    | sed 's/^/    | /'
+} >&2
+if run_step memory_saver 900 "$SG" "$CHECKS" saver --model "$MODEL_DENSE" --memory 0.3 --out "$OUT/saver.json"; then
+  report 0_memory_saver --check saver --inputs "$OUT/saver.json"
+else
+  fail_line "0_memory_saver" "a sleep-mode engine does not start, release and resume: see $WORKDIR/logs/memory_saver.log (checks 3 and 4 need it)"
+fi
 
 # ------------------------------------------------------------------ 1 parity
 

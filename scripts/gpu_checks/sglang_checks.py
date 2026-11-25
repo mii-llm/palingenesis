@@ -8,6 +8,7 @@ sleep steps need SGLang. Nothing here is imported by palingenesis.
     python sglang_checks.py score --model Qwen/Qwen3-0.6B --inputs gen.json --out score.json
     python sglang_checks.py update --model Qwen/Qwen3-0.6B --mode colocated --out update.json
     python sglang_checks.py sleep --model Qwen/Qwen3-0.6B --out sleep.json
+    python sglang_checks.py saver --model Qwen/Qwen3-0.6B --out saver.json    (sleep mode starts, releases, resumes)
     python sglang_checks.py throughput --engine sglang --model Qwen/Qwen3-0.6B --out tp.json
     python sglang_checks.py smoke-config --kind rl --model ... --workdir ... --out rl.yaml
     python sglang_checks.py install-plan --sglang-version 0.5.17 --cuda cu129 --workdir plan/   (standard library only)
@@ -446,6 +447,9 @@ def _perturbed(policy, scale: float = 0.05, seed: int = 0):
                 p.add_(noise * scale * p.std())
 
 
+PERTURBATION_EFFECT = 0.3  # mean |delta log-prob| the weight-update check's perturbation must cause in the trainer
+
+
 def _same(a: list[list[int]], b: list[list[int]]) -> float:
     return sum(x == y for x, y in zip(a, b)) / max(len(a), 1)
 
@@ -480,9 +484,33 @@ def update(args) -> None:
     policy = _trainer_model(args.model)
     original = {n: p.detach().clone() for n, p in policy.named_parameters()}
     record: dict = {"model": args.model, "mode": args.mode}
+
+    def restore() -> None:
+        with torch.no_grad():
+            for n, p in policy.named_parameters():
+                p.copy_(original[n])
+
+    def trainer_lp(completions) -> list[float]:
+        return [x for prompt, tokens in zip(prompts, completions) for x in _trainer_logprobs(policy, prompt, tokens)]
+
     try:
         before = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]
-        _perturbed(policy)
+        # Greedy decoding is not reproducible run to run (the batch a sequence decodes in changes with timing, and
+        # bf16 logits tie): how often the same weights give the same completions is the yardstick for "restored".
+        again = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]
+        # A perturbation the log-probs can tell apart: noise is raised until the trainer's own log-probs of the
+        # greedy completions move by PERTURBATION_EFFECT on average (a small one hides in the bf16 mismatch, and
+        # the comparison of new and old weights below would say nothing).
+        reference = trainer_lp(before)
+        scale, effect = 0.05, 0.0
+        for _ in range(6):
+            restore()
+            _perturbed(policy, scale)
+            effect = _mismatch(reference, trainer_lp(before))[0]
+            if effect >= PERTURBATION_EFFECT:
+                break
+            scale *= 2
+        record["perturbation_scale"], record["perturbation_dlogprob"] = scale, effect
         start = time.perf_counter()
         engine.update_weights(checkpoint_named_parameters(policy), 1)
         record["update_seconds"] = time.perf_counter() - start
@@ -492,18 +520,24 @@ def update(args) -> None:
         for prompt, r in zip(prompts, sampled):
             engine_lp += r.logprobs
             new_lp += _trainer_logprobs(policy, prompt, r.completion_ids)
-        with torch.no_grad():
-            for n, p in policy.named_parameters():
-                p.copy_(original[n])
+        restore()
         old_lp = []
         for prompt, r in zip(prompts, sampled):
             old_lp += _trainer_logprobs(policy, prompt, r.completion_ids)
         engine.update_weights(checkpoint_named_parameters(policy), 2)
         restored = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]
+        # the restored weights sample the original weights' log-probs again (what "restored" means for training;
+        # with the radix cache on, a prefix computed by the perturbed weights would show here)
+        resampled = engine.generate(prompts, budgets, Sampling(1.0))
+        restored_lp = [x for r in resampled for x in r.logprobs]
         record.update(
             {
                 "changed_share": 1 - _same(before, changed),
+                "repeat_share": _same(before, again),
                 "restored_share": _same(before, restored),
+                "mean_abs_dlogprob_restored": _mismatch(restored_lp, trainer_lp([r.completion_ids for r in resampled]))[
+                    0
+                ],
                 "mean_abs_dlogprob_new_weights": _mismatch(engine_lp, new_lp)[0],
                 "mean_abs_dlogprob_old_weights": _mismatch(engine_lp, old_lp)[0],
                 "k3_new_weights": _mismatch(engine_lp, new_lp)[1],
@@ -530,7 +564,7 @@ def sleep_check(args) -> None:
     completions after an update and a wake."""
     import torch
 
-    from palingenesis.opd.rollout import checkpoint_named_parameters
+    from palingenesis.opd.rollout import Sampling, checkpoint_named_parameters
 
     _, prompts, stop_ids = _prompts(args.model, args.prompts)
     budgets = [args.max_new_tokens] * len(prompts)
@@ -541,6 +575,7 @@ def sleep_check(args) -> None:
     try:
         awake = _used_gib()
         before = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]
+        repeat = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]  # the same weights, again
         engine.sleep()
         asleep = _used_gib()
         policy = _trainer_model(args.model)
@@ -557,8 +592,14 @@ def sleep_check(args) -> None:
         engine.update_weights(checkpoint_named_parameters(policy), 2)
         engine.wake()
         again = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]
+        # what matters to training: after a release and a resume the engine samples the pushed weights' log-probs
+        sampled = engine.generate(prompts, budgets, Sampling(1.0))
+        engine_lp = [x for r in sampled for x in r.logprobs]
+        trainer_lp = [x for p, r in zip(prompts, sampled) for x in _trainer_logprobs(policy, p, r.completion_ids)]
         record.update(
             {
+                "repeat_share": _same(before, repeat),
+                "mean_abs_dlogprob_after_wake": _mismatch(engine_lp, trainer_lp)[0],
                 "idle_gib": idle,
                 "awake_gib": awake,
                 "asleep_gib": asleep,
@@ -571,6 +612,37 @@ def sleep_check(args) -> None:
                 "same_greedy_again_share": _same(before, again),
             }
         )
+    finally:
+        _close(engine)
+    _emit(args.out, record)
+
+
+def saver_check(args) -> None:
+    """The smallest sleep-mode run: an engine with enable_memory_saver starts (torch_memory_saver's hook is preloaded
+    into its scheduler: this is where a CUDA runtime mismatch shows), generates, releases its memory and resumes
+    it. Nothing is generated afterwards (released weights come back empty: an update refills them, see `sleep`)."""
+    import torch
+
+    from palingenesis.opd.sglang_rollout import cuda_runtime_library_dirs
+
+    _, prompts, stop_ids = _prompts(args.model, 2)
+    record: dict = {
+        "model": args.model,
+        "cuda_runtime_dirs": cuda_runtime_library_dirs(),
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+    }
+    torch.cuda.init()
+    start = time.perf_counter()
+    engine = _engine("sglang", args.model, stop_ids, args.memory, sleep=True, max_len=512)
+    try:
+        record["start_seconds"] = time.perf_counter() - start
+        record["tokens"] = sum(len(r.completion_ids) for r in engine.generate(prompts, [8, 8], 0.0))
+        awake = _used_gib()
+        engine.calls.release(engine.memory_tags)
+        record["released_gib"] = awake - _used_gib()
+        engine.calls.resume(engine.memory_tags)
+        record["resumed_gib"] = _used_gib() - (awake - record["released_gib"])
+        record["tags"] = list(engine.memory_tags)
     finally:
         _close(engine)
     _emit(args.out, record)
@@ -706,17 +778,31 @@ def report(args) -> None:
         _line("1_generation_logprob_parity", ok, **numbers)
     elif args.check == "update":
         for record in data:
+            # The engine samples the new weights' distribution (close to the trainer's with them, far from the
+            # trainer's without: the perturbation moves the trainer's log-probs by perturbation_dlogprob), and the
+            # original one again after the weights are pushed back. Identical greedy completions are not asked
+            # for: the same weights repeat them only repeat_share of the time, so restored_share is held to that.
             ok = (
                 record["changed_share"] >= 0.5
-                and record["restored_share"] >= 0.75
-                and record["mean_abs_dlogprob_new_weights"] < args.max_delta
+                and record["perturbation_dlogprob"] >= PERTURBATION_EFFECT
+                and record["mean_abs_dlogprob_new_weights"] < 2 * args.max_delta
                 and record["mean_abs_dlogprob_new_weights"] < 0.5 * record["mean_abs_dlogprob_old_weights"]
+                and record["mean_abs_dlogprob_restored"] < args.max_delta
+                and record["restored_share"] >= record["repeat_share"] - 0.25
             )
             _line(f"2_weight_update_{record['mode']}", ok, **record)
+    elif args.check == "saver":
+        (record,) = data
+        ok = record.get("tokens", 0) > 0 and record.get("released_gib", 0) > 0.5 and record.get("resumed_gib", 0) > 0.5
+        _line("0_memory_saver", ok, **record)
     elif args.check == "sleep":
         (record,) = data
-        ok = record["released_share"] >= 0.8 and record["same_greedy_share"] >= 0.75
-        ok = ok and record["released_again_share"] >= 0.8 and record["same_greedy_again_share"] >= 0.75
+        # greedy completions repeat only repeat_share of the time with the same weights: the shares after a wake
+        # are held to that, and the engine's log-probs to the trainer's
+        floor = record["repeat_share"] - 0.25
+        ok = record["released_share"] >= 0.8 and record["same_greedy_share"] >= floor
+        ok = ok and record["released_again_share"] >= 0.8 and record["same_greedy_again_share"] >= floor
+        ok = ok and record["mean_abs_dlogprob_after_wake"] < args.max_delta
         _line("3_sleep_wake", ok, **record)
     elif args.check in ("smoke_rl", "smoke_distill"):
         rows = []
@@ -759,7 +845,7 @@ def main() -> None:
         p.add_argument("--workdir", default=".")
         p.add_argument("--lock", default="")
         p.add_argument("--lock-only", action="store_true", help="check the resolved list only (before installing)")
-    for name in ("generate", "score", "update", "sleep", "throughput", "smoke-config", "report"):
+    for name in ("generate", "score", "update", "sleep", "saver", "throughput", "smoke-config", "report"):
         p = sub.add_parser(name)
         p.add_argument("--model", default="Qwen/Qwen3-0.6B")
         p.add_argument("--out", default="")
@@ -790,6 +876,7 @@ def main() -> None:
         "score": score,
         "update": update,
         "sleep": sleep_check,
+        "saver": saver_check,
         "throughput": throughput,
         "smoke-config": smoke_config,
         "report": report,
