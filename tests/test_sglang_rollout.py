@@ -1166,15 +1166,10 @@ def test_gpu_check_refuses_a_resolution_of_another_cuda():
     assert checks.lock_problems(["sglang==0.5.17", "torch==2.11.0", "nvidia-cudnn-cu13==9.19.0.56"], "cu130") == []
 
 
-def test_gpu_check_install_verify_names_what_is_wrong(tmp_path, capsys):
-    """Run where SGLang is not installed (this test environment): the check fails and says why."""
-    pytest.importorskip("torch")
-    try:
-        import sglang  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        pytest.skip("sglang is installed here")
+def test_gpu_check_install_verify_names_what_is_wrong(tmp_path, capsys, monkeypatch):
+    """The check fails and says why: the wrong torch build, no visible GPU, SGLang missing. What it probes (torch's
+    CUDA build, the GPU, the sglang import) is set here, so the messages are the same on any machine."""
+    torch = pytest.importorskip("torch")
     checks = _checks()
     lock = tmp_path / "lock.txt"
     lock.write_text("sglang==0.5.17\ntorch==2.11.0\n")
@@ -1182,8 +1177,20 @@ def test_gpu_check_install_verify_names_what_is_wrong(tmp_path, capsys):
     with pytest.raises(SystemExit) as stopped:
         checks.install_verify(args)
     assert stopped.value.code == 1 and "torch==2.11.0 is not the cu129 build" in capsys.readouterr().err
+
     args.lock_only, args.lock = False, ""
+    monkeypatch.setitem(sys.modules, "sglang", None)  # `import sglang` fails, installed or not
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.version, "cuda", None)  # a CPU-only build
     with pytest.raises(SystemExit) as stopped:
         checks.install_verify(args)
     err = capsys.readouterr().err
-    assert stopped.value.code == 1 and "import sglang" in err and "CUDA" in err
+    assert stopped.value.code == 1 and "import sglang: " in err and "None in sys.modules" in err
+    assert f"torch {torch.__version__} is built for CUDA None, not 12.9" in err
+
+    monkeypatch.setattr(torch.version, "cuda", "12.9")  # the build asked for, on a machine without a visible GPU
+    with pytest.raises(SystemExit) as stopped:
+        checks.install_verify(args)
+    err = capsys.readouterr().err
+    assert stopped.value.code == 1 and "import sglang: " in err and "None in sys.modules" in err
+    assert f"torch {torch.__version__} does not see a GPU (driver too old for cu129?)" in err
