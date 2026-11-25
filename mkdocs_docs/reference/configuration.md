@@ -277,7 +277,7 @@ Neither works with `loss.kl_ref` or a `scenario:` yet. With `rollout.backend: re
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `rollout.backend` | str | `vllm` | `vllm` (in-process vLLM, asleep while training), `vllm_server` (a vLLM server fed weights over CUDA IPC), `sglang` (in-process SGLang engine, asleep while training), `sglang_server` (an SGLang server on this GPU or at `rollout.url`), `remote` (pool workers: `--backend vllm`, `sglang` or `hf`), `hf` (the trainer's `generate`). Feature table: [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang). The SGLang backends are experimental: GPU validation in progress; colocated sleep mode currently fails with torch_memory_saver on CUDA 12.9 (see [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang)). |
+| `rollout.backend` | str | `vllm` | `vllm` (in-process vLLM, asleep while training), `vllm_server` (a vLLM server fed weights over CUDA IPC), `sglang` (in-process SGLang engine, asleep while training), `sglang_server` (an SGLang server on this GPU or at `rollout.url`), `remote` (pool workers: `--backend vllm`, `sglang` or `hf`), `hf` (the trainer's `generate`). Feature table: [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang). |
 | `rollout.gpu_memory_utilization` | float | `0.3` | The engine's GPU share for weights and KV cache (vLLM's `gpu_memory_utilization`, SGLang's `mem_fraction_static`). |
 | `rollout.max_model_len` | int | `8192` | Prompt + completion tokens of a trajectory (SGLang's `context_length`). |
 | `rollout.max_num_seqs` | int | `0` | Concurrent sequences (vLLM: 0 = batch x group, at least 256; SGLang: 0 = sized by SGLang). |
@@ -573,7 +573,7 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | str | `hf` | `hf` (the trainer's `generate`), `vllm` (in-process vLLM on the student's GPU, asleep while the trainer trains), `vllm_server` (a vLLM server fed weights over CUDA IPC; experimental), `sglang` (in-process SGLang engine, asleep while the trainer trains) or `sglang_server` (an SGLang server on this GPU or at `url`). See [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang). The SGLang backends are experimental: GPU validation in progress; colocated sleep mode currently fails with torch_memory_saver on CUDA 12.9 (see [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang)). |
+| `backend` | str | `hf` | `hf` (the trainer's `generate`), `vllm` (in-process vLLM on the student's GPU, asleep while the trainer trains), `vllm_server` (a vLLM server fed weights over CUDA IPC; experimental), `sglang` (in-process SGLang engine, asleep while the trainer trains) or `sglang_server` (an SGLang server on this GPU or at `url`). See [Rollout engines](../guides/rl.md#rollout-engines-vllm-or-sglang). |
 | `batch_prompts` | int | `32` | Prompts per optimizer step. |
 | `group_size` | int | `1` | Rollouts per prompt. |
 | `temperature` | float | `1.0` | Sampling temperature (the losses compare the teacher with the temperature-scaled student). |
