@@ -129,7 +129,9 @@ def pipeline_on_this_backend():
 
 def use_torch_linear_attention(model):
     """Gated DeltaNet layers on transformers' pure-torch paths: the causal-conv1d and flash-linear-attention
-    kernels, when installed, are CUDA only and raise on CPU tensors. Returns the number of layers switched."""
+    kernels, when installed, are CUDA only (Triton, a compiled operator) and raise on CPU tensors. Every piece
+    the layer takes from them: the short convolution, the chunked and recurrent delta rules, the convolution's
+    decoding update, and the gated output norm (fla's FusedRMSNormGated). Returns the number of layers switched."""
     switched = 0
     for module in model.modules():
         if "causal_conv1d_fn" not in vars(module):
@@ -142,8 +144,29 @@ def use_torch_linear_attention(model):
                 raise RuntimeError(f"transformers has no torch fallback for {attr}")
             if fallback is not None:
                 setattr(module, attr, fallback)
+        norm = getattr(module, "norm", None)
+        if norm is not None and type(norm).__module__.split(".")[0] == "fla":
+            module.norm = torch_gated_norm(norm, module, source)
         switched += 1
     return switched
+
+
+def torch_gated_norm(fused, layer, source):
+    """transformers' own gated RMS norm (the class the layer uses without flash-linear-attention) in place of
+    fla's fused one: the same weight Parameter (and so the same state-dict key), eps and SiLU gate."""
+    name = next((n for n in vars(source) if n.endswith("RMSNormGated") and not n.startswith("Fused")), None)
+    if name is None:
+        raise RuntimeError("transformers has no torch gated RMS norm for this model")
+    activation = getattr(fused, "activation", getattr(layer, "activation", "silu"))
+    if activation not in ("silu", "swish"):
+        raise RuntimeError(f"the torch gated norm gates with SiLU; this layer uses {activation!r}")
+    weight = getattr(fused, "weight", None)
+    if weight is None or getattr(fused, "bias", None) is not None:
+        raise RuntimeError("the fused gated norm has no weight, or a bias the torch norm does not have")
+    eps = getattr(layer, "layer_norm_epsilon", getattr(fused, "eps", 1e-6))
+    norm = getattr(source, name)(weight.shape[0], eps=eps)
+    norm.weight = weight
+    return norm.train(fused.training)
 
 
 def load(name, dtype, untie=False, device=None):
