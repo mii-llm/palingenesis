@@ -20,12 +20,16 @@ torch = pytest.importorskip("torch")
 from palingenesis.opd.rollout import Sampling  # noqa: E402
 from palingenesis.opd.sglang_rollout import (  # noqa: E402
     OWNED_OPTIONS,
+    InProcessEngine,
     SGLangRollout,
+    SGLangServer,
     SGLangServerRollout,
+    _ok,
     build_request,
     check_options,
     clamp_budget,
     decode_routed_experts,
+    engine_env,
     engine_options,
     finish_type,
     launcher_env_removed,
@@ -273,6 +277,30 @@ def test_launcher_variables_are_hidden_while_engines_spawn(monkeypatch):
     assert os.environ["TORCHELASTIC_USE_AGENT_STORE"] == "True" and os.environ["WORLD_SIZE"] == "2"
 
 
+def test_engines_start_without_variables_that_change_the_logprobs(monkeypatch, caplog):
+    """SGLANG_RETURN_ORIGINAL_LOGPROB makes SGLang report the log-probs of the unscaled logits: an engine the
+    trainer starts never sees it (the in-process engine's children copy os.environ, a server gets engine_env)."""
+    monkeypatch.setenv("SGLANG_RETURN_ORIGINAL_LOGPROB", "1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("KEEP_ME", "x")
+    with caplog.at_level("WARNING"):
+        env = engine_env()
+    assert "SGLANG_RETURN_ORIGINAL_LOGPROB" not in env and "MASTER_PORT" not in env and env["KEEP_ME"] == "x"
+    assert "SGLANG_RETURN_ORIGINAL_LOGPROB" in caplog.text
+    with launcher_env_removed():
+        assert "SGLANG_RETURN_ORIGINAL_LOGPROB" not in os.environ and os.environ["KEEP_ME"] == "x"
+    assert os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] == "1" and os.environ["MASTER_PORT"] == "29500"
+
+
+def test_results_of_engine_calls_carry_their_message():
+    """Weight updates return (success, message); the LoRA calls an object whose text is error_message."""
+    assert _ok((False, "shape mismatch")) == (False, "shape mismatch")
+    assert _ok({"success": False, "message": "no such group"}) == (False, "no such group")
+    lora = SimpleNamespace(success=False, error_message="LoRA is not enabled", loaded_adapters=None)
+    assert _ok(lora) == (False, "LoRA is not enabled")
+    assert _ok(SimpleNamespace(success=True, error_message=None)) == (True, "")
+
+
 # ------------------------------------------------------------------ weights
 
 
@@ -418,6 +446,82 @@ def test_a_weight_update_waits_for_requests_in_flight():
     assert finished["new"][0].policy_version == 1
 
 
+def test_no_request_starts_between_the_buckets_of_an_update():
+    """An update is one engine call per bucket, and SGLang's model-update lock covers one call: the engine finishes
+    the requests in flight before the first bucket, so none can start on weights of two versions."""
+
+    class LockPerCall(ScriptedEngine):  # as SGLang: a call does not wait for requests that have not started
+        def update_weights_from_tensor(self, named, flush_cache):
+            self.calls.append(("update", self.inflight, flush_cache))
+            return True, "ok"
+
+    scripted = LockPerCall(delay=0.01)
+    engine, _ = _engine(engine=scripted)
+    engine.stream_add("a", [1], 8, 1.0, n=2)
+    engine.stream_add("b", [2], 8, 1.0, n=1)
+    named = [(f"w{i}", torch.randn(512, 512)) for i in range(3)]  # two buckets of 1 MiB
+    engine.update_weights(named, version=1)
+    assert scripted.calls == [("update", 0, False), ("update", 0, True)]  # nothing in flight at either bucket
+    finished = dict(engine.stream_step())
+    assert {r.policy_version for rollouts in finished.values() for r in rollouts} == {0}
+    assert len(finished["a"]) == 2 and not engine.stream_pending()
+
+
+def test_generate_reports_the_first_failure_and_a_dead_engine(monkeypatch):
+    def respond(request):
+        if request["input_ids"] == [9]:
+            raise ValueError("The input (9 tokens) is longer than the model's context length")
+        return _output(request["input_ids"])
+
+    engine, scripted = _engine(engine=ScriptedEngine(respond))
+    with pytest.raises(ValueError, match="context length"):
+        engine.generate([[1], [9], [2]], [8, 8, 8], 1.0)
+    assert scripted.inflight == 0  # the others were cancelled, not left on the loop
+
+    # the scheduler process died: a request would wait for it forever; the waiting call notices and raises
+    monkeypatch.setattr(SGLangRollout, "POLL_SECONDS", 0.01)
+    hung, scripted = _engine(engine=ScriptedEngine())
+    scripted.gate = asyncio.Event()  # never set: no answer comes
+    scripted.failed = ""
+
+    def check():
+        if scripted.failed:
+            raise RuntimeError(scripted.failed)
+
+    scripted.check = check
+    scripted.loop.call_later(0.03, lambda: setattr(scripted, "failed", "scheduler process died"))
+    with pytest.raises(RuntimeError, match="scheduler process died"):
+        hung.generate([[1]], [8], 1.0)
+    with pytest.raises(RuntimeError, match="scheduler process died"):
+        hung.stream_step()
+
+
+def test_a_dead_scheduler_ends_the_run_with_an_error_not_the_process_tree():
+    """SGLang's watchdog sends SIGQUIT when the scheduler dies. The engine wrapper's handler stops the engine's own
+    processes and raises in the trainer (SGLang's would kill the trainer and every child it has)."""
+    stopped = []
+    inner = SimpleNamespace(get_all_child_pids=lambda: [], shutdown=lambda: stopped.append("shutdown"))
+    engine = object.__new__(InProcessEngine)
+    engine.engine, engine.failed, engine._helper = inner, "", None
+    engine.loop = asyncio.new_event_loop()
+    engine.check()
+    with pytest.raises(RuntimeError, match="scheduler process died"):
+        engine._scheduler_died()
+    assert stopped == ["shutdown"] and engine.engine is None
+    assert engine._scheduler_died() is None  # a second signal (the scheduler's own, then the watchdog's)
+    with pytest.raises(RuntimeError, match="scheduler process died"):
+        engine.check()
+
+    async def nothing():
+        return 1
+
+    with pytest.raises(RuntimeError, match="scheduler process died"):
+        engine.run(nothing())
+    with pytest.raises(RuntimeError, match="scheduler process died"):
+        engine.update_weights_from_tensor([], True)
+    engine.loop.close()
+
+
 def test_a_failed_request_fails_the_step_and_clears_the_streams():
     def respond(request):
         if request["input_ids"] == [9]:
@@ -530,7 +634,9 @@ class ScriptedServer:
         return {"success": True, "message": ""}
 
     def info(self):
-        return {"tp_size": 1}
+        return {"tp_size": self.ranks}
+
+    ranks = 1
 
 
 def test_server_generates_in_parallel_batches_in_order():
@@ -562,6 +668,55 @@ def test_server_tensor_sync_sends_buckets_and_flushes_last():
     assert failing.version == 0
 
 
+def test_server_tensor_sync_sends_one_payload_per_tensor_parallel_rank():
+    """SGLang's ranks each read serialized_named_tensors[their rank]."""
+    server = ScriptedServer()
+    server.ranks = 2
+    engine = SGLangServerRollout(server, STOP, model="m", max_model_len=64)
+    engine.update_weights([("w", torch.ones(2))], version=1)
+    (post,) = [p for path, p in server.posts if path == "/update_weights_from_tensor"]
+    assert len(post["serialized_named_tensors"]) == 2
+
+
+def test_server_updates_wait_for_the_generate_call_in_flight():
+    """An update is several requests (one per bucket): a completion must not be sampled between two of them."""
+    server = ScriptedServer()
+    started, release = threading.Event(), threading.Event()
+    post = server.post
+
+    def slow_post(path, payload=None, timeout=0):
+        if path == "/generate":
+            started.set()
+            assert release.wait(5)
+        return post(path, payload, timeout)
+
+    server.post = slow_post
+    engine = SGLangServerRollout(server, STOP, model="m", max_model_len=64, parallel=1)
+    generating = threading.Thread(target=engine.generate, args=([[1]], [8], 1.0))
+    generating.start()
+    assert started.wait(5)
+    updating = threading.Thread(target=engine.update_weights, args=([("w", torch.ones(2))], 1))
+    updating.start()
+    updating.join(0.05)
+    assert updating.is_alive() and engine.version == 0
+    assert not [path for path, _ in server.posts if path.startswith("/update")]
+    release.set()
+    generating.join(5)
+    updating.join(5)
+    assert engine.version == 1 and [path for path, _ in server.posts][-1] == "/update_weights_from_tensor"
+
+
+def test_a_server_that_exited_is_named_with_its_log():
+    server = object.__new__(SGLangServer)
+    server.model, server.url, server.log_path = "m", "http://127.0.0.1:9", "/out/sglang.log"
+    server.process = SimpleNamespace(poll=lambda: -9, returncode=-9)
+    with pytest.raises(RuntimeError, match=r"exited with code -9 during /generate; see /out/sglang.log"):
+        server.request("/generate", {}, timeout=2)
+    server.process = None  # a server at rollout.url: the connection error itself
+    with pytest.raises(RuntimeError, match="SGLang server /generate at http://127.0.0.1:9"):
+        server.request("/generate", {}, timeout=2)
+
+
 def test_server_auto_sync_is_distributed_for_a_running_server():
     engine = SGLangServerRollout(ScriptedServer(launched=False), STOP, model="m", max_model_len=64)
     assert engine.weight_sync == "distributed"
@@ -586,6 +741,22 @@ def test_server_disk_sync_writes_a_checkpoint_and_drops_the_previous(tmp_path):
     weights = load_file(str(tmp_path / "sync/v2/model.safetensors"))
     assert torch.equal(weights["w"], torch.full((2, 2), 2.0, dtype=torch.bfloat16))
     assert (tmp_path / "sync/v2/config.json").read_text() == '{"model_type": "toy"}'
+    engine.close()  # the run's last checkpoint goes too
+    assert not (tmp_path / "sync/v2").exists() and engine.disk_versions == []
+
+    refusing = SGLangServerRollout(
+        ScriptedServer(fail="/update_weights_from_disk"),
+        STOP,
+        model=str(model),
+        max_model_len=64,
+        weight_sync="disk",
+        sync_dir=str(tmp_path / "sync"),
+    )
+    with pytest.raises(RuntimeError, match="refused"):
+        refusing.update_weights([("w", torch.ones(2, 2))], version=3)
+    assert refusing.version == 0 and (tmp_path / "sync/v3").exists()
+    refusing.close()  # a refused checkpoint is not left behind either
+    assert not (tmp_path / "sync/v3").exists()
 
 
 # ------------------------------------------------------------------ trainers and configuration
@@ -625,6 +796,7 @@ def _rl(**options):
         ({"rollout.backend": "sglang", "rollout.weight_sync": "disk"}, "sglang_server only"),
         ({"rollout.backend": "sglang_server", "rollout.weight_sync": "nfs"}, "weight_sync must be one of"),
         ({"rollout.backend": "sglang_server", "rollout.weight_sync_dir": "/x"}, "weight_sync disk only"),
+        ({"rollout.backend": "sglang_server", "rollout.weight_sync": "distributed"}, "needs a server on another GPU"),
         ({"rollout.backend": "sglang", "rollout.weight_bucket_mb": 0}, "weight_bucket_mb"),
         ({"rollout.backend": "sglang", "model.multimodal": True}, "token ids only"),
         ({"rollout.backend": "vllm", "rollout.url": "http://x:1"}, "rollout.url"),
@@ -645,6 +817,9 @@ def test_rl_config_accepts_the_sglang_backends(monkeypatch):
         **{"rollout.backend": "sglang_server", "rollout.weight_sync": "disk", "rollout.weight_sync_dir": "/s"}
     ).validate()
     _rl(**{"rollout.backend": "sglang", "rollout.max_staleness": 1}).validate()
+    _rl(
+        **{"rollout.backend": "sglang_server", "rollout.weight_sync": "distributed", "rollout.url": "http://h:1"}
+    ).validate()
     warnings = _rl(**{"rollout.backend": "sglang_server", "rollout.url": "http://h:1", "rollout.fp32_head": True})
     assert any("enable-fp32-lm-head" in w for w in warnings.validate())
     monkeypatch.setenv("WORLD_SIZE", "2")

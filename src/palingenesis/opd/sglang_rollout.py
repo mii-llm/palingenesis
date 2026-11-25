@@ -386,6 +386,11 @@ def config_errors(r, section: str, multimodal: bool = False) -> list[str]:
         errors.append(f"{section}.weight_sync must be one of {WEIGHT_SYNC_MODES}, got {r.weight_sync!r}.")
     elif r.weight_sync != "auto" and r.backend != "sglang_server":
         errors.append(f"{section}.weight_sync applies to {section}.backend sglang_server only.")
+    elif r.weight_sync == "distributed" and not getattr(r, "url", ""):
+        errors.append(
+            f"{section}.weight_sync distributed needs a server on another GPU ({section}.url): the server the "
+            "trainer launches shares its GPU, where NCCL cannot join the two (use tensor, the default)."
+        )
     if r.weight_sync_dir and r.weight_sync != "disk":
         errors.append(f"{section}.weight_sync_dir is used with {section}.weight_sync disk only.")
     if r.weight_bucket_mb < 1:
@@ -429,10 +434,31 @@ def server_flags(options: dict) -> list[str]:
     return flags
 
 
+# Variables that change what an engine returns: with SGLANG_RETURN_ORIGINAL_LOGPROB SGLang reports the log-probs of
+# the unscaled logits (temperature 1), not those of the distribution it sampled from.
+SEMANTICS_ENV = ("SGLANG_RETURN_ORIGINAL_LOGPROB",)
+
+
+def engine_env(environ=None) -> dict[str, str]:
+    """The environment an engine process starts with: `environ` (os.environ) without torchrun's variables and
+    without the ones that would change the meaning of the returned log-probs (a warning names those set)."""
+    environ = os.environ if environ is None else environ
+    for key in SEMANTICS_ENV:
+        if environ.get(key, "").lower() in ("1", "true", "yes"):
+            _warn_once(
+                key,
+                f"{key} is set: the rollout engine is started without it (it must return the log-probs of the "
+                "temperature-scaled distribution it samples from)",
+            )
+    return {k: v for k, v in environ.items() if k not in LAUNCHER_ENV and k not in SEMANTICS_ENV}
+
+
 @contextlib.contextmanager
 def launcher_env_removed():
-    """torchrun's variables out of os.environ while engine processes are spawned (they copy it)."""
-    saved = {key: os.environ.pop(key) for key in LAUNCHER_ENV if key in os.environ}
+    """torchrun's variables (and SEMANTICS_ENV) out of os.environ while engine processes are spawned (they copy
+    it)."""
+    kept = engine_env()
+    saved = {key: os.environ.pop(key) for key in list(os.environ) if key not in kept}
     try:
         yield
     finally:
@@ -536,7 +562,9 @@ class InProcessEngine:
             self.memory_tags = list(GPU_MEMORY_ALL_TYPES)
         except ImportError:
             self.memory_tags = ["kv_cache", "weights"]
-        previous = signal.getsignal(signal.SIGTERM) if threading.current_thread() is threading.main_thread() else None
+        self.failed = ""  # why the engine is gone (its scheduler process died); calls raise it
+        main = threading.current_thread() is threading.main_thread()
+        previous = signal.getsignal(signal.SIGTERM) if main else None
         with launcher_env_removed():
             self.engine = sglang.Engine(**options)
         # sglang.Engine kills every child process of this one at exit (its own and any other); ours kills its own
@@ -553,10 +581,39 @@ class InProcessEngine:
             with contextlib.suppress(Exception):
                 self.loop.remove_signal_handler(signal.SIGTERM)
                 signal.signal(signal.SIGTERM, previous)
+        if main:
+            # SGLang's watchdog sends this process SIGQUIT when the scheduler dies, and its handler kills this
+            # process and all of its children. The trainer ends with an error instead (its cleanup runs, and
+            # other children, sandboxes for instance, are left to it).
+            with contextlib.suppress(Exception):
+                self.loop.remove_signal_handler(signal.SIGQUIT)
+            with contextlib.suppress(Exception):
+                signal.signal(signal.SIGQUIT, self._scheduler_died)
+
+    def _scheduler_died(self, signum=None, frame=None) -> None:
+        """SIGQUIT from SGLang's subprocess watchdog (main thread): stop what is left of the engine and raise."""
+        if self.engine is None:  # closed: its processes were stopped on purpose
+            return
+        self.failed = (
+            "the SGLang engine's scheduler process died (out of memory, a CUDA error, or it was killed): its "
+            "output above has the cause. Lower rollout.gpu_memory_utilization or rollout.max_num_seqs if it ran "
+            "out of memory."
+        )
+        with contextlib.suppress(Exception):
+            self.close()
+        raise RuntimeError(self.failed)
+
+    def check(self) -> None:
+        """Raise when the engine's scheduler died (requests would wait for it forever)."""
+        if self.failed:
+            raise RuntimeError(self.failed)
 
     def run(self, coroutine):
         """Run a coroutine on the engine's event loop (callers serialize). From a thread whose own event loop is
         running (an asyncio server's executor callbacks are not), it runs on a helper thread."""
+        if self.failed:
+            coroutine.close()
+            raise RuntimeError(self.failed)
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -577,23 +634,29 @@ class InProcessEngine:
             await responses.aclose()
 
     def update_weights_from_tensor(self, named: list[tuple[str, Tensor]], flush_cache: bool) -> tuple[bool, str]:
+        self.check()
         result = self.engine.update_weights_from_tensor(named, flush_cache=flush_cache)
         return _ok(result)
 
     def release(self, tags: list[str]) -> None:
+        self.check()
         self.engine.release_memory_occupation(tags=tags)
 
     def resume(self, tags: list[str]) -> None:
+        self.check()
         self.engine.resume_memory_occupation(tags=tags)
 
     def flush_cache(self) -> bool:
+        self.check()
         result = self.engine.flush_cache()
         return bool(getattr(result, "success", result))
 
     def load_lora_adapter(self, name: str, path: str) -> tuple[bool, str]:
+        self.check()
         return _ok(self.engine.load_lora_adapter(name, path))
 
     def unload_lora_adapter(self, name: str) -> tuple[bool, str]:
+        self.check()
         return _ok(self.engine.unload_lora_adapter(name))
 
     def close(self) -> None:
@@ -616,12 +679,12 @@ class InProcessEngine:
 
 
 def _ok(result) -> tuple[bool, str]:
-    """SGLang's (success, message[, ...]) results, or objects with success / message."""
+    """SGLang's (success, message[, ...]) results, or objects / mappings with success and message (the LoRA
+    calls report theirs as error_message)."""
     if isinstance(result, tuple):
         return bool(result[0]), str(result[1]) if len(result) > 1 else ""
-    if isinstance(result, dict):
-        return bool(result.get("success", True)), str(result.get("message", ""))
-    return bool(getattr(result, "success", True)), str(getattr(result, "message", ""))
+    get = result.get if isinstance(result, dict) else lambda key, default=None: getattr(result, key, default)
+    return bool(get("success", True)), str(get("message", None) or get("error_message", None) or "")
 
 
 def _kill_trees(pids: list[int], timeout: float = 30.0) -> None:
@@ -704,6 +767,7 @@ class SGLangRollout(_Completions):
     """
 
     STEP_SECONDS = 0.02  # stream_step returns after this long when nothing finished (weight updates go between)
+    POLL_SECONDS = 1.0  # how often a waiting call checks that the engine's scheduler is still alive
 
     def __init__(
         self,
@@ -768,8 +832,28 @@ class SGLangRollout(_Completions):
 
     # ------------------------------------------------------------- weights
 
+    def _alive(self) -> None:
+        check = getattr(self.calls, "check", None)
+        if check is not None:
+            check()
+
+    async def _all(self, tasks: list) -> None:
+        """Wait for `tasks`, or for the first failure; raises when the engine's scheduler died meanwhile."""
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, timeout=self.POLL_SECONDS, return_when=asyncio.FIRST_EXCEPTION)
+            self._alive()
+            if any(not task.cancelled() and task.exception() is not None for task in done):
+                return
+
     def update_weights(self, named_tensors, version: int) -> None:
         with self.lock:
+            # The requests in flight finish first, under the weights that started them. SGLang's model-update lock
+            # does this for one call; an update is several (one per bucket), and a request that had not started
+            # could otherwise run between two of them, on weights of two versions.
+            inflight = [task for task, _, _ in self.streams.values() if not task.done()]
+            if inflight:
+                self.calls.run(self._all(inflight))
             if self.weights_released:
                 torch.cuda.empty_cache()  # the trainer's cached blocks back to the driver for the engine to map
                 self.calls.resume(["weights"])
@@ -860,10 +944,19 @@ class SGLangRollout(_Completions):
             requests.append(self._request(prompt, budget, sampling, adapter))
 
         async def run_all():
-            return await asyncio.gather(*(self.calls.agenerate(r) for r in requests))
+            tasks = [asyncio.ensure_future(self.calls.agenerate(r)) for r in requests]
+            try:
+                await self._all(tasks)
+                for task in tasks:  # the first failure, not an unfinished task's InvalidStateError
+                    if task.done() and not task.cancelled() and task.exception() is not None:
+                        raise task.exception()
+                return [task.result() for task in tasks]
+            finally:
+                for task in tasks:
+                    task.cancel()
 
         with self.lock:
-            outs = self.calls.run(run_all())
+            outs = self.calls.run(run_all()) if requests else []
             version = self.version
             done = [self._rollout(out, request, version) for out, request in zip(outs, requests)]
         return [done[slot] for slot in slots]
@@ -898,6 +991,7 @@ class SGLangRollout(_Completions):
         """Advance the engine's event loop until a request finishes (or STEP_SECONDS pass): (request id, its n
         rollouts) for every request that finished."""
         with self.lock:
+            self._alive()
             pending = [task for task, _, _ in self.streams.values() if not task.done()]
             if pending:
                 self.calls.run(asyncio.wait(pending, timeout=self.STEP_SECONDS, return_when=asyncio.FIRST_COMPLETED))
@@ -954,6 +1048,7 @@ class SGLangServer:
     ):
         self.model = model
         self.process = None
+        self.log_path = log_path
         self._log = None
         if url:
             self.url = url.rstrip("/")
@@ -972,7 +1067,7 @@ class SGLangServer:
                 str(port),
                 *server_flags(options or {}),
             ]
-            env = {k: v for k, v in os.environ.items() if k not in LAUNCHER_ENV}
+            env = engine_env()
             logger.info("Launching %s (log: %s)", " ".join(cmd), log_path or "inherited")
             self._log = open(log_path, "w") if log_path else None
             self.process = subprocess.Popen(
@@ -991,7 +1086,8 @@ class SGLangServer:
         while time.time() < deadline:
             if self.process is not None and self.process.poll() is not None:
                 raise RuntimeError(
-                    f"SGLang server for {self.model} exited with code {self.process.returncode}; see its log."
+                    f"SGLang server for {self.model} exited with code {self.process.returncode}"
+                    + (f"; see {self.log_path}." if self.log_path else "; see its output.")
                 )
             try:
                 with urllib.request.urlopen(f"{self.url}/health", timeout=5) as r:
@@ -1017,6 +1113,13 @@ class SGLangServer:
             raise RuntimeError(
                 f"SGLang server {path}: HTTP {e.code}: {e.read().decode(errors='replace')[:2000]}"
             ) from None
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError(
+                    f"SGLang server for {self.model} exited with code {self.process.returncode} during {path}"
+                    + (f"; see {self.log_path}" if self.log_path else "")
+                ) from None
+            raise RuntimeError(f"SGLang server {path} at {self.url}: {e}") from e
         return json.loads(body) if body else {}
 
     def post(self, path: str, payload: dict | None = None, timeout: float = 3600.0):
@@ -1129,6 +1232,10 @@ class SGLangServerRollout(_Completions):
         self.version = 0
         self.prompt_tokens = self.cached_tokens = 0
         self.group = None  # the NCCL group of weight_sync distributed (created at the first update)
+        self.ranks = 0  # the server's tensor-parallel ranks (read at the first tensor update)
+        # generate calls and weight updates exclude each other: an update is several requests (one per bucket),
+        # and a completion started between two of them would be sampled by weights of two versions
+        self.lock = threading.RLock()
         self.disk_versions: list[Path] = []
         self.routing = None
         if routing_replay:
@@ -1137,16 +1244,23 @@ class SGLangServerRollout(_Completions):
     # ------------------------------------------------------------- weights
 
     def update_weights(self, named_tensors, version: int) -> None:
+        with self.lock:
+            self._update_weights(named_tensors, version)
+
+    def _update_weights(self, named_tensors, version: int) -> None:
         mode = self.weight_sync
         if mode == "disk":
             self._update_from_disk(named_tensors, version)
         else:
+            if mode == "tensor" and not self.ranks:
+                self.ranks = int(self.server.info().get("tp_size", 1) or 1)
             for bucket, last in _with_last(weight_buckets(named_tensors, self.bucket_bytes)):
                 _cuda_sync(bucket)
                 if mode == "tensor":
+                    payload = serialize_named_tensors(bucket)  # one per tensor-parallel rank (each reads its own)
                     reply = self.server.post(
                         "/update_weights_from_tensor",
-                        {"serialized_named_tensors": [serialize_named_tensors(bucket)], "flush_cache": last},
+                        {"serialized_named_tensors": [payload] * self.ranks, "flush_cache": last},
                     )
                     _ipc_collect(bucket)
                     _check_reply(reply, "/update_weights_from_tensor")
@@ -1193,6 +1307,7 @@ class SGLangServerRollout(_Completions):
 
         target = self.sync_dir / f"v{version}"
         target.mkdir(parents=True, exist_ok=True)
+        self.disk_versions.append(target)  # removed with the next version, or at close (also when this one fails)
         tensors = {}
         for bucket in weight_buckets(named_tensors, self.bucket_bytes):
             tensors.update({name: t.detach().to("cpu").contiguous() for name, t in bucket})
@@ -1201,14 +1316,8 @@ class SGLangServerRollout(_Completions):
         _check_reply(
             self.server.post("/update_weights_from_disk", {"model_path": str(target)}), "/update_weights_from_disk"
         )
-        self.disk_versions.append(target)
         while len(self.disk_versions) > 1:  # the server has loaded this one: the older files go, one by one
-            old = self.disk_versions.pop(0)
-            for path in sorted(old.iterdir()):
-                with contextlib.suppress(OSError):
-                    path.unlink()
-            with contextlib.suppress(OSError):
-                old.rmdir()
+            self._remove_version(self.disk_versions.pop(0))
 
     def sleep(self) -> None:
         pass
@@ -1216,9 +1325,36 @@ class SGLangServerRollout(_Completions):
     def wake(self) -> None:
         pass
 
+    def close(self) -> None:
+        """Leave the server as a run found it: the NCCL group of weight_sync distributed destroyed on both sides,
+        the last checkpoint of weight_sync disk deleted (file by file). The server itself is its owner's."""
+        with self.lock:
+            if self.group is not None:
+                import torch.distributed as dist
+
+                group, self.group = self.group, None
+                with contextlib.suppress(Exception):
+                    self.server.post("/destroy_weights_update_group", {"group_name": self.GROUP}, timeout=60)
+                with contextlib.suppress(Exception):
+                    dist.destroy_process_group(group)
+            while self.disk_versions:
+                self._remove_version(self.disk_versions.pop())
+
+    @staticmethod
+    def _remove_version(directory: Path) -> None:
+        for path in sorted(directory.iterdir()) if directory.is_dir() else ():
+            with contextlib.suppress(OSError):
+                path.unlink()
+        with contextlib.suppress(OSError):
+            directory.rmdir()
+
     # ------------------------------------------------------------- generation
 
     def generate(self, prompts, max_new_tokens, temperature, images=None, adapter: str = "") -> list[Rollout]:
+        with self.lock:
+            return self._generate(prompts, max_new_tokens, temperature, images, adapter)
+
+    def _generate(self, prompts, max_new_tokens, temperature, images=None, adapter: str = "") -> list[Rollout]:
         self._no_images(images)
         if adapter and adapter != "base":
             raise ValueError("rollout.backend sglang_server serves one policy (no named adapters)")

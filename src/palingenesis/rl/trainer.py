@@ -1340,12 +1340,12 @@ class RLTrainer:
             if self.dumps is not None:
                 self.dumps.close()
             self.tracker.finish(1 if failed else 0)
+            if hasattr(self.engine, "make_client") or isinstance(self.engine, (SGLangRollout, SGLangServerRollout)):
+                self.engine.close()  # SGLang: its scheduler process holds GPU memory until it is stopped
             if self.server is not None:
                 self.server.close()
             for server in self.servers.values():
                 server.close()
-            if hasattr(self.engine, "make_client"):
-                self.engine.close()
             self.parallel.close()
 
     def _parity_check(self, metrics: dict[str, float]) -> None:

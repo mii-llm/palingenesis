@@ -762,6 +762,9 @@ class OPDTrainer:
             failed = False
         finally:
             self.orchestrator.stop()
+            engine = getattr(self.pipeline, "engine", None)
+            if isinstance(engine, (SGLangRollout, SGLangServerRollout)):
+                engine.close()  # SGLang: its scheduler process holds GPU memory until it is stopped
             for server in self.servers:
                 server.close()
             if dumps is not None:

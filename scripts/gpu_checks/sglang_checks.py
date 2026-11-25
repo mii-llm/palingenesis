@@ -121,6 +121,32 @@ def _trainer_logprobs(policy, prompt: list[int], tokens: list[int], temperature:
     return torch.log_softmax(logits, -1).gather(1, ids[0, len(prompt) :, None]).squeeze(1).tolist()
 
 
+TRUNCATED = (0.7, 0.8, 20)  # temperature, top_p, top_k of the truncated generation
+
+
+def _truncated_logprobs(policy, prompt: list[int], tokens: list[int], engine: str) -> list[float]:
+    """The trainer's log-probs of `tokens` under the truncated sampling distribution, renormalised over the support
+    as the engine builds it. vLLM (and palingenesis' truncate_scores): top-k first, the nucleus on the renormalised
+    rest. SGLang: both on the same sorted probabilities (the nucleus is not renormalised after top-k). -inf: a
+    token the trainer puts outside the support."""
+    import torch
+
+    from palingenesis.opd.rollout import truncate_scores
+
+    temperature, top_p, top_k = TRUNCATED
+    ids = torch.tensor([prompt + tokens], device="cuda")
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        logits = policy(ids).logits[0, len(prompt) - 1 : -1].float() / temperature
+    if engine == "vllm":
+        scores = truncate_scores(logits, top_k, top_p)
+    else:
+        probs, order = torch.softmax(logits, -1).sort(dim=-1, descending=True)
+        keep = torch.arange(probs.shape[-1], device=probs.device)[None] < top_k
+        keep &= (probs.cumsum(-1) - probs) <= top_p
+        scores = logits.masked_fill(~torch.zeros_like(keep).scatter(-1, order, keep), float("-inf"))
+    return torch.log_softmax(scores, -1).gather(1, ids[0, len(prompt) :, None]).squeeze(1).tolist()
+
+
 def _mismatch(engine_lp: list[float], trainer_lp: list[float]) -> tuple[float, float, int]:
     """(mean |delta log-prob|, mean k3 = exp(d) - 1 - d with d = trainer - engine, tokens)."""
     deltas = [t - e for e, t in zip(engine_lp, trainer_lp)]
@@ -146,7 +172,7 @@ def generate(args) -> None:
         greedy = engine.generate(prompts, [args.max_new_tokens] * len(prompts), 0.0)
         repeated = [p for p in prompts for _ in range(args.samples)]
         sampled = engine.generate(repeated, [args.max_new_tokens] * len(repeated), Sampling(1.0))
-        truncated = engine.generate(prompts, [args.max_new_tokens] * len(prompts), Sampling(0.7, 0.8, 20))
+        truncated = engine.generate(prompts, [args.max_new_tokens] * len(prompts), Sampling(*TRUNCATED))
     finally:
         _close(engine)
     _emit(
@@ -177,6 +203,15 @@ def score(args) -> None:
             engine_lp += item["logprobs"]
             trainer_lp += _trainer_logprobs(policy, item["prompt"], item["tokens"])
         mean_abs, k3, tokens = _mismatch(engine_lp, trainer_lp)
+        # truncated sampling: the engine's log-probs must be the renormalised ones of its own support
+        pairs = [
+            (e, t)
+            for item in data["truncated"]
+            for e, t in zip(
+                item["logprobs"], _truncated_logprobs(policy, item["prompt"], item["tokens"], data["engine"])
+            )
+        ]
+        inside = [(e, t) for e, t in pairs if math.isfinite(t) and math.isfinite(e)]
         lengths = [len(item["tokens"]) for item in data["sampled"]]
         result[data["engine"]] = {
             "mean_abs_dlogprob": mean_abs,
@@ -188,6 +223,9 @@ def score(args) -> None:
             "truncated_lp_mean": statistics.fmean(
                 [x for item in data["truncated"] for x in item["logprobs"]] or [math.nan]
             ),
+            "truncated_logprobs_per_token": all(len(i["logprobs"]) == len(i["tokens"]) for i in data["truncated"]),
+            "truncated_mean_abs_dlogprob": _mismatch([e for e, _ in inside], [t for _, t in inside])[0],
+            "truncated_outside_support_share": 1 - len(inside) / max(len(pairs), 1),
         }
     _emit(args.out, {"model": args.model, "engines": result})
 
@@ -309,6 +347,12 @@ def sleep_check(args) -> None:
         record["update_wake_seconds"] = time.perf_counter() - start
         woke = _used_gib()
         after = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]
+        # a second cycle, as every training step does: what the first resume left must release and come back again
+        engine.sleep()
+        asleep_again = _used_gib()
+        engine.update_weights(checkpoint_named_parameters(policy), 2)
+        engine.wake()
+        again = [r.completion_ids for r in engine.generate(prompts, budgets, 0.0)]
         record.update(
             {
                 "idle_gib": idle,
@@ -318,6 +362,9 @@ def sleep_check(args) -> None:
                 "trainer_gib": with_policy - asleep,
                 "released_share": (awake - asleep) / max(awake - idle, 1e-9),
                 "same_greedy_share": _same(before, after),
+                "asleep_again_gib": asleep_again,
+                "released_again_share": (woke - asleep_again) / max(woke - with_policy + asleep - idle, 1e-9),
+                "same_greedy_again_share": _same(before, again),
             }
         )
     finally:
@@ -430,6 +477,10 @@ def report(args) -> None:
         vl = engines.get("vllm")
         numbers = {"model": scores["model"], "sglang": {k: v for k, v in sg.items() if k != "greedy"}}
         ok = sg["logprobs_per_token"] and sg["mean_abs_dlogprob"] < args.max_delta
+        # truncated (top-k / top-p): renormalised log-probs for every token, close to the trainer's over the same
+        # support (looser: a token at the nucleus' edge moves the normaliser of its position)
+        ok = ok and sg["truncated_logprobs_per_token"] and sg["truncated_outside_support_share"] <= 0.05
+        ok = ok and sg["truncated_mean_abs_dlogprob"] < 3 * args.max_delta
         if vl is not None:
             prefix = []
             for a, b in zip(sg["greedy"], vl["greedy"]):
@@ -455,6 +506,7 @@ def report(args) -> None:
     elif args.check == "sleep":
         (record,) = data
         ok = record["released_share"] >= 0.8 and record["same_greedy_share"] >= 0.75
+        ok = ok and record["released_again_share"] >= 0.8 and record["same_greedy_again_share"] >= 0.75
         _line("3_sleep_wake", ok, **record)
     elif args.check in ("smoke_rl", "smoke_distill"):
         rows = []

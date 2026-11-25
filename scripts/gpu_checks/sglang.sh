@@ -10,14 +10,20 @@
 # Optional:  VLLM_PYTHON  the python of an environment with vLLM (palingenesis[vllm]) for the parity and
 #                         throughput comparisons (default: <repo>/.venv/bin/python when it imports vllm; else skipped)
 #            SGLANG_VERSION (0.5.17: the last release built on torch 2.11), CUDA_INDEX (cu129),
-#            MODEL_DENSE (Qwen/Qwen3-0.6B), MODEL_HYBRID (Qwen/Qwen3.5-0.8B), GPU (0), SKIP_INSTALL=1
+#            MODEL_DENSE (Qwen/Qwen3-0.6B), MODEL_HYBRID (Qwen/Qwen3.5-0.8B), GPU (0), SKIP_INSTALL=1,
+#            FLASHINFER_JIT_CACHE=1 (also install flashinfer's prebuilt kernels, several GB: for a machine without
+#            a CUDA toolkit, where its just-in-time build fails), LOG_TAIL (40: lines of a failed step's log printed)
 #
 # Prints one JSON line per check ({"check", "status": PASS|FAIL, numbers...}), also in $WORKDIR/results.jsonl:
 #   1 generation and log-prob parity with vLLM (each model)   2 weight updates (colocated; server tensor and disk)
 #   3 sleep / wake memory release                              4 10-step pgs rl and pgs distill smokes
 #   5 decode throughput vs vLLM at an equal batch (median of 3)
-# Models come from the Hugging Face cache (HF_HUB_OFFLINE=1). Every step runs in a process group of its own, which
-# is killed when the step ends; at the end no process of this script is left on the GPU (checked, "cleanup" line).
+# Models come from the Hugging Face cache (HF_HUB_OFFLINE=1, read only). Every step runs in a process group of its
+# own, which is killed when the step ends; at the end no process started by this run is left, on the GPU or off it
+# (every process carries a marker in its environment; checked, "cleanup" line). A failed step prints the end of its
+# log to stderr; the full logs are in $WORKDIR/logs. Nothing is written outside WORKDIR and SGLANG_VENV (caches,
+# bytecode and temporary files included); /dev/shm is not used beyond Python's own semaphores. Exit code 1 when a
+# check failed.
 # Takes about 45-60 minutes on an A100 80GB, plus ~10 minutes for the first install.
 
 set -uo pipefail
@@ -35,6 +41,10 @@ CHECKS="$HERE/sglang_checks.py"
 
 mkdir -p "$WORKDIR"/{tmp,cache,logs,out}
 WORKDIR="$(cd "$WORKDIR" && pwd)"
+if [ "${#WORKDIR}" -gt 80 ]; then  # SGLang's processes talk over unix sockets in TMPDIR: a path limit of 107 bytes
+  echo "WORKDIR is too long a path (${#WORKDIR} > 80 characters) for the unix sockets in $WORKDIR/tmp" >&2
+  exit 2
+fi
 RESULTS="$WORKDIR/results.jsonl"
 : > "$RESULTS"
 
@@ -45,6 +55,9 @@ export TMPDIR="$WORKDIR/tmp" XDG_CACHE_HOME="$WORKDIR/cache"
 export TRITON_CACHE_DIR="$WORKDIR/cache/triton" TORCHINDUCTOR_CACHE_DIR="$WORKDIR/cache/inductor"
 export FLASHINFER_WORKSPACE_BASE="$WORKDIR/cache" VLLM_CACHE_ROOT="$WORKDIR/cache/vllm"
 export CUDA_CACHE_PATH="$WORKDIR/cache/nv" UV_CACHE_DIR="$WORKDIR/cache/uv" PIP_CACHE_DIR="$WORKDIR/cache/pip"
+export HF_DATASETS_CACHE="$WORKDIR/cache/datasets" PYTHONPYCACHEPREFIX="$WORKDIR/cache/pycache"
+export MPLCONFIGDIR="$WORKDIR/cache/mpl" NUMBA_CACHE_DIR="$WORKDIR/cache/numba" TORCH_HOME="$WORKDIR/cache/torch"
+export WANDB_MODE=disabled WANDB_DIR="$WORKDIR/tmp"
 export CUDA_VISIBLE_DEVICES="${GPU:-${CUDA_VISIBLE_DEVICES:-0}}"
 export PYTHONPATH="$PGS_SRC" PYTHONUNBUFFERED=1
 export PGS_SGLANG_CHECKS_RUN="$WORKDIR"  # marks every process of this run (the final leftover check reads it)
@@ -82,6 +95,7 @@ run_step() {
   local name="$1" limit="$2"
   shift 2
   echo "[sglang-checks] $(date +%H:%M:%S) $name" >&2
+  : > "$GROUPS_FILE.$name"  # its time: server logs written after it belong to this step
   setsid bash -c 'echo $$ >> "$0"; exec timeout --kill-after=30 "$1" "${@:2}"' "$GROUPS_FILE" "$limit" "$@" \
     > "$WORKDIR/logs/$name.log" 2>&1 &
   local pid=$!
@@ -89,8 +103,16 @@ run_step() {
   local code=$?
   kill -KILL -- "-$pid" 2>/dev/null  # the step's leftovers (engine schedulers, servers)
   if [ "$code" -ne 0 ]; then
-    echo "[sglang-checks] $name exited with $code (log: $WORKDIR/logs/$name.log)" >&2
+    echo "[sglang-checks] $name exited with $code (124 / 137: its ${limit}s limit); the end of $WORKDIR/logs/$name.log:" >&2
+    tail -n "${LOG_TAIL:-40}" "$WORKDIR/logs/$name.log" | sed 's/^/    | /' >&2
+    local extra
+    for extra in "$WORKDIR"/tmp/server_*.log "$WORKDIR"/tmp/smoke_*/*_run/sglang*.log; do  # a launched server's log
+      [ -f "$extra" ] && [ "$extra" -nt "$GROUPS_FILE.$name" ] || continue
+      echo "[sglang-checks] the end of $extra:" >&2
+      tail -n "${LOG_TAIL:-40}" "$extra" | sed 's/^/    | /' >&2
+    done
   fi
+  rm -f "$GROUPS_FILE.$name"
   return "$code"
 }
 
@@ -130,6 +152,8 @@ if [ "${SKIP_INSTALL:-0}" != "1" ] && [ "$(cat "$SGLANG_VENV/.pgs-sglang" 2>/dev
     # torch, sglang-kernel and sgl-deep-gemm, and its Dockerfile the CUDA 12 flavours of flashinfer and cutlass.
     if [ "$CUDA_INDEX" != "cu130" ]; then
       local kernel gemm flashinfer cu13
+      local cutlass
+      cutlass="$(version nvidia-cutlass-dsl || true)"
       kernel="$(version sglang-kernel)"
       gemm="$(version sgl-deep-gemm || true)"
       flashinfer="$(version flashinfer-python)"
@@ -139,7 +163,12 @@ if [ "${SKIP_INSTALL:-0}" != "1" ] && [ "$(cat "$SGLANG_VENV/.pgs-sglang" 2>/dev
       pipr "https://docs.sglang.ai/whl/$CUDA_INDEX/" 1 "sglang-kernel==$kernel"
       [ -z "$gemm" ] || pipr "https://docs.sglang.ai/whl/$CUDA_INDEX/" 1 "sgl-deep-gemm==$gemm"
       freeze | grep -iE '^(torch|torchvision|torchaudio|transformers)==' > "$WORKDIR/tmp/constraints.txt" || true
-      pipi -c "$WORKDIR/tmp/constraints.txt" "flashinfer-python[cu12]==$flashinfer" "cuda-python>=12,<13" nvidia-cutlass-dsl
+      pipi -c "$WORKDIR/tmp/constraints.txt" "flashinfer-python[cu12]==$flashinfer" "cuda-python>=12,<13" \
+        "nvidia-cutlass-dsl${cutlass:+==$cutlass}"
+    fi
+    if [ "${FLASHINFER_JIT_CACHE:-0}" = "1" ]; then  # prebuilt kernels (SGLang's Dockerfile: INSTALL_FLASHINFER_JIT_CACHE)
+      pipr "https://flashinfer.ai/whl/$CUDA_INDEX" 1 "flashinfer-jit-cache==$(version flashinfer-python)" \
+        || echo "flashinfer-jit-cache was not installed: flashinfer builds its kernels at first use"
     fi
     # palingenesis' own dependencies, without letting anything move torch or transformers
     freeze | grep -iE '^(torch|torchvision|torchaudio|transformers)==' > "$WORKDIR/tmp/constraints.txt" || true
@@ -152,14 +181,40 @@ if [ "${SKIP_INSTALL:-0}" != "1" ] && [ "$(cat "$SGLANG_VENV/.pgs-sglang" 2>/dev
     exit 1
   fi
 fi
-emit "$("$SG" - <<'EOF'
+{
+  echo "[sglang-checks] WORKDIR $WORKDIR, SGLANG_VENV $SGLANG_VENV, PGS_SRC $PGS_SRC, GPU $CUDA_VISIBLE_DEVICES"
+  df -h "$WORKDIR" /dev/shm 2>/dev/null | sed 's/^/    | /'
+  nvidia-smi --query-gpu=index,name,driver_version,memory.used,memory.total --format=csv,noheader 2>/dev/null \
+    | sed 's/^/    | /'
+} >&2
+environment="$("$SG" - 2> "$WORKDIR/logs/environment.log" <<'EOF'
 import json, torch
-from importlib.metadata import version
-print(json.dumps({"check": "0_environment", "status": "PASS", "sglang": version("sglang"), "torch": torch.__version__,
-                  "cuda": torch.version.cuda, "transformers": version("transformers"),
-                  "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))
+from importlib.metadata import PackageNotFoundError, version
+
+def installed(name):
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+ok = torch.cuda.is_available()
+import sglang  # noqa: F401 (a broken install fails here, not in the first check)
+from sglang.srt.server_args import ServerArgs  # noqa: F401
+print(json.dumps({"check": "0_environment", "status": "PASS" if ok else "FAIL", "sglang": version("sglang"),
+                  "torch": torch.__version__, "cuda": torch.version.cuda, "transformers": version("transformers"),
+                  "sglang_kernel": installed("sglang-kernel"), "flashinfer": installed("flashinfer-python"),
+                  "torch_memory_saver": installed("torch_memory_saver"),
+                  "gpu": torch.cuda.get_device_name(0) if ok else None,
+                  "free_gib": round(torch.cuda.mem_get_info()[0] / 2**30, 1) if ok else None}))
 EOF
-)" || { fail_line "0_environment" "the SGLang environment does not import"; exit 1; }
+)"
+if [ -z "$environment" ]; then
+  fail_line "0_environment" "the SGLang environment does not import: see $WORKDIR/logs/environment.log"
+  tail -n "${LOG_TAIL:-40}" "$WORKDIR/logs/environment.log" | sed 's/^/    | /' >&2
+  exit 1
+fi
+emit "$environment"
+case "$environment" in *'"status": "FAIL"'*) echo "[sglang-checks] torch sees no GPU" >&2; exit 1 ;; esac
 
 if [ -z "${VLLM_PYTHON:-}" ] && [ -x "$PGS_SRC/../.venv/bin/python" ] \
   && "$PGS_SRC/../.venv/bin/python" -c "import vllm" >/dev/null 2>&1; then
@@ -242,15 +297,42 @@ fi
 # ------------------------------------------------------------------ cleanup
 
 cleanup
-sleep 5
+# Processes of this run still alive: every one it started has the marker in its environment (this shell and its
+# subshells do not: it was exported after they started; the tr and grep of the scan itself are skipped by name).
+# A launched server ends itself within seconds of its parent's death (SIGTERM, then SGLang's own shutdown), so
+# wait before counting.
+marked() {
+  local pid name
+  for pid in /proc/[0-9]*; do
+    pid="${pid#/proc/}"
+    if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qx "PGS_SGLANG_CHECKS_RUN=$WORKDIR"; then
+      name="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
+      case "$name" in tr | grep | cat | "") continue ;; esac
+      echo "$pid"
+    fi
+  done
+}
+for _ in $(seq 30); do
+  [ -n "$(marked)" ] || break
+  sleep 1
+done
 left=0
+for pid in $(marked); do
+  echo "[sglang-checks] left over: $pid $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-200)" >&2
+  kill -KILL "$pid" 2>/dev/null
+  left=$((left + 1))
+done
+sleep 2
+on_gpu=0
 for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sort -u); do
   if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qx "PGS_SGLANG_CHECKS_RUN=$WORKDIR"; then
-    kill -KILL "$pid" 2>/dev/null
-    left=$((left + 1))
+    on_gpu=$((on_gpu + 1))
   fi
 done
 status=PASS
-[ "$left" -eq 0 ] || status=FAIL
-emit "$(printf '{"check": "cleanup", "status": "%s", "leftover_gpu_processes_killed": %d, "results": "%s"}' \
-  "$status" "$left" "$RESULTS")"
+[ "$left" -eq 0 ] && [ "$on_gpu" -eq 0 ] || status=FAIL
+emit "$(printf '{"check": "cleanup", "status": "%s", "leftover_processes_killed": %d, "still_on_gpu": %d, "results": "%s"}' \
+  "$status" "$left" "$on_gpu" "$RESULTS")"
+failed="$(grep -c '"status": "FAIL"' "$RESULTS")"
+echo "[sglang-checks] $(grep -c '"status": "PASS"' "$RESULTS") PASS, $failed FAIL (results: $RESULTS, logs: $WORKDIR/logs)" >&2
+[ "$failed" -eq 0 ]
