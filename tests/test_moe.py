@@ -214,6 +214,51 @@ def test_padding_is_left_out():
     assert not torch.allclose(balancer.expert_loads(), results[0][2])
 
 
+def test_token_weights_count_a_token_as_often_as_the_sequences_through_it():
+    """A forward that runs a shared token once (a packed prefix tree) passes its multiplicity: the same loads,
+    statistics and gradients as the forward that runs every sequence's copy."""
+    model = _model()
+    ids, _, _ = _batch(rows=1)
+    labels = ids.clone()
+    labels[:, :2] = IGNORE_INDEX
+    twice, twice_labels = ids.repeat(2, 1), labels.repeat(2, 1)
+    results = []
+    for rows, row_labels, weight in ((twice, twice_labels, None), (ids, labels, torch.full(ids.shape, 2.0))):
+        model.zero_grad()
+        balancer = _balancer(model)
+        balancer.begin(torch.ones_like(rows), token_weight=weight)
+        loss = _ce(model, rows, row_labels, _denom(row_labels))
+        balancer.sync()
+        loss.backward()
+        balancer.end()
+        balancer.step()
+        results.append((_grads(model), balancer.metrics(), balancer.expert_loads()))
+        balancer.detach()
+    _assert_same(results[1][0], results[0][0])
+    assert results[1][1] == pytest.approx(results[0][1])
+    torch.testing.assert_close(results[1][2], results[0][2])
+    # uneven weights: the loads are the weighted shares of the chosen experts
+    weight = torch.ones(ids.shape)
+    weight[:, :5] = 3.0
+    balancer = _balancer(model)
+    with _captured(model) as (layers, _, chosen):
+        balancer.begin(None, token_weight=weight)
+        with torch.no_grad():
+            model(input_ids=ids)
+        balancer.end()
+    balancer.step()
+    loads = balancer.expert_loads()
+    for layer in layers:
+        picked = chosen[layer.index].reshape(ids.numel(), -1)
+        counts = torch.bincount(
+            picked.reshape(-1),
+            weights=weight.reshape(-1, 1).expand(picked.shape).reshape(-1).double(),
+            minlength=layer.num_experts,
+        )
+        torch.testing.assert_close(loads[layer.index, : layer.num_experts], (counts / counts.sum()).float())
+    balancer.detach()
+
+
 @pytest.mark.parametrize("mode", ["full", "selective"])
 def test_activation_checkpointing(mode):
     """The layers run twice (no grad, then recomputed in the backward): counted once, same gradients."""

@@ -77,6 +77,7 @@ from palingenesis.rl.config import (
     RLConfig,
     RLConfigError,
     max_num_seqs,
+    packing_gather_tokens,
     sampler_candidates,
     training_sampling,
     truncated_sampling,
@@ -944,7 +945,15 @@ class RLTrainer:
 
             sequences = [t.prompt_ids + t.tokens[:-1] for t in trajectories]
             trained = [sum(t.mask) for t in trajectories]
-            parts = plan(sequences, [t.group for t in trajectories], trained, budget, share=mode == "tree")
+            # tree: the K/V rows the attention gathers (every branch's whole path) are bounded too
+            parts = plan(
+                sequences,
+                [t.group for t in trajectories],
+                trained,
+                budget,
+                share=mode == "tree",
+                gather_budget=packing_gather_tokens(self.config) if mode == "tree" else None,
+            )
             return [[trajectories[i] for i in part] for part in parts]
         ordered = sorted(trajectories, key=lambda t: t.context_tokens, reverse=True)  # images expanded
         batches, i = [], 0
@@ -1073,7 +1082,12 @@ class RLTrainer:
                 replay = None
                 if self.routing_replay:
                     replay = _routing_batch(micro, ids.shape[1]) if packed is None else _packed_routing(micro, packed)
-                balancer.begin(real, grad_accum=count, replay=replay)
+                # a tree forwards a shared token once: it counts for every sequence through it in the expert
+                # loads and the balancing losses, as in the padded rows
+                shared = None
+                if packed is not None and not packed.flat:
+                    shared = torch.from_numpy(packed.multiplicity())[None]
+                balancer.begin(real, grad_accum=count, replay=replay, token_weight=shared)
             # the hidden states the loss reads: a mask over the padded rows (row-major, ascending positions), or
             # the packed positions in that same order
             positions = torch.zeros(ids.shape, dtype=torch.bool) if packed is None else []
@@ -1735,8 +1749,9 @@ def _routing_batch(micro: list[Trajectory], width: int) -> torch.Tensor | None:
 
 
 def _packed_routing(micro: list[Trajectory], packed: PackedRow) -> torch.Tensor | None:
-    """_routing_batch for a packed row: [1, N, MoE layers, top_k]; a position several sequences share takes the
-    first recorded routing (the engine prefills a group's shared prompt once anyway)."""
+    """_routing_batch for a packed row: [1, N, MoE layers, top_k]. Flat rows (train.packing varlen) only: a tree
+    is refused with routing replay (RLConfig.validate), and PackedRow.routing raises when sequences that share a
+    position recorded different experts."""
     recorded = [t.routing for t in micro]
     shape = next((r.shape[1:] for r in recorded if r is not None and len(r)), None)
     return None if shape is None else packed.routing(recorded, shape)

@@ -460,6 +460,12 @@ class RLTrainConfig:
     # Both packed modes compute the same log-probs and gradients as padded (up to floating-point order); they need
     # the model's attention on sdpa (rerouted by palingenesis) and full-attention / Gated DeltaNet layers only.
     packing: str = "padded"
+    # packing tree: K/V rows a micro-batch's attention may gather per layer (0 = 8 x micro_tokens). micro_tokens
+    # counts a shared prefix once, but every branch's attention reads its whole root-to-branch path: about
+    # (sequences x shared prefix) rows, transient per layer (a 12k-token prompt x 32 completions: ~13k packed
+    # tokens, ~390k gathered rows). A group above it is spread over several micro-batches, its prefix forwarded
+    # once in each. Raise it when memory allows and long prompts are being split.
+    packing_gather_tokens: int = 0
     # FSDP2: shard the policy over data-parallel ranks (always under torchrun with > 1 process;
     # set it for one GPU only with cpu_offload). cpu_offload keeps parameters, gradients and
     # optimizer state in CPU memory: the largest model a GPU can train, at PCIe speed.
@@ -1067,11 +1073,29 @@ class RLConfig:
                     f"train.packing {t.packing} with model.multimodal: image placeholders expand inside the "
                     "model's forward, which a packed row does not lay out. Use train.packing padded."
                 )
+            if t.packing == "tree" and r.routing_replay != "off":
+                errors.append(
+                    "train.packing tree with rollout.routing_replay: the tree forwards a shared prefix once, so it "
+                    "can replay one routing for it, while the engine routed every rollout by itself. Use "
+                    "train.packing varlen (or padded) with routing replay."
+                )
             if t.packing == "tree" and t.prompt_sharing == "on":
                 errors.append(
                     "train.prompt_sharing on with train.packing tree: the tree already forwards every shared prefix "
                     "once (prompts included, across groups). Leave prompt_sharing at auto or off."
                 )
+        gather = t.packing_gather_tokens
+        if isinstance(gather, bool) or not isinstance(gather, int) or gather < 0:
+            errors.append(
+                f"train.packing_gather_tokens must be an integer >= 0 (0 = 8 x train.micro_tokens), got {gather!r}."
+            )
+        elif gather and t.packing != "tree":
+            errors.append("train.packing_gather_tokens: only used with train.packing tree.")
+        elif 0 < gather < t.micro_tokens:
+            errors.append(
+                f"train.packing_gather_tokens ({gather}) must be >= train.micro_tokens ({t.micro_tokens}): a "
+                "sequence alone gathers its own length."
+            )
         if t.prompt_sharing == "on" and (t.fsdp or t.cpu_offload or in_world):
             errors.append("train.prompt_sharing on runs the tree forward on an unsharded model: not with FSDP.")
         if m.gradient_checkpointing not in ("auto", "none", "selective", "full"):
@@ -1183,13 +1207,17 @@ def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
                 f"rollout.concurrency_max ({r.concurrency_max}) must be >= rollout.concurrency_min "
                 f"({r.concurrency_min})."
             )
-        if not 0.0 < r.kv_usage_low < r.kv_usage_high <= 1.0:
+
+        def number(value) -> bool:  # (a quoted YAML value arrives as a string)
+            return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+        if not (number(r.kv_usage_low) and number(r.kv_usage_high) and 0.0 < r.kv_usage_low < r.kv_usage_high <= 1.0):
             errors.append(
                 "rollout.kv_usage_low and kv_usage_high are KV-cache usage fractions with 0 < low < high <= 1, got "
-                f"{r.kv_usage_low} and {r.kv_usage_high}."
+                f"{r.kv_usage_low!r} and {r.kv_usage_high!r}."
             )
-        if not (math.isfinite(r.concurrency_poll_s) and r.concurrency_poll_s > 0):
-            errors.append(f"rollout.concurrency_poll_s must be > 0 seconds, got {r.concurrency_poll_s}.")
+        if not (number(r.concurrency_poll_s) and r.concurrency_poll_s > 0):
+            errors.append(f"rollout.concurrency_poll_s must be > 0 seconds, got {r.concurrency_poll_s!r}.")
     else:
         changed = [name for name in tuning if getattr(r, name) != getattr(defaults, name)]
         if changed:
@@ -1197,13 +1225,28 @@ def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
                 f"rollout.{', rollout.'.join(changed)}: only used with rollout.concurrency kv (concurrency is "
                 "fixed)."
             )
-    if not (isinstance(r.token_allowance, int | float) and math.isfinite(r.token_allowance)) or r.token_allowance < 0:
+    allowance = r.token_allowance
+    if (
+        isinstance(allowance, bool)
+        or not isinstance(allowance, int | float)
+        or not math.isfinite(allowance)
+        or allowance < 0
+    ):
         errors.append(f"rollout.token_allowance must be a finite number >= 0 (0 = off), got {r.token_allowance!r}.")
     return errors
 
 
 class RLConfigError(Exception):
     """Raised when the RL config has settings that would train wrongly or not at all."""
+
+
+PACKING_GATHER_FACTOR = 8  # train.packing_gather_tokens 0: this many times train.micro_tokens
+
+
+def packing_gather_tokens(config: RLConfig) -> int:
+    """The gathered K/V rows a tree micro-batch may reach (train.packing_gather_tokens, or its automatic value)."""
+    t = config.train
+    return t.packing_gather_tokens or PACKING_GATHER_FACTOR * t.micro_tokens
 
 
 def truncated_sampling(config: RLConfig) -> bool:

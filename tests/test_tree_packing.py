@@ -15,7 +15,7 @@ from palingenesis.rl.losses import LowPrecisionWeight
 from palingenesis.rl.parallel import Parallel
 from palingenesis.rl.trajectory import Trajectory
 from palingenesis.seco import PACKED_VARLEN
-from palingenesis.tree_packing import PackedRow, PackingError, plan, prepare_model
+from palingenesis.tree_packing import PackedRow, PackingError, _Trie, plan, prepare_model
 
 VOCAB = 97
 
@@ -131,15 +131,48 @@ def test_conv_halo_reads_the_ancestors_last_inputs():
             assert window == want, (i, j, window, want)
 
 
-def test_routing_takes_the_first_recorded_sequence():
+def test_routing_of_a_shared_prefix_must_agree():
     seqs = [[1, 2, 3], [1, 2, 4]]
     row = PackedRow.build(seqs, share=True)
     r0 = np.array([[[0]], [[1]], [[2]]])
-    r1 = np.array([[[9]], [[9]], [[5]]])
-    routing = row.routing([r0, r1], (1, 1))[0, :, 0, 0]
+    same = np.array([[[0]], [[1]], [[5]]])
+    routing = row.routing([r0, same], (1, 1))[0, :, 0, 0]
     assert routing[row.positions(0)].tolist() == [0, 1, 2]
     assert routing[row.positions(1)].tolist() == [0, 1, 5]
-    assert row.routing([None, r1[:2]], (1, 1))[0, :, 0, 0][row.positions(1)].tolist() == [9, 9, -1]
+    other = np.array([[[9]], [[9]], [[5]]])  # the engine routed the second rollout's prompt differently
+    with pytest.raises(PackingError, match="recorded different experts"):
+        row.routing([r0, other], (1, 1))
+    assert row.routing([None, other[:2]], (1, 1))[0, :, 0, 0][row.positions(1)].tolist() == [9, 9, -1]
+    flat = PackedRow.build(seqs, share=False)  # nothing shared: every sequence replays its own routing
+    routing = flat.routing([r0, other], (1, 1))[0, :, 0, 0]
+    assert routing[flat.positions(1)].tolist() == [9, 9, 5]
+
+
+def test_multiplicity_counts_the_sequences_through_a_token():
+    seqs = [[1, 2, 3, 4], [1, 2, 5], [1, 2, 5], [7]]
+    row = PackedRow.build(seqs, share=True)
+    counts = row.multiplicity()
+    assert counts.sum() == sum(map(len, seqs)) and len(counts) == row.num_tokens
+    assert counts[row.positions(0)].tolist() == [3, 3, 1, 1]
+    assert counts[row.positions(1)].tolist() == [3, 3, 2]
+    assert PackedRow.build(seqs, share=False).multiplicity().tolist() == [1] * 11
+
+
+def test_the_trie_counts_the_rows_its_attention_gathers():
+    rng = random.Random(3)
+    for _ in range(30):
+        seqs = [[rng.randrange(1, 4) for _ in range(rng.randrange(1, 9))] for _ in range(rng.randrange(1, 9))]
+        arrays = [np.asarray(q, dtype=np.int64) for q in seqs]
+        for share in (False, True):
+            trie = _Trie(arrays, share)
+            for i, array in enumerate(arrays):
+                match, gathered = trie.probe(array)
+                unique, before = trie.unique, trie.gathered
+                trie.insert(i)
+                assert trie.unique - unique == len(array) - match  # what probe promised
+                assert trie.gathered - before == gathered
+            row = PackedRow.build(seqs, share)
+            assert trie.gathered == row.gathered_tokens and trie.unique == row.num_tokens
 
 
 # ── planning ───────────────────────────────────────────────────────────────────
@@ -173,6 +206,50 @@ def test_tree_plan_counts_unique_tokens_and_keeps_groups_together():
     assert len(bins) == 4 and all(len({groups[i] for i in b}) == 1 for b in bins)
     # a raw-length budget would need 70 tokens per sequence: 32 x 70 / 160 = 14+ micro-batches
     assert len(plan(seqs, groups, trained, 160, share=False)) >= 14
+
+
+def test_tree_plan_bounds_the_gathered_rows():
+    rng = random.Random(1)
+    prompt = [rng.randrange(1, 90) for _ in range(200)]
+    seqs = [prompt + [90 + i] + [rng.randrange(1, 90) for _ in range(9)] for i in range(32)]
+    groups, trained = [0] * 32, [10] * 32
+    # 200 + 32 x 10 = 520 packed tokens fit one micro-batch, whose attention would gather 200 + 32 x 210 rows
+    (whole,) = plan(seqs, groups, trained, 600, share=True)
+    assert PackedRow.build([seqs[i] for i in whole], share=True).gathered_tokens == 200 + 32 * 210
+    bins = plan(seqs, groups, trained, 600, share=True, gather_budget=2400)
+    assert sorted(i for b in bins for i in b) == list(range(32)) and len(bins) == 4
+    for b in bins:
+        row = PackedRow.build([seqs[i] for i in b], share=True)
+        assert row.gathered_tokens <= 2400 and row.num_tokens <= 600
+    # a sequence that alone gathers more than the bound still gets a micro-batch
+    assert plan(seqs[:2], [0, 0], [10, 10], 600, share=True, gather_budget=100) == [[0], [1]]
+    # varlen gathers nothing: the bound does not apply
+    assert plan(seqs, groups, trained, 600, share=False, gather_budget=100) == plan(
+        seqs, groups, trained, 600, share=False
+    )
+
+
+def test_the_trainer_bounds_gathered_rows_by_default_and_by_option():
+    from palingenesis.rl.config import packing_gather_tokens
+
+    trainer = _trainer("gpt2", "tree", **{"train.micro_tokens": 64})
+    assert packing_gather_tokens(trainer.config) == 8 * 64
+    prompt = list(range(3, 43))
+    group = []
+    for i in range(16):
+        t = Trajectory({}, 0, list(prompt), [])
+        t.append_generated([50 + i, 60, 61, 2], [-1.0] * 4, 0)
+        group.append(t)
+    # 40 + 16 x 3 = 88 unique tokens: split by train.micro_tokens first (the default bound is 8 x 64 rows)
+    parts = trainer._micro_batches(group)
+    assert sorted(id(t) for part in parts for t in part) == sorted(id(t) for t in group)
+    for part in parts:
+        sequences = [t.prompt_ids + t.tokens[:-1] for t in part]
+        row = PackedRow.build(sequences, share=True)
+        assert row.num_tokens <= 64 and row.gathered_tokens <= 512
+    trainer.config.train.packing_gather_tokens = 130
+    parts = trainer._micro_batches(group)
+    assert max(len(part) for part in parts) == 2  # 40 + 2 x 43 = 126 rows
 
 
 def test_tree_plan_bounds_trained_tokens():
@@ -317,6 +394,34 @@ def test_prepare_model_refuses_what_it_cannot_pack_exactly():
         prepare_model(eager)
 
 
+def test_head_dims_the_flash_kernel_cannot_take_are_refused_on_a_gpu():
+    """No silent fallback to the [N, N] mask at training sizes: refused when the model is prepared for CUDA (from
+    its config) and again at the attention itself (CUDA tensors; here only its shape check)."""
+    from seco_archs import COMMON
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from palingenesis.tree_packing import _config_head_dims, _flash_capable, _flash_shape_error
+
+    assert _flash_shape_error(128, 128, 128) is None and _flash_shape_error(256, 256, 256) is None
+    assert "head dim 320" in _flash_shape_error(320, 320, 320)
+    assert "head dim 12" in _flash_shape_error(12, 12, 12)
+    assert "differ" in _flash_shape_error(192, 192, 128)  # multi-head latent attention
+    cfg = AutoConfig.for_model("qwen3", **{**COMMON, "head_dim": 12})
+    assert _config_head_dims(cfg) == (12, 12, 12)
+    assert _config_head_dims(AutoConfig.for_model("gpt2", n_embd=64, n_head=4)) == (16, 16, 16)
+
+    class MLA:
+        qk_head_dim, v_head_dim = 192, 128
+
+    assert _config_head_dims(MLA()) == (192, 192, 128)
+    model = AutoModelForCausalLM.from_config(cfg)
+    with pytest.raises(PackingError, match="head dim 12"):
+        prepare_model(model, "cuda:0")
+    prepare_model(model)  # the CPU reference path takes any head dim
+    q = torch.zeros(3, 2, 12)
+    assert _flash_capable(q, q, q) is False  # CPU / fp32: the reference path, as before
+
+
 def test_check_catches_a_layer_that_ignored_the_layout():
     model = _model("qwen3")
     support = prepare_model(model)
@@ -456,6 +561,24 @@ def test_packing_options_are_validated():
     with pytest.raises(RLConfigError, match="prompt_sharing on with train.packing tree"):
         config.validate()
     config.set("train.prompt_sharing", "auto")
+    config.set("rollout.routing_replay", "auto")  # a shared prefix is forwarded once: one routing to replay
+    with pytest.raises(RLConfigError, match="train.packing tree with rollout.routing_replay"):
+        config.validate()
+    config.set("train.packing", "varlen")
+    config.validate()
+    config.set("rollout.routing_replay", "off")
+    config.set("train.packing_gather_tokens", 4096)
+    with pytest.raises(RLConfigError, match="only used with train.packing tree"):
+        config.validate()
+    config.set("train.packing", "tree")
+    with pytest.raises(RLConfigError, match="must be >= train.micro_tokens"):
+        config.validate()
+    config.set("train.packing_gather_tokens", 65536)
+    config.validate()
+    config.train.packing_gather_tokens = -1
+    with pytest.raises(RLConfigError, match="packing_gather_tokens must be an integer >= 0"):
+        config.validate()
+    config.train.packing_gather_tokens = 0
     config.set("model.multimodal", True)
     config.set("rollout.backend", "vllm")
     with pytest.raises(RLConfigError, match="model.multimodal"):

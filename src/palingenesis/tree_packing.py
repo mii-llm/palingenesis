@@ -20,7 +20,10 @@ Layers.
     queries attend to the K/V of its root-to-segment path, gathered by index, in one variable-length flash
     call; the causal mask is aligned bottom-right, so a query sees every ancestor and its own causal past.
     Without a flash kernel (CPU, fp32) an explicit [N, N] ancestor mask gives the same result (a reference
-    path: memory grows with N^2).
+    path: memory grows with N^2). On a GPU in half precision there is no fallback: head dims the kernel does
+    not take (above 256, not a multiple of 8, or query / key dims other than the value's) are refused.
+    The gathered K/V (sum of the paths' lengths, about sequences x shared prefix) are transient per layer and
+    bounded per micro-batch by plan's gather_budget.
   * Gated DeltaNet (Qwen3.5, Qwen3-Next): the short causal convolution reads each segment's last
     kernel-1 inputs from its ancestors; the chunked delta rule runs once per level over the level's segments
     (the layer's own kernel, variable-length), each segment starting from its parent's final state. The
@@ -89,29 +92,40 @@ class _Trie:
         self.share = share
         self.roots: dict[int, _Node] = {}  # first token -> root (share); sequence index -> root (no sharing)
         self.unique = 0  # tokens in the trie
+        # K/V rows the tree attention gathers: every segment's root-to-segment path, i.e. the sum of the segments'
+        # end depths (PackedRow.gathered_tokens of the trie's layout)
+        self.gathered = 0
 
     def match(self, seq: np.ndarray) -> int:
         """How many leading tokens of `seq` the trie already holds."""
+        return self.probe(seq)[0]
+
+    def probe(self, seq: np.ndarray) -> tuple[int, int]:
+        """What inserting `seq` would cost: (the leading tokens the trie already holds, the K/V rows the insertion
+        adds to `gathered`). The new tokens are len(seq) - match. A new segment gathers its whole path (len(seq)
+        rows); when it leaves an existing segment midway, that segment is split and its upper part gathers its own
+        path as well."""
         if not self.share:
-            return 0
+            return 0, len(seq)
         pos, children = 0, self.roots
         while pos < len(seq):
             node = children.get(int(seq[pos]))
             if node is None:
-                return pos
+                return pos, len(seq)
             tokens = self.sequences[node.seq][node.lo : node.hi]
             common = _common(tokens, seq[pos:])
             pos += common
             if common < len(tokens):
-                return pos
+                return (pos, 0) if pos == len(seq) else (pos, len(seq) + pos)
             children = node.children
-        return pos
+        return pos, 0
 
     def insert(self, s: int) -> None:
         seq = self.sequences[s]
         if not self.share:
             self.roots[s] = _Node(s, 0, len(seq), None)
             self.unique += len(seq)
+            self.gathered += len(seq)
             return
         pos, children, parent = 0, self.roots, None
         while pos < len(seq):
@@ -119,6 +133,7 @@ class _Trie:
             if node is None:
                 children[int(seq[pos])] = _Node(s, pos, len(seq), parent)
                 self.unique += len(seq) - pos
+                self.gathered += len(seq)
                 return
             tokens = self.sequences[node.seq][node.lo : node.hi]
             common = _common(tokens, seq[pos:])
@@ -135,6 +150,7 @@ class _Trie:
             upper.children[int(self.sequences[node.seq][node.lo])] = node
             upper.children[int(seq[pos + common])] = _Node(s, pos + common, len(seq), upper)
             self.unique += len(seq) - pos - common
+            self.gathered += upper.hi + len(seq)
             return
 
     def path(self, s: int) -> list[tuple[_Node, int]]:
@@ -279,6 +295,11 @@ class PackedRow:
     def positions(self, sequence: int) -> np.ndarray:
         return self.sequence_positions[sequence]
 
+    def multiplicity(self) -> np.ndarray:
+        """[N] how many of the input sequences hold each packed token (1 everywhere on a flat row): what a token
+        counts for in statistics over the sequences' tokens (the MoE balancer's expert loads)."""
+        return np.bincount(np.concatenate(self.sequence_positions), minlength=self.num_tokens)
+
     # ---------------------------------------------------------------- device tensors
 
     def _cached(self, key, device, make):
@@ -405,16 +426,25 @@ class PackedRow:
         return self._cached(("padded", level), device, make)
 
     def routing(self, recorded: list, shape) -> torch.Tensor:
-        """MoE routing replay: [1, N, *shape] expert indices from each sequence's recorded routing (the first
-        sequence that recorded a shared position wins), -1 where none."""
+        """MoE routing replay: [1, N, *shape] expert indices from each sequence's recorded routing, -1 where
+        none. A token is forwarded once, so it can replay one routing only: sequences that share a position must
+        have recorded the same experts for it, or PackingError (the engine routes every request by itself, and two
+        requests with the same prefix need not agree; flat rows share nothing)."""
         out = np.full((self.num_tokens, *shape), -1, dtype=np.int64)
         filled = np.zeros(self.num_tokens, dtype=bool)
         for s, r in enumerate(recorded):
             if r is None or not len(r) or tuple(r.shape[1:]) != tuple(shape):
                 continue
             pos = self.sequence_positions[s][: len(r)]
-            take = ~filled[pos]
-            out[pos[take]] = np.asarray(r[: len(pos)])[take].astype(np.int64)
+            values = np.asarray(r[: len(pos)]).astype(np.int64)
+            seen = filled[pos]
+            if seen.any() and not np.array_equal(out[pos[seen]], values[seen]):
+                raise PackingError(
+                    "routing replay on a prefix tree: sequences that share a prefix recorded different experts for "
+                    "it, and the tree forwards a shared token once. Use train.packing varlen or padded with "
+                    "rollout.routing_replay."
+                )
+            out[pos[~seen]] = values[~seen]
             filled[pos] = True
         return torch.from_numpy(out)[None]
 
@@ -432,13 +462,20 @@ def plan(
     trained: list[int],
     budget: int,
     share: bool,
+    gather_budget: int | None = None,
 ) -> list[list[int]]:
     """Micro-batches (lists of sequence indices) of at most `budget` packed tokens and `budget` loss terms.
 
     varlen (share False): first-fit decreasing on the sequences' lengths.
     tree (share True): a group at a time, longest groups first; each sequence goes to the micro-batch whose trie
     already holds the longest prefix of it, among those it fits (its new tokens counted, not its length).
-    A sequence longer than the budget gets a micro-batch of its own."""
+    A sequence longer than the budget gets a micro-batch of its own.
+
+    `gather_budget` (tree): at most this many gathered K/V rows per micro-batch (None: no bound). The packed
+    tokens count a shared prefix once, but every segment's attention reads its whole root-to-segment path, so a
+    layer gathers about (sequences x shared prefix) K/V rows: a 12k-token prompt with 32 completions is ~13k
+    packed tokens and ~390k gathered rows. A group that exceeds it is spread over several micro-batches (its
+    prefix is then forwarded once in each)."""
     arrays = [np.asarray(s, dtype=np.int64) for s in sequences]
     if not share:
         order = sorted(range(len(arrays)), key=lambda i: len(arrays[i]), reverse=True)
@@ -466,10 +503,14 @@ def plan(
         for i in sorted(members, key=lambda i: len(arrays[i]), reverse=True):
             best, best_match = -1, -1
             for b, trie in enumerate(tries):
-                match = trie.match(arrays[i])
-                if trie.unique + len(arrays[i]) - match <= budget and terms[b] + trained[i] <= budget:
-                    if match > best_match:
-                        best, best_match = b, match
+                match, gathered = trie.probe(arrays[i])
+                if (
+                    trie.unique + len(arrays[i]) - match <= budget
+                    and terms[b] + trained[i] <= budget
+                    and (gather_budget is None or trie.gathered + gathered <= gather_budget)
+                    and match > best_match
+                ):
+                    best, best_match = b, match
             if best < 0:
                 tries.append(_Trie(arrays, share=True))
                 terms.append(0)
@@ -484,14 +525,36 @@ def plan(
 # ── attention ──────────────────────────────────────────────────────────────────
 
 
+FLASH_MAX_HEAD_DIM = 256  # FlashAttention-2's kernels are built for head dims up to 256, multiples of 8
+BACKWARD_GATHER_ROWS = 65536  # gathered K/V gradient rows summed into the shared tokens per slice (fp32)
+
+
+def _flash_shape_error(q_dim: int, k_dim: int, v_dim: int) -> str | None:
+    """Why the variable-length flash kernel cannot take these head dims (None: it can)."""
+    if not (q_dim == k_dim == v_dim):
+        return (
+            f"query / key / value head dims {q_dim} / {k_dim} / {v_dim} differ (the kernel takes one head dim, "
+            "which rules out e.g. multi-head latent attention)"
+        )
+    if q_dim % 8 or q_dim > FLASH_MAX_HEAD_DIM:
+        return f"head dim {q_dim} (the kernel takes multiples of 8 up to {FLASH_MAX_HEAD_DIM})"
+    return None
+
+
 def _flash_capable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-    return (
-        q.is_cuda
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and q.shape[-1] % 8 == 0
-        and q.shape[-1] <= 256
-        and k.shape[-1] == v.shape[-1] == q.shape[-1]
-    )
+    """Whether the variable-length flash kernel runs these tensors: CUDA, half precision, head dims it takes. On
+    CUDA in half precision (training under bf16 autocast) head dims it cannot take are refused (PackingError): the
+    explicit [N, N] mask is a reference path for CPU and fp32, not something to fall back to silently at training
+    sizes."""
+    if not (q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)):
+        return False
+    error = _flash_shape_error(q.shape[-1], k.shape[-1], v.shape[-1])
+    if error is not None:
+        raise PackingError(
+            f"packed attention needs the variable-length flash kernel on a GPU, which does not take {error}. "
+            "Use train.packing padded."
+        )
+    return True
 
 
 class TreeFlashAttention(torch.autograd.Function):
@@ -530,8 +593,15 @@ class TreeFlashAttention(torch.autograd.Function):
             unused,
             scale=ctx.scale,
         )
-        dk = torch.zeros(k.shape, dtype=torch.float32, device=k.device).index_add_(0, kv_index, dkg.float())
-        dv = torch.zeros(v.shape, dtype=torch.float32, device=v.device).index_add_(0, kv_index, dvg.float())
+        del kg, vg
+        # shared tokens: the gradients of every path through them, summed in fp32 a slice of gathered rows at a
+        # time (an fp32 copy of all the gathered rows would double the backward's peak)
+        dk = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
+        dv = torch.zeros(v.shape, dtype=torch.float32, device=v.device)
+        for a in range(0, kv_index.shape[0], BACKWARD_GATHER_ROWS):
+            index = kv_index[a : a + BACKWARD_GATHER_ROWS]
+            dk.index_add_(0, index, dkg[a : a + BACKWARD_GATHER_ROWS].float())
+            dv.index_add_(0, index, dvg[a : a + BACKWARD_GATHER_ROWS].float())
         return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None, None, None, None
 
 
@@ -832,15 +902,32 @@ def _attention_modules(model: nn.Module, linear: set) -> set:
     }
 
 
+def _config_head_dims(config) -> tuple[int, int, int] | None:
+    """(query, key, value) head dims of a model config's softmax attention, or None when it does not say."""
+    qk, v = getattr(config, "qk_head_dim", None), getattr(config, "v_head_dim", None)
+    if isinstance(qk, int) and isinstance(v, int):  # multi-head latent attention (DeepSeek-V3 family)
+        return qk, qk, v
+    dim = getattr(config, "head_dim", None)
+    if not isinstance(dim, int):
+        hidden, heads = getattr(config, "hidden_size", None), getattr(config, "num_attention_heads", None)
+        if not (isinstance(hidden, int) and isinstance(heads, int) and heads > 0):
+            return None
+        dim = hidden // heads
+    return dim, dim, dim
+
+
 def prepare_model(model: nn.Module, device=None) -> PackingSupport:
     """Check that `model` can run packed rows exactly and route its layers; raise PackingError otherwise.
     Softmax attention runs through palingenesis.seco's attention route (sdpa models are rerouted here). On a
-    CUDA `device`, the flash tree attention is checked against the reference once (verify_flash_tree)."""
+    CUDA `device`, the model's head dims must be ones the variable-length flash kernel takes (no fallback to the
+    explicit [N, N] mask there), and the flash tree attention is checked against the reference once
+    (verify_flash_tree)."""
     from transformers import PretrainedConfig
 
     from palingenesis.seco import _ATTN, use_chunk_attention
 
     use_chunk_attention(model)
+    on_cuda = device is not None and torch.device(device).type == "cuda"
     seen = set()
     for m in model.modules():
         cfg = getattr(m, "config", None)
@@ -868,6 +955,10 @@ def prepare_model(model: nn.Module, device=None) -> PackingSupport:
                 f"packing needs the model's attention configured for sdpa (palingenesis routes it), got "
                 f"{implementation!r}."
             )
+        dims = _config_head_dims(text) if on_cuda and (types & _ATTENTION_LAYER_TYPES or not types) else None
+        error = _flash_shape_error(*dims) if dims else None
+        if error is not None:
+            raise PackingError(f"packing needs the variable-length flash kernel on a GPU, which does not take {error}.")
     linear = {id(m) for m in model.modules() if is_gated_delta_net(m)}
     recurrent = sorted(
         name
@@ -882,7 +973,7 @@ def prepare_model(model: nn.Module, device=None) -> PackingSupport:
     for m in model.modules():
         if id(m) in linear:
             _PackedLinearAttention.of(m)
-    if device is not None and torch.device(device).type == "cuda":
+    if on_cuda:
         for dtype in (torch.bfloat16, torch.float16):
             verify_flash_tree(device, dtype)
     return PackingSupport(attention=_attention_modules(model, linear), linear=linear)

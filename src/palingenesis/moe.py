@@ -278,6 +278,7 @@ class RouterBalancer:
         self._synced = False
         self._thread = 0
         self._mask: Tensor | None = None
+        self._weight: Tensor | None = None  # per-token counts (begin's token_weight)
         self._replay: Tensor | None = None
         self._grad_accum = 1
         self._local: Tensor | None = None  # this micro-batch, this rank: [layers, width]
@@ -368,6 +369,7 @@ class RouterBalancer:
         grad_accum: int = 1,
         replay: Tensor | None = None,
         tokens: int | None = None,
+        token_weight: Tensor | None = None,
     ) -> None:
         """Before a micro-batch's forward.
 
@@ -380,12 +382,17 @@ class RouterBalancer:
                     micro-batch are not all run before its first backward (prompt-sharing trees:
                     branches run and backpropagate one group at a time). The loads are then
                     those of the tokens routed before the first backward. One process only.
+        token_weight: [B, S] what each token counts for in the loads, the losses and the statistics (None: 1).
+                    A forward that runs a token several sequences share once (a packed prefix tree,
+                    palingenesis.tree_packing) passes the number of sequences through it, so the loads are
+                    those of the sequences' tokens. 0 at padding.
         """
         if self._active:
             self.end()
         device = self.layers[0].router.weight.device
         self._mask = token_mask.to(device).bool() if token_mask is not None else None
         self._replay = replay.to(device) if replay is not None else None
+        self._weight = token_weight.to(device, torch.float64) if token_weight is not None else None
         self._grad_accum = max(int(grad_accum), 1)
         self._tokens = tokens
         self._local = torch.zeros(len(self.layers), self._width, dtype=torch.float64, device=device)
@@ -428,7 +435,7 @@ class RouterBalancer:
         """After the micro-batch's backward (or when it had none)."""
         self.sync()
         self._active = False
-        self._mask = self._replay = None
+        self._mask = self._replay = self._weight = None
         self._logits.clear()
         if self._token is not None:
             try:
@@ -503,6 +510,23 @@ class RouterBalancer:
                 replay = None
         return mask, replay, weight
 
+    def _token_weight(self, tokens: int, mask: Tensor | None) -> Tensor | None:
+        """[N] float64 what each token of the forward being run counts for (begin's token_weight, 0 where `mask`
+        leaves a token out), or `mask` when there are no weights."""
+        if self._weight is None:
+            return mask
+        window = _WINDOW.get()
+        lo, hi = window[:2] if window is not None else (0, None)
+        counts = self._weight[:, lo:hi].reshape(-1)
+        if counts.numel() != tokens:
+            self._warn(
+                "weight",
+                f"MoE: the token weights cover {counts.numel()} tokens but {tokens} were routed; counting every "
+                "token once for such forwards",
+            )
+            return mask
+        return counts if mask is None else counts * mask
+
     def _experts_hook(self, layer: MoELayer):
         def hook(module, args):
             # only the thread that trains: a rollout thread may run the same model between micro-batches
@@ -519,6 +543,7 @@ class RouterBalancer:
             replayed = mismatched = None
             if replay is not None and layer.gate_normalised is not None:
                 index, weights, replayed, mismatched = _replay_routing(layer, flat_logits, index, weights, replay, mask)
+            mask = self._token_weight(flat_logits.shape[0], mask)  # (a bool mask, or float counts per token)
             if not self._synced:
                 self._measure(layer, flat_logits.detach(), index, mask, replayed, mismatched)
             if self.trains_routers and torch.is_grad_enabled() and logits.requires_grad:
@@ -537,11 +562,15 @@ class RouterBalancer:
         if mask is not None:
             keep = mask.to(p.dtype)
             p, entropy, lse_sq = p * keep[:, None], entropy * keep, lse_sq * keep
-            chosen = chosen[mask]
             tokens = keep.sum()
+            if mask.dtype == torch.bool:
+                row[:e] += torch.bincount(chosen[mask].reshape(-1), minlength=e)[:e]
+            else:  # per-token counts: every choice of a token counts as often as the token
+                counts = mask.to(row.dtype)[:, None].expand(chosen.shape).reshape(-1)
+                row[:e] += torch.bincount(chosen.reshape(-1), weights=counts, minlength=e)[:e]
         else:
             tokens = torch.tensor(float(logits.shape[0]), device=logits.device)
-        row[:e] += torch.bincount(chosen.reshape(-1), minlength=e)[:e]
+            row[:e] += torch.bincount(chosen.reshape(-1), minlength=e)[:e]
         m = self.max_experts
         row[m : m + e] += p.sum(0)
         row[2 * m + _TOKENS] += tokens

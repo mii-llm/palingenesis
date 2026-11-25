@@ -246,8 +246,9 @@ experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.
 
 RL configs lay out the policy step's micro-batches with `train.packing` (`padded` / `varlen` / `tree`, default `padded` until measured on a GPU):
 `varlen` packs a micro-batch's trajectories end to end in one row without padding, `tree` packs their prefix trie so a group's prompt and any other
-shared prefix is forwarded once; `train.micro_tokens` then bounds the packed (unique) tokens. Same log-probs and gradients as `padded`. Needs
-`sdpa` attention and full-attention / Gated DeltaNet layers; not with `model.multimodal`. See [RL: packing micro-batches](../guides/rl.md#packing-micro-batches).
+shared prefix is forwarded once; `train.micro_tokens` then bounds the packed (unique) tokens, and `train.packing_gather_tokens` (int, `0` = 8 x
+`micro_tokens`) the key / value rows a `tree` micro-batch's attention gathers (every branch reads its whole path: about trajectories x shared prefix). Same log-probs and gradients as `padded`. Needs
+`sdpa` attention and full-attention / Gated DeltaNet layers; not with `model.multimodal`, and `tree` not with `rollout.routing_replay`. See [RL: packing micro-batches](../guides/rl.md#packing-micro-batches).
 
 ### RL: truncated sampling and score centering
 
