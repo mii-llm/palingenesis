@@ -40,9 +40,13 @@ import logging
 import threading
 import time
 
+from palingenesis.opd.rollout import Candidates
 from palingenesis.rl.concurrency import AdmissionGate, ConcurrencySettings, EngineLoad
 from palingenesis.rl.generation import Generation
 from palingenesis.rl.pool.protocol import Staging, receive, send
+
+# identity settings a worker may exceed (it serves adapters up to its LoRA rank, log-probs up to its maximum)
+_AT_LEAST = ("lora_rank", "max_logprobs")
 
 logger = logging.getLogger(__name__)
 
@@ -163,15 +167,16 @@ class RemotePool:
         differ = [
             f"{key}: the trainer has {mine!r}, the worker {theirs[key]!r}"
             for key, mine in self.identity.items()
-            # (the worker serves adapters up to its rank; every other setting must be the same)
-            if key in theirs and (theirs[key] < mine if key == "lora_rank" else theirs[key] != mine)
+            # (the worker serves adapters up to its rank and log-probs up to its maximum; every other setting must
+            # be the same)
+            if key in theirs and (theirs[key] < mine if key in _AT_LEAST else theirs[key] != mine)
         ]
         if differ:
             raise ValueError(
                 f"engine worker {engine.address} was started with other settings than this run's "
                 f"({'; '.join(differ)}). Start it with the flags `pgs scenario plan --engine-gpus` prints "
                 "(or the worker's --model, --stop-tokens, --chat-template-kwargs, --max-model-len, --fp32-head, "
-                "--lora-rank)."
+                "--lora-rank, --max-logprobs)."
             )
 
     def _lose(self, engine: _Engine, reason: str, closing: bool = False) -> None:
@@ -190,7 +195,9 @@ class RemotePool:
     async def _listen(self, engine: _Engine) -> None:
         try:
             while True:
-                header, _ = await receive(engine.reader)
+                header, tensors = await receive(engine.reader)
+                if tensors:  # a generation's candidates (opd.rollout.Candidates)
+                    header["tensors"] = tensors
                 future = engine.waiting.pop(header.get("id"), None)
                 if future is not None and not future.done():
                     future.set_result(header)
@@ -256,7 +263,12 @@ class RemotePool:
             if "error" in reply:
                 raise RuntimeError(f"engine worker {engine.address}: {reply['error']}")
             return Generation(
-                reply["ids"], reply["logprobs"], reply["finish"], reply["version"], reply["first_version"]
+                reply["ids"],
+                reply["logprobs"],
+                reply["finish"],
+                reply["version"],
+                reply["first_version"],
+                candidates=Candidates.from_tensors(reply.get("tensors") or {}),
             )
 
     async def _load(self, address: str) -> EngineLoad | None:

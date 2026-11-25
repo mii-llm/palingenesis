@@ -465,7 +465,9 @@ class RLPipeline:
                 }
                 timing["turns"].append(turn_timing)
                 logprobs = out.logprobs if out.logprobs or training else [0.0] * len(out.ids)
-                trajectory.append_generated(out.ids, logprobs, out.version, out.first_version)
+                trajectory.append_generated(
+                    out.ids, logprobs, out.version, out.first_version, getattr(out, "candidates", None)
+                )
                 if training:
                     trajectory.extend_routing(out.routed_experts)
                 trajectory.messages.append(parsed.message())

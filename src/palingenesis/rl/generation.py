@@ -40,12 +40,14 @@ class Generation:
     version: int  # the policy version that finished the turn
     first_version: int | None = None  # the version that sampled its first token (None: `version`)
     routed_experts: object | None = None  # MoE routing replay: see opd.rollout.Rollout
+    candidates: object | None = None  # opd.rollout.Candidates (Sampling.candidates > 0), else None
 
 
 def _generation(r) -> Generation:
     first = getattr(r, "first_version", None)
     routed = getattr(r, "routed_experts", None)
-    return Generation(list(r.completion_ids), list(r.logprobs), r.finish_reason, r.policy_version, first, routed)
+    top = getattr(r, "candidates", None)
+    return Generation(list(r.completion_ids), list(r.logprobs), r.finish_reason, r.policy_version, first, routed, top)
 
 
 class GenerationClient:

@@ -17,6 +17,11 @@ policy mu of their importance ratios.
 `generate(prompts, max_new_tokens, temperature)` takes the sampling as a float
 (temperature, no truncation; 0 = greedy), a Sampling, or one Sampling per prompt.
 
+Candidates. A Sampling with `candidates` k > 0 also returns, per sampled token, the sampler's k most likely
+tokens with their processed log-probs (after temperature and top-k / top-p), the finite ones only, most likely
+first (Rollout.candidates). With top-k / top-p the tokens of finite log-prob are the support the token was drawn
+from: RL renormalises the trained policy over it (palingenesis.rl.losses.sampled_logprobs).
+
 vLLM is imported lazily: without it installed, the hf backend works as before.
 """
 
@@ -25,6 +30,7 @@ import base64
 import contextlib
 import json
 import logging
+import math
 import os
 import pickle
 import re
@@ -38,12 +44,15 @@ import urllib.request
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import Tensor, nn
 
 from palingenesis.accelerator import is_rocm
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +67,124 @@ class Sampling:
     top_p: float = 1.0
     top_k: int = 0
     presence_penalty: float = 0.0
+    # Per sampled token, also return the sampler's `candidates` most likely tokens and their processed log-probs
+    # (Rollout.candidates); 0 = none. vLLM bounds it with its max_logprobs.
+    candidates: int = 0
 
     @property
     def truncated(self) -> bool:
         return self.top_p < 1.0 or self.top_k > 0
+
+
+# vLLM's OpenAI server writes a log-prob of -inf (a token outside the sampler's support) as -9999.0
+VLLM_LOGPROB_FLOOR = -9999.0
+
+
+@dataclass
+class Candidates:
+    """The sampler's most likely tokens at each sampled position of a completion, ragged and flat: position t has
+    the `counts[t]` tokens ids[o_t : o_t + counts[t]] with processed log-probs logprobs[o_t : o_t + counts[t]]
+    (o_t = counts[:t].sum()), most likely first; tokens of log-prob -inf (outside the sampler's support) are left
+    out."""
+
+    counts: "np.ndarray"  # int32 [T]
+    ids: "np.ndarray"  # int32 [counts.sum()]
+    logprobs: "np.ndarray"  # float32 [counts.sum()]
+
+    @classmethod
+    def from_rows(cls, rows: list[tuple[list[int], list[float]]]) -> "Candidates":
+        """From per-position (ids, log-probs) lists, in any order; non-finite log-probs are dropped."""
+        import numpy as np
+
+        counts, ids, logprobs = [], [], []
+        for row_ids, row_logprobs in rows:
+            kept = sorted(
+                ((float(lp), int(i)) for i, lp in zip(row_ids, row_logprobs) if math.isfinite(lp)),
+                key=lambda x: -x[0],
+            )
+            kept = [(lp, i) for lp, i in kept if lp > VLLM_LOGPROB_FLOOR]
+            counts.append(len(kept))
+            ids += [i for _, i in kept]
+            logprobs += [lp for lp, _ in kept]
+        return cls(
+            np.asarray(counts, dtype=np.int32), np.asarray(ids, dtype=np.int32), np.asarray(logprobs, dtype=np.float32)
+        )
+
+    @classmethod
+    def empty(cls, positions: int = 0) -> "Candidates":
+        """`positions` positions without candidates (context, a forced prefix)."""
+        import numpy as np
+
+        return cls(np.zeros(positions, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32))
+
+    def __len__(self) -> int:
+        return len(self.counts)
+
+    def head(self, positions: int) -> "Candidates":
+        """The first `positions` positions."""
+        end = int(self.counts[:positions].sum())
+        return Candidates(self.counts[:positions], self.ids[:end], self.logprobs[:end])
+
+    @classmethod
+    def join(cls, parts: list["Candidates"]) -> "Candidates":
+        """The positions of `parts`, one after the other."""
+        import numpy as np
+
+        return cls(
+            np.concatenate([p.counts for p in parts]).astype(np.int32, copy=False),
+            np.concatenate([p.ids for p in parts]).astype(np.int32, copy=False),
+            np.concatenate([p.logprobs for p in parts]).astype(np.float32, copy=False),
+        )
+
+    def select(self, positions: list[int]) -> "Candidates":
+        """The candidates of `positions` (indices into this completion), in that order."""
+        import numpy as np
+
+        offsets = np.zeros(len(self.counts) + 1, dtype=np.int64)
+        np.cumsum(self.counts, out=offsets[1:])
+        index = np.asarray(positions, dtype=np.int64)
+        counts = self.counts[index]
+        starts = np.repeat(offsets[index], counts)
+        within = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+        flat = starts + within
+        return Candidates(counts.astype(np.int32), self.ids[flat], self.logprobs[flat])
+
+    def tensors(self, prefix: str = "candidates") -> dict[str, Tensor]:
+        """As host tensors (the engine pool's wire format, palingenesis.rl.pool)."""
+        return {
+            f"{prefix}.counts": torch.from_numpy(self.counts),
+            f"{prefix}.ids": torch.from_numpy(self.ids),
+            f"{prefix}.logprobs": torch.from_numpy(self.logprobs),
+        }
+
+    @classmethod
+    def from_tensors(cls, tensors: dict[str, Tensor], prefix: str = "candidates") -> "Candidates | None":
+        if f"{prefix}.counts" not in tensors:
+            return None
+        return cls(*(tensors[f"{prefix}.{key}"].numpy() for key in ("counts", "ids", "logprobs")))
+
+
+def candidates_from_steps(steps, k: int) -> Candidates:
+    """Candidates from vLLM's per-token log-probs ({token id: Logprob} per position; the sampled token is in it even
+    outside the top k): the k most likely finite entries of each position."""
+    rows = []
+    for step in steps:
+        ranked = sorted(((v.logprob, int(i)) for i, v in (step or {}).items()), key=lambda x: -x[0])[:k]
+        rows.append(([i for _, i in ranked], [lp for lp, _ in ranked]))
+    return Candidates.from_rows(rows)
+
+
+def candidates_from_openai(top_logprobs, k: int) -> Candidates:
+    """Candidates from an OpenAI completions `top_logprobs` list ({"token_id:<id>": log-prob} per position, as vLLM
+    writes it with return_tokens_as_token_ids; the sampled token may be in it beyond the top k)."""
+    rows = []
+    for step in top_logprobs or []:
+        ranked = sorted(
+            ((float(lp), int(str(token).removeprefix("token_id:"))) for token, lp in (step or {}).items()),
+            key=lambda x: -x[0],
+        )[:k]
+        rows.append(([i for _, i in ranked], [lp for lp, _ in ranked]))
+    return Candidates.from_rows(rows)
 
 
 def samplings(spec, n: int) -> list[Sampling]:
@@ -101,6 +224,8 @@ class Rollout:
     # MoE policies, with routing replay: the experts the engine routed each token it processed to,
     # [prompt + completion - 1, MoE layers, top_k] (the last sampled token was never forwarded); None otherwise.
     routed_experts: object | None = None
+    # Sampling.candidates > 0: the sampler's most likely tokens at each sampled position; None otherwise.
+    candidates: Candidates | None = None
 
 
 class RolloutEngine(Protocol):
@@ -168,10 +293,17 @@ class _RecordLogprobs:
         self.prompt_width = prompt_width  # generated tokens start here; only they get the presence penalty
         self.previous: Tensor | None = None
         self.logprobs: list[Tensor] = []
+        self.top: list[tuple[Tensor, Tensor]] = []  # Sampling.candidates: per step ([B, k] log-probs, [B, k] ids)
+
+    def _record(self, sampled: Tensor) -> None:
+        self.logprobs.append(self.previous.gather(1, sampled).squeeze(1))
+        if self.sampling.candidates:
+            values, ids = self.previous.topk(min(self.sampling.candidates, self.previous.shape[-1]), dim=-1)
+            self.top.append((values.cpu(), ids.cpu()))
 
     def __call__(self, input_ids: Tensor, scores: Tensor) -> Tensor:
         if self.previous is not None:
-            self.logprobs.append(self.previous.gather(1, input_ids[:, -1:]).squeeze(1))
+            self._record(input_ids[:, -1:])
         if self.sampling.presence_penalty and input_ids.shape[1] > self.prompt_width:
             seen = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, input_ids[:, self.prompt_width :], True)
             scores = scores - self.sampling.presence_penalty * seen
@@ -182,8 +314,13 @@ class _RecordLogprobs:
     def finish(self, sequences: Tensor) -> Tensor:
         """[B, steps] log-probs of the generated tokens."""
         if self.previous is not None:
-            self.logprobs.append(self.previous.gather(1, sequences[:, -1:]).squeeze(1))
+            self._record(sequences[:, -1:])
+            self.previous = None
         return torch.stack(self.logprobs, 1) if self.logprobs else sequences.new_zeros((sequences.shape[0], 0))
+
+    def candidates(self, row: int, steps: int) -> Candidates:
+        """Row `row`'s candidates over its first `steps` sampled tokens (after finish)."""
+        return Candidates.from_rows([(ids[row].tolist(), values[row].tolist()) for values, ids in self.top[:steps]])
 
 
 class HFRollout:
@@ -288,6 +425,7 @@ class HFRollout:
                         tokens = generated[row].tolist()
                         cut = next((k + 1 for k, t in enumerate(tokens) if t in self.stop_ids), None)
                         tokens = tokens[:cut] if cut else tokens
+                        top = recorder.candidates(row, len(tokens)) if recorder and sampling.candidates else None
                         out[i] = Rollout(
                             tokens,
                             logprobs[row][: len(tokens)] if logprobs else [],
@@ -298,6 +436,7 @@ class HFRollout:
                                 if experts is not None
                                 else None
                             ),
+                            candidates=top,
                         )
         finally:
             self.model.train(was_training)
@@ -435,6 +574,7 @@ class VLLMColocateRollout:
         self.asleep = False  # KV cache released
         self.prompt_tokens = self.cached_tokens = 0  # streaming: prefill accounting
         self.started: dict[str, int] = {}  # streaming: request id -> the version its decoding started with
+        self.candidates: dict[str, int] = {}  # streaming: request id -> its Sampling.candidates (when > 0)
         self.adapters: dict = {}  # LoRA adapters by name (load_adapter), for requests that name one
         self.adapter_ids: dict[str, int] = {}
 
@@ -527,8 +667,8 @@ class VLLMColocateRollout:
             **self._lora(adapter),
         )
         rollouts: list[Rollout | None] = [None] * len(prompts)
-        for g, (_, indices), out in zip(greedy, requests, outputs):
-            got = self._rollouts(out)
+        for g, ((_, _, sampling, _), indices), out in zip(greedy, requests, outputs):
+            got = self._rollouts(out, candidates=0 if g else samplings(sampling, 1)[0].candidates)
             for k, i in enumerate(indices):
                 rollouts[i] = got[0] if g else got[k]
         return rollouts
@@ -547,20 +687,22 @@ class VLLMColocateRollout:
             top_p=sampling.top_p,
             top_k=sampling.top_k,
             presence_penalty=sampling.presence_penalty,
-            logprobs=0 if sampling.temperature > 0 else None,
+            # the sampled token's log-prob, and Sampling.candidates more (processed: after temperature, top-k, top-p)
+            logprobs=sampling.candidates if sampling.temperature > 0 else None,
             stop_token_ids=list(self.stop_ids),
             detokenize=False,
             **kwargs,
         )
 
-    def _rollouts(self, out, first_version: int | None = None) -> list[Rollout]:
+    def _rollouts(self, out, first_version: int | None = None, candidates: int = 0) -> list[Rollout]:
         rollouts = []
         for o in out.outputs:
             tokens = list(o.token_ids)
             logprobs = [step[t].logprob for step, t in zip(o.logprobs, tokens)] if o.logprobs else []
             finish = "stop" if o.finish_reason == "stop" else "length"
             routed = getattr(o, "routed_experts", None)  # with enable_return_routed_experts (MoE routing replay)
-            rollouts.append(Rollout(tokens, logprobs, finish, self.version, first_version, routed))
+            top = candidates_from_steps(o.logprobs, candidates) if candidates and o.logprobs else None
+            rollouts.append(Rollout(tokens, logprobs, finish, self.version, first_version, routed, top))
         return rollouts
 
     # Streaming (continuous batching across calls): requests join the running batch the moment
@@ -579,6 +721,9 @@ class VLLMColocateRollout:
         params = self._params(n, max_new_tokens, temperature, final_only=True)
         self.llm.llm_engine.add_request(request_id, self._request(prompt, images), params, **self._lora(adapter))
         self.started[request_id] = self.version  # when added, not at the first token: an upper bound on staleness
+        (sampling,) = samplings(temperature, 1)
+        if sampling.candidates and sampling.temperature > 0:
+            self.candidates[request_id] = sampling.candidates
 
     def load_stats(self) -> dict | None:
         """The engine's load (rollout.concurrency kv on an engine worker, palingenesis.rl.concurrency): KV-cache
@@ -610,7 +755,13 @@ class VLLMColocateRollout:
         for out in finished:
             self.prompt_tokens += len(out.prompt_token_ids or ())
             self.cached_tokens += out.num_cached_tokens or 0
-        return [(out.request_id, self._rollouts(out, self.started.pop(out.request_id, None))) for out in finished]
+        return [
+            (
+                out.request_id,
+                self._rollouts(out, self.started.pop(out.request_id, None), self.candidates.pop(out.request_id, 0)),
+            )
+            for out in finished
+        ]
 
 
 def _die_with_parent() -> None:
@@ -803,18 +954,30 @@ class VLLMServerRollout:
                 top_p=sampling.top_p,
                 top_k=sampling.top_k,
                 presence_penalty=sampling.presence_penalty,
-                logprobs=0 if sampling.temperature > 0 else None,
+                logprobs=sampling.candidates if sampling.temperature > 0 else None,
                 stop_token_ids=list(self.stop_ids),
                 return_token_ids=True,
                 skip_special_tokens=False,
+                # candidates: top_logprobs keyed by token id ("token_id:<id>"), not by text
+                **({"return_tokens_as_token_ids": True} if sampling.candidates else {}),
             )
+            want = sampling.candidates if sampling.temperature > 0 else 0
             for i, choice in zip(idx, choices):
                 logprobs = (choice.get("logprobs") or {}).get("token_logprobs") or []
+                top = None
+                if want:
+                    top = candidates_from_openai((choice.get("logprobs") or {}).get("top_logprobs"), want)
+                    if len(top) != len(choice["token_ids"]):
+                        raise RuntimeError(
+                            f"vLLM server: top log-probs for {len(top)} of {len(choice['token_ids'])} sampled tokens "
+                            "(candidates need one entry per token)"
+                        )
                 out[i] = Rollout(
                     choice["token_ids"],
                     logprobs,
                     "stop" if choice["finish_reason"] == "stop" else "length",
                     self.version,
                     routed_experts=decode_routed_experts(choice.get("routed_experts")),
+                    candidates=top,
                 )
         return out

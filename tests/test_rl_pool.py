@@ -42,16 +42,19 @@ class WireEngine:
         self.calls = []
 
     def generate(self, prompts, max_new_tokens, temperature, images=None, adapter=""):
-        from palingenesis.opd.rollout import Rollout, Sampling
+        from palingenesis.opd.rollout import Candidates, Rollout, Sampling
 
         version, total = self.version, self.total
         self.calls.append((adapter, [list(p) for p in prompts]))
         while self.hold and os.path.exists(self.hold):
             time.sleep(0.01)
         ids = [version, int(round(total)), ord(adapter[0]) if adapter else 0]
+        top = None
         if isinstance(temperature, Sampling):
             ids.append(temperature.top_k)
-        return [Rollout(list(ids), [-0.5] * len(ids), "stop", -1) for _ in prompts]
+            if temperature.candidates:  # each token and the next id, as the sampler's candidates
+                top = Candidates.from_rows([([t, t + 1], [-0.25, -1.5]) for t in ids])
+        return [Rollout(list(ids), [-0.5] * len(ids), "stop", -1, candidates=top) for _ in prompts]
 
     def update_weights(self, named, version):
         self.total = float(sum(tensor.double().sum() for _, tensor in named))
@@ -632,6 +635,37 @@ def test_a_worker_must_serve_adapters_of_the_run_s_rank():
         RemotePool([f"127.0.0.1:{port}"], identity={"lora_rank": 4}, pin=False).close()
         with pytest.raises(ValueError, match="lora_rank: the trainer has 16, the worker 8"):
             RemotePool([f"127.0.0.1:{port}"], identity={"lora_rank": 16}, pin=False)
+    finally:
+        wait_for(lambda: not asyncio.all_tasks(loop))  # (the workers' connections have ended)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(10)
+        worker.client.close()
+
+
+def test_the_sampler_s_candidates_travel_with_a_completion_and_the_worker_must_serve_enough():
+    """rollout.top_p / top_k, loss.score_centering: the candidates come back as tensors next to the reply; a run that
+    needs more log-probs than the worker's --max-logprobs is refused at the hello."""
+    from palingenesis.opd.rollout import Sampling
+
+    worker = EngineWorker(WireEngine(), identity={"max_logprobs": 20})
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    port = asyncio.run_coroutine_threadsafe(worker.serve(), loop).result(30)
+    try:
+        pool = RemotePool([f"127.0.0.1:{port}"], identity={"max_logprobs": 12}, pin=False)
+        try:
+            request = pool._request([1, 2], 4, Sampling(0.7, 0.9, 4, candidates=12), "")
+            out = asyncio.run_coroutine_threadsafe(request, pool.loop).result(30)
+            assert out.candidates.counts.tolist() == [2] * len(out.ids)
+            assert out.candidates.ids.tolist()[:2] == [out.ids[0], out.ids[0] + 1]
+            assert out.candidates.logprobs.tolist()[:2] == [-0.25, -1.5]
+            plain = asyncio.run_coroutine_threadsafe(pool._request([1, 2], 4, 1.0, ""), pool.loop).result(30)
+            assert plain.candidates is None
+        finally:
+            pool.close()
+        with pytest.raises(ValueError, match="max_logprobs: the trainer has 28, the worker 20"):
+            RemotePool([f"127.0.0.1:{port}"], identity={"max_logprobs": 28}, pin=False)
     finally:
         wait_for(lambda: not asyncio.all_tasks(loop))  # (the workers' connections have ended)
         loop.call_soon_threadsafe(loop.stop)

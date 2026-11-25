@@ -190,9 +190,9 @@ class EngineWorker:
             pushing = header.get("op") == "weights"
             await self._gate(header)
 
-        async def reply(header: dict) -> None:
+        async def reply(header: dict, tensors: dict | None = None) -> None:
             async with lock:
-                await send(writer, header)
+                await send(writer, header, tensors)
 
         try:
             while True:
@@ -269,6 +269,8 @@ class EngineWorker:
             adapter = header.get("adapter") or self.default_adapter
             extra = {"adapter": adapter} if adapter else {}
             out = await self.client.generate(header["prompt"], header["max_new_tokens"], temperature, **extra)
+            # the sampler's candidates (Sampling.candidates) travel as tensors next to the header
+            tensors = out.candidates.tensors() if out.candidates is not None else None
             message = {
                 "op": "generated",
                 "id": header["id"],
@@ -280,10 +282,11 @@ class EngineWorker:
             }
         except Exception as error:  # noqa: BLE001 — the requester sees the failure
             message = {"op": "generated", "id": header["id"], "error": f"{type(error).__name__}: {error}"}
+            tensors = None
         finally:
             self.client.exit()
         try:
-            await reply(message)
+            await (reply(message, tensors) if tensors else reply(message))
         except ConnectionError:
             pass
 
@@ -393,6 +396,7 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
         "max_model_len": args.max_model_len,
         "fp32_head": bool(args.fp32_head),
         "lora_rank": args.lora_rank,
+        "max_logprobs": args.max_logprobs,
     }
     if args.backend == "hf":
         from palingenesis.opd.teachers import load_causal_lm
@@ -400,7 +404,7 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = load_causal_lm(args.model, torch.bfloat16 if device == "cuda" else torch.float32).to(device).eval()
         pad_id = tok.pad_token_id if tok.pad_token_id is not None else stop_ids[0]
-        for key in ("fp32_head", "max_model_len", "lora_rank"):  # vLLM's settings: the hf engine has none
+        for key in ("fp32_head", "max_model_len", "lora_rank", "max_logprobs"):  # vLLM's settings: hf has none
             del identity[key]
         return HFWorkerEngine(model, stop_ids, pad_id), identity
     if args.backend == "sglang":
@@ -432,6 +436,9 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
 
     extra = json.loads(args.vllm_args)
     extra.update(precision_options(args.fp32_head, args.ssm_state_dtype, extra.get("hf_overrides")))
+    # candidates (top-p / top-k in RL, score centering): the most log-probs a request may ask for
+    extra.setdefault("max_logprobs", args.max_logprobs)
+    identity["max_logprobs"] = extra["max_logprobs"]
     if args.lora_rank:  # native pushes: adapters served next to the base
         extra = {"enable_lora": True, "max_loras": args.max_loras, "max_lora_rank": args.lora_rank, **extra}
     engine = VLLMColocateRollout(
@@ -464,6 +471,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ssm-state-dtype", default="float32", help="as rollout.ssm_state_dtype")
     parser.add_argument("--lora-rank", type=int, default=0, help="vllm: serve LoRA adapters up to this rank (native)")
     parser.add_argument("--max-loras", type=int, default=4)
+    parser.add_argument(
+        "--max-logprobs",
+        type=int,
+        default=20,
+        help="vllm: top log-probs a request may ask for (rollout.top_k + 8, loss.score_centering_k: see the RL guide)",
+    )
     parser.add_argument("--adapter-dir", default="/dev/shm", help="vllm: where pushed adapters are written")
     parser.add_argument("--vllm-args", default="{}", help="JSON: extra vllm.LLM arguments")
     parser.add_argument("--sglang-args", default="{}", help="JSON: extra sglang.Engine arguments (--backend sglang)")

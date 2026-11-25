@@ -15,6 +15,10 @@ sequence is no longer append-only. A rewrite closes the current segment (its pro
 sampled on it) and starts a new one whose prompt is the rewritten context. Every sampled token
 belongs to exactly one segment and is trained on the context it was sampled from: `training_views`.
 
+Candidates (rollout.top_p / top_k, loss.score_centering). The sampler's most likely tokens at each sampled token,
+with their processed log-probs (opd.rollout.Candidates), aligned with `tokens` (no candidates at context and forced
+tokens): with top-p / top-k the support the token was drawn from, which the trainer renormalises the policy over.
+
 Observations (loss.observation_weight). With the observation loss on, the context appended after a tool turn
 records which of its tokens are the environment's output (`observation_targets`, indices into `tokens`) and how
 many tokens the observations hold in all (`observation_tokens`, the loss's per-trajectory normaliser).
@@ -40,6 +44,7 @@ class Segment:
     images: list[Any]
     image_tokens: list[int]
     observation_targets: list[int] = field(default_factory=list)
+    candidates: Any = None  # opd.rollout.Candidates aligned with `tokens`, or None
 
 
 @dataclass
@@ -78,6 +83,9 @@ class Trajectory:
     # tokens of the whole trajectory, targets or not (its normaliser |O|, shared by the segments)
     observation_targets: list[int] = field(default_factory=list)
     observation_tokens: int = 0
+    # The sampler's candidates per token of `tokens` (opd.rollout.Candidates; none at context and forced tokens), or
+    # None when the sampling did not ask for them (Sampling.candidates 0)
+    candidates: Any = field(default=None, compare=False, repr=False)
     # Scenarios (palingenesis.rl.scenarios): the role this context window played, the model and the LoRA adapter
     # that played it ("": the policy's own weights), its episode among the row's and its session in it, and the
     # comparison group (the sessions its baseline is computed over) with the unit it counts as in it.
@@ -90,13 +98,23 @@ class Trajectory:
     unit: tuple = ()
 
     def append_generated(
-        self, ids: list[int], logprobs: list[float], version: int, first_version: int | None = None
+        self,
+        ids: list[int],
+        logprobs: list[float],
+        version: int,
+        first_version: int | None = None,
+        candidates=None,
     ) -> None:
+        """A sampled turn; `candidates`: the sampler's candidates of its tokens (opd.rollout.Candidates), if any."""
         if len(logprobs) != len(ids):
             raise ValueError(
                 f"{len(ids)} sampled tokens but {len(logprobs)} log-probs: the rollout engine must "
                 "return the sampler's log-prob of every token (temperature > 0)"
             )
+        if candidates is not None and len(candidates) != len(ids):
+            raise ValueError(f"{len(ids)} sampled tokens but candidates for {len(candidates)}")
+        if candidates is not None or self.candidates is not None:
+            self._extend_candidates(len(ids), candidates)
         self.first_versions.append(version if first_version is None else first_version)
         self.turn_starts.append(len(self.tokens))
         self.tokens += ids
@@ -131,14 +149,26 @@ class Trajectory:
         """A prefix the sampler was made to write (think-skip): its first token is trained with the given behaviour
         log-prob (the forcing probability), the rest is context."""
         self.forced.append(len(self.tokens))
+        if self.candidates is not None:
+            self._extend_candidates(len(ids))
         self.tokens += ids
         self.mask += [True] + [False] * (len(ids) - 1)
         self.logprobs += [logprob] + [0.0] * (len(ids) - 1)
 
     def append_context(self, ids: list[int]) -> None:
+        if self.candidates is not None:
+            self._extend_candidates(len(ids))
         self.tokens += ids
         self.mask += [False] * len(ids)
         self.logprobs += [0.0] * len(ids)
+
+    def _extend_candidates(self, n: int, candidates=None) -> None:
+        """Candidates for the `n` tokens about to be appended (none when `candidates` is None); before the first
+        candidates, the tokens already there get none."""
+        from palingenesis.opd.rollout import Candidates
+
+        have = self.candidates if self.candidates is not None else Candidates.empty(len(self.tokens))
+        self.candidates = Candidates.join([have, candidates if candidates is not None else Candidates.empty(n)])
 
     def append_observations(self, start: int, marked: list[tuple[int, int]]) -> None:
         """The observation tokens of the context appended at `start` in `tokens`: (index in it, kind), as
@@ -181,12 +211,14 @@ class Trajectory:
                 self.images[:shown],
                 self.image_tokens[:shown],
                 self.observation_targets,
+                self.candidates.head(end) if self.candidates is not None else None,
             )
         )
         self.prompt_ids, self.images, self.image_tokens = list(prompt_ids), list(images), list(image_tokens)
         self.tokens, self.mask, self.logprobs = [], [], []
         self.first_versions, self.turn_starts, self.forced = [], [], []
         self.observation_targets = []
+        self.candidates = None
 
     def training_views(self) -> list["Trajectory"]:
         """The sequences to train on: the trajectory itself, or one per segment when its context was
@@ -208,6 +240,7 @@ class Trajectory:
                 images=segment.images,
                 image_tokens=segment.image_tokens,
                 observation_targets=segment.observation_targets,
+                candidates=segment.candidates,
             )
             for segment in self.segments
         ]

@@ -1798,6 +1798,7 @@ def test_token_versions_follow_turns_and_partial_rollouts():
     # the colocated engine remembers the version each streamed request started with
     engine = object.__new__(VLLMColocateRollout)
     engine.version, engine.started, engine.prompt_tokens, engine.cached_tokens = 2, {}, 0, 0
+    engine.candidates = {}
     engine._params = lambda *args, **kwargs: None
     output = SimpleNamespace(token_ids=[5, 6], logprobs=None, finish_reason="stop")
     finished = SimpleNamespace(
