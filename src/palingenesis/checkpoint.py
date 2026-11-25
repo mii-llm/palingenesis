@@ -290,10 +290,14 @@ def _save_fsdp(model, tokenizer, optimizer, scheduler, step, epoch, micro_step, 
     # Sharded state dicts: each rank holds only its shard. NO gathering.
     # full_state_dict=False means we save each rank's local shard directly.
     opts = StateDictOptions(full_state_dict=False)
+    # Pipeline stages hold different parameters: their optimizer state is keyed per parameter
+    # (param_groups.<name>.lr, ...), as torchtitan does, or the stages' param-group lists would overwrite
+    # each other in the checkpoint.
+    optim_opts = StateDictOptions(full_state_dict=False, flatten_optimizer_state_dict=_pipelined(model))
 
     state = {
         "model": get_model_state_dict(model, options=opts),
-        "optimizer": get_optimizer_state_dict(model, optimizer, options=opts),
+        "optimizer": get_optimizer_state_dict(model, optimizer, options=optim_opts),
     }
 
     # DCP save: each rank writes its shard to a separate file in the directory.
@@ -620,6 +624,20 @@ def _load_optimizer_sharded(optimizer, path: Path, device):
     logger.info(f"Loaded optimizer from {len(shard_files)} shards")
 
 
+def _pipelined(model) -> bool:
+    return getattr(model, "_pgs_pipeline", None) is not None
+
+
+def _flat_optimizer_state(dcp_path: Path) -> bool:
+    """Whether a DCP checkpoint keys its optimizer param groups per parameter (optimizer.param_groups.<name>.lr)
+    rather than by position (optimizer.param_groups.0.lr)."""
+    from torch.distributed.checkpoint import FileSystemReader
+
+    keys = FileSystemReader(str(dcp_path)).read_metadata().state_dict_metadata
+    groups = [k[len("optimizer.param_groups.") :] for k in keys if k.startswith("optimizer.param_groups.")]
+    return bool(groups) and not any(k.split(".", 1)[0].isdigit() for k in groups)
+
+
 def _load_fsdp(model, optimizer, path):
     """Load FSDP2 distributed checkpoint (sharded, each rank loads its shard).
 
@@ -641,9 +659,13 @@ def _load_fsdp(model, optimizer, path):
     # DCP fills them with the correct shard for this rank.
     opts = StateDictOptions(full_state_dict=False)
 
+    # The optimizer state's layout is the one the checkpoint was written in (per parameter by pipelined runs):
+    # a pipelined checkpoint resumes without pipelining and the reverse.
+    optim_opts = StateDictOptions(full_state_dict=False, flatten_optimizer_state_dict=_flat_optimizer_state(dcp_path))
+
     # Get empty state dict containers (shaped correctly for this rank's shard)
     model_state = get_model_state_dict(model, options=opts)
-    optim_state = get_optimizer_state_dict(model, optimizer, options=opts)
+    optim_state = get_optimizer_state_dict(model, optimizer, options=optim_opts)
 
     # Single DCP load call — loads both model and optimizer shards at once
     state = {"model": model_state, "optimizer": optim_state}
@@ -651,7 +673,7 @@ def _load_fsdp(model, optimizer, path):
 
     # Apply loaded shards back to model and optimizer
     set_model_state_dict(model, model_state, options=opts)
-    set_optimizer_state_dict(model, optimizer, optim_state, options=opts)
+    set_optimizer_state_dict(model, optimizer, optim_state, options=optim_opts)
 
     logger.info("Loaded FSDP distributed checkpoint (sharded)")
     barrier()
@@ -689,8 +711,12 @@ def _save_gathered_or_local(model, tokenizer, path: Path, is_fsdp: bool, export=
         from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
         barrier()  # every rank has finished its step before the gather
-        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        state = get_model_state_dict(model, options=opts)
+        pipeline = getattr(model, "_pgs_pipeline", None)
+        if pipeline is not None:  # every stage's part, gathered stage by stage (palingenesis.pipeline_parallel)
+            state = pipeline.gather_full_state(path.parent / f".{path.name}.stages")
+        else:
+            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            state = get_model_state_dict(model, options=opts)
         if dist.get_rank() == 0:
             if export is not None:
                 state = export(hf_state_dict(state))

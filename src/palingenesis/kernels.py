@@ -176,6 +176,8 @@ def apply_activation_checkpointing(
     if respect_saved_tensors_hooks is not None and sac_routes_saved_tensors_hooks():
         sac_hooks["respect_saved_tensors_hooks"] = respect_saved_tensors_hooks
     for layer_id, layer_module in layers:
+        if not any(True for _ in layer_module.parameters()):  # a layer of another pipeline stage: nothing to save
+            continue
         if mode == "full":
             wrapped = ptd_checkpoint_wrapper(
                 layer_module,

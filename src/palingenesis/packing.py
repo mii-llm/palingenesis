@@ -101,20 +101,30 @@ class PackedBatch:
     ) -> "PackedBatch":
         """`labels` (and `loss_weights`) must already be shifted (per row); `flatten`
         joins the rows."""
-        kwargs: dict = {"attention_mask": None}
         if flatten:
-            input_ids, labels, position_ids = (t.reshape(1, -1) for t in (input_ids, labels, position_ids))
+            input_ids, labels = input_ids.reshape(1, -1), labels.reshape(1, -1)
             if loss_weights is not None:
                 loss_weights = loss_weights.reshape(1, -1)
-            starts = position_ids[0] == 0
-            starts[0] = True
-            bounds = torch.nonzero(starts).flatten()
-            cu_seqlens = torch.cat([bounds, bounds.new_tensor([position_ids.shape[1]])]).to(torch.int32)
-            kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_k"] = cu_seqlens
-            kwargs["seq_idx"] = (torch.cumsum(starts.to(torch.int32), 0) - 1).to(torch.int32)[None]
-            # the variable-length flash kernels (flash_attention_2, and sdpa's routed through
-            # seco._varlen_attention) take the longest document
-            longest = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
-            kwargs["max_length_q"] = kwargs["max_length_k"] = longest
-        kwargs["position_ids"] = position_ids
+        kwargs = packed_forward_kwargs(position_ids, flatten)
         return cls(input_ids=input_ids, labels=labels, forward_kwargs=kwargs, loss_weights=loss_weights)
+
+
+def packed_forward_kwargs(position_ids: torch.Tensor, flatten: bool) -> dict:
+    """The forward arguments of packed rows [B, S] from their position ids alone (a pipeline stage past the
+    first has no token ids): the position ids, flattened to one row with the documents' boundaries when
+    `flatten`."""
+    kwargs: dict = {"attention_mask": None}
+    if flatten:
+        position_ids = position_ids.reshape(1, -1)
+        starts = position_ids[0] == 0
+        starts[0] = True
+        bounds = torch.nonzero(starts).flatten()
+        cu_seqlens = torch.cat([bounds, bounds.new_tensor([position_ids.shape[1]])]).to(torch.int32)
+        kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_k"] = cu_seqlens
+        kwargs["seq_idx"] = (torch.cumsum(starts.to(torch.int32), 0) - 1).to(torch.int32)[None]
+        # the variable-length flash kernels (flash_attention_2, and sdpa's routed through
+        # seco._varlen_attention) take the longest document
+        longest = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+        kwargs["max_length_q"] = kwargs["max_length_k"] = longest
+    kwargs["position_ids"] = position_ids
+    return kwargs

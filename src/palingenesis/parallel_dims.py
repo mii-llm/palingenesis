@@ -16,15 +16,18 @@ ParallelDims: pp, dp_replicate, dp_shard, cp, tp).
 
 from dataclasses import dataclass
 
-# Pipeline schedules: name -> (torch.distributed.pipelining class name, stages per rank: default, minimum, maximum).
+# Pipeline schedules: name -> (torch.distributed.pipelining schedule name, stages per rank: default, minimum,
+# maximum). zbv and dualpipev place a rank's two stages in a V (rank r: stages r and 2 x pp - 1 - r).
 PP_SCHEDULES: dict[str, tuple[str, int, int, int | None]] = {
-    "gpipe": ("ScheduleGPipe", 1, 1, 1),
-    "1f1b": ("Schedule1F1B", 1, 1, 1),
-    "interleaved_1f1b": ("ScheduleInterleaved1F1B", 2, 2, None),
-    "looped_bfs": ("ScheduleLoopedBFS", 2, 2, None),
-    "interleaved_zero_bubble": ("ScheduleInterleavedZeroBubble", 2, 2, None),
-    "zbv": ("ScheduleZBVZeroBubble", 2, 2, 2),
+    "gpipe": ("GPipe", 1, 1, 1),
+    "1f1b": ("1F1B", 1, 1, 1),
+    "interleaved_1f1b": ("Interleaved1F1B", 2, 2, None),
+    "looped_bfs": ("LoopedBFS", 2, 2, None),
+    "interleaved_zero_bubble": ("InterleavedZeroBubble", 2, 2, None),
+    "zbv": ("ZBVZeroBubble", 2, 2, 2),
+    "dualpipev": ("DualPipeV", 2, 2, 2),
 }
+V_SHAPED = ("zbv", "dualpipev")
 
 
 def schedule_errors(schedule: str, stages_per_rank: int) -> list[str]:

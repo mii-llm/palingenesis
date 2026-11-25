@@ -18,6 +18,13 @@ steps on worst-case rows (every row rendered to max_seq_length), with the
 configured batch size, gradient accumulation and evaluation (run once), and
 reports torch's peak allocated memory: exactly what training allocates for the
 largest possible batch. Single process, so FSDP sharding is not modelled.
+
+--world_size N (or WORLD_SIZE) adds the memory of ONE rank of an N-process run with the config's
+parallel.tp_degree / pp_degree / cp_degree: layer weights, gradients and optimizer states split over
+tensor x pipeline ranks and sharded by FSDP2 over the data (x context) ranks; the embeddings and head
+sharded over data x tensor ranks (palingenesis.tensor_parallel); activations divided by tp (sequence
+parallelism) and held for the micro-batches a pipeline stage keeps in flight (1F1B: up to pp of them,
+GPipe: all); one layer's gathered weights for FSDP's all-gather. Rough, like the activations above.
 """
 
 import sys
@@ -165,7 +172,7 @@ def _offloaded_per_layer(config: Config, ckpt: str, per_layer: float, layer_inpu
     return per_layer * 0.4 if sac_routes_saved_tensors_hooks() else layer_input
 
 
-def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
+def estimate_memory(config: Config, gpu_memory_gb: float = 80.0, world_size: int | None = None) -> dict:
     from palingenesis.train import _dynamic_num_chunks
 
     model_config = _model_config(config)
@@ -226,7 +233,20 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
 
     exact_gb = params_gb + optimizer_gb + grads_gb + reference_gb + teacher_gb
     total_gb = (exact_gb + activations_gb + logits_gb + kv_gb + teacher_buffers_gb + vision_gb) * 1.10
+    per_rank = _per_rank(
+        config,
+        model,
+        world_size,
+        weights_gb=params_gb + optimizer_gb + grads_gb,
+        activations_gb=activations_gb,
+        logits_gb=logits_gb,
+        layers=layers,
+    )
+    if per_rank is not None:
+        per_rank["gpu_memory_gb"] = gpu_memory_gb
+        per_rank["fits"] = per_rank["total_gb"] <= gpu_memory_gb
     return {
+        "per_rank": per_rank,
         "model": config.model.name_or_path,
         "total_params_B": params / 1e9,
         "trainable_ratio": trainable / max(params, 1),
@@ -254,6 +274,50 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         "hidden_size": hidden,
         "num_layers": layers,
         "vocab_size": vocab,
+    }
+
+
+def _per_rank(config: Config, model, world_size, *, weights_gb, activations_gb, logits_gb, layers) -> dict | None:
+    """One rank's share of an N-process run (see the module docstring); None for a single process without
+    tensor / pipeline parallelism."""
+    import os
+
+    from palingenesis.parallel_dims import PP_SCHEDULES, ParallelDims, stages_per_rank
+
+    p = config.parallel
+    world = world_size or int(os.environ.get("WORLD_SIZE", "0")) or p.tp_degree * p.pp_degree * max(p.cp_degree, 1)
+    if world <= 1:
+        return None
+    cp = (p.cp_degree or min(world // (p.tp_degree * p.pp_degree), 8)) if p.context_parallel else 1
+    dims = ParallelDims(world, tp=p.tp_degree, pp=p.pp_degree, cp=cp)
+    if dims.errors():
+        return {"error": dims.errors()[0]}
+    total = sum(q.numel() for q in model.parameters())
+    root = sum(
+        q.numel() for n, q in model.named_parameters() if "embed_tokens" in n or n.startswith("lm_head") or n == "model.norm.weight"
+    )
+    layer_share = (total - root) / max(total, 1)
+    # layers split over tensor x pipeline ranks, then FSDP over data x context; the root over data x context x tensor
+    layer_weights = weights_gb * layer_share / (dims.tp * dims.pp * dims.dp * dims.cp)
+    root_weights = weights_gb * (1 - layer_share) / (dims.dp * dims.cp * dims.tp)
+    gather = weights_gb * layer_share / 4 / max(layers, 1) / dims.tp * 2  # one layer's bf16 weights, gathered (x2: prefetch)
+    rows = config.train.per_device_batch_size
+    microbatches = p.pp_microbatches or rows
+    in_flight = 1.0
+    if dims.pp > 1:
+        per = stages_per_rank(p.pp_schedule, p.pp_stages_per_rank)
+        held = microbatches if PP_SCHEDULES[p.pp_schedule][0] in ("GPipe", "LoopedBFS") else min(microbatches, dims.pp * per)
+        in_flight = held / microbatches  # activations of `held` micro-batches of rows / microbatches rows each
+    acts = activations_gb / (dims.tp * dims.cp * dims.pp) * in_flight
+    logits = logits_gb / (dims.tp * dims.cp) / (microbatches if dims.pp > 1 else 1)
+    total_gb = (layer_weights + root_weights + gather + acts + logits) * 1.10
+    return {
+        "dims": dims.describe(),
+        "weights_optimizer_grads_gb": layer_weights + root_weights,
+        "fsdp_gather_gb": gather,
+        "activations_gb": acts,
+        "logits_gb": logits,
+        "total_gb": total_gb,
     }
 
 
@@ -377,6 +441,16 @@ def print_report(est: dict):
         f"    Total (+10% overhead): {est['total_estimated_gb']:5.1f} GiB of {est['gpu_memory_gb']:.0f} GiB "
         f"({est['headroom_gb']:+.1f} GiB)"
     )
+    rank = est.get("per_rank")
+    if rank and "error" in rank:
+        print(f"  Per rank: {rank['error']}")
+    elif rank:
+        print(f"  Per rank ({rank['dims']}):")
+        print(f"    Weights, optimizer, gradients: {rank['weights_optimizer_grads_gb']:6.1f} GiB")
+        print(f"    FSDP gathered layer:           {rank['fsdp_gather_gb']:6.1f} GiB")
+        print(f"    Activations (rough):           {rank['activations_gb']:6.1f} GiB")
+        print(f"    Logits (one chunk):            {rank['logits_gb']:6.1f} GiB")
+        print(f"    Total (+10%):                  {rank['total_gb']:6.1f} GiB of {rank['gpu_memory_gb']:.0f} GiB")
     print()
     verdict = "should fit" if est["fits"] else "likely does NOT fit"
     print(
@@ -400,10 +474,16 @@ def main():
         help="GPU memory in GiB, as GPUs are rated (default: 80)",
     )
     parser.add_argument("--measure", action="store_true", help="run two real optimizer steps and report the peak")
+    parser.add_argument(
+        "--world_size",
+        type=int,
+        default=None,
+        help="processes of the run: adds one rank's share under parallel.tp_degree / pp_degree / FSDP",
+    )
     args = parser.parse_args()
 
     config = Config.from_yaml(args.config)
-    est = estimate_memory(config, args.gpu_memory_gb)
+    est = estimate_memory(config, args.gpu_memory_gb, world_size=args.world_size)
     print_report(est)
     if args.measure:
         m = measure_memory(config)
@@ -413,7 +493,8 @@ def main():
             f"{m['seq_len']} tokens{', plus one evaluation' if m['evaluated'] else ''})\n"
         )
         sys.exit(0 if m["measured_peak_gb"] < m["gpu_total_gb"] else 1)
-    sys.exit(0 if est["fits"] else 1)
+    fits = est["per_rank"]["fits"] if est.get("per_rank") and "fits" in est["per_rank"] else est["fits"]
+    sys.exit(0 if fits else 1)
 
 
 if __name__ == "__main__":

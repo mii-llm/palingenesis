@@ -118,10 +118,13 @@ ARCHITECTURES = {
 }
 
 
-def save_architecture(path, name: str, tok, seed: int = 0) -> str:
+def save_architecture(path, name: str, tok, seed: int = 0, untie: bool = False) -> str:
     torch.manual_seed(seed)
     model = ARCHITECTURES[name](len(tok))
     model.config.use_cache = False
+    if untie:  # an output head of its own (pipeline stages hold the embeddings and the head apart)
+        model.config.tie_word_embeddings = False
+        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
     model.save_pretrained(path)
     tok.save_pretrained(path)
     return str(path)

@@ -504,8 +504,11 @@ def _parallelize_layer(layer: nn.Module, name: str, tp: TensorParallel) -> None:
         raise TensorParallelError(f"{name}: parameters left out of the tensor-parallel plan: {plain[:4]}")
 
 
-def apply_tensor_parallel(model: nn.Module, tp_mesh) -> TensorParallel:
-    """Split `model`'s decoder layers over `tp_mesh` (before activation checkpointing, compile and FSDP2)."""
+def apply_tensor_parallel(model: nn.Module, tp_mesh, pipeline: bool = False) -> TensorParallel:
+    """Split `model`'s decoder layers over `tp_mesh` (before activation checkpointing, compile and FSDP2).
+
+    `pipeline`: `model` holds this rank's pipeline stages only (palingenesis.pipeline_parallel): the embeddings
+    and the final norm may be on other ranks, and the layers of other stages are parameter-less stand-ins."""
     from palingenesis.distributed import _find_transformer_layers
     from palingenesis.logits import backbone_of
 
@@ -515,12 +518,14 @@ def apply_tensor_parallel(model: nn.Module, tp_mesh) -> TensorParallel:
         raise TensorParallelError("\n".join(errors))
     backbone = backbone_of(model)
     embed, norm = getattr(backbone, "embed_tokens", None), getattr(backbone, "norm", None)
-    if embed is None or norm is None:
+    if not pipeline and (embed is None or norm is None):
         raise TensorParallelError("tensor parallelism needs the backbone's embed_tokens and final norm")
     names = {id(m): n for n, m in model.named_modules()}
-    _sequence_local_embedding(embed, tp)
-    _sequence_local_input(norm)
-    layers = _find_transformer_layers(model)
+    if embed is not None:
+        _sequence_local_embedding(embed, tp)
+    if norm is not None and any(True for _ in norm.parameters()):  # a stage without the final norm has none
+        _sequence_local_input(norm)
+    layers = [layer for layer in _find_transformer_layers(model) if any(True for _ in layer.parameters())]
     for layer in layers:
         _parallelize_layer(layer, names[id(layer)], tp)
     logger.info(

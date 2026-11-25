@@ -266,8 +266,13 @@ def apply_fsdp(
     config: ParallelConfig,
     bf16: bool = True,
     ignored_params: set | None = None,
+    reshard_layers: bool | None = None,
 ) -> torch.nn.Module:
     """Apply FSDP2 (fully_shard) bottom-up to transformer layers then root.
+
+    `reshard_layers`: overrides parallel.reshard_after_forward for the layers (a pipeline stage keeps its
+    layers gathered between micro-batches, as torchtitan: one all-gather per step instead of one per
+    micro-batch and direction). Layers without parameters (another stage's) are skipped.
 
     `ignored_params`: parameters FSDP leaves alone (expert parallelism keeps each rank's own
     experts: palingenesis.moe_experts).
@@ -318,12 +323,13 @@ def apply_fsdp(
         fully_shard(block, **fsdp_kwargs)
 
     # Find and shard transformer layers bottom-up
-    layers = _find_transformer_layers(model)
+    layers = [layer for layer in _find_transformer_layers(model) if any(True for _ in layer.parameters())]
+    reshard = config.reshard_after_forward if reshard_layers is None else reshard_layers
     for i, layer in enumerate(layers):
         # Last layer optimization: don't reshard after forward since FSDP
         # would immediately prefetch it for backward (saves one reshard op)
         is_last = i == len(layers) - 1
-        layer_reshard = False if is_last else config.reshard_after_forward
+        layer_reshard = False if is_last else reshard
         fully_shard(layer, **{**fsdp_kwargs, "reshard_after_forward": layer_reshard})
 
     # The root owns the rest: embeddings, final norm and output head (tied or not).

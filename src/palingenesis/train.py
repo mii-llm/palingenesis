@@ -506,6 +506,30 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     plugin_ctx.is_fsdp = is_fsdp
     plugin_ctx.dp_world_size = _dp_world_size(mesh) if is_fsdp else 1
 
+    # ── Pipeline parallel: this rank keeps its stages' layers only (palingenesis.pipeline_parallel); `model` is
+    # from here on this rank's part of it (optimizer, checkpoints, export), the stage modules share its layers ──
+    pipe = None
+    if config.parallel.pp_degree > 1:
+        from palingenesis.pipeline_parallel import PipelineParallel
+
+        if router_balancer is not None:
+            raise ConfigError(
+                "parallel.pp_degree > 1 with MoE router balancing is not supported (the balancing gradient needs every "
+                "token's routing before the first backward; pipeline micro-batches interleave them). Set moe.balance: "
+                "false, or use tensor / expert parallelism for MoE models."
+            )
+        if plugin_mgr and plugin_mgr.implementing("loss"):
+            raise ConfigError("parallel.pp_degree > 1: plugin loss terms are not computed on the last stage yet.")
+        tp_multiple = config.parallel.tp_degree
+        pipe = PipelineParallel(
+            model,
+            mesh,
+            config.parallel,
+            seq_len=-(-config.data.max_seq_length // tp_multiple) * tp_multiple,
+            flatten_packed=False,
+        )
+        model = pipe.model
+
     # ── Off-policy distillation: teachers, caches, feature hooks (before AC / FSDP / compile) ──
     distiller = None
     if config.distill.enabled:
@@ -569,7 +593,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     if config.parallel.tp_degree > 1:
         from palingenesis.tensor_parallel import apply_tensor_parallel
 
-        tp = apply_tensor_parallel(model, mesh["tp"])
+        tp = apply_tensor_parallel(model, mesh["tp"], pipeline=pipe is not None)
+        if pipe is not None:
+            pipe.tp = tp
         if router_balancer is not None:
             router_balancer.replicas = tp.size
         if config.parallel.async_tp:
@@ -597,6 +623,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     if config.data.packing and not config.memory.seco:
         check_packing_support(model, config.model.attn_implementation)
         flatten_packed = accelerator.is_flash_varlen(config.model.attn_implementation) or has_linear_attention(model)
+    if pipe is not None:
+        pipe.flatten_packed = flatten_packed
 
     # ── sdpa: fused attention kernels under autocast (see seco.use_chunk_attention) ──
     if config.model.attn_implementation == "sdpa":
@@ -622,7 +650,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         apply_selective_diff_v2(model)
 
     # ── FSDP2 ─────────────────────────────────────────────────────────────
-    if is_fsdp:
+    if is_fsdp and pipe is not None:
+        logger.info("Applying FSDP2 (fully_shard) to each pipeline stage")
+        # a stage keeps its layers gathered across its micro-batches (torchtitan's default under pipelining)
+        pipe.build(device, lambda m: apply_fsdp(m, mesh, config.parallel, bf16=config.train.bf16, reshard_layers=False))
+    elif is_fsdp:
         logger.info("Applying FSDP2 (fully_shard)")
         # Expert parallel: the experts stay on their rank, sharded on the same mesh, outside FSDP's gathers
         expert_parallel = None
@@ -995,7 +1027,24 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         _loss_vocab_size = 128256
 
     seco = config.memory.seco
-    if seco:
+    if pipe is not None:
+        # the last stage computes the loss (palingenesis.pipeline_parallel); same backend priority as below
+        head = _get_lm_head(model)
+        if (
+            use_chunked_loss
+            and cce_available()
+            and not _needs_logits
+            and not isinstance(head, PostProcessedHead)
+            and _cce_supported(config.memory.float32_matmul_precision)
+        ):
+            pipe.loss_kind = "cce"
+        else:
+            pipe.loss_kind = "chunked" if use_chunked_loss else "plain"
+        pipe.stable = config.train.stable_softmax
+        pipe.num_chunks = lambda n: _dynamic_num_chunks(n, _loss_vocab_size)
+        use_chunked_loss = False
+        logger.info(f"Pipeline loss on the last stage: {pipe.loss_kind} cross-entropy")
+    elif seco:
         if world_size > 1:
             raise ConfigError(
                 "memory.seco is verified on a single process only; multi-GPU (FSDP) SeCO is not "
@@ -1294,6 +1343,17 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 compute_dtype,
                 config.train.bf16,
             )
+        if eval_batches and pipe is not None:
+            pipe.train(False)
+            try:
+                with torch.amp.autocast(
+                    "cuda", dtype=compute_dtype, enabled=config.train.bf16 and device.type == "cuda"
+                ):
+                    total, count = pipe.evaluate(eval_batches, config.train.per_device_batch_size, device)
+            finally:
+                pipe.train(True)
+            loss = total / max(count, 1)
+            return {"eval/loss": loss, "eval/ppl": math.exp(min(loss, 20.0))}
         if eval_batches:
             loss = _compute_eval_loss(model, eval_batches, device, compute_dtype, config.train.bf16, cp=cp, tp=tp)
             return {"eval/loss": loss, "eval/ppl": math.exp(min(loss, 20.0))}
@@ -1336,6 +1396,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     plugin_ctx.step = start_step
     if plugin_mgr:
         plugin_mgr.on_train_start(model)
+    if pipe is not None:
+        pipe.train(True)
+    # ranks holding the same rows (pipeline stages; tensor-parallel ranks under pipelining) count their tokens once
+    token_replicas = pipe.size * (tp.size if tp is not None else 1) if pipe is not None else 1
+    input_replicas = (tp.size if tp is not None else 1) * (pipe.size if pipe is not None else 1)
     # gradients are summed over every rank FSDP shards over (data- and context-parallel)
     plugin_loss_scale = 1.0 / (
         plugin_ctx.dp_world_size * (cp.size if cp is not None else 1) * (tp.size if tp is not None else 1)
@@ -1425,7 +1490,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             observed = shift_weights(batch[OBSERVATION_FIELD].float()) if OBSERVATION_FIELD in batch else None
             raw_input_ids = input_ids
             kd_reshape = None  # per-token batch fields -> the layout the student sees
-            if position_ids is not None:
+            if pipe is not None:  # whole rows of the pipeline's fixed length; each stage builds its own inputs
+                input_ids, labels, position_ids, loss_weights, observed = pipe.pad_rows(
+                    input_ids, labels, position_ids, loss_weights, observed, attention_mask
+                )
+                fwd_kwargs = {"input_ids": input_ids}
+            elif position_ids is not None:
                 if tp is not None:  # a multiple of tp tokens per row; the padding is a document of its own
                     input_ids, labels = tp.pad(input_ids), tp.pad(labels, IGNORE_INDEX)
                     position_ids = tp.pad_positions(position_ids)
@@ -1503,7 +1573,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 current_ga = grad_accum
             _accum_counter += 1
             is_last_micro = _accum_counter >= current_ga
-            if is_fsdp:
+            if is_fsdp and pipe is None:  # a pipeline stage reduces at the end of every schedule step
                 model.set_requires_gradient_sync(is_last_micro)
 
             # ── Forward ───────────────────────────────────────────────
@@ -1519,7 +1589,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             if is_fsdp:
                 global_valid = local_valid.clone()
                 dist.all_reduce(global_valid, op=dist.ReduceOp.SUM)
-                global_valid_tokens = max(global_valid.item(), 1)
+                global_valid_tokens = max(
+                    global_valid.item() / token_replicas if token_replicas > 1 else global_valid.item(), 1
+                )
             else:
                 global_valid_tokens = max(local_valid.item(), 1)
 
@@ -1572,7 +1644,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     )
                     if plugin_mgr:
                         kd_targets = plugin_mgr.transform_targets(kd_targets, batch)
-                if seco and distiller is not None:
+                if pipe is not None:
+                    # every pipeline micro-batch's forward and backward; the last stage's loss share
+                    loss_val = pipe.step(input_ids, labels, position_ids, loss_weights, loss_denom) * current_ga
+                    backward_done = True
+                elif seco and distiller is not None:
                     result = chunkwise_forward_backward(
                         model,
                         input_ids,
@@ -1821,8 +1897,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             # this process's tokens (under context parallel, its slice of the rows)
             _input_mask = attention_mask if cp is not None and attention_mask is not None else batch["attention_mask"]
             _n_valid, _n_input = torch.stack([local_valid, _input_mask.sum()]).tolist()
-            if tp is not None:  # the tensor-parallel group shares the rows: this rank's share of their tokens
-                _n_input /= tp.size
+            # ranks sharing the rows (tensor / pipeline parallel): this rank's share of their tokens
+            _n_input /= input_replicas
             accum_tokens += _n_input
             accum_trained += _n_valid
             tokens_total += _n_input
@@ -1856,7 +1932,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         # train.fused_optimizer: the norm in one launch per dtype, the clip factor applied inside
                         # the optimizer's kernel (no pass rescaling the gradients; .grad keeps unclipped values)
                         grad_norm = optimizer.clip_grad_norm_(config.train.max_grad_norm)
-                    elif tp is not None:  # parameters on several meshes (palingenesis.distributed.clip_grad_norm_)
+                    elif tp is not None or pipe is not None:  # several meshes / stages (distributed.clip_grad_norm_)
                         grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
                     elif config.train.max_grad_norm > 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.max_grad_norm)

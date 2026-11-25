@@ -395,3 +395,87 @@ def test_data_stream_version_is_importable_without_heavy_dependencies():
     from palingenesis.config import DATA_STREAM_VERSION
 
     assert DATA_STREAM_VERSION == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TENSOR / PIPELINE PARALLELISM (parallel.tp_degree, parallel.pp_*)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _parallel(**options) -> Config:
+    cfg = Config()
+    for key, value in options.items():
+        section, name = key.split("__")
+        setattr(getattr(cfg, section), name, value)
+    return cfg
+
+
+def test_model_parallel_defaults_are_off():
+    cfg = Config()
+    assert (cfg.parallel.tp_degree, cfg.parallel.pp_degree, cfg.parallel.async_tp) == (1, 1, False)
+    cfg.validate()
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"parallel__tp_degree": 0}, "tp_degree must be an integer >= 1"),
+        ({"parallel__pp_degree": True}, "pp_degree must be an integer >= 1"),
+        ({"parallel__pp_microbatches": -1}, "pp_microbatches must be an integer >= 0"),
+        ({"parallel__tp_degree": 2, "parallel__fsdp": False}, "need parallel.fsdp: true"),
+        ({"parallel__tp_degree": 2, "memory__seco": True}, "does not support memory.seco"),
+        ({"parallel__tp_degree": 2, "multimodal__enabled": True}, "does not support multimodal.enabled"),
+        ({"parallel__tp_degree": 2, "parallel__cpu_offload": True}, "does not support parallel.cpu_offload"),
+        ({"parallel__pp_degree": 2, "train__optimizer": "muon"}, "does not support train.optimizer=muon"),
+        ({"parallel__async_tp": True}, "async_tp .* needs parallel.tp_degree > 1"),
+        (
+            {"parallel__async_tp": True, "parallel__tp_degree": 2, "model__compile": False},
+            "async_tp needs model.compile",
+        ),
+        ({"parallel__pp_degree": 2, "parallel__pp_schedule": "pipedream"}, "pp_schedule must be one of"),
+        ({"parallel__pp_degree": 2, "parallel__pp_schedule": "zbv", "parallel__pp_stages_per_rank": 3}, "zbv runs 2"),
+        ({"parallel__pp_degree": 2, "parallel__pp_schedule": "1f1b", "parallel__pp_stages_per_rank": 2}, "1f1b runs 1"),
+        ({"parallel__pp_degree": 2, "parallel__pp_microbatches": 3}, "must divide train.per_device_batch_size"),
+        (
+            {"parallel__pp_degree": 2, "parallel__context_parallel": True},
+            "pp_degree > 1 does not support parallel.context",
+        ),
+        ({"parallel__pp_degree": 2, "train__ema": True}, "does not support train.ema"),
+    ],
+)
+def test_model_parallel_errors(options, message):
+    with pytest.raises(ConfigError, match=message):
+        _parallel(**options).validate()
+
+
+def test_model_parallel_valid_compositions():
+    _parallel(parallel__tp_degree=4, data__packing=True, train__gradient_checkpointing="full").validate()
+    _parallel(parallel__tp_degree=2, parallel__async_tp=True, model__compile=True).validate()
+    for schedule in ("gpipe", "1f1b", "interleaved_1f1b", "looped_bfs", "interleaved_zero_bubble", "zbv", "dualpipev"):
+        _parallel(parallel__pp_degree=4, parallel__pp_schedule=schedule, train__per_device_batch_size=8).validate()
+    _parallel(
+        parallel__pp_degree=2, parallel__tp_degree=2, parallel__pp_microbatches=2, train__per_device_batch_size=4
+    ).validate()
+
+
+def test_model_parallel_options_from_the_command_line():
+    cfg = Config.from_cli(["--parallel.tp_degree", "2", "--parallel.pp_schedule", "zbv", "--parallel.pp_degree", "2"])
+    assert (cfg.parallel.tp_degree, cfg.parallel.pp_degree, cfg.parallel.pp_schedule) == (2, 2, "zbv")
+
+
+def test_parallel_dims_and_stage_split():
+    from palingenesis.parallel_dims import ParallelDims, head_errors, split_layers, stage_indices
+
+    dims = ParallelDims(16, tp=2, pp=2, cp=2)
+    assert dims.dp == 2 and not dims.errors() and dims.describe() == "pp=2 x dp=2 x cp=2 x tp=2"
+    assert "cannot split" in ParallelDims(6, tp=4).errors()[0]
+    assert head_errors(4, {"num_key_value_heads": 2})[0].startswith("parallel.tp_degree=4 must divide")
+    for layers, stages in ((28, 4), (36, 8), (4, 4), (80, 16), (5, 2)):
+        split = split_layers(layers, stages)
+        assert sum(split, []) == list(range(layers)) and all(split)
+    # the embeddings and the head count as layers: the end stages get fewer
+    assert [len(s) for s in split_layers(28, 4)] == [6, 8, 8, 6]
+    with pytest.raises(ValueError, match="at least one layer"):
+        split_layers(2, 4)
+    assert stage_indices(1, 4, 2, v_shape=False) == [1, 5]
+    assert stage_indices(1, 4, 2, v_shape=True) == [1, 6]

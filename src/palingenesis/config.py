@@ -311,12 +311,12 @@ class ParallelConfig:
     # Pipeline parallelism (palingenesis.pipeline_parallel): the layers split into pp_degree stages, one
     # per rank group, with micro-batches flowing through them. 1 = off.
     pp_degree: int = 1
-    # gpipe, 1f1b, interleaved_1f1b, looped_bfs, interleaved_zero_bubble, zbv (zero bubble, V-shaped).
+    # gpipe, 1f1b, interleaved_1f1b, looped_bfs, interleaved_zero_bubble, zbv (zero bubble, V-shaped), dualpipev.
     pp_schedule: str = "1f1b"
     # Pipeline micro-batches per train.per_device_batch_size rows (must divide it); 0 = one row each.
     pp_microbatches: int = 0
     # Stages per pipeline rank: 1 for gpipe / 1f1b, 2 or more for the interleaved / looped / zero-bubble
-    # schedules (zbv: exactly 2). 0 = the schedule's default.
+    # schedules (zbv, dualpipev: exactly 2). 0 = the schedule's default.
     pp_stages_per_rank: int = 0
     # Layers the first / last stage gives up for the embeddings / output head (balance the stages).
     pp_first_stage_less_layers: int = 1
