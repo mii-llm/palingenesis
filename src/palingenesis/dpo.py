@@ -71,6 +71,16 @@ where delta = (policy - reference) log-ratio of chosen minus that of rejected.
 rejected differ (a token-level diff of the two answers, ± `sft_edit_window`
 tokens): for minimal-edit pairs, whose chosen side is mostly the policy's own
 uncorrected text, the anchor then lands on the corrections only.
+
+Packing
+-------
+`dpo.packing: tree` forwards a micro-batch as one packed row (palingenesis.tree_packing)
+instead of [2P, S] padded rows: every pair is a two-leaf prefix trie, so the tokens its
+chosen and rejected sides share (the prompt, earlier turns, the common start of the two
+answers) are forwarded once, by the policy and by the reference, and nothing is padded.
+`varlen` only drops the padding. The scores, the loss and the gradients are those of the
+padded rows up to floating-point order (`PackedPairs`); `dpo.micro_tokens` fills the
+micro-batches against a budget of packed tokens instead of a fixed number of pairs.
 """
 
 import difflib
@@ -79,6 +89,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -87,6 +98,7 @@ from torch.utils.data import IterableDataset
 from palingenesis.data import IGNORE_INDEX, ChatDataset, _collate_fn, _Epochs, _shard_then_shuffle
 from palingenesis.loss import _BackwardBridge, shift_labels
 from palingenesis.multimodal import forward_kwargs
+from palingenesis.tree_packing import PackedRow, PackingError, forward_packed, group_cost, pack_groups
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +284,8 @@ def build_preference_dataloader(
     shuffle: bool = False,
 ):
     """DataLoader over preference pairs: `batch_size` pairs per micro-batch,
-    collated as [2 * batch_size, S] (chosen rows first)."""
+    collated as [2 * batch_size, S] (chosen rows first). With `dpo.micro_tokens`
+    (packed rows), as many pairs as fit that many packed tokens instead."""
     from torch.utils.data import DataLoader
 
     pairs = PreferenceDataset(
@@ -294,15 +307,59 @@ def build_preference_dataloader(
     )
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     num_workers = data_config.num_workers
+    packing = getattr(dpo_config, "packing", "padded")
+    budget = getattr(dpo_config, "micro_tokens", 0)
+    if packing != "padded" and budget > 0:
+        return DataLoader(
+            PairBatches(pairs, budget, lambda b: collate_preferences(b, pad_id), share=packing == "tree"),
+            batch_size=None,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
     return DataLoader(
         pairs,
         batch_size=batch_size,
-        collate_fn=lambda b: collate_preferences(b, pad_id, pad_to_multiple=64),
+        collate_fn=lambda b: collate_preferences(b, pad_id, pad_to_multiple=1 if packing != "padded" else 64),
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         prefetch_factor=2 if num_workers > 0 else None,
     )
+
+
+class PairBatches(_Epochs, IterableDataset):
+    """Micro-batches of preference pairs filled against a budget of packed tokens (`dpo.micro_tokens`).
+
+    Pairs are taken in the stream's order (the shuffled order: no sorting by length, which would tie a step's
+    content to its pairs' sizes) until the next one would pass the budget. A pair costs what it adds to the
+    packed row: the tokens of its two-leaf trie under tree packing (its shared prefix once), both sides' tokens
+    under varlen. A pair larger than the budget is a micro-batch of its own. The epoch's last micro-batch may
+    be smaller. Yields collated batches (DataLoader with batch_size None)."""
+
+    def __init__(self, dataset: PreferenceDataset, budget: int, collate, share: bool = True):
+        self.dataset = dataset
+        self.budget = budget
+        self.collate = collate
+        self.share = share
+
+    def cost(self, pair: dict) -> int:
+        chosen, rejected = pair["chosen"]["input_ids"], pair["rejected"]["input_ids"]
+        if not self.share:
+            return chosen.numel() + rejected.numel()
+        return group_cost([chosen.numpy(), rejected.numpy()])[0]
+
+    def __iter__(self):
+        batch, load = [], 0
+        for pair in self.dataset:
+            cost = self.cost(pair)
+            if batch and load + cost > self.budget:
+                yield self.collate(batch)
+                batch, load = [], 0
+            batch.append(pair)
+            load += cost
+        if batch:
+            yield self.collate(batch)
 
 
 def estimate_preferences(dataset_id, dataset, tokenizer, data_config, dpo_config, world_size: int, batch_size: int):
@@ -467,6 +524,113 @@ def _scale_pairs(mask: torch.Tensor, num_pairs: int, pair_weight: torch.Tensor |
 
 
 # ==============================================================================
+# PACKED ROWS (dpo.packing: every pair a two-leaf prefix trie, palingenesis.tree_packing)
+# ==============================================================================
+
+
+class PackedPairs:
+    """A collated preference micro-batch [2P, S] laid out as one packed row, and its scored terms.
+
+    The row holds every pair's prefix trie (tree: the tokens its chosen and rejected sides share once, then
+    the two tails) or the 2P sequences end to end (varlen); no padding either way. The labels, score weights
+    and SFT masks stay in the collated [2P, S] layout, so every objective reads them as on padded rows; only
+    the hidden states are packed. A scored term (b, t) reads the hidden state at row.positions(b)[t].
+
+    Inside a shared prefix (earlier assistant turns when `data.last_turn_only` is off) both sides score the
+    same token from the same hidden state: such terms are computed once (`positions`, `targets`: the U
+    distinct (packed position, target) terms; `inverse`: each of the T scored tokens' term) and their
+    loss weights summed. The last shared token predicts each side's own next token: two terms.
+    """
+
+    def __init__(
+        self,
+        row: PackedRow,
+        valid: torch.Tensor,
+        positions: torch.Tensor,
+        targets: torch.Tensor,
+        inverse: torch.Tensor,
+        sequence_tokens: int,
+    ):
+        self.row = row
+        self.valid = valid  # [2P, S] bool: the scored tokens (shifted labels)
+        self.positions = positions  # [U] packed position of each distinct term's hidden state
+        self.targets = targets  # [U] its target token
+        self.inverse = inverse  # [T] the term of each scored token, in valid's row-major order
+        self.sequence_tokens = sequence_tokens  # tokens of the 2P sequences (padded rows forward these + padding)
+
+    @classmethod
+    def build(
+        cls, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor, share: bool = True
+    ) -> "PackedPairs":
+        """input_ids / attention_mask / labels: the collated batch (chosen rows first, right-padded, labels
+        unshifted). share: tree (True) or varlen (False)."""
+        if input_ids.shape[0] % 2:
+            raise PackingError(f"a preference batch holds chosen and rejected rows, got {input_ids.shape[0]} rows")
+        mask = attention_mask.bool()
+        if bool((mask[:, 1:] & ~mask[:, :-1]).any()):
+            raise PackingError("packed preference pairs need right-padded rows")
+        ids = input_ids.cpu().numpy()
+        lengths = mask.sum(dim=1).tolist()
+        num_pairs = ids.shape[0] // 2
+        sequences = [ids[b, :n] for b, n in enumerate(lengths)]
+        row = pack_groups(sequences, [b % num_pairs for b in range(len(sequences))], share)
+        where = np.zeros(ids.shape, dtype=np.int64)
+        for b, n in enumerate(lengths):
+            where[b, :n] = row.positions(b)
+        shifted = shift_labels(labels)
+        valid = shifted != IGNORE_INDEX
+        if bool((valid & ~mask).any()):
+            raise PackingError("a preference batch scores a token past the end of its row")
+        where = torch.from_numpy(where).to(labels.device)
+        terms = torch.stack([where[valid], shifted[valid]], dim=1)  # [T, 2]
+        unique, inverse = torch.unique(terms, dim=0, return_inverse=True)
+        return cls(row, valid, unique[:, 0], unique[:, 1], inverse, int(sum(lengths)))
+
+    @property
+    def num_terms(self) -> int:
+        return int(self.positions.numel())
+
+    def _term_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """[1, U, D]: the hidden states the terms read, from the packed row's [1, N, D]."""
+        if hidden.shape[0] != 1 or hidden.shape[1] != self.row.num_tokens:
+            raise PackingError(f"packed hidden states {tuple(hidden.shape)} for a row of {self.row.num_tokens} tokens")
+        return hidden[0].index_select(0, self.positions.to(hidden.device)).unsqueeze(0)
+
+    @torch.no_grad()
+    def token_logps(self, hidden: torch.Tensor, lm_head: nn.Module, num_chunks: int = 1) -> torch.Tensor:
+        """log pi(y_t | y_<t) at every scored position, 0 elsewhere, [2P, S]: `token_logps` of padded rows."""
+        out = torch.zeros(self.valid.shape, dtype=_loss_dtype(hidden), device=hidden.device)
+        if self.num_terms:
+            logps = token_logps(self._term_hidden(hidden), self.targets.unsqueeze(0), lm_head, num_chunks)[0]
+            out[self.valid] = logps[self.inverse]
+        return out
+
+    def weighted_backward(
+        self, hidden: torch.Tensor, lm_head: nn.Module, weights: torch.Tensor, loss_value: torch.Tensor, num_chunks: int
+    ) -> torch.Tensor:
+        """`_weighted_logp_backward` of padded rows: weights [2P, S] = dL/dlog pi(y_t). A term shared by both
+        sides of a pair carries the sum of their weights; the gathered hidden states' gradient flows back into
+        the packed row through autograd."""
+        if not hidden.requires_grad or not self.num_terms:
+            return loss_value
+        term_weights = torch.zeros(self.num_terms, dtype=weights.dtype, device=weights.device)
+        term_weights.index_add_(0, self.inverse, weights[self.valid])
+        term_hidden = self._term_hidden(hidden)
+        targets = self.targets.unsqueeze(0)
+        return _weighted_logp_backward(term_hidden, targets, lm_head, term_weights.unsqueeze(0), loss_value, num_chunks)
+
+
+@torch.no_grad()
+def packed_reference_logps(
+    ref_model: nn.Module, support, pairs: PackedPairs, lm_head: nn.Module, num_chunks: int = 1
+) -> torch.Tensor:
+    """Per-token reference log-probs [2P, S] of a packed preference batch (`reference_logps` of padded rows).
+    support: tree_packing.prepare_model(ref_model)."""
+    hidden = forward_packed(ref_model, support, pairs.row, pairs.valid.device)
+    return pairs.token_logps(hidden, lm_head, num_chunks)
+
+
+# ==============================================================================
 # LOSS
 # ==============================================================================
 
@@ -530,6 +694,7 @@ def preference_step(
     sft_scope: str = "all",
     sft_edit_window: int = 8,
     sft_pair_weight: torch.Tensor | None = None,
+    packed: PackedPairs | None = None,
 ) -> PreferenceStep:
     """The DPO loss for one micro-batch, via two chunked passes (see module doc).
 
@@ -542,11 +707,17 @@ def preference_step(
     chosen_token_denom: normaliser of the SFT term (defaults to the local tokens it covers).
     sft_scope / sft_edit_window: which chosen tokens the SFT term covers (`sft_token_mask`).
     sft_pair_weight: optional [P] per-pair scale of the SFT term (the rows' `sft_weight`).
+    packed:     the batch's packed layout (dpo.packing): `hidden` is then the packed row's
+                [1, N, D], and ref_logps come from `packed_reference_logps`. Labels, weights
+                and every objective stay in the [2P, S] layout.
     """
     shifted = shift_labels(labels)
     a = score_weights(shifted, num_pairs, ld_alpha)
     lengths = a.sum(dim=1)
-    policy_logps = token_logps(hidden.detach(), shifted, lm_head, num_chunks)
+    if packed is None:
+        policy_logps = token_logps(hidden.detach(), shifted, lm_head, num_chunks)
+    else:
+        policy_logps = packed.token_logps(hidden.detach(), lm_head, num_chunks)
 
     pair_denom = float(pair_denom if pair_denom is not None else num_pairs)
     scores = (policy_logps * a).sum(dim=1).requires_grad_(True)
@@ -570,7 +741,10 @@ def preference_step(
         weights = weights - (sft_weight / denom) * chosen_mask  # d(-mean logp)/dlog pi
 
     total = dpo_loss.detach() + sft_weight * sft_value
-    loss = _weighted_logp_backward(hidden, shifted, lm_head, weights, total, num_chunks)
+    if packed is None:
+        loss = _weighted_logp_backward(hidden, shifted, lm_head, weights, total, num_chunks)
+    else:
+        loss = packed.weighted_backward(hidden, lm_head, weights, total, num_chunks)
 
     with torch.no_grad():
         rewards = beta * (scores.detach() - ref_scores)
@@ -588,6 +762,8 @@ def preference_step(
         if sft_weight:
             local_chosen = max(chosen_mask.sum().item(), 1.0)
             metrics["dpo/sft_nll"] = float(-(policy_logps * chosen_mask).sum() / local_chosen)
+        if packed is not None:  # tokens forwarded per token of the pairs' sequences (1 = nothing shared)
+            metrics["dpo/forwarded_share"] = packed.row.num_tokens / max(packed.sequence_tokens, 1)
     return PreferenceStep(loss=loss, metrics=metrics)
 
 
