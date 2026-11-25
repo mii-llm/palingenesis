@@ -34,6 +34,13 @@ python -m palingenesis.agent_tooling.monitor_run --log_file outputs/train.log --
 python -m palingenesis.agent_tooling.rollouts --dir outputs/rl --json
 ```
 
+Before training on an environment, audit its reward (no GPU):
+
+```bash
+pgs env test text-to-sql --json        # oracle paid, degenerate policies not; exit 1 lists the reward-hacking holes
+pgs env test --all                     # the whole catalogue (pgs env list)
+```
+
 `monitor_run` and `check_loss` read the logs of `pgs train`, `pgs rl` and `pgs distill` alike.
 
 ### 3. Post-Training Analysis
@@ -118,6 +125,18 @@ Training issue?
 │   ├── Remote engines: pool/rejected or a half-applied push: rollout.push_verify; GPU-to-GPU push: push_link nccl
 │   │   (falls back to tcp, pool/link_failures); fp32 masters on the wire: rollout.push_dtype bfloat16
 │   └── A worker dies: rollout.min_engines n keeps the run (pool/lost, pool/rejoined); 0 ends it at the next update
+├── Need an environment, or an environment's reward looks gamed (reward up, task not solved)
+│   ├── Find: pgs env list [--family ...]; pgs env info <name> (data, tools, verifier, sandbox, licence, RL config lines)
+│   ├── Audit (no GPU): pgs env test <name> [--dataset rows.jsonl] [--json]: the oracle must pass every row, degenerate
+│   │   policies (empty, refusal, prompt repeated, tool spam, the entry's own attacks) must not; exit 1, holes listed
+│   │   with the policy and the first row it passes. Your own: pgs env test path/to/env.py:SPEC
+│   ├── Measure a checkpoint: pgs env run <name> --model <ckpt> --k 4 --output r.jsonl (pass@1, pass@4, finish
+│   │   reasons, episodes/s; then pgs compare base.jsonl r.jsonl)
+│   ├── Train: pgs env rows <name> --n 2000 -o rows.jsonl prints env.type / data.dataset; eval-only entries
+│   │   (instruction-following: form checks, no content check) are refused: pair them with a content reward
+│   ├── A policy found a shortcut the audit missed: add it to the entry's degenerate policies, fix the verifier
+│   │   (score the outcome, one committed answer place, gold outside the sandbox, a hidden twin), bump the version
+│   └── New environment: pgs env new <publisher>/<name> (environment, EnvSpec, entry point, audit test)
 ├── Multi-role RL (pgs rl with a scenario: section; CPU-tested only, GPU validation pending)
 │   ├── Data: an ordinary RL dataset plus a pattern (scenario.type solve_check | handoff | lead_workers, scored by
 │   │   the rewards: section; plan_execute on Harbor rows); pgs scenario patterns lists row fields and options
@@ -230,4 +249,5 @@ Use `--json` flag (where available) for structured output suitable for programma
 | MoE policy in RL: noisy ratios | `rollout.routing_replay: auto` with `rollout.prefix_caching: true` (vLLM returns the routed experts) |
 | Quality lost after FP4 / FP8 quantisation (PTQ) | QAT with KD to the bf16 model, `train.learning_rate: 3.0e-6`, thousands of distinct self-generated rows each seen once (measured on a 0.8B model: over half of the PTQ held-out KL recovered; a learning rate near SFT's on a narrow set made it worse than PTQ, so verify on held-out KL and a task metric against `pgs quantize`): `plugins.custom: [{class: palingenesis.qat:FloatQAT, args: {format: nvfp4, scales: mse, freeze_scales_at: 0.9}}]` + `distill.teachers.<name>.model: <the bf16 model>`, `model.torch_dtype: float32`; serve `final-nvfp4/` (see the QAT guide) |
 | Evaluation score dropped but samples look right | read `<task>.<mode>.samples.jsonl`: `finish: length` (raise `sampling.max_tokens`, thinking needs more), an answer format the scorer does not extract, or `unscored_samples` (see the Evaluation guide's pitfalls) |
+| RL reward rises while the task is not solved (a verifier hole) | `pgs env test <name or file.py:SPEC>`; fix the verifier, add the shortcut as a degenerate policy (see the Environments guide) |
 | Off-policy KD: student copies the teacher's tail / rambles | `distill.divergence: reverse_kl` or `jsd`, add `distill.ce_weight` |

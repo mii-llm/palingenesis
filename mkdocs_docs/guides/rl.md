@@ -126,6 +126,8 @@ A sandbox failure skips the sample (`skipped` in the logs); it is never scored a
 
 ## Tools and environments
 
+Ready-made environments with audited verifiers (math, code, tool calling, SQL, extraction, games, retrieval) are in the [environment catalogue](environments.md): `pgs env list`, `pgs env test <name>`, `pgs env rows <name>`. This section is the protocol they are written against.
+
 Stateless tools are functions:
 
 ```yaml
