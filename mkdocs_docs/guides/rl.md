@@ -418,6 +418,9 @@ With `rollout.url` (a server you started) these options cannot reach the server:
 
 ## Rollout engines: vLLM or SGLang
 
+!!! warning "The SGLang backends are experimental"
+    GPU validation is in progress (`scripts/gpu_checks/sglang.sh`, SGLang 0.5.17, torch 2.11 + cu129, one A100). The environment installs and the engine starts, generates and takes weight updates there, but the checks do not all pass yet. Colocated sleep mode (`rollout.backend: sglang` with `rollout.sleep: true`, the default, and `max_staleness: 0`) currently fails on CUDA 12.9: with `torch_memory_saver` active the engine's scheduler process does not start (`undefined symbol: cudaGetDriverEntryPointByVersion` when it loads torch), so `pgs rl` and `pgs distill` with that setting stop at startup. Until this is fixed, use vLLM (the default) for training runs; to try SGLang, set `rollout.sleep: false` with a `rollout.gpu_memory_utilization` that leaves the trainer room, or use `sglang_server`. See [Checking an engine](#checking-an-engine) for the checks and their status.
+
 `rollout.backend` picks what samples the rollouts. The trainer, the losses and the metrics are the same whichever engine it is: every engine implements one protocol (`palingenesis.opd.rollout.RolloutEngine`: `generate`, `update_weights`, `sleep`, `wake`, and the streaming calls for continuous batching), returns the sampled token ids with each token's log-probability under the sampling distribution, and is checked against the trainer by the same [agreement metrics](#samplertrainer-agreement).
 
 | `rollout.backend` | Engine | Weights after each step |
@@ -481,7 +484,7 @@ PGS_SRC=$PWD/src SGLANG_VENV=/scratch/sglang-venv WORKDIR=/scratch/sglang-checks
   VLLM_PYTHON=$PWD/.venv/bin/python bash scripts/gpu_checks/sglang.sh
 ```
 
-The SGLang backends are tested on CPU against a scripted engine (`tests/test_sglang_rollout.py`); their GPU validation is pending until that script's results are in.
+Status: the SGLang backends are tested on CPU against a scripted engine (`tests/test_sglang_rollout.py`). On a GPU the script's install and environment checks pass and the engine generates and takes weight updates; sleep / wake and the 10-step `pgs rl` and `pgs distill` runs (which sleep by default) fail with `torch_memory_saver` on CUDA 12.9, and the log-prob parity and weight-update checks have not passed yet. The backends stay experimental until the whole script passes.
 
 ## Speed
 
