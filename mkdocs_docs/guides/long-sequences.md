@@ -126,6 +126,8 @@ Every document is a row of its own, from position 0 with a fresh cache. There is
 
 The price is the padding inside the batches of short documents. It depends on how many short documents a block holds: grouping random length mixes the way SeCO does (a simulation, log-uniform lengths) gave 2–8% padding with 64 or more short documents per block and up to 30% with 4 to 16. `ChunkwiseResult.padding` reports it, and `scripts/bench_seco.py` prints it. The time per token of packed against unpacked SeCO has not been measured on a GPU yet.
 
+RL has its own packing of a step's trajectories, end to end or as a prefix trie that forwards shared prompts once: [RL: packing micro-batches](rl.md#packing-micro-batches).
+
 Raw-text corpora (`mode: pretrain`, continued pretraining) pack the same way; the [pretraining guide](pretraining.md#long-context-and-several-gpus) covers the rest of a long-context run.
 
 Not with packing: SpaCO, off-policy distillation, and MoE router balancing (the balancing losses need every token's routing before the first backward; set `moe.balance: false` or leave packing off).

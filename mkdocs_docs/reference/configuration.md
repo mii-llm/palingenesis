@@ -239,6 +239,11 @@ RL configs (`pgs rl`) run multi-role episodes when they have a `scenario:` secti
 RL configs also have `rollout.routing_replay` (`auto` / `on` / `off`, default `off` until the vLLM path is verified on a GPU): train each token through the
 experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.md#rl-routing-replay).
 
+RL configs lay out the policy step's micro-batches with `train.packing` (`padded` / `varlen` / `tree`, default `padded` until measured on a GPU):
+`varlen` packs a micro-batch's trajectories end to end in one row without padding, `tree` packs their prefix trie so a group's prompt and any other
+shared prefix is forwarded once; `train.micro_tokens` then bounds the packed (unique) tokens. Same log-probs and gradients as `padded`. Needs
+`sdpa` attention and full-attention / Gated DeltaNet layers; not with `model.multimodal`. See [RL: packing micro-batches](../guides/rl.md#packing-micro-batches).
+
 ---
 
 ### RL: rollout engines

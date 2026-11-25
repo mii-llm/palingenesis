@@ -443,6 +443,69 @@ The SGLang backends are tested on CPU against a scripted engine (`tests/test_sgl
 | `rollout.max_staleness: 1` | Rollouts, tools and rewards of step k+1 overlap the training of step k; the importance ratio corrects for the one-version lag |
 | `rollout.prefix_caching` | A group's rollouts share their prompt's prefill |
 | `train.micro_tokens` | Tokens per forward/backward micro-batch; logits are computed a slice at a time in fp32 and never materialized |
+| `train.packing: varlen` / `tree` | One packed row per micro-batch instead of padded rows; `tree` forwards every shared prefix once (below) |
+
+### Packing micro-batches
+
+`train.packing` decides how a micro-batch's trajectories are laid out for the policy's forward and backward
+(`palingenesis.tree_packing`):
+
+| Mode | Layout | Tokens through the model |
+|---|---|---|
+| `padded` (default) | Right-padded rows of similar lengths, longest first, a power-of-two number of rows | the rows' padded width x rows |
+| `varlen` | One row, the trajectories end to end; attention is variable-length, Gated DeltaNet layers restart their state at each trajectory | the trajectories' lengths, no padding |
+| `tree` | One row holding the trajectories' prefix trie: a token that several trajectories share with the same prefix is forwarded once | the trie's unique tokens |
+
+What `tree` shares: a group's prompt (computed once instead of `group_size` times), a system prompt or tool schema common to
+every group (across groups too), and a conversation before its turns branch (re-sampled final turns, tree search, onset
+branches). Rollouts that diverge at their first sampled token share only the prompt. `train.micro_tokens` bounds what a
+micro-batch forwards: padded tokens, the trajectories' tokens (`varlen`) or the trie's unique tokens (`tree`, which also
+keeps at most `micro_tokens` trained tokens per micro-batch, the head's work). The `tree` planner sends a trajectory to the
+micro-batch whose trie already holds the longest prefix of it, so a group is not split while it fits.
+
+How it is computed:
+
+- **Layout.** The trie is cut into segments, runs of tokens that end where trajectories branch or end, laid out level by
+  level. Every token keeps its position in its trajectories as position id, so rotary embeddings see what the unpacked
+  forward sees.
+- **Attention.** Each segment's queries attend to the keys and values of their root-to-segment path, gathered by index, in
+  one variable-length flash call whose causal mask is aligned bottom-right: a query sees every ancestor token and its own
+  causal past, nothing of its siblings. The kernel is torch's own FlashAttention-2 (`aten._flash_attention_forward`, the
+  variable-length kernel SFT packing uses): no flash-attn package is needed, and `model.flash_kernel` swaps in
+  FlashAttention-3 / 4 the same way. The backward gathers the paths again instead of saving them, and sums the gradients
+  of shared keys and values in fp32. Because a top-left aligned kernel would silently compute something else, the trainer
+  checks the tree path against an exact reference at startup and refuses to train if they disagree. Without a flash kernel
+  (CPU, fp32) an explicit `[N, N]` ancestor mask computes the same attention (the reference path; memory grows with `N^2`).
+- **Gated DeltaNet** (Qwen3.5, Qwen3-Next). The short convolution of a segment reads the last inputs of its ancestors;
+  the chunked delta rule runs once per tree level over the level's segments with the layer's own kernel, each segment
+  starting from its parent's final state, and the state's gradient flows back to the parent through autograd. With
+  flash-linear-attention installed a level is one variable-length kernel call; without it (transformers' torch fallback)
+  a level's segments run as right-padded rows, whose padded steps leave the state unchanged.
+- **Exactness.** The per-token log-probs, the loss statistics and every parameter gradient are the padded path's up to
+  floating-point order: tested on CPU in float64 on tiny GPT-2, Qwen3 and Qwen3.5 models (`tests/test_tree_packing.py`:
+  every token's hidden state against each trajectory forwarded alone, and one RL step padded vs `varlen` vs `tree` on
+  multi-turn groups with shared prompts, branching turns and the observation loss). After every packed forward the trainer
+  checks that each attention and Gated DeltaNet layer read the packed layout: a layer that ignored it would have mixed the
+  trajectories, and the step stops with an error instead.
+
+Requirements and incompatibilities, checked at startup: the policy's attention on `sdpa` (the default; palingenesis
+reroutes it), full-attention and Gated DeltaNet layers only (no sliding windows, attention soft-capping, chunked attention,
+Mamba or other recurrent layers), no `model.multimodal`, and with `tree` no `train.prompt_sharing: on` (the tree already
+forwards each prompt once; `auto` leaves it to the tree). FSDP (`train.fsdp`, torchrun), LoRA, scenarios, the KL
+reference and the observation loss work unchanged. MoE policies: router balancing counts a shared token once; routing
+replay takes a shared position's routing from the first trajectory that recorded it (a group's prompt is prefilled once by
+the engine anyway).
+
+The default stays `padded` until the GPU measurements below exist. TRL's AsyncGRPOTrainer, whose trie packing (`TreeRow`,
+`tree_attention`) this follows, reports 2.8 to 3x faster training steps than padding-free packing at a packing ratio of 3.4
+(raw tokens / unique tokens; Qwen3-0.6B / 1.7B on H100). The ratio is the upper bound of the gain on the model's work:
+multi-turn agent trajectories and branching rollouts gain most, single-turn groups with short prompts little.
+`scripts/gpu_checks/rl_packing.sh` measures equality on real models, step time, tokens/s and peak memory per mode, and runs
+a 20-step `pgs rl` smoke per mode:
+
+```bash
+PGS_PY=.venv/bin/python PGS_SRC=src bash scripts/gpu_checks/rl_packing.sh /tmp/rl_packing_check
+```
 
 ## How it is made fast
 

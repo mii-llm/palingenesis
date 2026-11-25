@@ -1004,15 +1004,15 @@ class RLTrainer:
                     balancer.end()
                 continue
             sequences = [t.prompt_ids + t.tokens[:-1] for t in micro]
-            image_kwargs, index, packed = {}, None, None
+            forward_kwargs, index, packed = {}, None, None  # images, or the packed layout
             if packing is not None:  # one row: the sequences end to end (varlen) or their prefix trie (tree)
                 packed = PackedRow.build(sequences, share=self.config.train.packing == "tree")
-                image_kwargs = packed.forward_kwargs(device)
-                ids = image_kwargs.pop("input_ids")
+                forward_kwargs = packed.forward_kwargs(device)
+                ids = forward_kwargs.pop("input_ids")
                 real = torch.ones(ids.shape, dtype=torch.bool)
             elif any(t.images for t in micro):
                 # placeholders expanded with the processor the engine used; the pixels are processed again here
-                ids, image_kwargs, index = multimodal.batch_sequences(
+                ids, forward_kwargs, index = multimodal.batch_sequences(
                     self.vision, sequences, [t.images for t in micro], self.pad_id, device
                 )
                 # a row's real positions end at its last token's expanded position
@@ -1064,11 +1064,11 @@ class RLTrainer:
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 if packed is None:
                     # right-padded rows need no mask: padding comes after every position scored
-                    states = final_hidden_states(self.model, ids, None, **image_kwargs)
+                    states = final_hidden_states(self.model, ids, None, **forward_kwargs)
                     hidden = states[positions.to(device, non_blocking=True)]
                     echo_hidden = states[echo_positions.to(device, non_blocking=True)] if echo else None
                 else:
-                    states = self._packed_forward(packing, packed, ids, image_kwargs)[0]
+                    states = self._packed_forward(packing, packed, ids, forward_kwargs)[0]
                     hidden = states[torch.tensor(positions, dtype=torch.long).to(device, non_blocking=True)]
                     echo_hidden = None
                     if echo:

@@ -180,6 +180,8 @@ routing part of the mismatch, not the rest.
 Limits:
 
 - With replay on, prompt-sharing trees (`train.prompt_sharing`) are off: the record is per rollout.
+- Packed micro-batches (`train.packing: varlen` / `tree`) replay too; a position several rollouts share in a `tree` takes the
+  first recorded routing (a group's prompt is prefilled once by the engine anyway).
 - A position without a record (an engine that returned none, a turn generated before a restart) is routed by the
   trainer itself.
 - The record costs host memory: positions x MoE layers x top_k bytes per trajectory (one byte per choice up to
