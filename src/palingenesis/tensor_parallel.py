@@ -260,34 +260,41 @@ class _LocalView(torch.autograd.Function):
         return grad, None
 
 
-def _local_params(module: nn.Module, mesh, placements: dict[str, tuple]) -> None:
-    """Distribute `module`'s parameters (name -> (placement, sum gradients over the group?)) and give its
-    forward their local shards as plain tensors."""
+def _local_params(module: nn.Module, mesh, placements: dict[str, tuple], child: str = "") -> None:
+    """Distribute the parameters `placements` (name -> (placement, sum gradients over the group?)) of `module`
+    (of its submodule `child`, when given) and give `module`'s forward their local shards as plain tensors.
+
+    `child`: the parameters belong to a submodule that `module`'s forward reads directly instead of calling
+    (Gated DeltaNet passes `self.conv1d.weight` to the causal-conv1d kernel, a custom operator that takes plain
+    tensors only), so the swap must last for the whole of `module`'s forward. The owner is looked up from the
+    hooked module at call time: a deep copy of the model keeps working."""
     from torch.distributed.tensor import distribute_tensor
 
+    owner = module.get_submodule(child) if child else module
     for name, (placement, _) in placements.items():
-        param = module._parameters[name]
-        module.register_parameter(
+        param = owner._parameters[name]
+        owner.register_parameter(
             name,
             nn.Parameter(distribute_tensor(param.data, mesh, [placement]), requires_grad=param.requires_grad),
         )
     reduce = {name: mesh.get_group() if summed else None for name, (_, summed) in placements.items()}
+    slot = f"_pgs_tp_saved_{child}"
 
     def pre(mod, args):
-        saved = {}
-        for name in placements:
-            param = mod._parameters[name]
-            saved[name] = param
-            mod._parameters[name] = _LocalView.apply(param, reduce[name])
-        mod._pgs_tp_saved = saved
+        target = mod.get_submodule(child) if child else mod
+        saved = {name: target._parameters[name] for name in placements}
+        for name, param in saved.items():
+            target._parameters[name] = _LocalView.apply(param, reduce[name])
+        setattr(mod, slot, saved)
 
     def post(mod, args, output):
-        for name, param in mod.__dict__.pop("_pgs_tp_saved").items():
-            mod._parameters[name] = param
+        target = mod.get_submodule(child) if child else mod
+        for name, param in mod.__dict__.pop(slot, {}).items():
+            target._parameters[name] = param
         return output
 
     module.register_forward_pre_hook(pre)
-    module.register_forward_hook(post)
+    module.register_forward_hook(post, always_call=True)  # also when the forward raises: the parameters come back
 
 
 def _sequence_local_embedding(embedding: nn.Module, tp: TensorParallel) -> None:
@@ -397,7 +404,9 @@ def _gated_delta_net(gdn: nn.Module, name: str, tp: TensorParallel) -> dict:
     if gdn.conv1d.bias is not None:
         tp.sections[f"{name}.conv1d.bias"] = sections
         conv["bias"] = (Shard(0), False)
-    _local_params(gdn.conv1d, tp.mesh, conv)
+    # the forward reads conv1d.weight / bias itself for the causal-conv1d kernel (a custom operator: plain tensors
+    # only) and calls conv1d without it: local for the whole of the layer's forward covers both
+    _local_params(gdn, tp.mesh, conv, child="conv1d")
     _local_params(gdn, tp.mesh, {"A_log": (Shard(0), False), "dt_bias": (Shard(0), False)})
     _local_params(gdn.norm, tp.mesh, {k: (Replicate(), True) for k, _ in gdn.norm.named_parameters(recurse=False)})
     # transformers' forward reads its sizes from these attributes: this rank's heads
