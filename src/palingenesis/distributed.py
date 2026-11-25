@@ -304,7 +304,9 @@ def apply_fsdp(
         reduce_dtype=torch.float32,
     )
 
-    offload_policy = CPUOffloadPolicy() if config.cpu_offload else None
+    # Pinned (page-locked) host memory only speeds up the copies to a GPU, and pinning needs a CUDA device: without
+    # one (a CPU run on a CUDA build of PyTorch) `pin_memory()` raises "No CUDA GPUs are available".
+    offload_policy = CPUOffloadPolicy(pin_memory=torch.cuda.is_available()) if config.cpu_offload else None
 
     fsdp_kwargs = dict(
         mesh=dp_mesh,
