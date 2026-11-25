@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 MiB = 1 << 20
 ARENA_CHUNK = 256 * MiB
-_ARENA_ALIGN = 512  # bytes: each offloaded tensor starts on a 512-byte boundary of its chunk
+_ARENA_ALIGN = 512  # bytes: each offloaded tensor starts at an address that is a multiple of 512
 
 
 @dataclass(frozen=True)
@@ -117,10 +117,20 @@ def _host_available_bytes() -> int | None:
 
 
 class _Chunk:
-    __slots__ = ("buf", "size", "offset", "live")
+    """`size` usable bytes of `buf` from its first byte at an aligned address (`start`); `offset` is the bump
+    pointer, an index into `buf`."""
 
-    def __init__(self, buf: torch.Tensor):
-        self.buf, self.size, self.offset, self.live = buf, buf.numel(), 0, 0
+    __slots__ = ("buf", "size", "start", "offset", "live")
+
+    def __init__(self, buf: torch.Tensor, size: int):
+        start = -buf.data_ptr() % _ARENA_ALIGN
+        if start + size > buf.numel():
+            raise ValueError(f"a buffer of {buf.numel()} bytes has no {size} bytes from an aligned address")
+        self.buf, self.size, self.start, self.offset, self.live = buf, size, start, start, 0
+
+    @property
+    def free(self) -> int:
+        return self.start + self.size - self.offset
 
 
 class HostArena:
@@ -151,10 +161,20 @@ class HostArena:
     def reserved_bytes(self) -> int:
         return sum(c.size for c in self._chunks)
 
+    def _allocate(self, size: int) -> torch.Tensor:
+        """A uint8 buffer with `size` bytes from an aligned address. Pinned (page-locked) memory starts on a page;
+        pageable memory from the C allocator need not start on a multiple of the alignment (glibc: 64 bytes), and
+        then the buffer is taken one alignment longer, so the chunk can start at its first aligned byte."""
+        buf = torch.empty(size, dtype=torch.uint8, pin_memory=self.pin)
+        if buf.data_ptr() % _ARENA_ALIGN:
+            del buf
+            buf = torch.empty(size + _ARENA_ALIGN, dtype=torch.uint8, pin_memory=self.pin)
+        return buf
+
     def take(self, nbytes: int) -> tuple[torch.Tensor, _Chunk]:
         need = -(-nbytes // _ARENA_ALIGN) * _ARENA_ALIGN
         with self._lock:
-            chunk = next((c for c in self._chunks if c.size - c.offset >= need), None)
+            chunk = next((c for c in self._chunks if c.free >= need), None)
             if chunk is None:
                 size = self.chunk_bytes if need <= self.chunk_bytes else 1 << (need - 1).bit_length()
                 if self.limit_bytes is not None and self.reserved_bytes + size > self.limit_bytes:
@@ -175,11 +195,11 @@ class HostArena:
                         "layer's input), memory.activation_offload_boundaries_only, a shorter sequence or a "
                         "smaller batch."
                     )
-                buf = torch.empty(size, dtype=torch.uint8, pin_memory=self.pin)
+                buf = self._allocate(size)
                 # the allocation may have run the garbage collector, and with it release(): look again
-                chunk = next((c for c in self._chunks if c.size - c.offset >= need), None)
+                chunk = next((c for c in self._chunks if c.free >= need), None)
                 if chunk is None:
-                    chunk = _Chunk(buf)
+                    chunk = _Chunk(buf, size)
                     self._chunks.append(chunk)
             # book the range before anything else allocates: a release() of this chunk's other tensors that the
             # garbage collector runs from here on finds it live and does not rewind it under the new view
@@ -192,7 +212,7 @@ class HostArena:
         with self._lock:
             chunk.live -= 1
             if chunk.live <= 0:
-                chunk.live, chunk.offset = 0, 0
+                chunk.live, chunk.offset = 0, chunk.start
 
     def clear(self) -> None:
         with self._lock:

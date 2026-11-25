@@ -359,7 +359,7 @@ def test_arena_reuses_released_chunks_and_bounds_its_size():
     b, cb = arena.take(400_000)
     assert ca is cb and a.data_ptr() % 512 == 0 and b.data_ptr() - a.data_ptr() >= 400_000
     c, cc = arena.take(400_000)  # does not fit the first chunk
-    assert cc is not ca and arena.reserved_bytes == 2 << 20
+    assert cc is not ca and arena.reserved_bytes == 2 << 20 and c.data_ptr() % 512 == 0
     for chunk in (ca, cb, cc):
         arena.release(chunk)
     d, cd = arena.take(400_000)
@@ -368,6 +368,35 @@ def test_arena_reuses_released_chunks_and_bounds_its_size():
     assert cbig.size == 2 << 20 and arena.reserved_bytes == 4 << 20
     with pytest.raises(RuntimeError, match="activation_offload_boundaries_only"):
         arena.take(1_500_000)  # a third chunk would pass the limit
+
+
+@pytest.mark.parametrize("shift", [8, 64, 384, 511])
+def test_arena_views_are_aligned_whatever_the_allocator_returns(monkeypatch, shift):
+    """Addresses, not offsets in the chunk, are aligned: pageable memory may start anywhere (glibc: 64 bytes)."""
+    arena = HostArena(pin=False, limit_bytes=2 << 20, chunk_bytes=1 << 20)
+    asked = []
+
+    def allocate(size, **kw):  # a buffer whose first byte is `shift` past a multiple of 512
+        asked.append(size)
+        raw = torch.zeros(size + 512, dtype=torch.uint8)
+        skip = (shift - raw.data_ptr()) % 512
+        return raw[skip : skip + size]
+
+    monkeypatch.setattr("palingenesis.activation_offload.torch.empty", allocate)
+    views = [arena.take(n)[0] for n in (1000, 513, 1 << 19)]
+    assert asked == [1 << 20, (1 << 20) + 512]  # misaligned: taken again, one alignment longer
+    assert all(v.data_ptr() % 512 == 0 for v in views)
+    assert views[1].data_ptr() - views[0].data_ptr() == 1024 and views[2].data_ptr() - views[1].data_ptr() == 1024
+    chunk = arena._chunks[0]
+    assert chunk.start == 512 - shift and arena.reserved_bytes == 1 << 20
+    rest, same = arena.take(chunk.free)  # the whole usable size is there, to the last byte of the buffer
+    assert same is chunk and rest.data_ptr() + rest.numel() <= chunk.buf.data_ptr() + chunk.buf.numel()
+    for v, dtype in zip(views, (torch.float64, torch.bfloat16, torch.float32)):
+        v[: v.numel() // 8 * 8].view(dtype).fill_(1.0)  # element-aligned for every dtype
+    for _ in range(4):
+        arena.release(chunk)
+    again, _ = arena.take(1000)
+    assert again.data_ptr() == views[0].data_ptr()  # rewound to the first aligned byte, not to the buffer's start
 
 
 def test_arena_leaves_host_memory_available():
@@ -393,7 +422,7 @@ def test_arena_release_during_take_is_safe():
     arena._available = lambda: arena.release(chunk)  # runs inside take(), under the lock
     view, second = arena.take(600_000)  # does not fit: a new chunk is asked for, the old one is released meanwhile
     assert second is chunk and chunk.live == 1 and chunk.offset >= 600_000
-    assert view.data_ptr() == chunk.buf.data_ptr()
+    assert view.data_ptr() == chunk.buf.data_ptr() + chunk.start
     other, third = arena.take(300_000)
     assert third is chunk and other.data_ptr() >= view.data_ptr() + 600_000  # no overlap with the live view
 
