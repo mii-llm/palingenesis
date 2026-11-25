@@ -766,13 +766,43 @@ class InProcessEngine:
         result = self.engine.update_weights_from_tensor(named, flush_cache=flush_cache)
         return _ok(result)
 
-    def release(self, tags: list[str]) -> None:
+    POLL_SECONDS = 1.0  # how often a waiting control call checks that the scheduler is still alive
+
+    async def _guarded(self, coroutine):
+        """Await a control call, giving up when the scheduler died: a scheduler that failed an assertion sends no
+        answer, and the call would wait for it forever (keeping the thread that made it, and the run's shutdown)."""
+        task = asyncio.ensure_future(coroutine)
+        try:
+            while True:
+                done, _ = await asyncio.wait([task], timeout=self.POLL_SECONDS)
+                if done:
+                    return task.result()
+                self.check()
+        finally:
+            task.cancel()
+
+    def wait_idle(self, timeout: float) -> tuple[bool, str]:
+        """Wait until the scheduler holds no request (running batch, last batch, waiting queue), up to `timeout`
+        seconds; (idle, message). SGLang's flush_cache with a timeout does exactly this wait (and then clears the
+        radix cache, which the callers, a release and a weight update, clear anyway). A completion's answer leaves
+        the scheduler before its batch is retired, so "every request answered" is not yet "idle"."""
         self.check()
-        self.engine.release_memory_occupation(tags=tags)
+        result = self.run(self._guarded(self.engine.tokenizer_manager.flush_cache(timeout_s=float(timeout))))
+        return bool(getattr(result, "success", result)), str(getattr(result, "message", "") or "")
+
+    def release(self, tags: list[str]) -> None:
+        from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
+
+        self.check()
+        request = ReleaseMemoryOccupationReqInput(tags=list(tags))
+        self.run(self._guarded(self.engine.tokenizer_manager.release_memory_occupation(request, None)))
 
     def resume(self, tags: list[str]) -> None:
+        from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
+
         self.check()
-        self.engine.resume_memory_occupation(tags=tags)
+        request = ResumeMemoryOccupationReqInput(tags=list(tags))
+        self.run(self._guarded(self.engine.tokenizer_manager.resume_memory_occupation(request, None)))
 
     def flush_cache(self) -> bool:
         self.check()
@@ -899,6 +929,7 @@ class SGLangRollout(_Completions):
 
     STEP_SECONDS = 0.02  # stream_step returns after this long when nothing finished (weight updates go between)
     POLL_SECONDS = 1.0  # how often a waiting call checks that the engine's scheduler is still alive
+    IDLE_SECONDS = 120.0  # how long sleep and a weight update wait for the scheduler to be idle
 
     def __init__(
         self,
@@ -977,7 +1008,7 @@ class SGLangRollout(_Completions):
             if any(not task.cancelled() and task.exception() is not None for task in done):
                 return
 
-    async def _drain(self, tasks: list) -> None:
+    async def _settle(self, tasks: list) -> None:
         """Wait until every one of `tasks` is done, failed ones included (their errors are raised where their
         results are read: stream_step); raises when the engine's scheduler died meanwhile."""
         pending = set(tasks)
@@ -985,15 +1016,33 @@ class SGLangRollout(_Completions):
             _, pending = await asyncio.wait(pending, timeout=self.POLL_SECONDS)
             self._alive()
 
+    def _drain(self, purpose: str) -> None:
+        """Every request in flight finished (failed ones included) and the scheduler idle, before `purpose` (a release
+        of the engine's memory or a weight update): SGLang asserts an idle scheduler for both (release_memory_occupation;
+        the cache flush of an update), and a failed assertion there ends the scheduler. A completion's answer arrives
+        before the scheduler retires its batch, so answered requests alone are not enough. Called under the lock."""
+        inflight = [task for task, _, _ in self.streams.values() if not task.done()]
+        if inflight:
+            self.calls.run(self._settle(inflight))
+        wait_idle = getattr(self.calls, "wait_idle", None)
+        if wait_idle is None:
+            return
+        idle, message = wait_idle(self.IDLE_SECONDS)
+        if not idle:
+            raise RuntimeError(
+                f"the SGLang engine did not become idle within {self.IDLE_SECONDS:.0f}s, so {purpose} was not "
+                f"attempted (its scheduler still holds requests{': ' + message if message else ''})."
+            )
+
     def update_weights(self, named_tensors, version: int) -> None:
         with self.lock:
             # The requests in flight finish first, under the weights that started them. SGLang's model-update lock
             # does this for one call; an update is several (one per bucket), and a request that had not started
             # could otherwise run between two of them, on weights of two versions. Every one of them: a request
-            # that failed does not end the wait for those still decoding.
-            inflight = [task for task, _, _ in self.streams.values() if not task.done()]
-            if inflight:
-                self.calls.run(self._drain(inflight))
+            # that failed does not end the wait for those still decoding. Asleep, nothing has run since the release
+            # (and the KV cache the idle wait would clear is not there).
+            if not self.asleep:
+                self._drain("the weight update")
             if self.weights_released:
                 torch.cuda.empty_cache()  # the trainer's cached blocks back to the driver for the engine to map
                 self.calls.resume(["weights"])
@@ -1012,8 +1061,7 @@ class SGLangRollout(_Completions):
         if not self.sleep_mode or self.asleep:
             return
         with self.lock:
-            if any(not task.done() for task, _, _ in self.streams.values()):
-                raise RuntimeError("the SGLang engine cannot sleep with requests in flight")
+            self._drain("the release of its memory (sleep)")  # requests in flight finish first; then idle
             self.calls.release(self.memory_tags)
             self.asleep, self.weights_released, self.version = True, "weights" in self.memory_tags, -1
 

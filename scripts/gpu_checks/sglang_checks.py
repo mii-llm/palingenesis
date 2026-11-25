@@ -638,6 +638,7 @@ def saver_check(args) -> None:
         record["start_seconds"] = time.perf_counter() - start
         record["tokens"] = sum(len(r.completion_ids) for r in engine.generate(prompts, [8, 8], 0.0))
         awake = _used_gib()
+        record["idle_before_release"] = engine.calls.wait_idle(60.0)[0]  # as SGLangRollout.sleep does
         engine.calls.release(engine.memory_tags)
         record["released_gib"] = awake - _used_gib()
         engine.calls.resume(engine.memory_tags)

@@ -570,6 +570,114 @@ def test_sleep_releases_everything_and_wakes_after_an_update():
     assert sum(c[0] == "release" for c in scripted.calls) == 2
 
 
+class IdleScripted(ScriptedEngine):
+    """A scripted engine with SGLang's idle rule: the scheduler still holds a batch for `settle` waits after the
+    last answer, and a release (or the cache flush of an update) before that is a failed assertion there."""
+
+    def __init__(self, settle=2, **kwargs):
+        super().__init__(**kwargs)
+        self.settle = settle
+        self.busy = 0
+        self.waits = 0
+
+    async def agenerate(self, request):
+        try:
+            return await super().agenerate(request)
+        finally:
+            self.busy = self.settle  # answered, its batch not retired yet
+
+    def wait_idle(self, timeout):
+        async def drain():
+            while self.inflight:
+                await asyncio.sleep(0.001)
+
+        self.run(drain())
+        self.waits += 1
+        if self.settle < 0:
+            return False, "Timed out waiting for idle state."
+        self.busy = 0
+        return True, ""
+
+    def release(self, tags):
+        assert (
+            not self.inflight and not self.busy
+        ), "release_memory_occupation should be called only when server is idle."
+        super().release(tags)
+
+    def update_weights_from_tensor(self, named, flush_cache):
+        assert not self.inflight and not (flush_cache and self.busy), "Cache flush failed after updating weights"
+        self.calls.append(("update", flush_cache))
+        return True, "ok"
+
+
+def test_sleep_waits_for_requests_in_flight_and_for_an_idle_scheduler():
+    """pgs distill slept the engine right after its batch came back, while the scheduler still held that batch:
+    SGLang asserts idleness in release_memory_occupation. sleep now waits for the requests in flight, then for the
+    scheduler to be idle, and only then releases."""
+    scripted = IdleScripted(delay=0.01)
+    engine, _ = _engine(engine=scripted, sleep_mode=True)
+    engine.generate([[1], [2]], [8, 8], 1.0)
+    assert scripted.busy  # every request answered, the scheduler not idle yet
+    engine.sleep()
+    assert scripted.waits == 1 and scripted.calls == [("release", ["kv_cache", "weights", "cuda_graph"])]
+
+    scripted = IdleScripted()
+    engine, _ = _engine(engine=scripted, sleep_mode=True)
+    scripted.gate = asyncio.Event()
+    engine.stream_add("a", [1], 8, 1.0, n=2)
+    assert engine.stream_step() == [] and scripted.inflight == 2  # in flight (held at the gate) when sleep is called
+    scripted.loop.call_later(0.02, scripted.gate.set)
+    engine.sleep()  # waits for them, then for idleness, then releases
+    assert scripted.inflight == 0 and scripted.calls == [("release", ["kv_cache", "weights", "cuda_graph"])]
+    assert engine.asleep
+    (finished,) = engine.stream_step()  # their completions were kept
+    assert finished[0] == "a" and len(finished[1]) == 2 and finished[1][0].policy_version == 0
+
+
+def test_a_weight_update_waits_for_an_idle_scheduler_and_a_busy_one_is_an_error():
+    scripted = IdleScripted()
+    engine, _ = _engine(engine=scripted)
+    engine.generate([[1]], [8], 1.0)
+    engine.update_weights([("w", torch.ones(2))], version=1)  # its last bucket flushes the cache: idle first
+    assert scripted.waits == 1 and scripted.calls == [("update", True)] and engine.version == 1
+
+    stuck = IdleScripted(settle=-1)
+    engine, _ = _engine(engine=stuck, sleep_mode=True)
+    with pytest.raises(RuntimeError, match=r"did not become idle within 120s.*Timed out waiting for idle"):
+        engine.sleep()
+    assert not engine.asleep and stuck.calls == []  # nothing was released
+    with pytest.raises(RuntimeError, match="the weight update was not attempted"):
+        engine.update_weights([("w", torch.ones(2))], version=1)
+    assert engine.version == 0
+
+    asleep = IdleScripted()
+    engine, _ = _engine(engine=asleep, sleep_mode=True)
+    engine.sleep()
+    engine.update_weights([("w", torch.ones(2))], version=1)  # asleep: nothing ran since the release, no wait
+    assert asleep.waits == 1 and asleep.calls[1:] == [("resume", ["weights"]), ("update", True)]
+
+
+def test_control_calls_give_up_when_the_scheduler_died():
+    """A scheduler that failed an assertion answers nothing: release / resume / the idle wait stop waiting once the
+    engine is marked dead, instead of holding their thread (and the run's shutdown) forever."""
+    engine = object.__new__(InProcessEngine)
+    engine.failed, engine._helper, engine.POLL_SECONDS = "", None, 0.01
+    engine.loop = asyncio.new_event_loop()
+    engine.engine = SimpleNamespace()
+
+    async def never():
+        await asyncio.Event().wait()
+
+    async def answer():
+        return "done"
+
+    assert engine.run(engine._guarded(answer())) == "done"
+    engine.loop.call_later(0.03, lambda: setattr(engine, "failed", "scheduler process died"))
+    with pytest.raises(RuntimeError, match="scheduler process died"):
+        engine.run(engine._guarded(never()))
+    engine.loop.close()
+
+
 def test_without_sleep_mode_the_engine_keeps_its_memory():
     engine, scripted = _engine(sleep_mode=False)
     engine.sleep()
