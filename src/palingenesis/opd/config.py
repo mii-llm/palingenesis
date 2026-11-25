@@ -16,6 +16,7 @@ import yaml
 
 from palingenesis.cmr import CMRConfig
 from palingenesis.config import MoEConfig
+from palingenesis.eval.config import EvalTasksConfig
 from palingenesis.hooks import PolicyPluginsConfig
 from palingenesis.validate_data import valid_think_tags
 
@@ -407,6 +408,9 @@ class OPDConfig:
     moe: MoEConfig = field(default_factory=MoEConfig)  # MoE students: router balancing (palingenesis.moe)
     # trainer plugins (palingenesis.hooks), e.g. palingenesis.qat:FloatQAT: plugins: {custom: [...]}
     plugins: PolicyPluginsConfig = field(default_factory=PolicyPluginsConfig)
+    # evaluation tasks during training (palingenesis.eval; `pgs eval` tasks every train.eval_every steps, on the
+    # rollout engine); off by default
+    eval_tasks: EvalTasksConfig = field(default_factory=EvalTasksConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "OPDConfig":
@@ -753,6 +757,7 @@ class OPDConfig:
         if self.train.lr_scheduler not in ("cosine", "constant"):
             errors.append(f"train.lr_scheduler must be 'cosine' or 'constant', got {self.train.lr_scheduler!r}.")
 
+        errors.extend(self.eval_tasks.errors())
         if errors:
             raise OPDConfigError(
                 "OPD configuration has incompatible settings:\n" + "\n".join(f"  ✗ {e}" for e in errors)

@@ -1,0 +1,18 @@
+# MMLU-Pro (Wang et al. 2024): multiple choice with up to ten options, 14 subjects. Test split, 12,032 items.
+# License: MIT. The full set is large: --limit 2000 draws a fixed sample (the same items for every checkpoint).
+name: mmlu_pro
+description: multiple choice, up to 10 options, 14 subjects (12,032 items)
+dataset: TIGER-Lab/MMLU-Pro
+split: test
+id_field: question_id
+fields:
+  choices: {from: options, choices: true}    # ["x", "y"] -> "A. x\nB. y"
+prompt: |
+  The following is a multiple-choice question about {{category}}. Think step by step, then finish with "The answer is (X)", where X is the letter of the correct option.
+
+  Question: {{question}}
+  Options:
+  {{choices}}
+scorer: mcq                # the last "answer is (X)" / "Answer: X", else a boxed or the last standalone letter
+scorer_args: {field: answer}
+sampling: {max_tokens: 2048}

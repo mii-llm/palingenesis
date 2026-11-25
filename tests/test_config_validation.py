@@ -267,7 +267,11 @@ def test_every_shipped_config_loads():
     assert configs
     for path in configs:
         # on-policy distillation and RL configs have their own schemas
-        if path.name.startswith("rl_"):
+        if path.parent.name == "eval":  # evaluation tasks (pgs eval)
+            from palingenesis.eval.config import MODES, load_task, task_errors
+
+            assert task_errors(load_task(str(path)), set(MODES)) == []
+        elif path.name.startswith("rl_"):
             RLConfig.from_yaml(path).validate()
         else:
             (OPDConfig if path.name.startswith("distill_") else Config).from_yaml(path)

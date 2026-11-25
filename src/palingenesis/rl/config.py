@@ -19,6 +19,7 @@ import yaml
 
 from palingenesis.cmr import CMRConfig
 from palingenesis.config import MoEConfig
+from palingenesis.eval.config import EvalTasksConfig
 from palingenesis.hooks import PolicyPluginsConfig
 
 LOSSES = ("masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce")
@@ -593,6 +594,9 @@ class RLConfig:
     )  # low-rank adapters instead of full weights; off by default
     # trainer plugins (palingenesis.hooks.PolicyPlugins), e.g. palingenesis.qat:FloatQAT: plugins: {custom: [...]}
     plugins: PolicyPluginsConfig = field(default_factory=PolicyPluginsConfig)
+    # evaluation tasks during training (palingenesis.eval; `pgs eval` tasks every train.eval_every steps, on the
+    # rollout engine); off by default
+    eval_tasks: EvalTasksConfig = field(default_factory=EvalTasksConfig)
 
     # ------------------------------------------------------------------ loading
 
@@ -1184,6 +1188,7 @@ class RLConfig:
         elif not adapters and t.learning_rate > 1e-5:
             warnings.append(f"train.learning_rate {t.learning_rate}: RL recipes use 5e-7 to 2e-6.")
 
+        errors.extend(self.eval_tasks.errors())
         if errors:
             raise RLConfigError("RL configuration has incompatible settings:\n" + "\n".join(f"  ✗ {x}" for x in errors))
         return warnings

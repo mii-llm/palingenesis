@@ -14,6 +14,7 @@ from typing import Literal
 import yaml
 
 from palingenesis.distill.config import DistillConfig
+from palingenesis.eval.config import EvalTasksConfig
 
 
 @dataclass(slots=True)
@@ -612,6 +613,8 @@ class Config:
     distill: DistillConfig = field(default_factory=DistillConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    # evaluation tasks during training (palingenesis.eval; `pgs eval` tasks every data.eval_every steps); off by default
+    eval_tasks: EvalTasksConfig = field(default_factory=EvalTasksConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
@@ -1079,6 +1082,8 @@ class Config:
                 "ga_ramp + mona: dynamic batch size changes the gradient noise scale, "
                 "which may confuse MONA's curvature estimates. UNTESTED combination."
             )
+
+        errors.extend(self.eval_tasks.errors())
 
         # ── Raise on errors ───────────────────────────────────────────────
         if errors:
