@@ -26,8 +26,13 @@
 #                is SKIPped, with the collective that failed or crashed, when this build cannot run them.
 #
 # Every gradient check runs once per dtype and names the parameters that differ most ("worst"):
-#   fp32   float32 weights, no autocast: the correctness check. Tight tolerances (loss 1e-4, gradients 2e-3);
-#          a wrong reduction or layout is an error of order 1 here.
+#   fp32   float32 weights, no autocast, TF32 off: the correctness check. Tight tolerances (loss 1e-4,
+#          gradients 2e-3); a wrong reduction or layout is an error of order 1 here. Some kernels are not
+#          that reproducible even in float32 (the Gated DeltaNet decay path, A_log / dt_bias / in_proj_a,
+#          through the flash-linear-attention kernels), so the plain model is also run twice, the batch whole
+#          and row by row (what pipeline micro-batches do), and each parameter's tolerance is
+#          2e-3 + 3 x that measured difference ("split_noise"). A parameter far above its own
+#          reference-against-reference noise is a bug; one within it is the kernel.
 #   bf16   bfloat16 weights under bf16 autocast, as deployed. A bf16 backward is only accurate to a few percent
 #          per parameter, and much less for the norm weights (their gradient is a sum of ~10^4 cancelling
 #          bf16 terms, accumulated in bf16): any change in the order of operations (micro-batches, a compiled
@@ -66,6 +71,10 @@ ROWS = 2
 FAILED = []
 # relative tolerances (loss, gradient) of the float32 pass; bf16: the loss, and the noise rule for gradients
 FP32_TOL = (1e-4, 2e-3)
+FP32_NOISE_FACTOR = 3.0  # x the plain model's own whole-batch against row-by-row difference, per parameter
+if DEVICE == "cuda":  # the float32 pass is float32: no TensorFloat-32 matmuls or convolutions
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 BF16_LOSS_TOL = 2e-3
 BF16_NOISE_FACTOR, BF16_NOISE_FLOOR = 3.0, 0.02
 
@@ -82,7 +91,9 @@ def run_check(name, fn, *args):
     try:
         fn(name, *args)
     except Exception as e:  # noqa: BLE001 - every check reports, none stops the others
-        emit(name, "FAIL", error=f"{type(e).__name__}: {e}"[:600], trace=traceback.format_exc()[-1500:])
+        # a worker's exception arrives as its whole traceback: the last line says what was raised
+        lines = str(e).strip().splitlines() or [""]
+        emit(name, "FAIL", error=f"{type(e).__name__}: {lines[-1]}"[:600], trace=traceback.format_exc()[-3000:])
 
 
 def free_port():
@@ -116,12 +127,33 @@ def pipeline_on_this_backend():
     return f"torch {torch.__version__} pipeline schedules send from a rank to itself, which gloo cannot do (CPU run)"
 
 
+def use_torch_linear_attention(model):
+    """Gated DeltaNet layers on transformers' pure-torch paths: the causal-conv1d and flash-linear-attention
+    kernels, when installed, are CUDA only and raise on CPU tensors. Returns the number of layers switched."""
+    switched = 0
+    for module in model.modules():
+        if "causal_conv1d_fn" not in vars(module):
+            continue
+        source = sys.modules.get(type(module).__module__)
+        module.causal_conv1d_fn = None  # the layer then calls its own nn.Conv1d
+        for attr in ("chunk_gated_delta_rule", "recurrent_gated_delta_rule", "causal_conv1d_update"):
+            fallback = getattr(source, f"torch_{attr}", None)
+            if fallback is None and attr in vars(module):
+                raise RuntimeError(f"transformers has no torch fallback for {attr}")
+            if fallback is not None:
+                setattr(module, attr, fallback)
+        switched += 1
+    return switched
+
+
 def load(name, dtype, untie=False, device=None):
     from transformers import AutoModelForCausalLM
 
     torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(name, dtype=torch_dtype, attn_implementation="sdpa")
     model.config.use_cache = False
+    if (device or DEVICE) == "cpu":
+        use_torch_linear_attention(model)
     if untie:  # pipeline stages keep the embeddings and the head apart
         model.config.tie_word_embeddings = False
         model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
@@ -147,17 +179,25 @@ def sync():
         torch.cuda.synchronize()
 
 
-def plain_step(model, ids, labels, dtype):
+def plain_step(model, ids, labels, dtype, row_by_row=False):
+    """One backward of the plain model; `row_by_row`: one row at a time, the gradients accumulated (the same
+    arithmetic in another order: what pipeline micro-batches do)."""
     from palingenesis.logits import final_hidden_states, output_head
     from palingenesis.loss import chunked_cross_entropy_loss
 
     model.zero_grad(set_to_none=True)
     n = int((labels != -100).sum())
-    with autocast(dtype):
-        hidden = final_hidden_states(model, ids)
-        loss = chunked_cross_entropy_loss(hidden, labels, output_head(model), num_chunks=4, global_valid_tokens=n)
-    loss.backward()
-    return float(loss.detach())
+    total = 0.0
+    parts = [(ids[r : r + 1], labels[r : r + 1]) for r in range(ids.shape[0])] if row_by_row else [(ids, labels)]
+    for part_ids, part_labels in parts:
+        with autocast(dtype):
+            hidden = final_hidden_states(model, part_ids)
+            loss = chunked_cross_entropy_loss(
+                hidden, part_labels, output_head(model), num_chunks=4, global_valid_tokens=n
+            )
+        loss.backward()
+        total += float(loss.detach())
+    return total
 
 
 def tp_step(model, tp, ids, labels, dtype):
@@ -202,23 +242,34 @@ def distances(ref, got):
 _FP32_REFERENCE = {}
 
 
+def split_noise(model, ids, labels, g_whole):
+    """Per parameter: how far the plain float32 model's gradient moves when the same batch is computed row by
+    row instead of whole. The reference against itself: the floor no comparison can go below."""
+    plain_step(model, ids, labels, "fp32", row_by_row=True)
+    noise, _ = distances(g_whole, grads(model))
+    model.zero_grad(set_to_none=True)
+    return noise
+
+
 def fp32_reference(model_id, untie, seed):
-    """Loss and gradients of the plain float32 model (kept for the bf16 pass of the same check)."""
+    """Loss, gradients and split noise of the plain float32 model (kept for the bf16 pass of the same check)."""
     key = (model_id, untie, seed)
     if key not in _FP32_REFERENCE:
         _FP32_REFERENCE.clear()  # one model's gradients at a time
         model = load(model_id, "fp32", untie)
         ids, labels = batch(model.config.vocab_size, seed)
         loss = plain_step(model, ids, labels, "fp32")
-        _FP32_REFERENCE[key] = (loss, grads(model))
+        g = grads(model)
+        _FP32_REFERENCE[key] = (loss, g, split_noise(model, ids, labels, g))
         del model
     return _FP32_REFERENCE[key]
 
 
-def judge(dtype, loss_ref, loss, g_ref, g, exact=None):
+def judge(dtype, loss_ref, loss, g_ref, g, exact=None, noise=None):
     """The verdict of one gradient comparison and the numbers that explain it.
 
-    fp32: `g` against `g_ref` (the plain model, same dtype), tight tolerances.
+    fp32: `g` against `g_ref` (the plain model, same dtype): each parameter within FP32_TOL plus
+    FP32_NOISE_FACTOR x `noise` (its split noise, see `split_noise`).
     bf16: `g` and `g_ref` (the plain bf16 model) both against `exact` (the plain float32 gradients): a parameter
     fails when it is further from the float32 gradient than BF16_NOISE_FACTOR x the plain bf16 model is, plus
     BF16_NOISE_FLOOR."""
@@ -236,13 +287,22 @@ def judge(dtype, loss_ref, loss, g_ref, g, exact=None):
     }
     if dtype == "fp32" or exact is None:
         loss_tol, grad_tol = FP32_TOL
-        over = {n: d for n, d in direct.items() if d >= grad_tol}
-        top = sorted(direct, key=direct.get, reverse=True)[:5]
+        noise = noise or {}
+        excess = {n: d - (grad_tol + FP32_NOISE_FACTOR * noise.get(n, 0.0)) for n, d in direct.items()}
+        over = {n: e for n, e in excess.items() if e >= 0}
+        top = sorted(excess, key=excess.get, reverse=True)[:5]
+        noisiest = max(noise, key=noise.get) if noise else ""
         numbers.update(
             loss_tol=loss_tol,
-            grad_tol=grad_tol,
+            rule=f"diff <= {grad_tol} + {FP32_NOISE_FACTOR} x split_noise",
             params_over_tol=len(over),
-            worst=[{"param": n, "diff": round(direct[n], 6)} for n in top],
+            # parameters past the flat tolerance that their own noise explains: the kernel, not the layout
+            params_within_noise_only=sum(1 for n, d in direct.items() if d >= grad_tol and n not in over),
+            max_split_noise=noise.get(noisiest, 0.0),
+            max_split_noise_param=noisiest,
+            worst=[
+                {"param": n, "diff": round(direct[n], 6), "split_noise": round(noise.get(n, 0.0), 6)} for n in top
+            ],
         )
     else:
         loss_tol = BF16_LOSS_TOL
@@ -293,7 +353,7 @@ def check_tp1(name, dtype, model_id):
     from palingenesis.tensor_parallel import apply_tensor_parallel
 
     one_rank_group()
-    exact = fp32_reference(model_id, False, 0)[1] if dtype == "bf16" else None
+    _, exact, noise = fp32_reference(model_id, False, 0)
     ref = load(model_id, dtype)
     model = copy.deepcopy(ref)
     tp = apply_tensor_parallel(model, init_device_mesh(DEVICE, (1,), mesh_dim_names=("tp",)))
@@ -301,7 +361,7 @@ def check_tp1(name, dtype, model_id):
     loss_ref = plain_step(ref, ids, labels, dtype)
     g_ref = grads(ref)
     loss = tp_step(model, tp, ids, labels, dtype)
-    ok, numbers = judge(dtype, loss_ref, loss, g_ref, grads(model), exact)
+    ok, numbers = judge(dtype, loss_ref, loss, g_ref, grads(model), exact if dtype == "bf16" else None, noise)
     del g_ref
     t_ref = timed(lambda: plain_step(ref, ids, labels, dtype))
     t_tp = timed(lambda: tp_step(model, tp, ids, labels, dtype))
@@ -329,7 +389,7 @@ def check_pp(name, dtype, model_id, schedule, tp_on=False):
         emit(name, "SKIP", reason=problem)
         return
     one_rank_group()
-    exact = fp32_reference(model_id, True, 0)[1] if dtype == "bf16" else None
+    _, exact, noise = fp32_reference(model_id, True, 0)
     ref = load(model_id, dtype, untie=True)
     model = copy.deepcopy(ref)
     names = ("pp", "dp", "tp") if tp_on else ("pp", "dp")
@@ -360,7 +420,7 @@ def check_pp(name, dtype, model_id, schedule, tp_on=False):
             return pipe.step(ids, labels, None, None, n)
 
     loss = step()
-    ok, numbers = judge(dtype, loss_ref, loss, g_ref, grads(pipe.model), exact)
+    ok, numbers = judge(dtype, loss_ref, loss, g_ref, grads(pipe.model), exact if dtype == "bf16" else None, noise)
     del g_ref
     t_ref = timed(lambda: plain_step(ref, ids, labels, dtype))
     t_pp = timed(step)
@@ -384,7 +444,7 @@ def check_compile(name, dtype, model_id):
         emit(name, "SKIP", reason="inductor check on CUDA only")
         return
     one_rank_group()
-    exact = fp32_reference(model_id, False, 1)[1] if dtype == "bf16" else None
+    _, exact, noise = fp32_reference(model_id, False, 1)
     ref = load(model_id, dtype)
     eager = copy.deepcopy(ref)
     tp_e = apply_tensor_parallel(eager, init_device_mesh(DEVICE, (1,), mesh_dim_names=("tp",)))
@@ -398,7 +458,8 @@ def check_compile(name, dtype, model_id):
     compile_s = time.perf_counter() - t
     g_c = grads(compiled)
     loss_e = tp_step(eager, tp_e, ids, labels, dtype)
-    ok, numbers = judge(dtype, loss_e, loss_c, grads(eager), g_c, exact)  # eager is the reference
+    # eager is the reference
+    ok, numbers = judge(dtype, loss_e, loss_c, grads(eager), g_c, exact if dtype == "bf16" else None, noise)
     del g_c
     t_e = timed(lambda: tp_step(eager, tp_e, ids, labels, dtype))
     t_c = timed(lambda: tp_step(compiled, tp_c, ids, labels, dtype))
@@ -439,12 +500,13 @@ def pair_worker(rank, port, model_id, device, out):
 
         from palingenesis.tensor_parallel import apply_tensor_parallel
 
-        loss_ref, g_ref = 0.0, {}
+        loss_ref, g_ref, noise = 0.0, {}, {}
         if rank == 0:
             ref = load(model_id, "fp32", device=device)
             ids, labels = batch(ref.config.vocab_size, device=device)
             loss_ref = plain_step(ref, ids, labels, "fp32")
             g_ref = grads(ref)
+            noise = split_noise(ref, ids, labels, g_ref)
             del ref
         model = load(model_id, "fp32", device=device)
         ids, labels = batch(model.config.vocab_size, device=device)
@@ -463,7 +525,7 @@ def pair_worker(rank, port, model_id, device, out):
             g[name] = tp.sections[name].canonical(full, 2) if name in tp.sections else full
             p.grad = None
         if rank == 0:
-            ok, numbers = judge("fp32", loss_ref, loss, g_ref, g)
+            ok, numbers = judge("fp32", loss_ref, loss, g_ref, g, noise=noise)
             with open(out, "w") as f:
                 json.dump({"ok": ok, "numbers": numbers}, f)
     finally:

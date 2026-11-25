@@ -394,7 +394,11 @@ micro-batches a stage keeps in flight).
 every gradient: tensor parallel on a one-rank mesh, a two-stage V-pipeline on one rank and compile on one GPU's
 CUDA kernels, and a real `tp_degree: 2` split on two CPU processes (NCCL refuses two ranks on one GPU; the same
 split over gloo on the GPU runs only when a probe shows this gloo build moves CUDA tensors). Each check runs
-twice. In float32 it is the correctness check, with tight tolerances. In bf16 (as deployed) a backward is only
+twice. In float32 (TF32 off) it is the correctness check, with tight tolerances; the plain model is also run
+whole and row by row, and a parameter may differ by three times that reference-against-reference noise on top
+(on CUDA the Gated DeltaNet decay parameters, A_log / dt_bias / in_proj_a, move by ~1% between a pipelined or
+compiled run and the plain one in float32, while the pure-torch path on the CPU agrees to 1e-6: the line
+reports how much of it the kernels' own noise explains). In bf16 (as deployed) a backward is only
 accurate to a few percent per parameter, and to 5-15% for some norm weights (q_norm / k_norm, the layer norms:
 their gradient is a sum of ~10^4 cancelling terms accumulated in bf16; the plain Qwen3-0.6B model's bf16
 gradient of q_norm is up to 13% from its float32 one). Any change in the order of operations (pipeline

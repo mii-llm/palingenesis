@@ -177,4 +177,6 @@ def test_gpu_check_script_runs_on_cpu(setup, tmp_path):
         assert by_name[name]["status"] == "PASS", by_name[name]
         assert by_name[name]["worst"], by_name[name]
     assert "bf16_noise" in by_name["tp1_qwen3_bf16"]["worst"][0]
+    # float32: each parameter next to the plain model's own whole-batch against row-by-row difference
+    assert "split_noise" in by_name["tp1_qwen35_fp32"]["worst"][0] and "max_split_noise" in by_name["tp2_cpu_qwen35"]
     assert by_name["summary"]["status"] == "PASS"
