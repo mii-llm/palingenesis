@@ -11,13 +11,14 @@
 #   NEED_GB      free space required in WORK before starting (default 8; see "Disk" below)
 #   KEEP         1 keeps every checkpoint (about 30 GB for the default model instead of the peak below)
 #   MODEL        default Qwen/Qwen3.5-0.8B (from the HF cache: HF_HUB_OFFLINE=1)
-#   STEPS        QAT steps per format (default 300)
+#   STEPS        QAT steps per format (default 1000; the training set is 8 x STEPS rows: one epoch, no row twice)
+#   QAT_LR       QAT peak learning rate (default 3.0e-6, cosine to a tenth of it)
 #   QAT_FORMATS  formats trained with QAT + KD (default "nvfp4 mxfp4")
 #   EVAL_ITEMS   accuracy-proxy items (default 200)
 #
 # Output: one JSON line per check on stdout, {"check": ..., "status": "PASS" | "FAIL" | "SKIP" | "INFO", ...numbers};
-# the last line is a summary. Logs of every step are in $WORK/logs. Expected run time on an A100 80GB: ~60-80 min
-# (data generation ~5 min, 9 vLLM evaluations ~1-2 min each, 2 QAT runs ~10-15 min each, vLLM loads, benchmarks).
+# the last line is a summary. Logs of every step are in $WORK/logs. Expected run time on an A100 80GB: ~50-60 min
+# (data generation ~8 min, 13 vLLM evaluations ~1-2 min each, 2 QAT runs ~8-10 min each, benchmarks).
 #
 # Disk: one run's checkpoints at a time. Each run is measured (KL, accuracy, vLLM) and its weight files are then
 # deleted (the files this script wrote, one by one; configs, reports, logs and results stay). The peak for a 0.8B
@@ -31,7 +32,20 @@
 #                            (GSM8K test if cached, else ARC-Easy, else synthetic arithmetic; greedy, non-thinking)
 #   (1b) exact/<fmt>         the dequantized export computes exactly what the fake-quantised forward computes
 #   (2) qat/<fmt>            pgs train, QAT with KD to the bf16 model (forward KL), STEPS steps on self-generated
-#                            text, from MSE-clipped scales, frozen at 90%: KL and accuracy vs PTQ (recovered share)
+#                            text, from MSE-clipped scales, frozen at 90%. Expectation (pre-registered): QAT
+#                            recovers at least half of the held-out KL of the PTQ model it starts from (mse
+#                            scales; KL on the answer tokens, the ones KD trains) and does not lower the accuracy
+#                            proxy (within 0.05, about one standard error of a 200-item difference). The line has
+#                            the numbers either way: KL on answer tokens and on all tokens, accuracy, how the
+#                            answers end (boxed, cut at the length limit), the training KD at the start and the
+#                            end, and the share of quantised values training changed (codes_changed).
+#
+# Training data: the bf16 model's own sampled answers (temperature 0.8) to prompts that are never the evaluation's:
+# half reasoning questions in the evaluation's prompt format (GSM8K train split if cached, else word problems
+# from several templates), half open questions on 48 topics x 16 templates. Held-out text for the KL: other
+# reasoning questions and 16 other topics. (A first version trained on 2400 rows, half of them one arithmetic
+# template, at 1e-5 for 300 steps: the training KD halved while the held-out KL did not move and GSM8K accuracy
+# fell from 0.42 to 0.24; see the QAT guide.)
 #   (3) vllm/<run>           the packed compressed-tensors checkpoint loads in vLLM (weight-only kernels on A100)
 #                            and computes what its dequantized twin computes: the log-probability of every token
 #                            of 20 fixed held-out texts (teacher-forced), vLLM on the packed checkpoint against
@@ -52,7 +66,8 @@ set -uo pipefail
 PGS_PY=${PGS_PY:-python}
 PGS_SRC=${PGS_SRC:-$(cd "$(dirname "$0")/../../src" && pwd)}
 MODEL=${MODEL:-Qwen/Qwen3.5-0.8B}
-STEPS=${STEPS:-300}
+STEPS=${STEPS:-1000}
+QAT_LR=${QAT_LR:-3.0e-6}
 QAT_FORMATS=${QAT_FORMATS:-"nvfp4 mxfp4"}
 EVAL_ITEMS=${EVAL_ITEMS:-200}
 WORK=${WORK:-$(mktemp -d /tmp/pgs_fp4_qat.XXXXXX)}
@@ -104,18 +119,56 @@ TEMPLATES = [
     "Summarize the history of {t} in a few sentences.",
     "Write a short dialogue between two friends discussing {t}.",
     "What are common misconceptions about {t}?",
+    "Compare {t} with something an everyday reader already knows.",
+    "Write a short quiz of three questions about {t}, with answers.",
+    "Describe a typical day of someone who works with {t}.",
+    "Give step-by-step advice to a beginner who wants to learn about {t}.",
+    "Write a formal paragraph and then a casual one about {t}.",
+    "What open questions remain about {t}?",
+    "List the key terms someone needs to discuss {t}, each with a one-line definition.",
+    "Argue for and then against a common opinion about {t}.",
 ]
+REASONING_SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{}."
+WORD_PROBLEMS = [  # questions only: the bf16 model's own answers are the data
+    "A store has {a} boxes with {b} items each. It sells {c} items. How many items are left?",
+    "{n} has {a} marbles and buys {b} bags of {d} marbles each. How many marbles does {n} have now?",
+    "A train travels {a} km per hour for {d} hours, then {b} km per hour for {e} hours. How far does it travel?",
+    "{n} earns {a} dollars a day and spends {b} dollars a day. How much is saved after {c} days?",
+    "A recipe needs {d} eggs per cake. How many eggs are needed for {a} cakes, and how many cartons of 12 is that?",
+    "{a} students are split into groups of {d}. How many full groups are there and how many students are left over?",
+    "A tank holds {c} liters. It is filled at {d} liters per minute. How many minutes until it is half full?",
+    "{n} reads {b} pages on each of {d} days and {a} pages on the last day. How many pages in total?",
+    "A shirt costs {a} dollars and is discounted by {d}0 percent. What is the price of {e} shirts?",
+    "There are {a} red and {b} blue balls. {d} of each color are removed. What fraction of the rest is red?",
+]
+NAMES = ["Ana", "Ben", "Chen", "Dalia", "Emre", "Farah", "Goran", "Hana", "Ivo", "Jun"]
 
 
-def arithmetic_prompts(rng, n):
-    out = []
-    for _ in range(n):
-        a, b, c = rng.randint(3, 60), rng.randint(2, 30), rng.randint(1, 99)
-        out.append(
-            f"A store has {a} boxes with {b} items each. It sells {c} items. "
-            "How many items are left? Think step by step, then give the final number."
+def reasoning_prompts(rng, n):
+    """n distinct reasoning questions in the evaluation's prompt format, never the evaluation's own items: the
+    GSM8K train split if it is cached, else word problems from several templates. (prompts, source)"""
+    try:
+        from datasets import load_dataset
+
+        for name in ("openai/gsm8k", "gsm8k"):
+            try:
+                questions = [r["question"] for r in load_dataset(name, "main", split="train")]
+                rng.shuffle(questions)
+                return [q + REASONING_SUFFIX for q in questions[:n]], "gsm8k_train"
+            except Exception:  # noqa: BLE001
+                pass
+    except ImportError:
+        pass
+    seen, out = set(), []
+    while len(out) < n:
+        text = rng.choice(WORD_PROBLEMS).format(
+            a=rng.randint(12, 240), b=rng.randint(3, 60), c=rng.randint(20, 900), d=rng.randint(2, 9),
+            e=rng.randint(2, 9), n=rng.choice(NAMES),
         )
-    return out
+        if text not in seen:
+            seen.add(text)
+            out.append(text + REASONING_SUFFIX)
+    return out, "word_problems"
 
 
 def chat(tok, prompt):
@@ -146,25 +199,29 @@ def cmd_data(work, model, n_train, n_eval, out):
 
     rng = random.Random(0)
     tok = AutoTokenizer.from_pretrained(model)
-    train_prompts = [tpl.format(t=t) for t in TOPICS for tpl in TEMPLATES] + arithmetic_prompts(rng, 400)
+    # half reasoning questions (each once), half open questions (repeated prompts get new samples)
+    held_reasoning = 64
+    reasoning, reasoning_source = reasoning_prompts(rng, n_train // 2 + held_reasoning)
+    held_prompts = [tpl.format(t=t) for t in HELD_OUT for tpl in TEMPLATES[:8]] + reasoning[:held_reasoning]
+    reasoning = reasoning[held_reasoning:]
+    topical = [tpl.format(t=t) for t in TOPICS for tpl in TEMPLATES]
+    wanted = n_train - len(reasoning)
+    topical = (topical * math.ceil(wanted / len(topical)))[:wanted]
+    train_prompts = reasoning + topical
     rng.shuffle(train_prompts)
-    held_prompts = [tpl.format(t=t) for t in HELD_OUT for tpl in TEMPLATES]
     prompts = train_prompts + held_prompts
     try:
         from vllm import SamplingParams
 
         llm = vllm_engine(model)
-        params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=384)  # repeated prompts: new samples
-        repeats = max(1, math.ceil(n_train / len(train_prompts)))
-        texts = [chat(tok, p) for p in train_prompts] * repeats + [chat(tok, p) for p in held_prompts]
-        outs = llm.generate(texts, params)
+        params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=384)
+        outs = llm.generate([chat(tok, p) for p in prompts], params)
         completions = [o.outputs[0].text for o in outs]
         used = "vllm"
     except Exception as e:  # noqa: BLE001
         print(f"vLLM generation failed ({e!r}); HF generate", file=sys.stderr)
         completions, used = hf_generate(model, tok, prompts, 384), "hf"
-        repeats = 1
-    train_all = (train_prompts * repeats)[: len(completions) - len(held_prompts)]
+    train_all = train_prompts
     rows = [
         {"messages": [{"role": "user", "content": p}, {"role": "assistant", "content": c}]}
         for p, c in zip(train_all, completions)
@@ -179,8 +236,8 @@ def cmd_data(work, model, n_train, n_eval, out):
     Path(work, "heldout.jsonl").write_text("".join(json.dumps(r) + "\n" for r in held))
     items, source = eval_items(rng, n_eval)
     Path(work, "eval.jsonl").write_text("".join(json.dumps(r) + "\n" for r in items))
-    result = {"train_rows": len(rows), "heldout_rows": len(held), "eval_items": len(items),
-              "eval_source": source, "generator": used}
+    result = {"train_rows": len(rows), "train_reasoning_rows": len(reasoning), "train_source": reasoning_source,
+              "heldout_rows": len(held), "eval_items": len(items), "eval_source": source, "generator": used}
     Path(out).write_text(json.dumps(result))  # a file: vLLM logs to stdout
     print(json.dumps(result))
 
@@ -273,7 +330,15 @@ def cmd_acc(work, model, out, tokenizer=None):
     outs = llm.generate([chat(tok, it["prompt"]) for it in items], SamplingParams(temperature=0.0, max_tokens=max_tokens))
     texts = [o.outputs[0].text for o in outs]
     correct = [extract(t, it["kind"]) == it["answer"] for t, it in zip(texts, items)]
-    result = {"accuracy": sum(correct) / len(correct), "items": len(items), "load_s": round(load, 1)}
+    result = {
+        "accuracy": sum(correct) / len(correct),
+        "items": len(items),
+        "load_s": round(load, 1),
+        # how the answers end: a model that lost the format or runs to the limit shows here, not in the KL
+        "boxed_share": sum("\\boxed{" in t for t in texts) / len(texts),
+        "length_limit_share": sum(o.outputs[0].finish_reason == "length" for o in outs) / len(outs),
+        "mean_answer_chars": round(sum(len(t) for t in texts) / len(texts)),
+    }
     extra = {"texts": texts}
     try:  # teacher-forced: the log-probability vLLM gives every token of the fixed texts
         ids = fixed_ids(tok, work)
@@ -295,11 +360,19 @@ def load_hf(path):
     return AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
 
 
-def heldout_batches(tok, work, limit=128):
+def heldout_batches(tok, work, limit=256, answer_start=False):
+    """Token ids of the held-out rows; with answer_start, also the index of the answer's first token (the
+    prompt up to the generation prompt is a prefix of the row's text)."""
     rows = [json.loads(line) for line in Path(work, "heldout.jsonl").read_text().splitlines()][:limit]
     for r in rows:
         text = tok.apply_chat_template(r["messages"], tokenize=False, enable_thinking=False)
-        yield tok(text, return_tensors="pt", truncation=True, max_length=1024).input_ids.cuda()
+        ids = tok(text, return_tensors="pt", truncation=True, max_length=1024).input_ids.cuda()
+        if not answer_start:
+            yield ids
+            continue
+        prompt = tok(chat(tok, r["messages"][0]["content"])).input_ids
+        start = len(prompt) if ids[0, : len(prompt)].tolist() == prompt else 0
+        yield ids, start
 
 
 @torch.no_grad()
@@ -323,15 +396,26 @@ def cmd_kl(work, reference, candidates, out):
         model = load_hf(cand)
         cand = Path(cand).parent.name if Path(cand).name in ("dequantized", "final") else cand  # the run's name
         kl_sum = agree = tokens = 0.0
-        for ids in heldout_batches(tok, work):
+        answer_kl = answer_agree = answer_tokens = 0.0
+        for ids, start in heldout_batches(tok, work, answer_start=True):
             lp = torch.log_softmax(ref(input_ids=ids).logits[0, :-1].float(), -1)
             lq = torch.log_softmax(model(input_ids=ids).logits[0, :-1].float(), -1)
-            kl_sum += float((lp.exp() * (lp - lq)).sum())
-            agree += float((lp.argmax(-1) == lq.argmax(-1)).sum())
+            kl = (lp.exp() * (lp - lq)).sum(-1)
+            same = lp.argmax(-1) == lq.argmax(-1)
+            kl_sum += float(kl.sum())
+            agree += float(same.sum())
             tokens += lp.shape[0]
+            first = max(start - 1, 0)  # position i predicts token i + 1: the answer's tokens from start - 1
+            answer_kl += float(kl[first:].sum())
+            answer_agree += float(same[first:].sum())
+            answer_tokens += lp.shape[0] - first
         logprobs = token_logprobs(model)
         gap = [abs(a - b) for x, y in zip(logprobs, ref_logprobs) for a, b in zip(x, y)]
         results[cand] = {"kl": kl_sum / tokens, "top1_agreement": agree / tokens, "tokens": int(tokens),
+                         # the answer's tokens only: what KD trains and what generation uses
+                         "kl_answer": answer_kl / max(answer_tokens, 1),
+                         "top1_agreement_answer": answer_agree / max(answer_tokens, 1),
+                         "answer_tokens": int(answer_tokens),
                          "logprob_gap_to_bf16": sum(gap) / len(gap), "prompt_logprobs": logprobs}
         del model
         torch.cuda.empty_cache()
@@ -493,31 +577,81 @@ def cmd_vllm(packed_file, twin_file, name, kernels, kl_file, twin):
     print(json.dumps(out))
 
 
-def cmd_qat_summary(results, run, fmt, acc, acc_bf16):
+class JsonlTracker:
+    """logging.trackers backend of the QAT runs: every logged metric as a line of <output_dir>/metrics.jsonl
+    (the plugin's metrics are not in the console log)."""
+
+    def __init__(self, *, output_dir, **_):
+        self.file = Path(output_dir, "metrics.jsonl")
+        self.file.parent.mkdir(parents=True, exist_ok=True)
+        self.file.write_text("")
+
+    def log(self, metrics, step):
+        row = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+        with self.file.open("a") as f:
+            f.write(json.dumps({"step": step, **row}) + "\n")
+
+    def finish(self, exit_code):
+        pass
+
+
+def training_metrics(file):
+    """From a run's metrics.jsonl: the KD loss at the start and the end (means over a tenth of the logged steps)
+    and the plugin's last error / change metrics."""
+    try:
+        rows = [json.loads(line) for line in Path(file).read_text().splitlines() if line.strip()]
+    except OSError:
+        return {}
+    out = {}
+    kd = [next(v for k, v in r.items() if k.endswith("kd_loss")) for r in rows if any(k.endswith("kd_loss") for k in r)]
+    if kd:
+        tenth = max(1, len(kd) // 10)
+        out["train_kd_start"] = round(sum(kd[:tenth]) / tenth, 4)
+        out["train_kd_end"] = round(sum(kd[-tenth:]) / tenth, 4)
+    for name in ("codes_changed", "qerr_mean", "saturated_blocks"):
+        values = [v for r in rows for k, v in r.items() if k.endswith(f"float_qat/{name}")]
+        if values:
+            out[name] = round(values[-1], 5)
+    return out
+
+
+def cmd_qat_summary(results, run, fmt, acc, acc_bf16, metrics_file):
+    """qat/<fmt>: the pre-registered expectation and every number behind it."""
+
     def load(name):
         try:
             return json.loads(Path(results, name).read_text())
         except Exception:  # noqa: BLE001
             return {}
 
-    def kl(name):
-        return load(f"kl_{name}.json").get(name, {}).get("kl")
+    def kl(name, key="kl_answer"):
+        return load(f"kl_{name}.json").get(name, {}).get(key)
 
-    q, p_max, p_mse = kl(run), kl(f"ptq_{fmt}_max"), kl(f"ptq_{fmt}_mse")
+    def answers(name):
+        r = load(f"acc_{name}.json")
+        return {k: r.get(k) for k in ("boxed_share", "length_limit_share", "mean_answer_chars")}
+
+    start = f"ptq_{fmt}_mse"  # the model QAT starts from
+    q, p_max, p_mse = kl(run), kl(f"ptq_{fmt}_max"), kl(start)
     acc = None if acc == "null" else float(acc)
     acc_bf16 = None if acc_bf16 == "null" else float(acc_bf16)
-    a_max, a_mse = load(f"acc_ptq_{fmt}_max.json").get("accuracy"), load(f"acc_ptq_{fmt}_mse.json").get("accuracy")
-    out = {"check": f"qat/{fmt}", "kl": q, "kl_ptq_max": p_max, "kl_ptq_mse": p_mse, "accuracy": acc,
-           "accuracy_ptq_max": a_max, "accuracy_ptq_mse": a_mse, "accuracy_bf16": acc_bf16}
-    if q is not None and p_max:
-        out["kl_recovered_vs_ptq_max"] = round(1 - q / p_max, 3)
-    if acc is not None and acc_bf16 is not None and a_max is not None and acc_bf16 > a_max:
-        out["accuracy_gap_recovered_vs_ptq_max"] = round((acc - a_max) / (acc_bf16 - a_max), 3)
+    a_max, a_mse = load(f"acc_ptq_{fmt}_max.json").get("accuracy"), load(f"acc_{start}.json").get("accuracy")
+    out = {"check": f"qat/{fmt}", "kl_answer": q, "kl_answer_ptq_mse": p_mse, "kl_answer_ptq_max": p_max,
+           "kl_all_tokens": kl(run, "kl"), "kl_all_tokens_ptq_mse": kl(start, "kl"),
+           "accuracy": acc, "accuracy_ptq_mse": a_mse, "accuracy_ptq_max": a_max, "accuracy_bf16": acc_bf16,
+           "answers": answers(run), "answers_ptq_mse": answers(start)}
+    recovered = None
+    if q is not None and p_mse:
+        recovered = out["kl_recovered"] = round(1 - q / p_mse, 3)
+    out.update(training_metrics(metrics_file))
     seconds = load(f"{run}.time.json").get("seconds")
     if seconds is not None:
         out["train_seconds"] = seconds
-    ok = q is not None and p_max is not None and q < p_max and (p_mse is None or q < p_mse)
-    out["status"] = "PASS" if ok else "FAIL"
+    kl_ok = recovered is not None and recovered >= 0.5
+    acc_ok = acc is not None and a_mse is not None and acc >= a_mse - 0.05
+    out["expectation"] = "kl_recovered >= 0.5 and accuracy >= accuracy_ptq_mse - 0.05"
+    out["kl_met"], out["accuracy_met"] = kl_ok, acc_ok
+    out["status"] = "PASS" if kl_ok and acc_ok else "FAIL"
     print(json.dumps(out))
 
 
@@ -611,7 +745,7 @@ CAPABILITY=$(jget "$R/env.json" "['capability']" || echo 0)
 VLLM_VERSION=$(jget "$R/env.json" "['vllm']" || echo "unavailable")
 
 # ── data: self-generated training / held-out text, accuracy items
-if ! $H data "$WORK" "$MODEL" 2400 "$EVAL_ITEMS" "$R/data.json" > "$WORK/logs/data.log" 2>&1; then
+if ! $H data "$WORK" "$MODEL" "$(( STEPS * 8 ))" "$EVAL_ITEMS" "$R/data.json" > "$WORK/logs/data.log" 2>&1; then
     line data FAIL error="data generation failed" log="$WORK/logs/data.log"
     exit 1
 fi
@@ -686,10 +820,11 @@ for spec in nvfp4:max mxfp4:max fp8:max fp8_block:max nvfp4:mse mxfp4:mse; do
     kl "$run" "$WORK/$run/dequantized" || line "kl/$run" FAIL error="KL evaluation crashed" log="$WORK/logs/kl_$run.log"
     a=$(acc "$run" "$WORK/$run/dequantized")
     k=$(jget "$R/kl_$run.json" "['$run']['kl']" || echo null)
+    ka=$(jget "$R/kl_$run.json" "['$run']['kl_answer']" || echo null)
     agree=$(jget "$R/kl_$run.json" "['$run']['top1_agreement']" || echo null)
     err=$(tail -n 1 "$R/$run.quantize.json" | "$PGS_PY" -c "import json,sys; print(json.loads(sys.stdin.read())['relative_error_mean'])" 2>/dev/null || echo null)
     status=PASS; { [ "$a" = "null" ] || [ -z "$k" ] || [ "$k" = "null" ]; } && status=FAIL
-    line "ptq/$fmt/$scales" "$status" kl="${k:-null}" top1_agreement="${agree:-null}" accuracy="$a" accuracy_bf16="$ACC_BF16" weight_rel_error="${err:-null}"
+    line "ptq/$fmt/$scales" "$status" kl="${k:-null}" kl_answer="${ka:-null}" top1_agreement="${agree:-null}" accuracy="$a" accuracy_bf16="$ACC_BF16" weight_rel_error="${err:-null}"
     [ "$scales" = "max" ] && vllm_check "$run" "$WORK/$run/packed" "$run"
     drop_weights "$WORK/$run/packed" "$WORK/$run/dequantized"
 done
@@ -715,8 +850,8 @@ train:
   max_steps: $STEPS
   per_device_batch_size: 8
   gradient_accumulation_steps: 1
-  learning_rate: 1.0e-5
-  min_learning_rate: 1.0e-6
+  learning_rate: $QAT_LR
+  min_learning_rate: $("$PGS_PY" -c "print(f'{float(\"$QAT_LR\") / 10:.3e}')")
   warmup_ratio: 0.05
   weight_decay: 0.0
   max_grad_norm: 1.0
@@ -739,9 +874,11 @@ plugins:
         scales: mse
         freeze_scales_at: 0.9
         metrics_every: 50
+        code_metrics: true          # plugins/float_qat/codes_changed: how much of the quantised model training moved
 logging:
   use_wandb: false
   use_trackio: false
+  trackers: ["$WORK/fp4_check.py:JsonlTracker"]   # every metric into $WORK/$run/metrics.jsonl
 YAML
     t0=$(date +%s)
     if $PGS_PY -m palingenesis.cli train --config "$WORK/$run.yaml" > "$WORK/logs/$run.log" 2>&1 \
@@ -749,7 +886,7 @@ YAML
         echo "{\"seconds\": $(( $(date +%s) - t0 ))}" > "$R/$run.time.json"
         kl "$run" "$WORK/$run/final" || line "kl/$run" FAIL error="KL evaluation crashed" log="$WORK/logs/kl_$run.log"
         a=$(acc "$run" "$WORK/$run/final")
-        emit "$($H qat_summary "$R" "$run" "$fmt" "$a" "$ACC_BF16")"
+        emit "$($H qat_summary "$R" "$run" "$fmt" "$a" "$ACC_BF16" "$WORK/$run/metrics.jsonl")"
         vllm_check "$run" "$WORK/$run/final-$fmt" "$run"
     else
         reason=$(grep -E "Error|No space left" "$WORK/logs/$run.log" | tail -n 1 | head -c 300)

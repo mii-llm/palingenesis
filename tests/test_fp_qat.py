@@ -930,3 +930,28 @@ def test_nvfp4_shards_with_their_own_global_scale_are_not_what_vllm_computes():
     amax = torch.stack([a.abs().amax(), b.abs().amax()]).amax()
     shared = [quantize(w, FORMATS["nvfp4"], global_amax=amax) for w in (a, b)]
     assert torch.equal(_marlin_nvfp4_weight([pack(q) for q in shared]), torch.cat([q.dequantize() for q in shared]))
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "fp8"])
+def test_code_metrics_count_the_quantised_values_training_changed(fmt):
+    torch.manual_seed(0)
+    model = H.tiny_llama(64, hidden=64)
+    plugin = FloatQAT(format=fmt, code_metrics=True, metrics_every=1)
+    plugin.transform_model(model, _ctx())
+    plugin.on_train_start(model, _ctx())
+    ctx = _ctx(step=1, total_steps=10)
+    assert plugin.metrics(model, ctx)["codes_changed"] == 0.0
+    m = model.model.layers[0].mlp.down_proj
+    nonzero = int((m.quantize_now(m.weight.detach(), m.global_amax()).values[0, :8] != 0).sum())
+    assert nonzero >= 4
+    with torch.no_grad():
+        m.weight[0, :8] = -m.weight[0, :8]  # a sign flip changes every code but zero's
+    total = sum(x.weight.numel() for x in plugin.modules.values())
+    assert plugin.metrics(model, ctx)["codes_changed"] == pytest.approx(nonzero / total)
+    # off by default: no copy of the codes, no metric
+    plain = FloatQAT(format=fmt, metrics_every=1)
+    plain.transform_model(H.tiny_llama(64, hidden=64), _ctx())
+    plain.on_train_start(model, _ctx())
+    assert plain._initial_codes == {} and "codes_changed" not in plain.metrics(model, ctx)
+    with pytest.raises(ValueError, match="code_metrics"):
+        FloatQAT(code_metrics="yes")

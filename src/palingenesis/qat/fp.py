@@ -43,7 +43,10 @@ Export (final/, best/model/)
 
 Metrics (plugins/float_qat/*): strength, frozen; every `metrics_every` steps qerr_mean / qerr_max (relative squared
 quantisation error ||W_q - W||^2 / ||W||^2 over the layers), saturated_blocks (share of blocks with a clipped
-element), clip_mean; per layer with `layer_metrics` (qerr/<layer>, saturated/<layer>).
+element), clip_mean; per layer with `layer_metrics` (qerr/<layer>, saturated/<layer>). With `code_metrics`:
+codes_changed, the share of quantised values whose code differs from the start of the run (a copy of the initial
+codes is kept: one byte per weight). It is how far training has moved the quantised model: a share that grows
+by several percent while the held-out loss does not fall is noise from the learning rate, not recovery.
 
 Trainers: pgs train (SFT, off-policy distillation), pgs distill (OPD) and pgs rl, where the rollout engine samples
 from the quantised weights (rollout_weights). With the teacher at full precision, distillation is QAT's recovery
@@ -328,6 +331,7 @@ class FloatQAT(TrainerPlugin):
         quantized_export="auto",
         layer_metrics: bool = False,
         metrics_every: int = 50,
+        code_metrics: bool = False,
     ):
         from palingenesis.qat.compressed import scheme_for
 
@@ -398,6 +402,8 @@ class FloatQAT(TrainerPlugin):
         if not isinstance(metrics_every, int) or metrics_every < 1:
             raise ValueError(f"float_qat: metrics_every must be a positive integer, got {metrics_every!r}")
         self.metrics_every = metrics_every
+        self.code_metrics = boolean("code_metrics", code_metrics)
+        self._initial_codes: dict[int, Tensor] = {}  # id(module) -> its codes at the start (code_metrics)
 
         self.modules: dict[str, nn.Module] = {}
         self.skipped: dict[str, str] = {}  # layer -> why it stays in full precision
@@ -529,6 +535,27 @@ class FloatQAT(TrainerPlugin):
         if self.scales in ("mse", "learned") and not restored:
             self.calibrate()
         self._set_strength(ctx)
+        if self.code_metrics and not self._initial_codes:
+            self._record_codes()
+
+    @staticmethod
+    def _codes(q: Quantized) -> Tensor:
+        """One byte per quantised value: twice the E2M1 value (an integer), or the E4M3 byte."""
+        values = q.values + 0.0  # -0.0 and 0.0 are one value
+        if q.spec.element == "e2m1":
+            return (values * 2).to(torch.int8)
+        return values.to(torch.float8_e4m3fn).view(torch.uint8)
+
+    @torch.no_grad()
+    def _record_codes(self) -> None:
+        """code_metrics: the codes of every layer now (the start of this run, or the step it resumed from; every
+        rank: it gathers sharded weights)."""
+        for group in self._groups():
+            weights = [_full(m.weight.detach()) for m in group]
+            amax = group[0].global_amax(weights)
+            for m, w in zip(group, weights):
+                clip = _full(m.qat_clip.detach()) if m.qat_clip is not None else None
+                self._initial_codes[id(m)] = self._codes(m.quantize_now(w, amax, clip, statistics=False))
 
     @torch.no_grad()
     def calibrate(self) -> None:
@@ -611,6 +638,7 @@ class FloatQAT(TrainerPlugin):
             return out
         self._reduce_activation_amax(ctx)
         errors, saturated, blocks = [], 0.0, 0
+        changed, values = 0.0, 0
         names = {id(m): n for n, m in self.modules.items()}
         for group in self._groups():
             weights = [_full(m.weight.detach()) for m in group]
@@ -624,6 +652,10 @@ class FloatQAT(TrainerPlugin):
                 errors.append(err)
                 saturated += float(sat.sum())
                 blocks += sat.numel()
+                initial = self._initial_codes.get(id(m))
+                if initial is not None:
+                    changed += float((self._codes(q) != initial.to(q.values.device)).sum())
+                    values += initial.numel()
                 if self.layer_metrics:
                     short = names[id(m)]
                     out[f"qerr/{short}"] = err
@@ -631,6 +663,8 @@ class FloatQAT(TrainerPlugin):
         out["qerr_mean"] = sum(errors) / len(errors)
         out["qerr_max"] = max(errors)
         out["saturated_blocks"] = saturated / max(blocks, 1)
+        if values:
+            out["codes_changed"] = changed / values
         clips = [_full(m.qat_clip.detach()).flatten() for m in self.modules.values() if m.qat_clip is not None]
         if clips:
             clips = torch.cat(clips)

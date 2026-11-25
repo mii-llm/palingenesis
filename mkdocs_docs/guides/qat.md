@@ -9,6 +9,9 @@
 
     FP8 rarely needs QAT (its PTQ is close to lossless, see [Measured](#measured)). Measure first: `pgs quantize` writes the PTQ checkpoint in seconds.
 
+!!! warning "Status: PTQ and the export are validated; QAT recovery is experimental"
+    Measured on an A100 with Qwen3.5-0.8B: post-training quantisation, the packed checkpoints in vLLM and the dequantized export behave as documented ([Measured](#measured)). The first QAT recipe did **not** recover quality: it lowered the training loss and left the held-out KL where PTQ had it, and it halved the accuracy proxy ([What a first QAT run did](#what-a-first-qat-run-did)). The recipe below is revised from that run and has not been measured yet. Until it is, treat a QAT run as an experiment: compare it with `pgs quantize` on a held-out KL **and** on a task metric before using it.
+
 ## The two steps
 
 ```bash
@@ -35,7 +38,8 @@ train:
   output_dir: runs/qat
   max_steps: 1000
   per_device_batch_size: 8
-  learning_rate: 1.0e-5           # about the SFT learning rate, or lower
+  learning_rate: 3.0e-6           # well below the SFT learning rate (see the notes)
+  min_learning_rate: 3.0e-7
   warmup_ratio: 0.05
   weight_decay: 0.0
 distill:
@@ -52,17 +56,19 @@ plugins:
         activations: none         # weight-only; nvfp4 / mxfp4 / fp8: weights and activations
         scales: mse               # MSE-optimal clipping searched before the first step
         freeze_scales_at: 0.9     # the last 10% train on the exported grid
+        code_metrics: true        # log codes_changed: how much of the quantised model training moved
 ```
 
 Notes on the recipe:
 
-- **Data.** Self-generated text (the full-precision model's own sampled answers to diverse prompts) is a good default: it is in the teacher's distribution, needs no labels and covers what the model actually says (LLM-QAT). Mix in your SFT data if the model is also being fine-tuned.
+- **Data.** Self-generated text (the full-precision model's own sampled answers to diverse prompts) is in the teacher's distribution and needs no labels (LLM-QAT). It must cover what the model will be used for, in the prompt formats it will see, and no single template may dominate: the weights are free to change wherever the data does not constrain them, and with 4-bit weights every change is a whole quantisation step. Thousands of distinct prompts, each seen once, rather than a few hundred repeated. Mix in your SFT data if the model is also being fine-tuned.
 - **Start from PTQ.** With `strength: 1` (the default) the first step is the PTQ model. `scales: mse` starts from the PTQ with the lower weight error; that is not always the better model (in the measurements below it lowers the weight error by about 1% and leaves the KL to the bf16 model unchanged for NVFP4, slightly worse for MXFP4), so compare both with `pgs quantize` if the starting point matters. A ramp (`strength: {start: 0.0, end: 0.1}`) eases the switch for a model that is also learning a new task.
-- **Learning rate.** QAT moves the latent weights by a few quantisation steps at most; 1e-5 for full weights of a 0.5–2B model is a reasonable start. Keep fp32 latent weights (`model.torch_dtype: float32`): bf16 weights round most such updates away.
+- **Learning rate.** Lower than SFT. Adam moves every weight by about the learning rate per step whatever its gradient, and a latent weight that crosses a rounding boundary changes the quantised weight by a whole step: at 1e-5 the first run made no progress until the cosine schedule had brought the rate below about 5e-6 (its training KD only fell in the second half). Start at 3e-6 with a cosine to a tenth of it, and watch `codes_changed`: a share that keeps growing while the held-out loss does not fall is noise, not recovery. Keep fp32 latent weights (`model.torch_dtype: float32`): bf16 weights round most such updates away.
+- **Judge on held-out data and on the task.** The training KD falling is not the recovery: it also falls when the model fits the training prompts at the expense of everything else. Measure the KL to the bf16 model on held-out text, on the answer tokens (the ones KD trains; prompt tokens are unconstrained and can get worse), and a task metric with the deployment's prompt format.
 - **Freeze.** `freeze_scales_at: 0.9` fixes the scales (no moving average: computed once from the weights at that step), so the last steps settle the weights on the grid that is exported.
 - **On-policy distillation and RL.** The same plugin runs in `pgs distill` and `pgs rl` (`plugins: {custom: [...]}` in their configs): the rollout engine receives the quantised weights at every push, so the student samples from the model being trained. Start with off-policy KD in `pgs train`; OPD after it fixes what the quantised model does on its own samples.
 
-What to watch (`plugins/float_qat/*`, every `metrics_every` steps): `qerr_mean` / `qerr_max` (relative squared weight error per layer), `saturated_blocks` (share of blocks with a clipped value: high after a freeze means the weights moved past their frozen scales), `clip_mean` (`scales: mse | learned`), `act_amax_max` (NVFP4 activations). The distillation loss (`train/kd_loss`) falling is the recovery itself.
+What to watch (`plugins/float_qat/*`, every `metrics_every` steps): `qerr_mean` / `qerr_max` (relative squared weight error per layer), `saturated_blocks` (share of blocks with a clipped value: high after a freeze means the weights moved past their frozen scales), `clip_mean` (`scales: mse | learned`), `act_amax_max` (NVFP4 activations). `codes_changed` (with `code_metrics: true`) is the share of quantised values whose code differs from the start. The distillation loss (`train/kd_loss`) should fall, but see the note above on what that does and does not show.
 
 ### Measured
 
@@ -77,9 +83,22 @@ PTQ of Qwen3.5-0.8B (weight-only, `pgs quantize`), one A100 80GB, `scripts/gpu_c
 | `fp8`, `max` | 0.0092 | 0.946 | 0.530 | 0.00070 |
 | `fp8_block`, `max` | 0.0091 | 0.948 | 0.535 | 0.00070 |
 
-So on a model this small, FP4 PTQ is far from free (NVFP4 loses about 5 points of the proxy, MXFP4 about 16, and a fifth of the next-token choices change), FP8 PTQ is within noise, and the dequantized export computes exactly what the fake-quantised forward computes (maximum logit difference 0). The packed NVFP4 and MXFP4 checkpoints load in vLLM 0.26 on the A100 (accuracy 0.415 and 0.365, within noise of their dequantized twins' 0.455 and 0.350). Only 25% and 20% of the greedy answers were identical to the twins': answers of hundreds of tokens diverge at the first near-tie between two kernels, so that share says little. The check now compares what matters, the log-probability of every token of fixed texts between vLLM on the packed checkpoint and transformers on the twin, against the same statistic for one set of weights in the two engines (not measured yet).
+So on a model this small, FP4 PTQ is far from free (NVFP4 loses about 5 points of the proxy, MXFP4 about 16, and a fifth of the next-token choices change), FP8 PTQ is within noise, and the dequantized export computes exactly what the fake-quantised forward computes (maximum logit difference 0). The packed NVFP4 and MXFP4 checkpoints load in vLLM 0.26 on the A100 (accuracy 0.415 and 0.365, within noise of their dequantized twins' 0.455 and 0.350). Only 25% and 20% of the greedy answers were identical to the twins': answers of hundreds of tokens diverge at the first near-tie between two kernels, so that share says little. The check now compares what matters, the log-probability of every token of fixed texts between vLLM on the packed checkpoint and transformers on the twin, against the same statistic for one set of weights in the two engines.
 
-**QAT recovery is not measured yet** (an estimate from the literature: a few hundred to a few thousand steps of QAT with KD close half or more of the KL gap). The same script trains NVFP4 and MXFP4 with the recipe above and reports the KL and accuracy next to PTQ.
+The packed checkpoints compute what their dequantized twins compute: over 6593 tokens of 20 fixed texts, the log-probability vLLM gives each token with the packed checkpoint differs from the one transformers gives with the twin by 0.022 to 0.025 nats on average for all four formats, which is the difference between the two engines on one and the same set of weights (0.022 to 0.026), and well below what the quantisation itself changes (0.29 to 0.40 for FP4, 0.07 to 0.08 for FP8). FP8 and block FP8 weights load on the A100 through Marlin (accuracy 0.54 and 0.505 against 0.53 and 0.535 for their twins).
+
+### What a first QAT run did
+
+The first recipe (300 steps, batch 8, learning rate 1e-5 with a cosine to 1e-6, forward KL to the bf16 model at temperature 1, `scales: mse`, scales frozen at 90%; 2400 self-generated rows, half of them answers to one arithmetic template, the rest 48 topics × 8 question templates) on the same model and GPU:
+
+| | Training KD, first → last 30 steps | Held-out KL (all tokens): PTQ `mse` → QAT | GSM8K accuracy: PTQ `mse` → QAT |
+|---|---|---|---|
+| `nvfp4` | 0.110 → 0.054 | 0.140 → 0.141 | 0.415 → 0.240 |
+| `mxfp4` | 0.202 → 0.064 | 0.228 → 0.184 | 0.355 → 0.225 |
+
+The loss on the training stream halved (on both kinds of rows) while the held-out text gained nothing (NVFP4) or a fifth (MXFP4), and the task metric fell by about 40%: the run fitted its narrow training prompts and paid for it elsewhere. The exported checkpoints are what was trained (vLLM on the packed checkpoint and transformers on the dequantized one agree as above, and both score 0.24), so this is the recipe, not the export. What that run cannot tell apart, because it logged neither: how much of the flat held-out KL is prompt tokens (which KD does not train) getting worse while answer tokens improved, and how many quantised values changed.
+
+The revised recipe above (lower learning rate, more steps, a training set of distinct prompts that includes reasoning questions in the evaluation's format, each row once) and the revised check (`scripts/gpu_checks/fp4_qat.sh`: KL on answer tokens and on all tokens, the accuracy proxy, how answers end, `codes_changed`, the training KD at both ends; expectation: at least half of the PTQ model's held-out answer-token KL recovered and accuracy not lowered) follow from it. **They have not been run yet.**
 
 ## Formats
 
@@ -144,6 +163,7 @@ compressed-tensors is chosen over ModelOpt's format because it is the one vLLM l
 | `quantized_export` | `auto` | write `final-<format>/` (`auto`: when vLLM has a scheme for the pair; `true`: error otherwise) |
 | `layer_metrics` | `false` | also log `qerr/<layer>` and `saturated/<layer>` |
 | `metrics_every` | `50` | steps between the (gathering) error metrics |
+| `code_metrics` | `false` | also log `codes_changed`, the share of quantised values whose code differs from the start of the run (keeps one byte per quantised weight; after a resume, from the resumed step) |
 
 Layers whose shape the block does not divide stay in full precision (logged at startup, listed in `ignore`). With FSDP the forward sees whole weights, so per-tensor and fused scales are exact; the metrics, the clipping search and the rollout push gather each weight once. The fake quantisation computes in float32 next to each matmul: a step-time overhead (forward + backward, Qwen3.5-0.8B, bf16, 4 × 1024 tokens on an A100, against 0.204 s plain: `fp8` / `fp8_block` 1.23×, `mxfp4` 1.40×, `nvfp4` 1.49×, `fp8` with FP8 activations 1.44×, `nvfp4` with NVFP4 activations 1.98×), and slow HF-backend generation (vLLM rollouts load the dequantized weights instead).
 
