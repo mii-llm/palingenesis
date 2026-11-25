@@ -452,3 +452,54 @@ def test_math_attention_reference_matches_explicit_per_sequence_attention():
         )
         want = F.scaled_dot_product_attention(qs, ks, vs, is_causal=True, scale=0.3).transpose(0, 1)
         assert torch.allclose(out[pos], want, atol=1e-12)
+
+
+@pytest.mark.parametrize("packing", ["varlen", "tree"])
+@pytest.mark.parametrize("fsdp", [False, True], ids=["single", "fsdp2"])
+def test_trainer_end_to_end_with_packing(tmp_path, packing, fsdp):
+    """A whole run (hf rollouts, two steps) with packed micro-batches: the model is checked and routed at start-up,
+    and FSDP2 with full activation checkpointing (the layers recomputed in the backward) trains through them."""
+    import json
+
+    from test_rl import tiny_policy
+
+    from palingenesis.rl.trainer import RLTrainer
+
+    rows = [{"prompt": f"What is {i} plus {i + 1}?", "answer": str(2 * i + 1)} for i in range(30)]
+    (tmp_path / "data.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    config = RLConfig()
+    for key, value in {
+        "model.policy": tiny_policy(tmp_path),
+        "model.use_liger_kernel": False,
+        "model.chat_template_kwargs": {"enable_thinking": False},
+        "model.gradient_checkpointing": "full" if fsdp else "none",
+        "data.dataset": str(tmp_path / "data.jsonl"),
+        "rollout.backend": "hf",
+        "rollout.batch_prompts": 3,
+        "rollout.group_size": 3,
+        "rollout.max_new_tokens": 8,
+        "rewards.m.fn": "math",
+        "rewards.m.weight": 0.0,
+        "train.output_dir": str(tmp_path / "run"),
+        "train.steps": 2,
+        "train.learning_rate": 1e-3,
+        "train.warmup_steps": 1,
+        "train.save_final": False,
+        "train.fsdp": fsdp,
+        "train.packing": packing,
+        "train.micro_tokens": 64,
+    }.items():
+        config.set(key, value)
+
+    def length(completion):  # dense, so a random policy's groups disagree
+        return len(completion) / 40
+
+    def local(p):  # FSDP2 parameters are DTensors; on one rank the local shard is the whole tensor
+        p = p.detach()
+        return p.to_local() if hasattr(p, "to_local") else p
+
+    trainer = RLTrainer(config, rewards=[length])
+    assert trainer._packing is not None and trainer._packing.attention
+    before = [local(p).clone() for p in trainer.model.parameters()]
+    trainer.train()
+    assert any(not torch.equal(local(p), b) for p, b in zip(trainer.model.parameters(), before))

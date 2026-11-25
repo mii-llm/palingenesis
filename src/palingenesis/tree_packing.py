@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -164,24 +164,40 @@ class _Level:
     parent_slot: np.ndarray | None  # per segment: its parent's index within the previous level (None: roots)
 
 
-@dataclass
 class PackedRow:
     """Sequences packed into one row: what the forward needs, and where each sequence's tokens went.
 
     Build with PackedRow.build(sequences, share); `positions(i)` maps sequence i's token indices to packed
-    positions (the hidden state at packed position p is the unpacked forward's at that token)."""
+    positions (the hidden state at packed position p is the unpacked forward's at that token).
 
-    tokens: np.ndarray  # [N] token ids
-    position_ids: np.ndarray  # [N] each token's position in its sequences
-    seg_starts: np.ndarray  # [S + 1] segment boundaries in the row (level-major)
-    seg_parents: np.ndarray  # [S] parent segment, -1 for a root
-    paths: list[np.ndarray]  # per segment: packed positions of its root-to-segment path (its own last)
-    levels: list[_Level]
-    sequence_positions: list[np.ndarray]  # per input sequence: packed position of each of its tokens
-    _device_cache: dict = field(default_factory=dict, repr=False)
-    # layers that served this row in the current forward (checked by the caller: packing must not be ignored)
-    attention_layers: set = field(default_factory=set, repr=False)
-    linear_layers: set = field(default_factory=set, repr=False)
+    A plain class on purpose: the row travels down the forward as a keyword argument, and FSDP2 rebuilds the
+    dataclasses, lists and sets it finds in a forward's arguments (casting their tensors); the layers must see
+    this very object."""
+
+    def __init__(
+        self,
+        tokens: np.ndarray,
+        position_ids: np.ndarray,
+        seg_starts: np.ndarray,
+        seg_parents: np.ndarray,
+        paths: list[np.ndarray],
+        levels: list[_Level],
+        sequence_positions: list[np.ndarray],
+    ):
+        self.tokens = tokens  # [N] token ids
+        self.position_ids = position_ids  # [N] each token's position in its sequences
+        self.seg_starts = seg_starts  # [S + 1] segment boundaries in the row (level-major)
+        self.seg_parents = seg_parents  # [S] parent segment, -1 for a root
+        self.paths = paths  # per segment: packed positions of its root-to-segment path (its own last)
+        self.levels = levels
+        self.sequence_positions = sequence_positions  # per input sequence: packed position of each of its tokens
+        self._device_cache: dict = {}
+        # layers that served this row in the current forward (checked by the caller: packing must not be ignored)
+        self.attention_layers: set = set()
+        self.linear_layers: set = set()
+
+    def __repr__(self) -> str:
+        return f"PackedRow(tokens={self.num_tokens}, segments={self.num_segments}, levels={len(self.levels)})"
 
     @classmethod
     def build(cls, sequences: list[list[int]] | list[np.ndarray], share: bool) -> PackedRow:
