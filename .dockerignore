@@ -6,5 +6,8 @@
 !README.md
 !src/
 !src/**
+# The built-in evaluation tasks: the wheel force-includes them (pyproject: tool.hatch...force-include).
+!configs/eval/
+!configs/eval/**
 **/__pycache__/
 **/*.pyc

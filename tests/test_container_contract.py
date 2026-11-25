@@ -56,3 +56,20 @@ def test_package_diagnostics_are_included_in_wheel():
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text())
     assert "src/palingenesis" in metadata["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
     assert (ROOT / "src" / "palingenesis" / "agent_tooling" / "__init__.py").exists()
+
+
+@pytest.mark.skipif(not (ROOT / ".dockerignore").exists(), reason=".dockerignore not present (sdist)")
+def test_wheel_force_includes_enter_the_docker_build_context():
+    """The image builds the wheel from the Docker context: every path the wheel force-includes must be admitted by
+    .dockerignore (which excludes everything else), or `uv sync` fails with "Forced include not found"."""
+    import tomllib
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    forced = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"].get("force-include", {})
+    rules = [line.strip() for line in (ROOT / ".dockerignore").read_text().splitlines()]
+    admitted = {rule[1:].rstrip("/*").rstrip("/") for rule in rules if rule.startswith("!")}
+    for source in forced:
+        parts = Path(source).parts
+        assert any("/".join(parts[:i]) in admitted for i in range(1, len(parts) + 1)), (
+            f"{source} is force-included in the wheel but excluded from the Docker build context (.dockerignore)"
+        )
