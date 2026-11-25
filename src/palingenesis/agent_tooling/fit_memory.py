@@ -8,7 +8,9 @@ Usage:
 
 Long sequences are bounded by activation memory, and the settings that lower it cost
 speed: activation checkpointing (none -> selective -> full) recomputes part or all of
-every layer in the backward, and SeCO (memory.seco) runs the sequence chunk by chunk.
+every layer in the backward, activation offload (memory.activation_offload) moves what
+the layers save to host memory over PCIe, and SeCO (memory.seco) runs the sequence
+chunk by chunk.
 Which one is the fastest that still fits depends on the model, the sequence length and
 the GPU, so this tool measures: for each setting, the real trainer runs a few optimizer
 steps on worst-case rows (every row at data.max_seq_length, as `pgs profile --measure`
@@ -69,16 +71,27 @@ def apply_overrides(config: Config, overrides: dict[str, object]) -> Config:
 
 def candidates(config: Config) -> list[Candidate]:
     """The settings to measure, from the one expected to be fastest to the most frugal: the config as it is,
-    the three activation-checkpointing modes, then SeCO at decreasing chunk sizes and with its K/V cache
-    offloaded, then full checkpointing with parameters, gradients and optimizer state offloaded to the CPU. Settings the config cannot take (SeCO with DPO, ...) are listed as skipped."""
+    the three activation-checkpointing modes, the same with activation offload, then SeCO at decreasing chunk
+    sizes and with its K/V cache offloaded, then full checkpointing with parameters, gradients and optimizer state
+    offloaded to the CPU. Settings the config cannot take (SeCO with DPO, ...) are listed as skipped."""
     out = [Candidate("as configured")]
     seco_on = config.memory.seco
+    offload_on = config.memory.activation_offload
     for mode in ("none", "selective", "full"):
-        if seco_on or mode != config.train.gradient_checkpointing:
+        if seco_on or offload_on or mode != config.train.gradient_checkpointing:
             overrides: dict[str, object] = {"train.gradient_checkpointing": mode}
             if seco_on:
                 overrides["memory.seco"] = False
+            if offload_on:
+                overrides["memory.activation_offload"] = False
             out.append(Candidate(f"{mode} checkpointing", overrides))
+    for mode in ("none", "selective", "full"):
+        if offload_on and not seco_on and mode == config.train.gradient_checkpointing:
+            continue  # the config as it is
+        overrides = {"train.gradient_checkpointing": mode, "memory.activation_offload": True}
+        if seco_on:
+            overrides["memory.seco"] = False
+        out.append(Candidate(f"{mode} checkpointing, activations offloaded", overrides))
     chunks = [c for c in SECO_CHUNKS if c < config.data.max_seq_length]
     for chunk in chunks:
         if seco_on and chunk == config.memory.seco_chunk_size and not config.memory.seco_kv_offload:

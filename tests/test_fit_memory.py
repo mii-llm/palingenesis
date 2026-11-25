@@ -26,6 +26,9 @@ def test_candidates_go_from_fastest_to_most_frugal():
         "as configured",  # selective checkpointing, the default
         "none checkpointing",
         "full checkpointing",
+        "none checkpointing, activations offloaded",
+        "selective checkpointing, activations offloaded",
+        "full checkpointing, activations offloaded",
         "SeCO, 8192-token chunks",
         "SeCO, 4096-token chunks",
         "SeCO, 2048-token chunks",
@@ -56,6 +59,30 @@ def test_a_seco_config_also_tries_the_checkpointing_modes_without_it():
     by_name = {x.name: x for x in candidates(c)}
     assert by_name["none checkpointing"].overrides == {"train.gradient_checkpointing": "none", "memory.seco": False}
     assert "SeCO, 4096-token chunks" not in by_name  # the config as it is
+    assert by_name["full checkpointing, activations offloaded"].overrides == {
+        "train.gradient_checkpointing": "full",
+        "memory.activation_offload": True,
+        "memory.seco": False,
+    }
+
+
+def test_an_offload_config_also_tries_the_checkpointing_modes_without_it():
+    c = _config()
+    c.memory.activation_offload = True  # with selective checkpointing, the default
+    by_name = {x.name: x for x in candidates(c)}
+    assert by_name["selective checkpointing"].overrides == {
+        "train.gradient_checkpointing": "selective",
+        "memory.activation_offload": False,
+    }
+    assert "selective checkpointing, activations offloaded" not in by_name  # the config as it is
+    assert by_name["full checkpointing, activations offloaded"].overrides == {
+        "train.gradient_checkpointing": "full",
+        "memory.activation_offload": True,
+    }
+    c.memory.activation_offload_boundaries_only = True  # needs checkpointing: refused without it
+    by_name = {x.name: x for x in candidates(c)}
+    assert "boundaries_only" in by_name["none checkpointing, activations offloaded"].skipped
+    assert not by_name["full checkpointing, activations offloaded"].skipped
 
 
 def test_overrides_reach_the_config_and_the_command_line():

@@ -59,13 +59,40 @@ train:
 
 **Reproducibility.** The rounding noise is a counter-based integer hash of (the element's position, a seed from `train.seed`, the parameter's name and its step count), not a random generator: runs are bit-for-bit reproducible, a resumed run rounds exactly as the uninterrupted one (the step count is in the optimizer state), data-parallel ranks holding the same parameter round it identically, and CPU and CUDA give the same bits.
 
-**Speed.** On CUDA each parameter's update is one fused kernel compiled by `torch.compile` (one read of weight, gradient and both moments, one write of weight and moments); per-step scalars and seeds reach the GPU in one non-blocking copy. Off CUDA it runs eagerly. Measure it on your GPU with `python scripts/bench_optimizers.py step --model <model>` (step time and state bytes per parameter against fused torch AdamW and bitsandbytes 8-bit) and `python scripts/bench_optimizers.py train --model <model>` (tokens/s, peak memory and the loss after a fixed number of steps against fp32 masters).
+**Speed.** On CUDA each parameter's update is one fused kernel compiled by `torch.compile` (one read of weight, gradient and both moments, one write of weight and moments); per-step scalars and seeds reach the GPU in one non-blocking copy. Off CUDA it runs eagerly. `train.fused_optimizer: true` steps all parameters in one Triton launch per dtype bucket instead, with the same bits as the eager update ([below](#multi-tensor-kernels-trainfused_optimizer)). Measure it on your GPU with `python scripts/bench_optimizers.py step --model <model>` (step time and state bytes per parameter against fused torch AdamW and bitsandbytes 8-bit) and `python scripts/bench_optimizers.py train --model <model>` (tokens/s, peak memory and the loss after a fixed number of steps against fp32 masters).
 
 **What is measured on CPU** (`tests/test_bf16_adamw.py`): 200 steps of updates of 1/16 ulp move weights by 100% ($\pm 2\%$) of the fp32-master drift, against under 50% for `adamw` on bf16; a small regression at lr 3e-4 ends within 5% of the fp32-master loss (plain bf16 AdamW: 37% higher); the second moment stays within 0.3% of its fp32 value where nearest rounding stalls 4% low; the fused (compiled) update gives the same bits as the eager one, for both roundings.
 
 Composes with: LLRD, gradient clipping, `memory.gradient_release` (per-parameter step), Hyperball, FSDP2 (each rank steps its shard; the noise is keyed by the element's offset in the local shard, so a resume must keep the sharding layout to be bit-exact), checkpoints and resume. Not with: Schedule-Free (it replaces the optimizer). `pgs rl` and `pgs distill` keep their fp32-master optimizers.
 
 After: stochastic rounding for low-precision training (Gupta et al., [arXiv:1502.02551](https://arxiv.org/abs/1502.02551); Zamirai et al., [arXiv:2010.06192](https://arxiv.org/abs/2010.06192), which also evaluates Kahan summation); Kahan-compensated bf16 optimizers as in [optimi](https://github.com/warner-benjamin/optimi) (MIT); rounding only the second moment stochastically follows the design notes of the [Halo](https://github.com/whitecircle/halo) framework's AdamWBF16 (re-implemented, no code shared).
+
+---
+
+## Multi-tensor kernels (`train.fused_optimizer`)
+
+```yaml
+train:
+  optimizer: adamw_bf16   # or adamw
+  fused_optimizer: true
+```
+
+**The problem.** The per-parameter paths launch at least one kernel per parameter: a 2B model has hundreds of parameter tensors, so `adamw_bf16`'s compiled update pays a `torch.compile` guard check and a launch hundreds of times per step, and the step becomes bound by the host rather than by the ~14 bytes per parameter it has to move.
+
+**What it does** (`palingenesis.fused_optim`). Per step the host builds one small table per bucket (the element offset of each tensor's weight, gradient, moments and compensation from the bucket's base tensors, its noise seed and its six AdamW scalars) and copies it to the GPU in one non-blocking transfer from pinned memory. A block map, cached by the tensors' sizes, gives every Triton program a (tensor, first element) pair; each program steps 8192 elements of one tensor. A bucket is (parameter dtype, gradient dtype, update kind), so a bf16 model with bf16 gradients takes **one launch for all its parameters** (plus one for fp32 parameters, if any). Tensors are addressed as base pointer + int64 element offset, so Triton keeps its 16-byte vector loads; tensors that are not 16-byte aligned (views into a flat buffer) take an unhinted variant.
+
+| Optimizer | Kernel | Semantics |
+|---|---|---|
+| `adamw_bf16` (both `bf16_rounding`s) | bf16 weights, bf16 moments, Kahan buffer | exactly the operations of the eager update, in the same order, IEEE `sqrt` and division, no FMA contraction: **the same bits** as `BF16AdamW(compile=False)`. The counter-based rounding noise is unchanged, so resumes stay bit-exact. (The default compiled per-parameter update may differ from it by one ulp on a few elements, where `torch.compile` contracts a multiply-add.) |
+| `adamw` | weights, moments in the weight's dtype (fp32 masters) | torch.optim.AdamW's update, equal to it up to fp32 rounding; the state and `state_dict` are torch AdamW's, so a checkpoint resumes with either |
+
+**Gradient clipping folded into the step.** On one process the trainer calls the optimizer's `clip_grad_norm_` instead of torch's: the global norm is one launch per gradient dtype (each program's partial sum of squares, then one deterministic sum), and the clip factor is multiplied into the fp32 gradient inside the step kernel, instead of a separate pass that reads and writes every gradient. The norm is accumulated in fp32 (torch rounds the per-tensor norms of bf16 gradients to bf16). The `.grad` tensors keep their unclipped values, which is what the health monitor's gradient metrics then see. Several processes (FSDP2): torch's clipping, then the multi-tensor step on each rank's shard.
+
+**Composes with** LLRD and the other parameter groups (per-tensor scalars), weight decay, spike detection (a skipped step drops its pending clip factor with `zero_grad`), and FSDP2 by design (each rank steps its local shards; not yet run on several GPUs). AdamC, Hyperball and MONA change the groups' scalars, wrap or precede `step()` as with the per-parameter optimizer. Not with `memory.gradient_release` (it steps each parameter inside the backward: nothing to batch; the config refuses the pair), `plugins.schedule_free`, `muon` or the 8-bit optimizers. **Falls back** to the per-parameter optimizer, with a warning, without a CUDA device or without Triton, and for parameters in host memory (`parallel.cpu_offload`). Importing palingenesis or validating a config does not import Triton.
+
+**What is measured where.** On CPU (`tests/test_fused_optim.py`): an emulation of the kernels' integer formulation (the uint32 hash, rounding on the top 16 bits) gives the reference functions' bits on special values (zeros, subnormals, the largest finite values, infinities, NaN), and run over the block map with per-tensor scalars and seeds it gives the per-parameter optimizer's bits for both roundings, with and without a clip factor; FusedAdamW matches torch AdamW and their state dicts interchange; folded clipping matches clip-then-step. On a GPU, `scripts/gpu_checks/offload_fused_optim.sh` checks the Triton kernels bit for bit against the eager update (odd sizes, misaligned views, extreme magnitudes, fp32 parameters, a clip factor), bit-exact resume, step time, host time and GPU launches per step against the per-parameter path and torch's fused AdamW on Qwen3.5-0.8B and -2B shapes, and a 30-step SFT loss curve against fp32 master weights. One known difference: Triton may flush denormal intermediates (gradients below ~1e-19) to zero where the eager update keeps them; the script reports how often that changes a stored value.
+
+After NVIDIA Apex's `multi_tensor_apply` and torch's fused / `_foreach` optimizers (both BSD-3); re-implemented in Triton, no code copied.
 
 ---
 

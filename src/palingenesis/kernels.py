@@ -136,7 +136,22 @@ def _save_ops() -> set:
 _SAVE_OPS = _save_ops()
 
 
-def apply_activation_checkpointing(model: nn.Module, mode: str = "selective"):
+def sac_routes_saved_tensors_hooks() -> bool:
+    """Whether this torch's checkpoint can route what selective checkpointing keeps through the saved-tensor hooks
+    around it (torch.utils.checkpoint's respect_saved_tensors_hooks), so activation offload can move those too."""
+    import inspect
+
+    from torch.utils.checkpoint import checkpoint
+
+    try:
+        return "respect_saved_tensors_hooks" in inspect.signature(checkpoint).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def apply_activation_checkpointing(
+    model: nn.Module, mode: str = "selective", respect_saved_tensors_hooks: bool | None = None
+):
     """Apply activation checkpointing to transformer layers.
 
     Modes:
@@ -144,6 +159,10 @@ def apply_activation_checkpointing(model: nn.Module, mode: str = "selective"):
         - "selective": Save expensive ops (SDPA, every other matmul), recompute the rest
                        (inspired by torchtitan's SelectiveAC — best memory/compute tradeoff)
         - "none": No checkpointing
+
+    respect_saved_tensors_hooks (selective): whether the tensors selective checkpointing keeps go through the
+    saved-tensor hooks active around the layer (activation offload: True moves them, False keeps them on the GPU).
+    None: torch's default. Ignored on torch versions without the option (they never route them).
     """
     layers = _find_layers(model)
     if not layers:
@@ -153,6 +172,9 @@ def apply_activation_checkpointing(model: nn.Module, mode: str = "selective"):
     if mode == "none":
         return
 
+    sac_hooks = {}
+    if respect_saved_tensors_hooks is not None and sac_routes_saved_tensors_hooks():
+        sac_hooks["respect_saved_tensors_hooks"] = respect_saved_tensors_hooks
     for layer_id, layer_module in layers:
         if mode == "full":
             wrapped = ptd_checkpoint_wrapper(
@@ -164,6 +186,7 @@ def apply_activation_checkpointing(model: nn.Module, mode: str = "selective"):
                 layer_module,
                 context_fn=lambda: create_selective_checkpoint_contexts(_selective_policy()),
                 preserve_rng_state=True,
+                **sac_hooks,
             )
         else:
             continue

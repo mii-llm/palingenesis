@@ -23,6 +23,7 @@ Launch:
              --rdzv_endpoint=$MASTER:29500 -m palingenesis.train --config config.yaml
 """
 
+import contextlib
 import logging
 import math
 import os
@@ -328,13 +329,15 @@ def train(config: Config, plugins: list | None = None) -> TrainResult:
 
     plugins: palingenesis.hooks.TrainerPlugin objects (or "module:Class" strings), run after the ones the
     config lists in `plugins.custom`."""
-    run: dict = {"tracker": None, "plugins": plugins}
+    run: dict = {"tracker": None, "plugins": plugins, "offloader": None}
     ok = False
     try:
         result = _train(config, run)
         ok = True
         return result
     finally:
+        if run["offloader"] is not None:  # its hooks on the model's layers, its pinned host memory
+            run["offloader"].close()
         if run["tracker"] is not None:
             run["tracker"].finish(exit_code=0 if ok else 1)
         cleanup_distributed()
@@ -551,7 +554,14 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         apply_float8_training(model)
 
     # ── Activation Checkpointing (before FSDP, before compile) ────────────
-    apply_activation_checkpointing(model, mode=config.train.gradient_checkpointing)
+    # Activation offload with selective checkpointing: what the policy keeps goes through the offload hooks too
+    # (on torch versions that support it), unless only the layers' inputs are to move.
+    offload_sac = config.memory.activation_offload and config.train.gradient_checkpointing == "selective"
+    apply_activation_checkpointing(
+        model,
+        mode=config.train.gradient_checkpointing,
+        respect_saved_tensors_hooks=(not config.memory.activation_offload_boundaries_only) if offload_sac else None,
+    )
 
     # ── Packing: documents must stay apart in every layer type (palingenesis.packing) ──
     # SeCO runs every packed document as a row of its own (seco._packed_plan): nothing to check.
@@ -636,6 +646,36 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             f"Compiling model layers (backend={config.model.compile_backend}, mode={config.model.compile_mode})"
         )
         _compile_layers(model, backend=config.model.compile_backend, mode=config.model.compile_mode)
+
+    # ── Activation offload: saved activations in pinned host memory (palingenesis.activation_offload) ──
+    offloader = None
+    if config.memory.activation_offload:
+        from palingenesis.activation_offload import ActivationOffloader, OffloadOptions, describe
+        from palingenesis.kernels import sac_routes_saved_tensors_hooks
+
+        offload_options = OffloadOptions(
+            min_bytes=config.memory.activation_offload_min_bytes,
+            in_flight=config.memory.activation_offload_in_flight,
+            prefetch=config.memory.activation_offload_prefetch,
+            boundaries_only=config.memory.activation_offload_boundaries_only,
+        )
+        offload_layers = _find_transformer_layers(model)
+        if not offload_layers:
+            raise ConfigError("memory.activation_offload: no transformer layers found in the model to offload from.")
+        offloader = ActivationOffloader(offload_layers, device, offload_options, params=model.parameters())
+        run["offloader"] = offloader  # train() closes it, also on errors
+        sac_hooks = sac_routes_saved_tensors_hooks()
+        logger.info(describe(offload_options, config.train.gradient_checkpointing, sac_hooks))
+        if offload_sac and not sac_hooks and not config.memory.activation_offload_boundaries_only:
+            logger.info(
+                f"activation offload: torch {torch.__version__} keeps what selective checkpointing saves out of "
+                "saved-tensor hooks: only the layers' inputs move (gradient_checkpointing: none or full moves more)"
+            )
+        if config.model.compile:
+            logger.info(
+                "activation offload with model.compile: the layer-boundary hooks run eagerly, a graph break before "
+                "and after each compiled layer"
+            )
 
     # ── Dataset ───────────────────────────────────────────────────────────
     logger.info("Loading dataset(s)")
@@ -829,6 +869,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             muon=config.train.muon_options(),
             seed=config.train.seed,
             bf16_rounding=config.train.bf16_rounding,
+            fused=config.train.fused_optimizer,
         )
         _override_groups(optimizer)
         scheduler = build_scheduler(
@@ -887,6 +928,16 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             _grad_release = GradientRelease(model, optimizer, adagc=None)
             _grad_release.enable()
             logger.info("Gradient release enabled: optimizer steps fused into backward pass")
+
+    # train.fused_optimizer on one process: gradient clipping folded into the multi-tensor step
+    fold_clipping = (
+        config.train.fused_optimizer
+        and world_size == 1
+        and getattr(optimizer, "triton", False)
+        and callable(getattr(optimizer, "clip_grad_norm_", None))
+    )
+    if fold_clipping and config.train.max_grad_norm > 0 and not config.train.adagc:
+        logger.info("Gradient clipping folded into the multi-tensor optimizer step (train.fused_optimizer)")
 
     # ── Loss computation setup ──────────────────────────────────────────────
     use_chunked_loss = config.memory.chunked_loss
@@ -1441,7 +1492,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 )
             # a flattened packed row: variable-length attention over its documents (seco.PACKED_VARLEN)
             _varlen = PACKED_VARLEN.set(position_ids is not None and flatten_packed)
-            with torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16 and device.type == "cuda"):
+            _offload = offloader.saving() if offloader is not None else contextlib.nullcontext()
+            with (
+                _offload,
+                torch.amp.autocast("cuda", dtype=compute_dtype, enabled=config.train.bf16 and device.type == "cuda"),
+            ):
                 if distiller is not None:
                     teacher_inputs = (
                         _teacher_packed_inputs(distiller, raw_input_ids, position_ids, flatten_packed, config, batch)
@@ -1739,6 +1794,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     # Standard mode: clip, detect spikes, step
                     if _adagc:
                         grad_norm = _adagc.clip(global_step)
+                    elif config.train.max_grad_norm > 0 and fold_clipping:
+                        # train.fused_optimizer: the norm in one launch per dtype, the clip factor applied inside
+                        # the optimizer's kernel (no pass rescaling the gradients; .grad keeps unclipped values)
+                        grad_norm = optimizer.clip_grad_norm_(config.train.max_grad_norm)
                     elif config.train.max_grad_norm > 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
                     else:
@@ -1831,6 +1890,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         "train/global_step": global_step,
                         "train/epoch": epoch + 1,
                     }
+                    if offloader is not None:  # per micro-batch: what went to host memory, and the pinned arena
+                        offload_stats = offloader.stats()
+                        metrics["memory/offload_gb"] = offload_stats["gb"]
+                        metrics["memory/offload_host_gb"] = offload_stats["host_reserved_gb"]
                     # ppl is only meaningful from a true cross-entropy
                     if ce_loss is not None:
                         metrics["train/ce_loss"] = ce_loss

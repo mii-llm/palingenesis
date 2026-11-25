@@ -82,7 +82,8 @@ Training issue?
 ├── OOM error
 │   ├── Check: python -m palingenesis.agent_tooling.profile_memory --config ... --gpu_memory_gb 80
 │   ├── Likely causes: Seq too long, batch too big, no checkpointing
-│   ├── Fix: Enable chunked_loss, selective AC, reduce seq/batch, add FSDP/CP
+│   ├── Fix: Enable chunked_loss, selective AC, activation offload (memory.activation_offload), reduce
+│   │   seq/batch, add FSDP/CP
 │   └── Fastest settings that fit: pgs fit --config ... --gpu 80 (measures checkpointing modes and SeCO, real steps)
 ├── Trained model loops, rambles to the token limit, or never stops calling tools
 │   ├── Measure: the loop share and how episodes end (stop / length limit / turn limit) at deployment sampling,
@@ -167,6 +168,8 @@ Use `--json` flag (where available) for structured output suitable for programma
 | Problem | Config Change |
 |---------|--------------|
 | OOM | `memory.chunked_loss: true`, `train.gradient_checkpointing: selective` |
+| OOM from activations, PCIe to spare | `memory.activation_offload: true` (saved activations in pinned host memory; with `gradient_checkpointing: full` only the layer inputs move) |
+| Optimizer step slow (many parameter tensors) | `train.fused_optimizer: true` (adamw / adamw_bf16: one Triton launch per dtype, clipping folded in) |
 | Loss NaN | `train.learning_rate: 1e-5`, `train.max_grad_norm: 1.0` |
 | No improvement | Increase LR, check masking with `validate_masking` |
 | Slow throughput | `model.compile: true`, `data.packing: true`, increase `data.num_workers` |

@@ -36,8 +36,13 @@ def build_optimizer(
     muon: dict | None = None,
     seed: int = 0,
     bf16_rounding: str = "stochastic",
+    fused: bool = False,
 ) -> torch.optim.Optimizer:
     """Build optimizer with optional LLRD, Muon, or 8-bit support.
+
+    fused: "adamw" and "adamw_bf16" step every parameter with palingenesis.fused_optim's multi-tensor Triton kernels
+    (one launch per dtype bucket, gradient clipping foldable into the step); without CUDA or Triton the usual
+    optimizer is built instead (logged).
 
     Options:
       - "adamw": standard AdamW (16 bytes/param with fp32 weights; moments in the weights' dtype)
@@ -60,14 +65,28 @@ def build_optimizer(
     if optimizer_name in ("adamw8bit", "lion8bit", "paged_adamw8bit"):
         return _build_bnb_optimizer(model, lr, weight_decay, optimizer_name)
 
+    if fused:
+        fused = _fused_kernels_usable(model, optimizer_name)
+
     if optimizer_name == "adamw_bf16":
-        return _build_bf16_adamw(model, lr, weight_decay, llrd_decay, seed, bf16_rounding)
+        return _build_bf16_adamw(model, lr, weight_decay, llrd_decay, seed, bf16_rounding, multi_tensor=fused)
 
     if any(p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters()):
         logger.info(
             "AdamW on bfloat16 weights: updates below half a bf16 ulp round away. train.optimizer: adamw_bf16 keeps "
             "them (stochastic rounding, same memory); model.torch_dtype: float32 keeps fp32 master weights."
         )
+
+    if fused:
+        from palingenesis.fused_optim import FusedAdamW
+
+        groups = (
+            _build_llrd_groups(model, lr, weight_decay, llrd_decay)
+            if llrd_decay < 1.0
+            else _decay_groups(model, weight_decay)
+        )
+        logger.info(f"AdamW on the multi-tensor Triton kernel (train.fused_optimizer): {len(groups)} parameter groups")
+        return FusedAdamW(groups, lr=lr, betas=(0.9, 0.95))
 
     if llrd_decay >= 1.0:
         return _build_simple_optimizer(model, lr, weight_decay)
@@ -92,8 +111,29 @@ def build_optimizer(
     return optimizer
 
 
+def _fused_kernels_usable(model: torch.nn.Module, optimizer_name: str) -> bool:
+    """Whether train.fused_optimizer can use the Triton kernels for this model (logged when it cannot)."""
+    from palingenesis.fused_optim import local, triton_available
+
+    if optimizer_name not in ("adamw", "adamw_bf16"):
+        raise ValueError(f"train.fused_optimizer applies to adamw and adamw_bf16, not {optimizer_name!r}")
+    ok, why = triton_available()
+    trained = [local(p) for p in model.parameters() if p.requires_grad]
+    if ok and not any(p.is_cuda for p in trained):
+        ok, why = False, "the parameters are not on a CUDA device (e.g. parallel.cpu_offload)"
+    if not ok:
+        logger.warning(f"train.fused_optimizer: {why}; stepping with the per-parameter {optimizer_name} instead")
+    return ok
+
+
 def _build_bf16_adamw(
-    model: torch.nn.Module, lr: float, weight_decay: float, llrd_decay: float, seed: int, rounding: str = "stochastic"
+    model: torch.nn.Module,
+    lr: float,
+    weight_decay: float,
+    llrd_decay: float,
+    seed: int,
+    rounding: str = "stochastic",
+    multi_tensor: bool = False,
 ) -> torch.optim.Optimizer:
     """AdamW on bf16 weights with stochastic rounding (palingenesis.bf16_adamw), with the same parameter groups as
     "adamw" (decay / no decay, or LLRD's per-layer groups). Parameters that are not bf16 take plain fp32 AdamW."""
@@ -104,13 +144,20 @@ def _build_bf16_adamw(
     else:
         groups = _decay_groups(model, weight_decay)
     optimizer = BF16AdamW(
-        groups, lr=lr, betas=(0.9, 0.95), named=model.named_parameters(), seed=seed, rounding=rounding
+        groups,
+        lr=lr,
+        betas=(0.9, 0.95),
+        named=model.named_parameters(),
+        seed=seed,
+        rounding=rounding,
+        multi_tensor=multi_tensor,
     )
     trained = [p for g in groups for p in g["params"]]
     bf16 = sum(p.numel() for p in trained if p.dtype == torch.bfloat16)
     other = sum(p.numel() for p in trained) - bf16
     logger.info(
-        f"AdamW bf16 ({rounding} rounding): {bf16 / 1e6:.1f}M bf16 params, "
+        f"AdamW bf16 ({rounding} rounding{', multi-tensor Triton kernel' if multi_tensor else ''}): "
+        f"{bf16 / 1e6:.1f}M bf16 params, "
         f"~{bf16 * (6 if rounding == 'kahan' else 4) / 1e9:.2f} GB of optimizer state"
         + (f"; {other / 1e6:.1f}M non-bf16 params on plain AdamW" if other else "")
     )

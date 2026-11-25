@@ -51,6 +51,7 @@ pgs fit --config my.yaml --gpu 24   # budget: 24 GiB
 Each setting runs the real trainer for a few steps on worst-case rows (every row at `data.max_seq_length`) in its own process; the report gives the peak and the throughput of each, and recommends the fastest one under the budget with the options to set. The settings it measures:
 
 - the config as it is, then the three activation-checkpointing modes, `none`, `selective` and `full`;
+- the same three modes with their saved activations offloaded to host memory (`memory.activation_offload`, [below](#activation-offload));
 - SeCO at chunk sizes of 8192, 4096, 2048 and 1024 tokens (those shorter than `data.max_seq_length`), then the smallest chunk with its K/V cache offloaded (`memory.seco_kv_offload`);
 - full checkpointing with parameters, gradients and optimizer state in CPU memory (`parallel.cpu_offload`, [below](#models-larger-than-the-gpu-cpu-offload)), the most frugal and the slowest. Settings the config cannot take (SeCO with DPO, for example) are listed as skipped.
 
@@ -80,6 +81,43 @@ With memory to spare, `none` is the fastest; `full` gives up 17% of the speed fo
 
 !!! note "Throughput is measured on worst-case rows"
     Every row is at `data.max_seq_length`, so the peak is an upper bound for the run; shorter rows train faster in every setting.
+
+### Activation offload
+
+Activation checkpointing trades memory for recompute; activation offload trades it for PCIe traffic. The tensors the transformer layers save for the backward wait in pinned host memory instead of on the GPU: they are copied out during the forward and back during the backward on a side CUDA stream, while other layers compute.
+
+```yaml
+memory:
+  activation_offload: true
+train:
+  gradient_checkpointing: full   # what moves depends on the checkpointing mode (table below)
+```
+
+What moves, per `train.gradient_checkpointing`:
+
+| Checkpointing | Moved to host memory | Left on the GPU |
+|---|---|---|
+| `none` | every activation the layers save (above `activation_offload_min_bytes`) | the last layer's, the layers in flight or prefetched |
+| `selective` | each layer's input, plus the outputs the selective policy keeps (attention, every other matmul) on torch versions whose checkpoint routes them through saved-tensor hooks (`respect_saved_tensors_hooks`); older torch: the layer inputs only (logged) | the recomputed rest |
+| `full` | each layer's input, the only thing full checkpointing saves | one layer's recompute |
+
+The schedule works per transformer layer, as Megatron-LM's offloading does: in the forward the copies of a layer may still run while the next `activation_offload_in_flight` layers compute (each of those keeps its activations on the GPU until its copies finish); in the backward, reaching layer *i* fetches the saved tensors of layers *i-1* ... *i-*`activation_offload_prefetch` while layer *i*'s backward runs. The last layer is never offloaded (its backward comes first), nor are tensors saved outside the layers (embeddings, final norm, loss), parameters and their casts, or tensors below `activation_offload_min_bytes` (1 MiB). A tensor saved by several ops is copied once, and a dense permuted tensor keeps its strides, so the copies are plain `memcpy`s and the backward sees the same layout. The values come back bit-identical: the gradients are those of a run without offload (`tests/test_activation_offload.py`: equal gradients on tiny Qwen3 and Qwen3.5 models under every checkpointing mode, packed rows, SeCO chunks, gradient accumulation, `retain_graph` and compiled layers; the trainer's loss equal with and without).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `memory.activation_offload` | `false` | turn it on |
+| `memory.activation_offload_min_bytes` | `1048576` | smaller saved tensors stay on the GPU |
+| `memory.activation_offload_in_flight` | `1` | layers whose device-to-host copies may overlap later layers' forward (>= 1) |
+| `memory.activation_offload_prefetch` | `1` | layers fetched ahead of the backward (0: when their backward starts) |
+| `memory.activation_offload_boundaries_only` | `false` | move only each checkpointed layer's inputs; what selective checkpointing keeps stays (needs `selective` or `full`) |
+
+**Host memory.** The offloaded tensors live in pinned memory carved from 256 MiB chunks that every step reuses (torch's caching host allocator would round each tensor up to a power of two). The arena is bounded by 40% of the machine's RAM, split between the GPUs of the node; past that the step stops with an error naming the options that move less (checkpointing, `boundaries_only`, a shorter sequence). `pgs profile` reports the estimate (`Offloaded activations: ... GiB [host memory]`), and the log line has `memory/offload_gb` (moved per micro-batch) and `memory/offload_host_gb` (the arena).
+
+**Composes with** (tested, CPU) the three checkpointing modes, packing, the chunked loss (it runs outside the layers), gradient accumulation, SeCO (each chunk's forward and backward are one offload pass; with `seco_kv_offload` both stream over PCIe, and the config warns) and compiled layers. With `model.compile` the layer-boundary hooks run eagerly: a graph break before and after each compiled layer, the layer body stays one graph; `scripts/gpu_checks/offload_fused_optim.sh` measures the step time and gradients with and without. Nothing in the design is specific to one process (each FSDP2 rank offloads its own activations, the host budget is split between a node's ranks), but FSDP2 on several GPUs, context parallel, gradient release, DPO and off-policy distillation have not been run with it yet.
+
+**When it pays.** Offload costs PCIe bandwidth (about 25 GB/s each way on PCIe 4.0): it is free when a layer's copies take less time than the next layer's compute, which favours long sequences and large hidden sizes, and it is most useful where recompute is the expensive alternative. `pgs fit` measures it next to the checkpointing modes and SeCO and picks the fastest setting that fits; the GPU check script above reports peak memory and step time against no checkpointing and selective checkpointing on Qwen3.5-2B at 4k and 16k tokens.
+
+After torchtune's `OffloadActivations` (BSD-3) and the layer-wise CPU offload of Megatron-LM / Transformer Engine (Apache-2.0); re-implemented, no code copied.
 
 ---
 

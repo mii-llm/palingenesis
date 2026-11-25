@@ -213,6 +213,11 @@ class TrainConfig:
     # adamw_bf16: how the weight keeps updates below its ulp. "stochastic" (unbiased rounding; its error is a random
     # walk) or "kahan" (a bf16 compensation buffer, +2 B/param: no rounding noise; for very small learning rates).
     bf16_rounding: str = "stochastic"
+    # adamw / adamw_bf16: step every parameter with one multi-tensor Triton launch per dtype bucket
+    # (palingenesis.fused_optim) instead of one kernel per parameter, with gradient clipping folded into the step on
+    # one process. adamw_bf16 keeps its exact rounding (same bits as its eager update); adamw is torch AdamW's update.
+    # Without CUDA or Triton the usual optimizer runs (logged). Not with memory.gradient_release (per-parameter steps).
+    fused_optimizer: bool = False
     # Muon (optimizer: muon; palingenesis.muon). muon_ns: "gram" (Gram Newton-Schulz with a restart, ~half the FLOPs
     # on rectangular matrices) or "standard"; muon_scale: "moonlight" (update RMS matched to AdamW: the same learning
     # rate and weight decay apply) or "spectral" (needs a larger LR); muon_min_dim: thinner matrices stay on AdamW;
@@ -369,6 +374,19 @@ class MemoryConfig:
     # SpaCO: backprop only this many random chunks per sequence (0 = SeCO, exact).
     # A stochastic gradient estimate; cuts backward compute on very long inputs.
     spaco_budget: int = 0
+    # Activation offload (palingenesis.activation_offload): the activations the transformer layers save for the
+    # backward wait in pinned host memory, copied out in the forward and back in the backward on a side CUDA stream,
+    # overlapped with other layers' compute. Exact. What moves depends on train.gradient_checkpointing: every saved
+    # activation (none), each layer's input (full), or its input plus what selective checkpointing keeps (selective).
+    # The last layer stays on the GPU. Host memory: about the activations' size, at most 40% of RAM.
+    activation_offload: bool = False
+    activation_offload_min_bytes: int = 1 << 20  # smaller tensors stay on the GPU
+    # layers whose device-to-host copies may still run while later layers compute (each keeps its activations on the
+    # GPU until done); layers fetched ahead of the backward (0: fetched when their backward starts)
+    activation_offload_in_flight: int = 1
+    activation_offload_prefetch: int = 1
+    # only each checkpointed layer's inputs; what selective checkpointing keeps stays on the GPU
+    activation_offload_boundaries_only: bool = False
 
 
 @dataclass(slots=True)
@@ -798,6 +816,8 @@ class Config:
                 )
         if self.train.bf16_rounding not in ("stochastic", "kahan"):
             errors.append(f"train.bf16_rounding must be stochastic or kahan, got {self.train.bf16_rounding!r}.")
+        errors += self._fused_optimizer_errors()
+        errors += self._activation_offload_errors(warnings)
         if self.train.optimizer == "adamw_bf16":
             if self.model.torch_dtype != "bfloat16":
                 errors.append(
@@ -1243,6 +1263,55 @@ class Config:
                     f"{', '.join(unweighted)}; use memory.chunked_loss, or observation_normalization: token with "
                     "observation_weight: 1.0 (observation tokens trained like the assistant's)."
                 )
+        return errors
+
+    def _fused_optimizer_errors(self) -> list[str]:
+        t = self.train
+        if not t.fused_optimizer:
+            return []
+        unsupported = {
+            f"train.optimizer={t.optimizer} (only adamw and adamw_bf16 have multi-tensor kernels)": t.optimizer
+            not in ("adamw", "adamw_bf16"),
+            "plugins.schedule_free (it replaces the optimizer)": self.plugins.schedule_free,
+            "memory.gradient_release (it steps each parameter in its backward hook: nothing to batch)": (
+                self.memory.gradient_release
+            ),
+        }
+        return [f"train.fused_optimizer does not support {name}." for name, on in unsupported.items() if on]
+
+    def _activation_offload_errors(self, warnings: list[str]) -> list[str]:
+        m = self.memory
+        errors: list[str] = []
+        if m.activation_offload_min_bytes < 0:
+            errors.append(f"memory.activation_offload_min_bytes must be >= 0, got {m.activation_offload_min_bytes}.")
+        if m.activation_offload_in_flight < 1:
+            errors.append(
+                "memory.activation_offload_in_flight must be >= 1 (layers whose copies may overlap later layers), "
+                f"got {m.activation_offload_in_flight}."
+            )
+        if m.activation_offload_prefetch < 0:
+            errors.append(f"memory.activation_offload_prefetch must be >= 0, got {m.activation_offload_prefetch}.")
+        if not m.activation_offload:
+            tuned = (
+                m.activation_offload_min_bytes != 1 << 20
+                or m.activation_offload_in_flight != 1
+                or m.activation_offload_prefetch != 1
+                or m.activation_offload_boundaries_only
+            )
+            if tuned:
+                warnings.append("memory.activation_offload_* options are set but memory.activation_offload is false.")
+            return errors
+        if m.activation_offload_boundaries_only and self.train.gradient_checkpointing == "none":
+            errors.append(
+                "memory.activation_offload_boundaries_only offloads the inputs of checkpointed layers; "
+                "train.gradient_checkpointing is none. Set it to selective or full, or offload every activation "
+                "(activation_offload_boundaries_only: false)."
+            )
+        if m.seco and m.seco_kv_offload:
+            warnings.append(
+                "memory.activation_offload with memory.seco_kv_offload: both stream over PCIe in the same backward; "
+                "measure the step time against either alone (pgs fit)."
+            )
         return errors
 
     def _seco_errors(self) -> list[str]:

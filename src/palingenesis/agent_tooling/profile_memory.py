@@ -61,7 +61,7 @@ def _meta_model(config: Config, model_config):
     return model
 
 
-def _optimizer_bytes(model, name: str, param_bytes: int) -> float:
+def _optimizer_bytes(model, name: str, param_bytes: int, bf16_rounding: str = "stochastic") -> float:
     """Optimizer state bytes for the trainable parameters, per optimizer layout."""
     total = 0.0
     for pname, p in model.named_parameters():
@@ -75,6 +75,8 @@ def _optimizer_bytes(model, name: str, param_bytes: int) -> float:
             total += 2 * n  # two 8-bit states (block stats negligible)
         elif name == "lion8bit":
             total += n  # one 8-bit momentum
+        elif name == "adamw_bf16" and param_bytes == 2 and bf16_rounding == "kahan":
+            total += 3 * n * param_bytes  # bf16 moments + the bf16 compensation buffer
         else:  # torch AdamW: exp_avg + exp_avg_sq, weight dtype
             total += 2 * n * param_bytes
     return total
@@ -151,6 +153,18 @@ def _distill_memory(config: Config, rows: int, seq: int, act_bytes: int) -> tupl
     return weights / GB, buffers / GB
 
 
+def _offloaded_per_layer(config: Config, ckpt: str, per_layer: float, layer_input: float) -> float:
+    """Bytes activation offload moves to host memory per layer (rough, like the activations themselves)."""
+    if ckpt == "none":
+        return per_layer
+    if ckpt == "full" or config.memory.activation_offload_boundaries_only:
+        return layer_input
+    from palingenesis.kernels import sac_routes_saved_tensors_hooks
+
+    # selective: the layer input, plus what the policy keeps when this torch routes it through the offload hooks
+    return per_layer * 0.4 if sac_routes_saved_tensors_hooks() else layer_input
+
+
 def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     from palingenesis.train import _dynamic_num_chunks
 
@@ -162,7 +176,7 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
     hidden, layers, vocab, kv_heads, head_dim, full_layers = _text_dims(model_config)
 
     params_gb = params * param_bytes / GB
-    optimizer_gb = _optimizer_bytes(model, config.train.optimizer, param_bytes) / GB
+    optimizer_gb = _optimizer_bytes(model, config.train.optimizer, param_bytes, config.train.bf16_rounding) / GB
     if config.train.hyperball:
         optimizer_gb += min(1.0, trainable * 4 / GB)  # one snapshot bucket (<= 1 GiB)
     grads_gb = trainable * param_bytes / GB
@@ -183,6 +197,15 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         activations_gb = layers * per_layer * 0.4 / GB
     else:  # full: layer inputs kept + one layer recomputed
         activations_gb = (layers * live_tokens * hidden * act_bytes + per_layer) / GB
+    offload_host_gb = 0.0
+    if config.memory.activation_offload:
+        # palingenesis.activation_offload: what a layer saves leaves the GPU, except in the last layer, the layers
+        # whose copies are in flight (forward) or prefetched (backward), and the one computing
+        offloaded = _offloaded_per_layer(config, ckpt, per_layer, live_tokens * hidden * act_bytes)
+        m = config.memory
+        resident = min(layers, 2 + max(m.activation_offload_in_flight, m.activation_offload_prefetch))
+        activations_gb -= (layers - resident) * offloaded / GB
+        offload_host_gb = (layers - 1) * offloaded / GB
 
     ce_tokens = live_tokens if config.memory.seco else rows * seq
     chunks = _dynamic_num_chunks(ce_tokens, vocab)
@@ -218,6 +241,7 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0) -> dict:
         "vision_memory_gb": vision_gb,
         "vision_params_B": vision_params / 1e9,
         "activation_memory_gb": activations_gb,
+        "activation_offload_host_gb": offload_host_gb,
         "ce_peak_gb": logits_gb,
         "kv_memory_gb": kv_gb,
         "total_estimated_gb": total_gb,
@@ -343,6 +367,11 @@ def print_report(est: dict):
             f"were an image; its {est['vision_params_B'] * 1e3:.0f}M parameters are in the weights above]"
         )
     print(f"    Activations (rough):  {est['activation_memory_gb']:6.1f} GiB  [checkpointing: {est['ac_mode']}]")
+    if est.get("activation_offload_host_gb"):
+        print(
+            f"    Offloaded activations: {est['activation_offload_host_gb']:5.1f} GiB  [host memory, pinned; "
+            "memory.activation_offload]"
+        )
     print(f"    {'─' * 50}")
     print(
         f"    Total (+10% overhead): {est['total_estimated_gb']:5.1f} GiB of {est['gpu_memory_gb']:.0f} GiB "

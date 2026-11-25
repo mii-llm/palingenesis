@@ -31,6 +31,9 @@ parameter and gradient round identically, and the same inputs give the same bits
 Speed: on CUDA the per-parameter update is compiled once (torch.compile, dynamic shapes) into a single fused
 kernel: one read of weight, gradient and moments and one write of weight and moments, 14 bytes per element moved
 for bf16 gradients. Without compilation (CPU, or `compile=False`) the same function runs eagerly in chunks.
+`multi_tensor=True` steps every parameter in one Triton launch per dtype bucket instead (palingenesis.fused_optim:
+the same operations without FMA contraction, so the same bits as the eager update), and can fold gradient clipping
+into that launch (`clip_grad_norm_`).
 
 After: stochastic rounding for low-precision training (Gupta et al. 2015, arXiv:1502.02551; Zamirai et al. 2020,
 arXiv:2010.06192, which finds bf16 weights with SR or Kahan summation match fp32 masters; Kahan-compensated bf16
@@ -187,6 +190,8 @@ class BF16AdamW(torch.optim.Optimizer):
              rounding dropped, so the weight carries ~16 significant bits with no noise; preferable at very small
              learning rates (RL at 1e-6, where an update is ~1/100 of an ulp).
     compile: "auto" (compile the fused update on CUDA), True, or False (eager everywhere).
+    multi_tensor: step all parameters with palingenesis.fused_optim's Triton kernels (one launch per dtype bucket)
+             on CUDA; parameters off CUDA, or every parameter when Triton is missing, take the per-parameter path.
     """
 
     def __init__(
@@ -201,6 +206,7 @@ class BF16AdamW(torch.optim.Optimizer):
         seed: int = 0,
         rounding: str = "stochastic",
         compile: bool | str = "auto",
+        multi_tensor: bool = False,
     ):
         if rounding not in ROUNDINGS:
             raise ValueError(f"rounding must be one of {', '.join(ROUNDINGS)}, got {rounding!r}")
@@ -227,6 +233,15 @@ class BF16AdamW(torch.optim.Optimizer):
                 self._keys[id(p)] = zlib.crc32(name.encode()) if name is not None else (1 << 32) + position
                 position += 1
         self._compiled = None
+        self._key_crc: dict[int, int] = {}  # parameter -> crc32 of (its key) under the seed: the step's seed chains on
+        self.multi_tensor = bool(multi_tensor)
+        self.triton = False
+        if self.multi_tensor:
+            from palingenesis.fused_optim import triton_available
+
+            self.triton = triton_available()[0]
+        self.grad_scale: torch.Tensor | None = None  # the folded clip factor of the next step (multi_tensor)
+        self.last_launches = 0
 
     # -- internals ---------------------------------------------------------------------------------------------
 
@@ -264,6 +279,13 @@ class BF16AdamW(torch.optim.Optimizer):
             key = self._keys[id(p)] = (1 << 32) + len(self._keys)
         return key
 
+    def _step_seed(self, p: torch.Tensor, step: int) -> int:
+        """_seed(key, step, seed), with the key's part of the chain cached."""
+        crc = self._key_crc.get(id(p))
+        if crc is None:
+            crc = self._key_crc[id(p)] = zlib.crc32(self._key(p).to_bytes(8, "little"), self.seed & _MASK32)
+        return zlib.crc32(step.to_bytes(8, "little"), crc)
+
     @staticmethod
     def _scalars(group: dict, step: int) -> list[float]:
         lr, (beta1, beta2), eps, wd = group["lr"], group["betas"], group["eps"], group["weight_decay"]
@@ -289,7 +311,7 @@ class BF16AdamW(torch.optim.Optimizer):
             by_device.setdefault(_local(item[0]).device, []).append(item)
         for device, its in by_device.items():
             hp = torch.tensor([self._scalars(g, s["step"]) for _, g, s in its], dtype=torch.float32)
-            seeds = torch.tensor([_seed(self._key(p), s["step"], self.seed) for p, _, s in its], dtype=torch.int64)
+            seeds = torch.tensor([self._step_seed(p, s["step"]) for p, _, s in its], dtype=torch.int64)
             if device.type == "cuda":
                 hp, seeds = (
                     hp.pin_memory().to(device, non_blocking=True),
@@ -317,13 +339,45 @@ class BF16AdamW(torch.optim.Optimizer):
 
     # -- public API --------------------------------------------------------------------------------------------
 
+    def _params(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    yield p, group
+
+    def _fusable(self, p: torch.Tensor, state: dict) -> bool:
+        """Whether the multi-tensor kernels step `p` (CUDA, contiguous local tensors of a supported dtype)."""
+        from palingenesis.fused_optim import local
+
+        if not self.triton:
+            return False
+        lp, lg = local(p), local(p.grad)
+        if not (lp.is_cuda and lp.is_contiguous() and lg.is_contiguous()):
+            return False
+        return lp.dtype == torch.bfloat16 or (lp.dtype == torch.float32 and lg.dtype in (torch.float32, torch.bfloat16))
+
+    @torch.no_grad()
+    def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
+        """With multi_tensor: the global L2 norm of the gradients (fp32), and the clip factor
+        min(1, max_norm / (norm + 1e-6)) kept for the next step(), which multiplies it into each fp32 gradient in the
+        kernel instead of a pass that rescales every gradient. The .grad tensors keep their unclipped values. One
+        process only (the norm is not reduced across ranks). max_norm <= 0: the norm only."""
+        from palingenesis.fused_optim import _clip
+
+        return _clip(self, max_norm)
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.grad_scale = None
+        super().zero_grad(set_to_none=set_to_none)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        bf16 = []
+        scale, self.grad_scale = self.grad_scale, None
+        bf16, fused = [], []
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
@@ -331,13 +385,40 @@ class BF16AdamW(torch.optim.Optimizer):
                 self._check(p)
                 state = self._init_state(p)
                 state["step"] += 1
+                if self.multi_tensor and self._fusable(p, state):
+                    fused.append((p, group, state))
+                    continue
+                if scale is not None:  # a folded clip factor, on a parameter the kernels do not step
+                    p.grad.mul_(scale.to(p.grad.device).to(p.grad.dtype))
                 if p.dtype == torch.bfloat16:
                     bf16.append((p, group, state))
                 else:
                     self._step_fp32(p, group, state)
         if bf16:
             self._run_bf16(bf16)
+        self.last_launches = self._run_fused(fused, scale) if fused else 0
         return loss
+
+    def _run_fused(self, items: list, scale: torch.Tensor | None) -> int:
+        """Step parameters with the multi-tensor kernels (palingenesis.fused_optim): bf16 ones with this optimizer's
+        update and rounding, fp32 ones with AdamW's. Returns the number of launches."""
+        from palingenesis.fused_optim import Bf16Row, Fp32Row, adamw, adamw_bf16, local
+
+        kahan = self.rounding == "kahan"
+        bf16_rows, fp32_rows, hp_cache = [], [], {}
+        for p, group, state in items:
+            key = (id(group), state["step"])
+            hp = hp_cache.get(key)
+            if hp is None:
+                hp = hp_cache[key] = self._scalars(group, state["step"])
+            flat = [local(t).view(-1) for t in (p, p.grad, state["exp_avg"], state["exp_avg_sq"])]
+            if p.dtype == torch.bfloat16:
+                c = local(state["compensation"]).view(-1) if kahan else None
+                bf16_rows.append(Bf16Row(*flat, c, hp, self._step_seed(p, state["step"])))
+            else:
+                fp32_rows.append(Fp32Row(*flat, hp))
+        launches = adamw_bf16(bf16_rows, scale) if bf16_rows else 0
+        return launches + (adamw(fp32_rows, scale) if fp32_rows else 0)
 
     @torch.no_grad()
     def step_parameter(self, p: torch.Tensor, group: dict) -> None:
@@ -361,6 +442,7 @@ class BF16AdamW(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         state_dict = dict(state_dict)
         self.seed = int(state_dict.pop("bf16_adamw_seed", self.seed))
+        self._key_crc.clear()
         super().load_state_dict(state_dict)
         for state in self.state.values():  # the step count is a plain int (it seeds the noise on the host)
             if torch.is_tensor(state.get("step")):

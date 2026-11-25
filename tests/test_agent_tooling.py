@@ -189,6 +189,28 @@ def test_profile_counts_parameters_exactly(tmp_path, model_dir):
     assert estimate_memory(config)["optimizer_memory_gb"] == pytest.approx(n / 2**30)
 
 
+def test_profile_knows_activation_offload_and_kahan_state(tmp_path, model_dir):
+    from palingenesis.agent_tooling.profile_memory import estimate_memory
+
+    config = _config(tmp_path, model_dir, CHATS)
+    config.data.max_seq_length = 4096
+    for mode in ("none", "full"):
+        config.train.gradient_checkpointing = mode
+        config.memory.activation_offload = False
+        before = estimate_memory(config)
+        config.memory.activation_offload = True
+        after = estimate_memory(config)
+        assert before["activation_offload_host_gb"] == 0.0
+        assert after["activation_offload_host_gb"] > 0
+        assert after["activation_memory_gb"] <= before["activation_memory_gb"]
+    config.memory.activation_offload = False
+    config.model.torch_dtype = "bfloat16"
+    config.train.optimizer = "adamw_bf16"
+    stochastic = estimate_memory(config)["optimizer_memory_gb"]
+    config.train.bf16_rounding = "kahan"
+    assert estimate_memory(config)["optimizer_memory_gb"] == pytest.approx(stochastic * 1.5)  # 6 B/param, not 4
+
+
 def test_profile_refuses_to_guess_an_unknown_model(tmp_path, model_dir):
     from palingenesis.agent_tooling.profile_memory import estimate_memory
 

@@ -139,6 +139,7 @@
 | `lr_scheduler` | str | `cosine` | LR schedule. `power_decay` (recommended), `wsd` (long runs), `cosine`, `linear`, `constant`. |
 | `optimizer` | str | `adamw` | Optimizer. `adamw`, `adamw_bf16`, `muon`, `lion8bit`, `adamw8bit`, `paged_adamw8bit`. `adamw_bf16`: AdamW on bf16 weights and bf16 moments with stochastic rounding, so updates smaller than a bf16 ulp still accumulate (needs `model.torch_dtype: bfloat16`; see [Optimizers](optimizers.md#adamw-bf16)). |
 | `bf16_rounding` | str | `stochastic` | With `optimizer: adamw_bf16`: `stochastic` (unbiased rounding of the weight, 6 B/param of weight and state) or `kahan` (a bf16 compensation buffer, 8 B/param: no rounding noise; for small learning rates such as RL or DPO). |
+| `fused_optimizer` | bool | `false` | With `optimizer: adamw` or `adamw_bf16`: step every parameter with one multi-tensor Triton launch per dtype bucket instead of one kernel per parameter, gradient clipping folded into the step on one process. `adamw_bf16` keeps its exact bits (those of its eager update) and bit-exact resumes; `adamw` is torch AdamW's update and state. Falls back to the usual optimizer (logged) without CUDA or Triton. Not with `memory.gradient_release`. See [Optimizers](optimizers.md#multi-tensor-kernels-trainfused_optimizer). |
 | `seed` | int | `42` | Training random seed. |
 | `save_steps` | int | `500` | Save a resumable checkpoint (`step-N/`) every N steps. Old ones are deleted after each save, keeping the newest `keep_checkpoints`. |
 | `keep_checkpoints` | int | `5` | Step checkpoints kept on disk; the oldest are deleted after each save. `best/` and `final/` are never deleted. `0` keeps all. A full checkpoint holds the weights and the optimizer state (about 3× the fp32 weights for AdamW): size the disk for `keep_checkpoints` of them. |
@@ -245,6 +246,11 @@ experts the rollout engine routed it to. See [RL: routing replay](../guides/moe.
 | `seco_chunk_size` | int | `4096` | Tokens per SeCO chunk; with packing, also the padded tokens of a batch of short documents. |
 | `seco_kv_offload` | bool | `false` | Keep full-attention K/V (and recurrent start states) in pinned CPU memory, streamed to the GPU block by block; GPU memory then grows only with the K/V gradient. Exact. Needs `attn_implementation: sdpa`. |
 | `spaco_budget` | int | `0` | SpaCO: backpropagate only this many random chunks per sequence (a stochastic gradient estimate). `0` = exact SeCO. |
+| `activation_offload` | bool | `false` | Keep the activations the transformer layers save for the backward in pinned host memory: copied out in the forward and back in the backward on a side CUDA stream, overlapped with other layers' compute. Exact. What moves depends on `train.gradient_checkpointing`: every saved activation (`none`), each layer's input (`full`), or the input plus what the selective policy keeps (`selective`, on torch versions that route it through saved-tensor hooks). The last layer stays on the GPU. Host memory: about the moved activations, at most 40% of RAM per node. See [Single GPU](../guides/single-gpu.md#activation-offload). |
+| `activation_offload_min_bytes` | int | `1048576` | Saved tensors smaller than this stay on the GPU. |
+| `activation_offload_in_flight` | int | `1` | Layers whose device-to-host copies may still run while later layers compute (each keeps its activations on the GPU until done). >= 1. |
+| `activation_offload_prefetch` | int | `1` | Layers fetched back ahead of the backward. `0`: a layer's tensors are fetched when its backward starts. |
+| `activation_offload_boundaries_only` | bool | `false` | Offload only each checkpointed layer's inputs; what selective checkpointing keeps stays on the GPU. Needs `gradient_checkpointing: selective` or `full`. |
 
 ---
 
