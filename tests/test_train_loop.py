@@ -485,11 +485,11 @@ def test_flagship_configs_validate():
     """All shipped YAML configs pass validation (no hard errors)."""
     configs_dir = Path(__file__).parent.parent / "configs"
     # distillation and RL configs have their own schemas (palingenesis.opd.config, palingenesis.rl.config), and so
-    # do the evaluation tasks of configs/eval (palingenesis.eval.config)
+    # do the evaluation tasks and suites under configs/eval (palingenesis.eval.config)
     yaml_files = [
         p
         for p in configs_dir.rglob("*.yaml")
-        if not p.name.startswith(("distill_", "rl_")) and p.parent.name != "eval"
+        if not p.name.startswith(("distill_", "rl_")) and "eval" not in p.relative_to(configs_dir).parts
     ]
     assert len(yaml_files) >= 5, f"Expected >=5 configs, found {len(yaml_files)}"
 
