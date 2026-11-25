@@ -1300,6 +1300,14 @@ class Config:
             "multimodal.enabled (the vision tower is not split)": self.multimodal.enabled,
             "memory.float8_training (float8 layouts are not split)": self.memory.float8_training,
             "memory.gradient_release (it steps inside the backward, per parameter)": self.memory.gradient_release,
+            "memory.activation_offload (its layer hooks and host copies have only run on whole layers in one "
+            "process: not with sequence-parallel activations or a pipeline schedule's backward)": (
+                self.memory.activation_offload
+            ),
+            "train.fused_optimizer (its multi-tensor kernels have only run on one process: not on parameters "
+            "split over tensor-parallel shards or pipeline stages; the per-parameter optimizer steps those)": (
+                self.train.fused_optimizer
+            ),
             "plugins.pre_rl (its per-rank normalisation and reference logits assume whole sequences)": (
                 self.plugins.pre_rl
             ),

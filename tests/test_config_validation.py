@@ -427,6 +427,15 @@ def test_model_parallel_defaults_are_off():
         ({"parallel__tp_degree": 2, "multimodal__enabled": True}, "does not support multimodal.enabled"),
         ({"parallel__tp_degree": 2, "parallel__cpu_offload": True}, "does not support parallel.cpu_offload"),
         ({"parallel__pp_degree": 2, "train__optimizer": "muon"}, "does not support train.optimizer=muon"),
+        # activation offload and the fused optimizer are validated on one process only: refused, not run unchecked
+        ({"parallel__tp_degree": 2, "memory__activation_offload": True}, "tp_degree > 1 does not support memory.act"),
+        ({"parallel__pp_degree": 2, "memory__activation_offload": True}, "pp_degree > 1 does not support memory.act"),
+        ({"parallel__tp_degree": 2, "train__fused_optimizer": True}, "tp_degree > 1 does not support train.fused_opt"),
+        ({"parallel__pp_degree": 2, "train__fused_optimizer": True}, "pp_degree > 1 does not support train.fused_opt"),
+        (
+            {"parallel__tp_degree": 2, "parallel__pp_degree": 2, "train__fused_optimizer": True},
+            "parallel.tp_degree / parallel.pp_degree > 1 does not support train.fused_optimizer",
+        ),
         ({"parallel__async_tp": True}, "async_tp .* needs parallel.tp_degree > 1"),
         (
             {"parallel__async_tp": True, "parallel__tp_degree": 2, "model__compile": False},

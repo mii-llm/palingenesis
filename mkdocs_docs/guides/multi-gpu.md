@@ -375,6 +375,7 @@ checkpoint layout, and the stages' parts are joined on rank 0.
 | tied embeddings (Qwen3-0.6B, Qwen3.5-0.8B) | yes | no: the embeddings and the head live on different stages |
 | DPO, off-policy distillation, SeCO, multimodal, float8, CPU offload, gradient release | no | no |
 | Muon, AdaGC, Hyperball, MONA, Schedule-Free | no | no |
+| activation offload (`memory.activation_offload`), fused optimizer (`train.fused_optimizer`) | no (refused by the config: both are validated on one process only; FSDP2 data parallel alone takes them by design) | no |
 | `data.eval_sources` | no | no |
 | EMA, base merge | no (their weight copies are plain tensors) | no |
 | LoRA and plugins that wrap layers | refused at startup (the plan names every module it splits) | refused |
