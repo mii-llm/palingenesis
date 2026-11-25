@@ -284,6 +284,7 @@ With ρ = π_θ/μ the ratio of the trained policy to the sampler on a token, A 
 | `icepop` | S · ρ inside [`icepop_low`, `icepop_high`], zero outside | The sampler and the trainer disagree on a few tokens (MoE routing, quantized rollouts) | Ring-1T (2510.18855, Oct 2025) |
 | `gspo` | one ratio per sequence (geometric mean of ρ), clipped at 1 ± `gspo_eps` | Token ratios are too noisy (long sequences, MoE); aggregation is then fixed per sequence | GSPO (2507.18071, Jul 2025) |
 | `ipo` | S · min(ρ, `is_cap`) where \|π_θ - μ\| ≤ `ipo_eps`, zero outside | Stale or mismatched rollouts where a ratio mask misfires: it drops a rare token moving 0.01 → 0.06 and keeps a likely one falling 0.9 → 0.2. Newer and less tested than the rows above | prime-rl's IPO (its algorithm docs, Oct 2026), after DPPO (2602.04879, Feb 2026); the published form has no cap on ρ, `is_cap` is kept here because a bounded difference does not bound the ratio of a rare token |
+| `decoupled` | S · W(π_prox/μ) · (π_θ/π_prox) inside the clip on π_θ/π_prox, zero outside | Stale rollouts (`max_staleness` 4 to 8): staleness is a weight, the clip is centred on a proximal policy; with `proximal: step` the gradient is `cispo`'s. Tested on CPU only ([Asynchronous RL](#asynchronous-rl-at-high-staleness)) | AReaL (2505.24298, May 2025) |
 | `reinforce` | S · 1 | On-policy runs where you want the plain score-function estimator, e.g. as a baseline for the others | REINFORCE; with `loss.baseline: leave_one_out`, RLOO (2402.14740, Feb 2024) |
 
 `reinforce` has no ratio, so it is the policy gradient only on samples of the policy being trained. It is refused with `rollout.max_staleness > 0` (older versions sampled part of the batch; `cispo` is the same estimator with the ratio) and with `rollout.think_skip` (a forced token needs its importance weight), and warns with FP8 rollouts. With `max_staleness: 0` every batch is sampled by the weights that train on it, so what it leaves uncorrected is the numerical difference between vLLM and the trainer: `policy/mismatch_k3` still reports it and `loss.seq_mask` still drops the trajectories where it is large. On-policy the other token-level objectives reduce to the same gradient wherever ρ is 1; they differ in what they do with the mismatch. Unclipped REINFORCE on off-policy samples has been reported to collapse (2509.24203, Sep 2025), which is why staleness is an error here and not a warning.
@@ -682,6 +683,116 @@ Measured on Qwen3.5-0.8B, GSM8K, one A100 (32 prompts x 8 rollouts per step): 92
 - **Overlap.** `rollout.max_staleness: 1` generates, runs tools and scores step k+1 while step k trains. Groups still generating when a batch is full keep going and join the next batch (partial rollouts; new weights load between engine steps, and the importance ratio uses the log-probs each token was sampled with), so the engine does not drain waiting for a batch's slowest groups.
 - **Budgets decide multi-turn speed.** A group is complete when its slowest rollout is, so a batch waits for the longest serial chain of turns. Size `rollout.max_completion_tokens` from what successful trajectories use (a row may carry its own `max_turns`, `max_completion_tokens` and `max_new_tokens`, positive integers checked at load; set `max_completion_tokens` with a raised `max_turns`, or the turns share the default budget: a warning names rows left under 256 tokens a turn): on agentic GSM8K with Qwen3.5-0.8B, halving it (cutting 1% of correct trajectories) made steps 1.7x faster. Measured and not worth it there: MTP speculative decoding (`rollout.vllm_args: {speculative_config: ...}`, slower at ~130 sequences in flight), smaller prefill chunks (no change), a bf16 recurrent state (`rollout.ssm_state_dtype: bfloat16`: a few % faster, 2.5x the sampler/trainer mismatch), and 64 groups per batch instead of 32 (the same trajectories per second: decoding is saturated). A profiled Qwen3.5-0.8B decode step at 128 sequences is 10 ms, 95% GPU kernels: the linear-attention state update (3 ms), attention (1.9 ms), GEMMs (2 ms) and the vocabulary softmax (0.7 ms).
 - **FP8 rollouts.** `rollout.kv_cache_dtype: fp8` / `rollout.quantization: fp8` speed up generation; the importance weights and the sequence mask absorb the extra sampler/trainer mismatch (watch `policy/abs_ratio_dev`).
+
+## Asynchronous RL at high staleness
+
+`rollout.max_staleness: 1` overlaps one batch of rollouts with one optimizer step. With slow episodes (agents, tools,
+long reasoning) or engines on other GPUs, the trainer still waits for rollouts most of the time; staleness 4 to 8
+keeps both sides busy, and then four things decide whether the run stays stable and fast. Each is an option; the
+defaults are unchanged. Everything in this section is tested on CPU (`tests/test_rl_async.py`,
+`tests/test_rl_pool_safe.py`); GPU validation is pending: `scripts/gpu_checks/async_rl.sh`.
+
+### The decoupled objective
+
+`masked_is` clips the ratio ρ = π_θ / μ against the *sampler*. At staleness 8 the sampler is eight updates old, so
+exactly the tokens the policy has improved on since (A > 0, ρ > 1 + `eps_high`) are the ones the mask removes: the
+update is held to the old policy's neighbourhood. `loss.type: decoupled` is decoupled PPO (AReaL, arXiv:2505.24298):
+three policies instead of two.
+
+| | |
+|---|---|
+| μ | the sampler: the engine's log-prob of each token, as sampled |
+| π_prox | the proximal policy the trust region is centred on |
+| ω = π_prox / μ | the behaviour weight: an importance weight only, capped at `is_cap` (`behaviour_weight: clamp`) or dropped above it (`mask`) |
+| u = π_θ / π_prox | the ratio PPO's clip acts on (`eps_low`, `eps_high`) |
+
+The coefficient on A · ∇log π_θ is S · W(ω) · u where u is inside the clip, 0 outside: the gradient of
+−ω · min(u A, clip(u) A). Staleness enters as a weight; the clip no longer measures it.
+
+`loss.proximal` chooses π_prox:
+
+- `step` (default): the policy at the start of the optimizer step, whose log-probs are the trainer's own forward pass
+  (no recompute). palingenesis takes one optimizer step per batch, so u = 1 and nothing is clipped: **the gradient is
+  then `cispo`'s exactly** (with `behaviour_weight: clamp`; a test asserts the equality). Use it as the name for
+  "importance-weighted, no sampler-centred mask", and expect what `cispo` gives.
+- `reference`: `loss.kl_ref`'s policy, reset to the current one every `loss.kl_ref_reset` steps. The trust region is
+  then around the policy of the last reset, held over several steps whatever the staleness of the data: this is the
+  variant that differs from every other objective here. It costs the reference's memory and one no-grad forward per
+  step.
+
+```yaml
+rollout: {max_staleness: 8, sleep: false}
+loss:
+  type: decoupled
+  proximal: reference       # or step
+  kl_ref: start
+  kl_ref_reset: 4           # steps between resets of the proximal policy
+  seq_mask: 0.5             # the sequence mask measures |rho - 1| against the sampler: loosen it with staleness
+```
+
+Watch `policy/behaviour_weight` (mean capped ω: near 1 when the data is fresh), `policy/behaviour_capped` (share of
+tokens above `is_cap`), `policy/proximal_dev` (mean |u − 1|; 0 with `step`) and `policy/clipped`.
+
+Pre-registered check, not run yet: decoupled at staleness 8 gains at least 1.2× the on-policy run's evaluation
+reward per minute and ends within 1 point of it; if `masked_is` at staleness 8 already does, the objective is not
+needed for that workload (`scripts/gpu_checks/async_rl.sh` reports which).
+
+### Generations in flight at an update
+
+With `max_staleness > 0`, generations keep decoding while new weights are loaded between two engine steps
+(`rollout.inflight`):
+
+| `rollout.inflight` | At an update | Version tags |
+|---|---|---|
+| `continue` (default) | the generation goes on under the new weights | per turn: the oldest version that sampled any of it |
+| `tag` | the same | per token (the engine streams token deltas and records each token's version) |
+| `resume` | the generation is aborted and continued from its tokens so far as a new request: the new weights prefill them, so the rest is sampled by one policy on its own context (one more prefill per update and generation) | per token |
+
+In all three a token keeps the log-prob of the weights that sampled it, so its importance ratio is exact. What
+`continue` leaves behind is a context whose KV cache was computed by older weights than the token's, which the ratio
+cannot see; `resume` removes it. Per-token versions feed `policy/stale_tokens`, the `current` / `stale` mismatch
+buckets and `rollout.stale`. Backends `vllm` and `remote` (start the workers with `--inflight tag|resume`); the
+vLLM side (delta outputs, abort) has not run on a GPU yet.
+
+`rollout.stale: mask` changes what happens past the bound. By default a group with a turn finished more than
+`max_staleness` versions ago is dropped whole, which selects against long episodes (they span more updates). With
+`mask` the group trains while one of its rollouts ended within the bound, and only the tokens sampled by too old a
+version leave the loss (`policy/stale_masked`).
+
+`rollout.sync: publish` loads new weights into the engine as soon as the trainer has stepped (colocated: between two
+engine steps; remote: staged and sent at once) instead of when the producer starts its next batch, so the rest of
+the batch being collected samples newer weights. Under FSDP the trainer already pushes after its step but waits
+for the batch being collected to end first (a per-step wait of up to one batch of rollouts); `publish` removes it.
+
+### Fail-safe weight pushes to engines in other processes
+
+`rollout.backend: remote` stages a snapshot in pinned host memory and sends it while the trainer steps. Three
+options harden and speed that path (full-weight pushes):
+
+| Option | Effect |
+|---|---|
+| `rollout.push_verify: true` | The snapshot travels as checksummed buckets (`push_bucket_mb`). An engine applies a push only after every bucket arrived intact and the version is not older than its own; a rejected push is sent once more. If applying fails half-way, the worker loads the last applied push again (it keeps two host staging areas for this); on a first push there is nothing to restore and what it samples is tagged version −1, which is never trained. An engine is never left stopped or half-updated; three rejections in a row end the run (`pool/rejected`). |
+| `rollout.push_link: nccl` | GPU to GPU: buckets are packed on the trainer's device (one bf16 snapshot there, 2 bytes per parameter) and sent to each engine over its own two-rank NCCL group, never one group for all (a collective fails for every rank when one dies). An engine whose link cannot be built or fails is served over TCP from then on, starting with the push that failed (`pool/link_pushes`, `pool/link_failures`). Always verified. `gloo` is the same protocol on CPU tensors (tests). **Not run on a GPU yet.** |
+| `rollout.push_dtype: bfloat16` | Float weights are cast on the trainer's device before staging: half the bytes of fp32 masters on the wire and in staging. |
+
+`pool/push_mb_s` reports what the pushes moved per second, `pool/stage_s` the time a snapshot held the trainer.
+
+### Many engines, and losing one
+
+N workers × M GPUs: start one `palingenesis.rl.pool.worker` per GPU and list them in `rollout.engines`; under
+torchrun rank r generates with `engines[r::ranks]`. `rollout.concurrency: kv` sends each request to the engine with
+the most room under its KV-sized cap. With `rollout.min_engines: n`, the run goes on while n engines are alive: a
+lost worker's requests are sent again to the others (its groups are not lost), it gets no more pushes, and its
+address is tried every `rollout.reconnect_s` seconds. A worker that answers there again is greeted as new, gets no
+request until a push has reached it, and then rejoins (`pool/lost`, `pool/rejoined`, `pool/engines`). With the
+default `min_engines: 0` a lost worker ends the run at the next update, as before.
+
+### What still needs more than one GPU or node
+
+- `push_link: nccl` itself (two GPUs at least; across nodes for InfiniBand / RoCE), and its speed against TCP.
+- Push throughput and `pool/lag` on a real network, and several engines per trainer rank under load.
+- A worker lost on another node (TCP keepalive timing), and `min_engines` under torchrun with FSDP.
+- `rollout.inflight tag / resume` on vLLM and the staleness × objective comparison need one GPU: `async_rl.sh`.
 
 ## Multi-GPU, clusters, and memory
 
