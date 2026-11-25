@@ -34,6 +34,7 @@ Commands:
   distill-score  Annotate an mcqa distillation pool with the teacher's answers (filter before training)
   rl          Reinforcement learning: rollouts scored by rewards (math, code, tools, your own)
   harbor      Harbor task directories (Docker envs with tests): check oracle/nop, export RL rows
+  env         Environment catalogue: list, info, test (oracle / degenerate audit), run (pass@k), rows, new
   scenario    Multi-role RL scenarios: generate rows, audit verifiers, export episodes, plan a cluster layout
   harness     Harness profiles for Harbor tasks: list, record a real harness's requests (capture)
   quantize    Post-training FP4 / FP8 quantisation into a vLLM checkpoint (NVFP4, MXFP4, FP8; compressed-tensors)
@@ -112,6 +113,11 @@ def main():
             from palingenesis.rl.envs.harbor import main as harbor_main
 
             sys.exit(harbor_main())
+
+        case "env":
+            from palingenesis.rl.catalog.cli import main as env_main
+
+            sys.exit(env_main())
 
         case "scenario":
             from palingenesis.rl.scenarios.cli import main as scenario_main

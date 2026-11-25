@@ -123,6 +123,8 @@ def safe_expression(text: str) -> bool:
             return False
     if any(len(digits) > 15 for digits in re.findall(r"\d+", text)):
         return False
+    if text.count("**") > 6 or re.search(r"\*\*[\s(]*-?\d+[\s)]*\*\*", text):
+        return False  # power towers
     for exponent in re.finditer(r"\*\*\s*\(?\s*(-?\d+)?", text):
         if exponent.group(1) is None or abs(int(exponent.group(1))) > 64:
             return False

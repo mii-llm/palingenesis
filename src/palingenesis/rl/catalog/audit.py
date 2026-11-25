@@ -111,6 +111,7 @@ async def audit_async(
     concurrency: int = 32,
     generic: bool = True,
     env_args: dict | None = None,
+    scripted_only: bool = False,
 ) -> dict[str, Any]:
     from palingenesis.rl.env import row_tools
 
@@ -133,7 +134,8 @@ async def audit_async(
         failures.append(f"missing Python modules: {', '.join(missing)}")
         report["ok"] = False
         return report
-    if spec.audit is not None:  # the environment audits itself (Harbor: each task's own oracle / nop check)
+    if spec.audit is not None and scripted_only is False:
+        # the environment audits itself (Harbor: each task's own oracle / nop check)
         custom = spec.audit(spec, n=n, seed=seed, dataset=dataset, rows=rows)
         if asyncio.iscoroutine(custom):
             custom = await custom
@@ -155,8 +157,14 @@ async def audit_async(
         return episodes, _summary(episodes, threshold, time.perf_counter() - start)
 
     try:
-        episodes, report["oracle"] = await run(spec.oracle)
-        unsolved = [e for e in episodes if e.reward is None or e.reward < threshold]
+        unsolved: list[Episode] = []
+        if spec.oracle is None:
+            report["warnings"].append(
+                "no oracle policy: the audit shows what must not be paid, not that the tasks can be solved"
+            )
+        else:
+            episodes, report["oracle"] = await run(spec.oracle)
+            unsolved = [e for e in episodes if e.reward is None or e.reward < threshold]
         if unsolved:
             first = unsolved[0]
             why = first.error or f"reward {first.reward} (finish {first.finish}, {first.turns} turns)"
@@ -205,8 +213,10 @@ async def audit_async(
                     f"({summary['first_error']}); a bad input must be an observation or a zero, not an exception"
                 )
         again = rows[: min(len(rows), 8)]
-        episodes, report["reuse"] = await run(spec.oracle, again)
-        stale = [e for e in episodes if e.reward is None or e.reward < threshold]
+        stale: list[Episode] = []
+        if spec.oracle is not None:
+            episodes, report["reuse"] = await run(spec.oracle, again)
+            stale = [e for e in episodes if e.reward is None or e.reward < threshold]
         if stale and not unsolved:
             failures.append(
                 f"reuse: the oracle fails {len(stale)} of {len(again)} rows after the degenerate episodes; the "
@@ -216,6 +226,16 @@ async def audit_async(
         await pool.shutdown()
     report["ok"] = not failures
     return report
+
+
+def audit_without_oracle(spec: EnvSpec, n: int = 32, seed: int = 0, dataset: str = "", rows=None) -> Any:
+    """An EnvSpec.audit for environments nobody wrote a solver for (imported ones): the degenerate policies only."""
+    return _degenerate_report(spec, n, seed, dataset, rows)
+
+
+async def _degenerate_report(spec: EnvSpec, n: int, seed: int, dataset: str, rows) -> dict[str, Any]:
+    report = await audit_async(spec, n=n, seed=seed, dataset=dataset, rows=rows, scripted_only=True)
+    return {k: report[k] for k in ("rows", "oracle", "degenerate", "reuse", "failures", "holes", "warnings") if k in report}
 
 
 def audit(spec: EnvSpec, **kwargs) -> dict[str, Any]:
