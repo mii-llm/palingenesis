@@ -95,10 +95,13 @@ def _common(a: np.ndarray, b: np.ndarray) -> int:
 class _Trie:
     """A radix trie over token sequences (numpy int64 arrays), built incrementally."""
 
-    def __init__(self, sequences: list[np.ndarray], share: bool = True):
+    def __init__(self, sequences: list[np.ndarray], share: bool = True, groups: list | None = None):
         self.sequences = sequences
         self.share = share
-        self.roots: dict[int, _Node] = {}  # first token -> root (share); sequence index -> root (no sharing)
+        # sharing only inside a group (a preference pair's two answers): each group is a trie of its own
+        self.groups = groups if share else None
+        # first token -> root (share; with groups: (group, first token) -> root); sequence index -> root (no sharing)
+        self.roots: dict = {}
         self.unique = 0  # tokens in the trie
         # K/V rows the tree attention gathers: every segment's root-to-segment path, i.e. the sum of the segments'
         # end depths (PackedRow.gathered_tokens of the trie's layout)
@@ -108,16 +111,20 @@ class _Trie:
         """How many leading tokens of `seq` the trie already holds."""
         return self.probe(seq)[0]
 
-    def probe(self, seq: np.ndarray) -> tuple[int, int]:
+    def _key(self, s: int | None, token: int):
+        """A root's key: its first token, within the sequence's group when sharing stays inside groups."""
+        return token if self.groups is None else (self.groups[s], token)
+
+    def probe(self, seq: np.ndarray, s: int | None = None) -> tuple[int, int]:
         """What inserting `seq` would cost: (the leading tokens the trie already holds, the K/V rows the insertion
         adds to `gathered`). The new tokens are len(seq) - match. A new segment gathers its whole path (len(seq)
         rows); when it leaves an existing segment midway, that segment is split and its upper part gathers its own
-        path as well."""
+        path as well. `s` (tries with groups): the sequence's index, which names its group."""
         if not self.share:
             return 0, len(seq)
         pos, children = 0, self.roots
         while pos < len(seq):
-            node = children.get(int(seq[pos]))
+            node = children.get(self._key(s, int(seq[pos])) if pos == 0 else int(seq[pos]))
             if node is None:
                 return pos, len(seq)
             tokens = self.sequences[node.seq][node.lo : node.hi]
@@ -137,9 +144,10 @@ class _Trie:
             return
         pos, children, parent = 0, self.roots, None
         while pos < len(seq):
-            node = children.get(int(seq[pos]))
+            key = self._key(s, int(seq[pos])) if pos == 0 else int(seq[pos])
+            node = children.get(key)
             if node is None:
-                children[int(seq[pos])] = _Node(s, pos, len(seq), parent)
+                children[key] = _Node(s, pos, len(seq), parent)
                 self.unique += len(seq) - pos
                 self.gathered += len(seq)
                 return
@@ -152,7 +160,7 @@ class _Trie:
                 return
             # the sequence leaves the segment after `common` tokens: split it there
             upper = _Node(node.seq, node.lo, node.lo + common, parent)
-            children[int(seq[pos])] = upper
+            children[key] = upper
             node.lo += common
             node.parent = upper
             upper.children[int(self.sequences[node.seq][node.lo])] = node
@@ -169,7 +177,7 @@ class _Trie:
             return [(node, len(seq))]
         out, pos, children = [], 0, self.roots
         while pos < len(seq):
-            node = children[int(seq[pos])]
+            node = children[self._key(s, int(seq[pos])) if pos == 0 else int(seq[pos])]
             take = min(node.hi - node.lo, len(seq) - pos)
             out.append((node, take))
             pos += take
@@ -224,8 +232,18 @@ class PackedRow:
         return f"PackedRow(tokens={self.num_tokens}, segments={self.num_segments}, levels={len(self.levels)})"
 
     @classmethod
-    def build(cls, sequences: list[list[int]] | list[np.ndarray], share: bool, min_saved: int = 0) -> PackedRow:
-        """`min_saved` (share): a shared run of tokens becomes a segment of its own only when that saves at least
+    def build(
+        cls,
+        sequences: list[list[int]] | list[np.ndarray],
+        share: bool,
+        min_saved: int = 0,
+        groups: list | None = None,
+    ) -> PackedRow:
+        """`groups` (share): one key per sequence; sequences share a prefix only with those of their own group (each
+        group a trie of its own, the tries side by side: a row of preference pairs has two levels, the pairs'
+        shared prefixes and the answers below them). None: every sequence shares with every other.
+
+        `min_saved` (share): a shared run of tokens becomes a segment of its own only when that saves at least
         this many forwarded tokens (its length x (the segments below that would each hold a copy - 1)); a run that
         saves less is copied into each branch instead. 0: the exact trie, every shared token forwarded once. Every segment boundary is a tree
         level for the recurrent layers and a gathered path for the attention, and their cost per level does not
@@ -234,7 +252,9 @@ class PackedRow:
         arrays = [np.asarray(s, dtype=np.int64) for s in sequences]
         if not arrays or any(len(a) == 0 for a in arrays):
             raise PackingError("packing needs at least one sequence, each of at least one token")
-        trie = _Trie(arrays, share)
+        if groups is not None and len(groups) != len(arrays):
+            raise PackingError(f"packing: {len(groups)} group keys for {len(arrays)} sequences")
+        trie = _Trie(arrays, share, groups)
         for i in range(len(arrays)):
             trie.insert(i)
         return cls._layout(trie, min_saved)
@@ -500,6 +520,49 @@ def pack(sequences: list[list[int]] | list[np.ndarray], share: bool) -> PackedRo
     """The packed row the trainer forwards: end to end (share False), or the prefix tree of the runs worth sharing
     (TREE_MIN_SAVED)."""
     return PackedRow.build(sequences, share, min_saved=TREE_MIN_SAVED if share else 0)
+
+
+def group_cost(sequences: list[list[int]] | list[np.ndarray]) -> tuple[int, int]:
+    """What one group costs a row whose groups share nothing with each other (pack_groups): (the tokens of its
+    trie, the K/V rows its attention gathers). Both add up over a row's groups, so a micro-batch can be filled
+    against a budget one group at a time."""
+    trie = _Trie([np.asarray(s, dtype=np.int64) for s in sequences], share=True)
+    for i in range(len(sequences)):
+        trie.insert(i)
+    return trie.unique, trie.gathered
+
+
+def pack_groups(sequences: list[list[int]] | list[np.ndarray], groups: list, share: bool = True) -> PackedRow:
+    """The packed row of sequences that share prefixes only inside their group (preference pairs: the prompt of a
+    pair's chosen and rejected answers, and whatever their answers start with in common, forwarded once). The exact
+    trie of every group: the levels are those of one group's trie (two for pairs), whatever the number of groups,
+    so the decision is taken for the row: when all its groups together save less than a tree level costs
+    (TREE_MIN_SAVED forwarded tokens per level below the roots), the row is laid out flat (varlen)."""
+    if share:
+        row = PackedRow.build(sequences, True, groups=groups)
+        saved = sum(len(s) for s in sequences) - row.num_tokens
+        if saved >= TREE_MIN_SAVED * (len(row.levels) - 1):  # (one level: nothing below the roots to pay for)
+            return row
+    return PackedRow.build(sequences, False)
+
+
+def forward_packed(model: nn.Module, support: PackingSupport, row: PackedRow, device) -> torch.Tensor:
+    """The final hidden states [1, N, H] of a packed row (FSDP-safe: palingenesis.logits.final_hidden_states).
+    transformers builds no attention mask for it (seco.PACKED_VARLEN): the layers read the row's layout from the
+    forward's keyword arguments, and every attention and Gated DeltaNet layer must have followed it (checked: one
+    that did not would have mixed the sequences)."""
+    from palingenesis.logits import final_hidden_states
+    from palingenesis.seco import PACKED_VARLEN
+
+    kwargs = row.forward_kwargs(device)
+    row.begin_forward()
+    token = PACKED_VARLEN.set(True)
+    try:
+        states = final_hidden_states(model, kwargs.pop("input_ids"), None, **kwargs)
+    finally:
+        PACKED_VARLEN.reset(token)
+    support.check(row)
+    return states
 
 
 # ── planning micro-batches ─────────────────────────────────────────────────────
