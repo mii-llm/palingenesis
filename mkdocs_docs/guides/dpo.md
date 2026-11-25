@@ -208,8 +208,82 @@ The `[B, S, V]` logits are never materialised, and neither is any other full-voc
 ## Batching and normalization
 
 - **Micro-batches:** `train.per_device_batch_size` counts **pairs**. A micro-batch is `[2P, S]`, chosen rows first, so one policy forward and one reference forward score both sides.
-- **Preference term:** summed over pairs and divided by `pairs × world_size × grad_accum`, so accumulated and data-parallel gradients are exactly the gradient of the mean over the effective batch.
+- **Preference term:** summed over pairs and divided by `pairs × world_size × grad_accum` (the micro-batch's pairs over all ranks), so accumulated and data-parallel gradients are exactly the gradient of the mean over the effective batch.
 - **`sft_weight` term:** divided by the global chosen-token count × grad accum, like SFT's token denominator.
+
+## Prompt-sharing packing (`dpo.packing`)
+
+A padded micro-batch computes every pair's prompt twice (once under the chosen answer, once under the
+rejected one), for the policy and again for the reference, and pads every row to the longest. With
+`dpo.packing: tree` a micro-batch is one packed row instead
+(the prefix-tree packing of `pgs rl`'s `train.packing: tree`):
+
+```yaml
+model:
+  attn_implementation: sdpa   # routed to the variable-length flash kernel over packed rows
+  compile: false              # compiled layers are refused with packed rows
+dpo:
+  enabled: true
+  packing: tree               # padded (default) | varlen | tree
+  micro_tokens: 16384         # optional: fill micro-batches by packed tokens instead of a pair count
+```
+
+- **Layout.** Every pair is a two-leaf prefix trie: the tokens its two sides share are forwarded once, then
+  the chosen and the rejected tails, each attending to the shared prefix and to itself. What is shared is
+  the common token prefix of the two rendered conversations: the prompt, earlier turns of a multi-turn
+  prompt, and the first tokens the two answers have in common (minimal-edit pairs share up to the first
+  edit). Pairs share nothing with each other, so a row has two levels whatever it holds: all the shared
+  prefixes, then all the tails. Gated DeltaNet layers (Qwen3.5) run once per level, the tails starting from
+  their prefix's final state. No row is padded. `varlen` lays the 2P sequences end to end: no padding, no
+  sharing.
+- **Policy and reference.** Both forwards use the packed row, so the prompt is computed twice per pair
+  (policy, reference) instead of four times.
+- **Same numbers.** Labels, score weights and the objectives stay in the `[2P, S]` layout; only the hidden
+  states come from the packed row. Per-token and per-sequence log-probs, the loss and the gradients equal
+  the padded path's up to floating-point order, for every `loss_type`, `ld_alpha`, `sft_weight` and
+  `sft_scope`. Tokens scored inside a shared prefix (earlier assistant turns with
+  `data.last_turn_only: false`) go through the output head once and carry both sides' weights.
+- **When a row stays flat.** A tree level costs the recurrent layers one more kernel call. A micro-batch
+  whose pairs together share fewer than 2,048 tokens is laid out as `varlen`. Watch
+  `train/dpo/forwarded_share`: tokens forwarded per token of the pairs' sequences (1.0 = nothing shared;
+  0.6 at an 80% prompt share with answers of equal length).
+- **Token budget.** By default a micro-batch still holds `train.per_device_batch_size` pairs, so a tree run
+  sees the same micro-batches as a padded run with the same seed. With `dpo.micro_tokens > 0`, pairs are
+  taken in data order while their packed tokens (a shared prefix counted once) fit the budget;
+  `per_device_batch_size` then does not apply, a pair above the budget is a micro-batch of its own, and
+  the number of pairs varies per micro-batch. The preference term of a micro-batch is divided by its own
+  pairs (summed over ranks) times grad accum, as SFT divides by a micro-batch's tokens. The LR schedule needs
+  `train.max_steps` or a non-streaming dataset (the micro-batches are counted by one scan).
+- **Memory.** The attention of a tail gathers its prefix's keys and values: at most three times the packed
+  tokens per layer, transient, so there is no separate gather budget (unlike RL groups of many rollouts).
+- **Works with** FSDP2, LoRA and `train.gradient_checkpointing` (none, selective, full), each checked against
+  the padded path on CPU, and with Liger kernels (which do not touch the layout). The chunked passes over the
+  vocabulary cover the scored tokens only. Held-out evaluation uses padded rows.
+- **Refused by `Config.validate()`** with `dpo.packing: varlen | tree`: `model.attn_implementation` other
+  than `sdpa`, `model.compile`, `multimodal.enabled`, `memory.activation_offload`. Refused at start-up: MoE
+  policies (router balancing is not laid out on packed pairs), plugins with a loss term, and models whose
+  layers a packed row cannot run exactly (sliding-window attention, recurrent layers other than Gated
+  DeltaNet).
+
+### Measured
+
+`scripts/gpu_checks/dpo_tree.sh` measures one micro-step (reference forward, policy forward, loss, backward)
+on synthesised pairs (answers of 100 to 700 tokens, the prompt sized to the share), against the fastest
+padded layout, compiled layers included. Pre-registered target: at least 1.5x at prompt shares of 70% and
+above; below 1.2x the feature is dropped.
+
+| Model | Prompt share | Pairs | Padded step (s) | Tree step (s) | Speed-up | Peak memory padded / tree (GiB) | Gradient cosine |
+|---|---|---|---|---|---|---|---|
+| Qwen3.5-0.8B | 50% | TBD | TBD | TBD | TBD | TBD | TBD |
+| Qwen3.5-0.8B | 80% | TBD | TBD | TBD | TBD | TBD | TBD |
+| Qwen3.5-0.8B | 95% | TBD | TBD | TBD | TBD | TBD | TBD |
+| Qwen3.5-2B | 50% | TBD | TBD | TBD | TBD | TBD | TBD |
+| Qwen3.5-2B | 80% | TBD | TBD | TBD | TBD | TBD | TBD |
+| Qwen3.5-2B | 95% | TBD | TBD | TBD | TBD | TBD | TBD |
+
+Not measured yet (GPU validation pending): the table is filled from the check's `throughput`, `speedup` and
+`equality` lines. On CPU, float64 tiny Qwen3 and Qwen3.5 models match the padded path to 1e-10 on
+log-probs and loss and 1e-6 (relative) on gradients (`tests/test_dpo_packing.py`).
 
 ## Metrics
 
@@ -221,6 +295,7 @@ The `[B, S, V]` logits are never materialised, and neither is any other full-voc
 | `train/rewards/margins` | Chosen reward minus rejected reward |
 | `train/rewards/accuracies` | Share of pairs where chosen outscores rejected |
 | `train/logps/chosen`, `train/logps/rejected` | Summed policy log-probs per sequence |
+| `train/dpo/forwarded_share` | With `dpo.packing`: tokens forwarded per token of the pairs' sequences |
 | `eval/loss`, `eval/rewards/*` | The same on `data.eval_dataset`. `eval/loss` selects the best checkpoint. |
 
 Training metrics are averaged over the accumulation window and across ranks. The reference scores of the fixed eval pairs are computed once and cached.
@@ -235,7 +310,7 @@ Training metrics are averaged over the accumulation window and across ranks. The
 
 `Config.validate()` rejects the following, because each assumes one SFT sequence per row or changes the token stream:
 
-- packing, `data.sources`, `data.eval_sources`;
+- `data.packing` (SFT document packing; `dpo.packing` is the preference layout), `data.sources`, `data.eval_sources`;
 - pretokenize, MSFT tracking, the sequence-length curriculum, pretrain replay;
 - `preprocess.enabled`;
 - context parallel and gradient release;
