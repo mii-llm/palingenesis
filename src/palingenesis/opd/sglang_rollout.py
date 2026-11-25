@@ -548,6 +548,51 @@ def launcher_env_removed():
         os.environ.update(saved)
 
 
+def cuda_runtime_library_dirs() -> list[str]:
+    """The directories of the CUDA runtime torch itself loads (the nvidia-cuda-runtime wheel next to it: its
+    libcudart), [] when torch uses a system CUDA."""
+    import importlib.util
+
+    dirs = []
+    for package in ("nvidia.cuda_runtime", "nvidia.cu13", "nvidia.cu12"):
+        try:
+            spec = importlib.util.find_spec(package)
+        except (ImportError, ValueError):
+            spec = None
+        for location in (spec.submodule_search_locations or []) if spec is not None else []:
+            lib = Path(location) / "lib"
+            if lib.is_dir() and any(lib.glob("libcudart.so*")) and str(lib) not in dirs:
+                dirs.append(str(lib))
+    return dirs
+
+
+@contextlib.contextmanager
+def memory_saver_library_path(enabled: bool = True):
+    """torch's own CUDA runtime first on LD_LIBRARY_PATH while a sleep-mode engine's processes are spawned.
+
+    With enable_memory_saver SGLang preloads torch_memory_saver's hook into its scheduler process (LD_PRELOAD).
+    The hook needs libcudart.so.<major> and has no run path, so the loader takes the first one it finds: a
+    system CUDA toolkit's, when the machine has one. torch then gets that library too (same soname) instead of
+    the one its wheel was built with, and fails to import where it is older ("undefined symbol:
+    cudaGetDriverEntryPointByVersion" with torch 2.11 + cu129 next to a CUDA 12.x toolkit): the scheduler dies at
+    startup. With the wheel's directory first, hook and torch share torch's runtime."""
+    dirs = cuda_runtime_library_dirs() if enabled else []
+    if not dirs:
+        yield
+        return
+    previous = os.environ.get("LD_LIBRARY_PATH")
+    rest = [d for d in (previous or "").split(os.pathsep) if d and d not in dirs]
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([*dirs, *rest])
+    logger.info("SGLang sleep mode: LD_LIBRARY_PATH starts with %s for the engine's processes", dirs)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+        else:
+            os.environ["LD_LIBRARY_PATH"] = previous
+
+
 # ------------------------------------------------------------------ weights
 
 
@@ -648,7 +693,7 @@ class InProcessEngine:
         self.failed = ""  # why the engine is gone (its scheduler process died); calls raise it
         main = threading.current_thread() is threading.main_thread()
         previous = signal.getsignal(signal.SIGTERM) if main else None
-        with launcher_env_removed():
+        with launcher_env_removed(), memory_saver_library_path(bool(options.get("enable_memory_saver"))):
             self.engine = sglang.Engine(**options)
         # sglang.Engine kills every child process of this one at exit (its own and any other); ours kills its own
         with contextlib.suppress(Exception):
