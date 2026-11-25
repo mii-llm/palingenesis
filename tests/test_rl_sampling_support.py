@@ -513,3 +513,19 @@ def test_a_step_with_many_incomplete_supports_warns(caplog):
         assert metrics == {"sampling/support_incomplete": 0.0, "sampling/support_size": 4.0} and not caplog.records
         sampling_metrics({"support_tokens": 10.0, "support_incomplete": 9.0, "support_size": 280.0})
     assert "processed_logprobs" in caplog.text
+
+
+def test_tokens_left_out_of_the_loss_stay_out_of_the_mismatch_buckets():
+    from palingenesis.rl.losses import mismatch_by_bucket
+    from palingenesis.rl.trainer import _unmeasured
+
+    valid = torch.tensor([True, False, True])
+    scored = SimpleNamespace(valid=valid)
+    forced = torch.tensor([False, False, True])
+    assert _unmeasured(None, None) is None and _unmeasured(forced, None) is forced
+    assert _unmeasured(None, scored).tolist() == [False, True, False]
+    assert _unmeasured(forced, scored).tolist() == [False, True, True]
+    lp, behaviour = torch.tensor([-1.0, -1.0, -1.0]), torch.tensor([-1.0, -40.0, -1.0])
+    where = torch.zeros(3, dtype=torch.long)
+    stats = mismatch_by_bucket(lp, behaviour, where, where, _unmeasured(None, scored))
+    assert sum(float(v) for k, v in stats.items() if k.startswith("abs_ratio_dev/")) == 0.0

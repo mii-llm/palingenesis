@@ -1158,7 +1158,7 @@ class RLTrainer:
             loss, stats = policy_loss(
                 lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config, forced_t, scored
             )
-            stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], forced_t))
+            stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], _unmeasured(forced_t, scored)))
             reference_lp = torch.cat([self.ref_lp[id(t)] for t in micro]) if self.ref_lp else None
             if self.scenario is not None:  # the same statistics per role
                 names = self.scenario.roles
@@ -1334,7 +1334,7 @@ class RLTrainer:
                     lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced, scored
                 )
                 where = torch.tensor([sampled, _sampled_by(t, sampled, current)], dtype=torch.long, device=device)
-                stats.update(mismatch_by_bucket(lp, floats[0], where[0], where[1], forced))
+                stats.update(mismatch_by_bucket(lp, floats[0], where[0], where[1], _unmeasured(forced, scored)))
                 if self.scenario is not None:
                     from palingenesis.rl.scenarios.credit import role_statistics
 
@@ -1762,6 +1762,14 @@ def _sampled_by(t: Trajectory, sampled: list[int], current: int) -> list[int]:
     older version sampled any of it, -1 when unknown (see Trajectory.token_versions)."""
     versions = t.token_versions()
     return [-1 if versions[j] < 0 else int(versions[j] < current) for j in sampled]
+
+
+def _unmeasured(forced: torch.Tensor | None, scored) -> torch.Tensor | None:
+    """The tokens whose ratio is not a sampler mismatch: forced ones (think-skip) and, with the sampler's
+    candidates, those left out of the loss (support incomplete or without the sampled token)."""
+    if scored is None:
+        return forced
+    return ~scored.valid if forced is None else forced | ~scored.valid
 
 
 def _candidates_of(t: Trajectory, sampled: list[int]):
