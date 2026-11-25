@@ -17,6 +17,20 @@ distribution actually sampled from), advantages A and aggregation weights w:
              (gradient s · A · mean_t ∇lp where unclipped)                  (Qwen GSPO)
   ipo        -Σ w · S · 1[|e^lp - e^μ| ≤ ε] · min(sg ρ, C) · A · lp       (probability-difference mask)
   reinforce  -Σ w · S · A · lp                                             (score function, on-policy only)
+  decoupled  -Σ w · S · W(ω) · 1[u inside the clip] · sg u · A · lp        (decoupled PPO, AReaL arXiv:2505.24298)
+             three policies instead of two: the sampler μ (stale by up to rollout.max_staleness versions), the
+             proximal policy π_prox the trust region is centred on, and the trained π_θ. ω = π_prox / μ is the
+             behaviour weight (an importance weight only: capped at is_cap, W(ω) = min(ω, C), or masked,
+             W(ω) = ω · 1[ω ≤ C], loss.behaviour_weight), u = π_θ / π_prox the trust-region ratio PPO's clip acts
+             on (A>0, u>1+ε_high or A<0, u<1-ε_low: no gradient). It is the gradient of
+             -ω · min(u A, clip(u, 1-ε_low, 1+ε_high) A). masked_is clips ρ = ω · u against the sampler, so the more
+             stale the data, the more of an improving policy's tokens fall outside the clip and the update is pulled
+             back to the old sampler; here staleness only enters as the weight ω.
+             π_prox (loss.proximal): "step", the policy at the start of the optimizer step, whose log-probs are the
+             trainer's own forward pass (no recompute; with one optimizer step per batch u = 1 and nothing is
+             clipped: the objective is then cispo's with behaviour_weight clamp); "reference", loss.kl_ref's
+             policy (reset every loss.kl_ref_reset steps): a trust region around the policy of the last reset that
+             holds over several steps whatever the data's staleness.
 
 reinforce leaves ρ out: its gradient is the policy gradient only when the tokens were sampled from π_θ, which the
 configuration guarantees (rollout.max_staleness 0, no forced tokens); ρ is still measured and logged, and S still
@@ -442,6 +456,8 @@ def _keep_factor(config, ratio: Tensor, advantage: Tensor, p: Tensor | None = No
         return ((ratio >= config.icepop_low) & (ratio <= config.icepop_high)).float()
     if config.type == "ipo":
         return ((p - q).abs() <= config.ipo_eps).float() * capped
+    if config.type == "decoupled" and getattr(config, "proximal", "step") == "step":  # u = 1: f(ρ) = W(ρ)
+        return (ratio <= config.is_cap).float() if getattr(config, "behaviour_weight", "clamp") == "mask" else capped
     raise ValueError(f"loss.score_centering is not defined for loss.type {config.type!r}")
 
 
@@ -501,6 +517,8 @@ def policy_loss(
     config,
     forced: Tensor | None = None,
     sampled: SampledLogProbs | None = None,
+    proximal: Tensor | None = None,
+    fresh: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
     """The loss over a micro-batch's trained tokens.
 
@@ -509,13 +527,19 @@ def policy_loss(
     tokens whose behaviour log-prob is a forcing probability (think-skip): their ratio is an intended importance
     weight, so it stays out of the sampler-mismatch statistics and the sequence mask. sampled: sampled_logprobs'
     result when the tokens came with the sampler's candidates (lp is then sampled.lp): tokens it marks invalid are
-    left out of the loss, and loss.score_centering uses its candidates.
+    left out of the loss, and loss.score_centering uses its candidates. proximal: [N] or None, log π_prox of each
+    token for loss.type decoupled (None: the policy as it is now, lp detached: loss.proximal step). fresh: [N] bool
+    or None, False for tokens sampled by a policy version older than rollout.max_staleness (rollout.stale mask): they
+    are left out of the loss and of its statistics' ratios (counted as stale_masked).
     Returns the loss (to backward) and summed statistics as 0-d tensors (no host sync).
     """
     centering = getattr(config, "score_centering", "off") != "off"
     if centering and sampled is None:
         raise ValueError("loss.score_centering needs the sampler's candidates (sampled_logprobs)")
     candidate_stats = {}
+    if fresh is not None:
+        weight = weight * fresh
+        candidate_stats["stale_masked"] = (~fresh).sum().float()
     if sampled is not None:
         weight = weight * sampled.valid
         if sampled.sampler.support:
@@ -533,13 +557,17 @@ def policy_loss(
             # meaningful ratio: it counts as on-policy (ρ = 1) in the sequence deviation (loss.seq_mask), gspo's
             # sequence ratio, the mismatch statistics and its (zero-weighted) coefficient, which stays finite
             log_ratio = log_ratio.masked_fill(~sampled.valid, 0.0)
+        if fresh is not None:  # too old to train: like a token left out above, it counts as on-policy
+            log_ratio = log_ratio.masked_fill(~fresh, 0.0)
         ratio = log_ratio.exp()
         deviation = (ratio - 1).abs()
         seen = ratio  # the sampler-mismatch view of the ratios
         if forced is not None:
             deviation = deviation.masked_fill(forced, 0.0)
             seen = ratio.masked_fill(forced, 1.0)
-        seq_deviation = torch.zeros(n_seq, dtype=deviation.dtype, device=lp.device).index_add_(0, seq, deviation) / seq_len
+        seq_deviation = (
+            torch.zeros(n_seq, dtype=deviation.dtype, device=lp.device).index_add_(0, seq, deviation) / seq_len
+        )
         keep_seq = (
             seq_deviation <= config.seq_mask
             if config.seq_mask > 0
@@ -561,9 +589,13 @@ def policy_loss(
 
     if config.type == "gspo":
         with torch.no_grad():
-            seq_log_ratio = torch.zeros(n_seq, dtype=log_ratio.dtype, device=lp.device).index_add_(0, seq, log_ratio) / seq_len
+            seq_log_ratio = (
+                torch.zeros(n_seq, dtype=log_ratio.dtype, device=lp.device).index_add_(0, seq, log_ratio) / seq_len
+            )
             s = seq_log_ratio.exp()
-            seq_adv = torch.zeros(n_seq, dtype=advantage.dtype, device=lp.device).index_add_(0, seq, advantage) / seq_len
+            seq_adv = (
+                torch.zeros(n_seq, dtype=advantage.dtype, device=lp.device).index_add_(0, seq, advantage) / seq_len
+            )
             clipped = ((seq_adv > 0) & (s > 1 + config.gspo_eps)) | ((seq_adv < 0) & (s < 1 - config.gspo_eps))
             coef = ((~clipped).float() * s)[seq] * advantage / seq_len[seq] * s_mask
             stats["clipped"] = clipped[seq].sum().float()
@@ -590,6 +622,23 @@ def policy_loss(
                 raise ValueError("loss.type reinforce cannot train forced tokens (they need an importance weight)")
             clipped = torch.zeros_like(ratio, dtype=torch.bool)
             coef = advantage
+        elif config.type == "decoupled":
+            # u = π_θ / π_prox (the clip's ratio), ω = π_prox / μ = ρ / u (the behaviour weight)
+            log_u = torch.zeros_like(log_ratio) if proximal is None else lp.detach() - proximal
+            if proximal is not None and sampled is not None:
+                log_u = log_u.masked_fill(~sampled.valid, 0.0)
+            u = log_u.exp()
+            omega = (log_ratio - log_u).exp()
+            clipped = ((advantage > 0) & (u > 1 + config.eps_high)) | ((advantage < 0) & (u < 1 - config.eps_low))
+            over = omega > config.is_cap
+            if getattr(config, "behaviour_weight", "clamp") == "mask":
+                held = omega.masked_fill(over, 0.0)
+            else:
+                held = omega.clamp(max=config.is_cap)
+            coef = (~clipped).float() * held * u * advantage
+            stats["behaviour_capped"] = over.sum().float()
+            stats["behaviour_weight"] = held.sum() if forced is None else held.masked_fill(forced, 0.0).sum()
+            stats["proximal_dev"] = (u - 1).abs().sum()
         else:
             raise ValueError(f"unknown loss.type {config.type!r}")
         coef = coef * s_mask
@@ -648,6 +697,19 @@ def mismatch_metrics(values: dict[str, float]) -> dict[str, float]:
     if versioned > 0:
         metrics["policy/stale_tokens"] = values.get("bucket_tokens/stale", 0.0) / versioned
     return metrics
+
+
+def decoupled_metrics(values: dict[str, float]) -> dict[str, float]:
+    """loss.type decoupled and rollout.stale mask: per-token means of a step's summed statistics.
+    policy/behaviour_weight (the mean capped weight π_prox / μ), policy/behaviour_capped (share above is_cap),
+    policy/proximal_dev (mean |π / π_prox - 1|: 0 with loss.proximal step), policy/stale_masked (share of tokens
+    older than rollout.max_staleness, left out)."""
+    tokens = max(values.get("tokens", 0.0), 1.0)
+    out = {}
+    for key in ("behaviour_weight", "behaviour_capped", "proximal_dev", "stale_masked"):
+        if key in values:
+            out[f"policy/{key}"] = values[key] / tokens
+    return out
 
 
 # ------------------------------------------------------- advantages & weights

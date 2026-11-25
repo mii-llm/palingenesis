@@ -45,6 +45,7 @@ class Segment:
     image_tokens: list[int]
     observation_targets: list[int] = field(default_factory=list)
     candidates: Any = None  # opd.rollout.Candidates aligned with `tokens`, or None
+    turn_versions: list[Any] = field(default_factory=list)  # Trajectory.turn_versions of the segment's turns
 
 
 @dataclass
@@ -61,6 +62,9 @@ class Trajectory:
     # while it decoded: partial rollouts), and where it starts in `tokens`.
     first_versions: list[int] = field(default_factory=list)
     turn_starts: list[int] = field(default_factory=list)
+    # Per assistant turn: its tokens' policy versions as runs [(first token index in the turn, version), ...] when
+    # the engine followed them across weight updates (rollout.inflight tag / resume), else None.
+    turn_versions: list[Any] = field(default_factory=list)
     finish: str = ""  # stop | length | turns | error
     turns: int = 0
     tool_calls: int = 0
@@ -104,8 +108,11 @@ class Trajectory:
         version: int,
         first_version: int | None = None,
         candidates=None,
+        versions: list | None = None,
     ) -> None:
-        """A sampled turn; `candidates`: the sampler's candidates of its tokens (opd.rollout.Candidates), if any."""
+        """A sampled turn; `candidates`: the sampler's candidates of its tokens (opd.rollout.Candidates), if any;
+        `versions`: its tokens' policy versions as runs (opd.rollout.Rollout.versions), if the engine followed
+        them."""
         if len(logprobs) != len(ids):
             raise ValueError(
                 f"{len(ids)} sampled tokens but {len(logprobs)} log-probs: the rollout engine must "
@@ -117,6 +124,7 @@ class Trajectory:
             self._extend_candidates(len(ids), candidates)
         self.first_versions.append(version if first_version is None else first_version)
         self.turn_starts.append(len(self.tokens))
+        self.turn_versions.append([tuple(run) for run in versions] if versions else None)
         self.tokens += ids
         self.mask += [True] * len(ids)
         self.logprobs += [lp if math.isfinite(lp) else 0.0 for lp in logprobs]
@@ -212,11 +220,13 @@ class Trajectory:
                 self.image_tokens[:shown],
                 self.observation_targets,
                 self.candidates.head(end) if self.candidates is not None else None,
+                self.turn_versions,
             )
         )
         self.prompt_ids, self.images, self.image_tokens = list(prompt_ids), list(images), list(image_tokens)
         self.tokens, self.mask, self.logprobs = [], [], []
         self.first_versions, self.turn_starts, self.forced = [], [], []
+        self.turn_versions = []
         self.observation_targets = []
         self.candidates = None
 
@@ -241,6 +251,7 @@ class Trajectory:
                 image_tokens=segment.image_tokens,
                 observation_targets=segment.observation_targets,
                 candidates=segment.candidates,
+                turn_versions=segment.turn_versions,
             )
             for segment in self.segments
         ]
@@ -257,16 +268,23 @@ class Trajectory:
         return len(self.observation_targets) + sum(len(s.observation_targets) for s in self.segments)
 
     def token_versions(self) -> list[int]:
-        """Per token of `tokens`, the oldest policy version that sampled any token of its assistant turn (a turn
-        decoded across a weight update counts as sampled by the older weights); -1 outside generated turns (context,
-        a forced prefix) and for trajectories built without append_generated."""
+        """Per token of `tokens`, the policy version that sampled it when the engine followed its turn's tokens
+        across weight updates (rollout.inflight tag / resume), else the oldest policy version that sampled any token
+        of its assistant turn (a turn decoded across a weight update counts as sampled by the older weights); -1
+        outside generated turns (context, a forced prefix) and for trajectories built without append_generated."""
         out = [-1] * len(self.tokens)
         ends = self.turn_starts[1:] + [len(self.tokens)]
-        for start, end, version in zip(self.turn_starts, ends, self.first_versions):
+        runs = self.turn_versions + [None] * (len(self.turn_starts) - len(self.turn_versions))
+        for start, end, version, turn_runs in zip(self.turn_starts, ends, self.first_versions, runs):
+            exact = None
+            if turn_runs:
+                from palingenesis.opd.rollout import token_versions
+
+                exact = token_versions(turn_runs, end - start)
             for j in range(start, end):
                 if not self.mask[j]:  # the turn ended: context follows
                     break
-                out[j] = version
+                out[j] = version if exact is None else exact[j - start]
         return out
 
     @property

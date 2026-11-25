@@ -20,6 +20,7 @@ returns when its longest sequence ends, so multi-turn trajectories advance in ro
 """
 
 import asyncio
+import contextlib
 import functools
 import itertools
 import queue
@@ -41,13 +42,52 @@ class Generation:
     first_version: int | None = None  # the version that sampled its first token (None: `version`)
     routed_experts: object | None = None  # MoE routing replay: see opd.rollout.Rollout
     candidates: object | None = None  # opd.rollout.Candidates (Sampling.candidates > 0), else None
+    # per-token policy versions as runs [(first token index, version), ...] (opd.rollout.Rollout.versions), or None
+    versions: list | None = None
 
 
 def _generation(r) -> Generation:
     first = getattr(r, "first_version", None)
     routed = getattr(r, "routed_experts", None)
     top = getattr(r, "candidates", None)
-    return Generation(list(r.completion_ids), list(r.logprobs), r.finish_reason, r.policy_version, first, routed, top)
+    runs = getattr(r, "versions", None)
+    return Generation(
+        list(r.completion_ids), list(r.logprobs), r.finish_reason, r.policy_version, first, routed, top, runs
+    )
+
+
+def _joined(prefix, rest):
+    """A completion resumed after a weight update (rollout.inflight resume): `prefix`, what was sampled before
+    it (a Rollout), followed by `rest`, the request that continued from it. Log-probs, candidates and per-token
+    versions are each token's own; the routing record is dropped (the continuation re-prefilled the prefix)."""
+    from palingenesis.opd.rollout import Candidates, Rollout
+
+    n = len(prefix.completion_ids)
+    before = prefix.versions or [(0, prefix.policy_version if prefix.first_version is None else prefix.first_version)]
+    after = rest.versions or [(0, rest.policy_version)]
+    runs = [r for r in before if r[0] < n or r[0] == 0] if n else []
+    for start, version in after:
+        if runs and runs[-1][1] == version:
+            continue
+        runs.append((n + start, version))
+    candidates = None
+    if prefix.candidates is not None or rest.candidates is not None:
+        candidates = Candidates.join(
+            [
+                prefix.candidates if prefix.candidates is not None else Candidates.empty(n),
+                rest.candidates if rest.candidates is not None else Candidates.empty(len(rest.completion_ids)),
+            ]
+        )
+    return Rollout(
+        list(prefix.completion_ids) + list(rest.completion_ids),
+        list(prefix.logprobs) + list(rest.logprobs),
+        rest.finish_reason,
+        rest.policy_version,
+        runs[0][1] if runs else rest.policy_version,
+        None,
+        candidates,
+        runs,
+    )
 
 
 def _release(gate, key: str, prompt_tokens: int, future: asyncio.Future) -> None:
@@ -58,10 +98,23 @@ def _release(gate, key: str, prompt_tokens: int, future: asyncio.Future) -> None
 
 
 class GenerationClient:
-    def __init__(self, engine: RolloutEngine, window: float = 0.02, merge: bool = True, gate=None):
+    def __init__(
+        self, engine: RolloutEngine, window: float = 0.02, merge: bool = True, gate=None, inflight: str = "continue"
+    ):
         """`gate`: a palingenesis.rl.concurrency.AdmissionGate every request acquires first (rollout.concurrency
-        kv: requests in flight under the engine's KV-sized cap); None: every request goes out at once."""
+        kv: requests in flight under the engine's KV-sized cap); None: every request goes out at once.
+        `inflight` (rollout.inflight): what requests in flight do when weights are loaded under paused().
+        "continue": go on; "tag": go on, the engine recording each token's version (engines with track_tokens);
+        "resume": each is aborted and continued from its tokens so far as a new request (engines with
+        stream_abort; the others continue)."""
         self.engine = engine
+        self.inflight_mode = inflight
+        self.resumed = 0  # generations aborted at a weight update and continued (rollout.inflight resume)
+        if inflight != "continue" and hasattr(engine, "track_tokens"):
+            engine.track_tokens = True
+        self.inflight: dict[str, list[tuple[asyncio.Future, asyncio.AbstractEventLoop]]] = {}
+        self.requests: dict[str, tuple] = {}  # request id -> (prompt, budget, temperature, images, adapter)
+        self.prefixes: dict[str, object] = {}  # resumed request id -> the Rollout sampled before the update
         self.merge = merge
         self.window = window
         self.gate = gate
@@ -143,7 +196,7 @@ class GenerationClient:
     def _engine_loop(self) -> None:
         """The engine thread: add what arrived, step, resolve what finished. Each add + step
         holds engine_lock, which weight updates take between steps (see paused())."""
-        inflight: dict[str, list[tuple[asyncio.Future, asyncio.AbstractEventLoop]]] = {}
+        inflight = self.inflight
         while True:
             items = []
             try:
@@ -159,11 +212,19 @@ class GenerationClient:
                 return
             with self.engine_lock:
                 finished = self._add_and_step(items, inflight)
-            if finished is None:
-                continue
-            for request_id, rollouts in finished:
-                self._resolve(inflight.pop(request_id), rollouts)
-            self.timeline.append((time.monotonic(), sum(len(w) for w in inflight.values()), len(finished)))
+                if finished is None:
+                    continue
+                resolved = []
+                for request_id, rollouts in finished:
+                    self.requests.pop(request_id, None)
+                    prefix = self.prefixes.pop(request_id, None)
+                    if prefix is not None:
+                        rollouts = [_joined(prefix, rollouts[0])]
+                    resolved.append((inflight.pop(request_id), rollouts))
+                live = sum(len(w) for w in inflight.values())
+            for waiters, rollouts in resolved:
+                self._resolve(waiters, rollouts)
+            self.timeline.append((time.monotonic(), live, len(finished)))
 
     def _add_and_step(self, items, inflight):
         """Add the arrived requests, then one engine step: its finished requests (None when
@@ -196,6 +257,7 @@ class GenerationClient:
                 self._resolve(waiters, error=e)
                 continue
             inflight[request_id] = waiters
+            self.requests[request_id] = (list(prompt), budget, temperature, pictures.get(key), adapters.get(key, ""))
             self.calls += 1
         if not inflight:
             return None
@@ -205,6 +267,8 @@ class GenerationClient:
             for waiters in inflight.values():
                 self._resolve(waiters, error=e)
             inflight.clear()
+            self.requests.clear()
+            self.prefixes.clear()
             return None
 
     @staticmethod
@@ -225,8 +289,59 @@ class GenerationClient:
     def paused(self):
         """A context in which the engine does not step: load weights while requests are in
         flight (they continue with the new weights; their tokens keep the log-probs they were
-        sampled with, which is what the importance ratio uses)."""
-        return self.engine_lock
+        sampled with, which is what the importance ratio uses). With rollout.inflight resume, requests in
+        flight when the context loaded new weights are aborted and continued from their tokens so far."""
+        if self.inflight_mode != "resume" or not self.streaming or not hasattr(self.engine, "stream_abort"):
+            return self.engine_lock
+        return self._resuming()
+
+    @contextlib.contextmanager
+    def _resuming(self):
+        with self.engine_lock:
+            before = self.engine.version
+            yield
+            if self.engine.version != before and before >= 0:
+                self._resume()
+
+    def _resume(self) -> None:
+        """Under engine_lock, after new weights were loaded: abort every request in flight and add, for each of its
+        samples that had not ended, a request that continues from the tokens it has (the new weights prefill them,
+        so what follows is sampled by one policy on its own context). A sample that had ended is answered; one
+        without budget left ends as "length"."""
+        for request_id in list(self.inflight):
+            try:
+                partial = self.engine.stream_abort(request_id)
+            except Exception as e:  # noqa: BLE001 — the request's trajectories see the failure
+                self._resolve(self.inflight.pop(request_id), error=e)
+                continue
+            if partial is None:  # the engine does not follow this request: it continues under the new weights
+                continue
+            waiters = self.inflight.pop(request_id)
+            prompt, budget, temperature, images, adapter = self.requests.pop(request_id)
+            before = self.prefixes.pop(request_id, None)
+            for waiter, part in zip(waiters, partial):
+                left = budget - len(part.completion_ids)
+                continued = prompt + list(part.completion_ids)
+                if before is not None:  # resumed before: what it had sampled until then comes first
+                    part = _joined(before, part)
+                if part.finish_reason != "abort" or left <= 0:
+                    if part.finish_reason == "abort":
+                        part.finish_reason = "length"
+                    self._resolve([waiter], [part])
+                    continue
+                new_id = str(next(self.ids))
+                extra = {"images": images} if images else {}
+                if adapter:
+                    extra["adapter"] = adapter
+                try:
+                    self.engine.stream_add(new_id, continued, left, temperature, 1, **extra)
+                except BaseException as e:  # noqa: BLE001
+                    self._resolve([waiter], error=e)
+                    continue
+                self.inflight[new_id] = [waiter]
+                self.requests[new_id] = (continued, left, temperature, images, adapter)
+                self.prefixes[new_id] = part
+                self.resumed += 1
 
     def close(self) -> None:
         if self.gate is not None:

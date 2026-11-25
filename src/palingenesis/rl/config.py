@@ -21,7 +21,7 @@ from palingenesis.cmr import CMRConfig
 from palingenesis.config import MoEConfig
 from palingenesis.hooks import PolicyPluginsConfig
 
-LOSSES = ("masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce")
+LOSSES = ("masked_is", "cispo", "icepop", "gspo", "ipo", "reinforce", "decoupled")
 BASELINES = ("mean", "leave_one_out")
 ADVANTAGE_STD = ("batch", "group", "none", "role")
 AGGREGATIONS = ("prompt", "token", "constant")
@@ -142,6 +142,26 @@ class RLRolloutConfig:
     # Policy versions a batch may lag behind the weights it trains (0 = on-policy).
     # > 0 overlaps rollouts (and environment/reward latency) with training.
     max_staleness: int = 0
+    # What happens to rollouts older than max_staleness when they reach the trainer. "drop": a group with a turn
+    # sampled more than max_staleness versions ago is dropped whole (stale_groups_dropped). "mask": the group trains
+    # while one of its rollouts ended within the bound, and only the tokens sampled by too old a version leave the
+    # loss (policy/stale_masked): long episodes that span several updates are kept instead of selected against.
+    stale: str = "drop"
+    # Generations in flight when new weights reach the engine (max_staleness > 0). "continue": they go on under the
+    # new weights; each turn is tagged with the oldest version that sampled any of it. "tag": the same, with the
+    # version of every token recorded (the engine streams token deltas): staleness, rollout.stale mask and the
+    # current / stale mismatch statistics are then per token. "resume": the generation is aborted at the update and
+    # continued from its tokens so far as a new request, so the rest is sampled by one policy on a context it
+    # prefilled itself (one more prefill per update and generation; per-token versions). Every sampled token keeps
+    # the log-prob of the weights that sampled it, so the importance ratio is exact per token in all three. Backends
+    # vllm and remote (workers started with --inflight); the others continue.
+    inflight: str = "continue"
+    # When new weights reach the engine (max_staleness > 0). "batch": when the producer starts the next batch.
+    # "publish": as soon as the trainer has stepped (colocated engines: between two engine steps; remote: staged and
+    # sent at once), so rollouts in flight and the rest of the batch being collected sample newer weights. With
+    # FSDP the trainer already pushes when it has stepped, but waits for the batch being collected to end first;
+    # "publish" loads between two engine steps instead, so training never waits for rollouts.
+    sync: str = "batch"
     # Dynamic sampling: groups whose rewards are all equal carry no gradient; draw more
     # prompts until batch_prompts informative groups are collected, at most this many
     # extra prompts per batch, as a multiple of batch_prompts (0 = never refill).
@@ -214,6 +234,24 @@ class RLRolloutConfig:
     # A worker that goes away ends the run at the next update (restart it, resume from the last checkpoint).
     engines: list = field(default_factory=list)
     push: str = "auto"
+    # remote, how full weights travel and how a push is made safe:
+    # push_link "tcp" (from pinned host memory, the default), "nccl" (GPU to GPU over a two-rank NCCL group per
+    # engine, in buckets of push_bucket_mb; falls back to tcp for an engine whose link fails) or "gloo" (the same
+    # protocol on CPU tensors: tests). push_verify: every push carries checksums; an engine applies it only when all
+    # of it arrived intact, and if applying fails half-way it restores the weights it had (or, on its first push,
+    # tags what it samples as untrainable): never a half-updated engine. Always on with nccl / gloo.
+    # push_dtype "bfloat16": float weights are cast on the trainer's device before they are staged (half the bytes
+    # of float32 masters; the engines compute in bf16 anyway). "": as the trainer holds them.
+    push_link: str = "tcp"
+    push_bucket_mb: int = 512
+    push_verify: bool = False
+    push_dtype: str = ""
+    # remote, losing an engine. 0: the run ends at the next weight update (restart the worker, resume). n > 0: the
+    # run goes on while at least n engines are alive: the lost engine's requests are sent again to the others (as
+    # always), it gets no more pushes, and every reconnect_s seconds the trainer tries its address again: a
+    # restarted worker rejoins after a full push (until then nothing it samples is trained).
+    min_engines: int = 0
+    reconnect_s: float = 10.0
     # How many generation requests a vLLM server (backend vllm_server) or each engine worker (remote) gets at once.
     # "fixed": every request as soon as a rollout asks for it (the engine queues and preempts by itself). "kv": a cap
     # on the requests in flight per engine, started at the engine's KV-cache tokens / max_model_len and moved with
@@ -327,7 +365,16 @@ class RLLossConfig:
     # reinforce: A · log π, the score-function estimator: no importance ratio, no clip. Unbiased only for samples of
     #            the policy being trained, so it needs rollout.max_staleness 0 and no think-skip (refused otherwise);
     #            the sampler/trainer numerical mismatch is not corrected, only guarded by seq_mask.
+    # decoupled: decoupled PPO (AReaL, arXiv:2505.24298) for stale rollouts (rollout.max_staleness 4-8): the
+    #            sampler's ratio is split into a behaviour weight π_prox / μ (capped at is_cap: `behaviour_weight`
+    #            clamp, or dropped above it: mask) and the trust-region ratio π / π_prox that eps_low / eps_high clip.
+    #            `proximal`: "step" = the policy at the start of the optimizer step (the trainer's own forward: free;
+    #            one optimizer step per batch never clips, and with clamp the gradient is cispo's), "reference" =
+    #            loss.kl_ref's policy (set loss.kl_ref_reset: the trust region is then around the policy of the last
+    #            reset, whatever the staleness of the data).
     type: str = "masked_is"
+    proximal: str = "step"
+    behaviour_weight: str = "clamp"
     eps_low: float = 0.2
     eps_high: float = 0.28
     is_cap: float = 5.0
@@ -753,7 +800,9 @@ class RLConfig:
                 errors.append(
                     f"loss.score_centering_k must be an integer in [1, {MAX_TOP_K}], got {loss.score_centering_k!r}."
                 )
-            if loss.type not in ("masked_is", "cispo", "icepop", "ipo"):
+            if loss.type == "decoupled" and loss.proximal == "step":
+                pass  # the token coefficient is W(ρ) · A: centred like cispo's
+            elif loss.type not in ("masked_is", "cispo", "icepop", "ipo"):
                 errors.append(
                     f"loss.score_centering centers a token-level importance-weighted gradient: not defined for "
                     f"loss.type {loss.type!r} (use masked_is, cispo, icepop or ipo)."
@@ -839,6 +888,38 @@ class RLConfig:
                 "rollout.fp32_head / ssm_state_dtype with rollout.url: a running SGLang server keeps its own settings; "
                 "start it with --enable-fp32-lm-head (and --mamba-ssm-dtype for hybrid models)."
             )
+        if r.stale not in ("drop", "mask"):
+            errors.append(f"rollout.stale must be drop or mask, got {r.stale!r}.")
+        if r.inflight not in ("continue", "tag", "resume"):
+            errors.append(f"rollout.inflight must be continue, tag or resume, got {r.inflight!r}.")
+        elif r.inflight != "continue" and r.backend not in ("vllm", "remote"):
+            errors.append(f"rollout.inflight {r.inflight} needs rollout.backend vllm or remote, got {r.backend!r}.")
+        elif r.inflight != "continue" and r.max_staleness == 0:
+            errors.append("rollout.inflight tag / resume is for rollout.max_staleness > 0 (nothing is in flight at 0).")
+        if r.sync not in ("batch", "publish"):
+            errors.append(f"rollout.sync must be batch or publish, got {r.sync!r}.")
+        elif r.sync == "publish" and (r.max_staleness == 0 or r.backend not in ("vllm", "remote")):
+            errors.append("rollout.sync publish needs rollout.max_staleness > 0 and rollout.backend vllm or remote.")
+        if r.push_link not in ("tcp", "nccl", "gloo"):
+            errors.append(f"rollout.push_link must be tcp, nccl or gloo, got {r.push_link!r}.")
+        if r.push_dtype not in ("", "bfloat16"):
+            errors.append(f'rollout.push_dtype must be "" or bfloat16, got {r.push_dtype!r}.')
+        if r.backend != "remote" and (
+            r.push_link != "tcp" or r.push_verify or r.push_dtype or r.min_engines or r.push_bucket_mb != 512
+        ):
+            errors.append(
+                "rollout.push_link / push_verify / push_dtype / push_bucket_mb / min_engines are only used with "
+                "rollout.backend remote."
+            )
+        if r.push_link != "tcp" and self.lora.rank and r.push != "full":
+            errors.append(
+                f"rollout.push_link {r.push_link} sends full weights: with lora.rank set rollout.push full (adapter "
+                "pushes are megabytes and stay on tcp)."
+            )
+        if r.push_bucket_mb < 1:
+            errors.append("rollout.push_bucket_mb must be >= 1.")
+        if r.min_engines < 0 or r.min_engines > len(r.engines) or r.reconnect_s <= 0:
+            errors.append("rollout.min_engines must be in [0, len(rollout.engines)] and rollout.reconnect_s > 0.")
         if r.max_staleness > 8:
             warnings.append(
                 f"rollout.max_staleness {r.max_staleness}: published recipes stay within 1-8 policy versions."
@@ -1003,6 +1084,17 @@ class RLConfig:
                     "quantized policy and reinforce does not correct for it (seq_mask only drops the worst "
                     "trajectories); cispo applies the ratio."
                 )
+        if loss.proximal not in ("step", "reference"):
+            errors.append(f"loss.proximal must be step or reference, got {loss.proximal!r}.")
+        if loss.behaviour_weight not in ("clamp", "mask"):
+            errors.append(f"loss.behaviour_weight must be clamp or mask, got {loss.behaviour_weight!r}.")
+        if loss.type != "decoupled" and (loss.proximal != "step" or loss.behaviour_weight != "clamp"):
+            errors.append("loss.proximal and loss.behaviour_weight belong to loss.type decoupled.")
+        if loss.type == "decoupled" and loss.proximal == "reference" and not loss.kl_ref:
+            errors.append(
+                'loss.proximal reference clips against loss.kl_ref\'s policy: set loss.kl_ref ("start" or a checkpoint) '
+                "and loss.kl_ref_reset (steps between resets of the proximal policy to the current one)."
+            )
         if not 0 < loss.ipo_eps < 1:
             errors.append(
                 f"loss.ipo_eps is a bound on |π - μ| (probabilities): it must be in (0, 1), got {loss.ipo_eps}."

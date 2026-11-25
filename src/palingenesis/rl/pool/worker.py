@@ -25,6 +25,19 @@ A push whose connection ends before its last byte is dropped whole; the engine k
            adapter of its own to the engine, and the versions before the last two are deleted; with the hf engine they are this library's
            own adapter layers. The trainer's default adapter is the adapter "policy".
 
+Verified pushes (rollout.push_verify; always over rollout.push_link nccl / gloo). The weights come as buckets
+with checksums (palingenesis.rl.pool.buckets), inside the frame or over the link the trainer built with this worker
+(`link`). Order of a push: every bucket is received into the staging area the engine is not running on, then
+checked (sizes, checksums, a version not older than the engine's), and only then applied, under the same lock as
+any update. A push that fails a check is rejected with nothing applied: the engine keeps its weights and its
+version. If applying fails half-way, the worker loads the weights of the last push it applied again (they are still
+whole in the other staging area); when there are none (its first push) or that fails too, what it samples is tagged
+with version -1, which no trainer trains on, until a push is applied. The engine is never left stopped: the lock is
+released on every path. The price is a second staging area in host memory (2 bytes per parameter for bf16).
+
+Generations in flight at an update (--inflight, as rollout.inflight): "tag" records the version of every token,
+"resume" aborts them and continues each from its tokens under the new weights (palingenesis.rl.generation).
+
 Identity. A trainer starts with a `hello`; the worker answers with its model's architecture, stop tokens,
 chat-template arguments, context length, head precision and the LoRA rank it serves, and the trainer refuses to go
 on if they differ from its own. The `hello` of the trainer that sends the weights also marks what the worker
@@ -52,6 +65,7 @@ from typing import Any
 import torch
 
 from palingenesis.rl.generation import GenerationClient
+from palingenesis.rl.pool import buckets as bucketed
 from palingenesis.rl.pool.protocol import Staging, receive, send
 
 logger = logging.getLogger(__name__)
@@ -131,17 +145,41 @@ class LockedEngine:
             return rollouts
 
 
+class PushRejected(RuntimeError):
+    """A verified push that was not applied; `restored`: the engine holds whole weights of this run (the ones it
+    had, or the last applied push loaded again)."""
+
+    def __init__(self, reason: str, restored: bool = True, link: bool = True):
+        super().__init__(reason)
+        self.restored, self.link = restored, link
+
+
 class EngineWorker:
     """Serves `engine` on a TCP port. `identity`: what a trainer's `hello` is checked against. `gate`: a path;
-    while a file exists there, pushes wait where they are (tests hold a push in the middle)."""
+    while a file exists there, pushes wait where they are (tests hold a push in the middle). `inflight`: what
+    generations in flight do at a weight update (rollout.inflight)."""
 
-    def __init__(self, engine: Any, identity: dict | None = None, adapter_dir: str = "", gate: str = ""):
+    def __init__(
+        self,
+        engine: Any,
+        identity: dict | None = None,
+        adapter_dir: str = "",
+        gate: str = "",
+        inflight: str = "continue",
+    ):
         self.lock = threading.Lock()  # held by a weight update, and by every generate call of a batch engine
         self.engine = engine  # weights and adapters are loaded into it; requests reach it through `client`
         serving = engine if hasattr(engine, "stream_add") else LockedEngine(engine, self.lock)
         self.identity, self.gate_path = dict(identity or {}), gate
-        self.client = GenerationClient(serving, merge=False)
+        self.identity["inflight"] = inflight
+        self.client = GenerationClient(serving, merge=False, inflight=inflight)
         self.staging = Staging(pin=True)
+        # verified pushes: two areas alternate, so the last applied push stays whole while the next arrives
+        self.areas = [Staging(pin=True), Staging(pin=True)]
+        self.incoming = 0  # the area the next verified push is received into
+        self.applied_push: tuple[int, dict, int] | None = None  # (area, bucket spec, version) of the last one applied
+        self.link: bucketed.Link | None = None
+        self.rejected = self.restored = 0
         self.base: dict[str, torch.Tensor] = {}  # the frozen base (host memory): folds are computed against it
         self.held: dict[str, torch.Tensor] | None = None  # a base frame waiting for the frame that follows it
         self.adapter_dir = adapter_dir
@@ -197,7 +235,7 @@ class EngineWorker:
         try:
             while True:
                 try:
-                    header, tensors = await receive(reader, self.staging, gate)
+                    header, tensors = await receive(reader, self._area, gate)
                 except (asyncio.IncompleteReadError, ConnectionError) as error:  # (a reset as well as an end)
                     cut = getattr(error, "frame", None) == {} and "weights" in seen and "generate" not in seen
                     if pushing or cut or self.held is not None and "weights" in seen:
@@ -214,6 +252,19 @@ class EngineWorker:
                     try:
                         seconds = await asyncio.get_running_loop().run_in_executor(None, self._apply, header, tensors)
                         await reply({"op": "applied", "version": self.version, "seconds": seconds})
+                    except PushRejected as error:
+                        logger.error("a weight update was rejected: %s", error)
+                        self.rejected += 1
+                        await reply(
+                            {
+                                "op": "applied",
+                                "version": self.version,
+                                "error": str(error),
+                                "rejected": True,
+                                "restored": error.restored,
+                                "link": error.link,
+                            }
+                        )
                     except Exception as error:  # noqa: BLE001 — the trainer must know its push was not applied
                         logger.exception("a weight update could not be applied")
                         await reply(
@@ -221,6 +272,13 @@ class EngineWorker:
                         )
                     finally:
                         self.receiving = False
+                elif op == "link":
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(None, self._join_link, header)
+                        await reply({"op": "linked", "id": header.get("id")})
+                    except Exception as error:  # noqa: BLE001 — the trainer falls back to TCP
+                        logger.warning("the %s link could not be built: %s", header.get("backend"), error)
+                        await reply({"op": "linked", "id": header.get("id"), "error": f"{error}"})
                 elif op == "hello":
                     if header.get("push"):  # a new trainer sends the weights from now on: these are another run's
                         self.confirmed, self.held = False, None
@@ -244,6 +302,9 @@ class EngineWorker:
             "dropped": self.dropped,
             "receiving": self.receiving,
             "confirmed": self.confirmed,
+            "rejected": self.rejected,
+            "restored": self.restored,
+            "linked": self.link is not None,
         }
         # the engine's load, for a trainer's rollout.concurrency kv (palingenesis.rl.concurrency): KV-cache usage,
         # requests waiting and running, KV-cache tokens; engines that cannot tell report nothing
@@ -280,6 +341,8 @@ class EngineWorker:
                 "version": out.version if self.confirmed else -1,
                 "first_version": out.first_version if self.confirmed else -1,
             }
+            if out.versions and self.confirmed:  # per-token versions (--inflight tag / resume)
+                message["versions"] = [list(run) for run in out.versions]
         except Exception as error:  # noqa: BLE001 — the requester sees the failure
             message = {"op": "generated", "id": header["id"], "error": f"{type(error).__name__}: {error}"}
             tensors = None
@@ -292,8 +355,92 @@ class EngineWorker:
 
     # ---------------------------------------------------------------- weights
 
+    def _area(self, header: dict) -> Staging:
+        """Where a frame's tensors are received: a verified push's buckets go to the area the engine is not on."""
+        return self.areas[self.incoming] if header.get("buckets") else self.staging
+
+    def _join_link(self, header: dict) -> None:
+        """Build this worker's end of the link a trainer offers (rank 1), and answer its handshake."""
+        if self.link is not None:
+            self.link.close()
+            self.link = None
+        link = bucketed.Link(
+            header["backend"], 1, tuple(header["store"]), header["prefix"], float(header.get("timeout", 120.0))
+        )
+        link.handshake()
+        self.link = link
+
+    def _drop_link(self) -> None:
+        if self.link is not None:
+            self.link.close()
+            self.link = None
+
+    def _apply_buckets(self, header: dict, tensors: dict[str, torch.Tensor]) -> float:
+        """A verified push: receive (over the link, if that is how it comes), check, apply; restore on failure
+        (see the module docstring). Raises PushRejected whenever the push was not applied."""
+        spec, version = header["buckets"], int(header["version"])
+        area = self.areas[self.incoming]
+        if spec["via"] == "link":
+            if self.link is None:
+                raise PushRejected("this worker has no link to receive the push over", link=False)
+            try:
+                buffers = []
+                for i, size in enumerate(spec["sizes"]):
+                    buffer = area.buffer(f"bucket/{i}", torch.uint8, [size])
+                    self.link.receive(buffer)
+                    buffers.append(buffer)
+            except bucketed.LinkError as error:
+                self._drop_link()
+                raise PushRejected(str(error), link=False) from error
+        else:
+            buffers = [tensors[f"bucket/{i}"] for i in range(len(spec["sizes"])) if f"bucket/{i}" in tensors]
+        if os.environ.get("PGS_TEST_CORRUPT") and os.path.exists(os.environ["PGS_TEST_CORRUPT"]) and buffers:
+            buffers[-1][-1] ^= 1  # tests: one bit of the push arrives flipped
+        wrong = bucketed.verify(spec, buffers)
+        if wrong:
+            raise PushRejected(wrong)
+        if self.confirmed and version < self.version:
+            raise PushRejected(f"version {version} is older than the engine's ({self.version})")
+        named = bucketed.unpack(spec, buffers)
+        before = self.version
+        start = time.perf_counter()
+        try:
+            with self.lock, self.client.paused():
+                self.engine.update_weights(named.items(), version)
+        except Exception as error:  # noqa: BLE001 — some of the weights may be the new ones: put whole ones back
+            logger.exception("a verified push failed while it was applied")
+            restored = self._restore()
+            raise PushRejected(
+                f"applying version {version} failed ({type(error).__name__}: {error}); "
+                + (f"the engine is back on version {before}" if restored else "the engine holds no whole weights"),
+                restored=restored,
+            ) from error
+        self.applied_push = (self.incoming, spec, version)
+        self.incoming ^= 1
+        self.pushes += 1
+        self.confirmed = True
+        return time.perf_counter() - start
+
+    def _restore(self) -> bool:
+        """Load the last applied verified push again. False (and nothing this worker samples is trained until a
+        push is applied) when there is none or it cannot be loaded."""
+        if self.applied_push is not None:
+            index, spec, version = self.applied_push
+            try:
+                buffers = [self.areas[index].buffers[f"bucket/{i}"] for i in range(len(spec["sizes"]))]
+                with self.lock, self.client.paused():
+                    self.engine.update_weights(bucketed.unpack(spec, buffers).items(), version)
+                self.restored += 1
+                return True
+            except Exception:  # noqa: BLE001
+                logger.exception("the last applied push could not be loaded again")
+        self.confirmed = False
+        return False
+
     def _apply(self, header: dict, tensors: dict[str, torch.Tensor]) -> float:
         """Make a complete push the engine's weights while the engine does nothing else. Seconds it was held."""
+        if header.get("buckets"):
+            return self._apply_buckets(header, tensors)
         version, mode = int(header["version"]), header.get("mode", "full")
         if mode == "base":  # held: the frame that follows applies it together with its own content
             self.held = dict(tensors)
@@ -484,12 +631,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--chat-template-kwargs", default="{}")
     parser.add_argument("--stop-tokens", default="[]")
     parser.add_argument("--gate", default="", help="tests: pushes wait while this file exists")
+    parser.add_argument(
+        "--inflight",
+        choices=("continue", "tag", "resume"),
+        default="continue",
+        help="generations in flight at a weight update, as rollout.inflight",
+    )
     args = parser.parse_args(argv)
     if not args.model and not args.engine:
         parser.error("--model (or --engine) is required")
     logging.basicConfig(level=logging.INFO, format="[engine] %(asctime)s | %(levelname)s | %(message)s")
     engine, identity = build_engine(args)
-    worker = EngineWorker(engine, identity, args.adapter_dir, args.gate)
+    worker = EngineWorker(engine, identity, args.adapter_dir, args.gate, args.inflight)
     asyncio.run(worker.run(args.host, args.port))
     return 0
 

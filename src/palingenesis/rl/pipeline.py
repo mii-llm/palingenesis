@@ -100,7 +100,9 @@ class RLPipeline:
         if hasattr(engine, "make_client"):  # engines in other processes (palingenesis.rl.pool): requests travel
             self.client = engine.make_client(merge=env_pool is None)
         else:  # rollout.concurrency kv: a vLLM server's requests in flight under its KV-sized cap
-            self.client = GenerationClient(engine, merge=env_pool is None, gate=gate_for(config, engine))
+            self.client = GenerationClient(
+                engine, merge=env_pool is None, gate=gate_for(config, engine), inflight=config.rollout.inflight
+            )
         r = config.rollout
         self.allowance = TokenAllowance(r.token_allowance, r.group_size) if r.token_allowance > 0 else None
         self.lock = threading.RLock()
@@ -140,6 +142,8 @@ class RLPipeline:
         self.batches += 1
         stats.update(_timeline_stats(self.client.timeline))
         stats.update(self.concurrency_metrics())
+        if getattr(self.client, "inflight_mode", "continue") == "resume":
+            stats["engine/resumed"] = float(self.client.resumed)  # cumulative
         if hasattr(self.engine, "prompt_tokens"):
             prompt = self.engine.prompt_tokens - prefill[0]
             stats["engine/prefill_tokens"] = prompt - (self.engine.cached_tokens - prefill[1])
@@ -168,6 +172,14 @@ class RLPipeline:
         # beyond max_staleness one by one instead of the orchestrator dropping the batch.
         version = max((t.version for t in trajectories), default=self.weights.version)
         return RLBatch(groups, version, stats, dump, timeline)
+
+    def sync_now(self) -> float:
+        """rollout.sync publish: load the newest weights into the engine from the trainer's thread, between two
+        engine steps, while a batch is being collected (its groups in flight continue as rollout.inflight says;
+        requests added from now on sample the new weights). Seconds spent. The producer's own sync at the start of
+        its next batch then finds the engine up to date. (A scenario's further engines keep syncing per batch.)"""
+        with self.client.paused():
+            return self.weights.sync(self.engine)
 
     def concurrency_metrics(self) -> dict[str, float]:
         """rollout.concurrency kv and rollout.token_allowance: the gates' and the allowance's metrics."""
@@ -469,7 +481,12 @@ class RLPipeline:
                 timing["turns"].append(turn_timing)
                 logprobs = out.logprobs if out.logprobs or training else [0.0] * len(out.ids)
                 trajectory.append_generated(
-                    out.ids, logprobs, out.version, out.first_version, getattr(out, "candidates", None)
+                    out.ids,
+                    logprobs,
+                    out.version,
+                    out.first_version,
+                    getattr(out, "candidates", None),
+                    getattr(out, "versions", None),
                 )
                 if training:
                     trajectory.extend_routing(out.routed_experts)

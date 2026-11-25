@@ -226,6 +226,53 @@ class Rollout:
     routed_experts: object | None = None
     # Sampling.candidates > 0: the sampler's most likely tokens at each sampled position; None otherwise.
     candidates: Candidates | None = None
+    # Per-token policy versions as runs [(first token index, version), ...] in token order (the first run starts at
+    # 0), when the engine followed the tokens it sampled across weight updates (rollout.inflight tag / resume); None:
+    # only the bounds first_version / policy_version are known.
+    versions: list[tuple[int, int]] | None = None
+
+
+def token_versions(runs: list[tuple[int, int]], length: int) -> list[int]:
+    """The version of each of `length` tokens from Rollout.versions' runs."""
+    out: list[int] = []
+    for k, (start, version) in enumerate(runs):
+        end = runs[k + 1][0] if k + 1 < len(runs) else length
+        out += [version] * (min(end, length) - len(out))
+    return out
+
+
+class VersionSpans:
+    """Which policy version sampled which token of the requests in flight (streaming engines).
+
+    start(id, n, version) when a request of n samples is added; switch(progress, version) when weights are loaded,
+    with `progress` {id: tokens sampled so far by each of its samples} (a request missing from it is no longer
+    followed: it falls back to the first / last version bounds); finish(id, lengths) gives each sample's runs
+    [(first token index, version), ...] or None."""
+
+    def __init__(self):
+        self.runs: dict[str, list[list[tuple[int, int]]] | None] = {}
+
+    def start(self, request_id: str, n: int, version: int) -> None:
+        self.runs[request_id] = [[(0, version)] for _ in range(n)]
+
+    def switch(self, progress: dict[str, list[int]] | None, version: int) -> None:
+        for request_id, runs in self.runs.items():
+            counts = (progress or {}).get(request_id)
+            if runs is None or counts is None or len(counts) != len(runs):
+                self.runs[request_id] = None
+                continue
+            for run, count in zip(runs, counts):
+                if run[-1][0] >= count:  # nothing was sampled under the version before: it is replaced
+                    run[-1] = (run[-1][0], version)
+                else:
+                    run.append((count, version))
+
+    def finish(self, request_id: str, lengths: list[int]) -> list[list[tuple[int, int]] | None]:
+        runs = self.runs.pop(request_id, None)
+        if runs is None or len(runs) != len(lengths):
+            return [None] * len(lengths)
+        # (a sample that had ended before an update has a last run that starts at its end: no token of it)
+        return [[r for r in run if r[0] < length or r[0] == 0] for run, length in zip(runs, lengths)]
 
 
 class RolloutEngine(Protocol):
@@ -515,6 +562,8 @@ class VLLMColocateRollout:
     update with newer ones).
     """
 
+    track_tokens = False  # rollout.inflight tag / resume (set by the generation client)
+
     def __init__(
         self,
         model: str,
@@ -574,6 +623,13 @@ class VLLMColocateRollout:
         self.asleep = False  # KV cache released
         self.prompt_tokens = self.cached_tokens = 0  # streaming: prefill accounting
         self.started: dict[str, int] = {}  # streaming: request id -> the version its decoding started with
+        # rollout.inflight tag / resume: requests stream token deltas, so the engine knows what each request in
+        # flight has sampled so far: per-token versions (spans) and partial completions to resume from (partial).
+        # Not run on a GPU yet (scripts/gpu_checks/async_rl.sh).
+        self.track_tokens = False
+        self.spans = VersionSpans()
+        self.partial: dict[str, dict[int, dict]] = {}  # request id -> sample index -> tokens, steps, finish, routed
+        self.samples: dict[str, int] = {}  # request id -> its n
         self.candidates: dict[str, int] = {}  # streaming: request id -> its Sampling.candidates (when > 0)
         self.adapters: dict = {}  # LoRA adapters by name (load_adapter), for requests that name one
         self.adapter_ids: dict[str, int] = {}
@@ -583,6 +639,8 @@ class VLLMColocateRollout:
             self._wake_up("weights")
         self.llm.apply_model(lambda model: model.load_weights(named_tensors))
         self.llm.reset_prefix_cache()
+        if self.track_tokens:
+            self.spans.switch(self.stream_progress(), version)
         self.version = version
 
     def sleep(self) -> None:
@@ -673,13 +731,13 @@ class VLLMColocateRollout:
                 rollouts[i] = got[0] if g else got[k]
         return rollouts
 
-    def _params(self, n: int, budget: int, sampling, final_only: bool = False):
+    def _params(self, n: int, budget: int, sampling, final_only: bool = False, delta: bool = False):
         (sampling,) = samplings(sampling, 1)
         kwargs = {}
-        if final_only:
+        if final_only or delta:
             from vllm.sampling_params import RequestOutputKind
 
-            kwargs["output_kind"] = RequestOutputKind.FINAL_ONLY
+            kwargs["output_kind"] = RequestOutputKind.DELTA if delta else RequestOutputKind.FINAL_ONLY
         return self.SamplingParams(
             n=n,
             max_tokens=budget,
@@ -718,8 +776,11 @@ class VLLMColocateRollout:
         images=None,
         adapter: str = "",
     ) -> None:
-        params = self._params(n, max_new_tokens, temperature, final_only=True)
+        params = self._params(n, max_new_tokens, temperature, final_only=not self.track_tokens, delta=self.track_tokens)
         self.llm.llm_engine.add_request(request_id, self._request(prompt, images), params, **self._lora(adapter))
+        if self.track_tokens:
+            self.spans.start(request_id, n, self.version)
+            self.partial[request_id], self.samples[request_id] = {}, n
         self.started[request_id] = self.version  # when added, not at the first token: an upper bound on staleness
         (sampling,) = samplings(temperature, 1)
         if sampling.candidates and sampling.temperature > 0:
@@ -745,13 +806,60 @@ class VLLMColocateRollout:
             out["kv_tokens"] = int(cache.num_gpu_blocks) * int(cache.block_size)
         return out
 
+    def _gather(self, out) -> None:
+        """Add a step's token deltas of one request to what its samples have so far."""
+        parts = self.partial.setdefault(out.request_id, {})
+        for o in out.outputs:
+            part = parts.setdefault(o.index, {"tokens": [], "steps": [], "finish": None, "routed": None})
+            part["tokens"] += list(o.token_ids)
+            if o.logprobs:
+                part["steps"] += list(o.logprobs)
+            if o.finish_reason is not None:
+                part["finish"] = o.finish_reason
+                part["routed"] = getattr(o, "routed_experts", None)
+
+    def _tracked_step(self, outputs) -> list[tuple[str, list[Rollout]]]:
+        done = []
+        for out in outputs:
+            self._gather(out)
+            if not out.finished:
+                continue
+            self.prompt_tokens += len(out.prompt_token_ids or ())
+            self.cached_tokens += out.num_cached_tokens or 0
+            done.append((out.request_id, self._tracked_rollouts(out.request_id)))
+        return done
+
+    def _tracked_rollouts(self, request_id: str) -> list[Rollout]:
+        parts, n = self.partial.pop(request_id, {}), self.samples.pop(request_id, 1)
+        runs = self.spans.finish(request_id, [len((parts.get(i) or {}).get("tokens", ())) for i in range(n)])
+        first = self.started.pop(request_id, None)
+        return _partial_rollouts(parts, n, self.version, first, runs, self.candidates.pop(request_id, 0))
+
+    def stream_progress(self) -> dict[str, list[int]]:
+        """Tokens each sample of every request in flight has so far (track_tokens)."""
+        return {
+            request_id: [len((self.partial.get(request_id, {}).get(i) or {}).get("tokens", ())) for i in range(n)]
+            for request_id, n in self.samples.items()
+        }
+
+    def stream_abort(self, request_id: str) -> list[Rollout] | None:
+        """Stop a request in flight and return what its samples have so far (finish_reason "abort" for those that
+        had not ended); None when the engine does not follow tokens (track_tokens off) or does not know it."""
+        if not self.track_tokens or request_id not in self.samples:
+            return None
+        self.llm.llm_engine.abort_request([request_id])
+        return self._tracked_rollouts(request_id)
+
     def stream_pending(self) -> bool:
         return self.llm.llm_engine.has_unfinished_requests()
 
     def stream_step(self) -> list[tuple[str, list[Rollout]]]:
         """One engine step: (request id, its n rollouts) for every request that finished.
         Counts the finished requests' prompt tokens and those served by the prefix cache."""
-        finished = [out for out in self.llm.llm_engine.step() if out.finished]
+        outputs = self.llm.llm_engine.step()
+        if self.track_tokens:
+            return self._tracked_step(outputs)
+        finished = [out for out in outputs if out.finished]
         for out in finished:
             self.prompt_tokens += len(out.prompt_token_ids or ())
             self.cached_tokens += out.num_cached_tokens or 0
@@ -762,6 +870,20 @@ class VLLMColocateRollout:
             )
             for out in finished
         ]
+
+
+def _partial_rollouts(parts: dict[int, dict], n: int, version: int, first: int | None, runs, k: int) -> list[Rollout]:
+    """Rollouts from the token deltas gathered per sample (VLLMColocateRollout.partial); a sample that has not ended
+    has finish_reason "abort"."""
+    rollouts = []
+    for index in range(n):
+        part = parts.get(index) or {"tokens": [], "steps": [], "finish": None, "routed": None}
+        tokens = part["tokens"]
+        logprobs = [step[t].logprob for step, t in zip(part["steps"], tokens)] if part["steps"] else []
+        finish = "abort" if part["finish"] is None else "stop" if part["finish"] == "stop" else "length"
+        top = candidates_from_steps(part["steps"], k) if k and part["steps"] else None
+        rollouts.append(Rollout(tokens, logprobs, finish, version, first, part["routed"], top, runs[index]))
+    return rollouts
 
 
 def _die_with_parent() -> None:

@@ -99,11 +99,12 @@ class Staging:
 
 async def receive(
     reader: asyncio.StreamReader,
-    staging: Staging | None = None,
+    staging: Staging | Callable[[dict], Staging] | None = None,
     gate: Callable[[dict], Awaitable[None]] | None = None,
 ) -> tuple[dict, dict[str, torch.Tensor]]:
     """Read one frame: (header, tensors). Tensors land in `staging`'s buffers when given (they are then valid
-    until a frame with tensors of the same names is received into it). `gate(header)` is awaited before each
+    until a frame with tensors of the same names is received into it; a callable is asked for the staging area
+    of each frame, by its header). `gate(header)` is awaited before each
     chunk of a tensor is read (tests hold a push there). Raises asyncio.IncompleteReadError when the stream ends;
     inside a frame, the error carries the frame's header as `.frame` ({} when the header itself was cut)."""
     start = await reader.readexactly(4)
@@ -113,6 +114,8 @@ async def receive(
         error.frame = {}  # the stream ended inside a frame's header
         raise
     tensors: dict[str, Any] = {}
+    if staging is not None and not isinstance(staging, Staging):
+        staging = staging(header)
     for entry in header.pop("tensors", []):
         dtype = DTYPES[entry["dtype"]]
         if staging is not None:
