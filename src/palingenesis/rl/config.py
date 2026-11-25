@@ -31,6 +31,7 @@ ENV_TYPES = ("single_turn", "tools")  # or "module:Class" / "path/to/file.py:Cla
 TOOL_PARSERS = ("auto", "hermes", "xml")
 SANDBOX_BACKENDS = ("docker", "agent_sandbox", "subprocess")
 SSM_STATE_DTYPES = ("float32", "bfloat16", "auto")
+PACKING_MODES = ("padded", "varlen", "tree")  # train.packing (palingenesis.tree_packing)
 
 
 @dataclass(slots=True)
@@ -405,7 +406,18 @@ class RLTrainConfig:
         }
 
     weight_decay: float = 0.0
-    micro_tokens: int = 16384  # padded tokens per forward/backward micro-batch
+    # Tokens per forward/backward micro-batch: padded tokens (packing padded), or the packed row's tokens (varlen:
+    # the sequences' lengths; tree: the trie's unique tokens; also at most this many trained tokens).
+    micro_tokens: int = 16384
+    # How a micro-batch's sequences are laid out for the forward (palingenesis.tree_packing):
+    # "padded": right-padded rows of similar lengths, a power-of-two count (the default until GPU numbers exist).
+    # "varlen": one row, the sequences end to end, no padding (variable-length attention; Gated DeltaNet layers
+    #           restart their state per sequence).
+    # "tree":   one row holding the sequences' prefix trie: tokens shared with the same prefix (a group's prompt,
+    #           a common system prompt, the conversation before turns branch) are forwarded once, across groups too.
+    # Both packed modes compute the same log-probs and gradients as padded (up to floating-point order); they need
+    # the model's attention on sdpa (rerouted by palingenesis) and full-attention / Gated DeltaNet layers only.
+    packing: str = "padded"
     # FSDP2: shard the policy over data-parallel ranks (always under torchrun with > 1 process;
     # set it for one GPU only with cpu_offload). cpu_offload keeps parameters, gradients and
     # optimizer state in CPU memory: the largest model a GPU can train, at PCIe speed.
@@ -951,6 +963,19 @@ class RLConfig:
             errors.append(f"train.lr_scheduler must be 'constant' or 'cosine', got {t.lr_scheduler!r}.")
         if t.prompt_sharing not in ("auto", "on", "off"):
             errors.append(f"train.prompt_sharing must be auto, on or off, got {t.prompt_sharing!r}.")
+        if t.packing not in PACKING_MODES:
+            errors.append(f"train.packing must be one of {PACKING_MODES}, got {t.packing!r}.")
+        elif t.packing != "padded":
+            if m.multimodal:
+                errors.append(
+                    f"train.packing {t.packing} with model.multimodal: image placeholders expand inside the "
+                    "model's forward, which a packed row does not lay out. Use train.packing padded."
+                )
+            if t.packing == "tree" and t.prompt_sharing == "on":
+                errors.append(
+                    "train.prompt_sharing on with train.packing tree: the tree already forwards every shared prefix "
+                    "once (prompts included, across groups). Leave prompt_sharing at auto or off."
+                )
         if t.prompt_sharing == "on" and (t.fsdp or t.cpu_offload or in_world):
             errors.append("train.prompt_sharing on runs the tree forward on an unsharded model: not with FSDP.")
         if m.gradient_checkpointing not in ("auto", "none", "selective", "full"):

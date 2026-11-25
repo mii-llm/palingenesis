@@ -92,7 +92,8 @@ from palingenesis.rl.rewards import code_reward, load_object, resolve_rewards
 from palingenesis.rl.sandbox import make_sandbox
 from palingenesis.rl.trajectory import Trajectory
 from palingenesis.rollouts import DROPPED_METRIC, RolloutSink, rl_record
-from palingenesis.seco import use_chunk_attention
+from palingenesis.seco import PACKED_VARLEN, use_chunk_attention
+from palingenesis.tree_packing import PackedRow
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +394,7 @@ class RLTrainer:
         if checkpointing != "none":
             apply_activation_checkpointing(self.model, mode=checkpointing)
         use_chunk_attention(self.model)
+        self._packing_support()  # train.packing varlen / tree: check the model and route its layers (fails fast)
         if t.cpu_offload:
             _check_host_memory(self.model, self.parallel.world)
         if fsdp:  # verify after sharding: the CPU-loaded model cannot run the (Triton) Liger kernels
@@ -860,13 +862,41 @@ class RLTrainer:
         """With adapters: the model's state with the adapters folded in (a plain model's state)."""
         return self.adapters.folded_state(self.model)
 
+    def _packing_support(self):
+        """train.packing varlen / tree: the model checked and its layers routed for packed rows (once; None for
+        padded). Raises RLConfigError when the model cannot run packed rows exactly."""
+        mode = self.config.train.packing
+        if mode == "padded":
+            return None
+        support = self.__dict__.get("_packing")
+        if support is None:
+            from palingenesis.tree_packing import PackingError, prepare_model
+
+            try:
+                support = prepare_model(self.model, self.device)
+            except PackingError as error:
+                raise RLConfigError(f"train.packing {mode}: {error}") from error
+            self._packing = support
+        return support
+
     def _micro_batches(self, trajectories: list[Trajectory]) -> list[list[Trajectory]]:
         """Micro-batches of at most train.micro_tokens padded tokens, longest trajectories first,
         each with a power-of-two number of rows. Triton kernels (flash-linear-attention's among
         them) autotune per batch size: arbitrary row counts would re-autotune all run long,
         powers of two do it a handful of times. Similar lengths share a micro-batch, so padding
-        stays small."""
+        stays small.
+
+        train.packing varlen / tree: micro-batches of at most train.micro_tokens packed tokens (and trained
+        tokens), each one packed row (palingenesis.tree_packing.plan)."""
         budget = self.config.train.micro_tokens
+        mode = self.config.train.packing
+        if mode != "padded":
+            from palingenesis.tree_packing import plan
+
+            sequences = [t.prompt_ids + t.tokens[:-1] for t in trajectories]
+            trained = [sum(t.mask) for t in trajectories]
+            parts = plan(sequences, [t.group for t in trajectories], trained, budget, share=mode == "tree")
+            return [[trajectories[i] for i in part] for part in parts]
         ordered = sorted(trajectories, key=lambda t: t.context_tokens, reverse=True)  # images expanded
         batches, i = [], 0
         while i < len(ordered):
@@ -954,6 +984,7 @@ class RLTrainer:
         current = self._current_version()
         self.model.train()
         balancer = getattr(self, "router_balancer", None)
+        packing = self._packing_support()
         for i, micro in enumerate(micro_batches):
             if micro_adapters and i < len(micro_adapters):
                 set_adapter(micro_adapters[i])  # this micro-batch's forward and backward use its role's adapter
@@ -973,8 +1004,13 @@ class RLTrainer:
                     balancer.end()
                 continue
             sequences = [t.prompt_ids + t.tokens[:-1] for t in micro]
-            image_kwargs, index = {}, None
-            if any(t.images for t in micro):
+            image_kwargs, index, packed = {}, None, None
+            if packing is not None:  # one row: the sequences end to end (varlen) or their prefix trie (tree)
+                packed = PackedRow.build(sequences, share=self.config.train.packing == "tree")
+                image_kwargs = packed.forward_kwargs(device)
+                ids = image_kwargs.pop("input_ids")
+                real = torch.ones(ids.shape, dtype=torch.bool)
+            elif any(t.images for t in micro):
                 # placeholders expanded with the processor the engine used; the pixels are processed again here
                 ids, image_kwargs, index = multimodal.batch_sequences(
                     self.vision, sequences, [t.images for t in micro], self.pad_id, device
@@ -985,25 +1021,34 @@ class RLTrainer:
             else:
                 ids, real = right_pad(sequences, self.pad_id, device)
             if balancer is not None:
-                replay = _routing_batch(micro, ids.shape[1]) if self.routing_replay else None
+                replay = None
+                if self.routing_replay:
+                    replay = _routing_batch(micro, ids.shape[1]) if packed is None else _packed_routing(micro, packed)
                 balancer.begin(real, grad_accum=count, replay=replay)
-            positions = torch.zeros(ids.shape, dtype=torch.bool)
+            # the hidden states the loss reads: a mask over the padded rows (row-major, ascending positions), or
+            # the packed positions in that same order
+            positions = torch.zeros(ids.shape, dtype=torch.bool) if packed is None else []
             targets, behaviour, advantage, weight, seq, forced = [], [], [], [], [], []
             completion_pos, sampled_by = [], []
             # the observation loss: its targets' positions, tokens and weights (none when it is off)
             echo = any(id(t) in observed and t.observation_targets for t in micro)
-            echo_positions = torch.zeros(ids.shape, dtype=torch.bool) if echo else None
+            echo_positions = (torch.zeros(ids.shape, dtype=torch.bool) if packed is None else []) if echo else None
             echo_targets, echo_weight = [], []
+
+            def select(where, row: int, before: list[int], packed=packed, index=index) -> None:
+                if packed is not None:
+                    where += packed.positions(row)[before].tolist()
+                else:
+                    where[row, [index[row][p] for p in before] if index else before] = True
+
             for row, t in enumerate(micro):
                 if echo and id(t) in observed and t.observation_targets:
-                    before = [len(t.prompt_ids) + j - 1 for j in t.observation_targets]
-                    echo_positions[row, [index[row][p] for p in before] if index else before] = True
+                    select(echo_positions, row, [len(t.prompt_ids) + j - 1 for j in t.observation_targets])
                     echo_targets += [t.tokens[j] for j in t.observation_targets]
                     echo_weight += [observed[id(t)]] * len(t.observation_targets)
                 sampled = [j for j, trained in enumerate(t.mask) if trained]
                 forced += [j in t.forced for j in sampled] if t.forced else [False] * len(sampled)
-                before = [len(t.prompt_ids) + j - 1 for j in sampled]  # the token whose output predicts j
-                positions[row, [index[row][p] for p in before] if index else before] = True
+                select(positions, row, [len(t.prompt_ids) + j - 1 for j in sampled])  # the outputs predicting j
                 completion_pos += sampled
                 sampled_by += _sampled_by(t, sampled, current)
                 targets += [t.tokens[j] for j in sampled]
@@ -1017,10 +1062,19 @@ class RLTrainer:
             )
             seq_len = torch.tensor([float(t.sampled_tokens) for t in micro]).to(device, non_blocking=True)
             with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-                # right-padded rows need no mask: padding comes after every position scored
-                states = final_hidden_states(self.model, ids, None, **image_kwargs)
-                hidden = states[positions.to(device, non_blocking=True)]
-                echo_hidden = states[echo_positions.to(device, non_blocking=True)] if echo else None
+                if packed is None:
+                    # right-padded rows need no mask: padding comes after every position scored
+                    states = final_hidden_states(self.model, ids, None, **image_kwargs)
+                    hidden = states[positions.to(device, non_blocking=True)]
+                    echo_hidden = states[echo_positions.to(device, non_blocking=True)] if echo else None
+                else:
+                    states = self._packed_forward(packing, packed, ids, image_kwargs)[0]
+                    hidden = states[torch.tensor(positions, dtype=torch.long).to(device, non_blocking=True)]
+                    echo_hidden = None
+                    if echo:
+                        echo_hidden = states[
+                            torch.tensor(echo_positions, dtype=torch.long).to(device, non_blocking=True)
+                        ]
                 del states
             inv_t = getattr(self, "inv_temperature", 1.0)  # applied to the fp32 logits
             lp, entropy = target_logprobs(
@@ -1084,6 +1138,20 @@ class RLTrainer:
                 metrics["loss/observation"] = values["observation_nll"] / values["observation_tokens"]
         return metrics
 
+    def _packed_forward(self, support, packed: PackedRow, ids: torch.Tensor, kwargs: dict) -> torch.Tensor:
+        """The final hidden states [1, N, H] of a packed row. transformers builds no attention mask for it
+        (seco.PACKED_VARLEN): the layers read the row's layout from the forward's keyword arguments. Every
+        attention and Gated DeltaNet layer must have followed the layout (checked: one that did not would have
+        mixed the sequences)."""
+        packed.begin_forward()
+        token = PACKED_VARLEN.set(True)
+        try:
+            states = final_hidden_states(self.model, ids, None, **kwargs)
+        finally:
+            PACKED_VARLEN.reset(token)
+        support.check(packed)
+        return states
+
     def _observation_term(self, stats: dict, hidden: torch.Tensor, targets: list[int], weight: list[float]):
         """The observation loss of a micro-batch (or branch): its targets' NLL under the model's own logits (not
         scaled by the sampling temperature: this is the likelihood of the environment's text, which the policy
@@ -1108,8 +1176,10 @@ class RLTrainer:
     def _share_prompts(self, groups: list[list[Trajectory]]) -> bool:
         mode = self.config.train.prompt_sharing
         # routing replay: the recorded routing is per row, the tree computes a group's prompt once
+        # train.packing tree: the packed trie already forwards every shared prefix once
         if (
             mode == "off"
+            or self.config.train.packing == "tree"
             or self.parallel.fsdp
             or getattr(self, "routing_replay", False)
             or getattr(self, "vision", None) is not None
@@ -1589,6 +1659,14 @@ def _routing_batch(micro: list[Trajectory], width: int) -> torch.Tensor | None:
             n = min(len(r), width)
             out[row, :n] = torch.from_numpy(r[:n].astype("int64"))
     return out
+
+
+def _packed_routing(micro: list[Trajectory], packed: PackedRow) -> torch.Tensor | None:
+    """_routing_batch for a packed row: [1, N, MoE layers, top_k]; a position several sequences share takes the
+    first recorded routing (the engine prefills a group's shared prompt once anyway)."""
+    recorded = [t.routing for t in micro]
+    shape = next((r.shape[1:] for r in recorded if r is not None and len(r)), None)
+    return None if shape is None else packed.routing(recorded, shape)
 
 
 def _sampled_by(t: Trajectory, sampled: list[int], current: int) -> list[int]:

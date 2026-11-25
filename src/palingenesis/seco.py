@@ -130,9 +130,10 @@ KV_BLOCK = 8192  # prefix tokens per attention block (bounds per-block memory an
 
 
 # Set by the training loop around a packed forward whose rows were flattened with
-# cu_seq_lens (packing.PackedBatch): the attention layers run variable-length flash
-# attention over the documents, so the [L, L] block-diagonal mask transformers would build
-# from position_ids (1 GiB at 32k tokens, and a memory-efficient kernel doing L^2 work over
+# cu_seq_lens (packing.PackedBatch), or that carries a packed row (tree_packing.PackedRow):
+# the attention layers run variable-length flash attention over the documents (or the
+# tree's paths), so the [L, L] block-diagonal mask transformers would build from
+# position_ids (1 GiB at 32k tokens, and a memory-efficient kernel doing L^2 work over
 # the whole packed row) is not needed.
 PACKED_VARLEN: contextvars.ContextVar[bool] = contextvars.ContextVar("pgs_packed_varlen", default=False)
 
@@ -182,6 +183,11 @@ def _attention(module, query, key, value, attention_mask, dropout=0.0, scaling=N
     from torch.nn.attention.bias import causal_lower_right
     from transformers.integrations.sdpa_attention import repeat_kv, sdpa_attention_forward
 
+    packed = kwargs.get("pgs_packed")
+    if packed is not None:  # a packed row (palingenesis.tree_packing): varlen documents or a prefix tree
+        from palingenesis.tree_packing import packed_attention
+
+        return packed_attention(module, query, key, value, packed, scaling, dropout, kwargs), None
     q_len, kv_len = query.shape[2], key.shape[2]
     causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
     special = any(kwargs.get(k) is not None for k in ("position_bias", "s_aux", "sinks"))
