@@ -314,7 +314,13 @@ class SampledLogProbs:
 class _GatheredLogits(torch.autograd.Function):
     """z[n, j] = hidden[n] · weight[ids[n, j]]: the raw projection of a few chosen tokens per row (computed in fp32,
     or fp64 for fp64 inputs, from the head's low-precision copy, as the full-vocabulary path accumulates bf16 GEMMs
-    in fp32), a slice of rows at a time; the backward recomputes the gathered rows instead of keeping them."""
+    in fp32), a slice of rows at a time; the backward recomputes the gathered rows instead of keeping them.
+
+    Memory: when the head's weight trains, the backward returns its gradient as one dense [vocabulary, hidden] fp32
+    tensor (autograd takes a dense gradient for a dense parameter), although only the gathered rows are non-zero:
+    as much as the full-vocabulary path's weight gradient (_LinearTargetLogProbs), 2.3 GiB for a 151k x 4096 head.
+    A micro-batch that also scores tokens over the vocabulary (score centering without top-p / top-k, forced
+    tokens) holds both until autograd has added them. A frozen head (LoRA) allocates none."""
 
     @staticmethod
     def forward(ctx, hidden, weight, ids, w_low, rows):
@@ -522,6 +528,11 @@ def policy_loss(
                 }
     with torch.no_grad():
         log_ratio = lp.detach() - behaviour
+        if sampled is not None:
+            # a token left out of the loss (its support may be incomplete, or lacks the sampled token) has no
+            # meaningful ratio: it counts as on-policy (ρ = 1) in the sequence deviation (loss.seq_mask), gspo's
+            # sequence ratio, the mismatch statistics and its (zero-weighted) coefficient, which stays finite
+            log_ratio = log_ratio.masked_fill(~sampled.valid, 0.0)
         ratio = log_ratio.exp()
         deviation = (ratio - 1).abs()
         seen = ratio  # the sampler-mismatch view of the ratios

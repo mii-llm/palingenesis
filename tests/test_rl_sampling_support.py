@@ -226,6 +226,37 @@ def test_tokens_without_candidates_or_with_an_incomplete_support():
     assert stats["support_tokens"].item() == 2 and stats["support_incomplete"].item() == 2
 
 
+@pytest.mark.parametrize("kind", ["masked_is", "gspo"])
+def test_tokens_left_out_of_the_loss_do_not_move_the_sequence_statistics(kind):
+    """A token whose support is incomplete (or lacks the sampled token) has a meaningless ratio: it must not mask
+    its sequence (loss.seq_mask), enter gspo's sequence ratio or the mismatch statistics, or make the loss NaN."""
+    torch.manual_seed(4)
+    weight = torch.randn(7, 5)
+    hidden = torch.randn(4, 5, requires_grad=True)
+    targets = torch.tensor([1, 4, 2, 3])
+    # rows 0 and 3 are whole; row 1 fills every requested candidate; row 2's sampled token is not in its support
+    rows = [([1, 0], [-0.3, -1.4]), ([4, 0, 6], [-0.1, -2.0, -3.0]), ([3, 5], [-0.2, -1.5]), ([3, 1], [-0.4, -1.1])]
+    out = sampled_logprobs(hidden, _head(weight), targets, _sampler(rows, requested=3))
+    assert out.valid.tolist() == [True, False, False, True]
+    behaviour = out.lp.detach().clone()
+    behaviour[1] -= 50.0  # the invalid tokens' ratios are huge and tiny
+    behaviour[2] += 50.0
+    config = RLConfig().loss
+    config.type, config.seq_mask = kind, 0.4
+    seq = torch.tensor([0, 0, 1, 1])
+    args = (torch.tensor([1.0, 1.0, -1.0, -1.0]), torch.ones(4), seq, 2, torch.tensor([2.0, 2.0]), config, None)
+    loss, stats = policy_loss(out.lp, behaviour, *args, out)
+    assert torch.isfinite(loss) and stats["seq_masked"].item() == 0
+    assert stats["abs_ratio_dev"].item() == pytest.approx(0.0, abs=1e-6)
+    assert stats["mismatch_k3"].item() == pytest.approx(0.0, abs=1e-6)
+    assert stats["ratio_max"].item() == pytest.approx(1.0, abs=1e-6)
+    (grad,) = torch.autograd.grad(loss, out.lp)
+    assert torch.isfinite(grad).all() and grad[1] == 0 and grad[2] == 0 and grad[0] != 0 and grad[3] != 0
+    # the same ratios on valid tokens do mask both sequences
+    whole = SampledLogProbs(out.lp, out.entropy, out.candidate_lp, torch.ones(4, dtype=torch.bool), out.sampler)
+    assert policy_loss(out.lp, behaviour, *args, whole)[1]["seq_masked"].item() == 2
+
+
 def test_hf_recorder_candidates_give_ratio_one():
     """The candidates the hf engine records are the support it sampled from: renormalising the same logits over
     them gives back the behaviour log-prob exactly (ratio 1 on-policy); the full vocabulary would not."""
