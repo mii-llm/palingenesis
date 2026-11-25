@@ -321,6 +321,20 @@ def _per_source_eval(metrics: dict) -> str:
     return f" eval_sources={','.join(parts)}" if parts else ""
 
 
+def _folds_clipping(config: Config, optimizer, world_size: int, stepped_by_wrapper: bool = False) -> bool:
+    """Whether train.fused_optimizer folds gradient clipping into the optimizer's step: one process, the Triton
+    kernels in use, and one optimizer.step() per training step. A wrapper that steps the optimizer several times
+    per training step (Hyperball: once per bucket of constrained matrices) would see the clip factor, which the
+    first step() consumes, in that call only: torch's clipping then rescales the gradients as usual."""
+    return bool(
+        config.train.fused_optimizer
+        and world_size == 1
+        and not stepped_by_wrapper
+        and getattr(optimizer, "triton", False)
+        and callable(getattr(optimizer, "clip_grad_norm_", None))
+    )
+
+
 def train(config: Config, plugins: list | None = None) -> TrainResult:
     """Run SFT / DPO / off-policy distillation training to completion and return a TrainResult.
 
@@ -930,12 +944,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             logger.info("Gradient release enabled: optimizer steps fused into backward pass")
 
     # train.fused_optimizer on one process: gradient clipping folded into the multi-tensor step
-    fold_clipping = (
-        config.train.fused_optimizer
-        and world_size == 1
-        and getattr(optimizer, "triton", False)
-        and callable(getattr(optimizer, "clip_grad_norm_", None))
-    )
+    fold_clipping = _folds_clipping(config, optimizer, world_size, stepped_by_wrapper=_hyperball is not None)
     if fold_clipping and config.train.max_grad_norm > 0 and not config.train.adagc:
         logger.info("Gradient clipping folded into the multi-tensor optimizer step (train.fused_optimizer)")
 

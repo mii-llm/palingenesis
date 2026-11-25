@@ -19,7 +19,8 @@ Engine, Apache-2.0; re-implemented, no code copied):
   selective checkpointing keeps (selective, on torch versions whose checkpoint routes them through saved-tensor
   hooks: `respect_saved_tensors_hooks`): those are what moves. `boundaries_only` moves the layer inputs alone.
 - Host memory comes from a pinned arena of 256 MiB chunks that every step reuses (torch's caching host allocator
-  rounds each request up to a power of two, up to twice the memory), bounded by a share of the machine's RAM.
+  rounds each request up to a power of two, up to twice the memory), bounded by a share of the machine's RAM and
+  by what the machine has available when a chunk is added (a tenth of its RAM stays free): past either, an error.
 - A tensor saved by several ops (a layer input read by a norm and by the residual) is copied once.
 
 The values come back bit-identical, so the gradients are those of a run without offload.
@@ -91,6 +92,25 @@ def host_limit_bytes() -> int | None:
     return int(HOST_BUDGET_FRACTION * total / ranks)
 
 
+HOST_HEADROOM_FRACTION = 0.1  # of the machine's RAM: what must stay available after a chunk is pinned
+
+
+def host_headroom_bytes() -> int | None:
+    """Host memory that must stay available (the kernel's MemAvailable) after the arena pins another chunk. The
+    share-of-RAM limit alone does not see what other processes, tmpfs files or this process's own model copy hold:
+    pinning past what is available gets the process killed by the kernel instead of an error."""
+    from palingenesis.seco_attention import _host_bytes
+
+    total = _host_bytes("SC_PHYS_PAGES")
+    return int(HOST_HEADROOM_FRACTION * total) if total else None
+
+
+def _host_available_bytes() -> int | None:
+    from palingenesis.accelerator import host_available_bytes
+
+    return host_available_bytes()
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Host memory
 # ----------------------------------------------------------------------------------------------------------------
@@ -107,12 +127,25 @@ class HostArena:
     """Host buffers for offloaded tensors, carved from large (pinned) chunks with a bump pointer. A chunk's pointer
     rewinds when the last tensor carved from it is released, so a training step reuses the previous step's memory."""
 
-    def __init__(self, pin: bool, limit_bytes: int | None = None, chunk_bytes: int = ARENA_CHUNK):
+    def __init__(
+        self,
+        pin: bool,
+        limit_bytes: int | None = None,
+        chunk_bytes: int = ARENA_CHUNK,
+        headroom_bytes: int | None = None,
+        available=_host_available_bytes,
+    ):
+        """limit_bytes: the most the arena may reserve. headroom_bytes: host memory that must stay available
+        (`available()`, bytes or None when unknown) after a new chunk; None: not checked."""
         self.pin = pin
         self.limit_bytes = limit_bytes
         self.chunk_bytes = chunk_bytes
+        self.headroom_bytes = headroom_bytes
+        self._available = available
         self._chunks: list[_Chunk] = []
-        self._lock = threading.Lock()  # releases come from the autograd engine's threads
+        # Releases come from the autograd engine's threads, and from the garbage collector, which may free a graph
+        # (its handles) inside take() on the thread that holds the lock: reentrant.
+        self._lock = threading.RLock()
 
     @property
     def reserved_bytes(self) -> int:
@@ -132,12 +165,28 @@ class HostArena:
                         "node). Use gradient checkpointing (full keeps only each layer's input), "
                         "memory.activation_offload_boundaries_only, a shorter sequence or a smaller batch."
                     )
-                chunk = _Chunk(torch.empty(size, dtype=torch.uint8, pin_memory=self.pin))
-                self._chunks.append(chunk)
-            view = chunk.buf[chunk.offset : chunk.offset + nbytes]
+                available = self._available() if self.headroom_bytes is not None else None
+                if available is not None and available - size < self.headroom_bytes:
+                    raise RuntimeError(
+                        f"memory.activation_offload needs another {size / 2**30:.2f} GiB of pinned host memory "
+                        f"(it holds {self.reserved_bytes / 2**30:.2f} GiB), but the machine has "
+                        f"{available / 2**30:.2f} GiB available and {self.headroom_bytes / 2**30:.2f} GiB must stay "
+                        "free. Free host memory, or move less: gradient checkpointing (full keeps only each "
+                        "layer's input), memory.activation_offload_boundaries_only, a shorter sequence or a "
+                        "smaller batch."
+                    )
+                buf = torch.empty(size, dtype=torch.uint8, pin_memory=self.pin)
+                # the allocation may have run the garbage collector, and with it release(): look again
+                chunk = next((c for c in self._chunks if c.size - c.offset >= need), None)
+                if chunk is None:
+                    chunk = _Chunk(buf)
+                    self._chunks.append(chunk)
+            # book the range before anything else allocates: a release() of this chunk's other tensors that the
+            # garbage collector runs from here on finds it live and does not rewind it under the new view
+            start = chunk.offset
             chunk.offset += need
             chunk.live += 1
-            return view, chunk
+            return chunk.buf[start : start + nbytes], chunk
 
     def release(self, chunk: _Chunk) -> None:
         with self._lock:
@@ -258,12 +307,20 @@ class ActivationOffloader:
     ):
         self.options = options or OffloadOptions()
         self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:  # tensors report an indexed device
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.layers = list(layers)
         self._index = {id(m): i for i, m in enumerate(self.layers)}
         self._first_kept = len(self.layers) - self.options.keep_last
         cuda = self.device.type == "cuda"
         self.copies = copies if copies is not None else (StreamCopies(self.device) if cuda else SyncCopies())
-        self.arena = arena if arena is not None else HostArena(pin=cuda, limit_bytes=host_limit_bytes())
+        self.arena = (
+            arena
+            if arena is not None
+            else HostArena(
+                pin=cuda, limit_bytes=host_limit_bytes(), headroom_bytes=host_headroom_bytes() if cuda else None
+            )
+        )
         # 2-D trained weights, by shape: a cast copy of one (fp32 masters under autocast, inside a compiled graph)
         # is not an activation
         shapes = {tuple(p.shape) for p in params if p.ndim == 2 and p.requires_grad}
@@ -292,6 +349,7 @@ class ActivationOffloader:
     def saving(self):
         """Offload what the forward inside this context saves."""
         self._new_pass()
+        self._group = None  # a forward that raised inside a layer never reached the layer's exit hook
         with torch.autograd.graph.saved_tensors_hooks(self._pack, self._unpack):
             yield self
 
@@ -357,7 +415,7 @@ class ActivationOffloader:
         return not t.requires_grad and t.ndim == 2 and tuple(t.shape) in self._weight_shapes
 
     def _offloadable(self, t: torch.Tensor) -> bool:
-        if type(t) is not torch.Tensor or t.layout != torch.strided or t.device.type != self.device.type:
+        if type(t) is not torch.Tensor or t.layout != torch.strided or t.device != self.device:
             return False
         nbytes = t.numel() * t.element_size()
         if nbytes < max(self.options.min_bytes, 1) or nbytes > t.untyped_storage().nbytes():

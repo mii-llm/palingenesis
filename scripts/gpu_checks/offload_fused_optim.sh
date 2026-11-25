@@ -23,8 +23,15 @@
 #   offload_compile   Qwen3-0.6B, 4k, compiled layers: gradients, step time and graph breaks with offload
 #   offload_trainer   the real trainer (pgs fit's measurement) on 2B at 16k: full checkpointing with and without
 #                     offload, adamw_bf16 on the multi-tensor kernels
-#   sft               a 30-step SFT run (Qwen3.5-0.8B): fp32-master adamw vs multi-tensor adamw_bf16 vs per-parameter
-#                     adamw_bf16, the loss curves compared
+#   sft               30-step SFT runs (Qwen3.5-0.8B, lr 1e-5): fp32-master adamw (two seeds: the run-to-run
+#                     spread), multi-tensor adamw_bf16 (stochastic, kahan) and per-parameter adamw_bf16. A smoke
+#                     test of the trainer path, not a precision measurement: the mean of the last 10 losses of
+#                     such a run has a standard error of ~35% of its value, and the runs are not bit-comparable
+#                     (the per-parameter path is the compiled update, which contracts multiply-adds on ~0.07% of
+#                     the elements, and torch's clipping rounds the norm and the gradients to bf16; the forward
+#                     itself is not deterministic). It fails when a run does not learn or ends more than 3x away
+#                     from fp32 masters (weights that stop moving end ~17x away). Bit-exactness of the kernels
+#                     is optim_exact's job.
 # PGS_CHECK_SMOKE=1 runs the code paths on the CPU with tiny random models (measures nothing; for development).
 set -uo pipefail
 
@@ -750,9 +757,13 @@ def sft(regime):
     c = Config()
     c.model.name_or_path = M_08B
     c.model.compile = False
-    c.model.torch_dtype = "float32" if regime == "fp32_master" else "bfloat16"
-    c.train.optimizer = "adamw" if regime == "fp32_master" else "adamw_bf16"
-    c.train.fused_optimizer = regime == "adamw_bf16_multi_tensor"
+    fp32 = regime.startswith("fp32_master")
+    c.model.torch_dtype = "float32" if fp32 else "bfloat16"
+    c.train.optimizer = "adamw" if fp32 else "adamw_bf16"
+    c.train.fused_optimizer = "multi_tensor" in regime
+    c.train.bf16_rounding = "kahan" if "kahan" in regime else "stochastic"
+    if regime.endswith("_seed2"):  # the same regime on another seed: how far two runs of one method end apart
+        c.train.seed += 1
     c.data.dataset, c.data.dataset_split, c.data.streaming, c.data.num_workers = data, "train", False, 0
     c.data.max_seq_length = 512
     c.train.max_steps = 30
@@ -771,26 +782,36 @@ def sft(regime):
          seconds=time.perf_counter() - t)
 
 
+SFT_RUNS = ("fp32_master", "fp32_master_seed2", "adamw_bf16_multi_tensor", "adamw_bf16_per_param",
+            "adamw_bf16_kahan_multi_tensor")
+SFT_FACTOR = 3.0  # see the header: ~3 standard errors of a 10-step tail mean; a stalled run is ~17x away
+
+
 def sft_compare():
     runs = {}
-    for r in ("fp32_master", "adamw_bf16_multi_tensor", "adamw_bf16_per_param"):
+    for r in SFT_RUNS:
         path = os.path.join(WORK, f"sft_{r}.json")
         if os.path.exists(path):
             runs[r] = json.load(open(path))["losses"]
-    if len(runs) < 3:
-        emit("sft", "FAIL", reason=f"runs missing: {sorted(set(('fp32_master', 'adamw_bf16_multi_tensor', 'adamw_bf16_per_param')) - set(runs))}")
+    if len(runs) < len(SFT_RUNS):
+        emit("sft", "FAIL", reason=f"runs missing: {sorted(set(SFT_RUNS) - set(runs))}")
         return
     tail = {k: statistics.mean(v[-10:]) for k, v in runs.items()}
-    ref = tail["fp32_master"]
-    gap = (tail["adamw_bf16_multi_tensor"] - ref) / ref
-    gap_pp = (tail["adamw_bf16_multi_tensor"] - tail["adamw_bf16_per_param"]) / tail["adamw_bf16_per_param"]
-    learned = runs["fp32_master"][-1] < runs["fp32_master"][0]
+    stderr = {k: statistics.stdev(v[-10:]) / math.sqrt(10) for k, v in runs.items()}
+    ref = (tail["fp32_master"] + tail["fp32_master_seed2"]) / 2
+    ratios = {k: tail[k] / ref for k in SFT_RUNS if k.startswith("adamw_bf16")}
+    ratios["multi_tensor_vs_per_param"] = tail["adamw_bf16_multi_tensor"] / tail["adamw_bf16_per_param"]
+    learned = all(tail[k] < 0.25 * v[0] for k, v in runs.items())
+    within = all(1 / SFT_FACTOR <= x <= SFT_FACTOR for x in ratios.values())
     emit(
         "sft",
-        "PASS" if learned and abs(gap) <= 0.03 and abs(gap_pp) <= 0.03 else "FAIL",
+        "PASS" if learned and within else "FAIL",
         last10_mean=tail,
-        multi_tensor_vs_fp32_master=gap,
-        multi_tensor_vs_per_param=gap_pp,
+        last10_stderr=stderr,
+        ratio_to_fp32_master=ratios,
+        fp32_master_seed_ratio=tail["fp32_master_seed2"] / tail["fp32_master"],
+        allowed_factor=SFT_FACTOR,
+        every_run_learned=learned,
         curves={k: [round(x, 4) for x in v] for k, v in runs.items()},
     )
 
@@ -873,8 +894,13 @@ FAILED=0
 START=$(date +%s)
 run() {
   local log="$WORK/log_$1_$RANDOM.txt"
-  if ! "$PGS_PY" -c "$PROG" "$@" 2>"$log"; then
+  "$PGS_PY" -c "$PROG" "$@" 2>"$log"
+  local code=$?
+  if [ $code -ne 0 ]; then
     FAILED=1
+    if [ $code -ne 1 ]; then  # not the program's own exit after a FAIL line: killed (137: out of host memory) or crashed
+      echo "{\"check\": \"$1\", \"status\": \"FAIL\", \"args\": \"${*:2}\", \"reason\": \"process exited with code $code before reporting (137 = killed, usually out of host memory)\"}"
+    fi
     echo "---- $* failed; last lines of its log:" >&2
     tail -n 40 "$log" >&2
   fi
@@ -899,6 +925,8 @@ if [ "${PGS_CHECK_SMOKE:-0}" != "1" ]; then
   run sft fp32_master
   run sft adamw_bf16_multi_tensor
   run sft adamw_bf16_per_param
+  run sft fp32_master_seed2
+  run sft adamw_bf16_kahan_multi_tensor
   run sft_compare
 fi
 echo "{\"check\": \"summary\", \"status\": \"$([ $FAILED = 0 ] && echo PASS || echo FAIL)\", \"seconds\": $(( $(date +%s) - START ))}"

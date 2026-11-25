@@ -370,6 +370,52 @@ def test_arena_reuses_released_chunks_and_bounds_its_size():
         arena.take(1_500_000)  # a third chunk would pass the limit
 
 
+def test_arena_leaves_host_memory_available():
+    # 3 MiB available, 1 MiB must stay: a second 1 MiB chunk would leave less than the headroom
+    left = [3 << 20]
+    arena = HostArena(pin=False, chunk_bytes=1 << 20, headroom_bytes=1 << 20, available=lambda: left[0])
+    _, first = arena.take(900_000)
+    left[0] = (2 << 20) - 1
+    with pytest.raises(RuntimeError, match="must stay free"):
+        arena.take(900_000)
+    assert arena.reserved_bytes == 1 << 20
+    arena.release(first)
+    arena.take(900_000)  # the released chunk is reused: no new memory, no check
+    unknown = HostArena(pin=False, chunk_bytes=1 << 20, headroom_bytes=1 << 20, available=lambda: None)
+    unknown.take(900_000)  # MemAvailable cannot be read (not Linux): only the share-of-RAM limit applies
+
+
+def test_arena_release_during_take_is_safe():
+    """The garbage collector may free a graph, and with it handles of the arena, while take() allocates on the
+    thread that holds the arena's lock: no deadlock, and the range being handed out is not rewound."""
+    arena = HostArena(pin=False, chunk_bytes=1 << 20, headroom_bytes=0)
+    _, chunk = arena.take(600_000)
+    arena._available = lambda: arena.release(chunk)  # runs inside take(), under the lock
+    view, second = arena.take(600_000)  # does not fit: a new chunk is asked for, the old one is released meanwhile
+    assert second is chunk and chunk.live == 1 and chunk.offset >= 600_000
+    assert view.data_ptr() == chunk.buf.data_ptr()
+    other, third = arena.take(300_000)
+    assert third is chunk and other.data_ptr() >= view.data_ptr() + 600_000  # no overlap with the live view
+
+
+def test_a_forward_that_raised_inside_a_layer_resets_the_layer_tag():
+    torch.manual_seed(0)
+    model, x = _Stack(), torch.randn(3, 16)
+    off = ActivationOffloader(list(model.layers), "cpu", OffloadOptions(min_bytes=0), params=model.parameters())
+
+    def boom(module, args, output):
+        raise RuntimeError("boom")
+
+    hook = model.layers[1].register_forward_hook(boom, prepend=True)  # before the offloader's exit hook
+    with pytest.raises(RuntimeError, match="boom"), off.saving():
+        model(x)
+    hook.remove()
+    assert off._group == 1
+    with off.saving():
+        assert off._group is None  # what is saved before the first layer is not charged to a stale layer
+    off.close()
+
+
 def test_handles_release_their_chunk():
     torch.manual_seed(0)
     model, x = _Stack(), torch.randn(3, 16)

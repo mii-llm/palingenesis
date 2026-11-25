@@ -328,6 +328,11 @@ def _to_device(rows: list, dtype: torch.dtype, device: torch.device) -> torch.Te
     return host.pin_memory().to(device, non_blocking=True)
 
 
+def _on(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """The clip factor as the 1-element fp32 tensor on `device` the kernels read."""
+    return scale.to(device=device, dtype=torch.float32).reshape(1)
+
+
 def _offsets(tensors: Sequence[torch.Tensor]) -> tuple[list[int], bool]:
     """Element offsets of `tensors` (one dtype) from the first, and whether every address is 16-byte aligned."""
     size = tensors[0].element_size()
@@ -336,7 +341,14 @@ def _offsets(tensors: Sequence[torch.Tensor]) -> tuple[list[int], bool]:
     for t in tensors:
         addr = t.data_ptr()
         aligned = aligned and addr % _ALIGN == 0
-        out.append((addr - base) // size)  # tensors of one dtype are element-aligned: the division is exact
+        offset, rest = divmod(addr - base, size)
+        if rest:  # memory from outside torch's allocator, at an odd address: element offsets cannot reach it
+            raise RuntimeError(
+                "the multi-tensor optimizer kernels address tensors by element offsets from a base tensor, and a "
+                f"{t.dtype} tensor here is not a whole number of elements away from it; use the per-parameter "
+                "optimizer (train.fused_optimizer: false)"
+            )
+        out.append(offset)
     return out, aligned
 
 
@@ -346,20 +358,24 @@ class _Launcher:
     unaligned_only = False
 
     @classmethod
-    def run(cls, kernel, grid: int, args: tuple, aligned: bool, **meta):
+    def run(cls, kernel, grid: int, args: tuple, aligned: bool, device: torch.device, **meta):
         if cls.unaligned_only:
             aligned = False
-        try:
-            kernel[(grid,)](*args, ALIGNED=aligned, num_warps=NUM_WARPS, enable_fp_fusion=False, **meta)
-        except Exception as e:  # noqa: BLE001 - only the alignment hints are retried; a second failure raises
-            if not aligned:
-                raise
-            logger.warning(
-                f"multi-tensor optimizer kernel with alignment hints failed to compile ({type(e).__name__}: {e}); "
-                "using unhinted loads (correct, possibly slower)"
-            )
-            cls.unaligned_only = True
-            kernel[(grid,)](*args, ALIGNED=False, num_warps=NUM_WARPS, enable_fp_fusion=False, **meta)
+        # Triton launches on torch's current CUDA device: make it the tensors' (a model spread over several GPUs)
+        with torch.cuda.device(device):
+            try:
+                kernel[(grid,)](*args, ALIGNED=aligned, num_warps=NUM_WARPS, enable_fp_fusion=False, **meta)
+            except Exception as e:  # noqa: BLE001 - only the alignment hints are retried; a second failure raises
+                if not aligned:
+                    raise
+                # a failure here is raised before anything is launched (compilation, argument binding)
+                kernel[(grid,)](*args, ALIGNED=False, num_warps=NUM_WARPS, enable_fp_fusion=False, **meta)
+                # the unhinted variant ran: the hints were the problem (not, say, an out-of-memory error)
+                cls.unaligned_only = True
+                logger.warning(
+                    f"multi-tensor optimizer kernel with alignment hints failed ({type(e).__name__}: {e}); "
+                    "using unhinted loads (correct, possibly slower)"
+                )
 
 
 @dataclass
@@ -420,8 +436,9 @@ def adamw_bf16(rows: list[Bf16Row], scale: torch.Tensor | None = None) -> int:
             kernel,
             m.blocks,
             (first.p, first.g, first.m, first.v, cs[0], table, hp, m.numels, m.tensor, m.start,
-             scale if scale is not None else hp),
+             _on(scale, device) if scale is not None else hp),
             al_p and al_g and al_m and al_v and al_c,
+            device,
             KAHAN=kahan,
             HAS_SCALE=scale is not None,
             G_VEC=_ALIGN // first.g.element_size(),
@@ -449,8 +466,9 @@ def adamw(rows: list[Fp32Row], scale: torch.Tensor | None = None) -> int:
             kernel,
             m.blocks,
             (first.p, first.g, first.m, first.v, table, hp, m.numels, m.tensor, m.start,
-             scale if scale is not None else hp),
+             _on(scale, device) if scale is not None else hp),
             all(a for _, a in offs),
+            device,
             HAS_SCALE=scale is not None,
             P_VEC=_ALIGN // first.p.element_size(),
             G_VEC=_ALIGN // first.g.element_size(),
@@ -474,21 +492,22 @@ def sum_of_squares(grads: list[torch.Tensor], device: torch.device, triton: bool
             total += g.float().pow(2).sum().to(device)
         return total
     kernel = _kernels()["sumsq"]
-    for (_, _dtype), bucket in _buckets(grads, lambda g: (g.device, g.dtype)).items():
+    for (where, _dtype), bucket in _buckets(grads, lambda g: (g.device, g.dtype)).items():
         offs, aligned = _offsets(bucket)
-        table = _to_device(offs, torch.int64, device)
-        m = _MAPS.get(device, tuple(g.numel() for g in bucket))
-        partial = torch.empty(m.blocks, dtype=torch.float32, device=device)
+        table = _to_device(offs, torch.int64, where)
+        m = _MAPS.get(where, tuple(g.numel() for g in bucket))
+        partial = torch.empty(m.blocks, dtype=torch.float32, device=where)
         _Launcher.run(
             kernel,
             m.blocks,
             (bucket[0], table, m.numels, m.tensor, m.start, partial),
             aligned,
+            where,
             G_VEC=_ALIGN // bucket[0].element_size(),
             BLOCK=BLOCK,
             ITERS=ITERS,
         )
-        total += partial.sum()
+        total += partial.sum().to(device)
     return total
 
 

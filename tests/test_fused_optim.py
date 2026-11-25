@@ -333,6 +333,83 @@ def test_folded_clipping_matches_clip_then_step(kind):
         torch.testing.assert_close(p.detach().float(), q.detach().float(), rtol=2e-2, atol=2e-5)
 
 
+def test_clipping_is_not_folded_under_a_wrapper_that_steps_several_times():
+    """The clip factor is consumed by the first step(): Hyperball steps the base optimizer once per bucket."""
+    from palingenesis.train import _folds_clipping
+
+    class Opt:
+        triton = True
+
+        def clip_grad_norm_(self, max_norm):
+            return None
+
+    c = Config()
+    c.train.fused_optimizer = True
+    assert _folds_clipping(c, Opt(), 1)
+    assert not _folds_clipping(c, Opt(), 1, stepped_by_wrapper=True)
+    assert not _folds_clipping(c, Opt(), 2)  # several ranks: the norm is not reduced across them
+    assert not _folds_clipping(c, torch.optim.AdamW([nn.Parameter(torch.zeros(1))]), 1)  # the fallback optimizer
+    c.train.fused_optimizer = False
+    assert not _folds_clipping(c, Opt(), 1)
+
+    # what would go wrong: a second step() in the same training step runs unclipped
+    p = nn.Parameter(torch.ones(4))
+    opt = FusedAdamW([p], lr=0.1)
+    p.grad = torch.full((4,), 100.0)
+    opt.clip_grad_norm_(1.0)
+    assert opt.grad_scale is not None
+    opt.step()
+    assert opt.grad_scale is None
+
+
+def test_offsets_refuse_tensors_between_elements():
+    class At:  # torch never places two tensors of one storage like this; memory wrapped from elsewhere can be
+        dtype = torch.float32
+
+        def __init__(self, addr):
+            self.addr = addr
+
+        def data_ptr(self):
+            return self.addr
+
+        def element_size(self):
+            return 4
+
+    assert F._offsets([At(4096), At(4104), At(4080)]) == ([0, 2, -4], False)
+    assert F._offsets([At(4096), At(4112)]) == ([0, 4], True)
+    with pytest.raises(RuntimeError, match="fused_optimizer: false"):
+        F._offsets([At(4096), At(4098)])
+
+
+def test_launcher_keeps_the_hinted_variant_after_an_unrelated_failure(monkeypatch):
+    import contextlib
+
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(F._Launcher, "unaligned_only", False)
+    calls = []
+
+    class Kernel:
+        def __init__(self, fails):
+            self.fails = fails
+
+        def __getitem__(self, grid):
+            def launch(*args, ALIGNED, **meta):
+                calls.append(ALIGNED)
+                if ALIGNED in self.fails:
+                    raise RuntimeError("out of memory")
+
+            return launch
+
+    with pytest.raises(RuntimeError, match="out of memory"):  # both variants fail: not the hints' fault
+        F._Launcher.run(Kernel({True, False}), 1, (), True, torch.device("cpu"))
+    assert calls == [True, False] and not F._Launcher.unaligned_only
+    F._Launcher.run(Kernel({True}), 1, (), True, torch.device("cpu"))  # only the hinted variant fails
+    assert F._Launcher.unaligned_only
+    calls.clear()
+    F._Launcher.run(Kernel(set()), 1, (), True, torch.device("cpu"))
+    assert calls == [False]
+
+
 def test_zero_grad_drops_a_pending_clip_factor():
     """A skipped step (spike detection zeroes the gradients) must not carry its clip factor to the next step."""
     ps, g = _fp32_params(3)
