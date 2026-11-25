@@ -580,6 +580,26 @@ class VLLMColocateRollout:
         self.llm.llm_engine.add_request(request_id, self._request(prompt, images), params, **self._lora(adapter))
         self.started[request_id] = self.version  # when added, not at the first token: an upper bound on staleness
 
+    def load_stats(self) -> dict | None:
+        """The engine's load (rollout.concurrency kv on an engine worker, palingenesis.rl.concurrency): KV-cache
+        usage (a fraction), requests waiting and running, and the KV cache's size in tokens, read from the
+        in-process scheduler (vLLM V1 without multiprocessing). None where this vLLM does not expose them."""
+        engine = self.llm.llm_engine
+        core = getattr(getattr(engine, "engine_core", None), "engine_core", None)  # V1 InprocClient -> EngineCore
+        scheduler = getattr(core, "scheduler", None)
+        manager = getattr(scheduler, "kv_cache_manager", None)
+        if scheduler is None or manager is None or not hasattr(manager, "usage"):
+            return None
+        out: dict = {
+            "kv_usage": float(manager.usage),
+            "waiting": float(len(scheduler.waiting)),
+            "running": float(len(scheduler.running)),
+        }
+        cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
+        if getattr(cache, "num_gpu_blocks", None) and getattr(cache, "block_size", None):
+            out["kv_tokens"] = int(cache.num_gpu_blocks) * int(cache.block_size)
+        return out
+
     def stream_pending(self) -> bool:
         return self.llm.llm_engine.has_unfinished_requests()
 

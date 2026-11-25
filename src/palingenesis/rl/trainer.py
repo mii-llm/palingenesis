@@ -125,6 +125,16 @@ _SUMMED = {
     "sampler/revisits_served",
     "sampler/cooldown_overrides",
     DROPPED_METRIC,
+    # rollout.concurrency kv: each rank's own engines (rollout/kv_usage, the highest of an engine's, is averaged)
+    "rollout/concurrency_cap",
+    "rollout/concurrency",
+    "rollout/concurrency_peak",
+    "rollout/requests_waiting",
+    "rollout/requests_running",
+    "rollout/preemptions",
+    "rollout/gate_waits",
+    "rollout/gate_wait_s",
+    "rollout/launches_deferred",
 }
 
 
@@ -506,10 +516,13 @@ class RLTrainer:
             from palingenesis.rl.pool.protocol import model_signature
 
             self.push_mode = self._push_mode()
+            from palingenesis.rl.concurrency import settings_from
+
             self.engine = RemotePool(
                 r.engines[rank::world],
                 push_to=list(r.engines) if self.parallel.main else [],
                 blocking=r.max_staleness == 0,
+                concurrency=settings_from(config),  # rollout.concurrency kv: caps sized from the engines' KV use
                 identity={
                     "model": model_signature(self.model.config),
                     "stop_ids": sorted(int(i) for i in self.stop_ids),

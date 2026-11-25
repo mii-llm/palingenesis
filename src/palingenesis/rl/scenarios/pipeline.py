@@ -31,6 +31,7 @@ from typing import Any
 
 from palingenesis.lora import use_adapter
 from palingenesis.opd.orchestrator import PublishedWeights
+from palingenesis.rl.concurrency import gate_for
 from palingenesis.rl.generation import GenerationClient
 from palingenesis.rl.pipeline import RLBatch, RLPipeline
 from palingenesis.rl.scenarios.base import Scenario
@@ -225,7 +226,7 @@ class ScenarioPipeline(RLPipeline, Host):
         self.clients: dict[str, GenerationClient] = {"": self.client}
         self.extra: dict[str, tuple] = {}
         for key, (engine, weights) in (engines or {}).items():
-            self.clients[key] = GenerationClient(engine, merge=False)
+            self.clients[key] = GenerationClient(engine, merge=False, gate=gate_for(self.config, engine))
             self.extra[key] = (engine, weights)
         self.client.merge = False  # sessions are multi-turn: an n-sample request returns when its longest ends
         if hasattr(self.engine, "make_client"):  # an engine pool serves every adapter: requests name theirs

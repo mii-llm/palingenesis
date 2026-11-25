@@ -49,10 +49,13 @@ def _generation(r) -> Generation:
 
 
 class GenerationClient:
-    def __init__(self, engine: RolloutEngine, window: float = 0.02, merge: bool = True):
+    def __init__(self, engine: RolloutEngine, window: float = 0.02, merge: bool = True, gate=None):
+        """`gate`: a palingenesis.rl.concurrency.AdmissionGate every request acquires first (rollout.concurrency
+        kv: requests in flight under the engine's KV-sized cap); None: every request goes out at once."""
         self.engine = engine
         self.merge = merge
         self.window = window
+        self.gate = gate
         self.calls = 0  # engine calls (batch) or requests added (streaming)
         self.active = 0  # live trajectories (each may ask for another turn)
         self.streaming = hasattr(engine, "stream_add")
@@ -93,6 +96,15 @@ class GenerationClient:
         """`images`: the prompt's images, one per placeholder token of `prompt_ids`, in order
         (a multimodal policy; the engine expands the placeholders). `adapter`: the LoRA adapter of the engine to
         generate with (engines that serve several; requests of different adapters share the running batch)."""
+        if self.gate is not None:
+            key = await self.gate.acquire()
+            try:
+                return await self._generate(prompt_ids, max_new_tokens, temperature, images, adapter)
+            finally:
+                self.gate.release(key)
+        return await self._generate(prompt_ids, max_new_tokens, temperature, images, adapter)
+
+    async def _generate(self, prompt_ids, max_new_tokens, temperature, images, adapter) -> Generation:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         images = list(images) if images else None
@@ -198,6 +210,8 @@ class GenerationClient:
         return self.engine_lock
 
     def close(self) -> None:
+        if self.gate is not None:
+            self.gate.close()
         if self.streaming and self.thread.is_alive():
             self.inbox.put(None)
             self.thread.join(timeout=10)

@@ -40,6 +40,7 @@ from palingenesis.rl.chat import (
     message_texts,
     parse_assistant,
 )
+from palingenesis.rl.concurrency import TokenAllowance, gate_for, merge_metrics
 from palingenesis.rl.config import RLConfig
 from palingenesis.rl.data import PromptSampler, prompt_messages, row_limit
 from palingenesis.rl.env import EnvPool, ToolOutput, call_sync_or_async, row_tools, run_tool
@@ -97,8 +98,10 @@ class RLPipeline:
         # n-sample merging only helps when a group's rollouts are one turn each
         if hasattr(engine, "make_client"):  # engines in other processes (palingenesis.rl.pool): requests travel
             self.client = engine.make_client(merge=env_pool is None)
-        else:
-            self.client = GenerationClient(engine, merge=env_pool is None)
+        else:  # rollout.concurrency kv: a vLLM server's requests in flight under its KV-sized cap
+            self.client = GenerationClient(engine, merge=env_pool is None, gate=gate_for(config, engine))
+        r = config.rollout
+        self.allowance = TokenAllowance(r.token_allowance, r.group_size) if r.token_allowance > 0 else None
         self.lock = threading.RLock()
         self.group_ids = itertools.count()
         self.carry: list[list[Trajectory]] = []  # surplus informative groups (max_staleness > 0)
@@ -135,6 +138,7 @@ class RLPipeline:
             self.engine.sleep()
         self.batches += 1
         stats.update(_timeline_stats(self.client.timeline))
+        stats.update(self.concurrency_metrics())
         if hasattr(self.engine, "prompt_tokens"):
             prompt = self.engine.prompt_tokens - prefill[0]
             stats["engine/prefill_tokens"] = prompt - (self.engine.cached_tokens - prefill[1])
@@ -163,6 +167,15 @@ class RLPipeline:
         # beyond max_staleness one by one instead of the orchestrator dropping the batch.
         version = max((t.version for t in trajectories), default=self.weights.version)
         return RLBatch(groups, version, stats, dump, timeline)
+
+    def concurrency_metrics(self) -> dict[str, float]:
+        """rollout.concurrency kv and rollout.token_allowance: the gates' and the allowance's metrics."""
+        clients = getattr(self, "clients", None) or {"": self.client}
+        gates = {id(g): g for g in (getattr(c, "gate", None) for c in clients.values()) if g is not None}
+        out = merge_metrics([g.metrics() for g in gates.values()])
+        if self.allowance is not None:
+            out.update(self.allowance.metrics())
+        return out
 
     async def _collect(self, target: int, temperature: float) -> tuple[list[list[Trajectory]], dict[str, float]]:
         """Run groups until `target` informative ones are collected.
@@ -199,6 +212,8 @@ class RLPipeline:
         def account(group: list[Trajectory]) -> bool:
             nonlocal dropped_tokens
             counts["groups"] += 1
+            if self.allowance is not None:
+                self.allowance.observe([t.context_tokens for t in group])
             finished.append(group)
             if any(t.rewards.get("env/metric/verifier_failed") for t in group):
                 counts["verifier_failed"] += 1  # a broken verifier, not a failure of the policy (the queue skips it)
@@ -211,10 +226,13 @@ class RLPipeline:
             return False
 
         while len(kept) < target:
-            missing = target - len(kept) - len(in_flight - adopted)
-            if missing > 0:
-                missing = math.ceil(missing / (1.0 - min(self.drop_rate, 0.8)))
-            for _ in range(max(0, min(missing, budget - launched))):
+            needed = target - len(kept) - len(in_flight - adopted)
+            missing = math.ceil(needed / (1.0 - min(self.drop_rate, 0.8))) if needed > 0 else needed
+            launches = max(0, min(missing, budget - launched))
+            if self.allowance is not None:  # rollout.token_allowance: speculative launches within the allowance
+                held = sum(t.context_tokens for g in [*kept, *self.carry] for t in g)
+                launches = self.allowance.launches(min(needed, launches), launches, target, held, len(in_flight))
+            for _ in range(launches):
                 # the policy version is the retry queue's clock (delays and the cooldown count training steps)
                 index, row = self.sampler.draw(self.weights.version)
                 revisit = bool(getattr(self.sampler, "last_revisit", False))

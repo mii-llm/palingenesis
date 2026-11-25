@@ -24,7 +24,10 @@ its rollouts at once); the run itself ends at the next weight update with an err
 restarted one holds none of this run's weights). Restart the worker and resume from the last checkpoint.
 
 A request goes to the engine with the fewest requests in flight. There is no prefix affinity: every push resets
-an engine's prefix cache, and an engine's own batch is where the turns of a session meet their prefix.
+an engine's prefix cache, and an engine's own batch is where the turns of a session meet their prefix. With
+rollout.concurrency kv (`concurrency`), each engine has a cap on its requests in flight, moved with the load its
+worker reports in `state` (palingenesis.rl.concurrency), and a request goes to the engine with the most room,
+waiting while every engine is at its cap.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ import logging
 import threading
 import time
 
+from palingenesis.rl.concurrency import AdmissionGate, ConcurrencySettings, EngineLoad
 from palingenesis.rl.generation import Generation
 from palingenesis.rl.pool.protocol import Staging, receive, send
 
@@ -74,7 +78,7 @@ class RemotePool:
     `blocking`: a weight update returns only when the engines have applied it (the ones this process sends to,
     and the ones it generates with), or fails after `push_timeout` seconds. `identity`: this trainer's model
     signature, stop tokens, chat-template arguments, context length and head precision; a worker that was started
-    with other values is refused."""
+    with other values is refused. `concurrency`: rollout.concurrency kv's settings (None: no cap)."""
 
     def __init__(
         self,
@@ -85,6 +89,7 @@ class RemotePool:
         pin: bool = True,
         identity: dict | None = None,
         push_timeout: float = 1800.0,
+        concurrency: ConcurrencySettings | None = None,
     ):
         if not addresses:
             raise ValueError("rollout.engines is empty: list the engine workers as host:port")
@@ -106,6 +111,9 @@ class RemotePool:
         self.failure = ""  # a push that was not applied, or a worker that went away: the next update raises
         self.ids = itertools.count()
         self.stats = {"pushes": 0, "skipped": 0, "bytes": 0, "seconds": 0.0, "stage_seconds": 0.0}
+        self.gate: AdmissionGate | None = None
+        if concurrency is not None:
+            self.gate = AdmissionGate(concurrency, [e.address for e in self.engines], self._load, self._capacity)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, name="pgs-engine-pool", daemon=True)
         self.thread.start()
@@ -233,16 +241,41 @@ class RemotePool:
             if not alive:
                 gone = "; ".join(f"{e.address}: {e.dead}" for e in self.engines)
                 raise ConnectionError(f"no engine worker is left to generate with ({gone})")
-            engine = min(alive, key=lambda e: e.load)
+            if self.gate is not None:  # rollout.concurrency kv: the engine with the most room under its cap
+                address = await self.gate.acquire([e.address for e in alive])
+                engine = next(e for e in alive if e.address == address)
+            else:
+                engine = min(alive, key=lambda e: e.load)
             try:
                 reply = await self._ask(engine, header)
             except EngineLost:
                 continue  # the request starts again on an engine that is still there
+            finally:
+                if self.gate is not None:
+                    self.gate.release(engine.address)
             if "error" in reply:
                 raise RuntimeError(f"engine worker {engine.address}: {reply['error']}")
             return Generation(
                 reply["ids"], reply["logprobs"], reply["finish"], reply["version"], reply["first_version"]
             )
+
+    async def _load(self, address: str) -> EngineLoad | None:
+        """An engine's load as its worker reports it in `state` (None: the worker's engine reports none)."""
+        engine = next(e for e in self.engines if e.address == address)
+        if engine.dead:
+            return None
+        try:
+            load = (await self._ask(engine, {"op": "state"})).get("load")
+        except EngineLost:
+            return None
+        if not isinstance(load, dict):
+            return None
+        fields = ("kv_usage", "waiting", "running", "preemptions", "kv_tokens")
+        return EngineLoad(**{key: load.get(key) for key in fields})
+
+    async def _capacity(self, address: str) -> tuple[int | None, int | None]:
+        load = await self._load(address)
+        return (load.kv_tokens if load is not None else None), self.identity.get("max_model_len")
 
     # ---------------------------------------------------------------- weights
 
@@ -432,6 +465,8 @@ class RemotePool:
 
         if not self.thread.is_alive():
             return
+        if self.gate is not None:
+            self.gate.close()
         with contextlib.suppress(Exception):
             self._call(finish(), 10)
         self.loop.call_soon_threadsafe(self.loop.stop)
@@ -446,6 +481,7 @@ class RemoteClient:
 
     def __init__(self, pool: RemotePool, adapter: str = ""):
         self.pool, self.adapter = pool, adapter
+        self.gate = pool.gate  # (its metrics; requests acquire it in the pool)
         self.merge = False
         self.calls = 0
         self.active = 0

@@ -238,13 +238,25 @@ class EngineWorker:
             writer.close()
 
     def state(self) -> dict:
-        return {
+        state = {
             "version": self.version,
             "pushes": self.pushes,
             "dropped": self.dropped,
             "receiving": self.receiving,
             "confirmed": self.confirmed,
         }
+        # the engine's load, for a trainer's rollout.concurrency kv (palingenesis.rl.concurrency): KV-cache usage,
+        # requests waiting and running, KV-cache tokens; engines that cannot tell report nothing
+        load_stats = getattr(self.engine, "load_stats", None)
+        if load_stats is not None:
+            try:
+                load = load_stats()
+            except Exception:  # noqa: BLE001 — a load the engine cannot read is no reason to fail a state request
+                logger.warning("the engine's load could not be read", exc_info=True)
+                load = None
+            if load:
+                state["load"] = load
+        return state
 
     async def _generate(self, header: dict, reply) -> None:
         self.client.enter()

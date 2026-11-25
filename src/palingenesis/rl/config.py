@@ -199,6 +199,26 @@ class RLRolloutConfig:
     # A worker that goes away ends the run at the next update (restart it, resume from the last checkpoint).
     engines: list = field(default_factory=list)
     push: str = "auto"
+    # How many generation requests a vLLM server (backend vllm_server) or each engine worker (remote) gets at once.
+    # "fixed": every request as soon as a rollout asks for it (the engine queues and preempts by itself). "kv": a cap
+    # on the requests in flight per engine, started at the engine's KV-cache tokens / max_model_len and moved with
+    # its load, polled every concurrency_poll_s seconds (palingenesis.rl.concurrency, after TRL's AsyncGRPOTrainer):
+    # cut by 30% when its KV-cache usage passes kv_usage_high (or requests wait in its queue), raised by 25% while
+    # usage stays under kv_usage_low with nothing waiting and the cap was reached. Kept in [concurrency_min,
+    # concurrency_max]; concurrency_max 0 = the engine's sequence limit (rollout.max_num_seqs, or its default).
+    # Remote workers report their load when their engine can (the vLLM worker does; others keep the starting cap).
+    concurrency: str = "fixed"
+    concurrency_min: int = 4
+    concurrency_max: int = 0
+    kv_usage_low: float = 0.6
+    kv_usage_high: float = 0.8
+    concurrency_poll_s: float = 5.0
+    # Token allowance: launches beyond what the batch being collected still needs (the speculative refills, and
+    # with them what is carried into later batches) start only while the tokens the pipeline holds and has in
+    # flight stay within (1 + token_allowance) x one batch's tokens (prompt and completion, measured on the
+    # rollouts so far): staleness bounded in tokens as well as in versions. 0 = off (launches bounded by
+    # max_refill alone). Any backend.
+    token_allowance: float = 0.0
 
 
 @dataclass(slots=True)
@@ -702,6 +722,7 @@ class RLConfig:
             errors.append("rollout.engines: every trainer rank needs at least one engine.")
         if r.backend == "remote" and (m.multimodal or r.routing_replay != "off"):
             errors.append("rollout.backend remote does not support model.multimodal or rollout.routing_replay yet.")
+        errors += _concurrency_errors(r)
         if r.max_staleness > 0 and r.backend == "hf":
             errors.append(
                 "rollout.max_staleness > 0 needs an inference engine backend (vllm, sglang, ...): hf generates with "
@@ -1052,6 +1073,58 @@ class RLConfig:
         if errors:
             raise RLConfigError("RL configuration has incompatible settings:\n" + "\n".join(f"  ✗ {x}" for x in errors))
         return warnings
+
+
+CONCURRENCY = ("fixed", "kv")
+
+
+def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
+    """rollout.concurrency and rollout.token_allowance (palingenesis.rl.concurrency)."""
+    errors: list[str] = []
+    defaults = RLRolloutConfig()
+    tuning = ("concurrency_min", "concurrency_max", "kv_usage_low", "kv_usage_high", "concurrency_poll_s")
+    if r.concurrency not in CONCURRENCY:
+        errors.append(f"rollout.concurrency must be one of {CONCURRENCY}, got {r.concurrency!r}.")
+    elif r.concurrency == "kv":
+        if r.backend not in ("vllm_server", "remote"):
+            errors.append(
+                f"rollout.concurrency kv sizes the requests sent to a vLLM server or to engine workers from their "
+                f"KV-cache use (rollout.backend vllm_server or remote); rollout.backend {r.backend} "
+                + (
+                    "adds every request to its own engine's batch, where vLLM admits and preempts by itself."
+                    if r.backend == "vllm"
+                    else "generates with the trainer's model."
+                )
+            )
+        if isinstance(r.concurrency_min, bool) or not isinstance(r.concurrency_min, int) or r.concurrency_min < 1:
+            errors.append(f"rollout.concurrency_min must be an integer >= 1, got {r.concurrency_min!r}.")
+        if isinstance(r.concurrency_max, bool) or not isinstance(r.concurrency_max, int) or r.concurrency_max < 0:
+            errors.append(
+                f"rollout.concurrency_max must be an integer >= 0 (0 = the engine's sequence limit), got "
+                f"{r.concurrency_max!r}."
+            )
+        elif isinstance(r.concurrency_min, int) and 0 < r.concurrency_max < r.concurrency_min:
+            errors.append(
+                f"rollout.concurrency_max ({r.concurrency_max}) must be >= rollout.concurrency_min "
+                f"({r.concurrency_min})."
+            )
+        if not 0.0 < r.kv_usage_low < r.kv_usage_high <= 1.0:
+            errors.append(
+                "rollout.kv_usage_low and kv_usage_high are KV-cache usage fractions with 0 < low < high <= 1, got "
+                f"{r.kv_usage_low} and {r.kv_usage_high}."
+            )
+        if not (math.isfinite(r.concurrency_poll_s) and r.concurrency_poll_s > 0):
+            errors.append(f"rollout.concurrency_poll_s must be > 0 seconds, got {r.concurrency_poll_s}.")
+    else:
+        changed = [name for name in tuning if getattr(r, name) != getattr(defaults, name)]
+        if changed:
+            errors.append(
+                f"rollout.{', rollout.'.join(changed)}: only used with rollout.concurrency kv (concurrency is "
+                "fixed)."
+            )
+    if not (isinstance(r.token_allowance, int | float) and math.isfinite(r.token_allowance)) or r.token_allowance < 0:
+        errors.append(f"rollout.token_allowance must be a finite number >= 0 (0 = off), got {r.token_allowance!r}.")
+    return errors
 
 
 class RLConfigError(Exception):
