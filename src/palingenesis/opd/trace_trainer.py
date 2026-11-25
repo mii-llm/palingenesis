@@ -14,6 +14,11 @@ the GPU trains: the turns to regenerate (`branches_per_trace`, each
      full-vocabulary reverse KL on every regenerated token (fused_rkl), and on the
      recorded turns, gradients through the whole shared context.
 
+train.packing tree replaces the chunk-wise passes of steps 2 and 3 with packed rows
+(opd.packing): each trace a prefix trie, its trunk forwarded once under every
+regenerated turn, several traces to a row, one forward and one backward per row
+(the row's activations are held whole: for traces within train.packing_tokens).
+
 A teacher on a vLLM server (teachers.<name>.backend vllm) scores each regenerated
 turn and the trunk prefill-only instead (prompt_logprobs: its top-k and the
 student token's log-prob at every position), and the student trains on topk_kl
@@ -33,12 +38,15 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import numpy as np
 import torch
 
+from palingenesis.accelerator import device_scope
 from palingenesis.opd import losses
 from palingenesis.opd.fused_rkl import fused_full_rkl
 from palingenesis.opd.orchestrator import Pipeline
-from palingenesis.opd.teachers import TeacherScores, VLLMTeacher
+from palingenesis.opd.packing import Packing, packed_hidden, packed_states
+from palingenesis.opd.teachers import HFTeacher, TeacherScores, VLLMTeacher
 from palingenesis.opd.traces import (
     FailedTurns,
     OnsetScan,
@@ -137,9 +145,11 @@ class TracePipeline(Pipeline):
         prefix_caching: bool,
         regenerate: bool = True,
         cutoffs: dict[str, TeacherCutoff] | None = None,
+        packing: Packing | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.packing = packing  # train.packing tree: hf teachers read their traces as packed prefix tries
         self.regenerate = regenerate  # False: recorded turns only (no rollouts)
         self.cutoffs = {k: v for k, v in (cutoffs or {}).items() if v is not None and v.active}  # per source
         self.chunk_size = chunk_size
@@ -186,8 +196,9 @@ class TracePipeline(Pipeline):
                         )
                     )
             t4 = time.perf_counter()
+            packed = self._packed_hidden(samples)
             for sample in samples:
-                self._score(sample)
+                self._score(sample, packed.get(id(sample)))
             t5 = time.perf_counter()
         cut = self._cut_stats(samples)
         samples = [s for s in samples if s.completions or s.plan.kd_spans]
@@ -222,8 +233,9 @@ class TracePipeline(Pipeline):
                 for r in requests
                 if r.plan.kd_spans
             ]
+            packed = self._packed_hidden(samples)
             for sample in samples:
-                self._score(sample)
+                self._score(sample, packed.get(id(sample)))
             cut = self._cut_stats(samples)
             samples = [s for s in samples if s.plan.kd_spans]
             stats = {
@@ -251,22 +263,70 @@ class TracePipeline(Pipeline):
             "teacher_turn_logp": sum(c["logp_sum"] for c in scored) / max(turns, 1),
         }
 
-    @torch.no_grad()
-    def _score(self, sample: TraceSample) -> None:
-        """The teacher's view of one trace: at the regenerated turns and (with KD) the recorded turns, hidden
-        states (hf) or sparse top-k log-probs (vLLM); with a TeacherCutoff, the turns past it dropped or
-        down-weighted first."""
-        teacher = self.routes[sample.teacher].teacher
+    def _wanted(self, sample: TraceSample):
+        """What the teacher's pass over a trace must yield besides the regenerated turns: (the source's cutoff or
+        None, the trunk positions of each recorded turn it reads, the positions distilled, those whose log-prob the
+        cutoff reads, and all of them, sorted)."""
         plan = sample.plan
         cutoff = self.cutoffs.get(sample.meta.get("_src")) if sample.meta.get("_cutoff") else None
         groups = cutoff.positions(plan.turns) if cutoff and plan.turns else []
         kd_positions = plan.kd_positions()
         scored = sorted(set().union(*groups))  # the positions whose log-prob the cutoff reads
-        positions = sorted(set(kd_positions).union(scored))
+        return cutoff, groups, kd_positions, scored, sorted(set(kd_positions).union(scored))
+
+    @torch.no_grad()
+    def _packed_hidden(self, samples: list[TraceSample]) -> dict[int, tuple]:
+        """train.packing tree: per sample (by id) of an hf teacher, (its hidden states per regenerated turn, those
+        at the trunk positions `_wanted` names), from packed rows: the turns' contexts and the trunk as one prefix
+        trie in the teacher's tokens, several traces to a row within the token budget. Empty without packing."""
+        out: dict[int, tuple] = {}
+        if self.packing is None:
+            return out
+        for name, route in self.routes.items():
+            teacher = route.teacher
+            group = [s for s in samples if s.teacher == name]
+            if not group or not isinstance(teacher, HFTeacher):
+                continue
+            bridge = route.aligner.bridge
+            sequences, wanted, layout = [], [], []
+            for sample in group:
+                seqs, rows = trace_sequences(sample.plan, sample.completions, self._wanted(sample)[4])
+                layout.append((len(sequences), len(sample.completions), len(seqs) > len(sample.completions)))
+                sequences += [bridge.to_teacher(ids) for ids in seqs]
+                wanted += rows
+            if teacher.offload:
+                teacher.model.to(teacher.device)
+            try:
+                with device_scope(teacher.device):
+                    hidden = packed_hidden(
+                        teacher.model,
+                        teacher.packing_support,
+                        self.packing,
+                        sequences,
+                        wanted,
+                        self.score_micro_seqs,
+                        teacher.device,
+                    )
+            finally:
+                if teacher.offload:
+                    teacher.model.to("cpu")
+            for sample, (start, branches, trunk) in zip(group, layout):
+                out[id(sample)] = (hidden[start : start + branches], hidden[start + branches] if trunk else None)
+        return out
+
+    @torch.no_grad()
+    def _score(self, sample: TraceSample, packed: tuple | None = None) -> None:
+        """The teacher's view of one trace: at the regenerated turns and (with KD) the recorded turns, hidden
+        states (hf) or sparse top-k log-probs (vLLM); with a TeacherCutoff, the turns past it dropped or
+        down-weighted first. `packed`: the hf teacher's hidden states when a packed row computed them
+        (_packed_hidden)."""
+        teacher = self.routes[sample.teacher].teacher
+        plan = sample.plan
+        cutoff, groups, kd_positions, scored, positions = self._wanted(sample)
         if isinstance(teacher, VLLMTeacher):
             branch_scores, trunk_scores, trunk_lp = self._score_vllm(sample, positions, scored)
         else:
-            branch_scores, trunk_scores, trunk_lp = self._score_hf(sample, positions, scored)
+            branch_scores, trunk_scores, trunk_lp = self._score_hf(sample, positions, scored, packed)
         sample.teacher_hidden = branch_scores
         sample.teacher_kd_hidden = trunk_scores if kd_positions else None
         if not groups:
@@ -307,14 +367,38 @@ class TracePipeline(Pipeline):
         sample.cutoff = stats
         return plan, keep
 
-    def _score_hf(self, sample: TraceSample, positions: list[int], scored: list[int]):
+    def _score_hf(self, sample: TraceSample, positions: list[int], scored: list[int], packed: tuple | None = None):
+        teacher = self.routes[sample.teacher].teacher
+        bridge = self.routes[sample.teacher].aligner.bridge
+        trunk_ids = bridge.to_teacher(sample.plan.trunk)
+        if packed is not None:
+            branch_hidden, kd = packed
+        else:
+            branch_hidden, kd = self._tree_hidden(sample, trunk_ids, positions)
+        lp = None
+        if scored:  # the teacher's log-prob of the next trunk token at `scored`, a slice of rows at a time
+            size = bridge.shared_vocab_size
+            index = {p: i for i, p in enumerate(positions)}
+            rows_at = torch.tensor([index[p] for p in scored], device=kd.device)
+            targets = torch.tensor([trunk_ids[p + 1] for p in scored], device=kd.device)
+            step = max(1, 2**27 // teacher.head.weight.shape[0])
+            lp = torch.cat(
+                [
+                    teacher.log_probs(kd[rows_at[a : a + step]], size).gather(1, targets[a : a + step, None]).squeeze(1)
+                    for a in range(0, len(scored), step)
+                ]
+            ).cpu()
+        return branch_hidden, kd, lp
+
+    def _tree_hidden(self, sample: TraceSample, trunk_ids: list[int], positions: list[int]):
+        """The hf teacher's hidden states of one trace, chunk-wise (seco_tree): per regenerated turn
+        [len(completion), H], and at the trunk `positions` [P, H]."""
         teacher = self.routes[sample.teacher].teacher
         device = teacher.device
         if teacher.offload:
             teacher.model.to(device)
         try:
             bridge = self.routes[sample.teacher].aligner.bridge
-            trunk_ids = bridge.to_teacher(sample.plan.trunk)
             trunk = torch.tensor([trunk_ids], device=device)
             inputs = [bridge.to_teacher(ids) for ids in branch_inputs(sample.plan, sample.completions)]
             branches = [
@@ -333,22 +417,7 @@ class TracePipeline(Pipeline):
                     min_gap=self.min_gap,
                 )
             rows = completion_rows(sample.plan, sample.completions)
-            lp = None
-            if scored:  # the teacher's log-prob of the next trunk token at `scored`, a slice of rows at a time
-                size = bridge.shared_vocab_size
-                index = {p: i for i, p in enumerate(positions)}
-                rows_at = torch.tensor([index[p] for p in scored], device=kd.device)
-                targets = torch.tensor([trunk_ids[p + 1] for p in scored], device=kd.device)
-                step = max(1, 2**27 // teacher.head.weight.shape[0])
-                lp = torch.cat(
-                    [
-                        teacher.log_probs(kd[rows_at[a : a + step]], size)
-                        .gather(1, targets[a : a + step, None])
-                        .squeeze(1)
-                        for a in range(0, len(scored), step)
-                    ]
-                ).cpu()
-            return [h[0, r] for h, r in zip(hidden, rows)], kd, lp
+            return [h[0, r] for h, r in zip(hidden, rows)], kd
         finally:
             if teacher.offload:
                 teacher.model.to("cpu")
@@ -372,6 +441,22 @@ class TracePipeline(Pipeline):
             index = {p: i for i, p in enumerate(positions)}
             lp = trunk.token_lp[torch.tensor([index[p] for p in scored], dtype=torch.long)]
         return scores[: len(sample.plan.branches)], trunk, lp
+
+
+def trace_sequences(plan: TracePlan, completions: list[list[int]], trunk_positions: list[int]):
+    """A trace as the sequences a packed row shares (student ids): each regenerated turn's whole input (the trunk up
+    to where it attaches, its prefix, its completion but the last token) and, when `trunk_positions` are read, the
+    trunk up to the last of them (the last sequence then). Returns (sequences, per sequence the positions whose
+    hidden states are read: a turn's completion rows, the trunk positions)."""
+    sequences, rows = [], []
+    for b, c in zip(plan.branches, completions):
+        sequences.append(plan.trunk[: b.attach] + b.prefix + c[:-1])
+        first = b.attach + len(b.prefix) - 1
+        rows.append(np.arange(first, first + len(c), dtype=np.int64))
+    if trunk_positions:
+        sequences.append(plan.trunk[: max(trunk_positions) + 1])
+        rows.append(np.asarray(trunk_positions, dtype=np.int64))
+    return sequences, rows
 
 
 def _rows(scores, rows: list[int]):
@@ -431,7 +516,17 @@ class TraceTrainer(OPDTrainer):
             regenerate=self.config.loss.trace_branch_weight > 0,
             prefix_caching=self.config.rollout.prefix_caching and self.config.rollout.backend != "hf",
             cutoffs={name: _cutoff(source) for name, source in self.config.sources.items()},
+            packing=self._packing(),
         )
+
+    def _packing(self) -> Packing | None:
+        """train.packing tree on traces: rows of train.packing_tokens packed tokens (0: one trunk chunk and one
+        forward of regenerated turns, tree_chunk_size + tree_branch_tokens)."""
+        train = self.config.train
+        if train.packing == "padded":
+            return None
+        tokens = train.packing_tokens or train.tree_chunk_size + train.tree_branch_tokens
+        return Packing(train.packing, tokens, train.packing_gather_tokens)
 
     def _dump_items(self, batch: TraceBatch, step: int) -> list[dict]:
         """The regenerated turns of logging.dump_groups traces (one group per trace), as plain values.
@@ -535,6 +630,13 @@ class TraceTrainer(OPDTrainer):
         kd_tokens = sum(sum(s.plan.kd_weights()) for s in batch.samples) if kd_on else 0
         stats: dict[str, float] = defaultdict(float)
         branch_weight = loss_cfg.trace_branch_weight
+        if self._packing() is not None:
+            return self._scores_packed(
+                batch.samples,
+                train,
+                branch_weight / branch_tokens if branch_tokens > 0 else 0.0,
+                loss_cfg.trace_kd_weight / kd_tokens if kd_tokens > 0 else 0.0,
+            )
         for sample in batch.samples:
             for k, v in self._score_trace(
                 sample,
@@ -574,16 +676,13 @@ class TraceTrainer(OPDTrainer):
             hidden, self.head, targets, weights, vocab, lambda a, b: route.teacher.log_probs(teacher_hidden[a:b], size)
         )
 
-    def _score_trace(self, sample: TraceSample, train: bool, branch_weight: float, kd_weight: float):
+    def _trace_terms(self, sample: TraceSample, branch_weight: float, kd_weight: float):
+        """One trace's loss terms: (stats they add to, turn_loss(i, h): regenerated turn i from the hidden states
+        [len(completion), H] predicting its tokens, recorded_loss(positions, h): the recorded turns at trunk
+        `positions` from their hidden states, the trunk positions distilled)."""
         name, device = sample.teacher, self.device
         bridge = self.routes[name].aligner.bridge
         plan = sample.plan
-        trunk = torch.tensor([plan.trunk], device=device)
-        branches = [
-            Branch(b.attach, torch.tensor([ids], device=device))
-            for b, ids in zip(plan.branches, branch_inputs(plan, sample.completions))
-        ]
-        rows = completion_rows(plan, sample.completions)
         targets = [torch.tensor(bridge.to_teacher(c), device=device) for c in sample.completions]
         teacher_hidden = [h if isinstance(h, TeacherScores) else h.to(device) for h in sample.teacher_hidden]
         kd_positions = plan.kd_positions() if kd_weight > 0 else []
@@ -595,8 +694,7 @@ class TraceTrainer(OPDTrainer):
         trunk_targets = torch.tensor(bridge.to_teacher(plan.trunk), device=device)
         stats: dict[str, float] = defaultdict(float)
 
-        def branch_loss(i: int, hidden):
-            h = hidden[0, rows[i]]
+        def turn_loss(i: int, h):
             weights = torch.full((h.shape[0],), branch_weight * plan.branches[i].weight, device=device)
             value, s = self._kl(name, h, teacher_hidden[i], targets[i], weights)
             stats[f"kl/{name}"] += s["kl"]
@@ -626,6 +724,66 @@ class TraceTrainer(OPDTrainer):
             stats[f"kd_tokens/{name}"] += len(positions)
             stats[f"loss/{name}"] += float(value.detach())
             return value
+
+        return stats, turn_loss, recorded_loss, kd_positions
+
+    def _scores_packed(self, samples: list[TraceSample], train: bool, branch_weight: float, kd_weight: float):
+        """train.packing tree: the batch's traces as packed rows (each trace a prefix trie: its trunk once under
+        every regenerated turn and onset branch; several traces to a row within the token budget), one forward and
+        one backward per row. The same terms as _score_trace, from the same hidden states."""
+        device = self.device
+        packing = self._packing()
+        stats: dict[str, float] = defaultdict(float)
+        sequences, wanted, terms = [], [], []  # per sequence: its loss from the hidden states at `wanted`
+        for sample in samples:
+            trace_stats, turn_loss, recorded_loss, kd_positions = self._trace_terms(sample, branch_weight, kd_weight)
+            seqs, rows = trace_sequences(sample.plan, sample.completions, kd_positions)
+            for i in range(len(sample.completions)):
+                terms.append((trace_stats, lambda h, i=i, fn=turn_loss: fn(i, h)))
+            if kd_positions:
+                terms.append((trace_stats, lambda h, fn=recorded_loss, at=kd_positions: fn(at, h)))
+            sequences += seqs
+            wanted += rows
+        parts = packing.micro_batches(sequences, [len(w) for w in wanted], self.config.train.score_micro_seqs)
+        balancer = getattr(self, "router_balancer", None) if train else None
+        for part in parts:
+            row = packing.row([sequences[i] for i in part])
+            if balancer is not None:
+                shared = None if row.flat else torch.from_numpy(row.multiplicity())[None]
+                balancer.begin(torch.ones(1, row.num_tokens, dtype=torch.long), len(parts), token_weight=shared)
+            with (
+                torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
+                torch.set_grad_enabled(train),
+            ):
+                states = packed_states(self.student, self.packing_support, row, device)
+                value = None
+                for j, i in enumerate(part):
+                    index = torch.from_numpy(row.positions(j)[wanted[i]]).to(states.device)
+                    term = terms[i][1](states[index])
+                    value = term if value is None else value + term
+            if train:
+                if balancer is not None:
+                    balancer.sync()
+                value.backward()
+            if balancer is not None:
+                balancer.end()
+        for trace_stats in {id(t[0]): t[0] for t in terms}.values():
+            for k, v in trace_stats.items():
+                stats[k] += v
+        return stats
+
+    def _score_trace(self, sample: TraceSample, train: bool, branch_weight: float, kd_weight: float):
+        device, plan = self.device, sample.plan
+        stats, turn_loss, recorded_loss, kd_positions = self._trace_terms(sample, branch_weight, kd_weight)
+        trunk = torch.tensor([plan.trunk], device=device)
+        branches = [
+            Branch(b.attach, torch.tensor([ids], device=device))
+            for b, ids in zip(plan.branches, branch_inputs(plan, sample.completions))
+        ]
+        rows = completion_rows(plan, sample.completions)
+
+        def branch_loss(i: int, hidden):
+            return turn_loss(i, hidden[0, rows[i]])
 
         def trunk_loss(lo: int, hi: int, hidden):
             here = [p for p in kd_positions if lo <= p < hi]

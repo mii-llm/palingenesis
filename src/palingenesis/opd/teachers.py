@@ -129,9 +129,49 @@ class HFTeacher:
         with device_scope(device):
             verify_output_head(self.model, self.head)
         self.generator = torch.Generator(device=device).manual_seed(seed)  # rs_kd's draws
+        self.packing = None  # train.packing varlen / tree (opd.packing.Packing): see enable_packing
+        self.packing_support = None
         if offload:
             self.head = copy.deepcopy(self.head)
             self.model.to("cpu")
+
+    def enable_packing(self, packing) -> None:
+        """Score packed rows (opd.packing): the completions of a micro-batch end to end, or as the prefix trie of
+        this teacher's own token sequences (its prompt forwarded once per group). Checks that the model can run
+        them exactly and routes its layers (tree_packing.PackingError otherwise)."""
+        from palingenesis.opd.packing import support_for
+
+        with device_scope(self.device):
+            self.packing_support = support_for(self.model, self.device)
+        self.packing = packing
+
+    def _micro_batches(self, views: list[TeacherView], micro_seqs: int) -> list[list[int]]:
+        if self.packing is not None:
+            return self.packing.micro_batches(
+                [v.input_ids[:-1] for v in views], [v.completion_len for v in views], micro_seqs
+            )
+        order = sorted(range(len(views)), key=lambda i: len(views[i].input_ids))
+        return [order[start : start + micro_seqs] for start in range(0, len(order), micro_seqs)]
+
+    def _completion_hidden(self, views: list[TeacherView]) -> Tensor:
+        """Final hidden states [sum of completion lengths, H] at the positions predicting each view's completion
+        tokens, view after view: from right-padded rows, or from one packed row."""
+        device = torch.device(self.device)
+        sequences = [v.input_ids[:-1] for v in views]
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            if self.packing is not None:
+                from palingenesis.opd.packing import gather_index, packed_states
+
+                row = self.packing.row(sequences)
+                spans = [(i, v.prompt_len - 1, v.completion_len) for i, v in enumerate(views)]
+                states = packed_states(self.model, self.packing_support, row, self.device)
+                return states[gather_index(row, spans, states.device)]
+            ids, _ = right_pad(sequences, 0, self.device)
+            positions = completion_positions(
+                [v.prompt_len for v in views], [v.completion_len for v in views], ids.shape[1]
+            )
+            # right-padded rows: no mask (padding after a row cannot reach it; flash attention)
+            return final_hidden_states(self.model, ids, None)[positions.to(ids.device)]
 
     @torch.no_grad()
     def score(self, views: list[TeacherView], **kwargs) -> list[TeacherScores]:
@@ -153,17 +193,10 @@ class HFTeacher:
         if self.offload:
             self.model.to(self.device)
         results: list[TeacherScores | None] = [None] * len(views)
-        order = sorted(range(len(views)), key=lambda i: len(views[i].input_ids))
         rows = max(1, 2**27 // self.head.weight.shape[0])
-        for start in range(0, len(order), micro_seqs):
-            chunk = order[start : start + micro_seqs]
-            ids, mask = right_pad([views[i].input_ids[:-1] for i in chunk], 0, self.device)
-            positions = completion_positions(
-                [views[i].prompt_len for i in chunk], [views[i].completion_len for i in chunk], ids.shape[1]
-            )
-            with torch.autocast(ids.device.type, dtype=torch.bfloat16, enabled=ids.is_cuda):
-                # right-padded rows: no mask (padding after a row cannot reach it; flash attention)
-                hidden = final_hidden_states(self.model, ids, None)[positions.to(ids.device)]
+        device = torch.device(self.device)
+        for chunk in self._micro_batches(views, micro_seqs):
+            hidden = self._completion_hidden([views[i] for i in chunk])
             if keep_hidden and not top_k:  # full_rkl projects the hidden states in its loss: nothing else needed
                 offset = 0
                 for i in chunk:
@@ -171,9 +204,9 @@ class HFTeacher:
                     results[i] = TeacherScores(None, hidden=hidden[offset : offset + n])
                     offset += n
                 continue
-            with torch.autocast(ids.device.type, dtype=torch.bfloat16, enabled=ids.is_cuda):
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 targets = torch.tensor(
-                    [t for i in chunk for t in views[i].input_ids[views[i].prompt_len :]], device=ids.device
+                    [t for i in chunk for t in views[i].input_ids[views[i].prompt_len :]], device=hidden.device
                 )
                 token_lp, topk_ids, topk_lp, samples = [], [], [], []
                 for a in range(0, hidden.shape[0], rows):
