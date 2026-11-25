@@ -395,6 +395,59 @@ The fused path covers every head `logits.output_head` produces: a logit scale (C
 
 Rollout time is set by decoding: 512 steps for the longest completion, about 5 ms each at 64 sequences (Qwen3.5's linear-attention layers read and write a recurrent state per sequence at every step). Larger batches decode more tokens per second: 128 prompts per step give 13.5k rollout tokens/s instead of 9.7k, and 4.9k trained tokens/s instead of 4.3k, at half the optimizer steps per token.
 
+### Packed scoring: `train.packing`
+
+A step samples `rollout.group_size` completions per prompt, and by default scores each as a row of its own: the teacher and the student both forward the prompt once per completion, and every row is padded to the longest of its micro-batch. `train.packing` lays a scoring micro-batch out as one row instead (`palingenesis.opd.packing`, on the packed forward of `palingenesis.tree_packing` that RL's `train.packing` uses):
+
+| `train.packing` | A micro-batch is | Forwarded tokens |
+|---|---|---|
+| `padded` (default) | right-padded rows, `train.score_micro_seqs` per forward | rows × the longest row |
+| `varlen` | one row, the sequences end to end | the sum of their lengths (no padding) |
+| `tree` | one row, the sequences' prefix trie | each prompt once + its completions |
+
+```yaml
+rollout:
+  group_size: 8
+train:
+  packing: tree
+  # packing_tokens: 32768          # packed tokens per micro-batch (0 = score_micro_seqs x the longest sequence)
+  # packing_gather_tokens: 262144  # tree: K/V rows the attention gathers per layer (0 = 8 x the token budget)
+```
+
+What `tree` shares, and how:
+
+- **The student's forward and backward, and every hf teacher's forward.** Softmax attention reads each segment's root-to-segment path in one variable-length flash call; Gated DeltaNet layers (Qwen3.5) run once per tree level, each segment from its parent's state. Gradients reach a shared prompt token from every completion below it.
+- **Each model packs its own tokens.** A teacher that reads another prompt than the student (privileged context, a view without the tools, another tokenizer for `xtok`) shares its own prompt among the group's completions; nothing assumes the two prompts are alike.
+- **Several teachers.** Samples are routed to their teacher as before; each teacher's samples form their own rows, and a prompt's completions stay together.
+- **Agent traces.** A trace is one trie: the trunk is forwarded once under every regenerated turn and onset branch, and the recorded-turn positions are read from the same pass. Several traces share a row. This replaces the chunk-wise pass of `seco_tree` (one no-grad forward of the trunk, then a recomputation chunk by chunk) with one forward and one backward that hold the whole row's activations: use it for traces that fit `train.packing_tokens` (default `tree_chunk_size + tree_branch_tokens`), and keep `padded` for traces far longer than that (a sequence longer than the budget is still forwarded whole).
+- **Only what pays.** A tree level costs the recurrent layers a kernel call and the attention a gathered path, whatever it saves. A row becomes a tree when its shared runs together save more than its levels cost (`tree_packing.TREE_MIN_SAVED` forwarded tokens per level); the few tokens completions happen to start alike are copied, not shared, and a row that would not gain is laid out flat (`varlen`).
+
+The losses do not change: `full_rkl` (the fused head kernel included), `topk_kl`, `sampled_rkl`, `rs_kd` and `xtok` read the hidden states of the completion positions gathered from the row, in the order the padded path yields them. On float64 models (tiny Qwen3 and Qwen3.5, `tests/test_opd_packing.py`) the teacher's hidden states, every loss statistic and `dev_kl` equal the padded path's to 1e-10 and the student's gradients to 1e-6 (relative), with privileged and tool views, two teachers, and traces with onset branches. Two things depend on how sequences are grouped into micro-batches, and so differ between modes without being wrong: `loss.token_weighting: entropy` keeps the highest-entropy tokens *of each micro-batch*, and `rs_kd` draws its samples micro-batch by micro-batch.
+
+What it does not cover:
+
+- **vLLM teachers** score on their server as before, one prefill-only request per completion; the server's own prefix cache serves what it serves for such requests (vLLM recomputes the prefill of a request that asks for `prompt_logprobs`, see [a vLLM teacher for agent traces](#a-vllm-teacher-for-agent-traces)). `train.packing` then applies to the student only.
+- **Rollouts** are the engine's (vLLM / SGLang prefix caching: `rollout.prefix_caching`).
+- **Models** need softmax attention configured for sdpa and, for recurrent layers, transformers' Gated DeltaNet; sliding-window attention, attention softcapping and other recurrent layers (Mamba) are refused at startup with the reason. `varlen` on agent traces is refused (it would forward every turn's context again).
+
+Memory: a packed micro-batch holds `train.packing_tokens` tokens of activations, by default what a padded micro-batch holds at most (`score_micro_seqs` × the longest sequence), so more completions fit a forward. If it does not fit, lower `train.packing_tokens`; `model.gradient_checkpointing` works with packed rows.
+
+**Measured** (`scripts/gpu_checks/opd_tree.sh`: one A100 80GB, Qwen3.5-0.8B student, Qwen3.5-2B teacher, `full_rkl`, 8 prompts per step, median of 3 steps on the same sampled batch). *To be filled from the GPU check; the pre-registered target is a step at least 25% faster at group size 8 with the same dev KL (|Δ| < 0.01), and the mode is not recommended below 10%.*
+
+| Group size | Mode | Step (s) | Teacher (s) | Student (s) | Trained tokens/s | Teacher share | Peak GiB | Step time vs padded | dev KL Δ |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | padded | TBD | TBD | TBD | TBD | TBD | TBD | — | — |
+| 4 | varlen | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 4 | tree | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 8 | padded | TBD | TBD | TBD | TBD | TBD | TBD | — | — |
+| 8 | varlen | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 8 | tree | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 16 | padded | TBD | TBD | TBD | TBD | TBD | TBD | — | — |
+| 16 | varlen | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 16 | tree | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+
+What to expect before the numbers: packing shortens the two backbones' passes, by the share of forwarded tokens it removes (a 300-token prompt under eight 300-token completions: 2700 tokens instead of 4800). The rollout and the output-head work of the loss (one projection per completion token, per model) are the same in every mode, so the step gains less than the backbones do, and little when prompts are short next to the completions.
+
 ### Sparse teacher targets and token selection
 
 Same setup (Qwen3.5-4B → 0.8B, 100 steps, one seed each; one standard error on 200 questions is ~3.4 points):
@@ -672,4 +725,4 @@ Every `train.save_steps` steps the trainer writes `output_dir/step_N`: the stude
 
 With `rollout.sleep: false` the vLLM engine keeps its `gpu_memory_utilization` share while the trainer trains, which saves the wake-up each step (about 1 s for Qwen3.5-0.8B) when it fits: models with little KV cache per token (hybrid linear-attention models, small models) need only a small share.
 
-Student (fp32 master weights + bf16 autocast, AdamW) and frozen bf16 hf teachers share the GPU; the `vllm` rollout engine takes `rollout.gpu_memory_utilization` of it only while it generates. If it does not fit: lower `train.score_micro_seqs` (gradient accumulation keeps the math identical), enable `model.gradient_checkpointing`, move a teacher to another GPU (`device`), or offload it between uses (`offload`). vLLM's sleep mode is not compatible with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+Student (fp32 master weights + bf16 autocast, AdamW) and frozen bf16 hf teachers share the GPU; the `vllm` rollout engine takes `rollout.gpu_memory_utilization` of it only while it generates. If it does not fit: lower `train.score_micro_seqs` (gradient accumulation keeps the math identical; with `train.packing` varlen / tree, `train.packing_tokens`), enable `model.gradient_checkpointing`, move a teacher to another GPU (`device`), or offload it between uses (`offload`). vLLM's sleep mode is not compatible with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.

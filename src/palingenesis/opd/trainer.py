@@ -44,6 +44,7 @@ from palingenesis.opd.config import OPDConfig, OPDConfigError, TeacherConfig, ro
 from palingenesis.opd.formatting import encode_prompt
 from palingenesis.opd.fused_rkl import fused_full_rkl
 from palingenesis.opd.orchestrator import Batch, Orchestrator, Pipeline, PublishedWeights, Request, Sample, TeacherRoute
+from palingenesis.opd.packing import Packing, gather_index, packed_states, support_for
 from palingenesis.opd.rollout import HFRollout, Sampling, VLLMColocateRollout, VLLMServer, VLLMServerRollout
 from palingenesis.opd.sglang_rollout import (
     SGLangRollout,
@@ -242,6 +243,7 @@ class OPDTrainer:
                     teacher.model, teacher.device or self.device, teacher.offload, seed=config.train.seed
                 )
                 use_chunk_attention(teachers[name].model)
+        self._enable_packing(teachers)
 
         if rollout.backend == "hf":
             engine = HFRollout(self.student, self.stop_ids, self.pad_id, rollout.micro_seqs)
@@ -373,6 +375,38 @@ class OPDTrainer:
                 "opd",
                 functools.partial(_dump_record, self.tok, config.logging.dump_content),
             )
+
+    def _packing(self) -> Packing | None:
+        """train.packing varlen / tree and its budgets (None: padded)."""
+        train = self.config.train
+        if train.packing == "padded":
+            return None
+        return Packing(train.packing, train.packing_tokens, train.packing_gather_tokens)
+
+    def _enable_packing(self, teachers: dict) -> None:
+        """train.packing varlen / tree: the student and the hf teachers checked and routed for packed rows, before
+        anything is generated (a model that cannot run them exactly is a configuration error)."""
+        from palingenesis.tree_packing import PackingError
+
+        packing = self._packing()
+        if packing is None:
+            return
+        try:
+            self.packing_support = support_for(self.student, self.device)
+        except PackingError as error:
+            raise OPDConfigError(f"train.packing {packing.mode}: the student: {error}") from error
+        for name, teacher in teachers.items():
+            if not isinstance(teacher, HFTeacher):
+                logger.info(
+                    "train.packing %s: teacher %s scores on its vLLM server as before (one request per completion)",
+                    packing.mode,
+                    name,
+                )
+                continue
+            try:
+                teacher.enable_packing(packing)
+            except PackingError as error:
+                raise OPDConfigError(f"train.packing {packing.mode}: teachers.{name}: {error}") from error
 
     def _make_pipeline(self, engine, overlap: bool):
         """The rollout pipeline (a subclass for other data shapes, e.g. agent traces)."""
@@ -508,10 +542,22 @@ class OPDTrainer:
         name = samples[0].teacher
         kind, route, loss = self.kinds[name], self.routes[name], self.config.loss
         device = self.device
-        ids, mask = right_pad([s.request.prompt_ids + s.completion[:-1] for s in samples], self.pad_id, device)
-        positions = completion_positions(
-            [len(s.request.prompt_ids) for s in samples], [len(s.completion) for s in samples], ids.shape[1]
-        ).to(device)
+        sequences = [s.request.prompt_ids + s.completion[:-1] for s in samples]
+        packing = self._packing()
+        if packing is None:
+            ids, mask = right_pad(sequences, self.pad_id, device)
+            positions = completion_positions(
+                [len(s.request.prompt_ids) for s in samples], [len(s.completion) for s in samples], ids.shape[1]
+            ).to(device)
+            row = shared = None
+        else:  # one row: the sequences end to end, or their prefix trie (each group's prompt once)
+            row = packing.row(sequences)
+            positions = gather_index(
+                row, [(i, len(s.request.prompt_ids) - 1, len(s.completion)) for i, s in enumerate(samples)], device
+            )
+            mask = torch.ones(1, row.num_tokens, dtype=torch.long)
+            # a shared token counts for every sequence through it in the MoE expert loads, as in the padded rows
+            shared = None if row.flat else torch.from_numpy(row.multiplicity())[None]
         targets = torch.tensor([t for s in samples for t in s.completion], device=device)
         token_weights = torch.tensor([w for s, w in zip(samples, weights) for _ in s.completion], device=device)
         behaviour = None
@@ -527,13 +573,16 @@ class OPDTrainer:
 
         balancer = getattr(self, "router_balancer", None) if train else None
         if balancer is not None:
-            balancer.begin(mask, grad_accum=self._moe_micro_batches)
+            balancer.begin(mask, grad_accum=self._moe_micro_batches, token_weight=shared)
         with (
             torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=device.startswith("cuda")),
             torch.set_grad_enabled(train),
         ):
             # right-padded rows: no mask (padding after a row cannot reach it; flash attention)
-            hidden = final_hidden_states(self.student, ids, None)[positions]
+            if row is None:
+                hidden = final_hidden_states(self.student, ids, None)[positions]
+            else:
+                hidden = packed_states(self.student, self.packing_support, row, device)[positions]
             token_weights = self._token_weights(token_weights, hidden, behaviour)
             if kind == "full_rkl":
                 for s in samples:  # made on the pipeline's CUDA stream: keep until this stream is done
@@ -671,27 +720,39 @@ class OPDTrainer:
         valid[:, -1] &= ~(support[:, -1:] == support[:, :-1]).any(1)  # actual token already in the top-k
         return chunks, losses.DenseTargets(torch.tensor(dense_rows, device=device), mapped, teacher_lp, valid)
 
+    def _micro_batches(self, samples: list[Sample], name: str) -> list[list[Sample]]:
+        """The scoring micro-batches of teacher `name`'s samples: train.score_micro_seqs sequences of similar
+        length (padded), or packed rows within the token budget, a prompt's completions together (opd.packing)."""
+        group = [s for s in samples if s.teacher == name]
+        if not group:
+            return []
+        micro_seqs = self.config.train.score_micro_seqs
+        packing = self._packing()
+        if packing is not None:
+            parts = packing.micro_batches(
+                [s.request.prompt_ids + s.completion[:-1] for s in group],
+                [len(s.completion) for s in group],
+                micro_seqs,
+            )
+            return [[group[i] for i in part] for part in parts]
+        group.sort(key=lambda s: len(s.completion))
+        return [group[start : start + micro_seqs] for start in range(0, len(group), micro_seqs)]
+
     def _scores(self, batch: Batch, train: bool) -> dict[str, float]:
         """Loss over a whole batch in micro-batches per teacher; per-teacher sums of the stats."""
         samples = batch.samples
         total_tokens = sum(len(s.completion) for s in samples)
         stats: dict[str, float] = defaultdict(float)
-        micro_seqs = self.config.train.score_micro_seqs
-        # micro-batches of this step: the MoE balancing losses are averaged over them
-        self._moe_micro_batches = max(
-            1, sum(-(-sum(s.teacher == name for s in samples) // micro_seqs) for name in self.routes)
-        )
-        for name in self.routes:
-            group = sorted((s for s in samples if s.teacher == name), key=lambda s: len(s.completion))
-            for start in range(0, len(group), self.config.train.score_micro_seqs):
-                micro = group[start : start + self.config.train.score_micro_seqs]
-                weights = [
-                    1.0 / (len(s.completion) * len(samples)) if self.config.loss.length_norm else 1.0 / total_tokens
-                    for s in micro
-                ]
-                for k, v in self._score(micro, weights, train).items():
-                    stats[f"{k}/{name}"] += v
-                stats[f"samples/{name}"] += len(micro)
+        micro_batches = [(name, micro) for name in self.routes for micro in self._micro_batches(samples, name)]
+        self._moe_micro_batches = max(1, len(micro_batches))  # the MoE balancing losses are averaged over them
+        for name, micro in micro_batches:
+            weights = [
+                1.0 / (len(s.completion) * len(samples)) if self.config.loss.length_norm else 1.0 / total_tokens
+                for s in micro
+            ]
+            for k, v in self._score(micro, weights, train).items():
+                stats[f"{k}/{name}"] += v
+            stats[f"samples/{name}"] += len(micro)
         return stats
 
     # ------------------------------------------------------------------- train

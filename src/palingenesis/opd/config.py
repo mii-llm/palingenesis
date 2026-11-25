@@ -25,6 +25,7 @@ TOKEN_WEIGHTINGS = ("none", "sure", "entropy")
 SOURCE_FORMATS = ("messages", "mcqa", "agent_traces")
 ROLLOUT_BACKENDS = ("hf", "vllm", "vllm_server", "sglang", "sglang_server")
 TEACHER_BACKENDS = ("hf", "vllm")
+PACKING_MODES = ("padded", "varlen", "tree")  # train.packing (palingenesis.opd.packing)
 
 
 @dataclass(slots=True)
@@ -346,6 +347,22 @@ class OPDTrainConfig:
     max_grad_norm: float = 1.0
     seed: int = 0
     score_micro_seqs: int = 16  # sequences per scoring forward (student and teacher)
+    # How a scoring micro-batch is laid out for the student's forward / backward and the hf teachers' forward
+    # (palingenesis.opd.packing over palingenesis.tree_packing):
+    #   padded  right-padded rows, one per completion (agent_traces: the chunk-wise tree of seco_tree)
+    #   varlen  one row, the sequences end to end: no padding
+    #   tree    one row, the sequences' prefix trie: a group's prompt is forwarded once for its group_size
+    #           completions (agent_traces: the trunk once for every regenerated turn and onset branch), by each
+    #           model on its own token sequences (a privileged teacher prompt is shared among its completions)
+    # Both packed modes compute the same losses and gradients as padded (up to floating-point order). They need
+    # softmax attention configured for sdpa and Gated DeltaNet recurrent layers. vLLM teachers score through their
+    # server as before.
+    packing: str = "padded"
+    # packing varlen / tree: packed tokens per micro-batch (0 = score_micro_seqs x the longest sequence of the
+    # batch, what a padded micro-batch holds at most; agent_traces: tree_chunk_size + tree_branch_tokens)
+    packing_tokens: int = 0
+    # packing tree: K/V rows a micro-batch's attention may gather per layer (0 = 8 x the token budget)
+    packing_gather_tokens: int = 0
     eval_every: int = 50  # dev metrics every N steps, and before the first (0 = off)
     eval_samples: int = 200  # dev prompts per source
     # Also sample each messages source's dev prompts at this sampling ({temperature, top_p, top_k, presence_penalty},
@@ -691,6 +708,37 @@ class OPDConfig:
                 errors.append(f"train.tree_chunk_size must be >= 64, got {self.train.tree_chunk_size}.")
             if self.train.tree_branch_tokens < 0:
                 errors.append("train.tree_branch_tokens must be >= 0 (0 = one turn at a time).")
+        train = self.train
+        if train.packing not in PACKING_MODES:
+            errors.append(f"train.packing must be one of {PACKING_MODES}, got {train.packing!r}.")
+        else:
+            packed = train.packing != "padded"
+            for key in ("packing_tokens", "packing_gather_tokens"):
+                value = getattr(train, key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    errors.append(f"train.{key} must be an integer >= 0 (0 = automatic), got {value!r}.")
+                elif value and not packed:
+                    errors.append(f"train.{key}: only used with train.packing varlen or tree.")
+            if train.packing_gather_tokens and train.packing == "varlen":
+                errors.append(
+                    "train.packing_gather_tokens: only used with train.packing tree (varlen gathers nothing)."
+                )
+            if (
+                train.packing == "tree"
+                and isinstance(train.packing_tokens, int)
+                and isinstance(train.packing_gather_tokens, int)
+                and 0 < train.packing_gather_tokens < train.packing_tokens
+            ):
+                errors.append(
+                    f"train.packing_gather_tokens ({train.packing_gather_tokens}) must be >= train.packing_tokens "
+                    f"({train.packing_tokens}): a row gathers at least its own tokens."
+                )
+            if train.packing == "varlen" and "agent_traces" in formats:
+                errors.append(
+                    "train.packing varlen with agent_traces: end to end, every regenerated turn would forward its "
+                    "whole context again. Use train.packing tree (the trace as one prefix trie) or padded (the "
+                    "chunk-wise tree, train.tree_chunk_size)."
+                )
         if self.loss.trace_kd_weight < 0:
             errors.append(f"loss.trace_kd_weight must be >= 0, got {self.loss.trace_kd_weight}.")
         if self.loss.trace_branch_weight < 0:

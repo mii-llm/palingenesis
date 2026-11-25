@@ -546,6 +546,34 @@ def pack_groups(sequences: list[list[int]] | list[np.ndarray], groups: list, sha
     return PackedRow.build(sequences, False)
 
 
+def pack_amortized(sequences: list[list[int]] | list[np.ndarray], share: bool = True) -> PackedRow:
+    """The packed row of sequences whose shared runs are short one by one and many together (on-policy
+    distillation: the prompts of a micro-batch's groups, a few hundred tokens each under their k completions). pack
+    asks every shared run to save a tree level's cost by itself; here the levels are paid for by the row: the
+    layout is the one with the lowest cost (forwarded tokens + TREE_MIN_SAVED per level below the roots) among the
+    tries that keep the runs saving at least TREE_MIN_SAVED, a quarter of it, a sixteenth, ... forwarded tokens
+    (shorter runs copied into their branches: the first tokens completions happen to agree on would each add a
+    level). A row that no tree makes cheaper is laid out flat (varlen)."""
+    if share:
+        arrays = [np.asarray(s, dtype=np.int64) for s in sequences]
+        if not arrays or any(len(a) == 0 for a in arrays):
+            raise PackingError("packing needs at least one sequence, each of at least one token")
+        trie = _Trie(arrays, share=True)
+        for i in range(len(arrays)):
+            trie.insert(i)
+        total = sum(len(a) for a in arrays)
+        best, best_cost, threshold = None, total, TREE_MIN_SAVED
+        while threshold >= 1:
+            row = PackedRow._layout(trie, threshold)
+            cost = row.num_tokens + TREE_MIN_SAVED * (len(row.levels) - 1)
+            if cost < best_cost:
+                best, best_cost = row, cost
+            threshold //= 4
+        if best is not None:
+            return best
+    return PackedRow.build(sequences, False)
+
+
 def forward_packed(model: nn.Module, support: PackingSupport, row: PackedRow, device) -> torch.Tensor:
     """The final hidden states [1, N, H] of a packed row (FSDP-safe: palingenesis.logits.final_hidden_states).
     transformers builds no attention mask for it (seco.PACKED_VARLEN): the layers read the row's layout from the
