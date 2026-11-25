@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import itertools
 import logging
 import threading
@@ -231,7 +232,9 @@ class RemotePool:
     def make_client(self, merge: bool = False, adapter: str = "") -> "RemoteClient":
         return RemoteClient(self, adapter)
 
-    async def _request(self, prompt_ids, max_new_tokens, temperature, adapter: str) -> Generation:
+    async def _request(
+        self, prompt_ids, max_new_tokens, temperature, adapter: str, continuing: bool = False
+    ) -> Generation:
         if dataclasses.is_dataclass(temperature):  # opd.rollout.Sampling
             temperature = dataclasses.asdict(temperature)
         else:
@@ -248,18 +251,20 @@ class RemotePool:
             if not alive:
                 gone = "; ".join(f"{e.address}: {e.dead}" for e in self.engines)
                 raise ConnectionError(f"no engine worker is left to generate with ({gone})")
-            if self.gate is not None:  # rollout.concurrency kv: the engine with the most room under its cap
-                address = await self.gate.acquire([e.address for e in alive])
-                engine = next(e for e in alive if e.address == address)
-            else:
-                engine = min(alive, key=lambda e: e.load)
             try:
-                reply = await self._ask(engine, header)
+                if self.gate is not None:  # rollout.concurrency kv: the engine with the most room under its cap
+                    address = await self.gate.acquire([e.address for e in alive], priority=continuing)
+                    engine = next(e for e in alive if e.address == address)
+                    # The slot is held until the worker answers (or is lost): a caller that is cancelled leaves
+                    # its request generating on the worker, which has no abort, so the slot stays taken.
+                    ask = asyncio.ensure_future(self._ask(engine, header))
+                    ask.add_done_callback(functools.partial(self._answered, address))
+                    reply = await asyncio.shield(ask)
+                else:
+                    engine = min(alive, key=lambda e: e.load)
+                    reply = await self._ask(engine, header)
             except EngineLost:
                 continue  # the request starts again on an engine that is still there
-            finally:
-                if self.gate is not None:
-                    self.gate.release(engine.address)
             if "error" in reply:
                 raise RuntimeError(f"engine worker {engine.address}: {reply['error']}")
             return Generation(
@@ -270,6 +275,13 @@ class RemotePool:
                 reply["first_version"],
                 candidates=Candidates.from_tensors(reply.get("tensors") or {}),
             )
+
+    def _answered(self, address: str, ask: asyncio.Future) -> None:
+        """A gated request was answered (or its engine lost): free its slot, and take the exception a cancelled
+        caller will not read."""
+        self.gate.release(address)
+        if not ask.cancelled():
+            ask.exception()
 
     async def _load(self, address: str) -> EngineLoad | None:
         """An engine's load as its worker reports it in `state` (None: the worker's engine reports none)."""
@@ -509,11 +521,14 @@ class RemoteClient:
     def paused(self):
         return self.engine_lock
 
-    async def generate(self, prompt_ids, max_new_tokens, temperature, images: list | None = None) -> Generation:
+    async def generate(
+        self, prompt_ids, max_new_tokens, temperature, images: list | None = None, continuing: bool = False
+    ) -> Generation:
+        """`continuing`: a later turn of a running episode (rollout.concurrency kv admits it first)."""
         if images:
             raise NotImplementedError("remote engines do not take images yet")
         self.calls += 1
-        coroutine = self.pool._request(prompt_ids, max_new_tokens, temperature, self.adapter)
+        coroutine = self.pool._request(prompt_ids, max_new_tokens, temperature, self.adapter, continuing)
         return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coroutine, self.pool.loop))
 
     def close(self) -> None:

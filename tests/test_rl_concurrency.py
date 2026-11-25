@@ -272,6 +272,187 @@ def test_a_request_goes_to_the_engine_with_the_most_room():
     assert metrics["rollout/concurrency_cap"] == 8 and metrics["rollout/concurrency"] == 7
 
 
+def _still_gate(cap: int, keys=("",), maximum: int = 16) -> AdmissionGate:
+    """A gate whose caps stay at `cap` (no poll within the test)."""
+    feed = FakeFeed([EngineLoad(kv_usage=0.7, waiting=0.0)], (1000 * cap, 1000))
+    return AdmissionGate(settings(minimum=1, maximum=maximum, poll_s=60.0), list(keys), feed.fetch, feed.capacity)
+
+
+def test_waiting_requests_are_admitted_first_come_first_served():
+    gate = _still_gate(1)
+
+    async def run():
+        order = []
+
+        async def request(i):
+            key = await gate.acquire()
+            order.append(i)
+            await asyncio.sleep(0.001)
+            gate.release(key)
+
+        held = await gate.acquire()
+        tasks = []
+        for i in range(12):
+            tasks.append(asyncio.ensure_future(request(i)))
+            await asyncio.sleep(0)  # each reaches the gate before the next starts
+        await asyncio.sleep(0.01)
+        late = asyncio.ensure_future(request("late"))  # arrives while the others wait: it does not barge
+        gate.release(held)
+        await asyncio.gather(*tasks, late)
+        gate.close()
+        return order
+
+    assert asyncio.run(run()) == [*range(12), "late"]
+
+
+def test_continuing_episodes_go_before_new_ones_and_engines_do_not_block_each_other():
+    gate = _still_gate(1, keys=("a", "b"))
+
+    async def run():
+        order = []
+
+        async def request(name, keys=None, priority=False):
+            key = await gate.acquire(keys, priority=priority)
+            order.append((name, key))
+
+        assert sorted([await gate.acquire(), await gate.acquire()]) == ["a", "b"]
+        tasks = [asyncio.ensure_future(request("new-1", ["a"]))]
+        await asyncio.sleep(0)
+        tasks.append(asyncio.ensure_future(request("new-2")))
+        await asyncio.sleep(0)
+        tasks.append(asyncio.ensure_future(request("turn-2", ["a"], priority=True)))
+        await asyncio.sleep(0.01)
+        gate.release("b")  # the oldest waiter cannot use "b": the next one that can takes it
+        await asyncio.sleep(0.01)
+        assert order == [("new-2", "b")]
+        gate.release("a")  # the continuing episode goes before the older first turn
+        await asyncio.sleep(0.01)
+        assert order == [("new-2", "b"), ("turn-2", "a")]
+        gate.release("a")
+        await asyncio.gather(*tasks)
+        gate.close()
+        return order
+
+    assert asyncio.run(run())[-1] == ("new-1", "a")
+
+
+def test_a_cancelled_waiter_leaves_the_queue_and_takes_no_slot():
+    gate = _still_gate(1)
+
+    async def run():
+        held = await gate.acquire()
+        first = asyncio.ensure_future(gate.acquire())
+        second = asyncio.ensure_future(gate.acquire())
+        await asyncio.sleep(0.01)
+        first.cancel()
+        await asyncio.sleep(0.01)
+        assert not any(gate.waiters[0]) and len(gate.waiters[1]) == 1
+        gate.release(held)
+        assert await asyncio.wait_for(second, 5) == ""
+        # granted and cancelled before it ran again: the slot goes back, to the next in line
+        third = asyncio.ensure_future(gate.acquire())
+        fourth = asyncio.ensure_future(gate.acquire())
+        await asyncio.sleep(0.01)
+        gate.release("")  # grants `third` (its future is set; its task has not resumed)
+        third.cancel()
+        assert await asyncio.wait_for(fourth, 5) == ""
+        assert gate.slots[""].in_flight == 1
+        with pytest.raises(ValueError, match="no engine"):
+            await gate.acquire(["gone"])
+        assert gate.slots[""].waiting == 0
+        gate.close()
+        return gate.metrics()
+
+    metrics = asyncio.run(run())
+    assert metrics["rollout/concurrency"] == 1 and metrics["rollout/gate_waits"] == 2
+
+
+def test_a_cancelled_rollout_keeps_its_slot_until_the_engine_is_done():
+    """The engine has no abort: a request whose caller was cancelled still generates, so its slot is released when
+    the engine resolves it, and a failed request's slot when it fails."""
+    from palingenesis.opd.rollout import Rollout
+    from palingenesis.rl.generation import GenerationClient
+
+    class SlowEngine:
+        def __init__(self):
+            self.go, self.calls = threading.Event(), 0
+
+        def generate(self, prompts, max_new_tokens, temperature):
+            self.calls += 1
+            if prompts[0] == [13]:
+                raise RuntimeError("engine failure")
+            assert self.go.wait(10)
+            return [Rollout([1], [-0.1], "stop", 0) for _ in prompts]
+
+    engine, gate = SlowEngine(), _still_gate(1)
+    client = GenerationClient(engine, gate=gate)
+
+    async def run():
+        client.enter()
+        first = asyncio.ensure_future(client.generate([1], 4, 1.0))
+        await asyncio.sleep(0.2)  # in the engine
+        second = asyncio.ensure_future(client.generate([2], 4, 1.0, continuing=True))
+        await asyncio.sleep(0.05)
+        first.cancel()
+        await asyncio.sleep(0.2)
+        assert first.cancelled() and gate.slots[""].in_flight == 1  # still the engine's
+        assert not second.done() and engine.calls == 1  # the second request was not sent on top of it
+        engine.go.set()
+        assert (await asyncio.wait_for(second, 10)).ids == [1]
+        assert gate.slots[""].finished == 2
+        with pytest.raises(RuntimeError, match="engine failure"):
+            await client.generate([13], 4, 1.0)
+        await asyncio.sleep(0)
+        assert gate.slots[""].in_flight == 0 and gate.slots[""].finished == 3
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(run())
+    finally:
+        client.close()
+        loop.close()
+
+
+def test_metrics_are_read_and_reset_under_the_locks_of_their_writers():
+    gate = _still_gate(4)
+    controller = gate.slots[""].controller
+    stop, errors = threading.Event(), []
+
+    def reader():
+        while not stop.is_set():
+            time.sleep(0.0005)
+            try:
+                gate.metrics()
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+    async def run():
+        async def request():
+            key = await gate.acquire()
+            await asyncio.sleep(0)
+            gate.release(key)
+
+        await asyncio.gather(*(request() for _ in range(500)))
+        gate.close()
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    try:
+        for i in range(200):  # preemptions arrive while another thread reads and resets them
+            controller.observe(EngineLoad(kv_usage=0.7, waiting=0.0, preemptions=float(i)), 0, 0, False)
+        asyncio.run(run())
+    finally:
+        stop.set()
+        thread.join()
+    assert not errors and gate.slots[""].in_flight == 0 and gate.slots[""].finished == 500
+    assert gate.totals.admitted == 500
+    # every preemption was reported exactly once: none lost between a read and its reset
+    controller.observe(EngineLoad(kv_usage=0.7, waiting=0.0, preemptions=250.0), 0, 0, False)
+    snapshot = controller.snapshot(reset=True)
+    assert snapshot["preempted"] <= 250.0 - 0.0 and controller.snapshot()["preempted"] == 0.0
+    assert gate.metrics()["rollout/preemptions"] == 0.0
+
+
 def test_merged_metrics_take_the_highest_usage_and_sum_the_rest():
     merged = merge_metrics(
         [
@@ -420,9 +601,19 @@ def test_engine_workers_report_their_load_and_the_pool_keeps_each_under_its_cap(
         time.sleep(0.5)
         assert pool.gate.slots[address].controller.cap == 2  # 64 KV tokens / max_model_len 32
         assert pool.gate.slots[address].in_flight == 2 and not any(f.done() for f in futures)
+        # a caller that gives up leaves its request on the worker (no abort): the slot stays taken
+        running = [f for f in futures if not f.done()]
+        futures[0].cancel()
+        time.sleep(0.3)
+        assert pool.gate.slots[address].in_flight == 2
         hold.unlink()
-        replies = [f.result(30) for f in futures]
+        replies = [f.result(30) for f in futures[1:]]
+        assert len(running) == 5
         assert max(ids[1] for ids in (r.ids for r in replies)) <= 2  # the engine never held more than 2 at once
+        deadline = time.time() + 10
+        while pool.gate.slots[address].in_flight and time.time() < deadline:
+            time.sleep(0.01)
+        assert pool.gate.slots[address].in_flight == 0
         state = pool.state()[0]
         assert state["load"]["kv_tokens"] == 64 and state["load"]["kv_usage"] == 0.7
     finally:

@@ -424,12 +424,15 @@ class RLPipeline:
                 t_generate = clock()
                 # stop resampling (evaluation only): a turn that would stop the episode is sampled again
                 resamples = 0 if training or env is None or turn == max_turns - 1 else r.stop_resample
+                # rollout.concurrency kv: a later turn of this episode goes before requests that start one
+                gated = turn > 0 and getattr(self.client, "gate", None) is not None
                 for attempt in range(resamples + 1):
                     out = await self.client.generate(
                         trajectory.prompt_ids + trajectory.tokens,
                         room,
                         temperature,
                         *([trajectory.images] if trajectory.images else []),  # only multimodal engines take images
+                        **({"continuing": True} if gated else {}),
                     )
                     if vision is not None and vision.image_token_id in out.ids:
                         # an image placeholder is an input; sampled, it has no image to stand for

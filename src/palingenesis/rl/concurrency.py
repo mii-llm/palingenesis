@@ -18,7 +18,9 @@ otherwise read as an idle engine and raise the cap). After TRL's AsyncGRPOTraine
 `_control_loop`, https://github.com/huggingface/trl), whose thresholds and factors these are.
 
 `AdmissionGate` is what requests acquire, from one asyncio event loop: one controller per engine (a vLLM server,
-or each worker of an engine pool), and a request goes to the engine with the most room. `TokenAllowance` bounds,
+or each worker of an engine pool), and a request goes to the engine with the most room. Requests wait first come,
+first served, the later turns of running episodes before requests that start one, and a slot is held until the
+engine is done with its request (a cancelled caller does not free it early). `TokenAllowance` bounds,
 in tokens, how far rollout generation may run ahead of what a batch needs (rollout.token_allowance).
 
 Nothing here imports torch or vLLM: configuration checks reach this module.
@@ -27,6 +29,7 @@ Nothing here imports torch or vLLM: configuration checks reach this module.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import math
@@ -36,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +271,21 @@ class KVController:
                     self.cap, self.at_change, self.raises = cap, finished, self.raises + 1
             return self.cap
 
+    def snapshot(self, reset: bool = False) -> dict:
+        """The cap, the last load, the cuts and raises since the start and the preemptions since the last reset,
+        read together (`reset`: start counting preemptions again)."""
+        with self.lock:
+            state = {
+                "cap": self.cap,
+                "last": self.last,
+                "cuts": self.cuts,
+                "raises": self.raises,
+                "preempted": self.preempted,
+            }
+            if reset:
+                self.preempted = 0.0
+            return state
+
 
 # ── the gate requests acquire ──────────────────────────────────────────────────
 
@@ -278,6 +296,7 @@ class _Slot:
     in_flight: int = 0
     finished: int = 0
     saturated: bool = False  # a request waited for this engine since the last poll
+    waiting: int = 0  # requests waiting at the gate that may go to this engine
 
 
 @dataclass
@@ -286,17 +305,34 @@ class _Totals:
     wait_s: float = 0.0
     admitted: int = 0
     peak: int = 0
-    samples: list = field(default_factory=list)
+
+
+@dataclass(eq=False)
+class _Waiter:
+    future: asyncio.Future  # resolved with the engine key the request goes to
+    keys: list[str]  # the engines it may go to
 
 
 class AdmissionGate:
     """Requests in flight to one or more engines, each under its controller's cap. Used from one event loop:
     `acquire(keys)` returns the engine key a request goes to (the one with the most room among `keys`), waiting
-    while every one of them is at its cap; `release(key)` when its answer is in.
+    while every one of them is at its cap; `release(key)` when the engine is done with the request.
+
+    Order. Waiting requests are admitted first come, first served, per engine: a slot that frees on an engine
+    goes to the request that has waited longest among those that may use it. Requests with `priority` (the later
+    turns of an episode that is already running) go before all the others: an episode in flight holds an
+    environment, its engine's prefix cache and a place in its batch, so finishing it comes before starting a new
+    one, and its turns are not starved by first turns when the cap is cut.
+
+    Release. A slot is the engine's work, not the caller's wait: a caller that gives up (a cancelled rollout)
+    must release only when the engine has finished or aborted the request, or the cap would undercount what the
+    engine is running (GenerationClient and the engine pool release from the request's own completion).
+
+    The wait at the gate is part of the caller's time: a timeout around an episode (scenario.timeout) counts it.
 
     `fetch(key)`: an engine's load (a coroutine; None when it could not be read). `capacity(key)`: (KV-cache tokens,
     max_model_len) for the first cap, read on the first acquire. The poller runs on the gate's loop from the first
-    acquire until `close()`."""
+    acquire until `close()`. `metrics()` may be called from any thread."""
 
     def __init__(
         self,
@@ -308,11 +344,16 @@ class AdmissionGate:
         self.settings = settings
         self.slots = {key: _Slot(KVController(settings, key)) for key in keys}
         self.fetch, self.capacity = fetch, capacity
-        self.changed: asyncio.Condition | None = None
         self.poller: asyncio.Task | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.starting: asyncio.Task | None = None
+        # requests waiting for a slot, oldest first: continuing episodes (priority), then the others
+        self.waiters: tuple[collections.deque[_Waiter], collections.deque[_Waiter]] = (
+            collections.deque(),
+            collections.deque(),
+        )
         self.totals = _Totals()
+        self.lock = threading.Lock()  # the slots' counts and the totals: the loop writes, metrics() reads and resets
         self.closed = False
 
     # -------------------------------------------------------------- admission
@@ -336,55 +377,85 @@ class AdmissionGate:
             ", ".join(f"{key or 'engine'} {slot.controller.cap}" for key, slot in self.slots.items()),
         )
 
-    async def acquire(self, keys: list[str] | None = None) -> str:
-        if self.changed is None:
+    async def acquire(self, keys: list[str] | None = None, priority: bool = False) -> str:
+        """The engine key a request goes to, once one of `keys` (None: any engine) has room under its cap.
+        `priority`: a later turn of a running episode, admitted before requests that start one."""
+        if self.starting is None:
             self.loop = asyncio.get_running_loop()
-            self.changed = asyncio.Condition()
             self.starting = asyncio.ensure_future(self._start())
             self.poller = asyncio.ensure_future(self._poll())
         await asyncio.shield(self.starting)
+        candidates = [k for k in (keys if keys is not None else self.slots) if k in self.slots]
+        if not candidates:
+            raise ValueError("no engine to send the request to")
+        waiter = _Waiter(asyncio.get_running_loop().create_future(), candidates)
+        queue = self.waiters[0 if priority else 1]
+        queue.append(waiter)
+        for k in candidates:
+            self.slots[k].waiting += 1
+        self._grant()
+        if waiter.future.done():  # admitted at once
+            return waiter.future.result()
+        for k in candidates:
+            self.slots[k].saturated = True
         start = time.perf_counter()
-        waited = False
-        async with self.changed:
-            while True:
-                candidates = [k for k in (keys if keys is not None else self.slots) if k in self.slots]
-                if not candidates:
-                    raise ValueError("no engine to send the request to")
-                free = [k for k in candidates if self.slots[k].in_flight < self.slots[k].controller.cap]
-                if free:
-                    key = min(free, key=lambda k: self.slots[k].in_flight / max(self.slots[k].controller.cap, 1))
-                    break
-                waited = True
-                for k in candidates:
-                    self.slots[k].saturated = True
-                try:  # re-checked at least every second: a caller may drop an engine without notifying
-                    await asyncio.wait_for(self.changed.wait(), 1.0)
-                except asyncio.TimeoutError:
-                    pass
-        slot = self.slots[key]
-        slot.in_flight += 1
-        self.totals.admitted += 1
-        self.totals.peak = max(self.totals.peak, sum(s.in_flight for s in self.slots.values()))
-        if waited:
+        try:
+            await waiter.future
+        except BaseException:  # cancelled while waiting: leave the queue, give back a slot granted meanwhile
+            if waiter.future.done() and not waiter.future.cancelled():
+                self._give_back(waiter.future.result())
+            else:
+                self._leave(queue, waiter)
+            raise
+        key = waiter.future.result()
+        with self.lock:
             self.totals.waits += 1
             self.totals.wait_s += time.perf_counter() - start
         return key
 
+    def _leave(self, queue: collections.deque, waiter: _Waiter) -> None:
+        queue.remove(waiter)
+        for k in waiter.keys:
+            self.slots[k].waiting -= 1
+
+    def _grant(self) -> None:
+        """Admit the waiting requests that have room, oldest first, continuing episodes before new ones. A request
+        whose engines are all at their cap keeps its place; one behind it that may use another engine goes ahead
+        (it takes nothing the first could have used). Stops as soon as no engine with waiting requests has room,
+        so a call costs the requests it admits (plus those it passes over for another engine)."""
+        for queue in self.waiters:
+            for waiter in list(queue) if self._room() else ():
+                free = [k for k in waiter.keys if self.slots[k].in_flight < self.slots[k].controller.cap]
+                if not free:
+                    continue
+                key = min(free, key=lambda k: self.slots[k].in_flight / max(self.slots[k].controller.cap, 1))
+                self._leave(queue, waiter)
+                with self.lock:
+                    self.slots[key].in_flight += 1
+                    self.totals.admitted += 1
+                    self.totals.peak = max(self.totals.peak, sum(s.in_flight for s in self.slots.values()))
+                waiter.future.set_result(key)
+                if not self._room():
+                    return
+
+    def _room(self) -> bool:
+        """Whether an engine that requests wait for has room under its cap."""
+        return any(s.waiting and s.in_flight < s.controller.cap for s in self.slots.values())
+
+    def _give_back(self, key: str) -> None:
+        """A slot granted to a request that was cancelled before it used it."""
+        with self.lock:
+            self.slots[key].in_flight -= 1
+            self.totals.admitted -= 1
+        self._grant()
+
     def release(self, key: str) -> None:
-        slot = self.slots[key]
-        slot.in_flight -= 1
-        slot.finished += 1
-        self._notify()
-
-    def _notify(self) -> None:
-        if self.changed is None:
-            return
-
-        async def wake() -> None:
-            async with self.changed:
-                self.changed.notify_all()
-
-        asyncio.ensure_future(wake())
+        """The engine is done with a request admitted to `key` (finished, failed or aborted). On the gate's loop."""
+        with self.lock:
+            slot = self.slots[key]
+            slot.in_flight -= 1
+            slot.finished += 1
+        self._grant()
 
     # ---------------------------------------------------------------- polling
 
@@ -393,17 +464,14 @@ class AdmissionGate:
         while not self.closed:
             await asyncio.sleep(self.settings.poll_s)
             loads = await asyncio.gather(*(self.fetch(key) for key in self.slots), return_exceptions=True)
-            raised = False
             for (key, slot), load in zip(self.slots.items(), loads):
                 if isinstance(load, BaseException):
                     logger.warning("rollout concurrency: reading the load of %s failed: %r", key or "the engine", load)
                     load = None
-                before = slot.controller.cap
-                after = slot.controller.observe(load, slot.in_flight, slot.finished, slot.saturated)
+                saturated = slot.saturated or slot.waiting > 0
+                slot.controller.observe(load, slot.in_flight, slot.finished, saturated)
                 slot.saturated = False
-                raised |= after > before
-            if raised:
-                self._notify()
+            self._grant()  # a raised cap admits waiting requests
 
     def close(self) -> None:
         """Stop polling (from any thread)."""
@@ -420,21 +488,24 @@ class AdmissionGate:
         rollout/concurrency_peak, rollout/kv_usage (the highest), rollout/requests_waiting and
         rollout/requests_running (summed), rollout/preemptions (since the last call), rollout/gate_waits and
         rollout/gate_wait_s (requests that waited at the gate, and their total wait, since the last call),
-        rollout/cap_cuts and rollout/cap_raises (since the start)."""
-        slots = list(self.slots.values())
-        loads = [s.controller.last for s in slots]
-        out = {
-            "rollout/concurrency_cap": float(sum(s.controller.cap for s in slots)),
-            "rollout/concurrency": float(sum(s.in_flight for s in slots)),
-            "rollout/concurrency_peak": float(self.totals.peak),
-            "rollout/gate_waits": float(self.totals.waits),
-            "rollout/gate_wait_s": self.totals.wait_s,
-            "rollout/cap_cuts": float(sum(s.controller.cuts for s in slots)),
-            "rollout/cap_raises": float(sum(s.controller.raises for s in slots)),
-            "rollout/preemptions": float(sum(s.controller.preempted for s in slots)),
-        }
-        for slot in slots:
-            slot.controller.preempted = 0.0
+        rollout/cap_cuts and rollout/cap_raises (since the start). From any thread: the counters are read and
+        reset under the locks the loop updates them with."""
+        states = [slot.controller.snapshot(reset=True) for slot in self.slots.values()]
+        with self.lock:
+            in_flight = sum(s.in_flight for s in self.slots.values())
+            out = {
+                "rollout/concurrency_cap": float(sum(state["cap"] for state in states)),
+                "rollout/concurrency": float(in_flight),
+                "rollout/concurrency_peak": float(max(self.totals.peak, in_flight)),
+                "rollout/gate_waits": float(self.totals.waits),
+                "rollout/gate_wait_s": self.totals.wait_s,
+            }
+            self.totals.waits, self.totals.wait_s = 0, 0.0
+            self.totals.peak = in_flight
+        out["rollout/cap_cuts"] = float(sum(state["cuts"] for state in states))
+        out["rollout/cap_raises"] = float(sum(state["raises"] for state in states))
+        out["rollout/preemptions"] = float(sum(state["preempted"] for state in states))
+        loads = [state["last"] for state in states]
         usage = [x.kv_usage for x in loads if x.kv_usage is not None]
         if usage:
             out["rollout/kv_usage"] = max(usage)
@@ -442,8 +513,6 @@ class AdmissionGate:
             known = [v for v in values if v is not None]
             if known:
                 out[f"rollout/requests_{name}"] = float(sum(known))
-        self.totals.waits, self.totals.wait_s = 0, 0.0
-        self.totals.peak = sum(s.in_flight for s in slots)
         return out
 
 
