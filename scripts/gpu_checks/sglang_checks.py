@@ -721,7 +721,8 @@ def smoke_config(args) -> None:
         config = {
             "model": {"student": args.model, "chat_template_kwargs": {"enable_thinking": False}},
             "teachers": {"teacher": {"model": args.teacher}},
-            "sources": {"arith": {"format": "messages", "path": data, "max_new_tokens": 192}},
+            # dev_size: the default holds out 200 rows, more than this file has
+            "sources": {"arith": {"format": "messages", "path": data, "max_new_tokens": 192, "dev_size": 8}},
             "rollout": {
                 "backend": args.backend,
                 "batch_prompts": 8,
@@ -744,8 +745,26 @@ def _line(check: str, ok: bool, **numbers) -> None:
     print(json.dumps({"check": check, "status": "PASS" if ok else "FAIL", **numbers}), flush=True)
 
 
+def _metric_rows(path: str) -> list[dict]:
+    """The rows of a metrics.jsonl (one JSON object per line); a line that does not parse (cut off when the run was
+    killed) is left out."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path) as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
 def report(args) -> None:
-    data = [json.load(open(p)) for p in args.inputs if os.path.exists(p)]
+    smoke = args.check in ("smoke_rl", "smoke_distill")  # their input is a JSONL of metrics, not a step's JSON
+    data = [] if smoke else [json.load(open(p)) for p in args.inputs if os.path.exists(p)]
     if args.check == "parity":
         (scores,) = data
         engines = scores["engines"]
@@ -805,10 +824,7 @@ def report(args) -> None:
         ok = ok and record["mean_abs_dlogprob_after_wake"] < args.max_delta
         _line("3_sleep_wake", ok, **record)
     elif args.check in ("smoke_rl", "smoke_distill"):
-        rows = []
-        for path in args.inputs:
-            if os.path.exists(path):
-                rows = [json.loads(line) for line in open(path)]
+        rows = [row for path in args.inputs for row in _metric_rows(path)]
         steps = sorted({r.get("step") for r in rows if r.get("step") is not None})
         last = rows[-1] if rows else {}
         keys = [k for k in last if any(s in k for s in ("loss", "kl", "mismatch", "reward", "tok_s", "time/sync"))]

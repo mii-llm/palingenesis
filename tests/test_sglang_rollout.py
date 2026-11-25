@@ -1319,3 +1319,58 @@ def test_gpu_check_sleep_lines(tmp_path, capsys):
         _report(checks, tmp_path, capsys, "sleep", {**sleep, "mean_abs_dlogprob_after_wake": 0.5})["status"] == "FAIL"
     )
     assert _report(checks, tmp_path, capsys, "sleep", {**sleep, "released_again_share": 0.3})["status"] == "FAIL"
+
+
+def test_gpu_check_smoke_configs_load_and_leave_rows_to_train_on(tmp_path):
+    """The 10-step smokes' configs: valid for pgs rl / pgs distill, and the distillation source keeps training rows
+    after its dev split (the default dev_size of 200 held out the whole 64-row file)."""
+    import random
+
+    from palingenesis.opd.config import OPDConfig
+    from palingenesis.opd.sources import ChatMessagesSource
+    from palingenesis.rl.config import RLConfig
+
+    checks = _checks()
+    for kind in ("rl", "distill"):
+        args = SimpleNamespace(
+            kind=kind,
+            model="m",
+            teacher="t",
+            backend="sglang",
+            workdir=str(tmp_path / kind),
+            out=str(tmp_path / f"{kind}.yaml"),
+        )
+        checks.smoke_config(args)
+    rl = RLConfig.from_yaml(tmp_path / "rl.yaml")
+    rl.validate()
+    assert rl.rollout.backend == "sglang" and rl.train.steps == 10
+    distill = OPDConfig.from_yaml(tmp_path / "distill.yaml")
+    distill.validate()
+    source = distill.sources["arith"]
+    built = ChatMessagesSource(source, distill.train.eval_samples, distill.train.seed, random.Random(0))
+    assert len(built.dev_rows) == source.dev_size == 8
+    assert len(built.train_rows) >= 4 * distill.rollout.batch_prompts
+
+
+def test_gpu_check_smoke_report_reads_the_metrics_line_by_line(tmp_path, capsys):
+    """metrics.jsonl has one JSON object per step (reading it as one document failed: 'no result'); a last line cut
+    off by a killed run is left out."""
+    import json
+
+    checks = _checks()
+    path = tmp_path / "metrics.jsonl"
+    rows = [{"step": step, "train/loss": 1.0 / (step + 1), "rollout_tok_s": 900.0} for step in range(10)]
+    rows[0]["policy/mismatch_k3_step0"] = 0.001
+    path.write_text("\n".join(json.dumps(row) for row in rows) + '\n{"step": 10, "train/lo')
+    args = SimpleNamespace(check="smoke_rl", inputs=[str(path)], exit_code=0, max_delta=0.08, min_ratio=0.7)
+    checks.report(args)
+    line = json.loads(capsys.readouterr().out.strip())
+    assert line["check"] == "4_smoke_rl" and line["status"] == "PASS" and line["steps_logged"] == 10
+    assert line["mismatch_k3_step0"] == 0.001 and line["last"]["train/loss"] == 0.1
+    args.exit_code = 1  # the run failed: its metrics do not make it pass
+    checks.report(args)
+    assert json.loads(capsys.readouterr().out.strip())["status"] == "FAIL"
+    args.exit_code, args.inputs = 0, [str(tmp_path / "missing.jsonl")]
+    checks.report(args)
+    line = json.loads(capsys.readouterr().out.strip())
+    assert line["status"] == "FAIL" and line["steps_logged"] == 0
