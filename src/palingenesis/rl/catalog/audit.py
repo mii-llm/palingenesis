@@ -235,7 +235,9 @@ def audit_without_oracle(spec: EnvSpec, n: int = 32, seed: int = 0, dataset: str
 
 async def _degenerate_report(spec: EnvSpec, n: int, seed: int, dataset: str, rows) -> dict[str, Any]:
     report = await audit_async(spec, n=n, seed=seed, dataset=dataset, rows=rows, scripted_only=True)
-    return {k: report[k] for k in ("rows", "oracle", "degenerate", "reuse", "failures", "holes", "warnings") if k in report}
+    return {
+        k: report[k] for k in ("rows", "oracle", "degenerate", "reuse", "failures", "holes", "warnings") if k in report
+    }
 
 
 def audit(spec: EnvSpec, **kwargs) -> dict[str, Any]:

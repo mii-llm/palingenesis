@@ -230,9 +230,20 @@ _GROUPS = {
 
 def _sample(rng: random.Random, name: str) -> dict:
     if name == "word_count":
-        return rng.choice([{"relation": "at least", "n": rng.randrange(80, 200, 10)}, {"relation": "at most", "n": rng.randrange(40, 90, 10)}])
+        return rng.choice(
+            [
+                {"relation": "at least", "n": rng.randrange(80, 200, 10)},
+                {"relation": "at most", "n": rng.randrange(40, 90, 10)},
+            ]
+        )
     if name == "sentence_count":
-        return rng.choice([{"relation": "at least", "n": rng.randint(8, 14)}, {"relation": "at most", "n": rng.randint(3, 5)}, {"relation": "exactly", "n": rng.randint(4, 7)}])
+        return rng.choice(
+            [
+                {"relation": "at least", "n": rng.randint(8, 14)},
+                {"relation": "at most", "n": rng.randint(3, 5)},
+                {"relation": "exactly", "n": rng.randint(4, 7)},
+            ]
+        )
     if name == "paragraph_count":
         return {"n": rng.randint(3, 5)}
     if name == "include_keywords":
@@ -240,7 +251,11 @@ def _sample(rng: random.Random, name: str) -> dict:
     if name == "forbidden_words":
         return {"forbidden": rng.sample(_FORBIDDEN, 3)}
     if name == "keyword_frequency":
-        return {"keyword": rng.choice(_KEYWORDS), "relation": rng.choice(["exactly", "at least"]), "n": rng.randint(2, 4)}
+        return {
+            "keyword": rng.choice(_KEYWORDS),
+            "relation": rng.choice(["exactly", "at least"]),
+            "n": rng.randint(2, 4),
+        }
     if name == "letter_frequency":
         return {"letter": rng.choice("qxzjk"), "relation": "at least", "n": rng.randint(4, 8)}
     if name == "capital_words":
@@ -272,7 +287,9 @@ def build(topic: str, constraints: list[dict]) -> str:
     if "letter_frequency" in by:
         extras.append(by["letter_frequency"]["letter"] * by["letter_frequency"]["n"] + " is a sound it makes.")
     if "capital_words" in by:
-        extras.append(" ".join(["NOTE", "THIS", "WELL", "NOW", "AND", "THEN", "AGAIN"][: by["capital_words"]["n"] + 1]) + ".")
+        extras.append(
+            " ".join(["NOTE", "THIS", "WELL", "NOW", "AND", "THEN", "AGAIN"][: by["capital_words"]["n"] + 1]) + "."
+        )
     if "highlighted" in by:
         extras.append(" ".join(f"*point {k + 1}*" for k in range(by["highlighted"]["n"])) + " stand out.")
     if "placeholders" in by:
@@ -322,7 +339,9 @@ def generate(n: int, seed: int = 0, constraints: int = 0) -> list[dict]:
         groups = rng.sample(list(_GROUPS), min(k, len(_GROUPS)))
         if "length" not in groups and "format" not in groups:
             groups[0] = rng.choice(["length", "format"])  # something about the shape of the text, always
-        chosen = [{"id": name, **_sample(rng, name)} for name in (rng.choice(_GROUPS[g]) for g in dict.fromkeys(groups))]
+        chosen = [
+            {"id": name, **_sample(rng, name)} for name in (rng.choice(_GROUPS[g]) for g in dict.fromkeys(groups))
+        ]
         prompt = f"Write a short text about {topic}. " + " ".join(describe(c) for c in chosen)
         solution = build(topic, chosen)
         row = {"prompt": prompt}
@@ -346,19 +365,49 @@ def _relation(value: str | None) -> str:
 
 
 _IFEVAL: dict[str, Callable[[dict], dict]] = {
-    "length_constraints:number_words": lambda k: {"id": "word_count", "relation": _relation(k.get("relation")), "n": k["num_words"]},
-    "length_constraints:number_sentences": lambda k: {"id": "sentence_count", "relation": _relation(k.get("relation")), "n": k["num_sentences"]},
-    "length_constraints:number_paragraphs": lambda k: {"id": "paragraph_count", "n": k["num_paragraphs"], "divider": "***"},
+    "length_constraints:number_words": lambda k: {
+        "id": "word_count",
+        "relation": _relation(k.get("relation")),
+        "n": k["num_words"],
+    },
+    "length_constraints:number_sentences": lambda k: {
+        "id": "sentence_count",
+        "relation": _relation(k.get("relation")),
+        "n": k["num_sentences"],
+    },
+    "length_constraints:number_paragraphs": lambda k: {
+        "id": "paragraph_count",
+        "n": k["num_paragraphs"],
+        "divider": "***",
+    },
     "keywords:existence": lambda k: {"id": "include_keywords", "keywords": list(k["keywords"])},
     "keywords:forbidden_words": lambda k: {"id": "forbidden_words", "forbidden": list(k["forbidden_words"])},
-    "keywords:frequency": lambda k: {"id": "keyword_frequency", "keyword": k["keyword"], "relation": _relation(k.get("relation")), "n": k["frequency"]},
-    "keywords:letter_frequency": lambda k: {"id": "letter_frequency", "letter": k["letter"], "relation": _relation(k.get("let_relation")), "n": k["let_frequency"]},
+    "keywords:frequency": lambda k: {
+        "id": "keyword_frequency",
+        "keyword": k["keyword"],
+        "relation": _relation(k.get("relation")),
+        "n": k["frequency"],
+    },
+    "keywords:letter_frequency": lambda k: {
+        "id": "letter_frequency",
+        "letter": k["letter"],
+        "relation": _relation(k.get("let_relation")),
+        "n": k["let_frequency"],
+    },
     "change_case:english_lowercase": lambda k: {"id": "lowercase"},
     "change_case:english_capital": lambda k: {"id": "uppercase"},
-    "change_case:capital_word_frequency": lambda k: {"id": "capital_words", "relation": _relation(k.get("capital_relation")), "n": k["capital_frequency"]},
+    "change_case:capital_word_frequency": lambda k: {
+        "id": "capital_words",
+        "relation": _relation(k.get("capital_relation")),
+        "n": k["capital_frequency"],
+    },
     "detectable_format:number_bullet_lists": lambda k: {"id": "bullet_points", "n": k["num_bullets"]},
     "detectable_format:title": lambda k: {"id": "title"},
-    "detectable_format:multiple_sections": lambda k: {"id": "sections", "n": k["num_sections"], "marker": k["section_spliter"]},
+    "detectable_format:multiple_sections": lambda k: {
+        "id": "sections",
+        "n": k["num_sections"],
+        "marker": k["section_spliter"],
+    },
     "detectable_format:number_highlighted_sections": lambda k: {"id": "highlighted", "n": k["num_highlights"]},
     "detectable_content:number_placeholders": lambda k: {"id": "placeholders", "n": k["num_placeholders"]},
     "detectable_content:postscript": lambda k: {"id": "postscript", "marker": k["postscript_marker"]},

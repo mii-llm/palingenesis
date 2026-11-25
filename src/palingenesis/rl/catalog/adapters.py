@@ -195,7 +195,11 @@ class VerifiersEnv:
             "info": info,
             "parser": getattr(rubric, "parser", None) or getattr(self.vf, "parser", None),
         }
-        available["state"] = {**available, "responses": [], "turn": sum(m.get("role") == "assistant" for m in completion)}
+        available["state"] = {
+            **available,
+            "responses": [],
+            "turn": sum(m.get("role") == "assistant" for m in completion),
+        }
         out: dict[str, float] = {}
         total = 0.0
         for fn, weight in _rubric_functions(rubric):
@@ -208,7 +212,9 @@ class VerifiersEnv:
         return {"reward": total, **out}
 
 
-def verifiers_rows(env: Any, n: int = 0, seed: int = 0, load_args: dict | None = None, split: str = "eval") -> list[dict]:
+def verifiers_rows(
+    env: Any, n: int = 0, seed: int = 0, load_args: dict | None = None, split: str = "eval"
+) -> list[dict]:
     """The verifiers environment's dataset as palingenesis rows ({"messages", "answer", "info", "task"})."""
     vf_env = load_verifiers(env, load_args)
 
@@ -282,7 +288,9 @@ def verifiers_spec(
         env_args={"env": env, **({"load_args": load_args} if load_args else {})},
         license=license,
         verifier="The verifiers rubric's weighted sum of reward functions, as the environment's author wrote it.",
-        datasets={"verifiers": DatasetSpec(generator=rows, license=license, description="The environment's own dataset.")},
+        datasets={
+            "verifiers": DatasetSpec(generator=rows, license=license, description="The environment's own dataset.")
+        },
         citation=citation,
         trainable=trainable,
         max_turns=max_turns or int(getattr(env, "max_turns", 0) or 0) or (1 if isinstance(env, str) else 8),

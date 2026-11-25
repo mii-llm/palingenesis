@@ -93,18 +93,31 @@ def build_world(seed: int, size: int = 120) -> dict:
                 return name
 
     towns = [
-        {"name": fresh(lambda: _name(rng)), "region": rng.choice(_REGIONS), "river": fresh(lambda: _name(rng, 1) + "water"),
-         "population": rng.randrange(2, 90) * 1000 + rng.randrange(100, 999)}  # fmt: skip
+        {
+            "name": fresh(lambda: _name(rng)),
+            "region": rng.choice(_REGIONS),
+            "river": fresh(lambda: _name(rng, 1) + "water"),
+            "population": rng.randrange(2, 90) * 1000 + rng.randrange(100, 999),
+        }  # fmt: skip
         for _ in range(count)
     ]
     companies = [
-        {"name": fresh(lambda: f"{_name(rng)} {rng.choice(['Works', 'Guild', 'Mills', 'Yard'])}"),
-         "founded": rng.randint(1700, 1990), "town": rng.choice(towns)["name"], "product": rng.choice(_GOODS)}  # fmt: skip
+        {
+            "name": fresh(lambda: f"{_name(rng)} {rng.choice(['Works', 'Guild', 'Mills', 'Yard'])}"),
+            "founded": rng.randint(1700, 1990),
+            "town": rng.choice(towns)["name"],
+            "product": rng.choice(_GOODS),
+        }  # fmt: skip
         for _ in range(count)
     ]
     people = [
-        {"name": fresh(lambda: f"{_name(rng)} {_name(rng)}"), "job": rng.choice(_JOBS), "born": rng.randint(1880, 1990),
-         "birthplace": rng.choice(towns)["name"], "employer": rng.choice(companies)["name"]}  # fmt: skip
+        {
+            "name": fresh(lambda: f"{_name(rng)} {_name(rng)}"),
+            "job": rng.choice(_JOBS),
+            "born": rng.randint(1880, 1990),
+            "birthplace": rng.choice(towns)["name"],
+            "employer": rng.choice(companies)["name"],
+        }  # fmt: skip
         for _ in range(count)
     ]
     documents = []

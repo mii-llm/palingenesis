@@ -360,7 +360,8 @@ def generate(n: int, seed: int = 0, difficulty: int = 0) -> list[dict]:
                 "answer": _plain(answer) if isinstance(answer, Fraction) else answer,
                 "form": task["form"],
                 "expression": task["expression"],
-                "solution_answer": task.get("solution_answer") or (_latex(answer) if isinstance(answer, Fraction) else answer),
+                "solution_answer": task.get("solution_answer")
+                or (_latex(answer) if isinstance(answer, Fraction) else answer),
                 "difficulty": level,
                 "task": maker.__name__.lstrip("_"),
             }

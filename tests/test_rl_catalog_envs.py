@@ -139,7 +139,12 @@ def test_math_only_the_last_box_counts():
 def test_gsm8k_rows_convert():
     from palingenesis.rl.catalog.envs.math_boxed import from_gsm8k
 
-    row = from_gsm8k({"question": "Ann has 1,000 beads and buys 280 more. How many?", "answer": "1000 + 280 = <<1000+280=1280>>1280\n#### 1,280"})
+    row = from_gsm8k(
+        {
+            "question": "Ann has 1,000 beads and buys 280 more. How many?",
+            "answer": "1000 + 280 = <<1000+280=1280>>1280\n#### 1,280",
+        }
+    )
     assert row["answer"] == "1280" and row["form"] == "number" and row["prompt"].endswith("\\boxed{}.")
     assert one("math-boxed", row, reply("\\boxed{1,280}")).reward == 1.0
     assert from_gsm8k({"question": "q", "answer": "no marker"}) is None
@@ -184,7 +189,9 @@ def test_code_limits_end_runaway_programs_as_failures_not_skips():
     sandbox = process_sandbox()
     reward, _, status = run(grade_stdio(sandbox, "while True:\n    pass", ["1\n"], ["1"], timeout=1.0))
     assert reward == 0.0 and status == "timeout"
-    reward, _, status = run(grade_calls(sandbox, "def f(n):\n    while True:\n        pass", "f", [[1]], [1], timeout=1.0))
+    reward, _, status = run(
+        grade_calls(sandbox, "def f(n):\n    while True:\n        pass", "f", [[1]], [1], timeout=1.0)
+    )
     assert reward == 0.0 and status == "timeout"
     flood = "import sys\nwhile True:\n    sys.stdout.write('x' * 65536)"
     assert run(grade_stdio(sandbox, flood, ["1\n"], ["1"], timeout=2.0))[0] == 0.0
@@ -203,8 +210,12 @@ def test_unit_tests_compare_call_results_outside_the_sandbox():
     assert code.functional_tests(["assert abs(f(1) - 0.5) < 1e-6"]) is None
     assert code.functional_tests("def check(candidate):\n    assert candidate(1) == 1\n") is None
     mbpp = code.from_mbpp(
-        {"prompt": "Write a function to add two numbers.", "code": "def add(a, b):\n    return a + b\n",
-         "test_list": ["assert add(1, 2) == 3", "assert add(-1, 1) == 0"], "test_imports": []}  # fmt: skip
+        {
+            "prompt": "Write a function to add two numbers.",
+            "code": "def add(a, b):\n    return a + b\n",
+            "test_list": ["assert add(1, 2) == 3", "assert add(-1, 1) == 0"],
+            "test_imports": [],
+        }  # fmt: skip
     )
     assert one("code-unit-tests", mbpp, code.oracle).reward == 1.0
     for attack in (code.rewrite_harness, code.always_equal, code.exit_zero, code.forge_report):
@@ -217,8 +228,12 @@ def test_humaneval_rows_run_through_the_assert_harness():
     from palingenesis.rl.catalog.envs import code
 
     row = code.from_humaneval(
-        {"prompt": "def double(x):\n    \"\"\"Twice x.\"\"\"\n", "canonical_solution": "    return 2 * x\n",
-         "test": "def check(candidate):\n    assert candidate(2) == 4\n    assert candidate(-1) == -2\n", "entry_point": "double"}  # fmt: skip
+        {
+            "prompt": 'def double(x):\n    """Twice x."""\n',
+            "canonical_solution": "    return 2 * x\n",
+            "test": "def check(candidate):\n    assert candidate(2) == 4\n    assert candidate(-1) == -2\n",
+            "entry_point": "double",
+        }  # fmt: skip
     )
     assert one("code-unit-tests", row, code.oracle).reward == 1.0
     assert one("code-unit-tests", row, code.exit_zero).reward == 0.0
@@ -244,9 +259,22 @@ def test_function_call_matching_is_exact_on_calls_and_lenient_on_spelling():
     two = expected + [{"name": "create_timer", "arguments": {"minutes": [5]}}]
     assert calls_match([("create_timer", {"minutes": 5}), ("get_weather", {"city": "Lisbon"})], two)
     row = from_bfcl(
-        {"id": "simple_0", "question": [[{"role": "user", "content": "Area of a 3 by 4 rectangle?"}]],
-         "function": [{"name": "area", "description": "Area.", "parameters": {"type": "dict", "properties": {"w": {"type": "float"}, "h": {"type": "integer"}}, "required": ["w", "h"]}}],
-         "ground_truth": [{"area": {"w": [3, 3.0], "h": [4]}}]}  # fmt: skip
+        {
+            "id": "simple_0",
+            "question": [[{"role": "user", "content": "Area of a 3 by 4 rectangle?"}]],
+            "function": [
+                {
+                    "name": "area",
+                    "description": "Area.",
+                    "parameters": {
+                        "type": "dict",
+                        "properties": {"w": {"type": "float"}, "h": {"type": "integer"}},
+                        "required": ["w", "h"],
+                    },
+                }
+            ],
+            "ground_truth": [{"area": {"w": [3, 3.0], "h": [4]}}],
+        }  # fmt: skip
     )
     assert row["tools"][0]["function"]["parameters"]["type"] == "object"
     assert row["tools"][0]["function"]["parameters"]["properties"]["w"]["type"] == "number"
@@ -339,7 +367,15 @@ def test_instruction_checks():
     assert check("ALL CAPS HERE", {"id": "uppercase"}) and check("all lower. here", {"id": "lowercase"})
     assert not check("", {"id": "no_commas"}) and not check("", {"id": "forbidden_words", "forbidden": ["x"]})
     for name in CHECKS:  # every check has a description
-        arguments = {"relation": "at least", "n": 2, "keywords": ["a"], "forbidden": ["a"], "keyword": "a", "letter": "a", "phrase": "a"}
+        arguments = {
+            "relation": "at least",
+            "n": 2,
+            "keywords": ["a"],
+            "forbidden": ["a"],
+            "keyword": "a",
+            "letter": "a",
+            "phrase": "a",
+        }
         assert describe({"id": name, **arguments})
 
 
@@ -347,9 +383,16 @@ def test_ifeval_rows_convert_or_drop():
     from palingenesis.rl.catalog.envs.instructions import from_ifeval
 
     row = from_ifeval(
-        {"key": 1000, "prompt": "Write 300+ words. No commas.",
-         "instruction_id_list": ["punctuation:no_comma", "length_constraints:number_words", "detectable_format:multiple_sections"],
-         "kwargs": [{}, {"relation": "at least", "num_words": 300}, {"section_spliter": "Part", "num_sections": 2}]}  # fmt: skip
+        {
+            "key": 1000,
+            "prompt": "Write 300+ words. No commas.",
+            "instruction_id_list": [
+                "punctuation:no_comma",
+                "length_constraints:number_words",
+                "detectable_format:multiple_sections",
+            ],
+            "kwargs": [{}, {"relation": "at least", "num_words": 300}, {"section_spliter": "Part", "num_sections": 2}],
+        }  # fmt: skip
     )
     assert row["constraints"] == [
         {"id": "no_commas"},
@@ -358,8 +401,15 @@ def test_ifeval_rows_convert_or_drop():
     ]
     text = "Part 1\n" + "word " * 200 + "\nPart 2\n" + "word " * 120
     assert one("instruction-following", row, reply(text)).reward == 1.0
-    assert one("instruction-following", row, reply(text + ", and more")).rewards["metric/constraints"] == pytest.approx(2 / 3)
-    unsupported = {"key": 1, "prompt": "p", "instruction_id_list": ["language:response_language"], "kwargs": [{"language": "it"}]}
+    assert one("instruction-following", row, reply(text + ", and more")).rewards["metric/constraints"] == pytest.approx(
+        2 / 3
+    )
+    unsupported = {
+        "key": 1,
+        "prompt": "p",
+        "instruction_id_list": ["language:response_language"],
+        "kwargs": [{"language": "it"}],
+    }
     assert from_ifeval(unsupported) is None
     assert from_ifeval({"key": 2, "prompt": "p", "instruction_id_list": ["keywords:existence"], "kwargs": [{}]}) is None
 
@@ -380,7 +430,9 @@ def test_sql_is_read_only_bounded_and_graded_on_the_hidden_twin():
         with pytest.raises(sql.SqlError):
             sql.run_query(connection, statement)
     with pytest.raises(sql.SqlError, match="too long"):
-        sql.run_query(connection, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT COUNT(*) FROM n")
+        sql.run_query(
+            connection, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT COUNT(*) FROM n"
+        )
     assert sql.run_query(connection, f"SELECT COUNT(*) FROM {table}")[1] == before
     connection.close()
     visible_only = one("text-to-sql", row, sql.hardcode_visible)
@@ -389,7 +441,9 @@ def test_sql_is_read_only_bounded_and_graded_on_the_hidden_twin():
     assert sql.results_equal([(1, "a"), (2, "b")], [(2, "b"), (1, "a")], ordered=False)
     assert not sql.results_equal([(1, "a"), (2, "b")], [(2, "b"), (1, "a")], ordered=True)
     assert sql.results_equal([(0.1 + 0.2,)], [(0.3,)], True) and not sql.results_equal([(1,)], [(1,), (1,)], False)
-    assert sql.is_ordered("SELECT a FROM t ORDER BY a") and not sql.is_ordered("SELECT (SELECT a FROM t ORDER BY a LIMIT 1)")
+    assert sql.is_ordered("SELECT a FROM t ORDER BY a") and not sql.is_ordered(
+        "SELECT (SELECT a FROM t ORDER BY a LIMIT 1)"
+    )
 
 
 def test_sql_tool_shows_rows_and_parallel_calls_do_not_deadlock():
@@ -399,19 +453,37 @@ def test_sql_tool_shows_rows_and_parallel_calls_do_not_deadlock():
     queries = [("run_sql", {"query": f"SELECT * FROM {_first_table(row)}"})] * 6 + [("run_sql", {"query": "SELEC"})]
     episode = one("text-to-sql", row, lambda r, m: queries if len(m) == 1 else f"```sql\n{r['gold_sql']}\n```")
     outputs = [m["content"] for m in episode.messages if m["role"] == "tool"]
-    assert episode.reward == 1.0 and episode.tool_errors == 1 and " | " in outputs[0] and outputs[-1].startswith("Error:")
+    assert (
+        episode.reward == 1.0 and episode.tool_errors == 1 and " | " in outputs[0] and outputs[-1].startswith("Error:")
+    )
 
 
 def test_gretel_rows_convert_when_they_run_in_sqlite():
     from palingenesis.rl.catalog.envs.sql import from_gretel
 
     context = "CREATE TABLE sales (id INT, region TEXT, amount INT); INSERT INTO sales VALUES (1, 'north', 5), (2, 'south', 7);"
-    row = from_gretel({"sql_prompt": "Total amount in the north?", "sql_context": context, "sql": "SELECT SUM(amount) FROM sales WHERE region = 'north';"})
-    assert row["gold_sql"].endswith("'north'") and "CREATE TABLE sales" in row["prompt"] and "INSERT" not in row["prompt"]
-    assert one("text-to-sql", row, reply("```sql\nSELECT SUM(amount) FROM sales WHERE region='north'\n```")).reward == 1.0
+    row = from_gretel(
+        {
+            "sql_prompt": "Total amount in the north?",
+            "sql_context": context,
+            "sql": "SELECT SUM(amount) FROM sales WHERE region = 'north';",
+        }
+    )
+    assert (
+        row["gold_sql"].endswith("'north'") and "CREATE TABLE sales" in row["prompt"] and "INSERT" not in row["prompt"]
+    )
+    assert (
+        one("text-to-sql", row, reply("```sql\nSELECT SUM(amount) FROM sales WHERE region='north'\n```")).reward == 1.0
+    )
     assert from_gretel({"sql_prompt": "q", "sql_context": context, "sql": "DELETE FROM sales"}) is None
-    assert from_gretel({"sql_prompt": "q", "sql_context": "CREATE TABLE t (x JSONB[]) PARTITION BY x;", "sql": "SELECT 1"}) is None
-    assert from_gretel({"sql_prompt": "q", "sql_context": context, "sql": "SELECT id FROM sales WHERE amount > 99"}) is None
+    assert (
+        from_gretel({"sql_prompt": "q", "sql_context": "CREATE TABLE t (x JSONB[]) PARTITION BY x;", "sql": "SELECT 1"})
+        is None
+    )
+    assert (
+        from_gretel({"sql_prompt": "q", "sql_context": context, "sql": "SELECT id FROM sales WHERE amount > 99"})
+        is None
+    )
 
 
 # ----------------------------------------------------------------- extraction
@@ -503,7 +575,9 @@ def test_corpus_search_finds_documents_and_answers_need_exact_match(tmp_path):
     assert len(world["documents"]) == 150 and len({d["title"] for d in world["documents"]}) == 150
     hits = sum(index.search(d["title"], 1)[0][0] == d["id"] for d in world["documents"])
     assert hits == 150  # an entity's own document is the first hit for its name
-    assert index.search("zzz qqq", 3) == [] and search.corpus_index({"seed": 7, "size": 150}) is search.corpus_index({"seed": 7, "size": 150})
+    assert index.search("zzz qqq", 3) == [] and search.corpus_index({"seed": 7, "size": 150}) is search.corpus_index(
+        {"seed": 7, "size": 150}
+    )
     rows = load_rows(get("corpus-qa"), n=12, seed=7)
     assert {row["hops"] for row in rows} == {1, 2}
     row = rows[0]
@@ -520,8 +594,10 @@ def test_corpus_search_finds_documents_and_answers_need_exact_match(tmp_path):
     def policy(r, messages):
         if len(messages) == 1:
             return [("search", {"query": "lamp invented"})]
-        assert messages[-1]["content"].startswith("[b] Lamp")
-        return [("read", {"doc_id": "[b]"})] if len(messages) == 3 else "ANSWER: oskvale"
+        if len(messages) == 3:
+            assert messages[-1]["content"].startswith("[b] Lamp")
+            return [("read", {"doc_id": "[b]"})]
+        return "ANSWER: oskvale"
 
     episode = one("corpus-qa", own, policy)
     assert episode.rewards == {"correct": 1.0, "metric/searched": 1.0} and "Oskvale" in episode.messages[-2]["content"]

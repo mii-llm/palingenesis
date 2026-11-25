@@ -355,7 +355,7 @@ def _unit_tasks(rng: random.Random) -> list[dict]:
         {
             "name": "to_base",
             "text": f"Write a function `to_base(n)` that returns the base-{base} representation of the non-negative "
-            "integer `n` as a string of digits (\"0\" for 0).",
+            'integer `n` as a string of digits ("0" for 0).',
             "solution": f"def to_base(n):\n    if n == 0:\n        return '0'\n    digits = ''\n    while n:\n"
             f"        digits = str(n % {base}) + digits\n        n //= {base}\n    return digits\n",
             "args": lambda: (rng.choice([0, rng.randint(1, 5000)]),),
@@ -363,15 +363,15 @@ def _unit_tasks(rng: random.Random) -> list[dict]:
         {
             "name": "count_vowels",
             "text": f"Write a function `count_vowels(text)` that returns how many characters of `text` are one of "
-            f"the letters \"{vowels}\", in either case.",
+            f'the letters "{vowels}", in either case.',
             "solution": f"def count_vowels(text):\n    return sum(c in '{vowels}' for c in text.lower())\n",
             "args": lambda: (_words(rng, rng.randint(4, 30), "aeiouyAEIOUYbcdfg "),),
         },
         {
             "name": "run_lengths",
             "text": "Write a function `run_lengths(text)` that returns the run-length encoding of `text` as a list "
-            "of `[character, count]` pairs, in order. For example `run_lengths(\"aaxbb\")` is "
-            "`[[\"a\", 2], [\"x\", 1], [\"b\", 2]]`.",
+            'of `[character, count]` pairs, in order. For example `run_lengths("aaxbb")` is '
+            '`[["a", 2], ["x", 1], ["b", 2]]`.',
             "solution": "def run_lengths(text):\n    out = []\n    for c in text:\n        if out and out[-1][0] == c:\n"
             "            out[-1][1] += 1\n        else:\n            out.append([c, 1])\n    return out\n",
             "args": lambda: ("".join(rng.choice("abc") * rng.randint(1, 4) for _ in range(rng.randint(1, 6))),),

@@ -238,9 +238,7 @@ def _company(rng: random.Random) -> str:
     names = rng.sample(_FIRST, 20)
     salaries = rng.sample(range(31, 120), 20)
     staffed = rng.sample(range(1, len(departments) + 1), rng.randint(4, 5))  # one or two departments stay empty
-    employees = [
-        (i + 1, names[i], rng.choice(staffed), salaries[i] * 1000, rng.randint(2008, 2024)) for i in range(20)
-    ]
+    employees = [(i + 1, names[i], rng.choice(staffed), salaries[i] * 1000, rng.randint(2008, 2024)) for i in range(20)]
     return COMPANY_DDL + _values("department", departments) + _values("employee", employees)
 
 
@@ -448,7 +446,9 @@ def hardcode_visible(row: dict, messages: list[dict]) -> str:
     connection.close()
 
     def literal(v: Any) -> str:
-        return "NULL" if v is None else repr(v) if isinstance(v, (int, float)) else "'" + str(v).replace("'", "''") + "'"
+        return (
+            "NULL" if v is None else repr(v) if isinstance(v, (int, float)) else "'" + str(v).replace("'", "''") + "'"
+        )
 
     return _fenced(" UNION ALL ".join("SELECT " + ", ".join(literal(v) for v in r) for r in rows))
 
@@ -456,7 +456,10 @@ def hardcode_visible(row: dict, messages: list[dict]) -> str:
 def gold_then_drop(row: dict, messages: list[dict]) -> Any:
     """Tries to change the database through the tool, then stacks a second statement on the gold query."""
     if turn_index(messages) == 0:
-        return [("run_sql", {"query": f"DROP TABLE {_first_table(row)}"}), ("run_sql", {"query": f"DELETE FROM {_first_table(row)}"})]
+        return [
+            ("run_sql", {"query": f"DROP TABLE {_first_table(row)}"}),
+            ("run_sql", {"query": f"DELETE FROM {_first_table(row)}"}),
+        ]
     return _fenced(f"{row['gold_sql']}; DROP TABLE {_first_table(row)}")
 
 

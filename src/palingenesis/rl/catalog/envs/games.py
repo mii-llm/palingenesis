@@ -181,6 +181,7 @@ def generate_wordle(n: int, seed: int = 0, max_guesses: int = 6) -> list[dict]:
             "answer": rng.choice(WORDS),
             "max_guesses": max_guesses,
             "max_turns": max_guesses + 2,
+            "max_completion_tokens": 512 * (max_guesses + 2),
         }
         for i in range(n)
     ]
@@ -197,6 +198,7 @@ def generate_number_guess(n: int, seed: int = 0, limit: int = 1000) -> list[dict
             "limit": limit,
             "max_guesses": budget,
             "max_turns": budget + 2,
+            "max_completion_tokens": 256 * (budget + 2),
         }
         for i in range(n)
     ]

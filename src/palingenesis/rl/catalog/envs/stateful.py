@@ -213,7 +213,9 @@ def _fs_task(rng: random.Random) -> dict:
         files.update({f"/srv/app/{names[4]}.conf": "mode=fast\n", f"/srv/app/data/{names[5]}.log": "nested\n"})
         prompt = "Move every .log file that is directly inside /srv/app into a new directory /archive/logs. Leave everything else where it is."
         solution = [["list_dir", {"path": "/srv/app"}], ["make_dir", {"path": "/archive/logs"}]]
-        solution += [["move", {"source": p, "destination": f"/archive/logs/{posixpath.basename(p)}"}] for p in sorted(logs)]
+        solution += [
+            ["move", {"source": p, "destination": f"/archive/logs/{posixpath.basename(p)}"}] for p in sorted(logs)
+        ]
     elif kind == "config":
         keys = rng.sample(["port", "region", "retries", "owner", "tier"], 4)
         values = {k: _token(rng) for k in keys}
@@ -254,8 +256,17 @@ def _fs_task(rng: random.Random) -> dict:
         prompt = f"One file in /inbox contains the reference {code}. Move that file into a new directory /done, keeping its name."
         solution = [["list_dir", {"path": "/inbox"}]]
         solution += [["read_file", {"path": f"/inbox/{n}.txt"}] for n in sorted(names[1:5])]
-        solution += [["make_dir", {"path": "/done"}], ["move", {"source": f"/inbox/{holder}.txt", "destination": f"/done/{holder}.txt"}]]
-    return {"kind": kind, "prompt": prompt, "state": {"files": files, "dirs": []}, "solution": solution, "answer": answer}
+        solution += [
+            ["make_dir", {"path": "/done"}],
+            ["move", {"source": f"/inbox/{holder}.txt", "destination": f"/done/{holder}.txt"}],
+        ]
+    return {
+        "kind": kind,
+        "prompt": prompt,
+        "state": {"files": files, "dirs": []},
+        "solution": solution,
+        "answer": answer,
+    }
 
 
 # ------------------------------------------------------------------ calendar
@@ -280,7 +291,13 @@ class CalendarEnv(StatefulEnv):
 
     def canonical(self, state: dict) -> Any:
         return sorted(
-            (e["title"].strip().lower(), e["date"], e["start"], e["end"], tuple(sorted(a.lower() for a in e["attendees"])))
+            (
+                e["title"].strip().lower(),
+                e["date"],
+                e["start"],
+                e["end"],
+                tuple(sorted(a.lower() for a in e["attendees"])),
+            )
             for e in state.get("events") or []
         )
 
@@ -299,7 +316,9 @@ class CalendarEnv(StatefulEnv):
             raise ToolFailed("an event must end after it starts, within one day")
         for other in self.state["events"]:
             if other["id"] != ignore and other["date"] == date and start < other["end"] and other["start"] < end:
-                raise ToolFailed(f"conflicts with {other['id']} ({other['title']}, {other['start']:02d}:00-{other['end']:02d}:00)")
+                raise ToolFailed(
+                    f"conflicts with {other['id']} ({other['title']}, {other['start']:02d}:00-{other['end']:02d}:00)"
+                )
 
     def list_events(self, date: str) -> list[dict]:
         """List the events of a day, by start time.
@@ -382,14 +401,26 @@ def _calendar_task(rng: random.Random) -> dict:
                 "attendees": sorted(rng.sample(_PEOPLE, rng.randint(1, 3))),
             }
         )
-    events.append({"id": "E6", "title": titles[5], "date": other_day, "start": 10, "end": 11, "attendees": sorted(rng.sample(_PEOPLE, 2))})
+    events.append(
+        {
+            "id": "E6",
+            "title": titles[5],
+            "date": other_day,
+            "start": 10,
+            "end": 11,
+            "attendees": sorted(rng.sample(_PEOPLE, 2)),
+        }
+    )
     state = {"events": events, "next_id": 7}
     listing = ["list_events", {"date": day}]
     answer = ""
 
     def free_start(first: int, length: int, ignore: str = "") -> int | None:
         for start in range(first, 24 - length + 1):
-            if all(e["id"] == ignore or e["date"] != day or not (start < e["end"] and e["start"] < start + length) for e in events):
+            if all(
+                e["id"] == ignore or e["date"] != day or not (start < e["end"] and e["start"] < start + length)
+                for e in events
+            ):
                 return start
         return None
 
@@ -408,7 +439,12 @@ def _calendar_task(rng: random.Random) -> dict:
             f"Reschedule \"{event['title']}\" on {day} to later the same day: the earliest start at or after 13:00 at "
             "which it overlaps no other event, keeping its length."
         )
-        arguments = {"event_id": event["id"], "date": day, "start": f"{start:02d}:00", "end": f"{start + length:02d}:00"}
+        arguments = {
+            "event_id": event["id"],
+            "date": day,
+            "start": f"{start:02d}:00",
+            "end": f"{start + length:02d}:00",
+        }
         solution = [listing, ["reschedule_event", arguments]]
     elif kind == "schedule":
         people = sorted(rng.sample(_PEOPLE, 2))
@@ -416,10 +452,16 @@ def _calendar_task(rng: random.Random) -> dict:
         if start is None:
             return _calendar_task(rng)
         prompt = (
-            f"Schedule a one-hour event titled \"{titles[6]}\" with {people[0]} and {people[1]} on {day}, at the earliest "
+            f'Schedule a one-hour event titled "{titles[6]}" with {people[0]} and {people[1]} on {day}, at the earliest '
             "free start time from 09:00 on."
         )
-        arguments = {"title": titles[6], "date": day, "start": f"{start:02d}:00", "end": f"{start + 1:02d}:00", "attendees": people}
+        arguments = {
+            "title": titles[6],
+            "date": day,
+            "start": f"{start:02d}:00",
+            "end": f"{start + 1:02d}:00",
+            "attendees": people,
+        }
         solution = [listing, ["create_event", arguments]]
     else:
         answer = str(sum(e["end"] - e["start"] for e in events[:5]))
@@ -443,7 +485,15 @@ class ShopEnv(StatefulEnv):
     """A shop's back office: state {"products": {id: {name, category, price, stock}}, "orders": {id: {customer,
     product_id, quantity, status, address}}, "next_order": n}. Orders can be changed only while "processing"."""
 
-    tools = ("search_products", "get_product", "list_orders", "get_order", "place_order", "cancel_order", "update_address")
+    tools = (
+        "search_products",
+        "get_product",
+        "list_orders",
+        "get_order",
+        "place_order",
+        "cancel_order",
+        "update_address",
+    )
 
     def canonical(self, state: dict) -> Any:
         orders = {
@@ -464,9 +514,15 @@ class ShopEnv(StatefulEnv):
         Args:
             category: The category name.
         """
-        found = [{"product_id": pid, **p} for pid, p in self.state["products"].items() if p["category"] == str(category).lower()]
+        found = [
+            {"product_id": pid, **p}
+            for pid, p in self.state["products"].items()
+            if p["category"] == str(category).lower()
+        ]
         if not found:
-            raise ToolFailed(f"no category {category!r}; categories: {', '.join(sorted({p['category'] for p in self.state['products'].values()}))}")
+            raise ToolFailed(
+                f"no category {category!r}; categories: {', '.join(sorted({p['category'] for p in self.state['products'].values()}))}"
+            )
         return found
 
     def get_product(self, product_id: str) -> dict:
@@ -587,24 +643,33 @@ def _shop_task(rng: random.Random) -> dict:
     answer = ""
     open_orders = [oid for oid, o in orders.items() if o["customer"] == customer and o["status"] == "processing"]
     if kind == "cancel_unshipped":
-        prompt = f"Customer {customer} wants to cancel all of their orders that have not shipped yet. Cancel exactly those."
+        prompt = (
+            f"Customer {customer} wants to cancel all of their orders that have not shipped yet. Cancel exactly those."
+        )
         solution = [mine] + [["cancel_order", {"order_id": oid}] for oid in open_orders]
     elif kind == "cheapest":
         category = rng.choice(list(_CATEGORIES))
         quantity, address = rng.randint(1, 3), _address(rng)
-        cheapest = min((pid for pid, p in products.items() if p["category"] == category), key=lambda pid: products[pid]["price"])
+        cheapest = min(
+            (pid for pid, p in products.items() if p["category"] == category), key=lambda pid: products[pid]["price"]
+        )
         prompt = f"Order {quantity} of the cheapest product in the {category} category for customer {customer}, shipped to {address}."
         arguments = {"customer": customer, "product_id": cheapest, "quantity": quantity, "address": address}
         solution = [["search_products", {"category": category}], ["place_order", arguments]]
     elif kind == "move_house":
         address = _address(rng) + " (new)"
-        prompt = f"Customer {customer} has moved to \"{address}\". Update the shipping address of every order of theirs that can still be changed."
+        prompt = f'Customer {customer} has moved to "{address}". Update the shipping address of every order of theirs that can still be changed.'
         solution = [mine] + [["update_address", {"order_id": oid, "address": address}] for oid in open_orders]
     else:
         delivered = [o for o in orders.values() if o["customer"] == customer and o["status"] == "delivered"]
         answer = str(sum(products[o["product_id"]]["price"] * o["quantity"] for o in delivered))
-        prompt = f"What is the total value in euros of customer {customer}'s delivered orders (price times quantity, summed)?" + ANSWER_NOTE
-        solution = [mine] + [["get_product", {"product_id": pid}] for pid in sorted({o["product_id"] for o in delivered})]
+        prompt = (
+            f"What is the total value in euros of customer {customer}'s delivered orders (price times quantity, summed)?"
+            + ANSWER_NOTE
+        )
+        solution = [mine] + [
+            ["get_product", {"product_id": pid}] for pid in sorted({o["product_id"] for o in delivered})
+        ]
     return {"kind": kind, "prompt": prompt, "state": state, "solution": solution, "answer": answer}
 
 
@@ -706,7 +771,9 @@ def _spec(name: str, summary: str, env: type, generator, attack: dict, first_cal
         license="Apache-2.0",
         verifier=_VERIFIER,
         datasets={
-            "synthetic": DatasetSpec(generator=generator, license="Apache-2.0", description="Generated worlds and requests.")
+            "synthetic": DatasetSpec(
+                generator=generator, license="Apache-2.0", description="Generated worlds and requests."
+            )
         },
         difficulty={"row_field": "task"},
         max_turns=16,

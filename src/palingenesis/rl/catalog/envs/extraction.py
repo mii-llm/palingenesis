@@ -174,11 +174,17 @@ def _date(rng: random.Random) -> tuple[str, str]:
 
 
 def _obj(properties: dict, **extra) -> dict:
-    return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False, **extra}
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+        **extra,
+    }
 
 
 def _invoice(rng: random.Random) -> tuple[str, dict, dict, str]:
-    (issued, issued_text), (due, due_text) = _date(rng), _date(rng)
+    (_, issued_text), (due, due_text) = _date(rng), _date(rng)
     vendor, number, currency = rng.choice(_VENDORS), f"INV-{rng.randint(1000, 9999)}", rng.choice(["EUR", "USD", "GBP"])
     lines = [
         {"description": item, "quantity": rng.randint(2, 40), "unit_price": rng.randrange(150, 4000, 25) / 100}
@@ -214,7 +220,14 @@ def _invoice(rng: random.Random) -> tuple[str, dict, dict, str]:
             },
         }
     )
-    answer = {"vendor": vendor, "invoice_number": number, "due_date": due, "currency": currency, "total": total, "lines": lines}
+    answer = {
+        "vendor": vendor,
+        "invoice_number": number,
+        "due_date": due,
+        "currency": currency,
+        "total": total,
+        "lines": lines,
+    }
     return text, schema, answer, "invoice"
 
 
@@ -265,7 +278,11 @@ def _event(rng: random.Random) -> tuple[str, dict, dict, str]:
     host = rng.choice([s for s in _SPEAKERS if s not in speakers])
     free = rng.random() < 0.35
     price = None if free else rng.randrange(8, 60)
-    money = "Entry is free." if free else f"Tickets cost {price} euros ({price + 5} at the door is an old rumour: it is {price})."
+    money = (
+        "Entry is free."
+        if free
+        else f"Tickets cost {price} euros ({price + 5} at the door is an old rumour: it is {price})."
+    )
     text = (
         f"{name} comes to {city}!\n\nJoin us at {venue} on {date_text}. Doors open {doors} minutes before the "
         f"{hour}:00 start. Talks by {', '.join(speakers[:-1])} and {speakers[-1]}; the evening is hosted by {host}. "
@@ -278,7 +295,12 @@ def _event(rng: random.Random) -> tuple[str, dict, dict, str]:
             "city": {"type": "string", "minLength": 1},
             "date": {"type": "string", "pattern": _ISO_DATE, "description": "ISO date of the event, YYYY-MM-DD"},
             "start_time": {"type": "string", "pattern": r"^\d{2}:\d{2}$", "description": "24-hour HH:MM"},
-            "speakers": {"type": "array", "items": {"type": "string"}, "x-unordered": True, "description": "not the host"},
+            "speakers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "x-unordered": True,
+                "description": "not the host",
+            },
             "price_eur": {"type": ["number", "null"], "description": "null when entry is free"},
         }
     )
@@ -337,7 +359,15 @@ def blank(schema: dict) -> Any:
         return [blank(schema["items"])] * schema.get("minItems", 0) if isinstance(schema.get("items"), dict) else []
     if kind == "string":
         pattern = schema.get("pattern", "")
-        return "2030-01-01" if pattern == _ISO_DATE else "00:00" if "\\d{2}:\\d{2}" in pattern else "INV-0" if "INV" in pattern else "x"
+        return (
+            "2030-01-01"
+            if pattern == _ISO_DATE
+            else "00:00"
+            if "\\d{2}:\\d{2}" in pattern
+            else "INV-0"
+            if "INV" in pattern
+            else "x"
+        )
     return {"integer": 0, "number": 0, "boolean": False, "null": None}.get(kind)
 
 

@@ -130,7 +130,9 @@ def cmd_info(args) -> int:
     print(f"  sandbox       {spec.sandbox}")
     print(f"  use           {'evaluation only' if spec.eval_only else 'training and evaluation'}")
     print(f"  licence       {spec.license}{'' if spec.permissive else '  (not permissive, or a dataset is not)'}")
-    print(f"  limits        max_turns {spec.max_turns}, max_new_tokens {spec.max_new_tokens}, pass at reward >= {spec.success_threshold:g}")
+    print(
+        f"  limits        max_turns {spec.max_turns}, max_new_tokens {spec.max_new_tokens}, pass at reward >= {spec.success_threshold:g}"
+    )
     if spec.difficulty:
         print(f"  difficulty    {json.dumps(spec.difficulty)}")
     if spec.citation:
@@ -140,8 +142,13 @@ def cmd_info(args) -> int:
         print(f"  requires      {', '.join(spec.requires)}" + (f"  (missing: {', '.join(missing)})" if missing else ""))
     print("\n  datasets")
     for key, dataset in spec.datasets.items():
-        where = dataset.hub_id and f"hub {dataset.hub_id}" + (f" [{dataset.config}]" if dataset.config else "") + f" ({dataset.split})"
-        where = where or ("generated" if dataset.kind == "generator" else dataset.path or "your rows (--dataset <path>)")
+        where = (
+            dataset.hub_id
+            and f"hub {dataset.hub_id}" + (f" [{dataset.config}]" if dataset.config else "") + f" ({dataset.split})"
+        )
+        where = where or (
+            "generated" if dataset.kind == "generator" else dataset.path or "your rows (--dataset <path>)"
+        )
         print(f"    {key:<12} {where}; licence {dataset.license or '-'}")
         if dataset.description:
             print(f"                 {dataset.description}")
@@ -151,7 +158,9 @@ def cmd_info(args) -> int:
     for tool in tools:
         function = tool["function"]
         parameters = ", ".join((function.get("parameters") or {}).get("properties") or {})
-        print(f"    {function['name']}({parameters})  {(function.get('description') or '').splitlines()[0] if function.get('description') else ''}")
+        print(
+            f"    {function['name']}({parameters})  {(function.get('description') or '').splitlines()[0] if function.get('description') else ''}"
+        )
     policies = entry["policies"]
     print(f"\n  audit         oracle: {'yes' if policies['oracle'] else 'none'}; degenerate: "
           f"{', '.join(policies['degenerate']) or '-'} (+ empty, refusal, echo_prompt, tool_spam); chance {spec.chance:g}")  # fmt: skip
@@ -205,7 +214,10 @@ def cmd_test(args) -> int:
             print(f"{name}: skipped (no built-in rows; pgs env test {name} --dataset <path>)")
         if len(reports) > 1:
             failed = [r["env"] for r in reports if not r["ok"]]
-            print(f"\n{len(reports) - len(failed)} of {len(reports)} audits passed" + (f"; FAILED: {', '.join(failed)}" if failed else ""))
+            print(
+                f"\n{len(reports) - len(failed)} of {len(reports)} audits passed"
+                + (f"; FAILED: {', '.join(failed)}" if failed else "")
+            )
     return 0 if all(r["ok"] for r in reports) else 1
 
 
@@ -288,7 +300,9 @@ def evaluate(spec, engine, tokenizer, rows: list[dict], k: int = 4, env_args: di
     episode_args.setdefault("max_turns", spec.max_turns)
     episode_args.setdefault("max_new_tokens", spec.max_new_tokens)
     start = time.perf_counter()
-    groups = run_episodes(engine, tokenizer, rows, spec.env_class(), {**spec.env_args, **(env_args or {})}, k=k, **episode_args)
+    groups = run_episodes(
+        engine, tokenizer, rows, spec.env_class(), {**spec.env_args, **(env_args or {})}, k=k, **episode_args
+    )
     return summarize(spec, rows, groups, time.perf_counter() - start, k)
 
 
@@ -358,22 +372,31 @@ def cmd_run(args) -> int:
 
         temperature = Sampling(args.temperature, args.top_p, args.top_k)
     engine = _engine(config, args.model, stop_ids, pad_id)
-    summary, records = evaluate(
-        spec,
-        engine,
-        tokenizer,
-        rows,
-        args.k,
-        env_args,
-        temperature=temperature,
-        chat_template_kwargs=kwargs,
-        model=args.model,
-        max_turns=max_turns,
-        max_new_tokens=max_new_tokens,
-        max_model_len=args.max_model_len,
-        max_concurrent=args.max_concurrent,
-        tool_timeout=args.tool_timeout,
-    )
+    try:
+        summary, records = evaluate(
+            spec,
+            engine,
+            tokenizer,
+            rows,
+            args.k,
+            env_args,
+            temperature=temperature,
+            chat_template_kwargs=kwargs,
+            model=args.model,
+            max_turns=max_turns,
+            max_new_tokens=max_new_tokens,
+            max_model_len=args.max_model_len,
+            max_concurrent=args.max_concurrent,
+            tool_timeout=args.tool_timeout,
+        )
+    finally:
+        if sandbox is not None and args.sandbox != "process":
+            import asyncio
+
+            try:  # its containers were started on the rollout loop, now closed: they also end with this process
+                asyncio.run(sandbox.close())
+            except Exception:  # noqa: BLE001
+                pass
     summary.update(model=args.model, dataset=args.dataset or spec.default_dataset, temperature=args.temperature,
                    thinking=args.thinking, backend=args.backend)  # fmt: skip
     if args.output:
@@ -384,6 +407,7 @@ def cmd_run(args) -> int:
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, default=str))
     else:
+
         def rate(value) -> str:
             return "-" if value is None else f"{value:.3f}"
 
@@ -469,14 +493,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=0)
-    p.add_argument("--thinking", default="default", choices=("default", "on", "off"), help="enable_thinking of the chat template")
+    p.add_argument(
+        "--thinking", default="default", choices=("default", "on", "off"), help="enable_thinking of the chat template"
+    )
     p.add_argument("--max_turns", type=int, default=0, help="default: the entry's")
     p.add_argument("--max_new_tokens", type=int, default=0, help="per turn; default: the entry's")
     p.add_argument("--max_model_len", type=int, default=16384)
     p.add_argument("--max_concurrent", type=int, default=0, help="environments alive at once (0: no limit)")
     p.add_argument("--tool_timeout", type=float, default=120.0)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
-    p.add_argument("--sandbox", default="", choices=("", "docker", "process", "agent_sandbox"), help="for code environments (default: docker)")
+    p.add_argument(
+        "--sandbox",
+        default="",
+        choices=("", "docker", "process", "agent_sandbox"),
+        help="for code environments (default: docker)",
+    )
     p.add_argument("--env_args", default="", help="JSON arguments for the environment class, over the entry's")
     p.add_argument("--output", "-o", default="", help="per-row results (JSONL), readable by pgs compare")
     p.add_argument("--json", action="store_true", help="print the summary as one JSON line")

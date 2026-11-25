@@ -232,7 +232,11 @@ def _request(rng: random.Random, name: str) -> tuple[str, dict]:
                 "days": [days],
                 "unit": ["fahrenheit"],
             }
-        return f"Give me tomorrow's forecast for {city}.", {"city": [city], "days": [1, OPTIONAL], "unit": ["celsius", OPTIONAL]}
+        return f"Give me tomorrow's forecast for {city}.", {
+            "city": [city],
+            "days": [1, OPTIONAL],
+            "unit": ["celsius", OPTIONAL],
+        }
     if name == "convert_currency":
         amount, (a, b) = rng.randrange(50, 5000, 25), rng.sample(_CURRENCIES, 2)
         return f"How much is {amount} {a} in {b}?", {"amount": [amount], "from_currency": [a], "to_currency": [b]}
@@ -265,7 +269,11 @@ def _request(rng: random.Random, name: str) -> tuple[str, dict]:
                 "max_price": [price],
                 "direct_only": [True],
             }
-        return f"Find me flights from {a} to {b}.", {"origin": [a], "destination": [b], "direct_only": [False, OPTIONAL]}
+        return f"Find me flights from {a} to {b}.", {
+            "origin": [a],
+            "destination": [b],
+            "direct_only": [False, OPTIONAL],
+        }
     if name == "calculate_tip":
         bill, percent = rng.randrange(20, 300), rng.choice([10, 12, 15, 18, 20])
         return f"What is a {percent}% tip on a bill of {bill} euros?", {"bill": [bill], "percent": [percent]}
@@ -287,9 +295,11 @@ def generate(n: int, seed: int = 0, distractors: int = 4) -> list[dict]:
         offered = rng.sample(others, min(distractors, len(others))) + ([] if category == "irrelevance" else needed)
         rng.shuffle(offered)
         prompt = " Also: ".join(text for text, _ in requests) if len(requests) > 1 else requests[0][0]
-        answer = [] if category == "irrelevance" else [
-            {"name": name, "arguments": arguments} for name, (_, arguments) in zip(needed, requests)
-        ]
+        answer = (
+            []
+            if category == "irrelevance"
+            else [{"name": name, "arguments": arguments} for name, (_, arguments) in zip(needed, requests)]
+        )
         rows.append(
             {
                 "id": f"tools-function-call/synthetic/{seed}/{i}",

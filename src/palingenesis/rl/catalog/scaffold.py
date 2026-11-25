@@ -96,7 +96,7 @@ SPEC = EnvSpec(
 )
 '''
 
-TEST = '''from palingenesis.rl.catalog import audit
+TEST = """from palingenesis.rl.catalog import audit
 
 from {module} import SPEC
 
@@ -106,7 +106,7 @@ def test_oracle_is_paid_and_degenerate_policies_are_not():
     assert report["ok"], report["failures"]
     assert report["oracle"]["pass_rate"] == 1.0
     assert all(policy["passed"] == 0 for policy in report["degenerate"].values())
-'''
+"""
 
 PYPROJECT = """[project]
 name = "{distribution}"
@@ -132,7 +132,7 @@ pythonpath = ["."]
 
 def scaffold(name: str, directory: str = ".", family: str = "other") -> Path:
     """Write the skeleton of environment `name` under `directory`; returns the package directory."""
-    from palingenesis.rl.catalog.spec import FAMILIES, _NAME
+    from palingenesis.rl.catalog.spec import _NAME, FAMILIES
 
     if not _NAME.fullmatch(name):
         raise ValueError(f"{name!r}: lower case letters, digits, '.', '_' or '-', optionally '<publisher>/<name>'")
