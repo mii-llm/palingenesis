@@ -25,7 +25,9 @@
 # own, which is killed when the step ends; at the end no process started by this run is left, on the GPU or off it
 # (every process carries a marker in its environment; checked, "cleanup" line). A failed step prints the end of its
 # log to stderr; the full logs are in $WORKDIR/logs. Nothing is written outside WORKDIR, SGLANG_VENV and the uv
-# cache next to it (caches, bytecode and temporary files included); /dev/shm is not used beyond Python's own semaphores. Exit code 1 when a
+# cache next to it (caches, bytecode, temporary files and the kernels SGLang builds at first use included: every
+# cache variable points into WORKDIR/cache and the steps run with HOME=WORKDIR/home; the "no_writes_in_home" line
+# checks ~/.cache, ~/.tilelang, ~/.triton, ~/.deep_gemm and ~/.nv for new files); /dev/shm is not used beyond Python's own semaphores. Exit code 1 when a
 # check failed.
 # Takes about 45-60 minutes on an A100 80GB, plus ~10 minutes for the first install.
 
@@ -66,6 +68,24 @@ export UV_PYTHON_INSTALL_DIR="$SGLANG_VENV.python"  # only used when the machine
 export HF_DATASETS_CACHE="$WORKDIR/cache/datasets" PYTHONPYCACHEPREFIX="$WORKDIR/cache/pycache"
 export MPLCONFIGDIR="$WORKDIR/cache/mpl" NUMBA_CACHE_DIR="$WORKDIR/cache/numba" TORCH_HOME="$WORKDIR/cache/torch"
 export WANDB_MODE=disabled WANDB_DIR="$WORKDIR/tmp"
+# SGLang's just-in-time kernel builds. Their defaults are in the home directory, whatever XDG_CACHE_HOME says:
+#   sgl_kernel's JIT (tvm-ffi)   TVM_FFI_CACHE_DIR, default ~/.cache/tvm-ffi/sgl_kernel_jit_*
+#   tilelang                     TILELANG_CACHE_DIR, default ~/.tilelang/cache
+#   flashinfer                   FLASHINFER_WORKSPACE_BASE (above), default ~/.cache/flashinfer
+#   triton                       TRITON_CACHE_DIR (above) and TRITON_HOME, default ~/.triton
+#   DeepGEMM                     DG_JIT_CACHE_DIR, default ~/.deep_gemm
+#   flash-attn cute DSL          FLASH_ATTENTION_CUTE_DSL_CACHE_DIR, default $TMPDIR/<user>/...
+export TVM_FFI_CACHE_DIR="$WORKDIR/cache/tvm-ffi" TILELANG_CACHE_DIR="$WORKDIR/cache/tilelang"
+export TRITON_HOME="$WORKDIR/cache/triton-home" DG_JIT_CACHE_DIR="$WORKDIR/cache/deep_gemm"
+export FLASH_ATTENTION_CUTE_DSL_CACHE_DIR="$WORKDIR/cache/flash-attn-cute"
+# Whatever else writes under ~ (a library that knows only HOME): after the install everything runs with HOME in
+# WORKDIR. The Hugging Face cache keeps its real place (HF_HOME above, resolved from the real home).
+REAL_HOME="$HOME"
+STEP_HOME="$WORKDIR/home"
+mkdir -p "$STEP_HOME"
+HOME_WATCH=("$REAL_HOME/.cache" "$REAL_HOME/.tilelang" "$REAL_HOME/.triton" "$REAL_HOME/.deep_gemm" "$REAL_HOME/.nv")
+START_MARK="$WORKDIR/tmp/started"
+: > "$START_MARK"
 export CUDA_VISIBLE_DEVICES="${GPU:-${CUDA_VISIBLE_DEVICES:-0}}"
 export PYTHONPATH="$PGS_SRC" PYTHONUNBUFFERED=1
 export PGS_SGLANG_CHECKS_RUN="$WORKDIR"  # marks every process of this run (the final leftover check reads it)
@@ -215,6 +235,7 @@ if [ "${SKIP_INSTALL:-0}" != "1" ] && [ "$(cat "$SGLANG_VENV/.pgs-sglang" 2>/dev
     exit 1
   fi
 fi
+export HOME="$STEP_HOME"  # from here on (the install above used the real one; its directories are all explicit)
 # The environment's size: with SGLANG_VENV on a RAM file system (/dev/shm) this is memory. The uv cache holds the
 # same files (hard links when it is on the venv's file system: counted once in the total).
 venv_kib="$(kib "$SGLANG_VENV")"
@@ -381,6 +402,29 @@ status=PASS
 [ "$left" -eq 0 ] && [ "$on_gpu" -eq 0 ] || status=FAIL
 emit "$(printf '{"check": "cleanup", "status": "%s", "leftover_processes_killed": %d, "still_on_gpu": %d, "results": "%s"}' \
   "$status" "$left" "$on_gpu" "$RESULTS")"
+# Nothing of this run under the real home: files that appeared since it started in the caches SGLang and its
+# kernels would use there. The Hugging Face cache is left out (HF_HOME, read only here; other jobs of this user
+# may download into it), and so is the uv cache when it was put there. Files under ~/.cache that belong to none of
+# SGLang's libraries (~/.nv, ~/.cache/vllm, ...) are counted apart: another job of the same user may have written
+# them, as it may ~/.triton (the list says which files).
+written="$WORKDIR/logs/written_in_home.txt"
+KERNEL_CACHES='/\.cache/(tvm-ffi|tilelang|flashinfer|deep_gemm|sglang|flash_attention_cute_dsl_cache)(/|$)|/\.(tilelang|triton|deep_gemm)/'
+for dir in "${HOME_WATCH[@]}"; do
+  [ -d "$dir" ] || continue
+  find "$dir" -xdev \( -path "$HF_HOME" -o -path "$REAL_HOME/.cache/huggingface" -o -path "$UV_CACHE_DIR" \) -prune \
+    -o -type f -newer "$START_MARK" -print 2>/dev/null
+done > "$written"
+ours="$(grep -c -E "$KERNEL_CACHES" "$written")"
+others="$(( $(wc -l < "$written") - ours ))"
+status=PASS
+[ "$ours" -eq 0 ] || status=FAIL
+emit "$(printf '{"check": "no_writes_in_home", "status": "%s", "new_kernel_cache_files": %d, "other_new_files_under_cache": %d, "list": "%s"}' \
+  "$status" "$ours" "$others" "$written")"
+if [ "$ours" -ne 0 ]; then
+  echo "[sglang-checks] written under $REAL_HOME by this run (first 20 of $ours):" >&2
+  grep -E "$KERNEL_CACHES" "$written" \
+    | head -n 20 | sed 's/^/    | /' >&2
+fi
 failed="$(grep -c '"status": "FAIL"' "$RESULTS")"
 echo "[sglang-checks] $(grep -c '"status": "PASS"' "$RESULTS") PASS, $failed FAIL (results: $RESULTS, logs: $WORKDIR/logs)" >&2
 [ "$failed" -eq 0 ]
