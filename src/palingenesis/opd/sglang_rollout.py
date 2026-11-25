@@ -11,16 +11,23 @@
 
 Both return, per completion, the sampled tokens and the log-probability of each under the sampling distribution
 (temperature applied; with top-k / top-p, SGLang's renormalised "sampling mask" log-probs where the installed
-SGLang returns them, else the untruncated ones, see below), the finish reason, the policy version, and with routing
-replay the experts every token was routed to. The radix (prefix) cache is flushed with every weight update, so no
+SGLang returns them, else the untruncated ones, see below), the finish reason, the policy version, with routing
+replay the experts every token was routed to, and with Sampling.candidates the sampler's candidates of every
+sampled token (candidates_from_output: with top-k / top-p, the support SGLang sampled from). The radix (prefix) cache is flushed with every weight update, so no
 prompt is ever served from KV computed by older weights.
 
 Differences from the vLLM engines (see the RL guide's backend table):
   * A weight update waits for the requests in flight to finish (SGLang's model-update lock): rollouts are never
     continued across weight versions (vLLM's partial rollouts), and every completion has one version.
   * The behaviour log-probs of truncated samplings (top_k / top_p) need SGLang's return_sampling_mask
-    (sglang >= 0.5.12); older versions return the untruncated temperature-scaled log-probs. RL training rollouts
-    are plain temperature sampling, where both are the same.
+    (sglang >= 0.5.12, and a top_k: SGLang reports no mask for top_p alone); otherwise they are the untruncated
+    temperature-scaled log-probs (a warning), and the support is not known at all: Sampling.candidates with
+    top-k / top-p (pgs rl's rollout.top_p / top_k) is then an error, not a rollout scored over another support.
+  * The support of a truncated sampling is SGLang's own (its sampling mask), which is not vLLM's: the nucleus is
+    cut on the temperature-scaled probabilities as they are, not renormalised after top-k (so top_p can keep
+    more tokens than vLLM's, which applies it to the top-k distribution), and at most top_k tokens are kept
+    (vLLM keeps every token tied with the k-th logit). The trainer renormalises over the ids the engine reports, so
+    either convention gives exact ratios.
   * No images (model.multimodal): the engine runs with skip_tokenizer_init and takes token ids only.
 
 The patterns follow slime (THUDM/slime) and verl (volcengine/verl), both Apache-2.0: bucketed CUDA IPC weight
@@ -42,6 +49,7 @@ import difflib
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -61,7 +69,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from palingenesis.opd.rollout import Rollout, Sampling, _die_with_parent, _free_port, samplings
+from palingenesis.opd.rollout import Candidates, Rollout, Sampling, _die_with_parent, _free_port, samplings
 
 logger = logging.getLogger(__name__)
 
@@ -188,8 +196,14 @@ def build_request(
         ),
         "return_logprob": sampling.temperature > 0,
     }
-    if sampling.temperature > 0 and sampling.truncated:
-        request["return_sampling_mask"] = True  # the renormalised log-probs of the truncated distribution
+    if sampling.temperature > 0 and sampling.top_k > 0:
+        # the renormalised log-probs of the truncated distribution, and its support. SGLang aborts a request for
+        # the mask of a top_p-only sampling (no bound on the support): that one returns untruncated log-probs
+        request["return_sampling_mask"] = True
+    if sampling.temperature > 0 and sampling.candidates:
+        # the most likely tokens of every sampled position (temperature-scaled, untruncated): with the sampling
+        # mask, the sampler's candidates (candidates_from_output)
+        request["top_logprobs_num"] = int(sampling.candidates)
     if routing:
         request["return_routed_experts"] = True
     if lora:
@@ -234,8 +248,9 @@ def output_tokens_and_logprobs(
         else:
             _warn_once(
                 "truncated",
-                "SGLang did not return the truncated sampling's log-probs (return_sampling_mask, sglang >= 0.5.12): "
-                "top-k / top-p rollouts carry the untruncated temperature-scaled log-probs",
+                "SGLang did not return the truncated sampling's log-probs (return_sampling_mask: sglang >= 0.5.12, "
+                "and a top_k, which bounds the support it reports): top-k / top-p rollouts carry the untruncated "
+                "temperature-scaled log-probs",
             )
     if ids != tokens:
         if len(ids) == len(tokens) + 1 and ids[:-1] == tokens:
@@ -248,6 +263,74 @@ def output_tokens_and_logprobs(
                 "the log-probs cannot be aligned to the sampled tokens"
             )
     return tokens, logprobs
+
+
+def candidates_from_output(out: dict, tokens: list[int], k: int, truncated: bool) -> Candidates:
+    """The sampler's candidates (opd.rollout.Candidates) of the sampled `tokens` of an SGLang output: per position
+    its `k` most likely tokens and their log-probs under the distribution the token was drawn from.
+
+    SGLang returns two things. meta_info.output_top_logprobs (top_logprobs_num): the k most likely tokens of the
+    temperature-scaled distribution p, before top-k / top-p. With a truncated sampling,
+    meta_info.output_token_sampling_mask (return_sampling_mask): the ids of the support S the token was drawn
+    from, as the sampler built it (the first top_k tokens whose preceding cumulative p is <= top_p, p not
+    renormalised after top-k; plus the sampled token, should a kernel have drawn it outside), and
+    output_token_sampling_logprobs, log(p(y) / p(S)) of the sampled token.
+
+    Plain temperature sampling: the candidates are the top log-probs as they are. Truncated: the support's tokens
+    with log p(v) - log p(S), where log p(S) = log p(y) - log(p(y) / p(S)) is the engine's own normaliser (the
+    sampled token's candidate log-prob is exactly its behaviour log-prob). A support of more than k tokens (top_p
+    without top_k) gives its k most likely: k candidates, which the trainer reads as a support it may not have
+    seen whole, as with vLLM. A support token whose log-prob was not returned although the support has at most k
+    tokens (more tokens tied at the k-th log-prob than k leaves room for) cannot be renormalised over: that
+    position's candidates leave out the sampled token, so the trainer leaves the token out of the loss
+    (sampling/support_incomplete) rather than train it over part of its support."""
+    meta = out.get("meta_info") or {}
+    top = meta.get("output_top_logprobs")
+    entries = meta.get("output_token_logprobs") or []
+    if top is None or len(top) != len(tokens) or len(entries) != len(tokens):
+        raise RuntimeError(
+            f"SGLang returned top log-probs for {0 if top is None else len(top)} of {len(tokens)} sampled tokens "
+            "(top_logprobs_num): the sampler's candidates (rollout.top_p / top_k, loss.score_centering) need one "
+            "entry per token"
+        )
+    masks = renormalised = None
+    if truncated:
+        masks = meta.get("output_token_sampling_mask")
+        renormalised = meta.get("output_token_sampling_logprobs")
+        if masks is None or renormalised is None or len(masks) != len(tokens) or len(renormalised) != len(tokens):
+            raise RuntimeError(
+                "SGLang did not return the support of its top-k / top-p sampling (return_sampling_mask: "
+                f"sglang >= 0.5.12, tested {TESTED_SGLANG}; it reports no support for top_p without top_k): the "
+                "trainer cannot renormalise the policy over it. Upgrade SGLang and set a top_k, or sample at plain "
+                "temperature (rollout.top_p 1, rollout.top_k 0)."
+            )
+    rows = []
+    for t, token in enumerate(tokens):
+        known = {int(entry[1]): _logprob(entry[0]) for entry in top[t] or []}
+        sampled = _logprob(entries[t][0])
+        known.setdefault(token, sampled)
+        if masks is None:
+            ranked = sorted(known.items(), key=lambda x: -x[1])[:k]
+        else:
+            if masks[t] is None or renormalised[t] is None:
+                raise RuntimeError("SGLang returned no sampling mask for a sampled token (return_sampling_mask)")
+            support = [int(i) for i in masks[t]]
+            log_mass = sampled - _logprob(renormalised[t])  # log p(S), the engine's normaliser
+            if not math.isfinite(log_mass):
+                raise RuntimeError(
+                    f"SGLang's log-probs of sampled token {token} are not finite ({sampled}, renormalised "
+                    f"{renormalised[t]}): its support cannot be renormalised"
+                )
+            ranked = sorted(((i, known[i] - log_mass) for i in support if i in known), key=lambda x: -x[1])[:k]
+            if len(ranked) < min(len(support), k):  # a support token without a log-prob: not this token's support
+                ranked = [(i, lp) for i, lp in ranked if i != token]
+        rows.append(([i for i, _ in ranked], [lp for _, lp in ranked]))
+    return Candidates.from_rows(rows)
+
+
+def _logprob(value) -> float:
+    """A log-prob of an SGLang output as a float (-inf arrives as None through JSON)."""
+    return float("-inf") if value is None else float(value)
 
 
 def moe_layer_indices(config) -> list[int] | None:
@@ -738,7 +821,10 @@ class _Completions:
             top_k, layers = self.routing
             positions = len(request["input_ids"]) + len(tokens) - 1
             routed = decode_routed_experts(meta.get("routed_experts"), positions, top_k, layers)
-        return Rollout(tokens, logprobs, finish, version, first_version, routed)
+        top = None
+        if request.get("top_logprobs_num"):  # Sampling.candidates
+            top = candidates_from_output(out, tokens, request["top_logprobs_num"], truncated)
+        return Rollout(tokens, logprobs, finish, version, first_version, routed, top)
 
     @staticmethod
     def _no_images(images) -> None:
@@ -1381,6 +1467,8 @@ class SGLangServerRollout(_Completions):
         }
         if any(r.get("return_sampling_mask") for r in requests):
             payload["return_sampling_mask"] = [bool(r.get("return_sampling_mask")) for r in requests]
+        if any(r.get("top_logprobs_num") for r in requests):
+            payload["top_logprobs_num"] = [int(r.get("top_logprobs_num") or 0) for r in requests]
         if self.routing is not None:
             payload["return_routed_experts"] = True
         out = self.server.post("/generate", payload)

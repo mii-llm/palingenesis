@@ -26,6 +26,7 @@ from palingenesis.opd.sglang_rollout import (  # noqa: E402
     SGLangServerRollout,
     _ok,
     build_request,
+    candidates_from_output,
     check_options,
     clamp_budget,
     decode_routed_experts,
@@ -151,6 +152,12 @@ def test_requests_ask_for_logprobs_masks_and_routing_only_when_needed():
     truncated = build_request([1, 2], 8, Sampling(1.0, 0.95, 20), STOP, 64, routing=True, lora="a-v3")
     assert truncated["return_sampling_mask"] is True and truncated["return_routed_experts"] is True
     assert truncated["lora_path"] == "a-v3"
+    # SGLang aborts a request for the mask of a top_p-only sampling (no bound on its support): not asked for
+    assert "return_sampling_mask" not in build_request([1, 2], 8, Sampling(1.0, 0.9, 0), STOP, 64)
+    # Sampling.candidates: that many top log-probs per sampled token (none for greedy)
+    assert "top_logprobs_num" not in truncated
+    assert build_request([1], 8, Sampling(1.0, 0.95, 20, candidates=28), STOP, 64)["top_logprobs_num"] == 28
+    assert "top_logprobs_num" not in build_request([1], 8, Sampling(0.0, candidates=8), STOP, 64)
 
 
 def test_budget_is_clamped_to_the_context_like_vllm():
@@ -200,6 +207,166 @@ def test_truncated_samplings_use_the_renormalised_logprobs(caplog):
         assert output_tokens_and_logprobs(_output([1, 2]), True, truncated=True)[1] == pytest.approx(
             [-0.5, -0.51, -0.52]
         )
+
+
+# ------------------------------------------------------------------ the sampler's candidates
+
+
+def _sglang_step(logits, temperature, top_k, top_p, n, sampled=None, seed=0):
+    """One sampled position as SGLang 0.5.17 reports it (sglang/srt/layers/sampler.py): p = softmax(logits / T);
+    the support is the first top_k tokens of the descending sort whose preceding cumulative p is <= top_p (p not
+    renormalised after top-k); the token is drawn from p over it. Returns (token, log p(token), the n top
+    (log p, id, None) entries, the mask ids, log(p(token) / p(support)))."""
+    p = torch.softmax(torch.as_tensor(logits, dtype=torch.float64) / temperature, -1)
+    order = torch.argsort(p, descending=True)
+    sorted_p = p[order]
+    before = torch.cumsum(sorted_p, 0) - sorted_p
+    keep = (torch.arange(len(p)) < (top_k if top_k > 0 else len(p))) & (before <= top_p)
+    support = order[keep].tolist()
+    if sampled is None:
+        generator = torch.Generator().manual_seed(seed)
+        sampled = support[int(torch.multinomial(sorted_p[keep], 1, generator=generator))]
+    if sampled not in support:  # "a backend/numeric edge": SGLang adds the sampled token to the mask
+        support.append(sampled)
+    mass = p[support].sum()
+    top = [(float(p[i].log()), int(i), None) for i in order[:n]]
+    return sampled, float(p[sampled].log()), top, support, float((p[sampled] / mass).log())
+
+
+def _sglang_output(steps, mask=True):
+    meta = {
+        "finish_reason": {"type": "length", "length": len(steps)},
+        "output_token_logprobs": [(lp, token, None) for token, lp, _, _, _ in steps],
+        "output_top_logprobs": [top for _, _, top, _, _ in steps],
+    }
+    if mask:
+        meta["output_token_sampling_mask"] = [support for _, _, _, support, _ in steps]
+        meta["output_token_sampling_logprobs"] = [renormalised for _, _, _, _, renormalised in steps]
+    return {"output_ids": [token for token, *_ in steps], "meta_info": meta}
+
+
+def test_candidates_of_a_plain_sampling_are_the_top_logprobs():
+    steps = [_sglang_step([2.0, 1.0, 0.0, -1.0, -30.0], 0.7, 0, 1.0, n=3, sampled=1)]
+    out = _sglang_output(steps, mask=False)
+    c = candidates_from_output(out, [1], 3, truncated=False)
+    assert c.counts.tolist() == [3] and c.ids.tolist() == [0, 1, 2]
+    assert c.logprobs.tolist() == pytest.approx([entry[0] for entry in steps[0][2]])
+    # a sampled token below the top k is not a candidate (as with vLLM); -inf (None through JSON) is dropped
+    steps = [_sglang_step([2.0, 1.0, 0.0, -1.0, -30.0], 0.7, 0, 1.0, n=2, sampled=3)]
+    out = _sglang_output(steps, mask=False)
+    out["meta_info"]["output_top_logprobs"][0].append((None, 4, None))
+    assert candidates_from_output(out, [3], 2, truncated=False).ids.tolist() == [0, 1]
+    with pytest.raises(RuntimeError, match="top log-probs for 0 of 1"):
+        candidates_from_output(
+            {"output_ids": [1], "meta_info": {"output_token_logprobs": [(-0.1, 1, None)]}}, [1], 3, False
+        )
+
+
+def test_candidates_of_a_truncated_sampling_are_sglangs_support_renormalised():
+    """The candidates are the ids of SGLang's sampling mask with log p(v) - log p(S): they sum to 1 over the
+    support and the sampled token's is its behaviour log-prob. SGLang's nucleus is cut on p as it is, not on the
+    top-k distribution: here it keeps 3 tokens where vLLM's order (top-k, renormalise, top-p) would keep 2."""
+    logits, temperature, top_k, top_p = [2.0, 1.6, 1.2, 0.8, 0.4, 0.0, -0.4, -0.8], 1.0, 3, 0.7
+    p = torch.softmax(torch.tensor(logits, dtype=torch.float64), -1)
+    assert p[:2].sum() <= top_p  # SGLang: the mass before the third token is within top_p
+    assert p[:2].sum() / p[:3].sum() > top_p  # vLLM: renormalised over the top 3 it is not
+    steps = [_sglang_step(logits, temperature, top_k, top_p, n=top_k + 8, seed=s) for s in range(4)]
+    out = _sglang_output(steps)
+    tokens = [token for token, *_ in steps]
+    c = candidates_from_output(out, tokens, top_k + 8, truncated=True)
+    assert c.counts.tolist() == [3] * 4 and c.ids.reshape(4, 3).tolist() == [[0, 1, 2]] * 4
+    rows = torch.from_numpy(c.logprobs.reshape(4, 3)).double()
+    torch.testing.assert_close(rows.exp().sum(-1), torch.ones(4, dtype=torch.float64), atol=1e-6, rtol=0)
+    for row, (token, _, _, _, renormalised) in zip(rows, steps):
+        assert float(row[token]) == pytest.approx(renormalised, abs=1e-6)
+
+
+def test_candidates_keep_a_token_sampled_outside_the_reconstructed_support():
+    steps = [_sglang_step([2.0, 1.0, 0.0, -1.0, -2.0], 1.0, 2, 1.0, n=10, sampled=3)]
+    c = candidates_from_output(_sglang_output(steps), [3], 10, truncated=True)
+    assert c.ids.tolist() == [0, 1, 3]  # SGLang's mask holds it: the trainer renormalises over all three
+    assert float(torch.from_numpy(c.logprobs).double().exp().sum()) == pytest.approx(1.0, abs=1e-6)
+    assert float(c.logprobs[2]) == pytest.approx(steps[0][4], abs=1e-6)
+
+
+def test_candidates_of_a_support_that_cannot_be_scored_whole():
+    logits = [2.0, 1.5, 1.0, 0.5, 0.0, -0.5]
+    # more support than candidates: the k most likely, k of them (the trainer reads k of k as possibly incomplete)
+    steps = [_sglang_step(logits, 1.0, 5, 1.0, n=3, sampled=1)]
+    c = candidates_from_output(_sglang_output(steps), [1], 3, truncated=True)
+    assert c.counts.tolist() == [3] and c.ids.tolist() == [0, 1, 2]
+    # a support token without a returned log-prob although the support fits: the sampled token is left out of the
+    # candidates, so the trainer leaves it out of the loss instead of renormalising over part of its support
+    steps = [_sglang_step(logits, 1.0, 3, 1.0, n=8, sampled=1)]
+    out = _sglang_output(steps)
+    out["meta_info"]["output_top_logprobs"][0] = [e for e in steps[0][2] if e[1] != 2]
+    c = candidates_from_output(out, [1], 8, truncated=True)
+    assert c.ids.tolist() == [0]
+    # no mask (an older SGLang, or top_p without top_k): an error, not a rollout scored over another support
+    with pytest.raises(RuntimeError, match="did not return the support"):
+        candidates_from_output(_sglang_output(steps, mask=False), [1], 8, truncated=True)
+    out = _sglang_output(steps)
+    out["meta_info"]["output_token_sampling_logprobs"] = [None]
+    with pytest.raises(RuntimeError, match="no sampling mask"):
+        candidates_from_output(out, [1], 8, truncated=True)
+
+
+def test_sglang_support_gives_ratio_one_in_the_trainer():
+    """End to end with the trainer's renormalisation (rl.losses.sampled_logprobs): the same weights scored over
+    the candidates of SGLang's support give back SGLang's behaviour log-prob (ratio 1 on-policy), and every
+    token's support counts as seen whole (fewer candidates than the top_k + 8 asked for)."""
+    from palingenesis.rl.config import CANDIDATE_SLACK
+    from palingenesis.rl.losses import SamplerCandidates, sampled_logprobs, target_logprobs
+
+    torch.manual_seed(5)
+    vocabulary, hidden_size, temperature, top_k, top_p = 31, 8, 0.7, 6, 0.9
+    weight = torch.randn(vocabulary, hidden_size, dtype=torch.float64)
+    hidden = torch.randn(5, hidden_size, dtype=torch.float64)
+    asked = top_k + CANDIDATE_SLACK
+    steps = [_sglang_step(row @ weight.T, temperature, top_k, top_p, n=asked, seed=i) for i, row in enumerate(hidden)]
+    tokens = [token for token, *_ in steps]
+    behaviour = torch.tensor([renormalised for *_, renormalised in steps], dtype=torch.float64)
+    candidates = candidates_from_output(_sglang_output(steps), tokens, asked, truncated=True)
+    assert all(1 <= count <= top_k for count in candidates.counts.tolist())
+    sampler = SamplerCandidates.build([candidates], asked, True, "cpu")
+    head = torch.nn.Linear(hidden_size, vocabulary, bias=False, dtype=torch.float64)
+    head.weight.data.copy_(weight)
+    out = sampled_logprobs(hidden, head, torch.tensor(tokens), sampler, scale=1 / temperature)
+    assert out.valid.all()
+    torch.testing.assert_close(out.lp.double(), behaviour, atol=1e-5, rtol=1e-5)
+    plain, _ = target_logprobs(hidden, head, torch.tensor(tokens), scale=1 / temperature)
+    assert (plain.double() < behaviour - 1e-4).all()  # the bias a full-vocabulary score would carry
+
+
+def test_engines_return_the_candidates_with_the_rollout():
+    steps = [_sglang_step([2.0, 1.0, 0.5, 0.0, -1.0], 1.0, 3, 0.95, n=11, seed=s) for s in range(2)]
+    sampling = Sampling(1.0, 0.95, 3, candidates=11)
+    engine, scripted = _engine()
+    scripted.respond = lambda request: _sglang_output(steps)
+    (rollout,) = engine.generate([[1, 2]], [2], sampling)
+    assert scripted.requests[0]["top_logprobs_num"] == 11 and scripted.requests[0]["return_sampling_mask"] is True
+    assert len(rollout.candidates) == len(rollout.completion_ids) == 2
+    assert rollout.logprobs == pytest.approx([step[4] for step in steps])
+    for t, token in enumerate(rollout.completion_ids):  # the sampled token is in its support
+        assert token in rollout.candidates.select([t]).ids.tolist()
+    (plain,) = engine.generate([[1, 2]], [2], 1.0)
+    assert plain.candidates is None
+    engine.stream_add("a", [1, 2], 2, sampling, n=2)
+    while engine.stream_pending():
+        finished = engine.stream_step()
+    assert [len(r.candidates) for r in finished[0][1]] == [2, 2]
+    engine.close()
+
+    class Server(ScriptedServer):
+        def post(self, path, payload=None, timeout=3600.0):
+            self.posts.append((path, payload))
+            return [_sglang_output(steps) for _ in payload["input_ids"]]
+
+    server = Server()
+    remote = SGLangServerRollout(server, STOP, model="m", max_model_len=64, parallel=1)
+    rollouts = remote.generate([[1], [2]], [2, 2], sampling)
+    assert server.posts[-1][1]["top_logprobs_num"] == [11, 11]
+    assert all(len(r.candidates) == 2 for r in rollouts)
 
 
 # ------------------------------------------------------------------ engine arguments
@@ -642,7 +809,7 @@ class ScriptedServer:
 def test_server_generates_in_parallel_batches_in_order():
     server = ScriptedServer()
     engine = SGLangServerRollout(server, STOP, model="m", max_model_len=64, parallel=2)
-    rollouts = engine.generate([[1], [2], [3]], [8, 8, 8], Sampling(1.0, 0.9, 0))
+    rollouts = engine.generate([[1], [2], [3]], [8, 8, 8], Sampling(1.0, 0.9, 20))
     assert [r.completion_ids for r in rollouts] == [[2, 3, 7], [3, 4, 7], [4, 5, 7]]
     sizes = sorted(len(p["input_ids"]) for path, p in server.posts if path == "/generate")
     assert sizes == [1, 2]
@@ -822,6 +989,18 @@ def test_rl_config_accepts_the_sglang_backends(monkeypatch):
     ).validate()
     warnings = _rl(**{"rollout.backend": "sglang_server", "rollout.url": "http://h:1", "rollout.fp32_head": True})
     assert any("enable-fp32-lm-head" in w for w in warnings.validate())
+    # truncated sampling and score centering: the engines return the sampler's candidates (SGLang's support)
+    from palingenesis.rl.config import training_sampling
+
+    truncated = _rl(**{"rollout.backend": "sglang", "rollout.top_p": 0.95, "rollout.top_k": 20})
+    assert not truncated.validate()
+    assert training_sampling(truncated).candidates == 28
+    centered = _rl(**{"rollout.backend": "sglang_server", "loss.score_centering": "topk"})
+    assert not centered.validate() and training_sampling(centered).candidates == 8
+    running = _rl(
+        **{"rollout.backend": "sglang_server", "rollout.url": "http://h:1", "rollout.top_k": 20, "rollout.top_p": 0.9}
+    )
+    assert any("SGLang >= 0.5.12" in w for w in running.validate())
     monkeypatch.setenv("WORLD_SIZE", "2")
     with pytest.raises(RLConfigError, match="sglang_server is single-process"):
         _rl(**{"rollout.backend": "sglang_server"}).validate()

@@ -411,6 +411,7 @@ def build_engine(args: argparse.Namespace) -> tuple[Any, dict]:
         from palingenesis.opd.sglang_rollout import SGLangRollout
 
         extra = json.loads(args.sglang_args)
+        del identity["max_logprobs"]  # vLLM's bound: SGLang returns as many top log-probs as a request asks for
         if args.lora_rank:  # native pushes: adapters served next to the base
             extra = {
                 "enable_lora": True,

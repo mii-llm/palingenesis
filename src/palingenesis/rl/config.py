@@ -36,7 +36,8 @@ SCORE_CENTERING = ("off", "topk")
 MAX_TOP_K = 1024
 # Candidates the engine returns beyond rollout.top_k: vLLM keeps every token tied with the k-th logit in the
 # support, so it can hold more than top_k tokens; a token whose support fills all the candidates may miss some
-# and is left out of the loss (logged as sampling/support_incomplete).
+# and is left out of the loss (logged as sampling/support_incomplete). SGLang reports its support as ids (at most
+# top_k tokens, see opd.sglang_rollout.candidates_from_output): the slack is never filled there.
 CANDIDATE_SLACK = 8
 
 
@@ -774,6 +775,12 @@ class RLConfig:
                 warnings.append(
                     f"{what} with rollout.url: the running server must have been started with --logprobs-mode "
                     f"processed_logprobs and --max-logprobs >= {candidates}."
+                )
+            if r.backend == "sglang_server" and r.url and truncated_sampling(self):
+                warnings.append(
+                    "rollout.top_p / top_k with rollout.url: the running server must be SGLang >= 0.5.12 (it "
+                    "reports each token's support, return_sampling_mask) without speculative decoding; an older "
+                    "one fails at the first rollout."
                 )
         if r.max_new_tokens < 1:
             errors.append("rollout.max_new_tokens must be >= 1.")
