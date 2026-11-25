@@ -309,8 +309,8 @@ def _truncated_logprobs(policy, prompt: list[int], tokens: list[int], engine: st
         scores = truncate_scores(logits, top_k, top_p)
     else:
         probs, order = torch.softmax(logits, -1).sort(dim=-1, descending=True)
-        keep = torch.arange(probs.shape[-1], device=probs.device)[None] < top_k
-        keep &= (probs.cumsum(-1) - probs) <= top_p
+        in_top_k = torch.arange(probs.shape[-1], device=probs.device)[None] < top_k  # [1, V], over sorted ranks
+        keep = in_top_k & ((probs.cumsum(-1) - probs) <= top_p)  # [T, V]
         scores = logits.masked_fill(~torch.zeros_like(keep).scatter(-1, order, keep), float("-inf"))
     return torch.log_softmax(scores, -1).gather(1, ids[0, len(prompt) :, None]).squeeze(1).tolist()
 
