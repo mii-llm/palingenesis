@@ -528,7 +528,7 @@ def policy_loss(
         if forced is not None:
             deviation = deviation.masked_fill(forced, 0.0)
             seen = ratio.masked_fill(forced, 1.0)
-        seq_deviation = torch.zeros(n_seq, device=lp.device).index_add_(0, seq, deviation) / seq_len
+        seq_deviation = torch.zeros(n_seq, dtype=deviation.dtype, device=lp.device).index_add_(0, seq, deviation) / seq_len
         keep_seq = (
             seq_deviation <= config.seq_mask
             if config.seq_mask > 0
@@ -550,9 +550,9 @@ def policy_loss(
 
     if config.type == "gspo":
         with torch.no_grad():
-            seq_log_ratio = torch.zeros(n_seq, device=lp.device).index_add_(0, seq, log_ratio) / seq_len
+            seq_log_ratio = torch.zeros(n_seq, dtype=log_ratio.dtype, device=lp.device).index_add_(0, seq, log_ratio) / seq_len
             s = seq_log_ratio.exp()
-            seq_adv = torch.zeros(n_seq, device=lp.device).index_add_(0, seq, advantage) / seq_len
+            seq_adv = torch.zeros(n_seq, dtype=advantage.dtype, device=lp.device).index_add_(0, seq, advantage) / seq_len
             clipped = ((seq_adv > 0) & (s > 1 + config.gspo_eps)) | ((seq_adv < 0) & (s < 1 - config.gspo_eps))
             coef = ((~clipped).float() * s)[seq] * advantage / seq_len[seq] * s_mask
             stats["clipped"] = clipped[seq].sum().float()

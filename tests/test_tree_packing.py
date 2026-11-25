@@ -329,10 +329,23 @@ def test_check_catches_a_layer_that_ignored_the_layout():
 # ── the RL trainer step ────────────────────────────────────────────────────────
 
 
-def _groups(seed: int, multi_turn: bool = True):
+def _groups(seed: int, multi_turn: bool = True, candidates: bool = False):
     """Three groups of four with a common system prompt; in each, two rollouts share a first turn and a tool
-    result before their second turns differ (branching turns), and observation targets in the tool results."""
+    result before their second turns differ (branching turns), and observation targets in the tool results.
+    `candidates`: each sampled token comes with a sampler support of 2-5 tokens holding it (top-k / top-p)."""
+    from palingenesis.opd.rollout import Candidates
+
     rng = random.Random(seed)
+
+    def support(ids):
+        if not candidates:
+            return None
+        rows = []
+        for token in ids:
+            others = rng.sample([i for i in range(1, 90) if i != token], rng.randint(1, 4))
+            rows.append(([token, *others], [-0.5 - rng.random() for _ in range(len(others) + 1)]))
+        return Candidates.from_rows(rows)
+
     system = [rng.randrange(1, 90) for _ in range(6)]
     out = []
     for g in range(3):
@@ -343,12 +356,13 @@ def _groups(seed: int, multi_turn: bool = True):
         for k in range(4):
             t = Trajectory({}, g, prompt, [])
             if multi_turn and k < 2:
-                t.append_generated(first, [-4.5 + 0.1 * j for j in range(len(first))], 0)
+                t.append_generated(first, [-4.5 + 0.1 * j for j in range(len(first))], 0, candidates=support(first))
                 start = len(t.tokens)
                 t.append_context(result)
                 t.append_observations(start, [(1, 1), (2, 1), (3, 2)])
             n = rng.randint(3, 25)
-            t.append_generated([rng.randrange(1, 90) for _ in range(n)], [-4.5 + rng.random() for _ in range(n)], 0)
+            ids = [rng.randrange(1, 90) for _ in range(n)]
+            t.append_generated(ids, [-4.5 + rng.random() for _ in range(n)], 0, candidates=support(ids))
             t.reward = rng.random()
             group.append(t)
         out.append(group)
@@ -397,6 +411,29 @@ def test_rl_step_is_the_same_padded_varlen_and_tree(arch):
             assert torch.allclose(grads[name], ref, rtol=1e-6, atol=1e-6 * float(ref.abs().max())), (packing, name)
     # micro_tokens bounds unique tokens: the tree needs no more micro-batches than varlen
     assert results["tree"][2] <= results["varlen"][2]
+
+
+@pytest.mark.parametrize("centering", ["off", "topk"])
+def test_rl_step_with_top_k_support_is_the_same_padded_varlen_and_tree(centering):
+    """Truncated sampling (log-probs renormalised over each token's sampler support) and score centering read the
+    packed hidden states in the same order as the padded ones: the same statistics and gradients."""
+    results = {}
+    for packing in ("padded", "varlen", "tree"):
+        trainer = _trainer(
+            "gpt2", packing, **{"loss.score_centering": centering, "loss.score_centering_k": 3, "loss.type": "cispo"}
+        )
+        trainer.candidates, trainer.renormalise = 13, True
+        metrics = trainer._train_step(_groups(1, candidates=True))
+        grads = {n: p.grad.clone() for n, p in trainer.model.named_parameters() if p.grad is not None}
+        results[packing] = (metrics, grads)
+    base, base_grads = results["padded"]
+    assert base["sampling/support_incomplete"] == 0.0 and base["sampling/support_size"] > 1
+    for packing in ("varlen", "tree"):
+        metrics, grads = results[packing]
+        for key in ("loss", "policy/mismatch_k3", "sampling/support_size", "policy/entropy"):
+            assert abs(metrics[key] - base[key]) <= 1e-6 * max(1.0, abs(base[key])), (packing, key)
+        for name, ref in base_grads.items():
+            assert torch.allclose(grads[name], ref, rtol=1e-6, atol=1e-6 * float(ref.abs().max())), (packing, name)
 
 
 def test_rl_step_routes_long_prompt_groups_through_the_tree_not_prompt_sharing():
