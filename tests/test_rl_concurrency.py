@@ -418,6 +418,28 @@ def test_a_cancelled_waiter_leaves_the_queue_and_takes_no_slot():
     assert metrics["rollout/concurrency"] == 1 and metrics["rollout/gate_waits"] == 2
 
 
+def test_a_slot_freed_before_a_cancelled_waiter_resumes_goes_to_the_next_in_line():
+    """A waiter cancelled (its future is cancelled at once) whose task has not run again yet is still in the queue
+    when a slot frees: the slot must go to the next waiter, not to the cancelled one."""
+    gate = _still_gate(1)
+
+    async def run():
+        held = await gate.acquire()
+        first = asyncio.ensure_future(gate.acquire())
+        second = asyncio.ensure_future(gate.acquire())
+        await asyncio.sleep(0.01)
+        first.cancel()
+        gate.release(held)  # before `first` has seen its cancellation
+        assert await asyncio.wait_for(second, 5) == ""
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert gate.slots[""].in_flight == 1 and gate.slots[""].waiting == 0
+        assert not any(gate.waiters)
+        gate.close()
+
+    asyncio.run(run())
+
+
 def test_a_cancelled_rollout_keeps_its_slot_until_the_engine_is_done():
     """The engine has no abort: a request whose caller was cancelled still generates, so its slot is released when
     the engine resolves it, and a failed request's slot when it fails."""

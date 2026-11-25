@@ -475,6 +475,8 @@ class AdmissionGate:
         so a call costs the requests it admits (plus those it passes over for another engine)."""
         for queue in self.waiters:
             for waiter in list(queue) if self._room() else ():
+                if waiter.future.done():  # cancelled, its task has not left the queue yet: it takes no slot
+                    continue
                 free = [k for k in waiter.keys if self.slots[k].in_flight < self.slots[k].controller.cap]
                 if not free:
                     continue
