@@ -557,6 +557,20 @@ class DPOConfig:
     # Zero every dropout in the policy. Otherwise the policy's
     # log-probs are noisy against a deterministic reference.
     disable_dropout: bool = True
+    # How a micro-batch's pairs are laid out for the forward (palingenesis.tree_packing; as train.packing in pgs rl):
+    # "padded": [2P, S] right-padded rows, chosen first: the prompt is computed for both sides (the default).
+    # "varlen": one row, the 2P sequences end to end, no padding.
+    # "tree":   one row, every pair a two-leaf prefix trie: the tokens its chosen and rejected sides share (the
+    #           prompt, earlier turns, the common start of the answers) are forwarded once, by the policy and by
+    #           the reference; no padding. A micro-batch whose pairs together share less than a tree level costs
+    #           (2048 forwarded tokens) is laid out as varlen.
+    # Both packed modes compute the same scores, loss and gradients as padded (up to floating-point order); they
+    # need model.attn_implementation sdpa and full-attention / Gated DeltaNet layers only.
+    packing: str = "padded"
+    # With packing varlen / tree: packed tokens per micro-batch (tree: a pair's shared prefix counted once). Pairs
+    # are taken in data order while they fit, so a micro-batch holds a varying number of pairs and
+    # train.per_device_batch_size does not apply. 0 = per_device_batch_size pairs per micro-batch, as padded.
+    micro_tokens: int = 0
 
 
 @dataclass(slots=True)
@@ -1133,6 +1147,46 @@ class Config:
         for name, on in unsupported.items():
             if on:
                 errors.append(f"dpo.enabled=true does not support {name}; disable it for preference training.")
+        errors.extend(self._dpo_packing_errors())
+        return errors
+
+    def _dpo_packing_errors(self) -> list[str]:
+        """dpo.packing / dpo.micro_tokens, and what packed preference rows do not run."""
+        from palingenesis.tree_packing import PACKING_MODES
+
+        d = self.dpo
+        errors: list[str] = []
+        budget_ok = not isinstance(d.micro_tokens, bool) and isinstance(d.micro_tokens, int) and d.micro_tokens >= 0
+        if not budget_ok:
+            errors.append(
+                f"dpo.micro_tokens must be an integer >= 0 (0 = train.per_device_batch_size pairs per micro-batch), "
+                f"got {d.micro_tokens!r}."
+            )
+        if d.packing not in PACKING_MODES:
+            errors.append(f"dpo.packing must be one of {', '.join(PACKING_MODES)}, got {d.packing!r}.")
+            return errors
+        if d.packing == "padded":
+            if budget_ok and d.micro_tokens:
+                errors.append(
+                    "dpo.micro_tokens is a budget of packed tokens: only used with dpo.packing varlen or tree "
+                    "(padded micro-batches hold train.per_device_batch_size pairs)."
+                )
+            return errors
+        if self.model.attn_implementation != "sdpa":
+            errors.append(
+                f"dpo.packing {d.packing} needs model.attn_implementation: sdpa (palingenesis routes it to the "
+                f"variable-length flash kernel over packed rows), got {self.model.attn_implementation!r}."
+            )
+        unsupported = {
+            "multimodal.enabled (image placeholders expand inside the model's forward, which a packed row does not "
+            "lay out)": self.multimodal.enabled,
+            "model.compile (a packed row's layout is a new forward argument every micro-batch, which compiled "
+            "layers would recompile for: set model.compile: false)": self.model.compile,
+            "memory.activation_offload (not validated with packed rows)": self.memory.activation_offload,
+        }
+        for name, on in unsupported.items():
+            if on:
+                errors.append(f"dpo.packing {d.packing} does not support {name}; use dpo.packing padded.")
         return errors
 
     def _source_errors(self) -> list[str]:

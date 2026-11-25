@@ -104,8 +104,8 @@ from palingenesis.rl.rewards import code_reward, load_object, resolve_rewards
 from palingenesis.rl.sandbox import make_sandbox
 from palingenesis.rl.trajectory import Trajectory
 from palingenesis.rollouts import DROPPED_METRIC, RolloutSink, rl_record
-from palingenesis.seco import PACKED_VARLEN, use_chunk_attention
-from palingenesis.tree_packing import PackedRow, pack
+from palingenesis.seco import use_chunk_attention
+from palingenesis.tree_packing import PackedRow, forward_packed, pack
 
 logger = logging.getLogger(__name__)
 
@@ -1218,14 +1218,7 @@ class RLTrainer:
         (seco.PACKED_VARLEN): the layers read the row's layout from the forward's keyword arguments. Every
         attention and Gated DeltaNet layer must have followed the layout (checked: one that did not would have
         mixed the sequences)."""
-        packed.begin_forward()
-        token = PACKED_VARLEN.set(True)
-        try:
-            states = final_hidden_states(self.model, ids, None, **kwargs)
-        finally:
-            PACKED_VARLEN.reset(token)
-        support.check(packed)
-        return states
+        return forward_packed(self.model, support, packed, ids.device)
 
     def _observation_term(self, stats: dict, hidden: torch.Tensor, targets: list[int], weight: list[float]):
         """The observation loss of a micro-batch (or branch): its targets' NLL under the model's own logits (not

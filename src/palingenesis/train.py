@@ -77,11 +77,13 @@ from palingenesis.distributed import (
     setup_distributed,
 )
 from palingenesis.dpo import (
+    PackedPairs,
     PreferenceDataset,
     PreferenceEvaluator,
     build_preference_dataloader,
     collate_preferences,
     disable_dropout,
+    packed_reference_logps,
     preference_step,
     reference_logps,
     sft_token_mask,
@@ -146,6 +148,7 @@ from palingenesis.plugins import (
 )
 from palingenesis.seco import PACKED_VARLEN, chunkwise_forward_backward, use_chunk_attention
 from palingenesis.tensor_parallel import TensorParallelError
+from palingenesis.tree_packing import forward_packed
 
 logger = logging.getLogger(__name__)
 
@@ -646,6 +649,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             f"({getattr(model.config, '_attn_implementation', None)}), flash kernel: {kernel}"
         )
 
+    # ── dpo.packing varlen / tree: the policy and the reference checked and routed for packed rows (before
+    # FSDP wraps the modules; fails fast on a model that cannot run them exactly) ──
+    dpo_packing = None  # (the policy's PackingSupport, the reference's)
+    if dpo is not None and dpo.packing != "padded":
+        dpo_packing = _prepare_dpo_packing(config, model, ref_model, device, router_balancer, plugin_mgr)
+
     # ── Hybrid model freeze (DeltaNet/SSM layers frozen, only attention trains) ──
     if config.train.freeze_non_attention:
         _freeze_non_attention_layers(model)
@@ -885,6 +894,9 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 from palingenesis.dpo import estimate_preferences
 
                 return estimate_preferences(dataset_id, dataset, tokenizer, config.data, dpo, data_world, bs)
+
+            if dpo.packing != "padded" and dpo.micro_tokens > 0:
+                _estimate = None  # pairs per micro-batch follow their lengths: counted by a scan (or max_steps)
         else:
 
             def _make_dataloader():
@@ -1094,7 +1106,11 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         logger.info(
             f"DPO: loss_type={dpo.loss_type} beta={dpo.beta} sft_weight={dpo.sft_weight} sft_scope={dpo.sft_scope} "
             f"ld_alpha={dpo.ld_alpha} label_smoothing={dpo.label_smoothing} "
-            f"(per_device_batch_size={config.train.per_device_batch_size} pairs)"
+            + (
+                f"(packing={dpo.packing}, micro-batches of up to {dpo.micro_tokens} packed tokens)"
+                if dpo_packing is not None and dpo.micro_tokens > 0
+                else f"(per_device_batch_size={config.train.per_device_batch_size} pairs, packing={dpo.packing})"
+            )
         )
     elif use_chunked_loss:
         lm_head = _get_lm_head(model)
@@ -1705,7 +1721,16 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                     # Rows [0, P) are chosen answers, [P, 2P) the paired rejected ones.
                     num_pairs = input_ids.shape[0] // 2
                     raw_labels = batch["labels"]
-                    num_chunks = _dynamic_num_chunks(input_ids.numel(), _loss_vocab_size)
+                    packed_pairs = None
+                    if dpo_packing is not None:
+                        # one packed row: every pair's shared prefix once (tree), no padding; the loss chunks
+                        # cover the scored terms only
+                        packed_pairs = PackedPairs.build(
+                            input_ids, batch["attention_mask"], raw_labels, share=dpo.packing == "tree"
+                        )
+                        num_chunks = _dynamic_num_chunks(packed_pairs.num_terms, _loss_vocab_size)
+                    else:
+                        num_chunks = _dynamic_num_chunks(input_ids.numel(), _loss_vocab_size)
                     # Averages match SFT's global-token denominator: pairs (and chosen
                     # tokens, for the SFT term) summed over ranks and GA micro-steps.
                     sft_pair_weight = batch.get("sft_pair_weight")
@@ -1720,23 +1745,32 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                             .round()
                             .long()
                         )
+                    # (the ranks' pairs too: under dpo.micro_tokens a micro-batch's pairs follow their lengths)
+                    global_pairs = num_pairs * world_size
                     if is_fsdp:
-                        global_chosen = local_chosen.clone()
-                        dist.all_reduce(global_chosen, op=dist.ReduceOp.SUM)
+                        counts = torch.stack([local_chosen, local_chosen.new_tensor(num_pairs)])
+                        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                        global_chosen, global_pairs = counts[0], int(counts[1].item())
                     else:
                         global_chosen = local_chosen
-                    image_kwargs = multimodal.forward_kwargs(batch, {})
-                    ref_logps = reference_logps(
-                        ref_model,
-                        _get_hidden_states,
-                        _get_lm_head,
-                        input_ids,
-                        attention_mask,
-                        raw_labels,
-                        num_chunks,
-                        forward_kwargs=image_kwargs,
-                    )
-                    hidden = _get_hidden_states(model, input_ids, attention_mask, **image_kwargs)
+                    if packed_pairs is not None:
+                        ref_logps = packed_reference_logps(
+                            ref_model, dpo_packing[1], packed_pairs, _get_lm_head(ref_model), num_chunks
+                        )
+                        hidden = forward_packed(model, dpo_packing[0], packed_pairs.row, input_ids.device)
+                    else:
+                        image_kwargs = multimodal.forward_kwargs(batch, {})
+                        ref_logps = reference_logps(
+                            ref_model,
+                            _get_hidden_states,
+                            _get_lm_head,
+                            input_ids,
+                            attention_mask,
+                            raw_labels,
+                            num_chunks,
+                            forward_kwargs=image_kwargs,
+                        )
+                        hidden = _get_hidden_states(model, input_ids, attention_mask, **image_kwargs)
                     step_out = preference_step(
                         hidden,
                         raw_labels,
@@ -1748,12 +1782,13 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         label_smoothing=dpo.label_smoothing,
                         ld_alpha=dpo.ld_alpha if dpo.ld_alpha < 1.0 else None,
                         sft_weight=dpo.sft_weight,
-                        pair_denom=num_pairs * world_size * current_ga,
+                        pair_denom=global_pairs * current_ga,
                         chosen_token_denom=max(global_chosen.item(), 1) * current_ga,
                         num_chunks=num_chunks,
                         sft_scope=dpo.sft_scope,
                         sft_edit_window=dpo.sft_edit_window,
                         sft_pair_weight=sft_pair_weight,
+                        packed=packed_pairs,
                     )
                     loss = step_out.loss
                     del ref_logps
@@ -2414,6 +2449,39 @@ def _load_plugin_state(plugin_mgr: PluginManager, checkpoint_dir: str) -> None:
         logger.info(f"Plugin state restored from {path}")
     elif any(p.overrides("state_dict") for p in plugin_mgr):
         logger.warning(f"No plugin state in {checkpoint_dir}: plugins resume from their initial state")
+
+
+def _prepare_dpo_packing(config: Config, model, ref_model, device, router_balancer, plugin_mgr):
+    """dpo.packing varlen / tree: the policy and the reference model checked and their layers routed for packed
+    rows (palingenesis.tree_packing.prepare_model; on a GPU the flash tree attention is checked against its exact
+    reference once). Returns their PackingSupports; ConfigError for what packed rows cannot run exactly."""
+    from palingenesis.tree_packing import PackingError, prepare_model
+
+    mode = config.dpo.packing
+    if router_balancer is not None:
+        raise ConfigError(
+            f"dpo.packing {mode} on an MoE model: the router balancing losses are not laid out on packed preference "
+            "rows. Use dpo.packing padded."
+        )
+    if plugin_mgr and plugin_mgr.implementing("loss"):
+        raise ConfigError(
+            f"dpo.packing {mode} with a plugin loss term: plugins read padded [rows, tokens] hidden states, a packed "
+            "row is [1, packed tokens]. Use dpo.packing padded."
+        )
+    try:
+        supports = prepare_model(model, device), prepare_model(ref_model, device)
+    except PackingError as error:
+        raise ConfigError(f"dpo.packing {mode}: {error} Use dpo.packing padded.") from error
+    if torch.device(device).type == "cuda" and not config.train.bf16:
+        logger.warning(
+            f"dpo.packing {mode} without train.bf16: packed attention has no flash kernel in fp32 and runs on an "
+            "explicit [N, N] mask (a reference path: memory grows with the packed tokens squared)."
+        )
+    logger.info(
+        f"DPO packing: {mode} (one packed row per micro-batch"
+        + ("; every pair's shared prefix forwarded once, by the policy and the reference)" if mode == "tree" else ")")
+    )
+    return supports
 
 
 def _on_device(dataloader, device):
