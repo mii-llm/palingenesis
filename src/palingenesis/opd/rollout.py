@@ -974,6 +974,8 @@ class VLLMServerRollout:
                 skip_special_tokens=False,
                 # candidates: top_logprobs keyed by token id ("token_id:<id>"), not by text
                 **({"return_tokens_as_token_ids": True} if sampling.candidates else {}),
+                **({"stop": list(sampling.stop)} if sampling.stop else {}),
+                **({"allowed_token_ids": list(sampling.allowed)} if sampling.allowed else {}),
             )
             want = sampling.candidates if sampling.temperature > 0 else 0
             for i, choice in zip(idx, choices):

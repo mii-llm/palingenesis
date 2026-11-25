@@ -29,6 +29,7 @@
 #   gsm8k   pgs at least 2x faster than the faster of lm-eval and lighteval
 #   mc      pgs at least 3x faster than lm-eval
 #   accuracy of pgs within 1 standard error of lm-eval's on gsm8k (exact_match,strict-match) and mc (acc)
+#   mc      the trie's log-likelihoods equal forward passes of the same weights (see loglikelihood/trie_vs_forward)
 #
 # Every result is a JSON line {"check": ..., "status": "PASS" | "FAIL" | "INFO" | "SKIP", ...} on stdout, also
 # collected in $WORK/results.jsonl; the exit code is 1 if any check failed. Everything is written inside WORK
@@ -45,6 +46,7 @@
 #   MAX_MODEL_LEN=4096               the engines' context (5-shot MMLU prompts are under 3,000 tokens)
 #   MEMORY_MARGIN_GB=3               left free on the GPU beyond what others hold now
 #   PGS_REPLICAS=0                   also time pgs with this many engines on the GPU (INFO lines; 0 = skip)
+#   TRIE_CHECK_ITEMS=64              mc: questions whose log-likelihoods are checked against forward passes (0 = skip)
 #   LMEVAL_VERSION=0.4.13  LIGHTEVAL_VERSION=0.13.0
 #   LIGHTEVAL_TASKS="gsm8k|5 lighteval|gsm8k|5 lighteval|gsm8k|5|0"   task spellings tried in order
 #   PART_TIMEOUT=5400                seconds per run
@@ -366,6 +368,36 @@ if has "$TASKS" mc && [ -n "$MC_NAME" ]; then
   if has "$HARNESSES" pgs; then
     pair pgs/mc "${PGS[@]}" ${MC_PGS[@]+"${MC_PGS[@]}"} --out "$WORK/pgs/mc" -- \
       "${PGS[@]}" --tasks "${MC_PGS[1]}" --out "$WORK/pgs/mc.start" --limit 1 --head
+  fi
+  # the trie's log-likelihoods against plain forward passes of the same weights (transformers, no vLLM): the first
+  # TRIE_CHECK_ITEMS questions, every choice. Pre-registered: the same answer on >= 95% of them, and log-likelihoods
+  # within 0.25 nats (two bf16 implementations) on >= 95% of the choices.
+  if has "$HARNESSES" pgs && [ "${TRIE_CHECK_ITEMS:-64}" -gt 0 ] && [ -f "$WORK/pgs/mc/summary.json" ]; then
+    if attempt pgs/mc_forward "$PGS_PY" -m palingenesis.eval.cli --model "$MODEL" --tasks "${MC_PGS[1]}" --backend hf \
+      --max_model_len "$MAX_MODEL_LEN" --no_cache --json --limit "${TRIE_CHECK_ITEMS:-64}" --head --out "$WORK/pgs/mc_forward"; then
+      "$PGS_PY" - "$WORK/pgs/mc" "$WORK/pgs/mc_forward" <<'PY' | tee -a "$RESULTS"
+import glob
+import json
+import sys
+
+
+def samples(directory):
+    (path,) = glob.glob(f"{directory}/*.samples.jsonl")
+    return {r["id"]: r for r in map(json.loads, open(path))}
+
+
+trie, forward = samples(sys.argv[1]), samples(sys.argv[2])
+shared = sorted(set(trie) & set(forward))
+pairs = [(a, b) for i in shared for a, b in zip(trie[i]["loglikelihoods"], forward[i]["loglikelihoods"])]
+close = sum(abs(a - b) <= 0.25 for a, b in pairs) / max(1, len(pairs))
+same = sum(trie[i]["completion"] == forward[i]["completion"] for i in shared) / max(1, len(shared))
+ok = bool(shared) and close >= 0.95 and same >= 0.95
+print(json.dumps({"check": "loglikelihood/trie_vs_forward", "status": "PASS" if ok else "FAIL", "items": len(shared),
+                  "choices": len(pairs), "within_0.25_nats": round(close, 4), "same_answer": round(same, 4),
+                  "max_abs_difference": round(max((abs(a - b) for a, b in pairs), default=0.0), 4),
+                  "requests_per_item": round(sum(trie[i]["requests"] for i in shared) / max(1, len(shared)), 2)}))
+PY
+    fi
   fi
   if has "$HARNESSES" lmeval && [ "$LMEVAL_OK" -eq 1 ]; then
     pair lmeval/mc "${LM[@]}" --model_args "$LM_ARGS" ${MC_LM[@]+"${MC_LM[@]}"} --output_path "$WORK/lmeval/mc" -- \
