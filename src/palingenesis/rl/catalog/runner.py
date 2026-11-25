@@ -41,6 +41,8 @@ def load_rows(spec: EnvSpec, dataset: str = "", n: int = 0, seed: int = 0, **opt
                 f"{spec.name} has no dataset {name!r} (and no such file); datasets: {', '.join(spec.datasets)}"
             )
         source = DatasetSpec(path=name)
+    if source.kind == "file" and not source.path:
+        raise KeyError(f"{spec.name} has no built-in rows: pass a dataset path ({source.description or 'a file of rows'})")
     convert = _resolve(source.convert)
     if source.kind == "generator":
         rows = _resolve(source.generator)(n or 32, seed, **{**source.options, **options})
