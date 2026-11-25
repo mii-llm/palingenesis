@@ -472,3 +472,13 @@ def test_trainer_step_with_top_p_top_k_is_on_policy(tmp_path, centering):
     assert metrics["sampling/support_incomplete"] == 0.0
     assert 1 <= metrics["sampling/support_size"] <= 5
     assert ("sampling/sampler_mass" in metrics) == centering
+
+
+def test_a_step_with_many_incomplete_supports_warns(caplog):
+    from palingenesis.rl.losses import sampling_metrics
+
+    with caplog.at_level("WARNING", logger="palingenesis.rl.losses"):
+        metrics = sampling_metrics({"support_tokens": 10.0, "support_incomplete": 0.0, "support_size": 40.0})
+        assert metrics == {"sampling/support_incomplete": 0.0, "sampling/support_size": 4.0} and not caplog.records
+        sampling_metrics({"support_tokens": 10.0, "support_incomplete": 9.0, "support_size": 280.0})
+    assert "processed_logprobs" in caplog.text

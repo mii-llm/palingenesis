@@ -52,6 +52,7 @@ top-k candidates V_t (q_v = μ(v), p_v = π(v)) and one ratio for the tail outsi
   loss         -Σ w · S · (sg(coef_t) · lp_t - A · correction_t)
 """
 
+import logging
 import math
 from dataclasses import dataclass
 
@@ -62,6 +63,11 @@ from palingenesis.evalstats import pass_at_k_rewards
 from palingenesis.opd.fused_rkl import Head, unwrap
 from palingenesis.opd.losses import SLICE_ELEMENTS
 from palingenesis.rl import head_kernels
+
+logger = logging.getLogger(__name__)
+# A step with more of its trained tokens left out for an incomplete support than this warns: ties at the k-th logit
+# are rare, so a high share means the engine returned raw (not processed) log-probs or too few of them.
+SUPPORT_INCOMPLETE_WARN = 0.05
 
 # ------------------------------------------------------------ token log-probs
 
@@ -460,8 +466,16 @@ def sampling_metrics(values: dict[str, float]) -> dict[str, float]:
     """The step's candidate statistics (sampled_logprobs, score centering) as per-token means."""
     metrics = {}
     if values.get("support_tokens"):
-        metrics["sampling/support_incomplete"] = values.get("support_incomplete", 0.0) / values["support_tokens"]
+        incomplete = values.get("support_incomplete", 0.0) / values["support_tokens"]
+        metrics["sampling/support_incomplete"] = incomplete
         metrics["sampling/support_size"] = values.get("support_size", 0.0) / values["support_tokens"]
+        if incomplete > SUPPORT_INCOMPLETE_WARN:
+            logger.warning(
+                "%.0f%% of the trained tokens are out of the loss: their support filled every candidate the engine "
+                "returned (or lacked the sampled token). The engine's top log-probs must be processed ones "
+                "(vLLM --logprobs-mode processed_logprobs) and cover rollout.top_k + 8 tokens.",
+                100 * incomplete,
+            )
     if values.get("centered_tokens"):
         metrics["sampling/sampler_mass"] = values.get("sampler_mass", 0.0) / values["centered_tokens"]
     return metrics
