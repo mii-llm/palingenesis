@@ -600,6 +600,13 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             router_balancer.replicas = tp.size
         if config.parallel.async_tp:
             _enable_async_tp(tp)
+        if not config.model.compile:
+            # every operation on a split tensor goes through DTensor's Python dispatch: a fixed cost per layer that
+            # dominates small models (scripts/gpu_checks/tp_pp.sh reports it); the compiled layers do not pay it
+            logger.warning(
+                "parallel.tp_degree > 1 without model.compile: the tensor-parallel layers run through DTensor's eager "
+                "dispatch (several times slower on small models). Set model.compile: true."
+            )
 
     # ── Float8 Training (H100+ speedup, before AC and FSDP) ─────────────
     if config.memory.float8_training:

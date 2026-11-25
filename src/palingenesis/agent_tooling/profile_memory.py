@@ -244,7 +244,8 @@ def estimate_memory(config: Config, gpu_memory_gb: float = 80.0, world_size: int
     )
     if per_rank is not None:
         per_rank["gpu_memory_gb"] = gpu_memory_gb
-        per_rank["fits"] = per_rank["total_gb"] <= gpu_memory_gb
+        # a world size the config's degrees do not divide has no per-rank estimate: reported, and not a fit
+        per_rank["fits"] = "error" not in per_rank and per_rank["total_gb"] <= gpu_memory_gb
     return {
         "per_rank": per_rank,
         "model": config.model.name_or_path,
@@ -294,19 +295,27 @@ def _per_rank(config: Config, model, world_size, *, weights_gb, activations_gb, 
         return {"error": dims.errors()[0]}
     total = sum(q.numel() for q in model.parameters())
     root = sum(
-        q.numel() for n, q in model.named_parameters() if "embed_tokens" in n or n.startswith("lm_head") or n == "model.norm.weight"
+        q.numel()
+        for n, q in model.named_parameters()
+        if "embed_tokens" in n or n.startswith("lm_head") or n == "model.norm.weight"
     )
     layer_share = (total - root) / max(total, 1)
     # layers split over tensor x pipeline ranks, then FSDP over data x context; the root over data x context x tensor
     layer_weights = weights_gb * layer_share / (dims.tp * dims.pp * dims.dp * dims.cp)
     root_weights = weights_gb * (1 - layer_share) / (dims.dp * dims.cp * dims.tp)
-    gather = weights_gb * layer_share / 4 / max(layers, 1) / dims.tp * 2  # one layer's bf16 weights, gathered (x2: prefetch)
+    gather = (
+        weights_gb * layer_share / 4 / max(layers, 1) / dims.tp * 2
+    )  # one layer's bf16 weights, gathered (x2: prefetch)
     rows = config.train.per_device_batch_size
     microbatches = p.pp_microbatches or rows
     in_flight = 1.0
     if dims.pp > 1:
         per = stages_per_rank(p.pp_schedule, p.pp_stages_per_rank)
-        held = microbatches if PP_SCHEDULES[p.pp_schedule][0] in ("GPipe", "LoopedBFS") else min(microbatches, dims.pp * per)
+        held = (
+            microbatches
+            if PP_SCHEDULES[p.pp_schedule][0] in ("GPipe", "LoopedBFS")
+            else min(microbatches, dims.pp * per)
+        )
         in_flight = held / microbatches  # activations of `held` micro-batches of rows / microbatches rows each
     acts = activations_gb / (dims.tp * dims.cp * dims.pp) * in_flight
     logits = logits_gb / (dims.tp * dims.cp) / (microbatches if dims.pp > 1 else 1)
