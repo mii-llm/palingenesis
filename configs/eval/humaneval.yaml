@@ -1,0 +1,20 @@
+# HumanEval (Chen et al. 2021): 164 hand-written Python problems, each a function signature with a docstring and
+# hidden unit tests. License: MIT. The completion's last ```python block runs against the tests in the code sandbox
+# (the RL `code` reward: a subprocess with time and memory limits; see the sandbox guide for containers).
+# Prompt: the chat form of the benchmark (the model writes the whole function), not raw continuation of the stub.
+# k > 1 gives the paper's unbiased pass@k: pgs eval --tasks humaneval --k 10 --temperature 0.8
+name: humaneval
+description: Python functions from docstrings, hidden tests in a sandbox (164 items)
+dataset: openai/openai_humaneval
+split: test
+id_field: task_id
+version: "1"
+prompt: |
+  Complete the following Python function. Reply with the complete function in one ```python code block.
+
+  ```python
+  {{prompt}}
+  ```
+scorer: code
+scorer_args: {field: test, entry_point_field: entry_point, timeout: 10}
+sampling: {max_tokens: 2048}

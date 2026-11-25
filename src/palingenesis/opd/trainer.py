@@ -365,6 +365,7 @@ class OPDTrainer:
             self.plugins.load_state(self.resume_path)
         # metrics: wandb, trackio, logging.trackers; the run id is saved with each checkpoint
         self.tracker = Tracker.for_run(config.logging, dataclasses.asdict(config), config.train.output_dir, wandb_id)
+        self.task_eval = self._make_task_eval()  # eval_tasks: `pgs eval` tasks on the rollout engine
         self.dumps = None  # logging.dump_trajectories: the completions' writer (palingenesis.rollouts)
         if config.logging.dump_trajectories:
             self.dumps = RolloutSink(
@@ -716,6 +717,8 @@ class OPDTrainer:
         try:
             if config.train.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)
+            if self.start_step == 0:
+                self._eval_tasks(0, end)
             start_time = time.time()
             for step in range(self.start_step, end):
                 t0 = time.perf_counter()
@@ -780,6 +783,7 @@ class OPDTrainer:
                     and step + 1 < config.train.steps
                 ):
                     self._log("eval", self.evaluate(), step + 1)
+                self._eval_tasks(step + 1, end)
                 if config.train.save_steps and (step + 1) % config.train.save_steps == 0:
                     self.save(f"step_{step + 1}", step + 1)
             if end < config.train.steps:  # a chunk of a longer schedule: evaluate and save the stop step, resumable
@@ -835,6 +839,46 @@ class OPDTrainer:
         return metrics
 
     # -------------------------------------------------------------------- eval
+
+    def _make_task_eval(self):
+        """The eval_tasks: hook (palingenesis.eval.training); None when the section is empty."""
+        config = self.config
+        if not config.eval_tasks.enabled:
+            return None
+        from palingenesis.eval.training import TrainingEval
+
+        return TrainingEval(
+            config.eval_tasks,
+            config.model.student,
+            self.tok,
+            config.train.output_dir,
+            every=config.train.eval_every,
+            engine_options={"max_model_len": config.rollout.max_model_len},
+            chat_template_kwargs=config.model.chat_template_kwargs,
+            stop_tokens=config.model.stop_tokens,
+            seed=config.train.seed,
+        )
+
+    def _eval_tasks(self, step: int, end: int) -> None:
+        """Run the eval_tasks: tasks when they are due at `step`, with the newest weights in the rollout engine,
+        under the pipeline's lock (no training rollout is generated meanwhile)."""
+        task_eval = getattr(self, "task_eval", None)  # subclasses with their own __init__
+        if task_eval is None or not task_eval.due(step, end):
+            return
+        p = self.pipeline
+        self.student.eval()
+        try:
+            with p._exclusive():
+                p.weights.sync(p.engine)
+                p.engine.wake()
+                try:
+                    metrics = task_eval.run(p.engine, step)
+                finally:
+                    p.engine.sleep()
+        finally:
+            self.student.train()
+        if metrics:
+            self._log("eval", metrics, step)
 
     def evaluate(self) -> dict[str, float]:
         """Held-out metrics of every source, each scored against its own teacher."""

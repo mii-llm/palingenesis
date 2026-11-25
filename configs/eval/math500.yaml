@@ -1,0 +1,16 @@
+# MATH-500: the 500-problem test subset of MATH (Hendrycks et al. 2021) used by PRM800K. License: MIT.
+# The score is symbolic equivalence of the last \boxed{} with the gold answer when math-verify is installed
+# (pip install 'palingenesis[rl]'); without it, a normalised text / numeric comparison (lower scores on
+# answers written in another equivalent form).
+name: math500
+description: competition math, \boxed{} answers (500 items)
+dataset: HuggingFaceH4/MATH-500
+split: test
+id_field: unique_id
+prompt: |
+  {{problem}}
+
+  Reason step by step and put the final answer in \boxed{}.
+scorer: math               # the RL math reward (palingenesis.rl.rewards.math_reward)
+scorer_args: {field: answer}
+sampling: {max_tokens: 4096}

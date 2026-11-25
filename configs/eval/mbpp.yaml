@@ -1,0 +1,20 @@
+# MBPP, sanitized subset (Austin et al. 2021): 257 test problems (427 in the subset), a one-line task and three
+# assert statements. License: CC-BY-4.0. As in the paper, the prompt shows the first assert (it fixes the function's
+# name and signature); the code must pass all three in the sandbox (the RL `code` reward).
+name: mbpp
+description: short Python tasks, assert tests in a sandbox (sanitized test split, 257 items)
+dataset: google-research-datasets/mbpp
+subset: sanitized
+split: test
+id_field: task_id
+version: "1"
+prompt: |
+  {{prompt}}
+
+  Your code must pass this test:
+  {{test_list.0}}
+
+  Reply with the code in one ```python code block.
+scorer: code
+scorer_args: {field: test_list, timeout: 10}
+sampling: {max_tokens: 2048}

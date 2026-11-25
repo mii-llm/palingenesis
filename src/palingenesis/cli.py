@@ -53,6 +53,8 @@ Commands:
   monitor     Check status of a running training
   loss        Analyze loss curve from log file
   rollouts    Read RL / distillation rollout dumps: finish reasons, rewards, tool errors, loops, slowest, worst
+  eval        Evaluate a checkpoint on tasks (gsm8k, math500, mmlu_pro, ifeval, bfcl_simple, your YAML) through the
+              training stack: k samples, thinking modes, results in the pgs compare format
   compare     Evaluation results with intervals; two checkpoints on the same items: paired tests, pass@k
   screen      RL pool difficulty: k rollouts per row with the RL config's rewards, keep rows with 0 < pass rate < 1
   pairs       Preference pairs: build contrastive twin pairs (minimal prompt edits), check a pair file
@@ -195,6 +197,11 @@ def main():
 
         case "rollouts":
             _run_agent_tool("palingenesis.agent_tooling.rollouts")
+
+        case "eval":
+            from palingenesis.eval.cli import main as eval_main
+
+            sys.exit(eval_main())
 
         case "compare":
             from palingenesis.agent_tooling.compare import main as compare_main

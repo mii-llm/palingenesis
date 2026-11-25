@@ -81,7 +81,10 @@ class RLPipeline:
         env_pool: EnvPool | None,
         sandbox,
         stop_ids,
+        client=None,
     ):
+        """client: a GenerationClient to share instead of creating one: evaluation rollouts next to a trainer whose
+        pipeline already drives the engine (palingenesis.eval); the pipeline that created it closes it."""
         self.tok, self.chat, self.engine, self.weights = tok, chat, engine, weights
         self.config, self.sampler, self.rewards, self.env_pool, self.sandbox = (
             config,
@@ -96,8 +99,11 @@ class RLPipeline:
         # loss.observation_weight: training rollouts record their observation tokens (ChatFormat.continuation)
         self.observation_loss = config.loss.observation_weight > 0
         self.observation_exclude = self.observation_patterns(config.loss.observation_exclude)
+        self.owns_client = client is None
         # n-sample merging only helps when a group's rollouts are one turn each
-        if hasattr(engine, "make_client"):  # engines in other processes (palingenesis.rl.pool): requests travel
+        if client is not None:
+            self.client = client
+        elif hasattr(engine, "make_client"):  # engines in other processes (palingenesis.rl.pool): requests travel
             self.client = engine.make_client(merge=env_pool is None)
         else:  # rollout.concurrency kv: a vLLM server's requests in flight under its KV-sized cap
             self.client = GenerationClient(
@@ -954,7 +960,8 @@ class RLPipeline:
                 self._await(self.sandbox.close())
             except Exception:  # noqa: BLE001 — best effort at shutdown
                 logger.warning("sandbox close failed", exc_info=True)
-        self.client.close()
+        if self.owns_client:
+            self.client.close()
         # Release the threads (a notebook runs many trainings in one process): the loop's default executor
         # (to_thread / run_in_executor calls), then the loop and its thread.
         if self.loop.is_running():

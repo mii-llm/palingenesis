@@ -484,8 +484,13 @@ def test_health_monitor_during_training():
 def test_flagship_configs_validate():
     """All shipped YAML configs pass validation (no hard errors)."""
     configs_dir = Path(__file__).parent.parent / "configs"
-    # distillation and RL configs have their own schemas (palingenesis.opd.config, palingenesis.rl.config)
-    yaml_files = [p for p in configs_dir.rglob("*.yaml") if not p.name.startswith(("distill_", "rl_"))]
+    # distillation and RL configs have their own schemas (palingenesis.opd.config, palingenesis.rl.config), and so
+    # do the evaluation tasks of configs/eval (palingenesis.eval.config)
+    yaml_files = [
+        p
+        for p in configs_dir.rglob("*.yaml")
+        if not p.name.startswith(("distill_", "rl_")) and p.parent.name != "eval"
+    ]
     assert len(yaml_files) >= 5, f"Expected >=5 configs, found {len(yaml_files)}"
 
     errors = []

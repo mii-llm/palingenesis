@@ -132,6 +132,11 @@ path = "src/palingenesis/__init__.py"
 # inside the package, so `pgs diagnose/inspect/validate/init ...` work from any directory.
 packages = ["src/palingenesis"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# The built-in evaluation tasks (`pgs eval --tasks gsm8k`): configs/eval in a checkout, palingenesis/eval/task_pack
+# in an installed package (palingenesis.eval.config.task_dirs looks in both).
+"configs/eval" = "palingenesis/eval/task_pack"
+
 [tool.hatch.build.targets.sdist]
 # An explicit list: everything else in the checkout (local tooling, notes, deployment files) stays out.
 only-include = ["src/palingenesis", "tests", "configs", "README.md", "LICENSE", "pyproject.toml"]

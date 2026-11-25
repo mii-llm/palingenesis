@@ -1,0 +1,20 @@
+# MMLU-Pro (Wang et al. 2024) scored by log-likelihood: the 12,032 test questions, up to ten options, the letter
+# after "Answer:" read from the next-token distribution. License: MIT. In lm-evaluation-harness's task format, so
+# the same file runs in both harnesses (scripts/gpu_checks/eval_bench.sh compares them with it). Zero-shot.
+# The generative form with chain of thought is the task `mmlu_pro`; the two measure different things.
+task: mmlu_pro_mc
+dataset_path: TIGER-Lab/MMLU-Pro
+test_split: test
+output_type: multiple_choice
+description: "The following are multiple choice questions (with answers) about {{category}}.\n\n"
+doc_to_text: "{{question.strip()}}\n{% for option in options %}{{'ABCDEFGHIJ'[loop.index0]}}. {{option}}\n{% endfor %}Answer:"
+doc_to_choice: "{{ ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'][:options|length] }}"
+doc_to_target: answer_index
+category_field: category
+num_fewshot: 0
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

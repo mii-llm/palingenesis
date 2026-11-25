@@ -1,0 +1,17 @@
+# GSM8K (Cobbe et al. 2021): grade-school math word problems. Test split, 1,319 items. License: MIT.
+# pgs eval --model <checkpoint> --tasks gsm8k --modes plain,think
+name: gsm8k
+description: grade-school math word problems (1,319 items)
+dataset: openai/gsm8k
+subset: main
+split: test
+fields:
+  # the gold column is a worked solution ending in "#### 18": keep the number
+  answer: {from: answer, regex: '####\s*(.+)$', replace: {",": ""}}
+prompt: |
+  {{question}}
+
+  Solve the problem step by step, then write the final number on the last line as "Answer: <number>".
+scorer: numeric            # \boxed{}, else "Answer: ...", else the last number in the completion
+scorer_args: {field: answer}
+sampling: {max_tokens: 2048}

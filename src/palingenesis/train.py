@@ -1151,6 +1151,26 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
 
     # ── Tracker ───────────────────────────────────────────────────────────
     tracker = Tracker(config, is_main=is_main())
+    # eval_tasks: `pgs eval` tasks on the model in training, by generation (palingenesis.eval.training)
+    _task_eval = None
+    if config.eval_tasks.enabled and is_main():
+        if world_size > 1:
+            logger.warning(
+                "eval_tasks: skipped. pgs train runs evaluation tasks on a single process only (they generate with "
+                "the model in training); run `pgs eval` on the saved checkpoints instead."
+            )
+        else:
+            from palingenesis.eval.training import TrainingEval
+
+            _task_eval = TrainingEval(
+                config.eval_tasks,
+                config.model.name_or_path,
+                tokenizer,
+                config.train.output_dir,
+                every=config.data.eval_every,
+                engine_options={"max_model_len": config.data.max_seq_length},
+                seed=config.train.seed,
+            )
     run["tracker"] = tracker  # train() closes it, also on errors
 
     # ── Health Monitor ────────────────────────────────────────────────────
@@ -2161,6 +2181,16 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 # after spike-skip (already zeroed above).
                 if _grad_release is None:
                     optimizer.zero_grad(set_to_none=True)
+
+                # eval_tasks: generation with the model itself, once the step's gradients are released
+                if _task_eval is not None and _task_eval.due(global_step, total_steps):
+                    task_metrics = _task_eval.run_on_model(model, global_step)
+                    if task_metrics:
+                        tracker.log({f"eval/{k}": v for k, v in task_metrics.items()}, step=global_step)
+                        logger.info(
+                            f"step={global_step} eval_tasks "
+                            + " ".join(f"{k}={v:.4g}" for k, v in sorted(task_metrics.items()))
+                        )
 
                 accum_loss, accum_tokens, accum_trained, accum_micro = 0.0, 0, 0, 0
                 accum_ce, accum_gate, accum_ce_micro = 0.0, 0.0, 0

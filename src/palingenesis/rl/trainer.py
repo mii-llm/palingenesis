@@ -651,6 +651,7 @@ class RLTrainer:
         self.stop_requested = False
         # metrics: wandb, trackio, logging.trackers (rank 0); the run id is saved with each checkpoint
         self.tracker = Tracker.for_run(config.logging, config.to_dict(), t.output_dir, wandb_id, self.parallel.main)
+        self.task_eval = self._make_task_eval()  # eval_tasks: `pgs eval` tasks on the rollout engine
         self.dumps = None  # logging.dump_trajectories: the trajectories' writer (palingenesis.rollouts)
         if config.logging.dump_trajectories:
             self.dumps = RolloutSink(
@@ -1458,6 +1459,8 @@ class RLTrainer:
         try:
             if t.eval_every and self.start_step == 0:
                 self._log("eval", self.evaluate(), 0)
+            if self.start_step == 0:
+                self._eval_tasks(0)
             start_time = time.time()
             t_loss = self.config.loss
             for step in range(self.start_step, t.steps):
@@ -1561,9 +1564,12 @@ class RLTrainer:
                     return
                 if t.eval_every and (step + 1) % t.eval_every == 0 and step + 1 < t.steps:
                     self._log("eval", self.evaluate(), step + 1)
+                if step + 1 < t.steps:
+                    self._eval_tasks(step + 1)
                 if t.save_steps and (step + 1) % t.save_steps == 0:
                     self.save(f"step_{step + 1}", step + 1)
             self._log("eval", self.evaluate(), t.steps)
+            self._eval_tasks(t.steps)
             self.plugins.on_train_end(self.model)
             if t.save_final:
                 self.save("final")
@@ -1665,6 +1671,49 @@ class RLTrainer:
             return stats
         gathered = self.parallel.gather((stats, len(self.eval_rows)))
         return mean_stats([s for s, _ in gathered], [float(n) for _, n in gathered])
+
+    def _make_task_eval(self):
+        """The eval_tasks: hook (palingenesis.eval.training), on the main rank; None when the section is empty."""
+        config = self.config
+        if not config.eval_tasks.enabled or not self.parallel.main:
+            return None
+        if config.scenario.type or not hasattr(self.pipeline, "client"):
+            logger.warning("eval_tasks: skipped (not run with multi-role scenarios); use `pgs eval` on checkpoints")
+            return None
+        from palingenesis.eval.training import TrainingEval
+
+        return TrainingEval(
+            config.eval_tasks,
+            config.model.policy,
+            self.tok,
+            config.train.output_dir,
+            every=config.train.eval_every,
+            engine_options={"max_model_len": config.rollout.max_model_len},
+            chat_template_kwargs=config.model.chat_template_kwargs,
+            stop_tokens=config.model.stop_tokens,
+            seed=config.train.seed,
+        )
+
+    def _eval_tasks(self, step: int) -> None:
+        """Run the eval_tasks: tasks when they are due at `step`: the newest weights through the rollout engine,
+        sharing the training pipeline's generation client (one driver per engine)."""
+        task_eval = getattr(self, "task_eval", None)
+        if task_eval is None or not task_eval.due(step, self.config.train.steps):
+            return
+        p = self.pipeline
+        self.model.eval()
+        try:
+            with p.lock:
+                with p.client.paused():  # groups still decoding from the last batch: load between engine steps
+                    self.weights.sync(self.engine)
+                self.engine.wake()
+                try:
+                    metrics = task_eval.run(self.engine, step, client=p.client)
+                finally:
+                    self.engine.sleep()
+        finally:
+            self.model.train()
+        self._log("eval", metrics, step)
 
     # ------------------------------------------------------------- bookkeeping
 

@@ -1,0 +1,5 @@
+# Multiple choice by log-likelihood (no generation): fast, and comparable with lm-evaluation-harness numbers.
+description: MMLU (5-shot) and MMLU-Pro (0-shot) by log-likelihood
+tasks:
+  - mmlu
+  - mmlu_pro_mc

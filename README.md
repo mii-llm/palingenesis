@@ -69,6 +69,11 @@ AMD GPUs (ROCm): [Training on AMD GPUs](https://mii-llm.github.io/palingenesis/g
   RL replays the experts the rollout engine chose. Gradients tested against the written-out losses on five families.
 - **Training you can inspect.** wandb and trackio with grad norm, spike and clip counters, gradient noise scale, entropy and
   the generalisation gap on one step axis; best-checkpoint tracking on eval loss.
+- **Evaluation that agrees with training.** `pgs eval --model X --suite core` runs tasks defined in YAML (GSM8K,
+  MATH-500, MMLU, MMLU-Pro, IFEval, BBH, HumanEval, MBPP, function calling, Italian sets, your own, agentic
+  environments, or task files of lm-evaluation-harness as they are) with the trainer's own prompt rendering, tool
+  parsing and rewards, in each thinking mode: one engine per run, scoring next to generation, multiple choice with
+  one prefill per question; `pgs compare` gives paired tests between two checkpoints.
 - **Crash-safe.** Re-run the same command to resume from the last complete checkpoint, in the same tracker run.
 - **Scale out.** FSDP across GPUs, multi-node SLURM with sharded checkpoints, and a container image for Kubernetes.
 - **Research options, one line each.** DEFT / DFT / InfoSFT token weighting, Hyperball, power-decay schedules: implemented to

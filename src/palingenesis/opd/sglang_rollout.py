@@ -153,7 +153,13 @@ def sampling_params(sampling: Sampling, max_new_tokens: int, stop_ids: Iterable[
     """SGLang sampling_params for one completion. top_k 0 (off) is SGLang's -1; temperature 0 is greedy (SGLang
     turns it into top_k 1). Stop tokens are kept in the output and special tokens are not skipped: the trainer
     trains on exactly the sampled ids."""
+    if sampling.allowed:
+        raise NotImplementedError(
+            "Sampling.allowed (a restricted next-token set) is not available with the SGLang engine: use the vllm "
+            "or hf backend for loglikelihood (multiple-choice) evaluation."
+        )
     return {
+        **({"stop": list(sampling.stop)} if sampling.stop else {}),
         "max_new_tokens": int(max_new_tokens),
         "temperature": float(sampling.temperature),
         "top_p": float(sampling.top_p),

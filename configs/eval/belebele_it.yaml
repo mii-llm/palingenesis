@@ -1,0 +1,25 @@
+# Belebele, Italian (Bandarkar et al. 2023): reading comprehension over FLORES passages, 900 items, four options,
+# parallel across 122 languages. License: CC-BY-SA-4.0. Questions on one passage are one cluster (they are not
+# independent: intervals resample passages). Other languages: change `subset` (eng_Latn, fra_Latn, ...).
+name: belebele_it
+description: reading comprehension in Italian, four options (900 items)
+dataset: facebook/belebele
+subset: ita_Latn
+split: test
+version: "1"
+cluster_field: link
+fields:
+  answer: {from: correct_answer_num, map: {"1": A, "2": B, "3": C, "4": D}}
+prompt: |
+  Leggi il brano e rispondi alla domanda. Concludi con "La risposta è (X)", dove X è la lettera dell'opzione corretta.
+
+  Brano: {{flores_passage}}
+
+  Domanda: {{question}}
+  A. {{mc_answer1}}
+  B. {{mc_answer2}}
+  C. {{mc_answer3}}
+  D. {{mc_answer4}}
+scorer: mcq
+scorer_args: {field: answer, letters: ABCD}
+sampling: {max_tokens: 1024}

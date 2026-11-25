@@ -1,0 +1,20 @@
+# BFCL v3 "simple" (Berkeley Function-Calling Leaderboard, Patil et al.): one user request, one function, one
+# expected call. 400 items. License: Apache-2.0. The questions and the accepted answers are two files of the
+# dataset repository, joined by id.
+# The functions are passed as tools through the model's chat template and the call is read by the RL tool-call
+# parser, as in training. The scorer is BFCL-style (function name, every argument among its accepted values,
+# optional arguments may be left out), not the leaderboard's own checker: do not compare with leaderboard numbers.
+# Other single-turn categories work the same way (multiple, parallel, parallel_multiple: change the two file names).
+name: bfcl_simple
+description: function calling, one call per request, BFCL-style argument matching (400 items)
+dataset: gorilla-llm/Berkeley-Function-Calling-Leaderboard
+data_files: BFCL_v3_simple.json
+join: {data_files: possible_answer/BFCL_v3_simple.json, key: id}
+id_field: id
+fields:
+  messages: question.0                       # the first (only) turn's messages
+  tools: {from: function, tools: true}       # function specs -> tool schemas (dict -> object, float -> number)
+prompt_field: messages
+scorer: function_call
+scorer_args: {field: ground_truth}
+sampling: {max_tokens: 512}

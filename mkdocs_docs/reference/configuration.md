@@ -457,6 +457,25 @@ Images in the training data, for the Qwen-VL family (Qwen2-VL, Qwen2.5-VL, Qwen3
 
 ---
 
+## eval_tasks
+
+Evaluation tasks during training ([Evaluation guide](../guides/evaluation.md#during-training)). The same section exists in `pgs train`, `pgs rl` and `pgs distill` configs. Off while `tasks` is empty.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tasks` | list | `[]` | Built-in task names (`gsm8k`, `math500`, `mmlu_pro`, `ifeval`, `bfcl_simple`), task YAML files, or inline tasks. |
+| `every` | int | `0` | Steps between evaluations. 0: the trainer's own interval (`data.eval_every` in `pgs train`, `train.eval_every` in `pgs rl` / `pgs distill`). |
+| `k` | int | `1` | Samples per item. |
+| `modes` | list | `[]` | Thinking modes (`default`, `plain`, `think`), each logged separately. Empty: the trainer's own chat template arguments. |
+| `limit` | int | `200` | Items per task: a fixed-seed sample, the same at every evaluation (0 = all). |
+| `sampling` | dict | `{}` | `temperature`, `top_p`, `top_k`, `presence_penalty`, `max_tokens`, `max_completion_tokens`, over each task's own. |
+| `save_samples` | bool | `false` | Also write every completion (`<task>.<mode>.samples.jsonl`). |
+| `final` | bool | `true` | Also evaluate at the last step. |
+
+Logged as `eval/tasks/<task>/<mode>/score`, `pass@k`, `truncated`, `loops`, `tokens`; result files in `<output_dir>/eval_tasks/step_<n>/` (the `pgs compare` format). `pgs rl` and `pgs distill` evaluate on their rollout engine with the newest weights; `pgs train` generates with the model itself, on a single process (multi-GPU runs skip the tasks with a warning).
+
+---
+
 ## CLI overrides
 
 Any parameter can be overridden from the command line:
@@ -624,3 +643,101 @@ A config in the first OPD format (`model.teacher`, `bridge:`, `data:`, `sampling
 | `dump_trajectories` | int | `0` | Every N steps, write the batch's completions to `<output_dir>/rollouts/` (0 = never); read them with `pgs rollouts`. |
 | `dump_groups` | int | `0` | Prompts (with all their rollouts) per dumped batch, drawn at random (0 = all). |
 | `dump_content` | bool | `true` | `false`: counts and log-probs only, no prompts or completions. |
+
+---
+
+## Evaluation config (`pgs eval`)
+
+`pgs eval --config eval.yaml` reads its own config (`palingenesis.eval.EvalConfig`), with the same strict loading: unknown options, wrong types and impossible combinations are errors that name the option. Command-line flags and `--section.option value` overrides apply on top. See the [Evaluation guide](../guides/evaluation.md).
+
+```yaml
+model: {path: runs/sft/final}
+engine: {backend: vllm, max_model_len: 8192, gpu_memory_utilization: 0.9}
+run: {k: 4, modes: [plain, think], output_dir: eval/sft}
+sampling: {temperature: 0.7, top_p: 0.8, top_k: 20}
+tasks:
+  - gsm8k                               # a built-in task
+  - tasks/store_math.yaml               # a task file (relative to this config or the working directory)
+  - {task: mmlu_pro, limit: 2000}       # a task with options changed
+  - {name: capitals, dataset: data/capitals.jsonl, prompt: "{{question}}", scorer: exact_match}   # inline
+```
+
+### model
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | str | required | The checkpoint: a Hugging Face id or a local path. |
+| `stop_tokens` | list | `[]` | Tokens that end a turn besides the template's end-of-turn token and eos. |
+| `chat_template_kwargs` | dict | `{}` | Chat template arguments under every mode's own. |
+
+### engine
+
+The rollout engine, with the engine options of the RL config's `rollout` section: `backend` (`vllm`, `sglang`, `hf`), `max_model_len` (8192), `gpu_memory_utilization` (0.9 here: evaluation alone on the GPU), `max_num_seqs`, `enforce_eager`, `prefix_caching`, `kv_cache_dtype`, `quantization`, `vllm_args`, `sglang_args`, `micro_seqs` (hf). Sampling options are not engine options (`sampling:`).
+
+Evaluation defaults differ from RL's: `prefix_caching: true`, `max_num_seqs: 512`, `vllm_args.max_num_batched_tokens: 16384`. Options of the evaluation itself: `replicas` (engines per GPU), `devices` (GPU indices, one engine each; default every visible GPU when there are several), `tensor_parallel_size` (one engine over several GPUs), `speculative_config` (passed to vLLM), `max_logprobs` (32: next-token candidates per loglikelihood request).
+
+### run
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `k` | int | `1` | Samples per item (a task's own `k` wins). |
+| `modes` | list | `[default]` | Thinking modes, each a separate result (a task's own `modes` wins). |
+| `limit` | int | `0` | Items per task, a fixed-seed sample (0 = the task's own `limit`). |
+| `head` | bool | `false` | A limit keeps the first items instead of a fixed-seed sample (lm-eval's `--limit`). |
+| `chunk` | int | `512` | Agentic tasks: items with episodes in flight at once. Single-turn tasks are submitted all at once. |
+| `template` | str | `chat` | `chat` or `completion` (raw text) for tasks that do not set their own. |
+| `num_fewshot` | int | `-1` | lm-eval tasks: few-shot examples (-1 = the task's). |
+| `score_workers` | int | `-1` | Scorer processes: -1 automatic (from 256 samples), 0 = threads. |
+| `cache_dir` | str | `""` | The generation cache directory (`""` = off in a config; the command line defaults to `~/.cache/palingenesis/eval`). |
+| `contamination` | list | `[]` | Training data files or directories checked for n-gram overlap with the prompts. |
+| `contamination_ngram` | int | `13` | Words per n-gram. |
+| `output_dir` | str | `eval_results` | Where the result files go. |
+| `save_samples` | bool | `true` | Write `<task>.<mode>.samples.jsonl`. |
+| `resume` | bool | `false` | Keep the items already in the result files. |
+| `resamples` | int | `10000` | Bootstrap resamples. |
+| `confidence` | float | `0.95` | Interval level. |
+| `seed` | int | `0` | The engine's and the bootstrap's seed. |
+
+### sampling
+
+Defaults for every task and mode; a task's `sampling:`, a mode's and the command line override them option by option.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `temperature` | float\|null | `null` | 0 = greedy. Unset everywhere: the model's `generation_config.json` (with its `top_p` / `top_k`); without one, 0 at k = 1 and 1 at k > 1. |
+| `top_p` | float\|null | `null` | Nucleus sampling (1 = off). |
+| `top_k` | int\|null | `null` | 0 = off. |
+| `presence_penalty` | float\|null | `null` | 0 = off. |
+| `max_tokens` | int\|null | `null` | Generated tokens per assistant turn, thinking included (2048). |
+| `max_completion_tokens` | int\|null | `null` | Generated tokens of a whole episode (agentic tasks; default `max_tokens` × `env.max_turns`). |
+
+### modes
+
+Built in: `default` (`{}`), `plain` (`{enable_thinking: false}`), `think` (`{enable_thinking: true}`). Others, or these with their own sampling: `modes: {<name>: {chat_template_kwargs: {...}, sampling: {...}}}`.
+
+### Task options
+
+A task YAML file, or an entry of `tasks:` (`{task: <name or file>, ...}` changes options of an existing task).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | str | file name | Names the result files (letters, digits, `_`, `-`). |
+| `description` | str | `""` | Shown by `pgs eval --list`. |
+| `dataset` | str | required | A Hugging Face dataset id, or a local `.jsonl` / `.json` / `.parquet` file. |
+| `subset`, `split`, `revision` | str | `""`, `test`, `""` | The Hub dataset's configuration, split and revision. |
+| `data_files` | str | `""` | One file of a Hub dataset repository (or of a local directory) instead of the dataset's loader. |
+| `join` | dict | `{}` | `{data_files: <second file>, key: <column>}`: columns of a second file, matched by the key. |
+| `limit`, `sample_seed` | int | `0`, `0` | At most `limit` items: a fixed-seed sample kept in file order (0 = all). |
+| `fields` | dict | `{}` | Columns computed from the dataset's: a column name, or `{from / template / value, json, regex, group, replace, strip, map, choices, letter, tools, default}`. |
+| `id_field` | str | `""` | The item's id column (default: its row number). Ids are `<task>/<value>` and must be unique. |
+| `cluster_field` | str | `""` | Items with equal values are resampled together (not independent). |
+| `prompt` / `messages` / `prompt_field` | str / list / str | `""` | One user turn, a chat, or a column holding either; `{{name}}` placeholders in the first two. |
+| `system_prompt` | str | `""` | Prepended when the chat has no system message. |
+| `scorer`, `scorer_args` | str, dict | `""`, `{}` | `exact_match`, `numeric`, `mcq`, `regex_match`, `json_schema`, `function_call`, `ifeval`, an RL reward (`math`, `code`, `judge`, ...) or `module:function`, and its arguments. |
+| `rewards` | dict | `{}` | Instead of `scorer`: several weighted rewards, `{name: {fn, weight, args}}` as in an RL config. |
+| `threshold` | float | `0.5` | A sample passes at or above this score (pass@k). |
+| `judge_validation` | dict | `{}` | For LLM judges: `{file, label_field, threshold, min_agreement, min_examples}` or `{skip: true}`. |
+| `k` | int | `0` | Samples per item (0 = the run's). |
+| `modes` | list | `[]` | Thinking modes (empty = the run's). |
+| `sampling` | dict | `{}` | Sampling options of this task. |
+| `env`, `sandbox` | dict | `{}` | Agentic tasks: the RL config's `env` (`type`, `args`, `tools`, `max_turns`, `max_concurrent`, `tool_timeout`, ...) and `sandbox` sections. |

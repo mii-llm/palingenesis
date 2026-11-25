@@ -1,0 +1,14 @@
+# IFEval (Zhou et al. 2023): 541 prompts with verifiable formatting instructions. Dataset and reference checker:
+# Apache-2.0. The score is the benchmark's prompt-level strict accuracy (every instruction of the prompt followed);
+# scorer_args {loose: true} gives the loose criterion, {level: instruction} the instruction-level accuracy.
+# Checks: the reference implementation when it is installed, else the port in palingenesis.eval.ifeval (sentence
+# and capital-word counts use NLTK only when available; the prompts with language:response_language need
+# `pip install langdetect` and are left out of the score without it; the summary's unscored_items counts them).
+name: ifeval
+description: verifiable instruction following, prompt-level strict accuracy (541 items)
+dataset: google/IFEval
+split: train
+id_field: key
+prompt_field: prompt
+scorer: ifeval
+sampling: {max_tokens: 1280}
