@@ -3,15 +3,17 @@
     $PGS_PY scripts/gpu_checks/rl_concurrency.py --work $WORK [--model Qwen/Qwen3-0.6B] [--repeats 3]
 
 Starts one `vllm serve` (its own process group; only that group is killed at the end) with a deliberately small KV
-cache, then sends the same burst of long completions twice per repeat: all at once (rollout.concurrency fixed) and
-through the KV-sized gate (kv). Prints JSON lines {"check", "status": PASS | FAIL, ...numbers}:
+cache, then sends the same burst of long completions three times per repeat: all at once (rollout.concurrency
+fixed), through the KV-sized gate with its defaults (kv), and through a gate that knows the requests' length and
+fills the cache further before it cuts (kv_tight: rollout.concurrency_request_tokens, kv_usage_low 0.8,
+kv_usage_high 0.95). Every gate starts cold, so each burst includes the cap's ramp. Prints JSON lines {"check", "status": PASS | FAIL, ...numbers}:
 
   concurrency/metrics      the server's /metrics and /v1/models give what the controller reads
   concurrency/start_cap    the gate's first cap is KV-cache tokens / max_model_len, within its bounds
   concurrency/burst        per mode: completion tokens/s, preemptions, peak KV usage, requests completed (median
                            over repeats); kv also the cap's range and final value
-  concurrency/kv_vs_fixed  every request completed in both modes, kv's caps stayed in bounds, and kv's throughput
-                           is at least --min-ratio x fixed's (the numbers say which way it went)
+  concurrency/kv_vs_fixed  the caps stayed in bounds, and the better of the two kv settings reaches --min-ratio x
+                           fixed's tokens/s with fewer preemptions (`reason` says what failed; both ratios given)
 
 Everything it writes (the server log, results.jsonl) stays in --work. Needs vLLM; HF_HUB_OFFLINE=1 is set.
 """
@@ -157,15 +159,18 @@ async def burst(url: str, model: str, args: argparse.Namespace, seed: int, gate=
             "seed": rng.randrange(1 << 30),
         }
         key = await gate.acquire() if gate is not None else None
+        held = 0
         try:
             reply = await loop.run_in_executor(pool, post, url, payload)
             done["ok"] += 1
             done["tokens"] += int(reply["usage"]["completion_tokens"])
-        except Exception:  # noqa: BLE001 — counted, reported
+            held = len(prompt) + int(reply["usage"]["completion_tokens"])
+        except Exception as error:  # noqa: BLE001 — counted, reported
             done["failed"] += 1
+            done.setdefault("error", f"{type(error).__name__}: {error}"[:300])
         finally:
             if gate is not None:
-                gate.release(key)
+                gate.release(key, held)  # (the tokens the request held size the cap)
 
     watcher = asyncio.ensure_future(monitor())
     start = time.perf_counter()
@@ -182,6 +187,7 @@ async def burst(url: str, model: str, args: argparse.Namespace, seed: int, gate=
         "tok_s": done["tokens"] / seconds,
         "completed": done["ok"],
         "failed": done["failed"],
+        "first_error": done.get("error"),
         "preemptions": preempted,
         "kv_usage_peak": peak_usage,
     }
@@ -247,24 +253,32 @@ def main() -> int:
             }
         )
         failed |= not ok
-        settings = ConcurrencySettings(
-            minimum=4, maximum=args.max_num_seqs, low=0.6, high=0.8, poll_s=1.0, max_model_len=args.max_model_len
-        )
-        fixed_runs, kv_runs, starts = [], [], []
+        # Two settings of the controller: the defaults (TRL's thresholds; the cap starts from max_model_len), and a
+        # tight one that knows what a request holds when it ends and fills the KV cache further before it cuts.
+        request_tokens = args.prompt_tokens + args.max_tokens
+        common = {"minimum": 4, "maximum": args.max_num_seqs, "poll_s": 1.0, "max_model_len": args.max_model_len}
+        modes = {
+            "kv": ConcurrencySettings(low=0.6, high=0.8, **common),
+            "kv_tight": ConcurrencySettings(low=0.8, high=0.95, request_tokens=request_tokens, **common),
+        }
+        runs: dict[str, list[dict]] = {"fixed": [], **{mode: [] for mode in modes}}
+        starts: list[int] = []
         for repeat in range(args.repeats):
-            fixed_runs.append(asyncio.run(burst(server.url, args.model, args, seed=repeat)))
-            gate = server_gate(settings, server.url)
+            runs["fixed"].append(asyncio.run(burst(server.url, args.model, args, seed=repeat)))
+            for mode, settings in modes.items():
+                gate = server_gate(settings, server.url)
 
-            async def gated(gate=gate, repeat=repeat):
-                key = await gate.acquire()  # the first cap, before the burst
-                starts.append(gate.slots[""].controller.cap)
-                gate.release(key)
-                try:
-                    return await burst(server.url, args.model, args, seed=repeat, gate=gate)
-                finally:
-                    gate.close()
+                async def gated(gate=gate, repeat=repeat, mode=mode):
+                    key = await gate.acquire()  # the first cap, before the burst
+                    if mode == "kv":
+                        starts.append(gate.slots[""].controller.cap)
+                    gate.release(key)
+                    try:
+                        return await burst(server.url, args.model, args, seed=repeat, gate=gate)
+                    finally:
+                        gate.close()
 
-            kv_runs.append(asyncio.run(gated()))
+                runs[mode].append(asyncio.run(gated()))
         expected = max(4, min(args.max_num_seqs, (load.kv_tokens or 0) // args.max_model_len)) if load else None
         ok = bool(starts) and all(s == expected for s in starts)
         emit(
@@ -272,12 +286,13 @@ def main() -> int:
         )
         failed |= not ok
         summary = {}
-        for mode, runs in (("fixed", fixed_runs), ("kv", kv_runs)):
+        for mode, mode_runs in runs.items():
             keys = ["tok_s", "seconds", "preemptions", "kv_usage_peak", "completed", "failed"]
-            if mode == "kv":
+            if mode != "fixed":
                 keys += ["cap_min", "cap_max", "cap_final", "cuts", "raises"]
-            summary[mode] = {key: median(runs, key) for key in keys}
-            complete = all(r["completed"] == args.requests and not r["failed"] for r in runs)
+            summary[mode] = {key: median(mode_runs, key) for key in keys}
+            complete = all(r["completed"] == args.requests and not r["failed"] for r in mode_runs)
+            errors = [r["first_error"] for r in mode_runs if r.get("first_error")]
             emit(
                 {
                     "check": "concurrency/burst",
@@ -287,29 +302,49 @@ def main() -> int:
                     "max_tokens": args.max_tokens,
                     "repeats": args.repeats,
                     **summary[mode],
+                    **({"first_error": errors[0]} if errors else {}),
                 }
             )
             failed |= not complete
-        bounded = all(settings.minimum <= r["cap_min"] and r["cap_max"] <= settings.maximum for r in kv_runs)
-        ratio = (summary["kv"]["tok_s"] or 0.0) / max(summary["fixed"]["tok_s"] or 0.0, 1e-9)
-        ok = bounded and ratio >= args.min_ratio
+        fixed = summary["fixed"]
+        ratios, reasons, bounded = {}, [], True
+        for mode, settings in modes.items():
+            bounded &= all(settings.minimum <= r["cap_min"] and r["cap_max"] <= settings.maximum for r in runs[mode])
+            ratios[mode] = (summary[mode]["tok_s"] or 0.0) / max(fixed["tok_s"] or 0.0, 1e-9)
+        # the better setting must reach min_ratio of fixed's tokens/s, with fewer preemptions than fixed when fixed
+        # preempted at all
+        best = max(ratios, key=ratios.get)
+        fewer = not fixed["preemptions"] or (summary[best]["preemptions"] or 0.0) < fixed["preemptions"]
+        if not bounded:
+            reasons.append("a cap left [minimum, maximum]")
+        if ratios[best] < args.min_ratio:
+            reasons.append(
+                f"the best setting ({best}) reached {ratios[best]:.2f} of fixed's tokens/s, below {args.min_ratio}"
+            )
+        if not fewer:
+            reasons.append(f"{best} preempted as much as fixed")
         emit(
             {
                 "check": "concurrency/kv_vs_fixed",
-                "status": "PASS" if ok else "FAIL",
-                "tok_s_ratio": ratio,
+                "status": "PASS" if not reasons else "FAIL",
+                **({"reason": "; ".join(reasons)} if reasons else {}),
+                "tok_s_ratio": ratios,
+                "best": best,
                 "caps_in_bounds": bounded,
-                "preemptions_fixed": summary["fixed"]["preemptions"],
-                "preemptions_kv": summary["kv"]["preemptions"],
+                "preemptions": {mode: values["preemptions"] for mode, values in summary.items()},
+                "request_tokens": request_tokens,
+                "kv_tokens": load.kv_tokens if load else None,
                 "min_ratio": args.min_ratio,
             }
         )
-        failed |= not ok
+        failed |= bool(reasons)
     except Exception as error:  # noqa: BLE001 — reported as a failed check
         emit({"check": "concurrency/run", "status": "FAIL", "error": f"{type(error).__name__}: {error}"})
         failed = True
     finally:
         server.stop()
+    if failed:  # the cause on stderr too, for whoever reads only the log
+        print(f"rl_concurrency: failed checks, see the FAIL lines in {OUT}", file=sys.stderr)
     return 1 if failed else 0
 
 

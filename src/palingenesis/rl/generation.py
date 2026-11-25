@@ -50,12 +50,11 @@ def _generation(r) -> Generation:
     return Generation(list(r.completion_ids), list(r.logprobs), r.finish_reason, r.policy_version, first, routed, top)
 
 
-def _release(gate, key: str, future: asyncio.Future) -> None:
-    """A gated request's future is done: free its slot (and take its exception, which a caller that was cancelled
-    will not read)."""
-    gate.release(key)
-    if not future.cancelled():
-        future.exception()
+def _release(gate, key: str, prompt_tokens: int, future: asyncio.Future) -> None:
+    """A gated request's future is done: free its slot, telling the gate how many tokens the request held (and
+    take its exception, which a caller that was cancelled will not read)."""
+    failed = future.cancelled() or future.exception() is not None
+    gate.release(key, 0 if failed else prompt_tokens + len(future.result().ids))
 
 
 class GenerationClient:
@@ -120,7 +119,7 @@ class GenerationClient:
         # The slot is the engine's work: it is released when the engine resolves the request, not when the caller
         # stops waiting. Engines have no abort, so a cancelled rollout's request keeps generating (and keeps its
         # slot) until it finishes; releasing at cancellation would let the gate send more than the cap.
-        future.add_done_callback(functools.partial(_release, self.gate, key))
+        future.add_done_callback(functools.partial(_release, self.gate, key, len(prompt_ids)))
         return await asyncio.shield(future)
 
     def _submit(self, prompt_ids, max_new_tokens, temperature, images, adapter) -> asyncio.Future:

@@ -258,7 +258,7 @@ class RemotePool:
                     # The slot is held until the worker answers (or is lost): a caller that is cancelled leaves
                     # its request generating on the worker, which has no abort, so the slot stays taken.
                     ask = asyncio.ensure_future(self._ask(engine, header))
-                    ask.add_done_callback(functools.partial(self._answered, address))
+                    ask.add_done_callback(functools.partial(self._answered, address, len(header["prompt"])))
                     reply = await asyncio.shield(ask)
                 else:
                     engine = min(alive, key=lambda e: e.load)
@@ -276,12 +276,12 @@ class RemotePool:
                 candidates=Candidates.from_tensors(reply.get("tensors") or {}),
             )
 
-    def _answered(self, address: str, ask: asyncio.Future) -> None:
-        """A gated request was answered (or its engine lost): free its slot, and take the exception a cancelled
-        caller will not read."""
-        self.gate.release(address)
-        if not ask.cancelled():
-            ask.exception()
+    def _answered(self, address: str, prompt_tokens: int, ask: asyncio.Future) -> None:
+        """A gated request was answered (or its engine lost): free its slot, telling the gate how many tokens the
+        request held, and take the exception a cancelled caller will not read."""
+        reply = None if ask.cancelled() or ask.exception() is not None else ask.result()
+        answered = isinstance(reply, dict) and "ids" in reply
+        self.gate.release(address, prompt_tokens + len(reply["ids"]) if answered else 0)
 
     async def _load(self, address: str) -> EngineLoad | None:
         """An engine's load as its worker reports it in `state` (None: the worker's engine reports none)."""

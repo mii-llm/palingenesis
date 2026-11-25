@@ -217,8 +217,9 @@ class RLRolloutConfig:
     # "fixed": every request as soon as a rollout asks for it (the engine queues and preempts by itself). "kv": a cap
     # on the requests in flight per engine, started at the engine's KV-cache tokens / max_model_len and moved with
     # its load, polled every concurrency_poll_s seconds (palingenesis.rl.concurrency, after TRL's AsyncGRPOTrainer):
-    # cut by 30% when its KV-cache usage passes kv_usage_high (or requests wait in its queue), raised by 25% while
-    # usage stays under kv_usage_low with nothing waiting and the cap was reached. Kept in [concurrency_min,
+    # cut by 30% when its KV-cache usage passes kv_usage_high (or requests wait in its queue, or it preempts), raised
+    # while usage stays under kv_usage_low with nothing waiting and the cap was reached (to what the finished
+    # requests' lengths say fits, then by 25%, 50% under half of kv_usage_low). Kept in [concurrency_min,
     # concurrency_max]; concurrency_max 0 = rollout.max_num_seqs, or what one step generates at once (>= 256).
     # Remote workers report their load when their engine can (the vLLM worker does; others keep the starting cap).
     concurrency: str = "fixed"
@@ -227,6 +228,11 @@ class RLRolloutConfig:
     kv_usage_low: float = 0.6
     kv_usage_high: float = 0.8
     concurrency_poll_s: float = 5.0
+    # kv: the context tokens (prompt and completion) a request is expected to hold when it ends. 0 = unknown: the
+    # cap starts at KV-cache tokens / max_model_len, the worst case, and is raised once requests have finished and
+    # their lengths are known. Set it when requests end far below max_model_len: the cap then starts at
+    # kv_usage_high x KV-cache tokens / this.
+    concurrency_request_tokens: int = 0
     # Token allowance: launches beyond what the batch being collected still needs (the speculative refills, and
     # with them what is carried into later batches) start only while the tokens the pipeline holds and has in
     # flight stay within (1 + token_allowance) x one batch's tokens (prompt and completion, measured on the
@@ -452,11 +458,13 @@ class RLTrainConfig:
     # the sequences' lengths; tree: the trie's unique tokens; also at most this many trained tokens).
     micro_tokens: int = 16384
     # How a micro-batch's sequences are laid out for the forward (palingenesis.tree_packing):
-    # "padded": right-padded rows of similar lengths, a power-of-two count (the default until GPU numbers exist).
+    # "padded": right-padded rows of similar lengths, a power-of-two count (the default).
     # "varlen": one row, the sequences end to end, no padding (variable-length attention; Gated DeltaNet layers
     #           restart their state per sequence).
     # "tree":   one row holding the sequences' prefix trie: tokens shared with the same prefix (a group's prompt,
     #           a common system prompt, the conversation before turns branch) are forwarded once, across groups too.
+    #           Only runs that save a tree level's cost are shared (2048 forwarded tokens): a micro-batch that
+    #           shares little is laid out as varlen.
     # Both packed modes compute the same log-probs and gradients as padded (up to floating-point order); they need
     # the model's attention on sdpa (rerouted by palingenesis) and full-attention / Gated DeltaNet layers only.
     packing: str = "padded"
@@ -1181,7 +1189,14 @@ def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
     """rollout.concurrency and rollout.token_allowance (palingenesis.rl.concurrency)."""
     errors: list[str] = []
     defaults = RLRolloutConfig()
-    tuning = ("concurrency_min", "concurrency_max", "kv_usage_low", "kv_usage_high", "concurrency_poll_s")
+    tuning = (
+        "concurrency_min",
+        "concurrency_max",
+        "kv_usage_low",
+        "kv_usage_high",
+        "concurrency_poll_s",
+        "concurrency_request_tokens",
+    )
     if r.concurrency not in CONCURRENCY:
         errors.append(f"rollout.concurrency must be one of {CONCURRENCY}, got {r.concurrency!r}.")
     elif r.concurrency == "kv":
@@ -1215,6 +1230,16 @@ def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
             errors.append(
                 "rollout.kv_usage_low and kv_usage_high are KV-cache usage fractions with 0 < low < high <= 1, got "
                 f"{r.kv_usage_low!r} and {r.kv_usage_high!r}."
+            )
+        expected = r.concurrency_request_tokens
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+            errors.append(
+                f"rollout.concurrency_request_tokens must be an integer >= 0 (0 = unknown), got {expected!r}."
+            )
+        elif expected > r.max_model_len:
+            errors.append(
+                f"rollout.concurrency_request_tokens ({expected}) is above rollout.max_model_len ({r.max_model_len}): "
+                "no request holds more."
             )
         if not (number(r.concurrency_poll_s) and r.concurrency_poll_s > 0):
             errors.append(f"rollout.concurrency_poll_s must be > 0 seconds, got {r.concurrency_poll_s!r}.")

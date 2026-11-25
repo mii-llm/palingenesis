@@ -141,16 +141,67 @@ def test_low_usage_raises_only_when_the_cap_binds_and_after_a_turnover():
     c = KVController(settings())
     c.start(10_000)  # 10
     low = EngineLoad(kv_usage=0.3, waiting=0.0)
-    assert c.observe(low, 10, finished=9, saturated=True) == 10  # fewer than a cap's worth finished
+    assert c.observe(low, 10, finished=4, saturated=True) == 10  # fewer than half a cap's worth finished
     assert c.observe(low, 3, finished=50, saturated=False) == 10  # nobody waited at the gate: no demand
     assert c.observe(EngineLoad(kv_usage=0.3, waiting=1.0), 10, 50, True) == 10  # the engine queues
     assert c.observe(EngineLoad(kv_usage=0.7, waiting=0.0), 10, 50, True) == 10  # between low and high: hold
     assert c.observe(low, 10, finished=50, saturated=True) == 13  # ceil(10 x 1.25)
     assert c.observe(low, 13, finished=55, saturated=True) == 13  # the turnover counts from the change
-    assert c.observe(low, 13, finished=63, saturated=True) == 17
+    assert c.observe(low, 13, finished=56, saturated=True) == 17
+    idle = EngineLoad(kv_usage=0.2, waiting=0.0)  # under half of `low`: x 1.5
+    assert c.observe(idle, 17, finished=70, saturated=True) == 26
     for finished in range(100, 10_000, 100):
         c.observe(low, c.cap, finished, True)
     assert c.cap == 64 and c.raises >= 3  # the maximum
+
+
+def test_finished_requests_size_the_cap_without_waiting_for_a_turnover():
+    """KV tokens / max_model_len is the worst case: once requests have finished, their mean length gives what fits
+    under `high` even if every request in flight reached it at once."""
+    c = KVController(settings(maximum=512))
+    assert c.start(74_704, 4096) == 18
+    low = EngineLoad(kv_usage=0.1, waiting=0.0)
+    for _ in range(7):
+        c.note_finished(1152)
+    assert c.observe(low, 18, finished=7, saturated=True) == 18  # too few measured, no turnover yet
+    c.note_finished(1152)
+    c.note_finished(0)  # a failed request tells nothing
+    assert c.observe(low, 18, finished=8, saturated=True) == 51 and c.raised  # 0.8 x 74704 / 1152
+    assert c.observe(low, 51, finished=20, saturated=True) == 51 and not c.raised  # beyond it: a turnover first
+    assert c.observe(EngineLoad(kv_usage=0.5, waiting=0.0), 51, finished=34, saturated=True) == 64
+    for _ in range(200):  # the requests get longer: the bound follows, the cap is not pulled down by it
+        c.note_finished(4000)
+    assert c.observe(low, 64, finished=40, saturated=True) == 64
+    # the expected length given up front: the cap starts there
+    assert KVController(settings(maximum=512, request_tokens=1152)).start(74_704, 4096) == 51
+
+
+def test_preemptions_cut_the_cap():
+    c = KVController(settings())
+    c.start(20_000)  # 20
+    assert c.observe(EngineLoad(kv_usage=0.7, waiting=0.0, preemptions=5.0), 20, 0, True) == 20  # the first reading
+    assert c.observe(EngineLoad(kv_usage=0.7, waiting=0.0, preemptions=5.0), 20, 0, True) == 20
+    assert c.observe(EngineLoad(kv_usage=0.7, waiting=0.0, preemptions=8.0), 20, 0, True) == 14 and c.cuts == 1
+    assert c.observe(EngineLoad(kv_usage=0.7, waiting=0.0, preemptions=9.0), 20, 0, True) == 14  # once per drain
+
+
+def test_the_gate_polls_sooner_while_it_raises_and_learns_lengths_from_releases():
+    feed = FakeFeed([EngineLoad(kv_usage=0.1, waiting=0.0)], capacity=(40_000, 4000))
+    gate = AdmissionGate(settings(minimum=1, maximum=64, poll_s=0.05), [""], feed.fetch, feed.capacity)
+
+    async def run():
+        async def request():
+            key = await gate.acquire()
+            await asyncio.sleep(0.002)
+            gate.release(key, tokens=1000)
+
+        await asyncio.gather(*(request() for _ in range(300)))
+        gate.close()
+
+    asyncio.run(run())
+    controller = gate.slots[""].controller
+    assert controller.requests_measured == 300 and controller.request_tokens == pytest.approx(1000)
+    assert controller.cap >= 32  # from 10 (40000 / 4000) to 0.8 x 40000 / 1000 in one step, then on
 
 
 def test_missing_metrics_leave_the_cap_alone(caplog):
@@ -748,6 +799,12 @@ def _config(**overrides) -> RLConfig:
         ({"rollout.concurrency": "kv", "rollout.concurrency_poll_s": 0}, "concurrency_poll_s must be > 0"),
         ({"rollout.kv_usage_high": 0.9}, "only used with rollout.concurrency kv"),
         ({"rollout.concurrency_max": 64}, "only used with rollout.concurrency kv"),
+        ({"rollout.concurrency_request_tokens": 512}, "only used with rollout.concurrency kv"),
+        ({"rollout.concurrency": "kv", "rollout.concurrency_request_tokens": -1}, "must be an integer >= 0"),
+        (
+            {"rollout.concurrency": "kv", "rollout.concurrency_request_tokens": 10**7},
+            "is above rollout.max_model_len",
+        ),
         ({"rollout.token_allowance": -1.0}, "token_allowance must be a finite number >= 0"),
         ({"rollout.token_allowance": float("inf")}, "token_allowance must be a finite number >= 0"),
     ],

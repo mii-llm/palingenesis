@@ -6,12 +6,24 @@ too many wastes its time on preemptions. The controller here keeps a cap on the 
 and moves it with the engine's own load, read from its metrics every `poll_s` seconds:
 
   start  KV-cache tokens / max_model_len: as many requests as fit at full length (or the configured maximum when
-         the engine does not report its KV capacity).
-  cut    KV-cache usage above `high` (or requests waiting in the engine's queue on two polls in a row): the cap
-         x 0.7, at most once until the requests in flight have drained below the cap (running requests keep
-         going; new ones wait).
-  raise  usage below `low`, nothing waiting, the cap reached since the last poll (requests waited at the gate),
-         and a cap's worth of requests finished since the last change: the cap x 1.25.
+         the engine does not report its KV capacity). With `request_tokens` (what a request is expected to hold
+         when it ends): `high` x KV-cache tokens / request_tokens.
+  cut    KV-cache usage above `high`, requests waiting in the engine's queue on two polls in a row, or
+         preemptions since the last poll: the cap x 0.7, at most once until the requests in flight have drained
+         below the cap (running requests keep going; new ones wait).
+  raise  usage below `low`, nothing waiting, the cap reached since the last poll (requests waited at the gate):
+         - to `high` x KV-cache tokens / the mean tokens of the requests finished so far, when the cap is below
+           it: what fits even if every request in flight reached that length at once (no wait: the bound comes
+           from measured lengths, not from a usage reading taken while the requests are still short);
+         - beyond it, after half a cap's worth of requests finished since the last change (the usage read then
+           is that of requests of every age): the cap x 1.25, x 1.5 while usage is under half of `low`.
+         While the cap is being raised the next poll comes after at most a second.
+
+Measured (scripts/gpu_checks/rl_concurrency.py, A100, Qwen3-0.6B, a KV cache of 74,704 tokens, bursts of 256
+requests of 128 + 1024 tokens): `fixed` 11.3k tokens/s with 317 preemptions; `kv` before the raise rules above
+(x 1.25 per full turnover from 18) 7.3k tokens/s with none, its cap at 59 after 36 s. 64 requests of that length
+fill that cache, so no cap that avoids preemption can match `fixed` there: preempting a short sequence costs
+little. The cap pays where a preempted sequence is long (its whole context is computed again).
 
 The cap stays in [minimum, maximum]. A poll whose metrics are missing changes nothing (a renamed metric would
 otherwise read as an idle engine and raise the cap). After TRL's AsyncGRPOTrainer (`_init_kv_cap`,
@@ -45,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 CUT = 0.7  # the cap's factor when the engine is overloaded
 GROW = 1.25  # its factor when the engine has room
+GROW_FAST = 1.5  # ... and when its KV cache is less than half as full as `low`
+FAST_POLL_S = 1.0  # the longest wait before the next poll while the cap is being raised
+LENGTH_SAMPLES = 8  # finished requests before their mean length sizes the cap
+LENGTH_SMOOTHING = 0.1
 WAITING_POLLS = 2  # polls in a row with requests waiting in the engine's queue that count as overload
 
 # vLLM's metric names (V1 first, the older V0 spelling after)
@@ -169,6 +185,7 @@ class ConcurrencySettings:
     high: float = 0.8  # cut above it
     poll_s: float = 5.0
     max_model_len: int = 8192  # what one request may reach (the start: KV tokens / this)
+    request_tokens: int = 0  # what a request is expected to hold when it ends (0: unknown, start from max_model_len)
 
 
 def settings_from(config) -> ConcurrencySettings | None:
@@ -186,6 +203,7 @@ def settings_from(config) -> ConcurrencySettings | None:
         high=r.kv_usage_high,
         poll_s=r.concurrency_poll_s,
         max_model_len=r.max_model_len,
+        request_tokens=r.concurrency_request_tokens,
     )
 
 
@@ -205,15 +223,23 @@ class KVController:
         self.last = EngineLoad()
         self.preemptions_seen: float | None = None
         self.preempted = 0.0  # preemptions since the start (as the engine counts them)
+        self.kv_tokens: int | None = None  # the engine's KV-cache size
+        self.request_tokens = 0.0  # mean context tokens of the finished requests (smoothed)
+        self.requests_measured = 0
+        self.raised = False  # the last poll raised the cap
 
     def _clamp(self, value: float) -> int:
         return int(min(self.settings.maximum, max(self.settings.minimum, value)))
 
     def start(self, kv_tokens: int | None, max_model_len: int | None = None) -> int:
-        """The first cap: KV tokens / max_model_len (as many requests as fit at full length), else the maximum."""
+        """The first cap: KV tokens / max_model_len (as many requests as fit at full length), or `high` x KV
+        tokens / settings.request_tokens when the expected length of a request is given; else the maximum."""
         with self.lock:
             length = max_model_len or self.settings.max_model_len
-            if kv_tokens and length:
+            self.kv_tokens = kv_tokens or None
+            if kv_tokens and self.settings.request_tokens:
+                self.cap = self._clamp(self.settings.high * kv_tokens / self.settings.request_tokens)
+            elif kv_tokens and length:
                 self.cap = self._clamp(kv_tokens // length)
             else:
                 self.cap = self.settings.maximum
@@ -225,6 +251,24 @@ class KVController:
                 )
             self.started = True
             return self.cap
+
+    def note_finished(self, tokens: int) -> None:
+        """A request finished holding `tokens` context tokens (prompt and completion)."""
+        if tokens <= 0:
+            return
+        with self.lock:
+            if not self.requests_measured:
+                self.request_tokens = float(tokens)
+            else:
+                self.request_tokens += LENGTH_SMOOTHING * (tokens - self.request_tokens)
+            self.requests_measured += 1
+
+    def _fits(self) -> int | None:
+        """Requests that fit under `high` if all of them held the finished requests' mean tokens at once (None
+        until enough have finished, or without the KV-cache size)."""
+        if not self.kv_tokens or self.requests_measured < LENGTH_SAMPLES or self.request_tokens <= 0:
+            return None
+        return self._clamp(self.settings.high * self.kv_tokens / self.request_tokens)
 
     def observe(self, load: EngineLoad | None, in_flight: int, finished: int, saturated: bool) -> int:
         """Move the cap after a poll. `in_flight`: requests out to the engine now; `finished`: requests it has
@@ -242,12 +286,17 @@ class KVController:
                     )
                 return self.cap
             self.last = load
+            self.raised = False
+            if load.kv_tokens:
+                self.kv_tokens = load.kv_tokens
+            preempting = False
             if load.preemptions is not None:
                 if self.preemptions_seen is not None and load.preemptions >= self.preemptions_seen:
                     self.preempted += load.preemptions - self.preemptions_seen
+                    preempting = load.preemptions > self.preemptions_seen
                 self.preemptions_seen = load.preemptions
             self.waiting_polls = self.waiting_polls + 1 if load.waiting > 0 else 0
-            overloaded = load.kv_usage > self.settings.high or self.waiting_polls >= WAITING_POLLS
+            overloaded = load.kv_usage > self.settings.high or self.waiting_polls >= WAITING_POLLS or preempting
             if overloaded and in_flight <= self.cap:  # once per drain: cuts do not compound while still above
                 cap = self._clamp(int(self.cap * CUT))
                 if cap != self.cap:
@@ -260,15 +309,16 @@ class KVController:
                         int(load.waiting),
                     )
                 self.waiting_polls = 0
-            elif (
-                load.kv_usage < self.settings.low
-                and load.waiting == 0
-                and saturated
-                and finished - self.at_change >= self.cap
-            ):
-                cap = self._clamp(math.ceil(self.cap * GROW))
+            elif load.kv_usage < self.settings.low and load.waiting == 0 and saturated:
+                fits = self._fits()
+                cap = self.cap
+                if fits is not None and cap < fits:  # sized from the finished requests' lengths: no wait
+                    cap = fits
+                elif finished - self.at_change >= max(1, self.cap // 2):
+                    factor = GROW_FAST if load.kv_usage < self.settings.low / 2 else GROW
+                    cap = self._clamp(math.ceil(self.cap * factor))
                 if cap != self.cap:
-                    self.cap, self.at_change, self.raises = cap, finished, self.raises + 1
+                    self.cap, self.at_change, self.raises, self.raised = cap, finished, self.raises + 1, True
             return self.cap
 
     def snapshot(self, reset: bool = False) -> dict:
@@ -449,12 +499,15 @@ class AdmissionGate:
             self.totals.admitted -= 1
         self._grant()
 
-    def release(self, key: str) -> None:
-        """The engine is done with a request admitted to `key` (finished, failed or aborted). On the gate's loop."""
+    def release(self, key: str, tokens: int = 0) -> None:
+        """The engine is done with a request admitted to `key` (finished, failed or aborted). `tokens`: the
+        context tokens it held at its end, prompt and completion (0: unknown), which size the cap. On the gate's
+        loop."""
         with self.lock:
             slot = self.slots[key]
             slot.in_flight -= 1
             slot.finished += 1
+        slot.controller.note_finished(tokens)
         self._grant()
 
     # ---------------------------------------------------------------- polling
@@ -462,7 +515,8 @@ class AdmissionGate:
     async def _poll(self) -> None:
         await asyncio.shield(self.starting)
         while not self.closed:
-            await asyncio.sleep(self.settings.poll_s)
+            ramping = any(slot.controller.raised for slot in self.slots.values())
+            await asyncio.sleep(min(self.settings.poll_s, FAST_POLL_S) if ramping else self.settings.poll_s)
             loads = await asyncio.gather(*(self.fetch(key) for key in self.slots), return_exceptions=True)
             for (key, slot), load in zip(self.slots.items(), loads):
                 if isinstance(load, BaseException):
