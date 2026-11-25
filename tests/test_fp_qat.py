@@ -817,3 +817,116 @@ def test_learned_clipping_factors_train_at_their_bounds_and_stay_in_range():
         m.qat_clip[0] = 1.3
     plugin.on_forward_start(model, {}, _ctx(step=2, total_steps=10))
     assert m.qat_clip[0].item() == pytest.approx(1.3)
+
+
+# ─────────────────────────────────────────────────────────────── vLLM's weight-only (Marlin) loading, re-implemented
+#
+# From vLLM 0.26: compressed_tensors/schemes/compressed_tensors_w4a4_{nvfp4,mxfp4}.py, quantization/utils/
+# marlin_utils_fp4.py (prepare_fp4_layer_for_marlin, nvfp4_marlin_process_scales), csrc/.../marlin/dequant.h,
+# gptq_marlin_repack.cu and marlin_template.h. Only the kernel's memory layout (tile permutations) is left out.
+
+
+def _marlin_e2m1(packed):
+    """weight_packed (uint8 [n, k/2]) as the kernel reads it: `.view(int32)`, element j of a row in bits
+    4 * (j % 8) of its word (gptq_marlin_repack: `(word >> (pos * 4)) & 15`); each code placed in a bf16 lane as
+    `sign | (code & 7) << 6` (dequant<nv_bfloat162, kFE2M1f>), a value 2^126 times too small until the scales
+    make up for it."""
+    words = packed.contiguous().view(torch.int32)
+    codes = torch.stack([(words >> (4 * j)) & 0xF for j in range(8)], dim=-1).reshape(packed.shape[0], -1)
+    lanes = (((codes & 0x8) << 12) | ((codes & 0x7) << 6)).to(torch.uint16).view(torch.int16)
+    return lanes.view(torch.bfloat16).to(torch.float64) * 2.0**126
+
+
+def _marlin_nvfp4_weight(shards, params_dtype=torch.bfloat16):
+    """The float32 weight vLLM computes with for a layer fused from `shards` (their packed tensors, in order)."""
+    q = _marlin_e2m1(torch.cat([s["weight_packed"] for s in shards]))
+    # CompressedTensorsW4A4Fp4.process_weights_after_loading: one global scale per fused layer, the reciprocal
+    stored = torch.cat([s["weight_global_scale"] for s in shards])
+    global_scale = 1.0 / stored.max().to(torch.float32)
+    # prepare_fp4_layer_for_marlin + nvfp4_marlin_process_scales
+    scales = torch.cat([s["weight_scale"] for s in shards]).to(params_dtype).to(torch.half)
+    factor = 1.0
+    if params_dtype != torch.half:  # _nvfp4_compute_scale_factor
+        top = (scales.float() * 2**7)[scales.float() > 0].max()
+        if top < 448 * 2**7:
+            factor = float((448 * 2**7 / top).log2().floor().exp2())
+    if factor > 1.0:
+        scales = (scales.float() * factor).to(torch.half)
+    scales = scales * 2**7
+    scales[scales < 2] = 0  # block scales below 2^-6 (times the factor) are dropped
+    s0e5m3 = ((scales.view(torch.int16) << 1).view(torch.uint8))[:, 1::2]  # the high byte: 5 exponent, 3 mantissa bits
+    decoded = (s0e5m3.to(torch.int16) << 7).view(torch.half).to(torch.float64) / 2**7 / factor
+    # the kernel: q * scale in bf16 (hmul2), accumulated in float32, the output times the float32 global scale
+    product = (q.reshape(q.shape[0], -1, 16) * decoded.unsqueeze(-1)).reshape(q.shape)
+    assert torch.equal(product.to(torch.bfloat16).to(torch.float64), product)  # exact in bf16: nothing lost there
+    return product.to(torch.float32) * global_scale
+
+
+def _marlin_mxfp4_weight(shards):
+    q = _marlin_e2m1(torch.cat([s["weight_packed"] for s in shards]))
+    stored = torch.cat([s["weight_scale"] for s in shards])
+    # `.view(torch.float8_e8m0fnu).to(params_dtype)`: the byte b is 2^(b - 127)
+    scales = torch.pow(torch.tensor(2.0, dtype=torch.float64), stored.to(torch.float64) - 127).to(torch.bfloat16)
+    product = (q.reshape(q.shape[0], -1, 32) * scales.to(torch.float64).unsqueeze(-1)).reshape(q.shape)
+    assert torch.equal(product.to(torch.bfloat16).to(torch.float64), product)
+    return product.to(torch.float32)
+
+
+def test_marlin_reference_decodes_the_e2m1_codes():
+    values = torch.tensor([[0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]])
+    assert torch.equal(_marlin_e2m1(pack_e2m1(values)).float(), values)
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("scales", ["max", "mse"])
+def test_packed_export_is_bit_for_bit_what_vllm_marlin_computes_with(fmt, scales):
+    """The dequantized twin (float32 as exported, and so its bf16 cast) against the packed tensors decoded by
+    vLLM's convention: nibble order, block-scale encoding and its 2^-6 floor, the reciprocal of the stored global
+    scale, one global scale per fused layer (the maximum of the shards' stored divisors)."""
+    torch.manual_seed(0)
+    model = H.tiny_llama(64, hidden=64)
+    with torch.no_grad():  # shards of very different sizes, a near-zero block, an all-zero block
+        attn = model.model.layers[0].self_attn
+        attn.k_proj.weight.mul_(7.0)
+        attn.v_proj.weight.mul_(0.01)
+        attn.q_proj.weight[3, :16] *= 1e-4
+        attn.q_proj.weight[5, 16:48] = 0.0
+    plugin = FloatQAT(format=fmt, scales=scales)
+    plugin.transform_model(model, _ctx())
+    plugin.on_train_start(model, _ctx())
+    plugin.export_state_dict(dict(model.state_dict()), model, _ctx())
+    pending = plugin._pending
+    fused = [("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj"), ("o_proj",), ("down_proj",)]
+    decode = _marlin_nvfp4_weight if fmt == "nvfp4" else _marlin_mxfp4_weight
+    checked = 0
+    for layer in range(2):
+        for group in fused:
+            block = "self_attn" if group[0].endswith(("q_proj", "o_proj")) else "mlp"
+            keys = [f"model.layers.{layer}.{block}.{name}.weight" for name in group]
+            twin = torch.cat([pending[k][0] for k in keys])
+            assert twin.dtype == torch.float32
+            reference = decode([pending[k][1] for k in keys])
+            assert torch.equal(reference, twin), keys
+            assert torch.equal(reference.to(torch.bfloat16), twin.to(torch.bfloat16))
+            if fmt == "nvfp4":  # what the decoding relies on
+                stored = torch.cat([pending[k][1]["weight_global_scale"] for k in keys])
+                assert torch.unique(stored).numel() == 1  # vLLM keeps one per fused layer
+                assert float(torch.cat([pending[k][1]["weight_scale"].float() for k in keys]).min()) >= 2.0**-6
+            checked += len(keys)
+    assert checked == len(pending) == 14
+    if fmt == "nvfp4":  # the near-zero block survives (Marlin would zero a scale below 2^-6), as in training
+        q_key = "model.layers.0.self_attn.q_proj.weight"
+        assert pending[q_key][1]["weight_scale"][3, 0].float().item() == 2.0**-6  # at the floor
+        assert pending[q_key][0][3, :16].abs().sum() > 0
+
+
+def test_nvfp4_shards_with_their_own_global_scale_are_not_what_vllm_computes():
+    """Why fused layers share the scale: vLLM takes the largest stored divisor for the whole fused layer."""
+    torch.manual_seed(0)
+    a, b = torch.randn(8, 32), torch.randn(8, 32) * 5
+    own = [quantize(w, FORMATS["nvfp4"]) for w in (a, b)]
+    reference = _marlin_nvfp4_weight([pack(q) for q in own])
+    assert not torch.equal(reference, torch.cat([q.dequantize() for q in own]))
+    amax = torch.stack([a.abs().amax(), b.abs().amax()]).amax()
+    shared = [quantize(w, FORMATS["nvfp4"], global_amax=amax) for w in (a, b)]
+    assert torch.equal(_marlin_nvfp4_weight([pack(q) for q in shared]), torch.cat([q.dequantize() for q in shared]))

@@ -20,7 +20,11 @@ Formats (FORMATS)
              compressed-tensors "nvfp4-pack-quantized"). Stored convention of compressed-tensors / vLLM:
                global_scale = 448 * 6 / amax(tensor)                       (a divisor, fp32)
                block_scale  = e4m3(clamp(amax(block) / 6 * global_scale, 2^-6, 448))
-               W ~= q * (block_scale / global_scale),  q = e2m1(W / (block_scale / global_scale))
+               W ~= (q * block_scale) * (1 / global_scale),  q = e2m1(W / (block_scale * (1 / global_scale)))
+             computed in this order in float32: q * block_scale is exact, and one multiplication by the
+             reciprocal is what vLLM's weight-only kernel does to the layer's output (Marlin: fp32 reciprocal
+             at load, applied after the accumulation), so the dequantized weights are bit for bit the ones
+             that kernel computes with.
              The lower clamp 2^-6 is torchao's (E4M3's smallest normal): vLLM's Marlin kernel (the weight-only
              path on GPUs without FP4 tensor cores) zeroes smaller block scales, and it keeps a block of
              near-zero weights from dividing by zero.
@@ -180,19 +184,27 @@ class Quantized:
     global_scale: Tensor | None
     saturated: Tensor
 
-    def effective_scale(self) -> Tensor:
-        """What a block's values are multiplied by: scale / global_scale (NVFP4), else scale."""
+    def global_reciprocal(self) -> Tensor | None:
+        """NVFP4: 1 / global_scale in float32 ([] or [rows, 1]), the factor vLLM computes at load."""
         if self.global_scale is None:
-            return self.scale
+            return None
         g = self.global_scale
-        return self.scale / (g if g.dim() == 0 else g.reshape(-1, 1))
+        return 1.0 / (g if g.dim() == 0 else g.reshape(-1, 1))
+
+    def effective_scale(self) -> Tensor:
+        """What a block's values are divided by to quantise: scale * (1 / global_scale) (NVFP4), else scale."""
+        inv = self.global_reciprocal()
+        return self.scale if inv is None else self.scale * inv
 
     def dequantize(self) -> Tensor:
+        """values * scale, exact in float32 (few significant bits each), then NVFP4's one multiplication by the
+        reciprocal of the global scale (see the module docstring)."""
         rows, cols = self.values.shape
         br, bc = self.spec.block_shape(rows, cols)
         v = self.values.reshape(rows // br, br, cols // bc, bc)
-        s = self.effective_scale().reshape(rows // br, 1, cols // bc, 1)
-        return (v * s).reshape(rows, cols)
+        out = (v * self.scale.reshape(rows // br, 1, cols // bc, 1)).reshape(rows, cols)
+        inv = self.global_reciprocal()
+        return out if inv is None else out * inv
 
 
 def _blocks(x: Tensor, spec: FormatSpec) -> Tensor:
@@ -307,11 +319,12 @@ def lsq_fake_quantize(
     # the stored scale in the forward; in the backward d scale / d clip = scale / clip (the scale is
     # proportional to the clipped amax up to its rounding, which the estimator passes straight through)
     scale = stored * (c / c.detach())
-    eff = scale / gs if gs is not None else scale
-    eff = eff.reshape(blocks.shape[0], 1, blocks.shape[2], 1)
+    inv = None if gs is None else 1.0 / gs  # as Quantized.effective_scale / dequantize: the same float32 steps
+    eff = (scale if inv is None else scale * inv).reshape(blocks.shape[0], 1, blocks.shape[2], 1)
     scaled = (blocks / eff).clamp(-spec.element_max, spec.element_max)
     q = scaled + (round_element(scaled.detach(), spec.element) - scaled).detach()
-    return (q * eff).reshape(rows, cols)
+    out = (q * scale.reshape(blocks.shape[0], 1, blocks.shape[2], 1)).reshape(rows, cols)
+    return out if inv is None else out * inv
 
 
 def straight_through(x: Tensor, x_q: Tensor, strength: Tensor | float = 1.0) -> Tensor:

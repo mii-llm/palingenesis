@@ -33,8 +33,16 @@
 #   (2) qat/<fmt>            pgs train, QAT with KD to the bf16 model (forward KL), STEPS steps on self-generated
 #                            text, from MSE-clipped scales, frozen at 90%: KL and accuracy vs PTQ (recovered share)
 #   (3) vllm/<run>           the packed compressed-tensors checkpoint loads in vLLM (weight-only kernels on A100)
-#                            and generates like its dequantized twin (accuracy within 0.05; share of identical
-#                            answers and of the answer both share before they diverge). If vLLM's default kernel
+#                            and computes what its dequantized twin computes: the log-probability of every token
+#                            of 20 fixed held-out texts (teacher-forced), vLLM on the packed checkpoint against
+#                            transformers on the twin. PASS: mean |difference| <= max(0.03 nats, 3 x the engine
+#                            noise), the engine noise being the same statistic for the twin itself in vLLM
+#                            against transformers (same weights, two engines); and accuracy within 0.05. The
+#                            line also has the quantised model's distance to bf16 in the same unit
+#                            (logprob_gap_to_bf16: what a wrong decoding would be comparable to), the share of
+#                            identical greedy answers and of an answer shared before the two diverge (greedy
+#                            answers of hundreds of tokens diverge at the first near-tie: not a criterion).
+#                            If vLLM's default kernel
 #                            fails (its Humming kernels are compiled at the first forward), one retry without
 #                            them (Marlin); the line says which kernels served. SKIP: no vLLM, or a GPU below the
 #                            scheme's minimum compute capability (7.5).
@@ -245,6 +253,13 @@ def extract(text, kind):
         return v
 
 
+def fixed_ids(tok, work, rows=20, max_length=512):
+    """Token ids of the first held-out texts: the fixed prompts of the vLLM / transformers logprob comparison."""
+    data = [json.loads(line) for line in Path(work, "heldout.jsonl").read_text().splitlines()][:rows]
+    texts = [tok.apply_chat_template(r["messages"], tokenize=False, enable_thinking=False) for r in data]
+    return [tok(t, truncation=True, max_length=max_length).input_ids for t in texts]
+
+
 def cmd_acc(work, model, out, tokenizer=None):
     from transformers import AutoTokenizer
     from vllm import SamplingParams
@@ -259,7 +274,18 @@ def cmd_acc(work, model, out, tokenizer=None):
     texts = [o.outputs[0].text for o in outs]
     correct = [extract(t, it["kind"]) == it["answer"] for t, it in zip(texts, items)]
     result = {"accuracy": sum(correct) / len(correct), "items": len(items), "load_s": round(load, 1)}
-    Path(out).write_text(json.dumps({**result, "texts": texts}))
+    extra = {"texts": texts}
+    try:  # teacher-forced: the log-probability vLLM gives every token of the fixed texts
+        ids = fixed_ids(tok, work)
+        scored = llm.generate(
+            [{"prompt_token_ids": x} for x in ids], SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=1)
+        )
+        extra["prompt_logprobs"] = [
+            [step[token].logprob for token, step in zip(x[1:], o.prompt_logprobs[1:])] for x, o in zip(ids, scored)
+        ]
+    except Exception as e:  # noqa: BLE001 — reported by the vllm/<run> line
+        extra["prompt_logprobs_error"] = repr(e)[:300]
+    Path(out).write_text(json.dumps({**result, **extra}))
     print(json.dumps(result))
 
 
@@ -283,6 +309,16 @@ def cmd_kl(work, reference, candidates, out):
     tok = AutoTokenizer.from_pretrained(reference)
     ref = load_hf(reference)
     results = {}
+    fixed = [torch.tensor([x], device="cuda") for x in fixed_ids(tok, work)]
+
+    def token_logprobs(m):  # of every token of the fixed texts given the ones before it (as vLLM's prompt_logprobs)
+        out = []
+        for ids in fixed:
+            lp = torch.log_softmax(m(input_ids=ids).logits[0, :-1].float(), -1)
+            out.append(lp.gather(1, ids[0, 1:, None])[:, 0].tolist())
+        return out
+
+    ref_logprobs = token_logprobs(ref)
     for cand in candidates:
         model = load_hf(cand)
         cand = Path(cand).parent.name if Path(cand).name in ("dequantized", "final") else cand  # the run's name
@@ -293,11 +329,14 @@ def cmd_kl(work, reference, candidates, out):
             kl_sum += float((lp.exp() * (lp - lq)).sum())
             agree += float((lp.argmax(-1) == lq.argmax(-1)).sum())
             tokens += lp.shape[0]
-        results[cand] = {"kl": kl_sum / tokens, "top1_agreement": agree / tokens, "tokens": int(tokens)}
+        logprobs = token_logprobs(model)
+        gap = [abs(a - b) for x, y in zip(logprobs, ref_logprobs) for a, b in zip(x, y)]
+        results[cand] = {"kl": kl_sum / tokens, "top1_agreement": agree / tokens, "tokens": int(tokens),
+                         "logprob_gap_to_bf16": sum(gap) / len(gap), "prompt_logprobs": logprobs}
         del model
         torch.cuda.empty_cache()
     Path(out).write_text(json.dumps(results))
-    print(json.dumps(results))
+    print(json.dumps({k: {a: b for a, b in v.items() if a != "prompt_logprobs"} for k, v in results.items()}))
 
 
 @torch.no_grad()
@@ -391,15 +430,54 @@ def cmd_line(check, status, *pairs):
     print(json.dumps(out))
 
 
-def cmd_vllm(packed_file, twin_file, name, kernels):
-    """The packed checkpoint's answers (vLLM) against its dequantized twin's."""
+LOGPROB_TOLERANCE = 0.03  # nats: mean |difference| of a token's log-probability, packed in vLLM vs the twin in HF
+
+
+def logprob_diff(a, b):
+    """(mean, max) |difference| over the tokens of two lists of per-text log-probabilities."""
+    if a is None or b is None or len(a) != len(b) or any(len(x) != len(y) for x, y in zip(a, b)):
+        return None
+    diffs = [abs(u - v) for x, y in zip(a, b) for u, v in zip(x, y)]
+    return (sum(diffs) / len(diffs), max(diffs), len(diffs)) if diffs else None
+
+
+def cmd_vllm(packed_file, twin_file, name, kernels, kl_file, twin):
+    """The packed checkpoint in vLLM against its dequantized twin: token log-probabilities (the criterion),
+    accuracy, greedy answers."""
     p = json.loads(Path(packed_file).read_text())
     try:
         d = json.loads(Path(twin_file).read_text())
     except Exception:  # noqa: BLE001 — the dequantized twin was not evaluated
         d = None
+    try:
+        hf = json.loads(Path(kl_file).read_text())[twin]
+    except Exception:  # noqa: BLE001 — no transformers pass over the twin
+        hf = {}
     out = {"check": f"vllm/{name}", "loaded": True, "kernels": kernels, "accuracy_packed": p["accuracy"],
            "load_s": p["load_s"]}
+    packed_vs_hf = logprob_diff(p.get("prompt_logprobs"), hf.get("prompt_logprobs"))
+    noise = logprob_diff((d or {}).get("prompt_logprobs"), hf.get("prompt_logprobs"))
+    same_engine = logprob_diff(p.get("prompt_logprobs"), (d or {}).get("prompt_logprobs"))
+    logprobs_ok = False
+    if packed_vs_hf is None:
+        out["logprob_error"] = (
+            p.get("prompt_logprobs_error")
+            or "no token log-probabilities to compare (vLLM's prompt_logprobs, or the transformers pass over the twin)"
+        )
+    else:
+        out["logprob_mean_abs_diff"] = round(packed_vs_hf[0], 5)  # packed in vLLM vs the twin in transformers
+        out["logprob_max_abs_diff"] = round(packed_vs_hf[1], 4)
+        out["logprob_tokens"] = packed_vs_hf[2]
+        limit = LOGPROB_TOLERANCE
+        if noise is not None:  # the twin in vLLM vs the twin in transformers: the same weights in two engines
+            out["logprob_engine_noise"] = round(noise[0], 5)
+            limit = max(limit, 3 * noise[0])
+        if same_engine is not None:  # packed vs twin, both in vLLM
+            out["logprob_mean_abs_diff_in_vllm"] = round(same_engine[0], 5)
+        if hf.get("logprob_gap_to_bf16") is not None:  # the quantisation itself, in the same unit
+            out["logprob_gap_to_bf16"] = round(hf["logprob_gap_to_bf16"], 5)
+        out["logprob_limit"] = round(limit, 5)
+        logprobs_ok = packed_vs_hf[0] <= limit
     if d is not None:
         pairs = list(zip(p["texts"], d["texts"]))
         shared = []
@@ -409,9 +487,9 @@ def cmd_vllm(packed_file, twin_file, name, kernels):
         out["accuracy_dequantized"] = d["accuracy"]
         out["identical_answers"] = round(sum(a == b for a, b in pairs) / len(pairs), 3)
         out["shared_prefix"] = round(sum(shared) / len(shared), 3)  # share of an answer before the two diverge
-        out["status"] = "PASS" if abs(p["accuracy"] - d["accuracy"]) <= 0.05 else "FAIL"
+        out["status"] = "PASS" if logprobs_ok and abs(p["accuracy"] - d["accuracy"]) <= 0.05 else "FAIL"
     else:
-        out["status"] = "PASS"
+        out["status"] = "PASS" if logprobs_ok else "FAIL"
     print(json.dumps(out))
 
 
@@ -578,7 +656,7 @@ vllm_check() {  # vllm_check <name> <packed dir> <dequantized twin name>
         fi
         kernels="marlin (VLLM_DISABLED_KERNELS=Humming*; the default kernels failed: $first)"
     fi
-    emit "$($H vllm "$R/acc_packed_$name.json" "$R/acc_$twin.json" "$name" "$kernels")"
+    emit "$($H vllm "$R/acc_packed_$name.json" "$R/acc_$twin.json" "$name" "$kernels" "$R/kl_$twin.json" "$twin")"
 }
 
 ACC_BF16=$(acc bf16 "$MODEL")

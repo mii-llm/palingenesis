@@ -134,20 +134,19 @@ def pack(q: Quantized, activation_amax: Tensor | None = None) -> dict[str, Tenso
 
 def unpack(tensors: dict[str, Tensor], scheme: tuple[str, str]) -> Tensor:
     """The float32 weight a packed layer holds, computed as vLLM's loaders define it (a reference for tests and
-    for checking an export): nvfp4 q * (weight_scale / weight_global_scale), mxfp4 q * 2^e, fp8 q * scale."""
+    for checking an export): nvfp4 (q * weight_scale) * (1 / weight_global_scale), mxfp4 q * 2^e, fp8 q * scale."""
     from palingenesis.qat.formats import e8m0_decode, unpack_e2m1
 
     fmt = scheme[0]
     if fmt in ("nvfp4", "mxfp4"):
         values = unpack_e2m1(tensors["weight_packed"])
         if fmt == "nvfp4":
-            scale = tensors["weight_scale"].float() / tensors["weight_global_scale"].float()
-            block = 16
+            scale, block = tensors["weight_scale"].float(), 16
         else:
-            scale = e8m0_decode(tensors["weight_scale"])
-            block = 32
+            scale, block = e8m0_decode(tensors["weight_scale"]), 32
         rows, cols = values.shape
-        return (values.reshape(rows, cols // block, block) * scale.unsqueeze(-1)).reshape(rows, cols)
+        out = (values.reshape(rows, cols // block, block) * scale.unsqueeze(-1)).reshape(rows, cols)
+        return out * (1.0 / tensors["weight_global_scale"].float()) if fmt == "nvfp4" else out
     values = tensors["weight"].float()
     scale = tensors["weight_scale"].float()
     if fmt == "fp8":
