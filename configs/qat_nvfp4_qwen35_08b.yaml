@@ -5,11 +5,15 @@
 #   pgs train --config configs/qat_nvfp4_qwen35_08b.yaml
 #   vllm serve runs/qat_nvfp4/final-nvfp4
 #
-# Data: the model's own answers to thousands of distinct prompts that cover its use (messages rows), or your SFT
-# mix: a narrow set lowers the training loss and damages everything else. See the QAT guide.
-# EXPERIMENTAL: a first recipe (learning rate 1e-5, 300 steps, 2400 narrow rows) lowered GSM8K accuracy from 0.42
-# (PTQ) to 0.24; the values below are revised from that run and not measured yet. Compare with the PTQ model on
-# held-out KL and on a task metric before using the result.
+# Data: the model's own sampled answers to thousands of distinct prompts that cover its use (messages rows, each
+# seen once: 8000 for the 1000 steps below), or your SFT mix. A narrow set lowers the training loss and damages
+# everything else. See the QAT guide.
+#
+# Measured with this recipe (one A100, one seed, scripts/gpu_checks/fp4_qat.sh; 8000 self-generated rows, half
+# answers to GSM8K train questions, half to open questions): held-out KL to the bf16 model on answer tokens
+# 0.095 (PTQ) -> 0.043, GSM8K proxy (200 items; bf16 0.51) 0.415 -> 0.435; with format: mxfp4 0.142 -> 0.061 and
+# 0.355 -> 0.50. A first recipe (learning rate 1e-5, 300 steps, 2400 repetitive rows) overfit and lowered the
+# proxy to 0.24: on another model or task, compare with the PTQ model on held-out KL and a task metric.
 
 model:
   name_or_path: Qwen/Qwen3.5-0.8B

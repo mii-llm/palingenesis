@@ -9,8 +9,8 @@
 
     FP8 rarely needs QAT (its PTQ is close to lossless, see [Measured](#measured)). Measure first: `pgs quantize` writes the PTQ checkpoint in seconds.
 
-!!! warning "Status: PTQ and the export are validated; QAT recovery is experimental"
-    Measured on an A100 with Qwen3.5-0.8B: post-training quantisation, the packed checkpoints in vLLM and the dequantized export behave as documented ([Measured](#measured)). The first QAT recipe did **not** recover quality: it lowered the training loss and left the held-out KL where PTQ had it, and it halved the accuracy proxy ([What a first QAT run did](#what-a-first-qat-run-did)). The recipe below is revised from that run and has not been measured yet. Until it is, treat a QAT run as an experiment: compare it with `pgs quantize` on a held-out KL **and** on a task metric before using it.
+!!! note "What is measured"
+    One model (Qwen3.5-0.8B), one seed, one A100: PTQ, the packed checkpoints in vLLM, the dequantized export, and the QAT recipe below, which recovered more than half of the PTQ model's held-out KL for NVFP4 and MXFP4 without lowering a 200-item GSM8K proxy ([Measured](#measured)). The A100 has no FP4 / FP8 matmuls: training fake-quantises and vLLM serves weight-only, so there are no FP4 speed numbers here. On another model or task, compare the QAT model with `pgs quantize` on held-out KL **and** a task metric before using it: a first recipe made the model worse ([the lesson](#the-first-recipe-a-lesson)).
 
 ## The two steps
 
@@ -32,7 +32,7 @@ model:
   name_or_path: Qwen/Qwen3.5-0.8B
   torch_dtype: float32            # fp32 latent weights (bf16 compute with train.bf16): QAT's updates are small
 data:
-  dataset: data/self_generated.jsonl   # the model's own answers to varied prompts, or your SFT mix
+  dataset: data/self_generated.jsonl   # the model's own answers to thousands of distinct prompts (see the notes)
   max_seq_length: 1024
 train:
   output_dir: runs/qat
@@ -63,7 +63,7 @@ Notes on the recipe:
 
 - **Data.** Self-generated text (the full-precision model's own sampled answers to diverse prompts) is in the teacher's distribution and needs no labels (LLM-QAT). It must cover what the model will be used for, in the prompt formats it will see, and no single template may dominate: the weights are free to change wherever the data does not constrain them, and with 4-bit weights every change is a whole quantisation step. Thousands of distinct prompts, each seen once, rather than a few hundred repeated. Mix in your SFT data if the model is also being fine-tuned.
 - **Start from PTQ.** With `strength: 1` (the default) the first step is the PTQ model. `scales: mse` starts from the PTQ with the lower weight error; that is not always the better model (in the measurements below it lowers the weight error by about 1% and leaves the KL to the bf16 model unchanged for NVFP4, slightly worse for MXFP4), so compare both with `pgs quantize` if the starting point matters. A ramp (`strength: {start: 0.0, end: 0.1}`) eases the switch for a model that is also learning a new task.
-- **Learning rate.** Lower than SFT. Adam moves every weight by about the learning rate per step whatever its gradient, and a latent weight that crosses a rounding boundary changes the quantised weight by a whole step: at 1e-5 the first run made no progress until the cosine schedule had brought the rate below about 5e-6 (its training KD only fell in the second half). Start at 3e-6 with a cosine to a tenth of it, and watch `codes_changed`: a share that keeps growing while the held-out loss does not fall is noise, not recovery. Keep fp32 latent weights (`model.torch_dtype: float32`): bf16 weights round most such updates away.
+- **Learning rate.** Lower than SFT. Adam moves every weight by about the learning rate per step whatever its gradient, and a latent weight that crosses a rounding boundary changes the quantised weight by a whole step: at 1e-5 a first run made no progress until the cosine schedule had brought the rate below about 5e-6. 3e-6 with a cosine to a tenth of it is the measured recipe (1000 steps of batch 8); `codes_changed` ended near 1.6% for MXFP4 in that run. A share that keeps growing while the held-out loss does not fall is noise, not recovery. Keep fp32 latent weights (`model.torch_dtype: float32`): bf16 weights round most such updates away.
 - **Judge on held-out data and on the task.** The training KD falling is not the recovery: it also falls when the model fits the training prompts at the expense of everything else. Measure the KL to the bf16 model on held-out text, on the answer tokens (the ones KD trains; prompt tokens are unconstrained and can get worse), and a task metric with the deployment's prompt format.
 - **Freeze.** `freeze_scales_at: 0.9` fixes the scales (no moving average: computed once from the weights at that step), so the last steps settle the weights on the grid that is exported.
 - **On-policy distillation and RL.** The same plugin runs in `pgs distill` and `pgs rl` (`plugins: {custom: [...]}` in their configs): the rollout engine receives the quantised weights at every push, so the student samples from the model being trained. Start with off-policy KD in `pgs train`; OPD after it fixes what the quantised model does on its own samples.
@@ -87,18 +87,26 @@ So on a model this small, FP4 PTQ is far from free (NVFP4 loses about 5 points o
 
 The packed checkpoints compute what their dequantized twins compute: over 6593 tokens of 20 fixed texts, the log-probability vLLM gives each token with the packed checkpoint differs from the one transformers gives with the twin by 0.022 to 0.025 nats on average for all four formats, which is the difference between the two engines on one and the same set of weights (0.022 to 0.026), and well below what the quantisation itself changes (0.29 to 0.40 for FP4, 0.07 to 0.08 for FP8). FP8 and block FP8 weights load on the A100 through Marlin (accuracy 0.54 and 0.505 against 0.53 and 0.535 for their twins).
 
-### What a first QAT run did
+### QAT with the recipe above
 
-The first recipe (300 steps, batch 8, learning rate 1e-5 with a cosine to 1e-6, forward KL to the bf16 model at temperature 1, `scales: mse`, scales frozen at 90%; 2400 self-generated rows, half of them answers to one arithmetic template, the rest 48 topics × 8 question templates) on the same model and GPU:
+Same model, GPU and script. Training: 1000 steps of batch 8 at 3e-6 (cosine to 3e-7), forward KL to the bf16 model at temperature 1, `scales: mse`, scales frozen at 90%, on 8000 self-generated rows, each seen once: half answers to GSM8K **train** questions in the evaluation's prompt format, half answers to open questions (48 topics × 16 templates). Held-out text: other reasoning questions and other topics. KL on the answer tokens (the ones KD trains) and on all tokens; accuracy on 200 GSM8K test items (bf16: 0.51); the share of answers with a boxed result and the share cut at the 512-token limit.
 
-| | Training KD, first → last 30 steps | Held-out KL (all tokens): PTQ `mse` → QAT | GSM8K accuracy: PTQ `mse` → QAT |
-|---|---|---|---|
-| `nvfp4` | 0.110 → 0.054 | 0.140 → 0.141 | 0.415 → 0.240 |
-| `mxfp4` | 0.202 → 0.064 | 0.228 → 0.184 | 0.355 → 0.225 |
+| | PTQ `mse` → QAT, `nvfp4` | PTQ `mse` → QAT, `mxfp4` |
+|---|---|---|
+| Held-out KL, answer tokens | 0.0954 → 0.0432 (55% recovered) | 0.1419 → 0.0605 (57% recovered) |
+| Held-out KL, all tokens | 0.1286 → 0.0668 | 0.2134 → 0.1048 |
+| GSM8K accuracy | 0.415 → 0.435 | 0.355 → 0.500 |
+| Answers with a boxed result | 0.65 → 0.725 | 0.70 → 0.82 |
+| Answers cut at the length limit | 0.365 → 0.28 | 0.305 → 0.185 |
+| Training KD, start → end | 0.0692 → 0.0344 | 0.1233 → 0.0483 |
 
-The loss on the training stream halved (on both kinds of rows) while the held-out text gained nothing (NVFP4) or a fifth (MXFP4), and the task metric fell by about 40%: the run fitted its narrow training prompts and paid for it elsewhere. The exported checkpoints are what was trained (vLLM on the packed checkpoint and transformers on the dequantized one agree as above, and both score 0.24), so this is the recipe, not the export. What that run cannot tell apart, because it logged neither: how much of the flat held-out KL is prompt tokens (which KD does not train) getting worse while answer tokens improved, and how many quantised values changed.
+Both formats meet the check's expectation (at least half of the PTQ model's held-out answer-token KL recovered, accuracy not lowered). MXFP4 gains the most: its QAT model is within noise of bf16 on the proxy, and about 1.6% of its quantised values changed code during the run. More answers finish with a boxed result inside the token limit, so part of the accuracy gain may be format rather than arithmetic.
 
-The revised recipe above (lower learning rate, more steps, a training set of distinct prompts that includes reasoning questions in the evaluation's format, each row once) and the revised check (`scripts/gpu_checks/fp4_qat.sh`: KL on answer tokens and on all tokens, the accuracy proxy, how answers end, `codes_changed`, the training KD at both ends; expectation: at least half of the PTQ model's held-out answer-token KL recovered and accuracy not lowered) follow from it. **They have not been run yet.**
+What this does not show: one model of 0.8B parameters, one seed, a 200-item proxy (one standard error ≈ 0.035, so NVFP4's +0.02 is not a measured gain, only "not lowered"), a training set that contains the evaluation's task family (train split, never the test items), weight-only quantisation, and no inference speed (fake quantisation in training; vLLM's weight-only kernels on the A100).
+
+### The first recipe: a lesson
+
+A first recipe, 300 steps at 1e-5 on 2400 rows of which half were answers to one arithmetic template and the rest a few hundred prompts sampled several times, halved the training KD (NVFP4 0.110 → 0.054), left the held-out all-token KL where PTQ had it (0.140 → 0.141) and lowered GSM8K accuracy from 0.415 to 0.24 (MXFP4: 0.355 → 0.225). The export was not at fault (vLLM on the packed checkpoint and transformers on the dequantized one agreed, and both scored 0.24): the run fitted its narrow prompts at a learning rate that changed quantised values faster than the data could constrain them. Hence the three rules of the recipe: many distinct prompts that cover the use, a learning rate well below SFT's, and a verdict from held-out KL and a task metric, never from the training loss.
 
 ## Formats
 
