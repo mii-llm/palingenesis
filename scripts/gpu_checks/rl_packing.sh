@@ -4,7 +4,7 @@
 #
 #   PGS_PY=/path/to/venv/bin/python PGS_SRC=/path/to/palingenesis/src bash scripts/gpu_checks/rl_packing.sh [WORK]
 #
-# Every result is a JSON line {"check": ..., "status": "PASS" | "FAIL" | "INFO", ...} on stdout, also collected in
+# Every result is a JSON line {"check": ..., "status": "PASS" | "FAIL" | "INFO" | "SKIP", ...} on stdout, also collected in
 # $WORK/results.jsonl; the exit code is 1 if any check failed. Everything is written inside WORK (default: a new
 # directory under /tmp); only processes this script started are stopped.
 #
@@ -81,9 +81,15 @@ run_part() {
   local code=$?
   grep '^{' "$log.out" | tee -a "$RESULTS"
   if [ "$code" -ne 0 ] && [ "$waited" -lt "$limit" ]; then
-    local tail_
-    tail_=$(json_tail "$log")
-    echo "{\"check\": \"$name\", \"status\": \"FAIL\", \"exit_code\": $code, \"log_tail\": $tail_}" | tee -a "$RESULTS"
+    # the cause: the part's own FAIL lines when it reported any, else the end of its stderr (of its stdout when
+    # stderr is empty)
+    local tail_ failed_checks source="$log"
+    failed_checks=$(grep '^{' "$log.out" | grep '"status": "FAIL"' |
+      "$PGS_PY" -c 'import json, sys; print(json.dumps([json.loads(line).get("check") for line in sys.stdin]))')
+    [ -s "$source" ] || source="$log.out"
+    tail_=$(json_tail "$source")
+    echo "{\"check\": \"$name\", \"status\": \"FAIL\", \"exit_code\": $code, \"failed_checks\": ${failed_checks:-[]}, \"log_tail\": $tail_}" |
+      tee -a "$RESULTS"
   fi
   echo "{\"check\": \"$name/elapsed\", \"status\": \"INFO\", \"seconds\": $((SECONDS - start))}" >>"$RESULTS"
 }
@@ -137,9 +143,11 @@ if ! skipped concurrency; then
   fi
 fi
 
+# (a part that exits non-zero after reporting its own FAIL lines adds a wrapper line: failures are counted by check)
 failed=$(grep -c '"status": "FAIL"' "$RESULTS")
+skipped_count=$(grep -c '"status": "SKIP"' "$RESULTS")
 status=PASS
 [ "$failed" -eq 0 ] || status=FAIL
-echo "{\"check\": \"summary\", \"status\": \"$status\", \"failed\": $failed, \"work\": \"$WORK\", \"seconds\": $SECONDS}" |
+echo "{\"check\": \"summary\", \"status\": \"$status\", \"failed\": $failed, \"skipped\": $skipped_count, \"work\": \"$WORK\", \"seconds\": $SECONDS}" |
   tee -a "$RESULTS"
 [ "$failed" -eq 0 ]

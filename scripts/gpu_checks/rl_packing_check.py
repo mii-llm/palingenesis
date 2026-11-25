@@ -321,52 +321,76 @@ def throughput(model_name: str, scenario: str, groups_count: int, repeats: int, 
     sampled = sum(t.sampled_tokens for t in trajectories)
     # padded_shared: padded rows with train.prompt_sharing on (each group's prompt once, palingenesis.seco_tree), what
     # train.prompt_sharing auto picks for long prompts on one GPU; its micro-batch count covers the padded rest only
-    for packing in ("padded", "padded_shared", "varlen", "tree"):
+    free_gib = total_gib = None
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        free_gib, total_gib = free / 2**30, total / 2**30
+
+    def measure(packing: str, budget: int) -> dict:
         shared = packing == "padded_shared"
-        trainer = make_trainer(model, "padded" if shared else packing, micro_tokens, "on" if shared else "off")
+        trainer = make_trainer(model, "padded" if shared else packing, budget, "on" if shared else "off")
         micro = trainer._micro_batches(trajectories)
         if shared:
             forwarded = sum(len(g[0].prompt_ids) - 1 + sum(len(t.tokens) for t in g) for g in groups)
         elif packing == "padded":
             forwarded = sum(max(t.context_tokens - 1 for t in m) * len(m) for m in micro)
         else:
-            forwarded = sum(
-                pack([t.prompt_ids + t.tokens[:-1] for t in m], share=packing == "tree").num_tokens
-                for m in micro
-            )
-        try:
-            step_grads(model, trainer, groups)  # warm-up (autotuning, allocator)
-            times = []
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
-            for _ in range(repeats):
+            rows = [pack([t.prompt_ids + t.tokens[:-1] for t in m], share=packing == "tree") for m in micro]
+            forwarded = sum(row.num_tokens for row in rows)
+        step_grads(model, trainer, groups)  # warm-up (autotuning, allocator)
+        times = []
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        for _ in range(repeats):
+            model.zero_grad(set_to_none=True)
+            sync()
+            t0 = time.perf_counter()
+            trainer._train_step(groups)
+            sync()
+            times.append(time.perf_counter() - t0)
+        peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        median = statistics.median(times)
+        return {
+            "micro_tokens": budget,
+            "micro_batches": len(micro),
+            "raw_tokens": raw,
+            "forwarded_tokens": forwarded,
+            "sampled_tokens": sampled,
+            "step_s_median": median,
+            "step_s_all": times,
+            "raw_tok_s": raw / median,
+            "sampled_tok_s": sampled / median,
+            "peak_gib": peak,
+        }
+
+    for packing in ("padded", "padded_shared", "varlen", "tree"):
+        # A mode that does not fit the memory left on the GPU (someone else may hold part of it) is measured with
+        # smaller micro-batches, down to a quarter; one that still does not fit is skipped with the reason, not
+        # failed: the check measures speed, and a mode's memory need is in the other modes' peak_gib.
+        budget, values, reason = micro_tokens, None, ""
+        while values is None:
+            try:
+                values = measure(packing, budget)
+            except torch.OutOfMemoryError as error:
+                reason = str(error)[:300]
                 model.zero_grad(set_to_none=True)
-                sync()
-                t0 = time.perf_counter()
-                trainer._train_step(groups)
-                sync()
-                times.append(time.perf_counter() - t0)
-            peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
-            median = statistics.median(times)
+                sync(empty=True)
+                if budget <= max(micro_tokens // 4, 2048):
+                    break
+                budget //= 2
+        common = {"model": model_name, "scenario": scenario, "mode": packing, "gpu_free_gib": free_gib}
+        if values is None:
             emit(
                 "throughput",
-                "INFO",
-                model=model_name,
-                scenario=scenario,
-                mode=packing,
-                micro_tokens=micro_tokens,
-                micro_batches=len(micro),
-                raw_tokens=raw,
-                forwarded_tokens=forwarded,
-                sampled_tokens=sampled,
-                step_s_median=median,
-                step_s_all=times,
-                raw_tok_s=raw / median,
-                sampled_tok_s=sampled / median,
-                peak_gib=peak,
+                "SKIP",
+                **common,
+                gpu_total_gib=total_gib,
+                micro_tokens=budget,
+                reason=f"out of memory down to train.micro_tokens {budget} ({reason})",
             )
-        except torch.OutOfMemoryError as error:
-            emit("throughput", "FAIL", model=model_name, scenario=scenario, mode=packing, error=str(error)[:300])
+        else:
+            note = {"reduced_from": micro_tokens, "out_of_memory_at": reason} if budget != micro_tokens else {}
+            emit("throughput", "INFO", **common, **values, **note)
         model.zero_grad(set_to_none=True)
         sync(empty=True)
 
