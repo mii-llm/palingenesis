@@ -510,6 +510,15 @@ micro-batch forwards: padded tokens, the trajectories' tokens (`varlen`) or the 
 keeps at most `micro_tokens` trained tokens per micro-batch, the head's work). The `tree` planner sends a trajectory to the
 micro-batch whose trie already holds the longest prefix of it, so a group is not split while it fits.
 
+Not every shared token is worth sharing. Each segment boundary is a tree level, and a level costs every Gated DeltaNet
+layer one more kernel call (forward and backward) and the attention a gathered path, whatever the segments hold: about
+0.08 s per level and micro-batch on the A100 run below, the time of ~1500 forwarded tokens. So a shared run becomes a
+segment of its own only when that saves at least 2048 forwarded tokens (its length x the copies it replaces - 1;
+`tree_packing.TREE_MIN_SAVED`); a run that saves less (the first tokens a group's rollouts happen to agree on, a chat
+template's opening tokens, a short prompt) is copied into its branches. A micro-batch in which nothing is worth a
+level is laid out end to end, exactly as `varlen`: with short prompts `tree` is `varlen`. `train.micro_tokens` counts
+the exact trie; the copies add less than 2048 tokens per run.
+
 `micro_tokens` counts a shared prefix once, but each branch's attention reads its whole root-to-branch path, so a layer
 gathers about (trajectories x shared prefix) key / value rows: a 12k-token prompt with 32 completions is ~13k packed
 tokens and ~390k gathered rows. These rows are transient (one layer at a time, forward and backward), and
@@ -559,10 +568,28 @@ trajectory through it, so the expert loads and the balancing losses are those of
 (`rollout.routing_replay`) works with `varlen` and is refused with `tree`: a shared prefix is forwarded once and could
 replay only one routing, while the engine routed every rollout by itself.
 
-The default stays `padded` until the GPU measurements below exist. TRL's AsyncGRPOTrainer, whose trie packing (`TreeRow`,
-`tree_attention`) this follows, reports 2.8 to 3x faster training steps than padding-free packing at a packing ratio of 3.4
-(raw tokens / unique tokens; Qwen3-0.6B / 1.7B on H100). The ratio is the upper bound of the gain on the model's work:
-multi-turn agent trajectories and branching rollouts gain most, single-turn groups with short prompts little.
+Measured on one A100 80GB (torch 2.11, flash-linear-attention and causal-conv1d installed; bf16; one optimizer step of 64
+trajectories, `micro_tokens` 16384; seconds per step, median of 3, with the exact trie, before short runs were copied):
+
+| Model | Batch (raw / unique tokens) | `padded` | `varlen` | `tree` |
+|---|---|---|---|---|
+| Qwen3-0.6B | 8 groups x 8 rollouts, 0.6k to 1.9k-token prompts, 1 to 4 turns (1.7) | 7.92 | 7.06 | 4.82 |
+| Qwen3-0.6B | branching: 2 histories x 4 final turns per group (2.9) | 7.11 | 6.35 | 2.96 |
+| Qwen3.5-0.8B | rollouts (1.8) | 6.20 | 5.79 | 4.96 |
+| Qwen3.5-0.8B | branching (3.1) | 6.42 | 6.18 | 3.47 |
+| Qwen3.5-2B | rollouts (1.8) | 11.09 | 10.61 | 8.13 |
+| Qwen3.5-2B | branching (3.1) | 11.58 | 11.29 | 5.61 |
+
+Log-probs and gradients of `varlen` and `tree` matched `padded` on all three models within the check's bound (three
+times the difference between two padded layouts of the same batch in bf16; gradient cosine above 0.999). Peak memory was the same within 1 GiB except on branching batches, where `tree` used 2 to 5 GiB less. `varlen`
+gains 3 to 12% here (rows of similar lengths pad little); `tree` gains with the share of repeated tokens, 1.2 to 1.5x
+over `varlen` at a ratio of 1.7 and 1.8 to 2.1x at 3 (TRL's AsyncGRPOTrainer, whose trie packing this follows, reports
+2.8 to 3x at 3.4 on H100). The other end: a 20-step `pgs rl` run on Qwen3.5-0.8B with 8 x 8 rollouts of a one-line
+prompt trained in 0.44 s per step `padded`, 0.24 s `varlen` and 0.62 s `tree` with the exact trie, a deep tree of tiny
+segments. That measurement is why short runs are now copied (above), which makes such a batch a `varlen` row; the
+threshold comes from the per-level cost in these runs and has not been re-measured, and nothing was measured between
+that case and a ratio of 1.7. The default stays `padded`; `varlen` is the safe gain, `tree` the choice when prompts are
+long or turns branch.
 `scripts/gpu_checks/rl_packing.sh` measures equality on real models, step time, tokens/s and peak memory per mode, and runs
 a 20-step `pgs rl` smoke per mode:
 
@@ -579,19 +606,37 @@ the requests in flight to each engine and moves it with the engine's own load, r
 `/metrics`; a worker reports its in-process scheduler's numbers):
 
 - **Start.** KV-cache tokens / `rollout.max_model_len`: as many requests as fit at full length (an engine that does
-  not report its KV-cache size starts at `rollout.concurrency_max`).
-- **Cut.** KV-cache usage above `rollout.kv_usage_high` (0.8), or requests waiting in the engine's queue on two polls
-  in a row: the cap x 0.7, once per drain (running requests go on; new ones wait at the gate).
-- **Raise.** Usage below `rollout.kv_usage_low` (0.6), nothing waiting, requests waited at the gate since the last
-  poll, and a cap's worth of requests answered since the last change: the cap x 1.25.
+  not report its KV-cache size starts at `rollout.concurrency_max`). When requests end far below `max_model_len`,
+  `rollout.concurrency_request_tokens` (the prompt and completion tokens a request is expected to hold at its end)
+  starts the cap at `kv_usage_high` x KV-cache tokens / that instead.
+- **Cut.** KV-cache usage above `rollout.kv_usage_high` (0.8), requests waiting in the engine's queue on two polls
+  in a row, or preemptions since the last poll: the cap x 0.7, once per drain (running requests go on; new ones wait
+  at the gate).
+- **Raise.** Usage below `rollout.kv_usage_low` (0.6), nothing waiting, and requests waited at the gate since the
+  last poll. First to `kv_usage_high` x KV-cache tokens / the mean tokens of the requests finished so far, at once:
+  what fits even if every request in flight reached that length together (a usage reading taken while the requests
+  are still short says little). Beyond that, after half a cap's worth of requests answered since the last change:
+  the cap x 1.25, x 1.5 while usage is under half of `kv_usage_low`. While the cap is being raised the next poll
+  comes after at most one second.
 
 The cap stays within `rollout.concurrency_min` and `rollout.concurrency_max` (0: `rollout.max_num_seqs`, or
 what one step generates at once, at least 256) and is re-read every `rollout.concurrency_poll_s` seconds. A poll whose
 metrics are missing changes nothing (a renamed metric would read as an idle engine). With several workers a request
 goes to the engine with the most room under its cap. The controller follows TRL's `AsyncGRPOTrainer`
 ([TRL](https://github.com/huggingface/trl), `_init_kv_cap` and `_control_loop`), whose thresholds and factors these
-are; pgs adds the cut on a waiting queue and raises only while the cap binds. Not yet measured against `fixed` on a
-GPU in pgs.
+are; pgs adds the cuts on a waiting queue and on preemptions, the raise sized from finished requests, and raises
+only while the cap binds.
+
+Measured once (A100, Qwen3-0.6B, vLLM server with a deliberately small KV cache of 74,704 tokens, bursts of 256
+requests of 128 prompt + 1024 completion tokens, `scripts/gpu_checks/rl_concurrency.py`): `fixed` 11.3k tokens/s
+with 317 preemptions; `kv` with the first version of the raise rule (x 1.25 per full turnover, from a cap of 18)
+7.3k tokens/s with none, its cap at 59 after 36 s. The raise rules above are the answer to that ramp and have not been
+measured yet. They do not close the gap on that workload: 64 requests of that length fill that cache, so a cap that
+avoids preemption runs fewer sequences at once than `fixed` does, and preempting a 1k-token sequence costs little.
+`kv` is for the opposite case, long contexts in a cache that holds few of them, where every preemption computes a
+whole context again. To trade some preemptions for throughput, raise the thresholds (`kv_usage_low: 0.8`,
+`kv_usage_high: 0.95`) and give `concurrency_request_tokens`; if `rollout/preemptions` stays near 0 under `fixed`,
+keep `fixed`.
 
 At the gate, requests wait first come, first served per engine, and the later turns of an episode that is already
 running go before requests that start one: a running episode holds an environment and its engine's prefix cache, so a
