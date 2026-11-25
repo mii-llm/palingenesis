@@ -20,6 +20,14 @@ from palingenesis.tree_packing import PackedRow, PackingError, _Trie, plan, prep
 VOCAB = 97
 
 
+@pytest.fixture(autouse=True)
+def small_trees(request, monkeypatch):
+    """The trainer shares only runs that save a tree level's cost (TREE_MIN_SAVED forwarded tokens), far more than
+    these tests' sequences hold: lowered, so their trees have shared segments and copied runs both."""
+    if "worth_a_tree_level" not in request.node.name:
+        monkeypatch.setattr("palingenesis.tree_packing.TREE_MIN_SAVED", 8)
+
+
 # ── the trie and its layout ────────────────────────────────────────────────────
 
 
@@ -77,6 +85,53 @@ def test_layout_recovers_every_sequence_and_its_context(name, share):
     if not share:
         assert row.flat and row.num_tokens == sum(map(len, seqs))
         assert row.kv_index("cpu").tolist() == list(range(row.num_tokens))
+
+
+@pytest.mark.parametrize("min_saved", [1, 3, 6, 12, 1000])
+def test_runs_that_save_little_are_copied_into_their_branches(min_saved):
+    """PackedRow.build(min_saved): the invariants hold for every threshold; fewer levels and segments, each
+    remaining shared segment saving at least the threshold, and nothing shared when nothing is worth it."""
+    rng = random.Random(min_saved)
+    cases = [list(seqs) for seqs in CASES.values()]
+    for _ in range(25):
+        cases.append([[rng.randrange(1, 4) for _ in range(rng.randrange(1, 12))] for _ in range(rng.randrange(1, 9))])
+    for seqs in cases:
+        exact = PackedRow.build(seqs, share=True)
+        row = PackedRow.build(seqs, share=True, min_saved=min_saved)
+        _check_layout(row, seqs)
+        assert len(row.levels) <= len(exact.levels) and row.num_segments <= exact.num_segments
+        assert exact.num_tokens <= row.num_tokens <= sum(map(len, seqs))
+        # a shared segment saves its length for every sequence through it but one, at least the threshold
+        through = row.multiplicity()[row.seg_starts[:-1]]
+        lengths = np.diff(row.seg_starts)
+        for segment in set(row.seg_parents[row.seg_parents >= 0].tolist()):
+            assert lengths[segment] * (through[segment] - 1) >= min_saved
+        if min_saved == 1000:
+            assert row.flat
+
+
+def test_the_trainer_packs_only_the_runs_worth_a_tree_level():
+    from palingenesis.tree_packing import TREE_MIN_SAVED, pack
+
+    rng = random.Random(0)
+    template = [rng.randrange(1, 90) for _ in range(6)]  # a chat template's opening tokens, shared by every group
+    short, long = [], []
+    for _ in range(4):
+        prompt = template + [rng.randrange(1, 90) for _ in range(40)]
+        document = template + [rng.randrange(1, 90) for _ in range(TREE_MIN_SAVED // 7 + 10)]
+        for i in range(8):
+            agreed = [91, 92] if i < 4 else [91, 93]  # rollouts agree on their first tokens
+            tail = agreed + [rng.randrange(1, 90) for _ in range(20)]
+            short.append(prompt + tail)
+            long.append(document + tail)
+    row = pack(short, share=True)  # 46-token prompts x 8 rollouts save too little: a flat row, as varlen
+    assert row.flat and row.num_tokens == sum(map(len, short))
+    assert pack(short, share=False).num_tokens == row.num_tokens
+    row = pack(long, share=True)  # long prompts: one segment per prompt, the rollouts below it (two levels)
+    assert len(row.levels) == 2 and row.num_segments == 4 + 32
+    exact = PackedRow.build(long, share=True)
+    assert len(exact.levels) > 2 and row.num_tokens - exact.num_tokens < 4 * 64
+    _check_layout(row, long)
 
 
 def test_trie_shares_exactly_the_common_prefixes():
@@ -504,6 +559,10 @@ def test_rl_step_is_the_same_padded_varlen_and_tree(arch):
         metrics = trainer._train_step(_groups(0))
         grads = {n: p.grad.clone() for n, p in trainer.model.named_parameters() if p.grad is not None}
         results[packing] = (metrics, grads, len(trainer._micro_batches([t for g in _groups(0) for t in g])))
+    from palingenesis.tree_packing import pack
+
+    rows = [pack([t.prompt_ids + t.tokens[:-1] for t in g], share=True) for g in _groups(0)]
+    assert all(len(row.levels) > 1 for row in rows)  # the tree step ran real trees
     base, base_grads, padded_count = results["padded"]
     assert base["policy/seq_masked"] == 0.0 and base["observation_tokens"] > 0
     for packing in ("varlen", "tree"):

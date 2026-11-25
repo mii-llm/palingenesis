@@ -39,6 +39,7 @@ layer's own chunked kernel per tree level instead of TRL's dedicated Triton tree
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 from dataclasses import dataclass
@@ -56,6 +57,12 @@ _ATTENTION_LAYER_TYPES = {"full_attention", "attention"}
 _RECURRENT_NAMES = ("linear_attn", "mamba", "ssm", "delta_net", "deltanet", "recurrent", "short_conv")
 # Explicit-mask attention (no flash kernel) builds an [N, N] mask per layer: past this many tokens, warn once.
 MATH_ATTENTION_WARN_TOKENS = 8192
+# Forwarded tokens a shared run must save to become a segment of its own in the trainer's trees (PackedRow.build's
+# min_saved). A tree level costs each Gated DeltaNet layer one more kernel call, forward and backward, and the
+# attention a gathered path per segment, whatever the segments' sizes: on an A100, Qwen3.5-0.8B at 16k packed
+# tokens, about 0.08 s per level and micro-batch, the time of ~1500 forwarded tokens. Runs that save less than a
+# level costs are copied into their branches: a micro-batch that shares little then packs as a flat row (varlen).
+TREE_MIN_SAVED = 2048
 
 
 class PackingError(ValueError):
@@ -68,13 +75,14 @@ class PackingError(ValueError):
 class _Node:
     """A segment: the tokens sequences[seq][lo:hi], at positions lo..hi-1 of every sequence through it."""
 
-    __slots__ = ("seq", "lo", "hi", "children", "parent", "index", "start")
+    __slots__ = ("seq", "lo", "hi", "children", "parent", "index", "start", "copies")
 
     def __init__(self, seq: int, lo: int, hi: int, parent: _Node | None):
         self.seq, self.lo, self.hi, self.parent = seq, lo, hi, parent
         self.children: dict[int, _Node] = {}
         self.index = -1  # segment index in the layout
         self.start = -1  # first packed position
+        self.copies = 1  # segments its tokens would be copied into if it were not a segment itself (layout)
 
 
 def _common(a: np.ndarray, b: np.ndarray) -> int:
@@ -216,52 +224,87 @@ class PackedRow:
         return f"PackedRow(tokens={self.num_tokens}, segments={self.num_segments}, levels={len(self.levels)})"
 
     @classmethod
-    def build(cls, sequences: list[list[int]] | list[np.ndarray], share: bool) -> PackedRow:
+    def build(cls, sequences: list[list[int]] | list[np.ndarray], share: bool, min_saved: int = 0) -> PackedRow:
+        """`min_saved` (share): a shared run of tokens becomes a segment of its own only when that saves at least
+        this many forwarded tokens (its length x (the segments below that would each hold a copy - 1)); a run that
+        saves less is copied into each branch instead. 0: the exact trie, every shared token forwarded once. Every segment boundary is a tree
+        level for the recurrent layers and a gathered path for the attention, and their cost per level does not
+        shrink with the segments: short shared runs (the first tokens rollouts happen to agree on, a chat template's
+        opening tokens) cost more as levels than they save as tokens (TREE_MIN_SAVED)."""
         arrays = [np.asarray(s, dtype=np.int64) for s in sequences]
         if not arrays or any(len(a) == 0 for a in arrays):
             raise PackingError("packing needs at least one sequence, each of at least one token")
         trie = _Trie(arrays, share)
         for i in range(len(arrays)):
             trie.insert(i)
-        return cls._layout(trie)
+        return cls._layout(trie, min_saved)
 
     @classmethod
-    def _layout(cls, trie: _Trie) -> PackedRow:
+    def _layout(cls, trie: _Trie, min_saved: int = 0) -> PackedRow:
         arrays = trie.sequences
-        levels_nodes: list[list[_Node]] = [list(trie.roots.values())]
-        while True:
-            nxt = [child for node in levels_nodes[-1] for child in node.children.values()]
-            if not nxt:
-                break
-            levels_nodes.append(nxt)
         tokens, positions, starts, parents, paths, levels = [], [], [0], [], [], []
         cursor, index = 0, 0
-        for depth, nodes in enumerate(levels_nodes):
-            lo = cursor
-            slot_of = {id(n): i for i, n in enumerate(levels_nodes[depth - 1])} if depth else {}
-            lengths, slots = [], []
-            for node in nodes:
+        seg_lo: list[int] = []  # per segment: the depth of its first token (above its node's when runs were copied)
+        # (node, depth its segment starts at or None for the node's own, parent segment), level by level
+        frontier: list[tuple[_Node, int | None, int]] = [(root, None, -1) for root in trie.roots.values()]
+        if min_saved > 0:  # bottom-up: how many segments a node's tokens are copied into when it is not one
+            order, stack = [], list(trie.roots.values())
+            while stack:
+                node = stack.pop()
+                order.append(node)
+                stack.extend(node.children.values())
+            for node in reversed(order):
+                node.copies = sum(
+                    1 if not c.children or (c.hi - c.lo) * (c.copies - 1) >= min_saved else c.copies
+                    for c in node.children.values()
+                )
+        slot_of: dict[int, int] = {}
+        while frontier:
+            lo_level, lengths, slots, following, slot_next = cursor, [], [], [], {}
+            queue = collections.deque(frontier)
+            while queue:
+                node, start, parent = queue.popleft()
+                lo = node.lo if start is None else start
+                if node.children and min_saved > 0 and (node.hi - lo) * (node.copies - 1) < min_saved:
+                    # not worth a segment: its tokens go into each branch's (same level, in place)
+                    node.index = -1
+                    queue.extendleft(reversed([(child, lo, parent) for child in node.children.values()]))
+                    continue
                 node.index, node.start = index, cursor
-                n = node.hi - node.lo
-                tokens.append(arrays[node.seq][node.lo : node.hi])
-                positions.append(np.arange(node.lo, node.hi, dtype=np.int64))
+                n = node.hi - lo
+                tokens.append(arrays[node.seq][lo : node.hi])  # (the node's sequence runs through its ancestors)
+                positions.append(np.arange(lo, node.hi, dtype=np.int64))
                 own = np.arange(cursor, cursor + n, dtype=np.int64)
-                if node.parent is None:
-                    parents.append(-1)
+                parents.append(parent)
+                if parent < 0:
                     paths.append(own)
                 else:
-                    parents.append(node.parent.index)
-                    paths.append(np.concatenate([paths[node.parent.index], own]))
-                    slots.append(slot_of[id(node.parent)])
+                    paths.append(np.concatenate([paths[parent], own]))
+                    slots.append(slot_of[parent])
+                slot_next[index] = len(lengths)
+                seg_lo.append(lo)
+                following += [(child, None, index) for child in node.children.values()]
                 cursor += n
                 starts.append(cursor)
                 lengths.append(n)
                 index += 1
-            levels.append(_Level(lo, cursor, lengths, np.asarray(slots, dtype=np.int64) if depth else None))
+            levels.append(_Level(lo_level, cursor, lengths, np.asarray(slots, dtype=np.int64) if levels else None))
+            frontier, slot_of = following, slot_next
         sequence_positions = []
         for s in range(len(arrays)):
-            parts = [np.arange(node.start, node.start + take, dtype=np.int64) for node, take in trie.path(s)]
-            sequence_positions.append(np.concatenate(parts))
+            node = trie.path(s)[-1][0]
+            while node.index < 0:  # the sequence ends in a run that was copied into the branches: read any copy
+                node = next(iter(node.children.values()))
+            chain, segment = [], node.index
+            while segment >= 0:
+                chain.append(segment)
+                segment = parents[segment]
+            end = len(arrays[s])
+            parts = [
+                np.arange(starts[g], starts[g] + min(end, seg_lo[g] + starts[g + 1] - starts[g]) - seg_lo[g])
+                for g in reversed(chain)
+            ]
+            sequence_positions.append(np.concatenate(parts).astype(np.int64, copy=False))
         return cls(
             tokens=np.concatenate(tokens),
             position_ids=np.concatenate(positions),
@@ -453,6 +496,12 @@ class PackedRow:
         self.linear_layers.clear()
 
 
+def pack(sequences: list[list[int]] | list[np.ndarray], share: bool) -> PackedRow:
+    """The packed row the trainer forwards: end to end (share False), or the prefix tree of the runs worth sharing
+    (TREE_MIN_SAVED)."""
+    return PackedRow.build(sequences, share, min_saved=TREE_MIN_SAVED if share else 0)
+
+
 # ── planning micro-batches ─────────────────────────────────────────────────────
 
 
@@ -469,7 +518,9 @@ def plan(
     varlen (share False): first-fit decreasing on the sequences' lengths.
     tree (share True): a group at a time, longest groups first; each sequence goes to the micro-batch whose trie
     already holds the longest prefix of it, among those it fits (its new tokens counted, not its length).
-    A sequence longer than the budget gets a micro-batch of its own.
+    A sequence longer than the budget gets a micro-batch of its own. The tree's budget counts the exact trie's
+    tokens: the row the trainer packs (pack) copies short shared runs into their branches, which adds less than
+    TREE_MIN_SAVED tokens per run.
 
     `gather_budget` (tree): at most this many gathered K/V rows per micro-batch (None: no bound). The packed
     tokens count a shared prefix once, but every segment's attention reads its whole root-to-segment path, so a

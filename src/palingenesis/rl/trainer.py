@@ -105,7 +105,7 @@ from palingenesis.rl.sandbox import make_sandbox
 from palingenesis.rl.trajectory import Trajectory
 from palingenesis.rollouts import DROPPED_METRIC, RolloutSink, rl_record
 from palingenesis.seco import PACKED_VARLEN, use_chunk_attention
-from palingenesis.tree_packing import PackedRow
+from palingenesis.tree_packing import PackedRow, pack
 
 logger = logging.getLogger(__name__)
 
@@ -1064,7 +1064,7 @@ class RLTrainer:
             sequences = [t.prompt_ids + t.tokens[:-1] for t in micro]
             forward_kwargs, index, packed = {}, None, None  # images, or the packed layout
             if packing is not None:  # one row: the sequences end to end (varlen) or their prefix trie (tree)
-                packed = PackedRow.build(sequences, share=self.config.train.packing == "tree")
+                packed = pack(sequences, share=self.config.train.packing == "tree")
                 forward_kwargs = packed.forward_kwargs(device)
                 ids = forward_kwargs.pop("input_ids")
                 real = torch.ones(ids.shape, dtype=torch.bool)

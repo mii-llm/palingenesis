@@ -190,7 +190,7 @@ def logprobs_of(model, trainer, groups, packing: str):
     from palingenesis.logits import final_hidden_states
     from palingenesis.opd.teachers import right_pad
     from palingenesis.rl.losses import target_logprobs
-    from palingenesis.tree_packing import PackedRow
+    from palingenesis.tree_packing import pack
 
     trajectories = [t for g in groups for t in g]
     out = {}
@@ -207,7 +207,7 @@ def logprobs_of(model, trainer, groups, packing: str):
                 states = final_hidden_states(model, ids, None)
                 rows = [states[r, len(t.prompt_ids) - 1 : len(sequences[r])] for r, t in enumerate(micro)]
             else:
-                packed = PackedRow.build(sequences, share=packing == "tree")
+                packed = pack(sequences, share=packing == "tree")
                 kwargs = packed.forward_kwargs(DEVICE)
                 states = trainer._packed_forward(trainer._packing_support(), packed, kwargs.pop("input_ids"), kwargs)
                 rows = []
@@ -311,7 +311,7 @@ def equality(model_name: str, groups_count: int) -> None:
 def throughput(model_name: str, scenario: str, groups_count: int, repeats: int, micro_tokens: int) -> None:
     import torch
 
-    from palingenesis.tree_packing import PackedRow
+    from palingenesis.tree_packing import pack
 
     model = load_model(model_name)
     vocab = model.config.get_text_config().vocab_size
@@ -331,7 +331,7 @@ def throughput(model_name: str, scenario: str, groups_count: int, repeats: int, 
             forwarded = sum(max(t.context_tokens - 1 for t in m) * len(m) for m in micro)
         else:
             forwarded = sum(
-                PackedRow.build([t.prompt_ids + t.tokens[:-1] for t in m], share=packing == "tree").num_tokens
+                pack([t.prompt_ids + t.tokens[:-1] for t in m], share=packing == "tree").num_tokens
                 for m in micro
             )
         try:
