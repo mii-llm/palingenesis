@@ -374,6 +374,27 @@ def test_rollout_weights_are_the_quantised_ones():
         list(plugin.rollout_weights(iter(lonely), _ctx()))
 
 
+@pytest.mark.parametrize("scales", ["max", "learned"])
+def test_rollout_weights_follow_the_strength_ramp(scales):
+    """While the quantisation is ramped in, the engine samples from the weights the trainer's forward computes
+    with (strength * W_q + (1 - strength) * W), not from the fully quantised ones."""
+    model = H.tiny_llama(64, hidden=64)
+    plugin = FloatQAT(format="nvfp4", scales=scales)
+    plugin.transform_model(model, _ctx())
+    key = "model.layers.1.self_attn.v_proj.weight"
+    m = model.model.layers[1].self_attn.v_proj
+    for strength in (0.0, 0.3, 1.0):
+        for module in plugin.modules.values():
+            module.strength.fill_(strength)
+        pushed = dict(plugin.rollout_weights(iter(list(model.named_parameters())), _ctx()))
+        assert torch.equal(pushed[key], m.effective_weight().detach()), strength
+    assert torch.equal(pushed[key], m.quantize_now(m.weight, m.global_amax()).dequantize())  # strength 1: W_q
+    for module in plugin.modules.values():
+        module.strength.fill_(0.0)
+    pushed = dict(plugin.rollout_weights(iter(list(model.named_parameters())), _ctx()))
+    assert torch.equal(pushed[key], m.weight)
+
+
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4", "fp8", "fp8_block"])
 def test_export_equals_the_fake_quantised_forward(tmp_path, fmt):
     from transformers import LlamaForCausalLM

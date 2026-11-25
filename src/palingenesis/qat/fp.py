@@ -49,8 +49,8 @@ codes is kept: one byte per weight). It is how far training has moved the quanti
 by several percent while the held-out loss does not fall is noise from the learning rate, not recovery.
 
 Trainers: pgs train (SFT, off-policy distillation), pgs distill (OPD) and pgs rl, where the rollout engine samples
-from the quantised weights (rollout_weights). With the teacher at full precision, distillation is QAT's recovery
-recipe (see the QAT guide).
+from the weights the forward computes with (rollout_weights: W_q, blended with W while `strength` ramps). With the
+teacher at full precision, distillation is QAT's recovery recipe (see the QAT guide).
 """
 
 from __future__ import annotations
@@ -680,9 +680,10 @@ class FloatQAT(TrainerPlugin):
     # -- rollout engines (pgs rl, pgs distill with vLLM)
 
     def rollout_weights(self, named: Iterable[tuple[str, Tensor]], ctx: PluginContext) -> Iterator[tuple[str, Tensor]]:
-        """The engine samples from the quantised policy: each quantised weight replaced by W_q (dequantized,
-        in the tensor's dtype); the clipping factors dropped. A fused group's weights are held back until the
-        whole group arrived (they share NVFP4's per-tensor scale)."""
+        """The engine samples from the policy the trainer computes with: each quantised weight replaced by
+        strength * W_q + (1 - strength) * W (W_q dequantized, in the tensor's dtype; W_q itself once the strength
+        ramp is at 1); the clipping factors dropped. A fused group's weights are held back until the whole group
+        arrived (they share NVFP4's per-tensor scale)."""
         keys = {f"{name}.weight": m for name, m in self.modules.items()}
         held: dict[str, tuple[str, Tensor]] = {}
         for name, tensor in named:
@@ -706,6 +707,9 @@ class FloatQAT(TrainerPlugin):
                 clip = _full(m.qat_clip.detach()) if m.qat_clip is not None else None
                 with torch.no_grad():
                     w_q = m.quantize_now(w, amax, clip, statistics=False).dequantize().to(w.dtype)
+                    strength = m.strength.to(w.device)
+                    if float(strength) != 1.0:  # the ramp: what the trainer's forward computes with now
+                        w_q = strength * w_q + (1 - strength) * w
                 yield original, w_q
         if held:
             raise RuntimeError(f"float_qat: rollout weights {sorted(held)[:3]} arrived without their fused partners")
