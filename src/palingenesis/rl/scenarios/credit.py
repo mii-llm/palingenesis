@@ -186,6 +186,12 @@ def role_statistics(lp, behaviour, advantage, role, names, config, entropy=None,
             clipped = (ratio < config.icepop_low) | (ratio > config.icepop_high)
         elif kind == "ipo":
             clipped = (lp.detach().exp() - behaviour.exp()).abs() > config.ipo_eps
+        elif kind == "decoupled":  # the clip acts on π / π_prox (the reference, or 1 with loss.proximal step)
+            if getattr(config, "proximal", "step") == "reference" and reference is not None:
+                u = (lp.detach() - reference).exp()
+            else:
+                u = torch.ones_like(ratio)
+            clipped = ((advantage > 0) & (u > 1 + config.eps_high)) | ((advantage < 0) & (u < 1 - config.eps_low))
         else:  # gspo clips whole sequences, reinforce nothing
             clipped = torch.zeros_like(ratio, dtype=torch.bool)
         zeros = torch.zeros_like(ratio)

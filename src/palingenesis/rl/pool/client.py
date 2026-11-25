@@ -23,6 +23,19 @@ again to the other engines of this process, so no rollout waits for it (a rank w
 its rollouts at once); the run itself ends at the next weight update with an error that names the worker (an engine that missed updates would otherwise keep sampling an old policy, and a
 restarted one holds none of this run's weights). Restart the worker and resume from the last checkpoint.
 
+Keeping the run (rollout.min_engines n > 0). While at least n engines are alive, losing one does not end the run:
+it is sent nothing more, its requests go to the others, and every rollout.reconnect_s seconds the pool tries its
+address again. A worker that answers (restarted, or back after a network cut) is greeted as a new one: it gets
+no request until a push has been applied, which the next update sends.
+
+Verified pushes (rollout.push_verify, rollout.push_link; full weights only). The snapshot is packed into checksummed
+buckets (palingenesis.rl.pool.buckets), cast to rollout.push_dtype as they are copied. The engine applies a push
+only when every bucket arrived intact, and restores its weights if applying fails (palingenesis.rl.pool.worker). A
+rejected push is sent once more; an engine that rejects three in a row ends the run, otherwise it simply stays on
+the version it has, and the staleness bound decides what is trained. Over a link (nccl: GPU to GPU) the buckets
+live on the trainer's device (one snapshot, 2 bytes per parameter in bf16) and are sent to each engine over its own
+two-rank group; an engine whose link fails is served over TCP from then on, starting with the push that failed.
+
 A request goes to the engine with the fewest requests in flight. There is no prefix affinity: every push resets
 an engine's prefix cache, and an engine's own batch is where the turns of a session meet their prefix. With
 rollout.concurrency kv (`concurrency`), each engine has a cap on its requests in flight, moved with the load its
@@ -41,9 +54,12 @@ import logging
 import threading
 import time
 
+import torch
+
 from palingenesis.opd.rollout import Candidates
 from palingenesis.rl.concurrency import AdmissionGate, ConcurrencySettings, EngineLoad
 from palingenesis.rl.generation import Generation
+from palingenesis.rl.pool import buckets as bucketed
 from palingenesis.rl.pool.protocol import Staging, receive, send
 
 # identity settings a worker may exceed (it serves adapters up to its LoRA rank, log-probs up to its maximum)
@@ -71,6 +87,9 @@ class _Engine:
         self.listener: asyncio.Task | None = None
         self.dead = ""  # why nothing more is sent to this worker
         self.confirmed = False  # the worker holds weights this run sent it
+        self.link: bucketed.Link | None = None  # rollout.push_link nccl / gloo: this engine's own two-rank group
+        self.rejections = 0  # verified pushes this engine rejected in a row
+        self.retry: asyncio.Task | None = None  # rollout.min_engines: reconnecting
 
     @property
     def load(self) -> int:
@@ -95,6 +114,13 @@ class RemotePool:
         identity: dict | None = None,
         push_timeout: float = 1800.0,
         concurrency: ConcurrencySettings | None = None,
+        link: str = "tcp",
+        verify: bool = False,
+        bucket_mb: int = 512,
+        wire_dtype: str = "",
+        min_engines: int = 0,
+        reconnect_s: float = 10.0,
+        link_timeout: float = 120.0,
     ):
         if not addresses:
             raise ValueError("rollout.engines is empty: list the engine workers as host:port")
@@ -116,6 +142,15 @@ class RemotePool:
         self.failure = ""  # a push that was not applied, or a worker that went away: the next update raises
         self.ids = itertools.count()
         self.stats = {"pushes": 0, "skipped": 0, "bytes": 0, "seconds": 0.0, "stage_seconds": 0.0}
+        self.stats.update({"rejected": 0, "link_failures": 0, "link_pushes": 0, "rejoined": 0, "lost": 0})
+        self.link_backend, self.link_timeout = link, link_timeout
+        self.verify = verify or link != "tcp"  # full pushes travel as checksummed buckets
+        self.bucket_bytes = bucket_mb * 2**20
+        self.wire_dtype = getattr(torch, wire_dtype) if wire_dtype else None
+        self.min_engines, self.reconnect_s = min_engines, reconnect_s
+        self.store = None  # the links' rendezvous store (hosted here, built with the first link)
+        self.device_buckets: dict[int, torch.Tensor] = {}  # link pushes: the snapshot's buckets on the device
+        self.closing = False
         self.gate: AdmissionGate | None = None
         if concurrency is not None:
             self.gate = AdmissionGate(concurrency, [e.address for e in self.engines], self._load, self._capacity)
@@ -137,12 +172,7 @@ class RemotePool:
         for engine in everyone:
             while True:
                 try:
-                    if engine in self.engines:
-                        engine.reader, engine.writer = await asyncio.open_connection(engine.host, engine.port)
-                    if engine in self.targets:
-                        engine.weights_reader, engine.weights_writer = await asyncio.open_connection(
-                            engine.host, engine.port
-                        )
+                    await self._open(engine)
                     break
                 except OSError:
                     if time.monotonic() > deadline:
@@ -150,10 +180,55 @@ class RemotePool:
                             f"engine worker {engine.address} did not answer in {timeout:g} s"
                         ) from None
                     await asyncio.sleep(0.5)
-            engine.write_lock, engine.push_lock = asyncio.Lock(), asyncio.Lock()
-            await self._hello(engine)
-            if engine.reader is not None:
-                engine.listener = asyncio.ensure_future(self._listen(engine))
+
+    async def _open(self, engine: _Engine) -> None:
+        """Connect to a worker, greet it, build its link (if any) and listen for its answers."""
+        if engine in self.engines:
+            engine.reader, engine.writer = await asyncio.open_connection(engine.host, engine.port)
+        if engine in self.targets:
+            engine.weights_reader, engine.weights_writer = await asyncio.open_connection(engine.host, engine.port)
+        engine.write_lock, engine.push_lock = asyncio.Lock(), asyncio.Lock()
+        await self._hello(engine)
+        if engine in self.targets and self.link_backend != "tcp":
+            await self._link(engine)
+        if engine.reader is not None:
+            engine.listener = asyncio.ensure_future(self._listen(engine))
+
+    async def _link(self, engine: _Engine) -> None:
+        """Build the two-rank group with this engine's worker; on any failure the engine is served over TCP."""
+        loop = asyncio.get_running_loop()
+        try:
+            if self.store is None:
+                self.store = bucketed.Link.host_store(self.link_timeout)
+            prefix = bucketed.Link.new_prefix()
+            host = engine.weights_writer.get_extra_info("sockname")[0]  # this node, as the worker reaches it
+            offer = {
+                "op": "link",
+                "backend": self.link_backend,
+                "store": [host, self.store.port],
+                "prefix": prefix,
+                "timeout": self.link_timeout,
+            }
+            await send(engine.weights_writer, offer)
+
+            def build():
+                link = bucketed.Link(self.link_backend, 0, self.store, prefix, self.link_timeout)
+                link.handshake()
+                return link
+
+            mine = loop.run_in_executor(None, build)
+            reply, _ = await receive(engine.weights_reader)
+            if "error" in reply:
+                mine.add_done_callback(lambda f: f.exception())  # (its end times out by itself)
+                raise bucketed.LinkError(f"the worker could not join: {reply['error']}")
+            engine.link = await mine
+            logger.info("engine worker %s: %s link ready", engine.address, self.link_backend)
+        except (bucketed.LinkError, RuntimeError, ValueError) as error:
+            self.stats["link_failures"] += 1
+            engine.link = None
+            logger.warning(
+                "engine worker %s: no %s link (%s): its pushes go over TCP", engine.address, self.link_backend, error
+            )
 
     async def _hello(self, engine: _Engine) -> None:
         """Refuse a worker that was started for another model or with other generation settings."""
@@ -177,7 +252,7 @@ class RemotePool:
                 f"engine worker {engine.address} was started with other settings than this run's "
                 f"({'; '.join(differ)}). Start it with the flags `pgs scenario plan --engine-gpus` prints "
                 "(or the worker's --model, --stop-tokens, --chat-template-kwargs, --max-model-len, --fp32-head, "
-                "--lora-rank, --max-logprobs)."
+                "--lora-rank, --max-logprobs, --inflight)."
             )
 
     def _lose(self, engine: _Engine, reason: str, closing: bool = False) -> None:
@@ -186,12 +261,52 @@ class RemotePool:
         if not engine.dead:
             engine.dead = reason
             logger.error("engine worker %s is gone (%s)", engine.address, reason)
-            if engine in self.targets:
+            self.stats["lost"] += 1
+            if engine.link is not None:
+                engine.link.close()
+                engine.link = None
+            alive = sum(not e.dead for e in self.engines) if self.engines else sum(not e.dead for e in self.targets)
+            if self.min_engines and alive >= self.min_engines and not self.closing:
+                # the run goes on without it; its address is tried again until a worker answers there
+                logger.warning("continuing with %d engine(s) (rollout.min_engines %d)", alive, self.min_engines)
+                if engine.retry is None or engine.retry.done():
+                    engine.retry = asyncio.run_coroutine_threadsafe(self._rejoin(engine), self.loop)
+            elif engine in self.targets or self.min_engines:
                 self.failure = self.failure or f"engine worker {engine.address} went away ({reason})"
         for future in engine.waiting.values():
             if not future.done():
                 future.set_exception(EngineLost(f"engine worker {engine.address} went away ({reason})"))
         engine.waiting.clear()
+
+    async def _rejoin(self, engine: _Engine) -> None:
+        """rollout.min_engines: try a lost worker's address until one answers, then greet it as a new worker. It
+        generates again at once; what it samples is trained after the next full push reached it."""
+        while not self.closing:
+            await asyncio.sleep(self.reconnect_s)
+            if engine.listener is not None:
+                engine.listener.cancel()
+            for writer in (engine.writer, engine.weights_writer):
+                if writer is not None:
+                    writer.close()
+            try:
+                engine.applied, engine.confirmed, engine.queued, engine.rejections = -1, False, None, 0
+                await self._open(engine)
+            except (OSError, asyncio.IncompleteReadError, ValueError) as error:
+                logger.debug("engine worker %s is still away (%r)", engine.address, error)
+                continue
+            if self.payload is not None:
+                self.first = True  # adapters: the next push carries the frozen base again
+            engine.dead = ""
+            self.stats["rejoined"] += 1
+            logger.warning("engine worker %s is back: it joins after the next weight update", engine.address)
+            while engine not in self.targets and not engine.confirmed and not engine.dead and not self.closing:
+                # (another rank pushes to it: ask until it holds this run's weights)
+                await asyncio.sleep(self.reconnect_s)
+                with contextlib.suppress(EngineLost):
+                    state = await self._ask(engine, {"op": "state"})
+                    if state.get("confirmed"):
+                        engine.confirmed, engine.applied = True, int(state["version"])
+            return
 
     async def _listen(self, engine: _Engine) -> None:
         try:
@@ -251,6 +366,8 @@ class RemotePool:
             if not alive:
                 gone = "; ".join(f"{e.address}: {e.dead}" for e in self.engines)
                 raise ConnectionError(f"no engine worker is left to generate with ({gone})")
+            if self.started:  # a worker that rejoined holds none of this run's weights until a push reached it
+                alive = [e for e in alive if e.confirmed] or alive
             try:
                 if self.gate is not None:  # rollout.concurrency kv: the engine with the most room under its cap
                     address = await self.gate.acquire([e.address for e in alive], priority=continuing)
@@ -274,6 +391,7 @@ class RemotePool:
                 reply["version"],
                 reply["first_version"],
                 candidates=Candidates.from_tensors(reply.get("tensors") or {}),
+                versions=[tuple(run) for run in reply["versions"]] if reply.get("versions") else None,
             )
 
     def _answered(self, address: str, prompt_tokens: int, ask: asyncio.Future) -> None:
@@ -325,8 +443,10 @@ class RemotePool:
                 self._wait(self._reached(version), f"version {version} from rank 0")
             self.version, self.started = version, True
             return
+        on_link = self.link_backend != "tcp" and self.payload is None
         with self.counts:
-            free = [i for i in (0, 1) if not self.sending[i]]
+            # (a link's snapshot lives on the trainer's device: one of them, not two)
+            free = [i for i in ((0,) if on_link else (0, 1)) if not self.sending[i]]
             if free:
                 self.sending[free[0]] += len(self.targets)
         if not free:
@@ -340,16 +460,22 @@ class RemotePool:
                 for _ in named_tensors or ():
                     pass
                 frames = self.payload(self.first)
+            elif self.verify:  # checksummed buckets: on the device for a link, in pinned host memory for TCP
+                snapshot = self._snapshot(named_tensors, self.staging[free[0]], on_link)
+                self.stats["stage_seconds"] += time.perf_counter() - start
+                frames = [({"op": "weights", "version": version, "mode": "full"}, snapshot)]
+                named_tensors = None
             else:
-                frames = [({"mode": "full"}, dict(named_tensors))]
+                frames = [({"mode": "full"}, self._wire(named_tensors))]
             area = self.staging[free[0]]
             self.once[free[0]] = [
                 name for fields, tensors in frames if fields.get("mode") == "base" for name in tensors
             ]
-            frames = [
-                ({"op": "weights", "version": version, **fields}, area.stage(tensors)) for fields, tensors in frames
-            ]
-            self.stats["stage_seconds"] += time.perf_counter() - start
+            if named_tensors is not None or self.payload is not None:
+                frames = [
+                    ({"op": "weights", "version": version, **fields}, area.stage(tensors)) for fields, tensors in frames
+                ]
+                self.stats["stage_seconds"] += time.perf_counter() - start
         except BaseException:
             with self.counts:
                 self.sending[free[0]] -= len(self.targets)
@@ -366,6 +492,33 @@ class RemotePool:
             self._wait(self._reached(version), f"version {version}")  # (engines of this rank it does not push to)
             self.check()
             self.version, self.started = version, True  # (set after the engines have it: pool/lag reads 0)
+
+    def _wire(self, named_tensors) -> dict[str, torch.Tensor]:
+        """Full weights as they are staged: float tensors cast to rollout.push_dtype on their own device first."""
+        if self.wire_dtype is None:
+            return dict(named_tensors)
+        return {
+            name: tensor.detach().to(self.wire_dtype) if tensor.is_floating_point() else tensor
+            for name, tensor in named_tensors
+        }
+
+    def _snapshot(self, named_tensors, area: Staging, on_link: bool) -> bucketed.Buckets:
+        """The weights packed into checksummed buckets, reusing the last snapshot's buffers."""
+        named = list(named_tensors) if on_link else named_tensors
+        device = named[0][1].device if on_link and named else None
+
+        def allocate(index: int, nbytes: int) -> torch.Tensor:
+            if not on_link:
+                return area.buffer(f"bucket/{index}", torch.uint8, [nbytes])
+            have = self.device_buckets.get(index)
+            if have is None or have.numel() != nbytes or have.device != device:
+                have = self.device_buckets[index] = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            return have
+
+        snapshot = bucketed.pack(named, self.bucket_bytes, allocate, self.wire_dtype)
+        if not on_link and area.pin:
+            torch.cuda.synchronize()
+        return snapshot
 
     async def _all(self, futures) -> None:
         await asyncio.gather(*(asyncio.wrap_future(f) for f in futures))
@@ -414,15 +567,21 @@ class RemotePool:
                 start = time.perf_counter()
                 try:
                     sent = 0
+                    applied = True
                     for header, staged in frames:
+                        if isinstance(staged, bucketed.Buckets):
+                            reply, sent = await self._push_buckets(engine, header, staged)
+                            applied = reply is not None
+                            continue
                         sent += await send(engine.weights_writer, header, staged)
                         reply, _ = await receive(engine.weights_reader)
                         if "error" in reply:
                             raise RuntimeError(f"the worker could not apply the update: {reply['error']}")
-                    engine.applied, engine.confirmed = max(engine.applied, int(reply["version"])), True
-                    self.stats["pushes"] += 1
-                    self.stats["bytes"] += sent
-                    self.stats["seconds"] += time.perf_counter() - start
+                    if applied:
+                        engine.applied, engine.confirmed = max(engine.applied, int(reply["version"])), True
+                        self.stats["pushes"] += 1
+                        self.stats["bytes"] += sent
+                        self.stats["seconds"] += time.perf_counter() - start
                 except (ConnectionError, OSError, asyncio.IncompleteReadError) as error:
                     self._lose(engine, repr(error))
                 except Exception as error:  # noqa: BLE001 — the trainer raises it at its next update
@@ -434,6 +593,64 @@ class RemotePool:
                 if job is not None and engine.dead:
                     self._sent(job[0])
                     job = None
+
+    async def _push_buckets(self, engine: _Engine, header: dict, snapshot: bucketed.Buckets):
+        """Send a verified push: over the engine's link when it has one (TCP from then on if the link fails), in
+        the frame otherwise; once more if the engine rejects it. (the worker's reply, bytes sent), or (None, 0)
+        when the engine did not apply it and stays on its version; raises when it rejected three pushes in a row,
+        or holds no whole weights and the pool waits for it."""
+        loop = asyncio.get_running_loop()
+        reply: dict = {}
+        for attempt in range(2):
+            if engine.link is not None:
+                await send(engine.weights_writer, {**header, "buckets": snapshot.spec("link")})
+                link = engine.link
+
+                def transfer(link=link):
+                    for buffer in snapshot.buffers:
+                        link.send(buffer)
+
+                failed = ""
+                try:
+                    await loop.run_in_executor(None, transfer)
+                except bucketed.LinkError as error:
+                    failed = str(error)
+                reply, _ = await receive(engine.weights_reader)
+                if failed or reply.get("link") is False:
+                    self.stats["link_failures"] += 1
+                    link.close()
+                    engine.link = None
+                    logger.warning(
+                        "engine worker %s: the %s link failed (%s): its pushes go over TCP from now on",
+                        engine.address,
+                        self.link_backend,
+                        failed or reply.get("error"),
+                    )
+                    if "error" not in reply:  # (it arrived whole all the same)
+                        return reply, snapshot.nbytes
+                    reply = {}
+                    continue  # this push again, in the frame
+                if "error" not in reply:
+                    self.stats["link_pushes"] += 1
+            else:
+                host = await loop.run_in_executor(None, snapshot.host)
+                await send(engine.weights_writer, {**header, "buckets": snapshot.spec("tcp")}, host)
+                reply, _ = await receive(engine.weights_reader)
+            if "error" not in reply:
+                engine.rejections = 0
+                return reply, snapshot.nbytes
+            if not reply.get("rejected"):
+                raise RuntimeError(f"the worker could not apply the update: {reply['error']}")
+            self.stats["rejected"] += 1
+            logger.warning(
+                "engine worker %s rejected version %s: %s", engine.address, header["version"], reply["error"]
+            )
+            if not reply.get("restored", True):
+                engine.confirmed = False  # it tags what it samples as untrainable until a push is applied
+        engine.rejections += 1
+        if engine.rejections >= 3 or self.blocking or not self.started:
+            raise RuntimeError(f"verified push rejected {engine.rejections} time(s) in a row: {reply.get('error')}")
+        return None, 0
 
     def _sent(self, area: int) -> None:
         """One push from `area` is over (delivered or not); its one-time tensors are freed with the last."""
@@ -458,8 +675,20 @@ class RemotePool:
             "pool/skipped": float(self.stats["skipped"]),
             "pool/engines": float(sum(not e.dead for e in self.engines)),
         }
-        if self.targets:
-            out["pool/lag"] = float(self.version - min(self.applied()))
+        alive = [engine.applied for engine in self.targets if not engine.dead]
+        if alive:
+            out["pool/lag"] = float(self.version - min(alive))
+        seconds = self.stats["seconds"]
+        if seconds > 0:  # measured streaming: what the pushes moved per second of travel and apply
+            out["pool/push_mb_s"] = self.stats["bytes"] / 2**20 / seconds
+        out["pool/stage_s"] = self.stats["stage_seconds"] / max(self.stats["pushes"] + self.stats["skipped"], 1)
+        if self.verify:
+            out["pool/rejected"] = float(self.stats["rejected"])
+        if self.link_backend != "tcp":
+            out["pool/link_pushes"] = float(self.stats["link_pushes"])
+            out["pool/link_failures"] = float(self.stats["link_failures"])
+        if self.min_engines:
+            out["pool/lost"], out["pool/rejoined"] = float(self.stats["lost"]), float(self.stats["rejoined"])
         return out
 
     def state(self) -> list[dict]:
@@ -489,6 +718,13 @@ class RemotePool:
 
         if not self.thread.is_alive():
             return
+        self.closing = True
+        for engine in {id(e): e for e in [*self.engines, *self.targets]}.values():
+            if engine.retry is not None:
+                engine.retry.cancel()
+            if engine.link is not None:
+                engine.link.close()
+                engine.link = None
         if self.gate is not None:
             self.gate.close()
         with contextlib.suppress(Exception):

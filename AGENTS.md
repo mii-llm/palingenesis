@@ -106,6 +106,14 @@ Training issue?
 │   │   (keeps 0 < pass rate < 1 rows in screened.kept.jsonl)
 │   ├── pass@1 up, pass@G down (sharpening): loss.pass_k (2 <= k < group_size), then a pass_k 1 stage
 │   └── Rollout engine latency: vLLM OTLP traces via rollout.vllm_args (see the Observability guide)
+├── Asynchronous RL (rollout.max_staleness 4-8; CPU-tested only, GPU check: scripts/gpu_checks/async_rl.sh)
+│   ├── policy/clipped high and reward stalls with masked_is: loss.type decoupled (proximal: reference + loss.kl_ref
+│   │   start + kl_ref_reset 4; proximal: step is cispo's gradient); loosen loss.seq_mask with staleness
+│   ├── stale_groups_dropped rising on long episodes: rollout.stale mask (per token), rollout.inflight tag / resume
+│   ├── Trainer waits for rollouts (time/wait_batch) or engines sample old weights: rollout.sync publish
+│   ├── Remote engines: pool/rejected or a half-applied push: rollout.push_verify; GPU-to-GPU push: push_link nccl
+│   │   (falls back to tcp, pool/link_failures); fp32 masters on the wire: rollout.push_dtype bfloat16
+│   └── A worker dies: rollout.min_engines n keeps the run (pool/lost, pool/rejoined); 0 ends it at the next update
 ├── Multi-role RL (pgs rl with a scenario: section; CPU-tested only, GPU validation pending)
 │   ├── Data: an ordinary RL dataset plus a pattern (scenario.type solve_check | handoff | lead_workers, scored by
 │   │   the rewards: section; plan_execute on Harbor rows); pgs scenario patterns lists row fields and options

@@ -89,6 +89,7 @@ from palingenesis.rl.losses import (
     LowPrecisionWeight,
     SamplerCandidates,
     assign_advantages,
+    decoupled_metrics,
     mismatch_by_bucket,
     mismatch_metrics,
     observation_weights,
@@ -173,6 +174,8 @@ class RLTrainer:
     # the policy is renormalised over them (truncated sampling)
     candidates: int = 0
     renormalise: bool = False
+    proximal_reference: bool = False  # loss.type decoupled with loss.proximal reference: clip against loss.kl_ref
+    mask_stale: bool = False  # rollout.stale mask: tokens older than max_staleness leave the loss, not their group
 
     def __init__(
         self,
@@ -458,6 +461,8 @@ class RLTrainer:
         # through gathered rows of the head (losses.sampled_logprobs), which needs a plain linear head
         self.candidates = sampler_candidates(config)
         self.renormalise = truncated_sampling(config)
+        self.proximal_reference = config.loss.type == "decoupled" and config.loss.proximal == "reference"
+        self.mask_stale = config.rollout.stale == "mask"
         if self.candidates and unwrap(self.head) is None:
             raise RLConfigError(
                 "rollout.top_p / top_k and loss.score_centering need a plain linear output head (no bias): the trainer "
@@ -555,6 +560,12 @@ class RLTrainer:
                 push_to=list(r.engines) if self.parallel.main else [],
                 blocking=r.max_staleness == 0,
                 concurrency=settings_from(config),  # rollout.concurrency kv: caps sized from the engines' KV use
+                link=r.push_link,
+                verify=r.push_verify,
+                bucket_mb=r.push_bucket_mb,
+                wire_dtype=r.push_dtype,
+                min_engines=r.min_engines,
+                reconnect_s=r.reconnect_s,
                 identity={
                     "model": model_signature(self.model.config),
                     "stop_ids": sorted(int(i) for i in self.stop_ids),
@@ -564,6 +575,8 @@ class RLTrainer:
                     # the worker's --max-logprobs must cover the sampler's candidates (rollout.top_p / top_k, ...)
                     **({"max_logprobs": sampler_candidates(config)} if sampler_candidates(config) else {}),
                     **({"lora_rank": config.lora.rank} if self.push_mode == "native" else {}),
+                    # the workers' --inflight: per-token versions come from the engine that samples
+                    **({"inflight": r.inflight} if r.inflight != "continue" else {}),
                 },
             )
             # every rank goes on only after rank 0 has greeted every worker: from then on a worker tags what it
@@ -1040,6 +1053,7 @@ class RLTrainer:
         micro_batches += [None] * (count - len(micro_batches))
         device = self.device
         current = self._current_version()
+        stale_limit = self.config.rollout.max_staleness if self.mask_stale else None
         self.model.train()
         balancer = getattr(self, "router_balancer", None)
         packing = self._packing_support()
@@ -1114,7 +1128,7 @@ class RLTrainer:
                 forced += [j in t.forced for j in sampled] if t.forced else [False] * len(sampled)
                 select(positions, row, [len(t.prompt_ids) + j - 1 for j in sampled])  # the outputs predicting j
                 completion_pos += sampled
-                sampled_by += _sampled_by(t, sampled, current)
+                sampled_by += _sampled_by(t, sampled, current, stale_limit)
                 targets += [t.tokens[j] for j in sampled]
                 behaviour += [t.logprobs[j] for j in sampled]
                 advantage += [t.advantage] * len(sampled)
@@ -1155,11 +1169,22 @@ class RLTrainer:
                     hidden, self.head, longs[0], loss_config.log_entropy, self.head_weight, scale=inv_t
                 )
             forced_t = torch.tensor(forced, dtype=torch.bool).to(device, non_blocking=True) if any(forced) else None
+            reference_lp = torch.cat([self.ref_lp[id(t)] for t in micro]) if self.ref_lp else None
             loss, stats = policy_loss(
-                lp, floats[0], floats[1], floats[2], longs[1], len(micro), seq_len, loss_config, forced_t, scored
+                lp,
+                floats[0],
+                floats[1],
+                floats[2],
+                longs[1],
+                len(micro),
+                seq_len,
+                loss_config,
+                forced_t,
+                scored,
+                proximal=reference_lp if self.proximal_reference else None,
+                fresh=_fresh_tokens(longs[3]) if self.mask_stale else None,
             )
             stats.update(mismatch_by_bucket(lp, floats[0], longs[2], longs[3], _unmeasured(forced_t, scored)))
-            reference_lp = torch.cat([self.ref_lp[id(t)] for t in micro]) if self.ref_lp else None
             if self.scenario is not None:  # the same statistics per role
                 names = self.scenario.roles
                 of_row = torch.tensor([names.index(t.role) for t in micro], device=device)
@@ -1195,6 +1220,7 @@ class RLTrainer:
             "trained_tokens": values["tokens"],
             "trained_sequences": values["sequences"],
             **mismatch_metrics(values),
+            **decoupled_metrics(values),
             **sampling_metrics(values),
             **advantage_stats,
         }
@@ -1272,6 +1298,7 @@ class RLTrainer:
 
         loss_config, device = self.config.loss, self.device
         current = self._current_version()
+        stale_limit = self.config.rollout.max_staleness if self.mask_stale else None
         rest: list[Trajectory] = []
         self.model.train()
         for group in groups:
@@ -1323,10 +1350,23 @@ class RLTrainer:
                     if t.forced
                     else None
                 )
-                loss, stats = policy_loss(
-                    lp, floats[0], floats[1], floats[2], seq, 1, seq_len, loss_config, forced, scored
+                where = torch.tensor(
+                    [sampled, _sampled_by(t, sampled, current, stale_limit)], dtype=torch.long, device=device
                 )
-                where = torch.tensor([sampled, _sampled_by(t, sampled, current)], dtype=torch.long, device=device)
+                loss, stats = policy_loss(
+                    lp,
+                    floats[0],
+                    floats[1],
+                    floats[2],
+                    seq,
+                    1,
+                    seq_len,
+                    loss_config,
+                    forced,
+                    scored,
+                    proximal=self.ref_lp[id(t)] if self.proximal_reference else None,
+                    fresh=_fresh_tokens(where[1]) if self.mask_stale else None,
+                )
                 stats.update(mismatch_by_bucket(lp, floats[0], where[0], where[1], _unmeasured(forced, scored)))
                 if self.scenario is not None:
                     from palingenesis.rl.scenarios.credit import role_statistics
@@ -1375,8 +1415,11 @@ class RLTrainer:
         start = time.perf_counter()
         if isinstance(self.engine, (VLLMColocateRollout, SGLangRollout, SGLangServerRollout)):
             # no batch is being collected and the engine does not step: partial rollouts (max_staleness > 0) keep
-            # decoding between batches, and continue with the new weights
-            with self.pipeline.lock, self.pipeline.client.paused():
+            # decoding between batches, and continue with the new weights. rollout.sync publish: between two engine
+            # steps of the batch being collected, without waiting for it to end
+            publish = getattr(getattr(getattr(self, "config", None), "rollout", None), "sync", "batch") == "publish"
+            batch = contextlib.nullcontext() if publish else self.pipeline.lock
+            with batch, self.pipeline.client.paused():
                 full = self.plugins.rollout_weights(self.parallel.full_parameters(self.model))
                 if self.adapters is not None:  # gathered on every rank (collectives), folded as they arrive
                     full = self.adapters.fold_stream(full, measure=True)
@@ -1468,6 +1511,9 @@ class RLTrainer:
                 push = self._push_weights(self.weights.version + 1) if self.parallel.fsdp else 0.0
                 staleness = self.weights.version - batch.version
                 self.weights.publish()
+                if config.rollout.sync == "publish" and not self.parallel.fsdp:
+                    # the engine gets the weights now, not when the producer starts its next batch
+                    metrics["time/sync_publish"] = self.pipeline.sync_now()
                 metrics.update(batch.stats)
                 metrics.update(
                     {
@@ -1572,6 +1618,17 @@ class RLTrainer:
         """Groups within rollout.max_staleness of the current policy (carried groups can be older)."""
         limit = self.config.rollout.max_staleness
         current = self.weights.version  # (a version below 0 or above the trainer's is another run's: never trained)
+        if getattr(self, "mask_stale", False):
+            # a group stays while one of its rollouts ended on a version young enough: its older tokens are masked
+            # in the loss (an episode that spans more than max_staleness updates is not dropped whole, which
+            # would select for short episodes)
+            def young(t: Trajectory) -> bool:
+                return bool(t.versions) and 0 <= current - max(t.versions) <= limit
+
+            fresh = [g for g in groups if any(young(t) for t in g) and min(t.version for t in g) >= 0]
+            fresh = [g for g in fresh if max(max(t.versions, default=0) for t in g) <= current]
+            self.stale_groups += len(groups) - len(fresh)
+            return fresh
         fresh = [g for g in groups if 0 <= min(t.version for t in g) and current - min(t.version for t in g) <= limit]
         fresh = [g for g in fresh if max(t.version for t in g) <= current]
         self.stale_groups += len(groups) - len(fresh)
@@ -1750,11 +1807,21 @@ def _packed_routing(micro: list[Trajectory], packed: PackedRow) -> torch.Tensor 
     return None if shape is None else packed.routing(recorded, shape)
 
 
-def _sampled_by(t: Trajectory, sampled: list[int], current: int) -> list[int]:
-    """Per sampled token index: 0 if version `current` (the policy being trained) sampled its whole turn, 1 if an
-    older version sampled any of it, -1 when unknown (see Trajectory.token_versions)."""
+def _sampled_by(t: Trajectory, sampled: list[int], current: int, limit: int | None = None) -> list[int]:
+    """Per sampled token index: 0 if version `current` (the policy being trained) sampled it, 1 if an older version
+    did, -1 when unknown (see Trajectory.token_versions: per token with rollout.inflight tag / resume, else the oldest
+    version of the token's turn). With `limit` (rollout.stale mask): 2 for a token more than `limit` versions old,
+    or of a version the trainer has not published (another run's)."""
     versions = t.token_versions()
-    return [-1 if versions[j] < 0 else int(versions[j] < current) for j in sampled]
+    out = [-1 if versions[j] < 0 else int(versions[j] < current) for j in sampled]
+    if limit is not None:
+        out = [2 if versions[j] >= 0 and not 0 <= current - versions[j] <= limit else k for k, j in zip(out, sampled)]
+    return out
+
+
+def _fresh_tokens(sampled_by: torch.Tensor) -> torch.Tensor:
+    """rollout.stale mask: the tokens young enough to train (see _sampled_by)."""
+    return sampled_by != 2
 
 
 def _unmeasured(forced: torch.Tensor | None, scored) -> torch.Tensor | None:

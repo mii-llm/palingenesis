@@ -226,7 +226,9 @@ class ScenarioPipeline(RLPipeline, Host):
         self.clients: dict[str, GenerationClient] = {"": self.client}
         self.extra: dict[str, tuple] = {}
         for key, (engine, weights) in (engines or {}).items():
-            self.clients[key] = GenerationClient(engine, merge=False, gate=gate_for(self.config, engine))
+            self.clients[key] = GenerationClient(
+                engine, merge=False, gate=gate_for(self.config, engine), inflight=self.config.rollout.inflight
+            )
             self.extra[key] = (engine, weights)
         self.client.merge = False  # sessions are multi-turn: an n-sample request returns when its longest ends
         if hasattr(self.engine, "make_client"):  # an engine pool serves every adapter: requests name theirs
