@@ -327,6 +327,36 @@ def _mismatch(engine_lp: list[float], trainer_lp: list[float]) -> tuple[float, f
     )
 
 
+def _support_stats(rollouts) -> dict | None:
+    """The sampler's candidates of truncated rollouts (Sampling.candidates; pgs rl's rollout.top_p / top_k): the
+    largest support, the share of tokens found in their own support, how far a support's probabilities are from
+    summing to 1, and how far the sampled token's candidate log-prob is from its behaviour log-prob."""
+    import numpy as np
+
+    tokens = members = largest = 0
+    mass_error = lp_error = 0.0
+    for r in rollouts:
+        if r.candidates is None:
+            return None
+        offsets = np.concatenate([[0], np.cumsum(r.candidates.counts)])
+        for t, (token, logprob) in enumerate(zip(r.completion_ids, r.logprobs)):
+            ids = r.candidates.ids[offsets[t] : offsets[t + 1]].tolist()
+            lps = r.candidates.logprobs[offsets[t] : offsets[t + 1]].astype(np.float64)
+            tokens += 1
+            largest = max(largest, len(ids))
+            mass_error = max(mass_error, abs(float(np.exp(lps).sum()) - 1.0))
+            if token in ids:
+                members += 1
+                lp_error = max(lp_error, abs(float(lps[ids.index(token)]) - logprob))
+    return {
+        "tokens": tokens,
+        "largest": largest,
+        "member_share": members / max(tokens, 1),
+        "max_mass_error": mass_error,
+        "max_dlogprob": lp_error,
+    }
+
+
 # ------------------------------------------------------------------ steps
 
 
@@ -340,7 +370,11 @@ def generate(args) -> None:
         greedy = engine.generate(prompts, [args.max_new_tokens] * len(prompts), 0.0)
         repeated = [p for p in prompts for _ in range(args.samples)]
         sampled = engine.generate(repeated, [args.max_new_tokens] * len(repeated), Sampling(1.0))
-        truncated = engine.generate(prompts, [args.max_new_tokens] * len(prompts), Sampling(*TRUNCATED))
+        # SGLang: with the support of every token, as pgs rl asks for it with rollout.top_p / top_k
+        wanted = TRUNCATED[2] + 8 if args.engine == "sglang" else 0
+        truncated = engine.generate(
+            prompts, [args.max_new_tokens] * len(prompts), Sampling(*TRUNCATED, candidates=wanted)
+        )
     finally:
         _close(engine)
     _emit(
@@ -356,6 +390,7 @@ def generate(args) -> None:
             "truncated": [
                 {"prompt": p, "tokens": r.completion_ids, "logprobs": r.logprobs} for p, r in zip(prompts, truncated)
             ],
+            "support": _support_stats(truncated),
         },
     )
 
@@ -394,6 +429,7 @@ def score(args) -> None:
             "truncated_logprobs_per_token": all(len(i["logprobs"]) == len(i["tokens"]) for i in data["truncated"]),
             "truncated_mean_abs_dlogprob": _mismatch([e for e, _ in inside], [t for _, t in inside])[0],
             "truncated_outside_support_share": 1 - len(inside) / max(len(pairs), 1),
+            "support": data.get("support"),
         }
     _emit(args.out, {"model": args.model, "engines": result})
 
@@ -649,6 +685,12 @@ def report(args) -> None:
         # support (looser: a token at the nucleus' edge moves the normaliser of its position)
         ok = ok and sg["truncated_logprobs_per_token"] and sg["truncated_outside_support_share"] <= 0.05
         ok = ok and sg["truncated_mean_abs_dlogprob"] < 3 * args.max_delta
+        # the support pgs rl renormalises over (candidates): every token in its own, at most top_k tokens (one more
+        # when a kernel draws outside the reconstructed mask), probabilities summing to 1, the sampled token's equal
+        # to its behaviour log-prob
+        support = sg.get("support")
+        ok = ok and support is not None and support["member_share"] == 1.0 and support["largest"] <= TRUNCATED[2] + 1
+        ok = ok and support["max_mass_error"] < 1e-3 and support["max_dlogprob"] < 1e-3
         if vl is not None:
             prefix = []
             for a, b in zip(sg["greedy"], vl["greedy"]):
