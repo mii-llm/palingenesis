@@ -205,7 +205,7 @@ class RLRolloutConfig:
     # its load, polled every concurrency_poll_s seconds (palingenesis.rl.concurrency, after TRL's AsyncGRPOTrainer):
     # cut by 30% when its KV-cache usage passes kv_usage_high (or requests wait in its queue), raised by 25% while
     # usage stays under kv_usage_low with nothing waiting and the cap was reached. Kept in [concurrency_min,
-    # concurrency_max]; concurrency_max 0 = the engine's sequence limit (rollout.max_num_seqs, or its default).
+    # concurrency_max]; concurrency_max 0 = rollout.max_num_seqs, or what one step generates at once (>= 256).
     # Remote workers report their load when their engine can (the vLLM worker does; others keep the starting cap).
     concurrency: str = "fixed"
     concurrency_min: int = 4
@@ -1100,7 +1100,7 @@ def _concurrency_errors(r: RLRolloutConfig) -> list[str]:
             errors.append(f"rollout.concurrency_min must be an integer >= 1, got {r.concurrency_min!r}.")
         if isinstance(r.concurrency_max, bool) or not isinstance(r.concurrency_max, int) or r.concurrency_max < 0:
             errors.append(
-                f"rollout.concurrency_max must be an integer >= 0 (0 = the engine's sequence limit), got "
+                f"rollout.concurrency_max must be an integer >= 0 (0 = rollout.max_num_seqs or its automatic value), got "
                 f"{r.concurrency_max!r}."
             )
         elif isinstance(r.concurrency_min, int) and 0 < r.concurrency_max < r.concurrency_min:

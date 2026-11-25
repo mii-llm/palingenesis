@@ -522,8 +522,8 @@ the requests in flight to each engine and moves it with the engine's own load, r
 - **Raise.** Usage below `rollout.kv_usage_low` (0.6), nothing waiting, requests waited at the gate since the last
   poll, and a cap's worth of requests answered since the last change: the cap x 1.25.
 
-The cap stays within `rollout.concurrency_min` and `rollout.concurrency_max` (0: the engine's sequence limit,
-`rollout.max_num_seqs` or its default) and is re-read every `rollout.concurrency_poll_s` seconds. A poll whose
+The cap stays within `rollout.concurrency_min` and `rollout.concurrency_max` (0: `rollout.max_num_seqs`, or
+what one step generates at once, at least 256) and is re-read every `rollout.concurrency_poll_s` seconds. A poll whose
 metrics are missing changes nothing (a renamed metric would read as an idle engine). With several workers a request
 goes to the engine with the most room under its cap. The controller follows TRL's `AsyncGRPOTrainer`
 ([TRL](https://github.com/huggingface/trl), `_init_kv_cap` and `_control_loop`), whose thresholds and factors these
