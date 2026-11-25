@@ -48,7 +48,7 @@ def test_two_tensor_parallel_ranks_train_like_one_process(setup, arch):
     P.assert_same(got, ref)
 
 
-@pytest.mark.parametrize("arch", ["mistral", "qwen2", "gemma3", "qwen3_moe"])
+@pytest.mark.parametrize("arch", ["mistral", "qwen2", "gemma", "gemma2", "gemma3", "qwen3_moe"])
 def test_other_architectures_train_like_one_process(setup, arch):
     ref = P.run(_config(setup, f"one_{arch}", arch, fsdp=False), world=1)
     got = P.run(_config(setup, f"tp2_{arch}", arch, tp=2), world=2)
@@ -70,7 +70,7 @@ def test_data_by_tensor_mesh_trains_like_data_parallel(setup):
 
 
 @pytest.mark.parametrize(
-    "variant", ["packing", "checkpointing_full", "checkpointing_selective", "plain_loss", "observations"]
+    "variant", ["packing", "checkpointing_full", "checkpointing_selective", "plain_loss", "observations", "dft"]
 )
 def test_training_options_compose(setup, variant):
     def configure(c):
@@ -84,6 +84,8 @@ def test_training_options_compose(setup, variant):
         elif variant == "observations":
             c.data.include_observations = True
             c.data.observation_weight = 0.5
+        elif variant == "dft":
+            c.plugins.dft = True
         return c
 
     ref = P.run(configure(_config(setup, f"one_{variant}", fsdp=False)), world=1)
@@ -146,3 +148,43 @@ def test_sections_round_trip():
     m = Sections(1, (3, 3))
     w = torch.randn(2, 6, 5)
     assert torch.equal(m.canonical(m.to_ranks(w, 3), 3), w)
+
+
+def test_support_errors_name_what_does_not_split():
+    from types import SimpleNamespace
+
+    from palingenesis.tensor_parallel import support_errors
+
+    qwen3 = SimpleNamespace(model_type="qwen3", num_attention_heads=16, num_key_value_heads=8, intermediate_size=3072)
+    assert support_errors(qwen3, 8) == []
+    assert "num_key_value_heads (8)" in support_errors(qwen3, 16)[0]
+    assert "has no tensor-parallel plan" in support_errors(SimpleNamespace(model_type="phi3"), 2)[0]
+    hybrid = SimpleNamespace(
+        model_type="qwen3_5_text",
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        intermediate_size=3584,
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=16,
+        linear_num_value_heads=16,
+    )
+    assert support_errors(hybrid, 2) == []
+    assert any("num_key_value_heads" in e for e in support_errors(hybrid, 4))
+    shared = SimpleNamespace(
+        model_type="qwen3_moe", num_attention_heads=8, num_experts=8, shared_expert_intermediate_size=64
+    )
+    assert any("shared expert" in e for e in support_errors(shared, 2))
+
+
+def test_a_layer_outside_the_plan_is_refused():
+    # a plugin that wraps a projection (LoRA, QAT) leaves the plan nothing it knows how to split
+    from torch import nn
+
+    from palingenesis.tensor_parallel import TensorParallel, TensorParallelError, _parallelize_layer
+
+    model = P.ARCHITECTURES["llama"](64)
+    layer = model.model.layers[0]
+    layer.self_attn.q_proj = nn.Sequential(layer.self_attn.q_proj)
+    tp = TensorParallel(mesh=None, size=2, rank=0)
+    with pytest.raises(TensorParallelError, match="q_proj"):
+        _parallelize_layer(layer, "model.layers.0", tp)

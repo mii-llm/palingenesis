@@ -287,6 +287,131 @@ For a single GPU, use [SeCO](long-sequences.md) instead: it trains sequences of 
 
 ---
 
+## Tensor and pipeline parallelism
+
+FSDP2 alone gathers every layer whole on every GPU and keeps a whole micro-batch's activations per GPU. Past a
+point (a 70B layer, 32B at long sequences, or a node count where FSDP's all-gathers dominate) split the layers
+themselves:
+
+```yaml
+parallel:
+  fsdp: true            # required: FSDP2 is the data-parallel dimension (it shards nothing when it has one rank)
+  tp_degree: 4          # tensor parallel: heads / MLP columns of every layer over 4 GPUs of a node
+  pp_degree: 2          # pipeline parallel: the layers in 2 stages
+  pp_schedule: 1f1b     # gpipe | 1f1b | interleaved_1f1b | looped_bfs | interleaved_zero_bubble | zbv | dualpipev
+  pp_microbatches: 4    # per train.per_device_batch_size rows (must divide it); 0 = one row each
+```
+
+`torchrun --nproc_per_node 8` with this config runs a 2 (pp) x 1 (dp) x 4 (tp) mesh; 16 GPUs make it 2 x 2 x 4.
+The mesh is pp x dp x cp x tp, outermost first: a tensor-parallel group is consecutive ranks (one node's
+NVLink), pipeline stages cross nodes. `tp_degree x pp_degree (x cp_degree)` must divide the number of
+processes; the rest is data parallel.
+
+**Tensor parallelism** (`palingenesis.tensor_parallel`, on `torch.distributed.tensor.parallel`):
+
+- Attention: q / k / v column-parallel, o row-parallel, each rank holds `heads / tp` query and K/V heads
+  (q_norm / k_norm per head, weights shared). MLP: gate / up column-parallel, down row-parallel.
+- Sequence parallelism between the blocks: the residual stream and the norms are split along the sequence; each
+  block starts with one all-gather and ends with one reduce-scatter (2 + 2 per layer and direction, nothing
+  else). Activation memory per GPU is about 1 / tp.
+- Qwen3.5 Gated DeltaNet layers are split by heads as well (transformers' own tensor-parallel plan leaves them
+  whole): key and value heads, the short convolution's channels and the decay parameters follow their heads,
+  and the gated norm's weight is shared. The fused q / k / v projection and the convolution are stored rank by
+  rank, so each GPU's slice is exactly what transformers' forward expects for its heads (no copy at run time).
+  vLLM shards these layers by heads the same way at load time.
+- Qwen3-MoE: every rank routes the whole sequence and runs `moe_intermediate_size / tp` columns of every expert
+  (expert tensor parallelism); the router is replicated, and router balancing counts every token once.
+- The embeddings, the final norm and the output head are **not** split: each rank applies them to its own
+  `1 / tp` of the sequence, and FSDP2 shards them over the data x tensor ranks. The loss therefore runs
+  unchanged, with every backend (chunked cross-entropy, Cut Cross-Entropy, plain cross-entropy, the gated
+  objectives, per-token weights): each rank computes `1 / tp` of the logits, which is what a vocabulary-parallel
+  cross-entropy (Megatron's, torchtitan's `loss_parallel`) saves too, without a custom softmax that the fused
+  kernels cannot use. The price is one all-gather of the embeddings and head per step (FSDP's, overlapped).
+- Rows are padded to a multiple of `tp_degree` tokens (packed rows get a padding document), so any length works.
+- Liger's fused norm / SwiGLU / RoPE kernels take plain tensors, and the split norms run on DTensors: they are
+  not applied under tensor parallelism (logged); `model.compile: true` fuses the same operations.
+- `async_tp: true` (with `model.compile: true`) lets inductor split each all-gather / reduce-scatter and the
+  matmul next to it into chunks over symmetric memory (torch's micro-pipelined TP, as torchtitan). H100-class
+  GPUs with NVLink; not checked on A100.
+
+**Pipeline parallelism** (`palingenesis.pipeline_parallel`, on `torch.distributed.pipelining`):
+
+- The layers are split into `pp_degree x stages_per_rank` stages, the embeddings and the head counting as
+  `pp_first_stage_less_layers` / `pp_last_stage_less_layers` layers (torchtitan's balancing). Looped schedules
+  place stages `r, r + pp, ...` on rank `r`; zbv / dualpipev place them in a V.
+- Each stage runs transformers' own forward with the other stages' layers replaced by parameter-less stand-ins,
+  so rotary embeddings, packed masks and per-layer choices (Qwen3.5's linear / full attention, Gemma3's sliding
+  windows) are computed exactly as without pipelining, and parameter names stay the model's own.
+- The last stage computes the loss (chunked, CCE or plain cross-entropy) with the step's global token count.
+- Every pipeline micro-batch has the same shape: rows are padded to `data.max_seq_length` (use `data.packing`
+  to fill them). Gradient accumulation works as usual; each accumulation step runs the whole schedule, and the
+  gradients are reduced at its end.
+- Evaluation walks the stages forward only (any schedule).
+- Stage layers stay gathered between micro-batches (FSDP `reshard_after_forward: false` for them, as
+  torchtitan): one all-gather per step instead of one per micro-batch.
+
+**Checkpoints.** Sharded (DCP) checkpoints name every parameter as the model does. A pipelined run resumes
+with another `pp_degree` or without pipelining, and the reverse. The rank-by-rank parameters of tensor
+parallelism (Gated DeltaNet q / k / v and convolution, MoE gate / up) need the same `tp_degree` to resume:
+the run checks it and refuses another one, instead of loading scrambled weights. The exported model
+(`final/`, `best/model`) is always plain HF format: the exports gather every rank's shards, restore the
+checkpoint layout, and the stages' parts are joined on rank 0.
+
+### What composes with what
+
+| | tensor parallel | pipeline parallel |
+|---|---|---|
+| FSDP2 data parallel (dp) | yes (dp x tp) | yes (pp x dp, pp x dp x tp) |
+| context parallel | no (not validated: the sequence would be split twice; use one of the two) | no |
+| expert parallel | no (an expert cannot have both layouts) | no |
+| packing | yes | yes (per micro-batch) |
+| activation checkpointing (full / selective), compile | yes | yes |
+| losses: chunked CE, CCE, plain CE, per-token weights, observation loss | yes | yes (last stage) |
+| DFT / DEFT / CADFT / InfoSFT | yes | no |
+| MoE router balancing | yes (counts tokens once) | no (set `moe.balance: false`) |
+| tied embeddings (Qwen3-0.6B, Qwen3.5-0.8B) | yes | no: the embeddings and the head live on different stages |
+| DPO, off-policy distillation, SeCO, multimodal, float8, CPU offload, gradient release | no | no |
+| Muon, AdaGC, Hyperball, MONA, Schedule-Free | no | no |
+| `data.eval_sources` | no | no |
+| EMA, base merge | no (their weight copies are plain tensors) | no |
+| LoRA and plugins that wrap layers | refused at startup (the plan names every module it splits) | refused |
+| `pgs rl`, `pgs distill` (OPD) | not yet: their trainers shard with FSDP2 only | not yet |
+
+Everything marked no is rejected by configuration validation (or at startup, for what depends on the model)
+with the reason. DPO and distillation need sequence log-probabilities / teacher targets split the same way;
+SeCO and multimodal run a plain module; RL's policy side would also need the rollout engine's weight sync from
+the split layout.
+
+**Sizing.** `pgs profile --config ... --world_size 16` adds one rank's share of the memory under the config's
+`tp_degree` / `pp_degree` (weights, optimizer and gradients split; activations divided by tp and held for the
+micro-batches a stage keeps in flight).
+
+**Checking and measuring.** `scripts/gpu_checks/tp_pp.sh` checks the plans on one GPU's CUDA kernels against
+the plain model (loss and every gradient, tensor parallel on a one-rank mesh, a two-stage V-pipeline on one
+rank, compile). `scripts/bench_parallel.py` measures tokens/s, MFU and peak memory of FSDP, TP and PP layouts
+on a multi-GPU node (random weights from the model's config: 8B to 72B without downloads).
+
+**Expected gains (estimates, not measured yet).** On one node of 8 x 80 GB, FSDP alone is the fastest layout
+up to ~8B at 4-8K tokens. TP 2-4 pays off when FSDP runs out of memory for activations (long sequences, 32B+)
+or when its all-gathers stop overlapping: expect 1.3-2x the tokens/s of FSDP with full checkpointing on 32B at
+8K tokens, mostly from lighter checkpointing that the freed memory allows. TP 8 inside an NVLink node costs
+~10-20% in communication. PP across nodes over InfiniBand avoids the per-layer all-gathers of FSDP over the
+slower links: with enough micro-batches (`pp_microbatches >= 4 x pp_degree`) the 1F1B bubble is
+`(pp - 1) / (microbatches + pp - 1)`, ~10-20%, and zero-bubble schedules remove most of it.
+
+Design sources: Megatron-LM tensor parallelism (Shoeybi et al., [arXiv:1909.08053](https://arxiv.org/abs/1909.08053))
+and sequence parallelism (Korthikanti et al., [arXiv:2205.05198](https://arxiv.org/abs/2205.05198)); GPipe
+([arXiv:1811.06965](https://arxiv.org/abs/1811.06965)), 1F1B and interleaved schedules (Narayanan et al.,
+[arXiv:2104.04473](https://arxiv.org/abs/2104.04473)), zero-bubble pipelines (Qi et al.,
+[arXiv:2401.10241](https://arxiv.org/abs/2401.10241)), DualPipe (DeepSeek-V3,
+[arXiv:2412.19437](https://arxiv.org/abs/2412.19437)); torchtitan ([arXiv:2410.06511](https://arxiv.org/abs/2410.06511),
+BSD-3: mesh order, TP plans and SequenceParallel placement, stage balancing and placement, async TP, gradient
+norm across meshes and stages, per-parameter optimizer state in pipelined checkpoints); PyTorch's
+`torch.distributed.tensor.parallel` and `torch.distributed.pipelining`; Hugging Face transformers' `tp_plan`
+(packed gate / up sharding). Re-implemented, no code copied.
+
+---
+
 ## Practical expectations
 
 Multi-GPU throughput has not been benchmarked for this release. Parameters, gradients and optimizer states are sharded across GPUs, so memory per GPU drops roughly with their count; the freed memory goes to larger batches or longer sequences. Measure your setup's tokens/s from the log (`tok/s`, and `train/tokens_per_sec_global` in wandb) over the first steps.

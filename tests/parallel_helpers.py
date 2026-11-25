@@ -52,6 +52,28 @@ def _qwen3(vocab, tie=True):  # q_norm / k_norm, tied embeddings (as Qwen3-0.6B)
     )
 
 
+def _gemma(vocab):  # embeddings scaled in the backbone's forward
+    from transformers import GemmaConfig, GemmaForCausalLM
+
+    return GemmaForCausalLM(GemmaConfig(vocab_size=vocab, intermediate_size=64, max_position_embeddings=512, **COMMON))
+
+
+def _gemma2(vocab):  # attention and final logit soft-capping, sliding windows, four norms per layer
+    from transformers import Gemma2Config, Gemma2ForCausalLM
+
+    return Gemma2ForCausalLM(
+        Gemma2Config(
+            vocab_size=vocab,
+            intermediate_size=64,
+            max_position_embeddings=512,
+            sliding_window=16,
+            attn_logit_softcapping=50.0,
+            final_logit_softcapping=30.0,
+            **COMMON,
+        )
+    )
+
+
 def _gemma3(vocab):  # four norms per layer, scaled embeddings, sliding-window layers, q_norm / k_norm
     from transformers import Gemma3ForCausalLM, Gemma3TextConfig
 
@@ -112,6 +134,8 @@ ARCHITECTURES = {
     "mistral": _mistral,
     "qwen2": _qwen2,
     "qwen3": _qwen3,
+    "gemma": _gemma,
+    "gemma2": _gemma2,
     "gemma3": _gemma3,
     "qwen3_5": _qwen3_5,
     "qwen3_moe": _qwen3_moe,

@@ -1308,12 +1308,19 @@ class Config:
             "train.hyperball (norm constraints on unsplit matrices)": self.train.hyperball,
             "train.mona": self.train.mona,
             "plugins.schedule_free": self.plugins.schedule_free,
+            "train.ema / train.base_merge (their weight copies are plain tensors)": self.train.ema
+            or self.train.base_merge,
             "data.eval_sources (the multi-source evaluator scores whole sequences; use data.eval_dataset)": bool(
                 self.data.eval_sources
             ),
         }
         which = " / ".join(name for name, on in (("parallel.tp_degree", tp), ("parallel.pp_degree", pp)) if on)
         errors += [f"{which} > 1 does not support {name}." for name, on in shared.items() if on]
+        if tp and p.context_parallel:
+            errors.append(
+                "parallel.tp_degree > 1 with parallel.context_parallel is not validated yet (the sequence would be split "
+                "twice); use one of them: context parallelism for very long sequences, tensor parallelism for large layers."
+            )
         if pp:
             from palingenesis.parallel_dims import PP_SCHEDULES, schedule_errors
 
@@ -1333,9 +1340,6 @@ class Config:
                     self.plugins.dft or self.plugins.cadft or self.plugins.deft or self.plugins.info_sft
                 ),
                 "logging.rl_readiness (it needs the final hidden states on every rank)": self.logging.rl_readiness,
-                "train.ema / train.base_merge (their weight copies are not split by stage)": (
-                    self.train.ema or self.train.base_merge
-                ),
             }
             errors += [f"parallel.pp_degree > 1 does not support {name}." for name, on in pp_unsupported.items() if on]
         return errors

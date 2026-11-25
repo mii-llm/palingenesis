@@ -13,9 +13,12 @@ built on torch.distributed.tensor.parallel as torchtitan does):
     short convolution are stored rank by rank ([q_0 k_0 v_0 | q_1 k_1 v_1 | ...], `Sections`), so each rank's
     slice is the layout transformers' own forward expects for its heads, with no copy at run time. The
     decay (A_log, dt_bias) splits by value head; the gated norm's weight is shared;
+  * Qwen3-MoE blocks: every rank routes the whole sequence (the router is replicated) and runs its slice of every
+    expert's intermediate columns (expert tensor parallelism, the fused gate / up stored rank by rank); the
+    partial outputs meet in the block's reduce-scatter;
   * the embeddings, the final norm and the output head are not split. Each rank applies them to its own
-    slice of the sequence: the losses (chunked cross-entropy, Cut Cross-Entropy, Liger, the gated
-    objectives) run unchanged on [B, S / tp, H] hidden states and the matching labels. Per rank that is
+    slice of the sequence: the losses (chunked cross-entropy, Cut Cross-Entropy, plain cross-entropy, the
+    gated objectives) run unchanged on [B, S / tp, H] hidden states and the matching labels. Per rank that is
     1 / tp of the logits FLOPs and memory, the same as a vocabulary-parallel cross-entropy, without its
     custom softmax (which the fused kernels cannot use). Their gradients come from different tokens on
     every rank: FSDP2 shards them over data x tensor ranks and sums them there
@@ -228,6 +231,14 @@ def _gather_sequence(module: nn.Module) -> None:
     module.register_forward_pre_hook(hook, with_kwargs=True)
 
 
+def _sum_over(grad: torch.Tensor, group) -> torch.Tensor:
+    """`grad` summed over the group (out of place: autograd may still use the incoming tensor)."""
+    import torch.distributed._functional_collectives as funcol
+
+    out = funcol.all_reduce(grad.contiguous(), "sum", group)
+    return out.wait() if hasattr(out, "wait") else out
+
+
 class _LocalView(torch.autograd.Function):
     """A DTensor parameter's local shard as a plain tensor, for code that reads weights directly (kernels,
     depthwise convolutions). Backward: the local gradient, summed over the group first when every rank
@@ -244,9 +255,7 @@ class _LocalView(torch.autograd.Function):
         from torch.distributed.tensor import DTensor
 
         if ctx.group is not None:
-            import torch.distributed._functional_collectives as funcol
-
-            grad = funcol.all_reduce(grad.contiguous(), "sum", ctx.group)
+            grad = _sum_over(grad, ctx.group)
         grad = DTensor.from_local(grad, ctx.mesh, ctx.placements, run_check=False, shape=ctx.shape, stride=ctx.stride)
         return grad, None
 
@@ -421,9 +430,7 @@ class _ReduceBackward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        import torch.distributed._functional_collectives as funcol
-
-        return funcol.all_reduce(grad.contiguous(), "sum", ctx.group), None
+        return _sum_over(grad, ctx.group), None
 
 
 def _moe_block(block: nn.Module, name: str, tp: TensorParallel) -> None:

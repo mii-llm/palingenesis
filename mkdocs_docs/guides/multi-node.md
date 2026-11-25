@@ -17,6 +17,13 @@ The physics change. Inside a node, GPUs communicate via NVLink (600-900 GB/s, ~5
 
 Multi-node training works well when you understand these constraints.
 
+Two layouts keep the heavy traffic inside the node (see
+[Tensor and pipeline parallelism](multi-gpu.md#tensor-and-pipeline-parallelism)): `parallel.tp_degree` up to the
+GPUs per node (its per-layer all-gathers / reduce-scatters stay on NVLink, consecutive ranks are one node's), and
+`parallel.pp_degree` across nodes (only one micro-batch's activations cross InfiniBand per stage boundary, instead
+of FSDP's per-layer weight gathers). For example, 4 nodes x 8 GPUs, a 70B model: `tp_degree: 8`, `pp_degree: 2`,
+the remaining 2 data parallel.
+
 ---
 
 ## SLURM

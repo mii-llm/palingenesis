@@ -84,7 +84,9 @@ Training issue?
 │   ├── Likely causes: Seq too long, batch too big, no checkpointing
 │   ├── Fix: Enable chunked_loss, selective AC, activation offload (memory.activation_offload), reduce
 │   │   seq/batch, add FSDP/CP
-│   └── Fastest settings that fit: pgs fit --config ... --gpu 80 (measures checkpointing modes and SeCO, real steps)
+│   ├── Fastest settings that fit: pgs fit --config ... --gpu 80 (measures checkpointing modes and SeCO, real steps)
+│   └── Layers too large for FSDP alone (32B+, long sequences on many GPUs): parallel.tp_degree (inside a node),
+│       parallel.pp_degree (across nodes); per-rank memory: pgs profile --config ... --world_size N
 ├── Trained model loops, rambles to the token limit, or never stops calling tools
 │   ├── Measure: the loop share and how episodes end (stop / length limit / turn limit) at deployment sampling,
 │   │   in both thinking modes; during SFT watch train/repeat_p and train/stop_p
@@ -182,6 +184,7 @@ Use `--json` flag (where available) for structured output suitable for programma
 | Off-policy KD: "no teacher target" | rebuild the cache with the training config, or `distill.missing: skip` + `distill.ce_weight: 0.1` |
 | LoRA (many adapters, model too big for full-weight optimizer state) | `plugins.custom: [{class: palingenesis.lora:LoRA, args: {rank: 16, alpha: 32}}]`, `train.learning_rate` ~10x the full fine-tune's (see the LoRA guide) |
 | LoRA in RL (`pgs rl`: policy too big for full-weight optimizer state next to the rollout engine) | `lora.rank: 16`, `lora.alpha: 32` in the RL config; watch `lora/push_survival` and `policy/mismatch_k3`; checkpoints are plain models plus `adapter/` (tested on CPU only; GPU validation pending, see the LoRA guide) |
+| Large model, FSDP all-gathers dominate or activations OOM on many GPUs | `parallel.tp_degree: 2..8` (one node's GPUs; Llama / Mistral / Qwen2 / Qwen3 / Qwen3-MoE / Qwen3.5 / Gemma), `parallel.pp_degree` + `pp_schedule: 1f1b` / `zbv` across nodes (untied embeddings); see the multi-GPU guide's composition table |
 | MoE routers collapse (`moe/load_max` rising, `moe/router_entropy` falling) | `moe.balance_loss_coef: 0.01`, `moe.z_loss_coef: 0.001` (see the MoE guide) |
 | Rollouts slow with vLLM, or an engine on another node | `rollout.backend: sglang` (in-process) or `sglang_server` (+ `rollout.weight_sync`); check `policy/mismatch_k3_step0` and `rollout_tok_s` against the vLLM run (RL guide, Rollout engines) |
 | MoE policy in RL: noisy ratios | `rollout.routing_replay: auto` with `rollout.prefix_caching: true` (vLLM returns the routed experts) |

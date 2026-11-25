@@ -441,6 +441,7 @@ def test_model_parallel_defaults_are_off():
             "pp_degree > 1 does not support parallel.context",
         ),
         ({"parallel__pp_degree": 2, "train__ema": True}, "does not support train.ema"),
+        ({"parallel__tp_degree": 2, "parallel__context_parallel": True}, "context_parallel is not validated"),
     ],
 )
 def test_model_parallel_errors(options, message):
