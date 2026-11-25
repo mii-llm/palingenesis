@@ -1,0 +1,24 @@
+# GPQA Diamond (Rein et al. 2023): 198 graduate-level science questions, four options. License: CC-BY-4.0. The
+# dataset is gated (accept its terms on the Hub and log in); its authors ask that examples are not published in
+# plain text, so keep the .samples.jsonl files of this task private. Not part of the core suite for that reason.
+# The four options are shuffled once per question (a fixed order, the same for every checkpoint).
+name: gpqa_diamond
+description: graduate-level science multiple choice (198 items; gated dataset)
+dataset: Idavidrein/gpqa
+subset: gpqa_diamond
+split: train
+version: "1"
+category_field: High-level domain
+fields:
+  options: {columns: [Correct Answer, Incorrect Answer 1, Incorrect Answer 2, Incorrect Answer 3], shuffle: true}
+  answer: {index_of: Correct Answer, in: options, letter: true}
+  choices: {from: options, choices: true}
+prompt: |
+  Answer the following multiple-choice question. Think step by step, then finish with "The answer is (X)", where X is the letter of the correct option.
+
+  Question: {{Question}}
+  Options:
+  {{choices}}
+scorer: mcq
+scorer_args: {field: answer, letters: ABCD}
+sampling: {max_tokens: 4096}

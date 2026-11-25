@@ -1,0 +1,27 @@
+# MMLU (Hendrycks et al. 2021), scored by log-likelihood: 14,042 test questions in 57 subjects, four options.
+# License: MIT. This file is in lm-evaluation-harness's task format (pgs eval reads both): the prompt, the 5 dev
+# examples per subject and the " A" / " B" / " C" / " D" continuations are the harness's `mmlu` tasks', so the
+# micro-average here is the harness's `mmlu` group accuracy. One file covers the 57 subjects: the examples of a
+# question are the first five dev rows of its own subject (fewshot_config.group_by, a pgs extension).
+# No text is generated: each question is one request that reads the four letters' next-token log-probs.
+task: mmlu
+dataset_path: cais/mmlu
+dataset_name: all
+test_split: test
+fewshot_split: dev
+fewshot_config:
+  sampler: first_n
+  group_by: subject
+num_fewshot: 5
+output_type: multiple_choice
+description: "The following are multiple choice questions (with answers) about {{subject.replace('_', ' ')}}.\n\n"
+doc_to_text: "{{question.strip()}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nAnswer:"
+doc_to_choice: ["A", "B", "C", "D"]
+doc_to_target: answer
+category_field: subject
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

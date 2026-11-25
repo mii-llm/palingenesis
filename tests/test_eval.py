@@ -684,7 +684,7 @@ def test_evaluator_both_modes_and_compare(tmp_path, qwen, capsys):
     rows = [json.loads(line) for line in (out / "sums.plain.jsonl").read_text().splitlines()]
     assert [r["id"] for r in rows] == ["sums/alpha", "sums/beta", "sums/gamma", "sums/delta"]
     assert rows[1]["scores"] == [1.0, 0.0, 1.0, 0.0] and rows[3]["finish"] == ["length"] * 4
-    assert set(rows[0]) == {"id", "scores", "task", "mode", "finish", "tokens", "loop"}
+    assert set(rows[0]) == {"id", "scores", "task", "mode", "finish", "tokens", "loop", "key"}
     samples = [json.loads(line) for line in (out / "sums.think.samples.jsonl").read_text().splitlines()]
     assert len(samples) == 16 and samples[0]["reasoning"] == "Let me work it out."
     assert (
@@ -701,8 +701,13 @@ def test_evaluator_both_modes_and_compare(tmp_path, qwen, capsys):
     assert report["a"]["pass@4"]["estimate"] == pytest.approx(s_plain["pass@4"]["estimate"])
     # resume keeps the finished items; without it the files start over
     calls = len(engine.samplings)
-    again = evaluator.run(task, "plain", k=4, out_dir=out, resume=True)
+    same = SamplingConfig(temperature=0.7, top_k=20)
+    again = evaluator.run(task, "plain", k=4, out_dir=out, resume=True, sampling=same)
     assert len(engine.samplings) == calls and again["mean_score"] == s_plain["mean_score"]
+    # ... of the same request: another sampling is another result, generated again
+    evaluator.run(task, "plain", k=4, out_dir=out, resume=True, sampling=SamplingConfig(temperature=0.5))
+    assert len(engine.samplings) == calls + 1
+    evaluator.close()
 
 
 def test_function_calling_task_through_the_tool_parser(tmp_path, qwen):
@@ -748,7 +753,8 @@ def test_cli_end_to_end(tmp_path, qwen, monkeypatch, capsys):
     monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *a, **k: tok)
     out = tmp_path / "out"
     argv = ["--model", "Qwen/Qwen3-0.6B", "--tasks", str(task_file), "--modes", "plain,think", "--out", str(out),
-            "--backend", "hf", "--max_model_len", "2048", "--limit", "3", "--json", "--run.resamples", "200"]  # fmt: skip
+            "--backend", "hf", "--max_model_len", "2048", "--limit", "3", "--json", "--run.resamples", "200",
+            "--no_cache"]  # fmt: skip
     assert cli.main(argv) == 0
     report = json.loads(capsys.readouterr().out)
     assert [(r["task"], r["mode"], r["items"]) for r in report["results"]] == [
@@ -759,7 +765,7 @@ def test_cli_end_to_end(tmp_path, qwen, monkeypatch, capsys):
     assert report["results"][0]["sampling"]["temperature"] == 0.0  # no generation config: greedy at k = 1
     assert json.loads((out / "summary.json").read_text())["model"] == "Qwen/Qwen3-0.6B"
     assert sorted(p.name for p in out.iterdir()) == [
-        "summary.json", "sums.plain.jsonl", "sums.plain.samples.jsonl", "sums.plain.summary.json",
+        "report.md", "summary.json", "sums.plain.jsonl", "sums.plain.samples.jsonl", "sums.plain.summary.json",
         "sums.think.jsonl", "sums.think.samples.jsonl", "sums.think.summary.json",
     ]  # fmt: skip
     # config errors: exit 1 with the reason, before any model is loaded

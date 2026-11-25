@@ -121,6 +121,12 @@ class TrainingEval:
             resamples=1000,
             seed=self.seed,
         )
+        try:
+            return self._tasks(evaluator, step, format_summary)
+        finally:
+            evaluator.close()
+
+    def _tasks(self, evaluator, step: int, format_summary) -> dict[str, float]:
         metrics: dict[str, float] = {}
         out_dir = self.output_dir / f"step_{step}"
         for task in self.tasks:

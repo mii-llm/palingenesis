@@ -50,8 +50,10 @@ MODES: dict[str, dict] = {
 PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][\w.]*)\s*\}\}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]*")
 # What a `fields:` entry may say: one source (from / template / value) and transforms, applied in this order.
-FIELD_SOURCES = ("from", "template", "value")
-FIELD_TRANSFORMS = ("json", "regex", "group", "replace", "strip", "map", "choices", "letter", "tools", "default")
+FIELD_SOURCES = ("from", "template", "value", "columns", "index_of")
+FIELD_TRANSFORMS = (
+    "json", "regex", "group", "replace", "strip", "map", "choices", "letter", "tools", "default", "shuffle", "in",
+)  # fmt: skip
 # rollout.* options an `engine:` section may not set: they are the task's sampling, not the engine's.
 ENGINE_RESERVED = {
     "temperature": "sampling.temperature",
@@ -60,7 +62,16 @@ ENGINE_RESERVED = {
     "max_new_tokens": "sampling.max_tokens",
     "max_completion_tokens": "sampling.max_completion_tokens",
 }
-ENGINE_DEFAULTS = {"backend": "vllm", "gpu_memory_utilization": 0.9, "max_model_len": 8192}
+ENGINE_DEFAULTS = {"backend": "vllm", "gpu_memory_utilization": 0.9, "max_model_len": 8192, "prefix_caching": True}
+# `engine:` options of the evaluation itself (palingenesis.eval.engines), not rollout.* options:
+#   replicas               engines per GPU (data parallel on one GPU: small models leave it idle; 0 = 1)
+#   devices                GPU indices, one engine each (default: every visible GPU when there are several)
+#   tensor_parallel_size   one engine over this many GPUs (a model too big for one)
+#   speculative_config     vLLM's speculative decoding configuration, passed through
+#   max_logprobs           next-token candidates a loglikelihood request may read at once (default 32)
+EVAL_ENGINE_KEYS = ("replicas", "devices", "tensor_parallel_size", "speculative_config", "max_logprobs")
+OUTPUTS = ("generate", "choices")
+TEMPLATES = ("chat", "completion")
 BACKENDS = ("vllm", "sglang", "hf")
 DEFAULT_MAX_TOKENS = 2048
 
@@ -77,6 +88,7 @@ class SamplingConfig:
     presence_penalty: float | None = None  # 0 = off
     max_tokens: int | None = None  # generated tokens per assistant turn, thinking included (default 2048)
     max_completion_tokens: int | None = None  # of a whole episode (agentic tasks; default max_tokens x env.max_turns)
+    stop: list | None = None  # stop strings: the completion is cut at the first one (completion-style prompts)
 
 
 @dataclass(slots=True)
@@ -119,6 +131,20 @@ class TaskConfig:
     # Agentic tasks: the RL config's env: and sandbox: sections (type, args, max_turns, tools, ...).
     env: dict = field(default_factory=dict)
     sandbox: dict = field(default_factory=dict)
+    # generate: completions are sampled and scored. choices: loglikelihood multiple choice; no text is generated,
+    # each row's `choices` (continuations) are scored after its prompt and the most likely one is the answer.
+    output: str = "generate"
+    choices_field: str = "choices"  # output choices: the row's list of continuation strings
+    gold_field: str = "gold"  # output choices: the index of the correct one
+    target_delimiter: str = " "  # output choices: between the prompt and a choice
+    # chat: the prompt goes through the model's chat template. completion: it is the raw text a base model
+    # continues (few-shot prompts of lm-evaluation-harness tasks). Empty: the run's (run.template, default chat).
+    template: str = ""
+    version: str = ""  # of the task definition: part of the result cache key and of the report
+    category_field: str = ""  # a column the report breaks scores down by (subject, difficulty, language)
+    subsets: list = field(default_factory=list)  # several dataset configurations as one task (column `subset`)
+    # A task written for lm-evaluation-harness (palingenesis.eval.lmeval): its parsed YAML. Set by load_task.
+    lmeval: dict = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -133,7 +159,15 @@ class RunSection:
     k: int = 1  # samples per item
     modes: list = field(default_factory=lambda: ["default"])  # each mode is a separate result
     limit: int = 0  # items per task (0 = the task's own limit)
-    chunk: int = 512  # items per batch of rollouts (and per write)
+    head: bool = False  # a limit keeps the first items (lm-eval's --limit) instead of a fixed-seed sample
+    chunk: int = 512  # agentic tasks: episodes in flight at once (single-turn tasks are submitted all at once)
+    template: str = "chat"  # chat | completion: tasks that do not set their own
+    num_fewshot: int = -1  # lm-evaluation-harness tasks: few-shot examples (-1 = the task's own)
+    # Scorer processes (verifiers run next to generation, off the engine's thread): -1 = automatic, 0 = threads.
+    score_workers: int = -1
+    cache_dir: str = ""  # the generation cache ("" = off; the command line defaults to ~/.cache/palingenesis/eval)
+    contamination: list = field(default_factory=list)  # training data files: n-gram overlap with the prompts
+    contamination_ngram: int = 13
     output_dir: str = "eval_results"
     save_samples: bool = True  # <task>.<mode>.samples.jsonl: every completion with its score
     resume: bool = False  # keep the items already in the result files
@@ -248,6 +282,14 @@ class EvalConfig:
         backend = self.engine.get("backend", ENGINE_DEFAULTS["backend"])
         if backend not in BACKENDS:
             errors.append(f"engine.backend must be one of {', '.join(BACKENDS)}, got {backend!r}.")
+        if r.template not in TEMPLATES:
+            errors.append(f"run.template must be one of {', '.join(TEMPLATES)}, got {r.template!r}.")
+        for key in ("replicas", "tensor_parallel_size", "max_logprobs"):
+            value = self.engine.get(key, 1)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                errors.append(f"engine.{key} must be an integer >= 0, got {value!r}.")
+        if self.engine.get("replicas", 1) > 1 and self.engine.get("tensor_parallel_size", 1) > 1:
+            errors.append("engine: replicas (several engines) and tensor_parallel_size (one engine) exclude each other.")
         for key in self.engine:
             if key in ENGINE_RESERVED:
                 errors.append(f"engine.{key}: set {ENGINE_RESERVED[key]} instead (sampling is per task and mode).")
@@ -305,6 +347,10 @@ def load_task(ref: Any, base: Path | None = None) -> TaskConfig:
         return ref
     if isinstance(ref, str):
         path = _task_path(ref, base)
+        from palingenesis.eval import lmeval
+
+        if lmeval.is_lmeval_task(path):  # a task of lm-evaluation-harness's zoo, as it is
+            return _named(lmeval.load(path), str(path))
         task = TaskConfig(name=path.stem)
         _apply(task, "task", _read_mapping(path), str(path))
         return _named(task, str(path))
@@ -320,9 +366,32 @@ def load_task(ref: Any, base: Path | None = None) -> TaskConfig:
     raise EvalConfigError(f"a task is a name, a YAML file or a mapping, got {ref!r}")
 
 
+def builtin_suites() -> dict[str, Path]:
+    """{name: YAML file} of the built-in suites (configs/eval/suites): named lists of tasks."""
+    found: dict[str, Path] = {}
+    for directory in task_dirs():
+        for path in sorted((directory / "suites").glob("*.yaml")):
+            found.setdefault(path.stem, path)
+    return dict(sorted(found.items()))
+
+
+def load_suite(ref: str) -> list[TaskConfig]:
+    """The tasks of a suite: a built-in name (core, quick, multilingual, ...) or a YAML file with `tasks:`."""
+    suites = builtin_suites()
+    path = Path(ref) if ref.endswith((".yaml", ".yml")) else suites.get(ref)
+    if path is None or not path.is_file():
+        raise EvalConfigError(f"unknown suite {ref!r}{_hint(ref, list(suites))}; suites: {', '.join(suites) or 'none'}")
+    raw = _read_mapping(path)
+    if not isinstance(raw.get("tasks"), list) or not raw["tasks"]:
+        raise EvalConfigError(f"{path}: a suite is a mapping with a `tasks:` list.")
+    return [load_task(entry, path.parent) for entry in raw["tasks"]]
+
+
 def _task_path(ref: str, base: Path | None) -> Path:
     if ref.endswith((".yaml", ".yml")) or "/" in ref:
         for candidate in (Path(ref), *([base / ref] if base else [])):
+            if candidate.is_dir() and (candidate / f"{candidate.name}.yaml").is_file():  # lm-eval: tasks/<name>/
+                return candidate / f"{candidate.name}.yaml"
             if candidate.is_file():
                 return candidate
         raise EvalConfigError(f"task file {ref} not found")
@@ -351,11 +420,19 @@ def task_errors(task: TaskConfig, modes: set[str]) -> list[str]:
         errors.append(f"{where}: `dataset` is empty (a Hugging Face dataset id or a .jsonl / .json / .parquet file).")
     if task.limit < 0 or task.k < 0:
         errors.append(f"{where}: limit and k must be >= 0.")
+    if task.output not in OUTPUTS:
+        errors.append(f"{where}: output must be one of {', '.join(OUTPUTS)}, got {task.output!r}.")
+    if task.template and task.template not in TEMPLATES:
+        errors.append(f"{where}: template must be one of {', '.join(TEMPLATES)}, got {task.template!r}.")
+    if task.output == "choices" and (task.env or task.k > 1):
+        errors.append(f"{where}: output choices scores log-likelihoods: it takes no env and no k.")
     if sum(bool(x) for x in (task.prompt, task.messages, task.prompt_field)) > 1:
         errors.append(f"{where}: give one of prompt, messages and prompt_field.")
     if task.scorer and task.rewards:
         errors.append(f"{where}: give `scorer` (one) or `rewards` (several, weighted), not both.")
-    if not (task.scorer or task.rewards or task.env.get("type", "single_turn") not in ("single_turn", "tools")):
+    if task.output == "choices":
+        pass  # scored by the log-likelihoods
+    elif not (task.scorer or task.rewards or task.env.get("type", "single_turn") not in ("single_turn", "tools")):
         errors.append(
             f"{where}: no score: set `scorer` (built-in: exact_match, numeric, mcq, regex_match, json_schema, "
             "function_call, ifeval; RL rewards: math, code, judge, ...; or module:function), `rewards`, or an "

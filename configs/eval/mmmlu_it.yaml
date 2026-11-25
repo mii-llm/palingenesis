@@ -1,0 +1,22 @@
+# MMMLU, Italian (OpenAI 2024): the MMLU test set professionally translated into Italian, 14,042 items, four
+# options. License: MIT. The prompt is in Italian; the answer line is fixed. Other languages: change `subset`
+# (AR_XY, DE_DE, ES_LA, FR_FR, JA_JP, ...) and the prompt.
+name: mmmlu_it
+description: MMLU in Italian (human translation), four options (14,042 items)
+dataset: openai/MMMLU
+subset: IT_IT
+split: test
+version: "1"
+category_field: Subject
+prompt: |
+  Rispondi alla seguente domanda a scelta multipla. Ragiona passo dopo passo, poi concludi con "La risposta è (X)", dove X è la lettera dell'opzione corretta.
+
+  Domanda: {{Question}}
+  Opzioni:
+  A. {{A}}
+  B. {{B}}
+  C. {{C}}
+  D. {{D}}
+scorer: mcq
+scorer_args: {field: Answer, letters: ABCD}
+sampling: {max_tokens: 2048}

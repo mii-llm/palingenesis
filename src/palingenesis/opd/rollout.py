@@ -70,6 +70,16 @@ class Sampling:
     # Per sampled token, also return the sampler's `candidates` most likely tokens and their processed log-probs
     # (Rollout.candidates); 0 = none. vLLM bounds it with its max_logprobs.
     candidates: int = 0
+    # Only these token ids may be sampled (empty: any). The processed log-probs are renormalised over them:
+    # palingenesis.eval.loglikelihood reads the log-probs of chosen next tokens this way (vLLM: allowed_token_ids).
+    allowed: tuple[int, ...] = ()
+    # Stop strings: the completion ends at the first one (vLLM detokenizes these requests; the tokens returned
+    # may run a few past the match, so callers cut the text again). Evaluation of completion-style prompts.
+    stop: tuple[str, ...] = ()
+
+    def __post_init__(self):  # lists (a config, the engine pool's JSON header) become hashable tuples
+        object.__setattr__(self, "allowed", tuple(int(t) for t in self.allowed))
+        object.__setattr__(self, "stop", tuple(str(s) for s in self.stop))
 
     @property
     def truncated(self) -> bool:
@@ -376,6 +386,8 @@ class HFRollout:
             for budget, sampling in sorted(set(zip(max_new_tokens, per_prompt)), key=lambda x: (x[0], repr(x[1]))):
                 idx = [i for i, (m, sp) in enumerate(zip(max_new_tokens, per_prompt)) if m == budget and sp == sampling]
                 temperature = sampling.temperature
+                if sampling.allowed:
+                    raise NotImplementedError("Sampling.allowed is a vLLM engine option; score with the model itself")
                 if temperature == 0 and sampling.presence_penalty:
                     raise ValueError("presence_penalty with greedy decoding: use temperature > 0 or the vLLM engine")
                 for start in range(0, len(idx), self.micro_seqs):
@@ -690,7 +702,9 @@ class VLLMColocateRollout:
             # the sampled token's log-prob, and Sampling.candidates more (processed: after temperature, top-k, top-p)
             logprobs=sampling.candidates if sampling.temperature > 0 else None,
             stop_token_ids=list(self.stop_ids),
-            detokenize=False,
+            detokenize=bool(sampling.stop),  # only stop strings need the engine's incremental detokenizer
+            **({"stop": list(sampling.stop)} if sampling.stop else {}),
+            **({"allowed_token_ids": list(sampling.allowed)} if sampling.allowed else {}),
             **kwargs,
         )
 

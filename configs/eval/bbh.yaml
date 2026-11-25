@@ -1,0 +1,26 @@
+# BIG-Bench Hard (Suzgun et al. 2022): 27 tasks (23 problem types) that earlier models failed, 6,511 items.
+# License: MIT. Zero-shot chat form: the task's own input, then a fixed answer line. The gold targets are short
+# ("(B)", "True", "yes", a word list); the answer after the last "Answer:" must equal it, case and punctuation
+# aside, so "(B)" and "B" agree. Not comparable with the paper's 3-shot chain-of-thought numbers.
+# The report breaks the score down by task (category_field: subset).
+name: bbh
+description: BIG-Bench Hard, 27 reasoning tasks, zero-shot (6,511 items)
+dataset: lukaemon/bbh
+split: test
+version: "1"
+subsets: [boolean_expressions, causal_judgement, date_understanding, disambiguation_qa, dyck_languages,
+          formal_fallacies, geometric_shapes, hyperbaton, logical_deduction_five_objects,
+          logical_deduction_seven_objects, logical_deduction_three_objects, movie_recommendation,
+          multistep_arithmetic_two, navigate, object_counting, penguins_in_a_table,
+          reasoning_about_colored_objects, ruin_names, salient_translation_error_detection, snarks,
+          sports_understanding, temporal_sequences, tracking_shuffled_objects_five_objects,
+          tracking_shuffled_objects_seven_objects, tracking_shuffled_objects_three_objects, web_of_lies,
+          word_sorting]
+category_field: subset
+prompt: |
+  {{input}}
+
+  Think step by step, then give the final answer on the last line as "Answer: <answer>".
+scorer: exact_match
+scorer_args: {field: target, extract: answer, ignore_punctuation: true}
+sampling: {max_tokens: 2048}

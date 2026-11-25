@@ -1,0 +1,18 @@
+# The core suite: one command for a rounded picture of a checkpoint.
+#   pgs eval --model <checkpoint> --suite core --modes plain,think
+# Math (gsm8k, math500), knowledge (mmlu_pro, a fixed 2,000-item sample), instruction following (ifeval),
+# reasoning (bbh, a fixed 1,350-item sample), code with sandboxed tests (humaneval, mbpp), function calling
+# (bfcl_simple) and Italian (mmmlu_it sample, belebele_it). Samples are fixed-seed: the same items for every
+# checkpoint, so two runs stay paired for `pgs compare`. Every task's prompt format is documented in its file.
+description: math, knowledge, instructions, reasoning, code, function calling, Italian
+tasks:
+  - gsm8k
+  - math500
+  - {task: mmlu_pro, limit: 2000}
+  - ifeval
+  - {task: bbh, limit: 1350}
+  - humaneval
+  - mbpp
+  - bfcl_simple
+  - {task: mmmlu_it, limit: 1000}
+  - belebele_it

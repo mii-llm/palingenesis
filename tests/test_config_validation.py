@@ -267,7 +267,11 @@ def test_every_shipped_config_loads():
     assert configs
     for path in configs:
         # on-policy distillation and RL configs have their own schemas
-        if path.parent.name == "eval":  # evaluation tasks (pgs eval)
+        if path.parent.name == "suites":  # evaluation suites: lists of tasks
+            from palingenesis.eval.config import load_suite
+
+            assert load_suite(str(path))
+        elif path.parent.name == "eval":  # evaluation tasks (pgs eval)
             from palingenesis.eval.config import MODES, load_task, task_errors
 
             assert task_errors(load_task(str(path)), set(MODES)) == []

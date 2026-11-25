@@ -1,0 +1,5 @@
+# Italian next to the English originals of the same benchmarks (MMLU / MMMLU share questions; Belebele is parallel).
+description: Italian knowledge and reading comprehension
+tasks:
+  - {task: mmmlu_it, limit: 2000}
+  - belebele_it

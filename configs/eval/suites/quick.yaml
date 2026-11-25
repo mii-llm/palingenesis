@@ -1,0 +1,7 @@
+# A few minutes on one GPU: 200 fixed items of each. For a first look, and for the eval_tasks: hook of a training run.
+description: 200 items each of gsm8k, math500, mmlu_pro, ifeval
+tasks:
+  - {task: gsm8k, limit: 200}
+  - {task: math500, limit: 200}
+  - {task: mmlu_pro, limit: 200}
+  - {task: ifeval, limit: 200}

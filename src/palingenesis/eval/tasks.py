@@ -9,6 +9,8 @@ Field entries (`fields:`), a column name or a mapping with one source and transf
 
     from: column            a column; dotted paths reach into mappings and lists (question.0.content)
     template: "{{a}} {{b}}" text over the row's columns and the fields mapped before it
+    columns: [a, b, c]      several columns as one list; shuffle: true gives each row a fixed random order
+    index_of: column        the position of the column's value in the list field `in:` (mapped before it)
     value: anything         a constant
     default: x              used when the column is missing or null (otherwise that is an error)
     json: true              parse a JSON string
@@ -23,6 +25,7 @@ Field entries (`fields:`), a column name or a mapping with one source and transf
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import random
@@ -59,8 +62,17 @@ class EvalItem:
 # -------------------------------------------------------------------- loading
 
 
-def load_task_rows(task: TaskConfig) -> list[dict[str, Any]]:
-    """The task's dataset rows as plain dicts (arrays as lists), joined with `join` when set."""
+def load_task_rows(task: TaskConfig, split: str = "") -> list[dict[str, Any]]:
+    """The task's dataset rows as plain dicts (arrays as lists), joined with `join` when set. `split`: another
+    split than the task's (few-shot examples). With `subsets`, every subset's rows, each with a `subset` column."""
+    if split and split != task.split:
+        task = dataclasses.replace(task, split=split, data_files="" if task.lmeval else task.data_files)
+    if task.subsets:
+        rows = []
+        for subset in task.subsets:
+            part = load_task_rows(dataclasses.replace(task, subset=str(subset), subsets=[]))
+            rows += [{"subset": str(subset), **row} for row in part]
+        return rows
     rows = _read_source(task, task.data_files)
     if task.join:
         key = task.join["key"]
@@ -202,6 +214,19 @@ def map_field(spec: Any, row: dict, where: str) -> Any:
         spec = {"from": spec}
     if "value" in spec:
         value = spec["value"]
+    elif "columns" in spec:  # several columns as one list (answer options stored one per column)
+        value = [lookup(row, column) for column in spec["columns"]]
+        if any(v is _MISSING or v is None for v in value):
+            raise EvalConfigError(f"{where}: columns {spec['columns']} are not all in the row (columns: {sorted(row)})")
+        if spec.get("shuffle"):  # a fixed order per row: the same for every checkpoint and run
+            import zlib
+
+            random.Random(zlib.crc32(repr(value).encode())).shuffle(value)
+    elif "index_of" in spec:  # where a column's value sits in a list field mapped before (the gold option)
+        options, wanted = lookup(row, str(spec.get("in", ""))), lookup(row, spec["index_of"])
+        if not isinstance(options, list) or wanted not in options:
+            raise EvalConfigError(f"{where}: {spec['index_of']!r} is not an element of the list `in: {spec.get('in')}`")
+        value = options.index(wanted)
     elif "template" in spec:
         value = render(str(spec["template"]), row, where)
     else:
@@ -297,16 +322,43 @@ def _json_schema(node: Any) -> Any:
 # ---------------------------------------------------------------------- items
 
 
-def build_items(task: TaskConfig, limit: int = 0, rows: list[dict] | None = None) -> list[EvalItem]:
-    """The task's items: rows loaded (or given), sampled to the limit, mapped, prompted and named.
-    `limit`: the run's own cap (0 = the task's)."""
+def _lmeval_rows(task: TaskConfig, rows, fewshot_rows, num_fewshot: int) -> list[dict]:
+    from palingenesis.eval import lmeval
+
     rows = load_task_rows(task) if rows is None else [_plain(dict(r)) for r in rows]
+    rows = lmeval.process_docs(task, rows)
+    wanted = int(task.lmeval.get("num_fewshot") or 0) if num_fewshot < 0 else num_fewshot
+    split = lmeval.fewshot_split(task)
+    if wanted > 0 and fewshot_rows is None and split:
+        fewshot_rows = rows if split == task.split else lmeval.process_docs(task, load_task_rows(task, split))
+    built = lmeval.build_rows(task, rows, fewshot_rows, num_fewshot)
+    for row in built:
+        row["messages"] = [{"role": "user", "content": row["prompt_text"]}]
+    return built
+
+
+def build_items(
+    task: TaskConfig,
+    limit: int = 0,
+    rows: list[dict] | None = None,
+    fewshot_rows: list[dict] | None = None,
+    num_fewshot: int = -1,
+    head: bool = False,
+) -> list[EvalItem]:
+    """The task's items: rows loaded (or given), sampled to the limit, mapped, prompted and named.
+    `limit`: the run's own cap (0 = the task's). `fewshot_rows` / `num_fewshot`: lm-evaluation-harness tasks
+    (the few-shot split's rows instead of loading them; the number of examples, -1 = the task's). `head`: a limit
+    keeps the first rows instead of a fixed-seed sample (what lm-evaluation-harness's --limit does)."""
+    if task.lmeval:  # a task of lm-evaluation-harness: its own prompt construction, in document order
+        rows = _lmeval_rows(task, rows, fewshot_rows, num_fewshot)
+    else:
+        rows = load_task_rows(task) if rows is None else [_plain(dict(r)) for r in rows]
     if not rows:
         raise EvalConfigError(f"task {task.name}: {task.dataset} has no rows")
     indices = list(range(len(rows)))
     cap = limit or task.limit
     if cap and cap < len(rows):  # a fixed sample in file order: the same items for every checkpoint
-        indices = sorted(random.Random(task.sample_seed).sample(indices, cap))
+        indices = indices[:cap] if head else sorted(random.Random(task.sample_seed).sample(indices, cap))
     items: list[EvalItem] = []
     seen: set[str] = set()
     for index in indices:
@@ -321,7 +373,7 @@ def build_items(task: TaskConfig, limit: int = 0, rows: list[dict] | None = None
             ]
         elif task.prompt:
             row["messages"] = [{"role": "user", "content": render(task.prompt, row, f"{where}: prompt").strip()}]
-        elif task.prompt_field and lookup(row, task.prompt_field) is _MISSING:
+        elif task.prompt_field and not task.lmeval and lookup(row, task.prompt_field) is _MISSING:
             raise EvalConfigError(f"{where}: prompt_field {task.prompt_field!r} is not a column ({sorted(row)})")
         key = index
         if task.id_field:
@@ -345,4 +397,15 @@ def build_items(task: TaskConfig, limit: int = 0, rows: list[dict] | None = None
 
 def prompt_field(task: TaskConfig) -> str:
     """The RL data.prompt_field for the task's rows: the rendered chat, the task's column, or RL's default."""
-    return "messages" if task.messages or task.prompt else task.prompt_field
+    return "messages" if task.messages or task.prompt or task.lmeval else task.prompt_field
+
+
+def prompt_text(row: dict, task: TaskConfig) -> str:
+    """The raw text a completion-style run continues (template: completion): the row's `prompt_text` (lm-eval
+    tasks), else the contents of its prompt's messages joined by blank lines."""
+    if isinstance(row.get("prompt_text"), str):
+        return row["prompt_text"]
+    from palingenesis.rl.data import prompt_messages
+
+    messages = prompt_messages(row, prompt_field(task), task.system_prompt)
+    return "\n\n".join(m["content"] for m in messages if isinstance(m.get("content"), str))
