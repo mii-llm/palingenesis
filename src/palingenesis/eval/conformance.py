@@ -5,8 +5,8 @@
 
 Reads lm-eval's results JSON (results_*.json under --lmeval: the aggregate) and, when it was run with
 --log_samples, its samples_<task>_*.jsonl (per document). Reports both accuracies, their difference in units of
-the standard error of a difference of two proportions over n items, and, with samples, how many documents the two
-harnesses score the same way (documents are matched by position: lm-eval's doc_id is the row number, which is the
+the standard error of the accuracy over n items, and, with samples, how many documents the two harnesses score
+the same way (documents are matched by position: lm-eval's doc_id is the row number, which is the
 item id pgs gives rows without an id column). Greedy decoding is not bit-identical between two engine runs
 (batch-dependent floating point), so a handful of flipped documents is expected; exit code 1 when the difference
 exceeds --max_se standard errors (default 1).
@@ -61,11 +61,14 @@ def lmeval_results(directory: str | Path, task: str, metric: str) -> tuple[float
 
 
 def compare(ours: dict[str, float], aggregate: float | None, docs: dict[str, float], max_se: float = 1.0) -> dict[str, Any]:
+    """The two accuracies and their difference in standard errors of lm-eval's accuracy over the n items
+    (sqrt(p (1 - p) / n)); `within`: the difference is at most max_se of them. With per-document values, also how
+    many documents the harnesses score alike, and the paired z of the mean difference (information: two greedy
+    runs of one engine already differ on a few documents)."""
     n = len(ours)
     mine = sum(ours.values()) / n if n else float("nan")
     theirs = aggregate if aggregate is not None else (sum(docs.values()) / len(docs) if docs else float("nan"))
-    pooled = (mine + theirs) / 2
-    se = math.sqrt(max(pooled * (1 - pooled), 1e-12) * 2 / n) if n else float("nan")
+    se = math.sqrt(max(theirs * (1 - theirs), 1e-12) / n) if n else float("nan")
     report: dict[str, Any] = {
         "items": n,
         "pgs": mine,
@@ -80,9 +83,8 @@ def compare(ours: dict[str, float], aggregate: float | None, docs: dict[str, flo
         diffs = [ours[i] - docs[i] for i in shared]
         mean = sum(diffs) / len(diffs)
         paired = math.sqrt(sum((d - mean) ** 2 for d in diffs) / max(1, len(diffs) - 1) / len(diffs))
-        report.update(paired_items=len(shared), same_items=same, agreement=same / len(shared), paired_stderr=paired)
-        if paired > 0:  # the paired standard error is the sharper one when documents can be matched
-            report["z"] = mean / paired
+        report.update(paired_items=len(shared), same_items=same, agreement=same / len(shared))
+        report["paired_z"] = mean / paired if paired > 0 else 0.0
     report["within"] = bool(abs(report["z"]) <= max_se or abs(report["difference"]) < 1e-12)
     return report
 

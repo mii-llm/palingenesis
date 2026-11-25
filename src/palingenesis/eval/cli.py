@@ -187,6 +187,7 @@ def run(config, cli_sampling=None, engine=None, tokenizer=None) -> dict:
         raise EvalConfigError("\n".join(problems))
     # the data first: a missing column or an offline dataset fails before the engine takes the GPU
     items = {task.name: build_items(task, r.limit, num_fewshot=r.num_fewshot, head=r.head) for task in config.tasks}
+    prepare_seconds = time.perf_counter() - started
     if tokenizer is None:
         from transformers import AutoTokenizer
 
@@ -281,6 +282,7 @@ def run(config, cli_sampling=None, engine=None, tokenizer=None) -> dict:
         "model": config.model.path,
         "output_dir": r.output_dir,
         "engine": {"backend": options.get("backend"), "engines": layout.engines, "start_seconds": engine_seconds},
+        "prepare_seconds": prepare_seconds,  # datasets read, prompts built
         "wall_seconds": time.perf_counter() - started,
         "overall": reporting.overall(summaries),
         "results": summaries,

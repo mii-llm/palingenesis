@@ -334,23 +334,34 @@ pgs rollouts --dir outputs/rl --since 200 --json
 
 ### eval
 
-Evaluate a checkpoint on tasks defined in YAML, through the RL pipeline: the prompt rendering, chat template arguments, tool-call parsing, environments and rewards of training. Each task and thinking mode is one result, written in the [`pgs compare`](#compare) format. See the [Evaluation guide](../guides/evaluation.md).
+Evaluate a checkpoint on tasks defined in YAML (ours, or task files of lm-evaluation-harness) with the prompt rendering, chat template arguments, tool-call parsing, environments and rewards of training. One engine serves the run; single-turn tasks are submitted at once and scored while the engine generates; multiple choice is scored by log-likelihood with one prefill per question. Each task and thinking mode is one result, written in the [`pgs compare`](#compare) format. See the [Evaluation guide](../guides/evaluation.md).
 
 ```bash
+pgs eval --model runs/sft/final --suite core # the curated suite: a table, summary.json, report.md
 pgs eval --model runs/sft/final --tasks gsm8k,math500 --k 4 --modes plain,think --out eval/sft
+pgs eval --model runs/sft/final --tasks path/to/lm_eval/tasks/gsm8k/gsm8k.yaml   # an lm-eval task file
 pgs eval --config eval.yaml                  # model, engine, run, sampling, modes, tasks
 pgs eval --model runs/sft/final --tasks my_task.yaml,mmlu_pro --limit 500 --temperature 0.7 --top_p 0.8 --top_k 20
-pgs eval --list                              # built-in tasks: gsm8k, math500, mmlu_pro, ifeval, bfcl_simple
+pgs eval --list                              # built-in tasks and suites
 ```
 
 | Option | |
 |---|---|
 | `--model` | the checkpoint (a Hugging Face id or a path) |
-| `--tasks` | comma-separated built-in names or task YAML files |
+| `--tasks` | comma-separated built-in names or task YAML files (ours or lm-eval's; globs expand) |
+| `--suite` | a built-in suite (`core`, `quick`, `multilingual`, `loglikelihood`) or a suite YAML file |
+| `--template` | `chat` or `completion` (raw text) for every task; default: the task's own (lm-eval tasks: completion) |
+| `--num_fewshot` | lm-eval tasks: few-shot examples (default: the task's) |
 | `--k` | samples per item (default 1) |
 | `--modes` | thinking modes, each a separate result: `default` (the template's own), `plain` (`enable_thinking: false`), `think` (`enable_thinking: true`), or modes the config defines |
 | `--out` | the output directory (default `eval_results`) |
-| `--limit` | items per task: a fixed-seed sample, the same for every checkpoint |
+| `--limit`, `--head` | items per task: a fixed-seed sample, the same for every checkpoint; `--head` keeps the first items instead (lm-eval's `--limit`) |
+| `--replicas`, `--devices` | engines per GPU; the GPUs (default: one engine on each visible GPU) |
+| `--score_workers` | scorer processes (`-1` automatic, `0` threads) |
+| `--cache_dir`, `--no_cache` | the generation cache (default `~/.cache/palingenesis/eval`, or `$PGS_EVAL_CACHE`) |
+| `--contamination` | training data files or directories: n-gram overlap with the prompts |
+| `--categories` | per-category lines in the table |
+| `--push_to_hub` | upload the output directory to a (private) dataset repository |
 | `--temperature`, `--top_p`, `--top_k`, `--presence_penalty`, `--max_tokens` | sampling, over every task's and mode's own. Unset: the model's `generation_config.json`; without one, greedy at k = 1 |
 | `--backend`, `--max_model_len` | the engine: `vllm` (default), `sglang`, `hf`; its context length |
 | `--resume` | keep the items already in the result files |
@@ -358,7 +369,7 @@ pgs eval --list                              # built-in tasks: gsm8k, math500, m
 | `--json` | print the run summary as JSON |
 | `--section.option value` | any option of the [evaluation config](configuration.md#evaluation-config-pgs-eval): `--run.chunk 256`, `--engine.gpu_memory_utilization 0.4` |
 
-Writes `<task>.<mode>.jsonl` (per item: `id`, `scores`, `cluster`), `<task>.<mode>.samples.jsonl`, `<task>.<mode>.summary.json` and `summary.json` (mean score, unbiased pass@k, bootstrap and Wilson intervals, tokens, truncation and loop shares). Exit code 1 on a config error or when nothing could be scored.
+Writes `<task>.<mode>.jsonl` (per item: `id`, `scores`, `cluster`), `<task>.<mode>.samples.jsonl`, `<task>.<mode>.summary.json`, `report.md` and `summary.json` (mean score, unbiased pass@k, bootstrap and Wilson intervals, tokens, truncation and loop shares). Exit code 1 on a config error or when nothing could be scored.
 
 ```bash
 pgs compare eval/base/gsm8k.think.jsonl eval/sft/gsm8k.think.jsonl --require not_worse --margin 0.02

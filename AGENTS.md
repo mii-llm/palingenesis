@@ -146,6 +146,16 @@ Training issue?
 │   │   through the experts the engine used; watch moe/route_mismatch and policy/mismatch_k3
 │   └── Speed: python scripts/bench_moe_experts.py picks moe.experts_implementation; several GPUs:
 │       parallel.expert_parallel (experimental)
+├── Evaluate a checkpoint broadly / fast (pgs eval)
+│   ├── One command: pgs eval --model <ckpt> --suite core --modes plain,think (table, summary.json, report.md)
+│   ├── lm-eval task files run as they are: --tasks path/to/task.yaml (completion mode; --template chat);
+│   │   agreement with lm-eval: python -m palingenesis.eval.conformance --pgs ... --lmeval ... --task ... --metric ...
+│   ├── Slow: check gpu_util_mean in the summary (well under 90% on a small model: --replicas 2..4), the
+│   │   engine's memory share (--engine.gpu_memory_utilization), time_to_first_result, cache_hits
+│   ├── Multiple choice by log-likelihood (output: choices; mmlu, mmlu_pro_mc): one prefill per question; needs
+│   │   the vllm or hf backend
+│   ├── Leakage: --contamination <training data paths> (13-gram overlap; clean_score vs flagged_score)
+│   └── Against lm-eval and lighteval on one GPU: scripts/gpu_checks/eval_bench.sh
 ├── Did my model improve? (a checkpoint against its base, a step against step 0)
 │   ├── Run: pgs eval --model <base> --tasks <tasks> --k 4 --modes plain,think --out eval/base, the same command
 │   │   for the candidate (same tasks, k, modes, sampling, environment), then per task and mode:

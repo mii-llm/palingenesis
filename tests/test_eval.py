@@ -52,6 +52,9 @@ def test_builtin_tasks_load_and_validate():
         task = load_task(name)
         assert task.name == name and task.dataset and task.description
         assert task_errors(task, set(MODES)) == []
+        if task.output == "choices":  # scored by log-likelihood: no scorer
+            assert not task.scorer and not task.rewards
+            continue
         assert resolve_scorers(task)[0].fn is not None  # every built-in task names a scorer that exists
 
 

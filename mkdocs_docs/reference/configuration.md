@@ -663,6 +663,8 @@ tasks:
 
 The rollout engine, with the engine options of the RL config's `rollout` section: `backend` (`vllm`, `sglang`, `hf`), `max_model_len` (8192), `gpu_memory_utilization` (0.9 here: evaluation alone on the GPU), `max_num_seqs`, `enforce_eager`, `prefix_caching`, `kv_cache_dtype`, `quantization`, `vllm_args`, `sglang_args`, `micro_seqs` (hf). Sampling options are not engine options (`sampling:`).
 
+Evaluation defaults differ from RL's: `prefix_caching: true`, `max_num_seqs: 512`, `vllm_args.max_num_batched_tokens: 16384`. Options of the evaluation itself: `replicas` (engines per GPU), `devices` (GPU indices, one engine each; default every visible GPU when there are several), `tensor_parallel_size` (one engine over several GPUs), `speculative_config` (passed to vLLM), `max_logprobs` (32: next-token candidates per loglikelihood request).
+
 ### run
 
 | Parameter | Type | Default | Description |
@@ -670,7 +672,14 @@ The rollout engine, with the engine options of the RL config's `rollout` section
 | `k` | int | `1` | Samples per item (a task's own `k` wins). |
 | `modes` | list | `[default]` | Thinking modes, each a separate result (a task's own `modes` wins). |
 | `limit` | int | `0` | Items per task, a fixed-seed sample (0 = the task's own `limit`). |
-| `chunk` | int | `512` | Items per batch of rollouts, and per write to the result files. |
+| `head` | bool | `false` | A limit keeps the first items instead of a fixed-seed sample (lm-eval's `--limit`). |
+| `chunk` | int | `512` | Agentic tasks: items with episodes in flight at once. Single-turn tasks are submitted all at once. |
+| `template` | str | `chat` | `chat` or `completion` (raw text) for tasks that do not set their own. |
+| `num_fewshot` | int | `-1` | lm-eval tasks: few-shot examples (-1 = the task's). |
+| `score_workers` | int | `-1` | Scorer processes: -1 automatic (from 256 samples), 0 = threads. |
+| `cache_dir` | str | `""` | The generation cache directory (`""` = off in a config; the command line defaults to `~/.cache/palingenesis/eval`). |
+| `contamination` | list | `[]` | Training data files or directories checked for n-gram overlap with the prompts. |
+| `contamination_ngram` | int | `13` | Words per n-gram. |
 | `output_dir` | str | `eval_results` | Where the result files go. |
 | `save_samples` | bool | `true` | Write `<task>.<mode>.samples.jsonl`. |
 | `resume` | bool | `false` | Keep the items already in the result files. |

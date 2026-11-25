@@ -2,20 +2,32 @@
 
 *`pgs eval`: tasks defined in YAML, run through the code that trains.*
 
-An evaluation harness that renders prompts, parses tool calls or scores answers differently from the trainer measures a slightly different model than the one you trained. `pgs eval` has no rendering or scoring code of its own: every sample goes through the RL pipeline (`palingenesis.rl.pipeline`), so the chat template and its arguments (thinking modes), the tool-call parser, the environments (tools, Harbor, harness profiles), the sandboxes and the rewards are the ones `pgs rl`, `pgs screen` and `pgs distill` use. Training and evaluation agree by construction.
+An evaluation harness that renders prompts, parses tool calls or scores answers differently from the trainer measures a slightly different model than the one you trained. `pgs eval` renders, parses and scores with the trainer's functions: the chat template and its arguments (thinking modes), the tool-call parser, the environments (tools, Harbor, harness profiles), the sandboxes and the rewards are the ones `pgs rl`, `pgs screen` and `pgs distill` use. Tasks with an environment run as episodes of the RL pipeline; single-turn tasks run in a leaner executor built from the same functions (a test compares the two paths record by record). Training and evaluation agree by construction.
 
 !!! abstract "In short"
     - **A task is a YAML file**: a dataset (local file or Hub id), a field mapping, a prompt, a scorer (a built-in, any RL reward, or your function), k samples, sampling, and an environment for agentic tasks.
-    - **Built-in tasks** (`configs/eval/`, datasets pulled from the Hub at run time): `gsm8k`, `math500`, `mmlu_pro`, `ifeval`, `bfcl_simple`.
+    - **Built-in tasks and suites** (`configs/eval/`, datasets pulled from the Hub at run time): `pgs eval --model X --suite core` runs math, knowledge, instruction following, reasoning, sandboxed code, function calling and Italian on one engine.
+    - **Tasks of lm-evaluation-harness run as they are**: `--tasks path/to/lm_eval/tasks/gsm8k/gsm8k.yaml`. Same prompts, few-shot examples, filters and metrics.
+    - **Built for speed**: one engine per run, every request submitted at once, n = k sampling, prefix caching, scoring in other processes while the engine generates, multiple choice with one prefill per question, a generation cache. See [Speed](#speed).
     - **Each thinking mode is a separate result**: `--modes plain,think` writes `<task>.plain.jsonl` and `<task>.think.jsonl`.
     - **Results are `pgs compare` files**: one row per item with its k scores, so `pgs compare base.jsonl candidate.jsonl --require not_worse` is the whole regression gate.
     - **`eval_tasks:`** in a `pgs train` / `pgs rl` / `pgs distill` config runs tasks during training, on the trainer's rollout engine.
 
 ```bash
+pgs eval --model runs/sft/final --suite core
 pgs eval --model runs/sft/final --tasks gsm8k,math500 --k 4 --modes plain,think --out eval/sft
 pgs eval --config eval.yaml
-pgs eval --list                      # the built-in tasks
+pgs eval --list                      # the built-in tasks and suites
 ```
+
+```text
+┌───────┬───────┬───────┬─────────────────┬────────────────┬─────────────────┬────────┬───────┬───────┬─────────┬───────┬───────┐
+│ task  │ mode  │ items │           score │         95% CI │          pass@k │ tokens │ trunc │ loops │ items/s │ tok/s │  time │
+├───────┼───────┼───────┼─────────────────┼────────────────┼─────────────────┼────────┼───────┼───────┼─────────┼───────┼───────┤
+│ gsm8k │ plain │  1319 │ 0.xxxx ± 0.xxxx │ [0.xxx, 0.xxx] │ 0.xxxx (k=4)    │    ... │  ...% │  ...% │     ... │   ... │  ...s │
+```
+
+The table's score is the mean over items with its standard error; `report.md` and `summary.json` in the output directory hold the same, with per-category scores (`--categories` prints them too). `--push_to_hub me/eval-results` uploads the directory to a private dataset repository.
 
 The engine is vLLM in-process by default (`--backend sglang` or `hf` otherwise; `hf` is `model.generate`, for CPU tests and tiny models). One engine serves every task and mode of a run.
 
@@ -111,6 +123,25 @@ The summary records the agreement, Cohen's kappa and the number of examples. `ju
 | `mmlu_pro` | `TIGER-Lab/MMLU-Pro`, test (MIT) | 12,032 | `mcq`: the letter, up to ten options |
 | `ifeval` | `google/IFEval` (Apache-2.0) | 541 | `ifeval`: prompt-level strict accuracy |
 | `bfcl_simple` | `gorilla-llm/Berkeley-Function-Calling-Leaderboard`, v3 simple (Apache-2.0) | 400 | `function_call`: BFCL-style accepted values |
+| `bbh` | `lukaemon/bbh`, 27 tasks (MIT) | 6,511 | `exact_match` on the line after "Answer:", zero-shot; per-task scores |
+| `humaneval` | `openai/openai_humaneval` (MIT) | 164 | `code`: the function passes the hidden tests in the sandbox |
+| `mbpp` | `google-research-datasets/mbpp`, sanitized test (CC-BY-4.0) | 257 | `code`: the three asserts pass in the sandbox |
+| `mmlu` | `cais/mmlu`, test, 57 subjects (MIT) | 14,042 | log-likelihood of " A" ... " D", 5 dev examples per subject (lm-eval's `mmlu`) |
+| `mmlu_pro_mc` | `TIGER-Lab/MMLU-Pro`, test (MIT) | 12,032 | log-likelihood of the letter, zero-shot |
+| `mmmlu_it` | `openai/MMMLU`, `IT_IT` (MIT) | 14,042 | `mcq`, Italian prompt; per-subject scores |
+| `belebele_it` | `facebook/belebele`, `ita_Latn` (CC-BY-SA-4.0) | 900 | `mcq`, Italian prompt; questions of one passage are a cluster |
+| `gpqa_diamond` | `Idavidrein/gpqa` (CC-BY-4.0, gated) | 198 | `mcq`, options shuffled once per question |
+
+Every task file starts with a comment that states the prompt format, the license and what the score is and is not comparable with. `gpqa_diamond` is not part of a suite: the dataset is gated and its authors ask that examples are not published, so keep its sample files private.
+
+| Suite | Tasks |
+|---|---|
+| `core` | `gsm8k`, `math500`, `mmlu_pro` (2,000 items), `ifeval`, `bbh` (1,350), `humaneval`, `mbpp`, `bfcl_simple`, `mmmlu_it` (1,000), `belebele_it` |
+| `quick` | 200 items each of `gsm8k`, `math500`, `mmlu_pro`, `ifeval` |
+| `multilingual` | `mmmlu_it` (2,000), `belebele_it` |
+| `loglikelihood` | `mmlu`, `mmlu_pro_mc` |
+
+A suite is a YAML file with a `tasks:` list (`--suite my_suite.yaml`); limits are fixed-seed samples, the same items for every checkpoint.
 
 Nothing is vendored: the datasets are downloaded from the Hub on first use and cached. Override a task without copying its file: `tasks: [{task: mmlu_pro, limit: 2000}]`.
 
@@ -127,6 +158,60 @@ Nothing is vendored: the datasets are downloaded from the Hub on first use and c
     ```
 
     Your own function-calling data needs a `tools` column (schemas or function specs with `tools: true`) and a column of expected calls: `[{"get_weather": {"city": ["Rome", "Roma"], "unit": ["celsius", ""]}}]`.
+
+## Multiple choice by log-likelihood
+
+A task with `output: choices` generates nothing: each row has a list of continuations (`choices_field`, default `choices`) and the index of the right one (`gold_field`, default `gold`), and the answer is the choice the model gives the highest log-probability after the prompt (`target_delimiter`, default a space, goes between them). This is how lm-evaluation-harness scores MMLU, ARC or HellaSwag.
+
+Other harnesses send one request per choice, each a full prefill of the prompt with vLLM's `prompt_logprobs`. `pgs eval` folds an item's choices into a trie over their tokens and reads each node with a one-token request that returns the next token's top log-probs: four single-token choices (" A" to " D") cost one request and one prefill; longer choices share their common prefix and reuse the prompt from the prefix cache. A wanted token outside the engine's top candidates (`engine.max_logprobs`, default 32) is read with a second request restricted to it and an anchor token, whose known log-prob restores the scale, so every value is the model's exact log-prob. With `--backend hf` the model is in the process and choices are scored with padded forward passes.
+
+The summary reports `acc` (the score) and `acc_norm` (log-likelihood per character, as lm-eval), and the sample file each choice's log-likelihood. Chat models can be scored after their chat-templated prompt (`template: chat`); few-shot text prompts are `template: completion`.
+
+## Tasks of lm-evaluation-harness
+
+```bash
+pgs eval --model M --tasks path/to/lm_eval/tasks/gsm8k/gsm8k.yaml              # as it is
+pgs eval --model M --tasks 'path/to/lm_eval/tasks/mmlu/default/mmlu_*.yaml' --num_fewshot 5
+pgs eval --model M --tasks path/to/task.yaml --template chat                    # through the chat template
+```
+
+A task file in lm-eval's format is read directly (`palingenesis.eval.lmeval`). The supported subset: `dataset_path` / `dataset_name`, the split keys, `output_type: generate_until | multiple_choice`, `doc_to_text` / `doc_to_target` / `doc_to_choice` (a column, a Jinja template, a literal or `!function`), `description`, `target_delimiter`, `fewshot_delimiter`, `num_fewshot`, `fewshot_config` (`sampler: default | first_n`), `generation_kwargs` (`until`, `max_gen_toks`, `temperature`), `filter_list` (`regex`, `take_first`, `remove_whitespace`, `lowercase`, `uppercase`), `metric_list` (`exact_match` with its options; `acc`, `acc_norm`; any metric a `process_results` function returns as a number), `process_docs`, `include`, `metadata.version`. Anything else is refused with an error naming the key, never silently approximated.
+
+The prompt a harness builds is reproduced exactly: description, examples (text, delimiter, target), the question; the default sampler draws with `random.Random(1234)` in document order; `first_n` takes the first examples; continuations are tokenized as lm-eval does (`encode_pair`). Tasks run in completion mode (raw text, no chat template) unless `--template chat`. Each (metric, filter) is reported under lm-eval's name (`exact_match,strict-match`); the first is the item's score. `!function` runs Python from the task's directory, as lm-eval does: read a task before you run it.
+
+One extension: `fewshot_config.group_by: <column>` takes a question's examples from the few-shot rows with the same value (the built-in `mmlu` is one file for 57 subjects).
+
+**Agreement is measured, not assumed.** `python -m palingenesis.eval.conformance --pgs <result.jsonl> --lmeval <lm-eval output dir> --task gsm8k --metric exact_match,strict-match` reports both accuracies, the difference in standard errors, and how many documents the two harnesses score alike; `scripts/gpu_checks/eval_bench.sh` runs it on GSM8K and a multiple-choice task after timing the harnesses.
+
+## Speed
+
+| What | How |
+|---|---|
+| one engine per run | every task and mode reuses it; scorer processes start while it loads |
+| everything at once | a task's requests enter the engine's continuous batch together, in prefix order (shared few-shot examples, system prompts and tool schemas are prefilled once: `prefix_caching` is on) |
+| n = k | the k samples of an item are one request (one prefill); a greedy item is one request whatever k |
+| tokenization | prompts are rendered once per task and mode and tokenized in one batched call |
+| scoring | runs while the engine generates: plain scorers in `run.score_workers` processes (automatic from 256 samples), so a symbolic math check never takes the interpreter from the engine's thread; judges and sandboxes on threads |
+| multiple choice | one prefill per question instead of one per choice ([above](#multiple-choice-by-log-likelihood)) |
+| engine settings | `max_num_seqs` 512, `max_num_batched_tokens` 16384, no engine-side detokenization unless a task has stop strings |
+| several GPUs | one engine per visible GPU, automatically (`--devices 0,1`); `engine.tensor_parallel_size` for a model that needs several |
+| small models | `--replicas N` puts N engines on each GPU: a sub-2B model leaves a large GPU idle behind the engine's single scheduling thread |
+| cache | what the engine returned is cached by (checkpoint fingerprint, prompt tokens, sampling, k, seed) in `~/.cache/palingenesis/eval` (`--cache_dir`, `--no_cache`): a second run of the same checkpoint generates nothing, and a changed scorer re-scores |
+| resume | `--resume` keeps the finished items whose request (prompt tokens, sampling, k) is unchanged |
+| speculative decoding | `engine.speculative_config: {...}` is passed to vLLM |
+
+Each summary has `seconds`, `items_per_second`, `tokens_per_second`, `time_to_first_result`, `engine_requests`, `cache_hits` and, where `nvidia-smi` is present, `gpu_util_mean` / `gpu_util_max` / `gpu_memory_max_gb`. If `gpu_util_mean` is well under 90% on a small model, raise `--replicas`.
+
+!!! note "Measured where?"
+    The comparison with lm-evaluation-harness and lighteval is `scripts/gpu_checks/eval_bench.sh` (same model, tasks, sampling, GPU and vLLM build; pre-registered targets in its header). Numbers belong in this guide only once that script has produced them on your hardware.
+
+## Contamination
+
+```bash
+pgs eval --model M --tasks gsm8k --contamination data/sft.jsonl,data/rl/
+```
+
+Flags the items whose prompt shares a 13-gram of words (`run.contamination_ngram`) with the training data (`.jsonl`, `.json`, `.parquet`, `.txt`; directories are walked), and reports the score on the flagged and on the clean items in each summary (`contamination`). The training files are streamed once; memory does not grow with them.
 
 ## Agentic tasks
 
@@ -189,9 +274,10 @@ Per task and mode, in the output directory:
 | `finish`, `truncated_share`, `turn_limit_share`, `error_share` | how samples ended; `truncated_share` is the share cut by the token budget |
 | `loop_share` | the share of samples the loop detector of the rollout dumps flags (a repeated span in the answer, or one tool call made three times) |
 | `unscored_samples`, `unscored_items` | samples no reward could score (a sandbox or judge outage, an unsupported check); items with none scored are left out of the result file |
-| `sampling`, `chat_template_kwargs`, `seconds`, `tokens_per_second` | what was run, and how long generation and scoring took |
+| `stderr`, `metrics`, `categories` | the standard error of the mean score; each reward component's mean (a task with several rewards, lm-eval metrics per filter); the score per value of the task's `category_field` |
+| `sampling`, `chat_template_kwargs`, `seconds`, `tokens_per_second`, `items_per_second`, `time_to_first_result` | what was run, and how long generation and scoring took |
 
-The intervals come from `palingenesis.evalstats`, the code behind `pgs compare`. `--resume` keeps the items already in the result files (after an interruption); without it the files start over.
+The intervals come from `palingenesis.evalstats`, the code behind `pgs compare`. `--resume` keeps the items already in the result files whose request is unchanged (after an interruption); without it the files start over. Result files are appended item by item while a task runs and rewritten in item order when it ends.
 
 ## Comparing checkpoints
 
