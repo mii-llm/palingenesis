@@ -11,14 +11,21 @@ and vLLM's loaders (vllm/model_executor/layers/quantization/compressed_tensors):
   fp8 (+ fp8)         float-quantized         weight f8e4m3 [out, in], weight_scale f32 [out, 1]
   fp8_block (+ fp8)   float-quantized         weight f8e4m3 [out, in], weight_scale f32 [out/128, in/128]
 
+Block FP8 is always written with its dynamic FP8 input scheme (per token and 128 inputs: compressed-tensors' FP8_BLOCK
+preset, what llm-compressor writes), also for a weight-only run: vLLM (0.26) refuses a block scheme without input
+activations (an assertion in its weight-only FP8 scheme). GPUs without FP8 matmuls (compute capability < 8.9) ignore
+the input scheme and run weight-only; Ada / Hopper and later quantise the inputs as well (SERVING_NOTES).
+
 E2M1 codes are packed two per byte, the even input column in the low nibble, sign in bit 3. A linear layer whose
 weights stay in full precision (excluded, a shape the format does not take, the head) is listed in the config's
 `ignore`; the embedding and head keep their (fake-quantised, if trained so) values in bf16.
 
 Why this format: it is the one vLLM loads for every format here (ModelOpt's covers NVFP4 and FP8 but has no dense
-MXFP4), and it runs on GPUs without FP4 / FP8 tensor cores through vLLM's Marlin weight-only kernels (NVFP4 and
-MXFP4 from compute capability 7.5 / 8.0, FP8 from 7.5): an A100 serves these checkpoints with 4-bit / 8-bit weights
-and bf16 activations; the activation formats need Blackwell (FP4) or Hopper / Ada (FP8) to run as trained.
+MXFP4), and it runs on GPUs without FP4 / FP8 tensor cores through vLLM's weight-only kernels: an A100 serves these
+checkpoints with 4-bit / 8-bit weights and bf16 activations (NVFP4 and MXFP4: Marlin; FP8: vLLM 0.26 picks its
+Humming kernel, compiled at the first forward with NVRTC, before Marlin: where that compilation fails, start vLLM
+with VLLM_DISABLED_KERNELS=HummingFP8ScaledMMLinearKernel or --linear-backend marlin). The activation formats need
+Blackwell (FP4) or Hopper / Ada (FP8) to run as trained.
 
 `pgs quantize` (main below) is post-training quantisation with the same code: round-to-nearest with max or
 MSE-optimal scales, written in both forms (packed for vLLM, dequantized bf16 for any loader).
@@ -40,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 _FP4_WEIGHTS = {"num_bits": 4, "type": "float", "symmetric": True, "dynamic": False}
 _FP8 = {"num_bits": 8, "type": "float", "symmetric": True}
+_FP8_BLOCK_WEIGHTS = {**_FP8, "strategy": "block", "block_structure": [128, 128], "dynamic": False}
+_FP8_BLOCK_INPUTS = {**_FP8, "strategy": "group", "group_size": 128, "dynamic": True}
 # (weight format, activations) -> (compressed-tensors format, weights args, input activation args)
 SCHEMES: dict[tuple[str, str], tuple[str, dict, dict | None]] = {
     ("nvfp4", "none"): (
@@ -84,15 +93,16 @@ SCHEMES: dict[tuple[str, str], tuple[str, dict, dict | None]] = {
         {**_FP8, "strategy": "channel", "dynamic": False},
         {**_FP8, "strategy": "token", "dynamic": True},
     ),
+    # the same checkpoint for both (see the module docstring): vLLM loads block FP8 only with its input scheme
+    ("fp8_block", "none"): ("float-quantized", _FP8_BLOCK_WEIGHTS, _FP8_BLOCK_INPUTS),
+    ("fp8_block", "fp8"): ("float-quantized", _FP8_BLOCK_WEIGHTS, _FP8_BLOCK_INPUTS),
+}
+# What a user of a scheme must know about serving it (logged at startup, printed by pgs quantize)
+SERVING_NOTES: dict[tuple[str, str], str] = {
     ("fp8_block", "none"): (
-        "float-quantized",
-        {**_FP8, "strategy": "block", "block_structure": [128, 128], "dynamic": False},
-        None,
-    ),
-    ("fp8_block", "fp8"): (
-        "float-quantized",
-        {**_FP8, "strategy": "block", "block_structure": [128, 128], "dynamic": False},
-        {**_FP8, "strategy": "group", "group_size": 128, "dynamic": True},
+        "block FP8 checkpoints carry the dynamic FP8 input scheme (vLLM loads no block scheme without one): GPUs "
+        "with FP8 matmuls (compute capability >= 8.9: Ada, Hopper, Blackwell) also quantise each layer's input, "
+        "older ones run weight-only. To serve on such a GPU as trained, use activations: fp8 (or format: fp8)."
     ),
 }
 
@@ -339,18 +349,17 @@ def main(argv: list[str] | None = None) -> int:
             save_hf_model(model, tok, Path(tmp) / "dequantized", state=state, source_layout=True)
             write_checkpoint(Path(tmp) / "dequantized", out, plugin._pending, plugin.scheme, plugin._report)
     errors = [r["relative_error"] for r in plugin._report.values()]
-    print(
-        json.dumps(
-            {
-                "out": str(out),
-                "format": args.format,
-                "activations": args.activations,
-                "layers": len(errors),
-                "relative_error_mean": sum(errors) / len(errors),
-                "relative_error_max": max(errors),
-            }
-        )
-    )
+    summary = {
+        "out": str(out),
+        "format": args.format,
+        "activations": args.activations,
+        "layers": len(errors),
+        "relative_error_mean": sum(errors) / len(errors),
+        "relative_error_max": max(errors),
+    }
+    if plugin.scheme in SERVING_NOTES:
+        summary["note"] = SERVING_NOTES[plugin.scheme]
+    print(json.dumps(summary))
     return 0
 
 

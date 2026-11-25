@@ -83,7 +83,14 @@ EXPORTS = ("dequantized", "latent")
 DEFAULT_INCLUDE = (r"(^|\.)layers\.\d+\.",)  # the decoder layers' linear layers (not a vision tower, not the head)
 # Kept in full precision by default: Gated DeltaNet's decay / write-gate projections (in_proj_a / in_proj_b: one output
 # per head, a few thousand weights, numerically sensitive, and too narrow for the 4-bit kernels) and MoE routers
-DEFAULT_EXCLUDE = (r"\.in_proj_[ab]$", r"\.mlp\.gate$", r"\.shared_expert_gate$")
+# and the encoders of other modalities, whose own `layers.N` the default include would match (an inference engine
+# builds them from plain layers: it cannot load a packed weight there)
+DEFAULT_EXCLUDE = (
+    r"\.in_proj_[ab]$",
+    r"\.mlp\.gate$",
+    r"\.shared_expert_gate$",
+    r"(^|\.)(visual|vision_tower|vision_model|audio_tower|audio_model|multi_modal_projector)\.",
+)
 # Layers an inference engine fuses into one matmul: NVFP4 shards of one fused layer share the per-tensor scale
 # (vLLM keeps one per fused layer). Matched among the children of one parent module.
 FUSED_GROUPS = (
@@ -144,7 +151,9 @@ class _FloatQuantMixin:
         clip = self.qat_clip if clip is None else clip
         if clip is None:
             return None
-        return clip.clamp(self.clip_min, 1.0)
+        # the clamped value with the factor's own gradient: torch.clamp passes none at or beyond a bound, and
+        # the search leaves most rows exactly at 1 (FloatQAT._project_clips keeps the parameter in range)
+        return clip + (clip.clamp(self.clip_min, 1.0) - clip).detach()
 
     def global_amax(self, weights: Iterable[Tensor] | None = None) -> Tensor | None:
         """NVFP4: the largest |w| over the fused group (the forward's own, unsharded weights by default)."""
@@ -410,6 +419,8 @@ class FloatQAT(TrainerPlugin):
     # -- model
 
     def transform_model(self, model: nn.Module, ctx: PluginContext):
+        from palingenesis.qat.compressed import SERVING_NOTES
+
         head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
         embed = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
         chosen: dict[str, nn.Module] = {}
@@ -480,6 +491,8 @@ class FloatQAT(TrainerPlugin):
                     "float_qat: the head is tied to the embedding but only one of them is quantised; the shared "
                     "latent weight then serves a quantised and a full-precision module"
                 )
+        if self.quantized_export and self.scheme in SERVING_NOTES:
+            logger.warning(f"float_qat: {SERVING_NOTES[self.scheme]}")
         n = sum(m.weight.numel() for m in self._unique_modules())
         act = f", {self.activations} activations" if self.activation_spec else ", weight-only"
         logger.info(
@@ -550,8 +563,20 @@ class FloatQAT(TrainerPlugin):
         for m in self.modules.values():
             m.strength.fill_(value)
 
+    @torch.no_grad()
+    def _project_clips(self) -> None:
+        """scales: learned: the factors back into [clip_min, 1] (projected gradient). The forward uses their
+        clamped value; without the projection a factor pushed past a bound would drift away from it, and need as
+        many steps to come back into effect."""
+        for m in self.modules.values():
+            if isinstance(m.qat_clip, nn.Parameter):
+                clip = m.qat_clip.to_local() if hasattr(m.qat_clip, "to_local") else m.qat_clip
+                clip.clamp_(m.clip_min, 1.0)
+
     def on_forward_start(self, model: nn.Module, batch: dict, ctx: PluginContext) -> None:
         self._set_strength(ctx)
+        if self.scales == "learned" and not self._frozen:
+            self._project_clips()
         if self.freeze_scales_at is not None and not self._frozen and ctx.progress >= self.freeze_scales_at:
             self._reduce_activation_amax(ctx)
             for m in self.modules.values():

@@ -503,6 +503,8 @@ class OPDConfig:
             errors.append("model.student is required (see configs/distill_*.yaml for worked examples).")
         if not self.teachers:
             errors.append("at least one teacher is required: teachers: {<name>: {model: ...}}.")
+        if not isinstance(self.plugins.custom, list):
+            errors.append("plugins.custom must be a list of plugin entries (module:Class or {class, args}).")
         if not self.sources:
             errors.append("at least one prompt source is required: sources: {<name>: {path: ...}}.")
         for name, teacher in self.teachers.items():

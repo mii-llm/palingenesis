@@ -614,6 +614,18 @@ def test_rl_config_refuses_plugins_with_lora():
         config.validate()
 
 
+def test_policy_configs_refuse_a_plugin_entry_that_is_not_a_list():
+    """`plugins: {custom: palingenesis.qat:FloatQAT}` (a string) would otherwise be read letter by letter."""
+    from palingenesis.opd.config import OPDConfig, OPDConfigError
+    from palingenesis.rl.config import RLConfig, RLConfigError
+
+    for config, error in ((OPDConfig(), OPDConfigError), (RLConfig(), RLConfigError)):
+        assert config.plugins.custom == []  # the default: no plugin
+        config.plugins.custom = "palingenesis.qat:FloatQAT"
+        with pytest.raises(error, match="plugins.custom must be a list"):
+            config.validate()
+
+
 @pytest.mark.parametrize("fsdp", [False, True], ids=["single", "fsdp2"])
 def test_qat_in_rl(tmp_path, fsdp):
     transformers = pytest.importorskip("transformers")
@@ -707,3 +719,101 @@ def test_pgs_quantize_cli(tmp_path):
     want = unpack(tensors, ("nvfp4", "none")).to(torch.bfloat16)
     assert torch.equal(deq.model.layers[0].mlp.up_proj.weight.detach(), want)  # both exports: the same weights
     assert (tmp_path / "nvfp4" / "tokenizer_config.json").exists()
+
+
+# ─────────────────────────────────────────────────────────────── what vLLM (0.26) needs from the checkpoint
+
+
+def test_block_fp8_checkpoints_always_carry_the_dynamic_input_scheme(caplog):
+    """vLLM's weight-only FP8 scheme asserts `is_static_input_scheme is False` for block weights, and computes
+    that flag as `input_quant and not input_quant.dynamic`: None without input activations. So a block
+    checkpoint is written as compressed-tensors' FP8_BLOCK preset whatever the activations trained with."""
+    from palingenesis.qat.compressed import SCHEMES, SERVING_NOTES
+
+    for scheme, (_, weights, inputs) in SCHEMES.items():
+        if weights["strategy"] == "block":
+            assert inputs is not None and inputs["dynamic"] is True, scheme
+            assert weights["block_structure"] == [128, 128]
+    assert quantization_config(("fp8_block", "none"), []) == quantization_config(("fp8_block", "fp8"), [])
+    inputs = quantization_config(("fp8_block", "none"), [])["config_groups"]["group_0"]["input_activations"]
+    assert inputs == {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "group",
+        "group_size": 128,
+        "dynamic": True,
+    }
+    # the formats with a weight-only scheme in vLLM keep it
+    for scheme in (("nvfp4", "none"), ("mxfp4", "none"), ("fp8", "none")):
+        assert quantization_config(scheme, [])["config_groups"]["group_0"]["input_activations"] is None
+    # the user is told what a weight-only block run means on GPUs with FP8 matmuls
+    assert "8.9" in SERVING_NOTES[("fp8_block", "none")] and ("fp8_block", "fp8") not in SERVING_NOTES
+    with caplog.at_level("WARNING", logger="palingenesis.qat.fp"):
+        FloatQAT(format="fp8_block").transform_model(H.tiny_llama(64, hidden=256), _ctx())
+    assert any("dynamic FP8 input scheme" in r.message for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="palingenesis.qat.fp"):
+        FloatQAT(format="fp8_block", quantized_export=False).transform_model(H.tiny_llama(64, hidden=256), _ctx())
+        FloatQAT(format="fp8").transform_model(H.tiny_llama(64, hidden=64), _ctx())
+    assert not any("input scheme" in r.message for r in caplog.records)
+
+
+def test_other_modalities_encoders_stay_in_full_precision_by_default():
+    """A vision / audio encoder's own `layers.N` match the default include; an engine builds those towers from
+    plain layers and could not load a packed weight there."""
+
+    class Tower(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.ModuleDict({"q_proj": nn.Linear(32, 32)})])
+
+    class Multimodal(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_tower = Tower()
+            self.visual = Tower()
+            self.audio_tower = Tower()
+            self.language_model = Tower()
+
+    model = Multimodal()
+    plugin = FloatQAT(format="nvfp4", fused_groups=[])
+    plugin.transform_model(model, _ctx())
+    assert list(plugin.modules) == ["language_model.layers.0.q_proj"]
+    assert type(model.vision_tower.layers[0]["q_proj"]) is nn.Linear
+    # an explicit exclude list replaces the default (documented): the towers are then the caller's choice
+    plugin = FloatQAT(format="nvfp4", fused_groups=[], exclude=[])
+    plugin.transform_model(Multimodal(), _ctx())
+    assert len(plugin.modules) == 4
+
+
+def test_learned_clipping_factors_train_at_their_bounds_and_stay_in_range():
+    """torch.clamp passes no gradient at or beyond a bound, and the search leaves most rows exactly at 1: the
+    factors use a straight-through clamp, and are projected back into [clip_min, 1] before each forward."""
+    torch.manual_seed(0)
+    model = H.tiny_llama(64, hidden=64)
+    plugin = FloatQAT(format="nvfp4", scales="learned", clip_min=0.5)
+    plugin.transform_model(model, _ctx())
+    plugin.on_train_start(model, _ctx())
+    m = model.model.layers[0].mlp.up_proj
+    at_one = m.qat_clip.detach().flatten() == 1.0
+    assert at_one.sum() > 10  # the search's usual result
+    ids = torch.randint(0, 64, (2, 7))
+    model(input_ids=ids, labels=ids).loss.backward()
+    assert (m.qat_clip.grad.flatten()[at_one] != 0).all()  # rows at the bound train
+    model.zero_grad()
+    with torch.no_grad():
+        m.qat_clip[0] = 1.3  # an optimizer step took them out of the range
+        m.qat_clip[1] = 0.2
+    reference = m.effective_weight().detach().clone()
+    plugin.on_forward_start(model, {}, _ctx(step=1, total_steps=10))
+    assert m.qat_clip[0].item() == 1.0 and m.qat_clip[1].item() == 0.5
+    assert torch.equal(m.effective_weight().detach(), reference)  # the forward already used the clamped values
+    model(input_ids=ids, labels=ids).loss.backward()
+    assert m.qat_clip.grad[0].item() != 0.0 and m.qat_clip.grad[1].item() != 0.0
+    # frozen scales no longer use the factors: nothing to project
+    plugin._frozen = True
+    with torch.no_grad():
+        m.qat_clip[0] = 1.3
+    plugin.on_forward_start(model, {}, _ctx(step=2, total_steps=10))
+    assert m.qat_clip[0].item() == pytest.approx(1.3)
