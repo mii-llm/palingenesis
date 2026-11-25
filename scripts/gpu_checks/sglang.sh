@@ -5,11 +5,14 @@
 #   VLLM_PYTHON=/path/to/pgs/.venv/bin/python  bash scripts/gpu_checks/sglang.sh
 #
 # Required:  PGS_SRC      the palingenesis src directory to test (put on PYTHONPATH; nothing is installed from it)
-#            SGLANG_VENV  a virtual environment this script creates (or reuses) for SGLang; no other is modified
+#            SGLANG_VENV  a virtual environment this script creates (or reuses) for SGLang; no other is modified.
+#                         About 9 GB (it is memory on /dev/shm), 10 GB free asked for; uv's cache goes next to it
+#                         (<SGLANG_VENV>.uv-cache: hard links of the same files; UV_CACHE=<dir> to move it)
 #            WORKDIR      every temporary file, cache, log and result goes here
 # Optional:  VLLM_PYTHON  the python of an environment with vLLM (palingenesis[vllm]) for the parity and
 #                         throughput comparisons (default: <repo>/.venv/bin/python when it imports vllm; else skipped)
-#            SGLANG_VERSION (0.5.17: the last release built on torch 2.11), CUDA_INDEX (cu129),
+#            SGLANG_VERSION (0.5.17: the last release built on torch 2.11), CUDA_INDEX (cu129: the PyTorch index
+#            name of the CUDA build every package is installed for; the driver must support it), MIN_FREE_GB (10),
 #            MODEL_DENSE (Qwen/Qwen3-0.6B), MODEL_HYBRID (Qwen/Qwen3.5-0.8B), GPU (0), SKIP_INSTALL=1,
 #            FLASHINFER_JIT_CACHE=1 (also install flashinfer's prebuilt kernels, several GB: for a machine without
 #            a CUDA toolkit, where its just-in-time build fails), LOG_TAIL (40: lines of a failed step's log printed)
@@ -21,8 +24,8 @@
 # Models come from the Hugging Face cache (HF_HUB_OFFLINE=1, read only). Every step runs in a process group of its
 # own, which is killed when the step ends; at the end no process started by this run is left, on the GPU or off it
 # (every process carries a marker in its environment; checked, "cleanup" line). A failed step prints the end of its
-# log to stderr; the full logs are in $WORKDIR/logs. Nothing is written outside WORKDIR and SGLANG_VENV (caches,
-# bytecode and temporary files included); /dev/shm is not used beyond Python's own semaphores. Exit code 1 when a
+# log to stderr; the full logs are in $WORKDIR/logs. Nothing is written outside WORKDIR, SGLANG_VENV and the uv
+# cache next to it (caches, bytecode and temporary files included); /dev/shm is not used beyond Python's own semaphores. Exit code 1 when a
 # check failed.
 # Takes about 45-60 minutes on an A100 80GB, plus ~10 minutes for the first install.
 
@@ -54,7 +57,12 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export TMPDIR="$WORKDIR/tmp" XDG_CACHE_HOME="$WORKDIR/cache"
 export TRITON_CACHE_DIR="$WORKDIR/cache/triton" TORCHINDUCTOR_CACHE_DIR="$WORKDIR/cache/inductor"
 export FLASHINFER_WORKSPACE_BASE="$WORKDIR/cache" VLLM_CACHE_ROOT="$WORKDIR/cache/vllm"
-export CUDA_CACHE_PATH="$WORKDIR/cache/nv" UV_CACHE_DIR="$WORKDIR/cache/uv" PIP_CACHE_DIR="$WORKDIR/cache/pip"
+export CUDA_CACHE_PATH="$WORKDIR/cache/nv" PIP_CACHE_DIR="$WORKDIR/cache/pip"
+# uv's cache: next to the environment by default, so its files are hard links of the environment's (no second copy,
+# and an install after the environment was removed downloads nothing). UV_CACHE=<dir on a disk> keeps it out of RAM
+# when SGLANG_VENV is on /dev/shm (a copy then, still no download).
+export UV_CACHE_DIR="${UV_CACHE:-$SGLANG_VENV.uv-cache}" UV_LINK_MODE="${UV_LINK_MODE:-hardlink}"
+export UV_PYTHON_INSTALL_DIR="$SGLANG_VENV.python"  # only used when the machine has no Python 3.12
 export HF_DATASETS_CACHE="$WORKDIR/cache/datasets" PYTHONPYCACHEPREFIX="$WORKDIR/cache/pycache"
 export MPLCONFIGDIR="$WORKDIR/cache/mpl" NUMBA_CACHE_DIR="$WORKDIR/cache/numba" TORCH_HOME="$WORKDIR/cache/torch"
 export WANDB_MODE=disabled WANDB_DIR="$WORKDIR/tmp"
@@ -119,67 +127,107 @@ run_step() {
 # ------------------------------------------------------------------ environment
 
 SG="$SGLANG_VENV/bin/python"
+INSTALL_LOG="$WORKDIR/logs/install.log"
+SGLANG_INDEX="https://docs.sglang.ai/whl/$CUDA_INDEX/"
+TORCH_INDEX="https://download.pytorch.org/whl/$CUDA_INDEX"
+kib() { du -sk "$@" 2>/dev/null | tail -n 1 | cut -f1; }  # with several paths: their total, hard links counted once
+gib() { LC_ALL=C awk -v k="${1:-0}" 'BEGIN {printf "%.1f", k / 1048576}'; }
+
+# SGLang's PyPI wheel declares the CUDA 13 builds of torch and of its kernel packages. Installing it and swapping
+# packages afterwards downloads both sets, and every later resolution wants the CUDA 13 libraries back. So the
+# environment is resolved once, with SGLang's own requirements replaced for $CUDA_INDEX (sglang_checks.py
+# install-plan writes the replacements: torch / torchaudio / torchvision from PyTorch's $CUDA_INDEX index, the
+# [cu12] extras, cuda-python below 13, sglang-kernel and sgl-deep-gemm from SGLang's $CUDA_INDEX index) together
+# with palingenesis' own dependencies; the result is checked for CUDA 13 packages before anything large is
+# downloaded, and `uv pip sync` makes the environment exactly that list (leftovers of an earlier attempt go).
+install() {
+  local plan="$WORKDIR/tmp/install" uv="" have free existed=0
+  [ ! -x "$SG" ] || existed=1
+  local indexes=(--extra-index-url "$TORCH_INDEX" --extra-index-url "$SGLANG_INDEX" --index-strategy unsafe-best-match)
+  mkdir -p "$plan" "$(dirname "$SGLANG_VENV")" "$UV_CACHE_DIR" || return 1
+  if command -v uv > /dev/null 2>&1; then
+    uv="$(command -v uv)"
+  else  # no uv on this machine: one for this environment, outside its site-packages (pip sync would remove it)
+    uv="$SGLANG_VENV/.uv/bin/uv"
+    if [ ! -x "$uv" ]; then
+      [ -x "$SG" ] || python3 -m venv "$SGLANG_VENV" || { echo "INSTALL: neither uv nor python3 -m venv works"; return 1; }
+      "$SG" -m pip install --no-cache-dir --quiet --target "$SGLANG_VENV/.uv" uv \
+        || { echo "INSTALL: could not install uv with pip (install uv, or check the network)"; return 1; }
+    fi
+  fi
+  echo "INSTALL: $("$uv" --version), cache $UV_CACHE_DIR, link mode $UV_LINK_MODE"
+  if [ "$existed" = 1 ]; then
+    # an environment without this script's mark: an install that did not finish, or another version. Its packages
+    # (and the pip cache an earlier version of this script kept in WORKDIR) go first: their space is needed.
+    echo "INSTALL: $SGLANG_VENV holds $(gib "$(kib "$SGLANG_VENV")") GB of an unfinished or other install: emptying it"
+    [ ! -d "$PIP_CACHE_DIR" ] || "$SG" -m pip cache purge > /dev/null 2>&1 || true
+    : > "$plan/empty.txt"
+    "$uv" pip sync "$plan/empty.txt" --python "$SG" --allow-empty-requirements --quiet \
+      || echo "INSTALL: could not empty it (continuing)"
+  fi
+  have="$(kib "$SGLANG_VENV" "$UV_CACHE_DIR")"
+  free="$(df -Pk "$(dirname "$SGLANG_VENV")" | awk 'NR == 2 {print $4}')"
+  echo "INSTALL: $(gib "$free") GB free for $SGLANG_VENV, $(gib "${have:-0}") GB already there (with the uv cache)"
+  if [ "$(( ${free:-0} + ${have:-0} ))" -lt "$(( ${MIN_FREE_GB:-10} * 1048576 ))" ]; then
+    echo "INSTALL: not enough space: the environment takes about 9 GB (MIN_FREE_GB=${MIN_FREE_GB:-10} changes the limit)"
+    return 1
+  fi
+  [ -x "$SG" ] || "$uv" venv --python 3.12 "$SGLANG_VENV" || { echo "INSTALL: uv could not create $SGLANG_VENV"; return 1; }
+  "$SG" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 12))' \
+    || { echo "INSTALL: $SG is not Python 3.12 (sglang $SGLANG_VERSION ships cp312 wheels): remove $SGLANG_VENV"; return 1; }
+  "$SG" "$CHECKS" install-plan --sglang-version "$SGLANG_VERSION" --cuda "$CUDA_INDEX" --workdir "$plan" \
+    || { echo "INSTALL: could not read sglang==$SGLANG_VERSION's requirements from PyPI"; return 1; }
+  echo "INSTALL: requirements:"; sed 's/^/    /' "$plan/requirements.in"
+  echo "INSTALL: replacing SGLang's own for $CUDA_INDEX:"; sed 's/^/    /' "$plan/overrides.txt"
+  "$uv" pip compile "$plan/requirements.in" --override "$plan/overrides.txt" --python "$SG" "${indexes[@]}" \
+    --no-header --no-annotate --quiet -o "$plan/lock.txt" \
+    || { echo "INSTALL: no set of packages satisfies sglang==$SGLANG_VERSION on $CUDA_INDEX (see above)"; return 1; }
+  "$SG" "$CHECKS" install-verify --lock-only --lock "$plan/lock.txt" --sglang-version "$SGLANG_VERSION" \
+    --cuda "$CUDA_INDEX" || { echo "INSTALL: the resolution is not a $CUDA_INDEX one; nothing was installed"; return 1; }
+  echo "INSTALL: $(grep -c '==' "$plan/lock.txt") packages; torch and SGLang's builds:"
+  grep -E '^(torch|torchaudio|torchvision|sglang|sglang-kernel|sgl-deep-gemm|flashinfer-python|transformers)==' \
+    "$plan/lock.txt" | sed 's/^/    /'
+  "$uv" pip sync "$plan/lock.txt" --python "$SG" "${indexes[@]}" \
+    || { echo "INSTALL: installing the packages failed (space? network?)"; return 1; }
+  if [ "${FLASHINFER_JIT_CACHE:-0}" = "1" ]; then  # prebuilt kernels (SGLang's Dockerfile: INSTALL_FLASHINFER_JIT_CACHE)
+    "$uv" pip install --python "$SG" --no-deps --index-url "https://flashinfer.ai/whl/$CUDA_INDEX" \
+      "flashinfer-jit-cache==$(sed -n 's/^flashinfer-python==//p' "$plan/lock.txt")" \
+      || echo "INSTALL: flashinfer-jit-cache was not installed: flashinfer builds its kernels at first use"
+  fi
+  # the environment must import and be the CUDA build asked for, on this machine's driver
+  "$SG" "$CHECKS" install-verify --lock "$plan/lock.txt" --sglang-version "$SGLANG_VERSION" --cuda "$CUDA_INDEX" \
+    || { echo "INSTALL: the installed environment failed its check (install-verify lines above)"; return 1; }
+  cp "$plan/lock.txt" "$SGLANG_VENV/.pgs-sglang.lock"
+  echo "$SGLANG_VERSION-$CUDA_INDEX" > "$SGLANG_VENV/.pgs-sglang"
+}
+
 if [ "${SKIP_INSTALL:-0}" != "1" ] && [ "$(cat "$SGLANG_VENV/.pgs-sglang" 2>/dev/null)" != "$SGLANG_VERSION-$CUDA_INDEX" ]; then
-  install() {
-    set -e
-    if command -v uv >/dev/null; then
-      [ -x "$SG" ] || uv venv --python 3.12 "$SGLANG_VENV"
-      pipi() { uv pip install --python "$SG" "$@"; }
-      pipr() {  # reinstall: <index url> <no-deps 0|1> <packages...>
-        local index="$1" nodeps="$2" flags=()
-        shift 2
-        for p in "$@"; do flags+=(--reinstall-package "${p%%[=<>[]*}"); done
-        [ "$nodeps" = 1 ] && flags+=(--no-deps)
-        uv pip install --python "$SG" "${flags[@]}" --index-url "$index" "$@"
-      }
-      pipu() { uv pip uninstall --python "$SG" "$@"; }
-    else
-      [ -x "$SG" ] || python3 -m venv "$SGLANG_VENV"
-      "$SG" -m pip install --upgrade pip
-      pipi() { "$SG" -m pip install "$@"; }
-      pipr() {
-        local index="$1" nodeps="$2" flags=(--force-reinstall)
-        shift 2
-        [ "$nodeps" = 1 ] && flags+=(--no-deps)
-        "$SG" -m pip install "${flags[@]}" --index-url "$index" "$@"
-      }
-      pipu() { "$SG" -m pip uninstall -y "$@"; }
-    fi
-    version() { "$SG" -c "from importlib.metadata import version; print(version('$1'))" 2>/dev/null; }
-    freeze() { "$SG" -c "from importlib.metadata import distributions as d; print('\n'.join(sorted(f'{x.metadata[\"Name\"]}=={x.version}' for x in d())))"; }
-    pipi "sglang==$SGLANG_VERSION"
-    # SGLang's PyPI wheels target CUDA 13. For a CUDA 12.9 driver its install guide swaps in the cu129 builds of
-    # torch, sglang-kernel and sgl-deep-gemm, and its Dockerfile the CUDA 12 flavours of flashinfer and cutlass.
-    if [ "$CUDA_INDEX" != "cu130" ]; then
-      local kernel gemm flashinfer cu13
-      local cutlass
-      cutlass="$(version nvidia-cutlass-dsl || true)"
-      kernel="$(version sglang-kernel)"
-      gemm="$(version sgl-deep-gemm || true)"
-      flashinfer="$(version flashinfer-python)"
-      cu13="$(freeze | awk -F'==' '$1 ~ /-cu13$/ {print $1}')"
-      [ -z "$cu13" ] || pipu $cu13
-      pipr "https://download.pytorch.org/whl/$CUDA_INDEX" 0 torch==2.11.0 torchaudio==2.11.0 torchvision==0.26.0
-      pipr "https://docs.sglang.ai/whl/$CUDA_INDEX/" 1 "sglang-kernel==$kernel"
-      [ -z "$gemm" ] || pipr "https://docs.sglang.ai/whl/$CUDA_INDEX/" 1 "sgl-deep-gemm==$gemm"
-      freeze | grep -iE '^(torch|torchvision|torchaudio|transformers)==' > "$WORKDIR/tmp/constraints.txt" || true
-      pipi -c "$WORKDIR/tmp/constraints.txt" "flashinfer-python[cu12]==$flashinfer" "cuda-python>=12,<13" \
-        "nvidia-cutlass-dsl${cutlass:+==$cutlass}"
-    fi
-    if [ "${FLASHINFER_JIT_CACHE:-0}" = "1" ]; then  # prebuilt kernels (SGLang's Dockerfile: INSTALL_FLASHINFER_JIT_CACHE)
-      pipr "https://flashinfer.ai/whl/$CUDA_INDEX" 1 "flashinfer-jit-cache==$(version flashinfer-python)" \
-        || echo "flashinfer-jit-cache was not installed: flashinfer builds its kernels at first use"
-    fi
-    # palingenesis' own dependencies, without letting anything move torch or transformers
-    freeze | grep -iE '^(torch|torchvision|torchaudio|transformers)==' > "$WORKDIR/tmp/constraints.txt" || true
-    pipi -c "$WORKDIR/tmp/constraints.txt" "datasets>=4.0" "accelerate>=1.10" pyyaml safetensors math-verify \
-      flash-linear-attention psutil
-    echo "$SGLANG_VERSION-$CUDA_INDEX" > "$SGLANG_VENV/.pgs-sglang"
-  }
-  if ! (install) > "$WORKDIR/logs/install.log" 2>&1; then
-    fail_line "0_install" "installing sglang==$SGLANG_VERSION failed: see $WORKDIR/logs/install.log"
+  echo "[sglang-checks] $(date +%H:%M:%S) installing sglang==$SGLANG_VERSION ($CUDA_INDEX) into $SGLANG_VENV" >&2
+  rm -f "$SGLANG_VENV/.pgs-sglang"
+  install > "$INSTALL_LOG" 2>&1
+  code=$?
+  grep -a '^INSTALL: ' "$INSTALL_LOG" | sed 's/^/    | /' >&2
+  if [ "$code" -ne 0 ]; then
+    echo "[sglang-checks] the install failed; the end of $INSTALL_LOG:" >&2
+    grep -a -v '^INSTALL: ' "$INSTALL_LOG" | tail -n "${LOG_TAIL:-40}" | cut -c1-400 | sed 's/^/    | /' >&2
+    reason="$(grep -a '^INSTALL: ' "$INSTALL_LOG" | tail -n 1 | sed 's/^INSTALL: //; s/["\\]/ /g')"
+    fail_line "0_install" "sglang==$SGLANG_VERSION ($CUDA_INDEX): ${reason:-see $INSTALL_LOG}"
     exit 1
   fi
+fi
+# The environment's size: with SGLANG_VENV on a RAM file system (/dev/shm) this is memory. The uv cache holds the
+# same files (hard links when it is on the venv's file system: counted once in the total).
+venv_kib="$(kib "$SGLANG_VENV")"
+total_kib="$(kib "$SGLANG_VENV" "$UV_CACHE_DIR")"
+status=PASS
+[ "$(cat "$SGLANG_VENV/.pgs-sglang" 2>/dev/null)" = "$SGLANG_VERSION-$CUDA_INDEX" ] || [ "${SKIP_INSTALL:-0}" = "1" ] || status=FAIL
+emit "$(printf '{"check": "0_install", "status": "%s", "sglang": "%s", "cuda_index": "%s", "venv_gib": %s, "venv_and_uv_cache_gib": %s, "venv": "%s", "uv_cache": "%s"}' \
+  "$status" "$SGLANG_VERSION" "$CUDA_INDEX" "$(gib "${venv_kib:-0}")" "$(gib "${total_kib:-0}")" "$SGLANG_VENV" "$UV_CACHE_DIR")"
+echo "[sglang-checks] $SGLANG_VENV: $(gib "${venv_kib:-0}") GB; with the uv cache $UV_CACHE_DIR: $(gib "${total_kib:-0}") GB" \
+  "(the same files when hard-linked; to free the space remove both)" >&2
+if [ "${total_kib:-0}" -gt "$(( ${MAX_ENV_GB:-9} * 1048576 ))" ]; then
+  echo "[sglang-checks] that is more than ${MAX_ENV_GB:-9} GB: if the two are on different file systems the cache is" \
+    "a second copy (UV_CACHE=<a directory on a disk> keeps it out of /dev/shm)" >&2
 fi
 {
   echo "[sglang-checks] WORKDIR $WORKDIR, SGLANG_VENV $SGLANG_VENV, PGS_SRC $PGS_SRC, GPU $CUDA_VISIBLE_DEVICES"

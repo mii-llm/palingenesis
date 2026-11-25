@@ -898,3 +898,113 @@ def test_trainers_and_screen_build_the_sglang_engines_with_their_options(monkeyp
     config.set("rollout.backend", "sglang")
     screen._engine(config, "m", (7,), 0)
     assert screen_calls and screen_calls[0]["engine_kwargs"] == {"attention_backend": "fa3"}
+
+
+# ------------------------------------------------------------------ the GPU check's install plan
+
+
+def _checks():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts/gpu_checks/sglang_checks.py"
+    spec = importlib.util.spec_from_file_location("sglang_checks", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Requires-Dist of sglang 0.5.17 (the CUDA-specific lines and a few others)
+SGLANG_REQUIRES = [
+    "aiohttp",
+    "cuda-python>=13.0",
+    "flashinfer_python[cu13]==0.6.15.post1",
+    "humming-kernels[cu13]==0.1.10",
+    "nvidia-cutlass-dsl[cu13]==4.6.0",
+    "sgl-deep-gemm==0.1.5.post1",
+    "sglang-kernel==0.4.5",
+    "torch==2.11.0",
+    "torchaudio==2.11.0",
+    'torchcodec==0.11.1; sys_platform != "linux" or platform_machine != "aarch64"',
+    "torchvision",
+    "transformers==5.12.1",
+    'pytest; extra == "test"',
+    'torch==9.9.9; extra == "dev"',
+]
+
+
+def test_gpu_check_installs_one_cuda_build_of_everything():
+    """SGLang's wheel declares the CUDA 13 builds: on a CUDA 12.9 driver every one of them is replaced in the
+    resolution itself (installing first and swapping afterwards pulled the CUDA 13 libraries back)."""
+    checks = _checks()
+    assert checks.install_overrides(SGLANG_REQUIRES, "cu129") == [
+        "cuda-python>=12,<13",
+        "flashinfer-python[cu12]==0.6.15.post1",
+        "humming-kernels[cu12]==0.1.10",
+        "nvidia-cutlass-dsl==4.6.0",  # no cu12 extra: the plain package is the CUDA 12 one
+        "sgl-deep-gemm==0.1.5.post1+cu129",
+        "sglang-kernel==0.4.5+cu129",
+        "torch==2.11.0+cu129",
+        "torchaudio==2.11.0+cu129",
+        "torchvision==0.26.0+cu129",
+    ]
+    # the wheel's own CUDA: only torch is held to its index
+    assert checks.install_overrides(SGLANG_REQUIRES, "cu130") == [
+        "torch==2.11.0+cu130",
+        "torchaudio==2.11.0+cu130",
+        "torchvision==0.26.0+cu130",
+    ]
+    assert checks.cuda_version("cu129") == "12.9" and checks.cuda_version("cu130") == "13.0"
+    # uv takes pre-releases only for requirements given to it directly: those of SGLang's are named in the plan
+    requires = [*SGLANG_REQUIRES, "flash-attn-4>=4.0.0b18", 'x==1.0rc1; extra == "dev"', "blobfile==3.0.0"]
+    assert checks.prerelease_requirements(requires) == ["flash-attn-4>=4.0.0b18"]
+    with pytest.raises(ValueError, match="CUDA_INDEX"):
+        checks.cuda_version("12.9")
+    with pytest.raises(ValueError, match="does not pin torch"):
+        checks.install_overrides(["torch>=2.11"], "cu129")
+
+
+def test_gpu_check_refuses_a_resolution_of_another_cuda():
+    checks = _checks()
+    good = [
+        "sglang==0.5.17",
+        "torch==2.11.0+cu129",
+        "torchaudio==2.11.0+cu129",
+        "torchvision==0.26.0+cu129",
+        "sglang-kernel==0.4.5+cu129",
+        "sgl-deep-gemm==0.1.5.post1+cu129",
+        "nvidia-cudnn-cu12==9.17.1.4",
+        "nvidia-cuda-nvdisasm==13.3.1  # unsuffixed tools are fine",
+    ]
+    assert checks.lock_problems(good, "cu129") == []
+    bad = ["torch==2.11.0", "nvidia-cudnn-cu13==9.19.0.56", "nvidia_nccl_cu13==2.28.9", "sglang-kernel==0.4.5"]
+    problems = checks.lock_problems(bad, "cu129")
+    assert "nvidia-cudnn-cu13 is a CUDA 13 package" in problems and "nvidia-nccl-cu13 is a CUDA 13 package" in problems
+    assert (
+        "torch==2.11.0 is not the cu129 build" in problems and "sglang-kernel==0.4.5 is not the cu129 build" in problems
+    )
+    assert "sglang is not in the resolution" in problems
+    assert checks.lock_problems(["sglang==0.5.17", "torch==2.11.0", "nvidia-cudnn-cu13==9.19.0.56"], "cu130") == []
+
+
+def test_gpu_check_install_verify_names_what_is_wrong(tmp_path, capsys):
+    """Run where SGLang is not installed (this test environment): the check fails and says why."""
+    pytest.importorskip("torch")
+    try:
+        import sglang  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("sglang is installed here")
+    checks = _checks()
+    lock = tmp_path / "lock.txt"
+    lock.write_text("sglang==0.5.17\ntorch==2.11.0\n")
+    args = SimpleNamespace(lock=str(lock), lock_only=True, cuda="cu129", sglang_version="0.5.17")
+    with pytest.raises(SystemExit) as stopped:
+        checks.install_verify(args)
+    assert stopped.value.code == 1 and "torch==2.11.0 is not the cu129 build" in capsys.readouterr().err
+    args.lock_only, args.lock = False, ""
+    with pytest.raises(SystemExit) as stopped:
+        checks.install_verify(args)
+    err = capsys.readouterr().err
+    assert stopped.value.code == 1 and "import sglang" in err and "CUDA" in err

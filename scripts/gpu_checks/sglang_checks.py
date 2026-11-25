@@ -10,6 +10,8 @@ sleep steps need SGLang. Nothing here is imported by palingenesis.
     python sglang_checks.py sleep --model Qwen/Qwen3-0.6B --out sleep.json
     python sglang_checks.py throughput --engine sglang --model Qwen/Qwen3-0.6B --out tp.json
     python sglang_checks.py smoke-config --kind rl --model ... --workdir ... --out rl.yaml
+    python sglang_checks.py install-plan --sglang-version 0.5.17 --cuda cu129 --workdir plan/   (standard library only)
+    python sglang_checks.py install-verify --sglang-version 0.5.17 --cuda cu129
     python sglang_checks.py report --check parity --inputs a.json b.json ...
 """
 
@@ -19,6 +21,7 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -41,6 +44,171 @@ QUESTIONS = [
     "What is the boiling point of water at sea level in Fahrenheit?",
     "Suggest a name for a bakery run by robots.",
 ]
+
+
+# ------------------------------------------------------------------ install plan
+
+# What palingenesis itself needs next to SGLang's own dependencies (torch and transformers come from SGLang's pins).
+PGS_REQUIREMENTS = (
+    "datasets>=4.0",
+    "accelerate>=1.10",
+    "pyyaml",
+    "safetensors",
+    "math-verify",
+    "flash-linear-attention",
+    "psutil",
+)
+# SGLang's wheel index per CUDA build (sglang-kernel, sgl-deep-gemm), and PyTorch's
+SGLANG_INDEX = "https://docs.sglang.ai/whl/{cuda}/"
+TORCH_INDEX = "https://download.pytorch.org/whl/{cuda}"
+# Dependencies SGLang's wheel index builds per CUDA version (local version +cuNNN)
+SGLANG_BUILT = ("sglang-kernel", "sgl-deep-gemm")
+# Dependencies whose cu13 extra has no cu12 counterpart: the plain package is the CUDA 12 one
+NO_CU12_EXTRA = ("nvidia-cutlass-dsl",)
+
+
+def _normalized(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def cuda_version(cuda: str) -> str:
+    """torch.version.cuda of a PyTorch index name: cu129 -> 12.9, cu130 -> 13.0."""
+    digits = cuda.removeprefix("cu")
+    if not cuda.startswith("cu") or not digits.isdigit() or len(digits) < 3:
+        raise ValueError(f"CUDA_INDEX must look like cu129 or cu130, got {cuda!r}")
+    return f"{digits[:-1]}.{digits[-1]}"
+
+
+def install_overrides(requires: list[str], cuda: str) -> list[str]:
+    """The requirements that replace SGLang's own (uv --override) so that one resolution installs the `cuda`
+    build of everything: SGLang's wheels declare the CUDA 13 flavour of torch and of its kernel packages.
+
+    `requires`: the wheel's Requires-Dist lines. For a CUDA 12 index: torch / torchaudio / torchvision pinned to
+    that index's builds (torchvision's version follows torch's: 2.11.x -> 0.26.x), the [cu13] extras become [cu12]
+    (or go, where the plain package is the CUDA 12 one), cuda-python stays below 13, and SGLang's own kernel
+    wheels are that index's. For cu130 the torch pins only (nothing may move torch)."""
+    major = cuda_version(cuda).split(".")[0]
+    overrides: dict[str, str] = {}
+    torch_version = ""
+    for line in requires:
+        requirement, _, marker = line.partition(";")
+        if "extra ==" in marker:
+            continue
+        match = re.match(r"\s*([A-Za-z0-9._-]+)\s*(\[[^\]]*\])?\s*(.*)", requirement)
+        name, extras, spec = _normalized(match.group(1)), match.group(2) or "", match.group(3).strip()
+        suffix = f" ;{marker}" if marker.strip() else ""
+        pinned = spec.removeprefix("==") if spec.startswith("==") and "," not in spec else ""
+        if name in ("torch", "torchaudio"):
+            if not pinned:
+                raise ValueError(f"sglang does not pin {name} ({line!r}): give the builds to install by hand")
+            overrides[name] = f"{name}=={pinned}+{cuda}"
+            if name == "torch":
+                torch_version = pinned
+        elif major != "13" and "cu13" in extras:
+            extras = "" if name in NO_CU12_EXTRA else extras.replace("cu13", f"cu{major}")
+            overrides[name] = f"{name}{extras}{spec}{suffix}"
+        elif major != "13" and name == "cuda-python":
+            overrides[name] = f"cuda-python>={major},<{int(major) + 1}"
+        elif major != "13" and name in SGLANG_BUILT and pinned:
+            overrides[name] = f"{name}=={pinned}+{cuda}"
+    if not torch_version:
+        raise ValueError("sglang's requirements do not name torch")
+    release = [int(x) for x in torch_version.split(".")[:3]]
+    overrides["torchvision"] = f"torchvision==0.{release[1] + 15}.{release[2]}+{cuda}"
+    return sorted(overrides.values())
+
+
+def prerelease_requirements(requires: list[str]) -> list[str]:
+    """SGLang's requirements that name a pre-release version (flash-attn-4>=4.0.0b18). uv takes pre-releases only
+    for requirements given to it directly, so these go into requirements.in (allowing them for every package
+    would let release candidates of anything in)."""
+    named = []
+    for line in requires:
+        requirement, _, marker = line.partition(";")
+        if "extra ==" not in marker and re.search(r"\d(a|b|rc|\.dev)\d", requirement):
+            named.append(line.strip())
+    return named
+
+
+def install_plan(args) -> None:
+    """Write <workdir>/requirements.in and overrides.txt for `uv pip compile --override`: sglang at the version
+    asked for plus palingenesis' own dependencies, with the CUDA build's replacements. The wheel's requirements
+    come from PyPI's JSON API (nothing is installed to read them)."""
+    import urllib.request
+
+    url = f"https://pypi.org/pypi/sglang/{args.sglang_version}/json"
+    with urllib.request.urlopen(url, timeout=120) as response:
+        requires = json.load(response)["info"]["requires_dist"] or []
+    os.makedirs(args.workdir, exist_ok=True)
+    with open(os.path.join(args.workdir, "requirements.in"), "w") as f:
+        lines = [f"sglang=={args.sglang_version}", *prerelease_requirements(requires), *PGS_REQUIREMENTS]
+        f.write("\n".join(lines) + "\n")
+    with open(os.path.join(args.workdir, "overrides.txt"), "w") as f:
+        f.write("\n".join(install_overrides(requires, args.cuda)) + "\n")
+    print(SGLANG_INDEX.format(cuda=args.cuda), TORCH_INDEX.format(cuda=args.cuda))
+
+
+def lock_problems(lines: list[str], cuda: str) -> list[str]:
+    """What a resolved requirements file (name==version lines) has that the `cuda` build must not: CUDA 13
+    packages in a CUDA 12 environment, or a torch of another build."""
+    major = cuda_version(cuda).split(".")[0]
+    problems = []
+    for line in lines:
+        line = line.split("#")[0].split(";")[0].strip()
+        if "==" not in line:
+            continue
+        name, version = (part.strip() for part in line.split("==", 1))
+        name = _normalized(name)
+        if major != "13" and name.endswith("-cu13"):
+            problems.append(f"{name} is a CUDA 13 package")
+        if name in ("torch", "torchaudio", "torchvision", *SGLANG_BUILT) and major != "13":
+            if not version.endswith(f"+{cuda}"):
+                problems.append(f"{name}=={version} is not the {cuda} build")
+    if not any(_normalized(line.split("==")[0].strip()) == "sglang" for line in lines if "==" in line):
+        problems.append("sglang is not in the resolution")
+    return problems
+
+
+def install_verify(args) -> None:
+    """Before the install (--lock-only): the resolved list is the CUDA build asked for. After it: sglang imports at
+    the version asked for, torch is that CUDA build and sees the GPU, and no CUDA 13 package is installed next to a
+    CUDA 12 torch. Exit code 1 with the reasons otherwise."""
+    from importlib.metadata import distributions, version
+
+    problems = []
+    if args.lock:
+        problems += lock_problems(open(args.lock).read().splitlines(), args.cuda)
+    if args.lock_only:
+        for problem in problems:
+            print(f"install-verify: {problem}", file=sys.stderr)
+        raise SystemExit(1 if problems else 0)
+    try:
+        import torch
+
+        if torch.version.cuda != cuda_version(args.cuda):
+            problems.append(
+                f"torch {torch.__version__} is built for CUDA {torch.version.cuda}, not {cuda_version(args.cuda)}"
+            )
+        elif not torch.cuda.is_available():
+            problems.append(f"torch {torch.__version__} does not see a GPU (driver too old for {args.cuda}?)")
+    except Exception as e:  # noqa: BLE001 — any import failure is the finding
+        problems.append(f"import torch: {type(e).__name__}: {e}")
+    try:
+        import sglang  # noqa: F401
+        from sglang.srt.server_args import ServerArgs  # noqa: F401
+
+        if version("sglang") != args.sglang_version:
+            problems.append(f"sglang {version('sglang')} is installed, not {args.sglang_version}")
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"import sglang: {type(e).__name__}: {e}")
+    names = sorted({_normalized(d.metadata["Name"]) for d in distributions() if d.metadata["Name"]})
+    if not cuda_version(args.cuda).startswith("13"):
+        problems += [f"{name} (a CUDA 13 package) is installed" for name in names if name.endswith("-cu13")]
+    for problem in problems:
+        print(f"install-verify: {problem}", file=sys.stderr)
+    if problems:
+        raise SystemExit(1)
+    print(f"install-verify: sglang {version('sglang')}, torch {torch.__version__} (CUDA {torch.version.cuda}) ok")
 
 
 def _emit(path: str, record: dict) -> None:
@@ -542,6 +710,13 @@ def report(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("install-plan", "install-verify"):
+        p = sub.add_parser(name)
+        p.add_argument("--sglang-version", default="0.5.17")
+        p.add_argument("--cuda", default="cu129")
+        p.add_argument("--workdir", default=".")
+        p.add_argument("--lock", default="")
+        p.add_argument("--lock-only", action="store_true", help="check the resolved list only (before installing)")
     for name in ("generate", "score", "update", "sleep", "throughput", "smoke-config", "report"):
         p = sub.add_parser(name)
         p.add_argument("--model", default="Qwen/Qwen3-0.6B")
@@ -567,6 +742,8 @@ def main() -> None:
     if args.command == "throughput" and args.max_new_tokens == 128:
         args.max_new_tokens = 256
     {
+        "install-plan": install_plan,
+        "install-verify": install_verify,
         "generate": generate,
         "score": score,
         "update": update,
