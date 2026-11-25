@@ -121,7 +121,8 @@ def compare(a: dict[str, dict], b: dict[str, dict], ks: list[int], threshold: fl
     if not common:
         raise ValueError("the two files have no item in common (compare matches rows by id)")
     rows_a, rows_b = [a[i] for i in common], [b[i] for i in common]
-    clusters = _clusters(rows_a)
+    # an item's cluster as either file names it (the baseline's first): results written by another tool may lack it
+    clusters = _clusters([x if x["cluster"] is not None else {"cluster": y["cluster"]} for x, y in zip(rows_a, rows_b)])
     samples = min(len(i["scores"]) for i in rows_a + rows_b)
     out: dict = {"paired_items": len(common), "only_a": len(a) - len(common), "only_b": len(b) - len(common)}
     metrics = [("mean_score", None)] + [(f"pass@{k}", k) for k in _ks(ks, samples)]

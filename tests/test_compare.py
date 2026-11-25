@@ -71,3 +71,17 @@ def test_paired_comparison_and_require(tmp_path, capsys):
     assert main([pa, pb, "--strict"]) == 1  # an item only in B
     assert "--strict" in capsys.readouterr().err
     assert main([pa, "--require", "better"]) == 1
+
+
+def test_paired_comparison_uses_the_clusters_of_either_file():
+    """Clusters named only in the candidate's file still widen the paired interval (items of a cluster move
+    together): the comparison must not fall back to independent items because the baseline has no labels."""
+    from palingenesis.agent_tooling.compare import compare
+
+    n = 40
+    a = {str(i): {"scores": [0.0], "cluster": None} for i in range(n)}
+    b = {str(i): {"scores": [1.0 if i < n // 2 else 0.0], "cluster": i < n // 2} for i in range(n)}
+    labelled_a = {k: {**v, "cluster": b[k]["cluster"]} for k, v in a.items()}
+    want = compare(labelled_a, b, [1], 0.5, 2000, 0.95, 0)["mean_score"]
+    got = compare(a, b, [1], 0.5, 2000, 0.95, 0)["mean_score"]
+    assert (got["lo"], got["hi"]) == (want["lo"], want["hi"]) == (0.0, 1.0)  # two clusters: all or nothing
