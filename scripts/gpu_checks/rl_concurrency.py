@@ -91,7 +91,11 @@ class Server:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError(f"vllm serve exited with code {self.process.returncode}; see vllm_server.log")
+                self.log.flush()
+                tail = Path(self.log.name).read_bytes()[-600:].decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"vllm serve exited with code {self.process.returncode}; vllm_server.log ends with: {tail}"
+                )
             try:
                 with urllib.request.urlopen(f"{self.url}/health", timeout=5) as r:
                     if r.status == 200:
