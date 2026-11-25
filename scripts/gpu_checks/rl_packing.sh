@@ -28,6 +28,10 @@ SKIP="${SKIP:-}"
 export PYTHONPATH="$PGS_SRC${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# The Hugging Face cache stays where the models are: huggingface_hub's default is $XDG_CACHE_HOME/huggingface, so
+# it is pinned before XDG_CACHE_HOME moves into WORK (compiled kernels and vLLM's cache go there; the models do
+# not: offline, a moved cache reads as "couldn't find them in the cached files").
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
 export TMPDIR="$WORK/tmp" TRITON_CACHE_DIR="$WORK/triton" TORCHINDUCTOR_CACHE_DIR="$WORK/inductor"
 export VLLM_CACHE_ROOT="$WORK/vllm_cache" XDG_CACHE_HOME="$WORK/xdg"
 mkdir -p "$TMPDIR"
@@ -88,6 +92,17 @@ CHECK=("$PGS_PY" "$HERE/rl_packing_check.py")
 DEVICE_ARGS=(--device "${CHECK_DEVICE:-cuda:0}")  # CHECK_DEVICE=cpu: a dry run of the plumbing on tiny models
 
 run_part env 600 "${CHECK[@]}" env
+
+# the models must be in the Hugging Face cache (no network): say which are missing once, before every part fails
+for model in $MODELS $SMOKE_MODEL; do
+  if [ ! -e "$model" ] && ! "$PGS_PY" -c 'import sys
+from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1], local_files_only=True, allow_patterns=["config.json"])' "$model" >/dev/null 2>&1; then
+    hub="${HF_HUB_CACHE:-$HF_HOME/hub}"
+    echo "{\"check\": \"model_cache\", \"status\": \"FAIL\", \"model\": \"$model\", \"hub_cache\": \"$hub\", \"error\": \"not in the Hugging Face cache (HF_HOME / HF_HUB_CACHE)\"}" |
+      tee -a "$RESULTS"
+  fi
+done
 
 for model in $MODELS; do
   skipped equality && break
