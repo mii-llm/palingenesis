@@ -199,6 +199,41 @@ def test_apply_param_groups_moves_parameters():
         apply_param_groups(opt, model, [{"names": "missing", "lr": 1.0}])
 
 
+class _RecordingEngine:
+    """A rollout engine as the trainers push to it: keeps what update_weights was given."""
+
+    def __init__(self):
+        self.pushed, self.version = {}, -1
+
+    def update_weights(self, named, version):
+        self.pushed, self.version = {name: tensor.detach().clone() for name, tensor in named}, version
+
+
+@pytest.mark.parametrize("tie", [False, True])
+def test_rollout_weights_are_what_the_forward_computes_with(tie):
+    """pgs distill / pgs rl with an engine: the engine samples from the ternary (strength-mixed) weights the
+    trainer scores with, not from the latent ones."""
+    from palingenesis.hooks import PolicyPlugins
+
+    plugin = TernaryQAT(group_size=16, quantize_head=tie, quantize_embedding=tie)
+    plugins = PolicyPlugins([plugin], None, "distill")
+    model = plugins.transform_model(H.tiny_llama(64, hidden=32, tie=tie))
+    assert plugins.transforms_rollout_weights()
+    engine = _RecordingEngine()
+    for strength in (0.0, 0.3, 1.0):
+        for m in plugin.modules.values():
+            m.strength.fill_(strength)
+        engine.update_weights(plugins.rollout_weights(model.named_parameters()), 1)
+        assert set(engine.pushed) == {name for name, _ in model.named_parameters()}
+        for name, m in plugin.modules.items():
+            key = f"{name}.weight"
+            if key not in engine.pushed:  # the tied head: its weight travels under the embedding's name
+                key = next(k for k, p in model.named_parameters() if p is m.weight)
+            assert torch.equal(engine.pushed[key], m.effective_weight().detach()), (name, strength)
+        assert torch.equal(engine.pushed["model.norm.weight"], model.model.norm.weight)
+    _assert_ternary(engine.pushed["model.layers.0.mlp.up_proj.weight"], 16)  # strength 1: on the grid
+
+
 def test_folded_export_loads_into_a_stock_model(tmp_path):
     from transformers import LlamaForCausalLM
 

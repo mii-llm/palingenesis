@@ -39,6 +39,8 @@ grid_weight * sum (W - W_q)^2 to the latent weights before every optimizer step,
 their grid points so that the final rounding changes little. Optional int8 per-token activations
 (absmax, `activation_bits: 8`). Export "folded" writes W_q in place of W (any HF loader reads it; the
 values are exactly ternary times a scale), "latent" writes the latent weights and scales as trained.
+In pgs distill with a rollout engine (vLLM, SGLang), the engine is given W_eff at every weight push
+(rollout_weights), so it samples from the policy the trainer scores.
 
 This plugin is a starting point, not a recipe: its defaults are not tuned for any model.
 """
@@ -386,6 +388,26 @@ class TernaryQAT(TrainerPlugin):
         out["codes_changed"] = changed / max(total, 1)
         out["zero_share"] = zeros / max(total, 1)
         return out
+
+    # -- rollout engines (pgs distill, pgs rl)
+
+    def rollout_weights(self, named, ctx: PluginContext):
+        """The engine samples from the policy the trainer computes with: each ternary module's weight replaced by
+        W + strength * (W_q - W), the forward's effective weight (W_q itself at strength 1), from the whole tensor
+        (per-tensor scales included). What an engine cannot be given stays as trained: activation quantisation
+        (activation_bits), and a tied embedding / head of which only one is quantised (one tensor serves both)."""
+        from palingenesis.qat.fp import _clean_name
+
+        keys = {f"{name}.weight": m for name, m in self.modules.items()}
+        for name, tensor in named:
+            module = keys.get(_clean_name(name))
+            if module is None:
+                yield name, tensor
+                continue
+            with torch.no_grad():
+                w = tensor.detach()
+                strength = module.strength.to(device=w.device, dtype=w.dtype)
+                yield name, w + strength * (quantize_weight(w, module.group_size) - w)
 
     # -- export and resume
 
