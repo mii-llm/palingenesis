@@ -46,10 +46,18 @@ def _config(setup, name, arch="llama", pp=1, tp=1, schedule="1f1b", fsdp=True, s
     return c
 
 
+def _needs_same_rank_stages(schedule):
+    # zbv / dualpipev put two neighbouring stages on a rank: on gloo that needs torch's in-memory hand-over
+    # (torch 2.11 sends from the rank to itself, which only NCCL accepts: scripts/gpu_checks/tp_pp.sh covers it)
+    if schedule in ("zbv", "dualpipev") and not P.same_rank_stages_run_on_gloo():
+        pytest.skip("this torch's V-shaped pipeline schedules need NCCL (a rank sends to itself)")
+
+
 @pytest.mark.parametrize(
-    "schedule", ["gpipe", "1f1b", "interleaved_1f1b", "looped_bfs", "zbv", "interleaved_zero_bubble"]
+    "schedule", ["gpipe", "1f1b", "interleaved_1f1b", "looped_bfs", "zbv", "dualpipev", "interleaved_zero_bubble"]
 )
 def test_schedules_train_like_one_process(setup, schedule):
+    _needs_same_rank_stages(schedule)
     ref = P.run(_config(setup, f"one_{schedule}", fsdp=False), world=1)
     got = P.run(_config(setup, f"pp2_{schedule}", pp=2, schedule=schedule), world=2)
     P.assert_same(got, ref)
@@ -110,3 +118,63 @@ def test_checkpoint_resumes_at_another_pipeline_degree(setup):
     back.train.gradient_accumulation_steps = 1
     back.train.resume_from = str(Path(on_fsdp.train.output_dir) / "step-2")
     assert P.run(back, world=2)["steps"] == 3
+
+
+@pytest.mark.parametrize(
+    "arch,schedule,tp",
+    [("qwen3", "zbv", False), ("qwen3", "dualpipev", False), ("qwen3_5", "zbv", False), ("qwen3_5", "zbv", True)],
+)
+def test_every_gradient_of_a_v_pipeline_matches_the_plain_model_in_float64(arch, schedule, tp):
+    _needs_same_rank_stages(schedule)
+    # Both stages of the V on one rank, FSDP2 inside (the one-GPU layout of scripts/gpu_checks/tp_pp.sh): the loss
+    # and every parameter's gradient, summed over the pipeline micro-batches, against one plain backward. In
+    # float64 the micro-batches' summation order is invisible, so what is left is the pipeline's arithmetic.
+    result = P.pipeline_gradient_errors(arch, schedule, tp=tp)
+    assert not result["missing"], result["missing"]
+    assert result["loss"] == pytest.approx(result["loss_ref"], rel=1e-9)
+    worst = max(result["errors"], key=result["errors"].get)
+    assert result["errors"][worst] < 1e-6, (worst, result["errors"][worst])  # FSDP2 reduces in float32
+
+
+def test_gpu_check_script_runs_on_cpu(setup, tmp_path):
+    # scripts/gpu_checks/tp_pp.sh end to end on tiny models (the CPU smoke mode, both dtype passes): every check
+    # reports, none FAILs, and each gradient check names the parameters that differ most.
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    if shutil.which("bash") is None:
+        pytest.skip("needs bash")
+    tmp, models, _ = setup
+    root = Path(__file__).parent.parent
+    env = dict(
+        os.environ,
+        PGS_PY=sys.executable,
+        PGS_SRC=str(root / "src"),
+        PGS_DEVICE="cpu",
+        PGS_DTYPES="fp32,bf16",
+        PGS_SEQ="32",
+        PGS_QWEN3=models["qwen3"],
+        PGS_QWEN35=models["qwen3_5"],
+        CUDA_VISIBLE_DEVICES="",
+    )
+    run = subprocess.run(
+        ["bash", str(root / "scripts/gpu_checks/tp_pp.sh")], env=env, capture_output=True, text=True, timeout=900
+    )
+    lines = [json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")]
+    by_name = {line["check"]: line for line in lines}
+    failed = {n: line for n, line in by_name.items() if line["status"] == "FAIL"}
+    assert not failed and run.returncode == 0, (failed, run.stderr[-2000:])
+    names = ["tp2_cpu_qwen3", "tp2_cpu_qwen35", "tp1_qwen35_fp32"]
+    pipelines = ["pp_dualpipev_qwen3_fp32", "pp_tp_zbv_qwen35_bf16"]
+    if P.same_rank_stages_run_on_gloo():
+        names += pipelines
+    else:  # reported as skipped, with the reason
+        assert all(by_name[name]["status"] == "SKIP" and "gloo" in by_name[name]["reason"] for name in pipelines)
+    for name in names:
+        assert by_name[name]["status"] == "PASS", by_name[name]
+        assert by_name[name]["worst"], by_name[name]
+    assert "bf16_noise" in by_name["tp1_qwen3_bf16"]["worst"][0]
+    assert by_name["summary"]["status"] == "PASS"

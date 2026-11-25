@@ -125,6 +125,96 @@ def test_resume_from_a_sharded_checkpoint_continues_the_run(setup):
         P.run(other, world=2)
 
 
+def test_checkpoint_without_rank_by_rank_parameters_resumes_at_another_degree(setup):
+    # Llama has no parameter stored rank by rank: DCP reshards a tp=2 checkpoint into plain FSDP (dp=2) and the
+    # run continues from its step (the load itself is what is checked: other rows per step, so no reference).
+    whole = _config(setup, "tp2_llama_whole", "llama", tp=2, steps=4)
+    whole.train.save_steps = 2
+    ref = P.run(whole, world=2)
+    meta = (Path(whole.train.output_dir) / "step-2" / "training_meta.json").read_text()
+    assert '"rank_by_rank": []' in meta
+    resumed = _config(setup, "dp2_from_tp2_llama", "llama", tp=1, steps=4)
+    resumed.train.resume_from = str(Path(whole.train.output_dir) / "step-2")
+    got = P.run(resumed, world=2)
+    assert got["steps"] == ref["steps"] == 4 and got["loss"] > 0
+
+
+@pytest.mark.parametrize("arch", ["qwen3", "gemma3", "qwen3_5", "qwen3_moe"])
+def test_every_gradient_matches_one_process_in_float64(arch):
+    # One backward on two ranks as the trainer builds the model (tensor parallel, FSDP2 on top), parameter by
+    # parameter: a replicated weight used on each rank's tokens or heads (layer norms, q_norm / k_norm, the gated
+    # norm) has a different partial gradient on every rank, and each rank's optimizer must step with their sum.
+    # FSDP2 reduces in float32: 1e-6 (the grouped expert matmul has no float64 kernel: float32 and 1e-3 there).
+    # A missing reduction is an error of order 1.
+    double = arch != "qwen3_moe"
+    bound = 1e-6 if double else 1e-3
+    ranks = P.gradient_errors(arch, world=2, fsdp=True, double=double)
+    for rank, result in enumerate(ranks):
+        assert not result["missing"], (rank, result["missing"])
+        assert not result["partial"], (rank, result["partial"])
+        worst = max(result["errors"], key=result["errors"].get)
+        assert result["errors"][worst] < bound, (rank, worst, result["errors"][worst])
+    norms = [n for n in ranks[0]["errors"] if "norm" in n]
+    assert any("q_norm" in n or "linear_attn.norm" in n or "layernorm" in n for n in norms)
+
+
+def test_replicated_norm_gradients_are_exact_without_fsdp():
+    # The plan alone (the layout scripts/gpu_checks/tp_pp.sh checks): DTensor leaves the norms' gradients as
+    # partial sums, and gathering them reduces over the group. Exact to float64 rounding.
+    for result in P.gradient_errors("qwen3", world=2, fsdp=False):
+        assert not result["missing"]
+        assert any("norm" in n for n in result["partial"])
+        worst = max(result["errors"], key=result["errors"].get)
+        assert result["errors"][worst] < 1e-12, (worst, result["errors"][worst])
+
+
+def test_gated_delta_net_convolution_kernel_gets_plain_tensors():
+    # With causal-conv1d installed, transformers' forward hands conv1d.weight / bias to the kernel itself (a
+    # custom operator: "got mixed torch.Tensor and DTensor") instead of calling the convolution module.
+    for rank, result in enumerate(P.gradient_errors("qwen3_5", world=2, fsdp=True, conv_kernel=True)):
+        assert not result["missing"] and not result["partial"]
+        assert any("conv1d.weight" in n for n in result["errors"])
+        worst = max(result["errors"], key=result["errors"].get)
+        assert result["errors"][worst] < 1e-6, (rank, worst, result["errors"][worst])
+
+
+def test_local_parameters_come_back_when_the_forward_raises():
+    from torch import nn
+
+    from palingenesis.tensor_parallel import _local_params
+
+    class Owner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1d = nn.Conv1d(4, 4, 2, groups=4)
+
+        def forward(self, x):
+            assert not hasattr(self.conv1d.weight, "to_local")  # a plain tensor inside the forward
+            raise ValueError("boom")
+
+    import torch.distributed as dist
+
+    from palingenesis.distributed import init_single_process_group
+
+    created = not dist.is_initialized()
+    if created:
+        init_single_process_group()
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor, Shard
+
+        owner = Owner()
+        _local_params(
+            owner, init_device_mesh("cpu", (1,), mesh_dim_names=("tp",)), {"weight": (Shard(0), False)}, "conv1d"
+        )
+        with pytest.raises(ValueError, match="boom"):
+            owner(torch.zeros(1, 4, 3))
+        assert isinstance(owner.conv1d.weight, DTensor) and isinstance(owner.conv1d.weight, nn.Parameter)
+    finally:
+        if created:
+            dist.destroy_process_group()
+
+
 def test_layout_check():
     from palingenesis.checkpoint import check_layout
 
@@ -188,3 +278,20 @@ def test_a_layer_outside_the_plan_is_refused():
     tp = TensorParallel(mesh=None, size=2, rank=0)
     with pytest.raises(TensorParallelError, match="q_proj"):
         _parallelize_layer(layer, "model.layers.0", tp)
+
+
+def test_per_rank_memory_estimate():
+    from palingenesis.agent_tooling.profile_memory import _per_rank
+    from palingenesis.config import Config
+
+    model = P.ARCHITECTURES["llama"](64)
+    config = Config()
+    config.parallel.tp_degree = 2
+    kwargs = dict(weights_gb=16.0, activations_gb=8.0, logits_gb=2.0, layers=4)
+    one = _per_rank(config, model, 2, **kwargs)
+    two = _per_rank(config, model, 4, **kwargs)  # dp=2 on top: weights sharded again, activations unchanged
+    assert one["dims"] == "pp=1 x dp=1 x cp=1 x tp=2" and one["activations_gb"] == pytest.approx(4.0)
+    assert one["weights_optimizer_grads_gb"] == pytest.approx(8.0)
+    assert two["weights_optimizer_grads_gb"] == pytest.approx(4.0) and two["activations_gb"] == one["activations_gb"]
+    assert "cannot split" in _per_rank(config, model, 3, **kwargs)["error"]
+    assert _per_rank(Config(), model, 1, **kwargs) is None
