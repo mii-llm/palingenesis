@@ -116,6 +116,11 @@ ternary-qat = "palingenesis.qat:TernaryQAT"
 float-qat = "palingenesis.qat:FloatQAT"
 lora = "palingenesis.lora:LoRA"
 
+# Environments of the catalogue (`pgs env`). The built-in ones are listed in palingenesis.rl.catalog.registry; a
+# third-party package registers its EnvSpec objects under this group in its own pyproject:
+#   [project.entry-points."palingenesis.environments"]
+#   my_env = "my_package.my_env:SPEC"
+
 [project.urls]
 Repository = "https://github.com/mii-llm/palingenesis"
 Documentation = "https://mii-llm.github.io/palingenesis/"

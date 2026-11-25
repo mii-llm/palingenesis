@@ -210,6 +210,20 @@ RL and distillation configs also have a `plugins:` section (`custom`: trainer pl
 
 RL configs also have a `lora:` section (`rank`, `alpha`, `rslora`, `dora`, `lr_ratio`, `targets`, `exclude`; `rank: 0` = off) that trains low-rank adapters instead of the full weights: see [LoRA in RL](../guides/lora.md#lora-in-rl).
 
+### RL: catalogue environments
+
+An environment of the [catalogue](../guides/environments.md) is used like any other: `env.type` is the entry's class and `data.dataset` a file of its rows. `pgs env rows <name> -o rows.jsonl` writes the rows and prints the lines; `pgs env info <name>` shows them too. The environments score their own episodes (`get_reward`), so no `rewards:` section is needed.
+
+| Option | Value |
+|---|---|
+| `env.type` | The entry's class, e.g. `palingenesis.rl.catalog.envs.sql:SqlEnv` (`pgs env info <name>`) |
+| `env.max_turns` | The entry's `max_turns` (rows may carry their own `max_turns` / `max_completion_tokens`: the games do) |
+| `env.args` | The entry's `env_args`, if any (e.g. `{timeout: 6.0, max_tests: 20}` for the code environments) |
+| `data.dataset` | Rows from `pgs env rows`; `data.success_threshold: 1` (every built-in reward is 0 or 1) |
+| `sandbox.backend` | `docker` for `code-unit-tests` / `code-stdio`: the config's sandbox is passed to the environment |
+
+`PGS_VERIFY_WORKERS` (environment variable) sets the worker processes of the batched verifier pool (`palingenesis.rl.catalog.verify`; default up to 4, 0 = threads).
+
 ### RL: `scenario`, `roles` and replicated bases
 
 RL configs (`pgs rl`) run multi-role episodes when they have a `scenario:` section ([Multi-Agent RL](../guides/multi-agent.md)).

@@ -15,6 +15,7 @@
 | read what RL / distillation rollouts do | [`pgs rollouts`](#rollouts) |
 | compare two checkpoints' evaluations (intervals, paired tests, pass@k) | [`pgs compare`](#compare) |
 | keep the RL prompts the policy solves sometimes | [`pgs screen`](#screen) |
+| find, audit or run an RL / evaluation environment | [`pgs env`](#env) |
 | build or check contrastive twin preference pairs | [`pgs pairs`](#pairs) |
 | on-policy distillation / RL | [`pgs distill`](#distill), [`pgs rl`](#rl) |
 
@@ -91,6 +92,26 @@ Reinforcement learning: groups of rollouts scored by rewards (checked answers, t
 ```bash
 pgs rl --config configs/rl_harbor.yaml
 ```
+
+### env
+
+The environment catalogue: built-in environments and those other packages register (entry-point group `palingenesis.environments`). See [Environments](../guides/environments.md).
+
+```bash
+pgs env list [--family tool-calling] [--trainable | --eval-only] [--permissive] [--json]
+pgs env info text-to-sql [--json]                      # data, tools, verifier, sandbox, licence, an example prompt, RL config lines
+pgs env test text-to-sql [--n 32] [--seed 0] [--dataset D] [--json]     # or several names, or --all; exit 1 on a failure
+pgs env run  text-to-sql --model runs/sft/final --k 4 [--n 64] [--output results.jsonl] [--json]
+pgs env rows text-to-sql --n 2000 --seed 1 -o rows.jsonl [--option difficulty=3]
+pgs env new  acme/my-env [--dir .] [--family other]
+```
+
+A name is a registered environment, or `module:SPEC` / `path/to/file.py:SPEC` for one under development.
+
+- `test` is the audit: the entry's oracle policy must pass every row, its degenerate policies (plus an empty reply, a refusal, the prompt repeated and tool spam) no more than the entry's chance level, and the oracle again on reused instances. Reward-hacking holes are listed with the policy and the first row it passes. No model, no GPU.
+- `run` plays k episodes per row with a model through the RL rollout loop and reports pass@1, pass@k, the mean reward, finish reasons, the tool error rate and episodes/s. Options: `--backend vllm | sglang | hf`, `--temperature` (0.7), `--top_p`, `--top_k`, `--thinking on | off | default`, `--dataset` (a dataset of the entry or a file of rows), `--option key=value` (generator options), `--max_turns`, `--max_new_tokens`, `--max_model_len`, `--max_concurrent`, `--tool_timeout`, `--gpu_memory_utilization`, `--env_args '{...}'`, `--sandbox docker | process | agent_sandbox` (code environments; default docker). `--output` writes per-row results that [`pgs compare`](#compare) reads.
+- `rows` writes rows for `pgs rl` and prints the `env:` / `data:` / `rollout:` lines of the config. Evaluation-only entries are refused unless `--allow-eval-only`.
+- `new` writes a package skeleton: the environment, its `EnvSpec`, the entry point, and a test that runs the audit.
 
 ### harbor
 

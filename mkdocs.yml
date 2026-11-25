@@ -131,6 +131,7 @@ nav:
     - LoRA: guides/lora.md
     - Multimodal (Images): guides/multimodal.md
     - Reinforcement Learning: guides/rl.md
+    - Environments (Catalogue): guides/environments.md
     - Multi-Agent RL (Scenarios): guides/multi-agent.md
     - Harbor Environments: guides/harbor.md
     - Harness Profiles: guides/harness-profiles.md
