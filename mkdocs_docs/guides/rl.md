@@ -354,9 +354,14 @@ $$
 from $|S_t|$ gathered rows of the output head (no pass over the vocabulary), with its gradient through the normaliser. `policy/entropy` is then the entropy of $\pi_S$. On the policy's own samples the ratio is 1 (`tests/test_rl_sampling_support.py` checks it against the hf engine's recorded log-probs and end to end).
 {: .pg-where }
 
-The support is shipped as token ids, not recomputed: the trainer's logits differ slightly from the engine's, and a token at the boundary of its own top-k would change the set. vLLM keeps every token tied with the k-th logit, so the support can exceed `top_k`; the 8 extra candidates cover that, and a token whose support fills all of them (it may miss some) or does not contain the sampled token is left out of the loss and counted in `sampling/support_incomplete` (expected 0). `sampling/support_size` is the mean support. A think-skip token (`rollout.think_skip`) has no support and is scored over the vocabulary.
+The support is shipped as token ids, not recomputed: the trainer's logits differ slightly from the engine's, and a token at the boundary of its own top-k would change the set. vLLM keeps every token tied with the k-th logit, so the support can exceed `top_k`; the 8 extra candidates cover that, and a token whose support fills all of them (it may miss some) or does not contain the sampled token is left out of the loss and counted in `sampling/support_incomplete` (expected 0); such a token counts as on-policy
+(ratio 1) in the mismatch statistics and in `loss.seq_mask`'s sequence deviation, since its ratio means nothing. `sampling/support_size` is the mean support. A think-skip token (`rollout.think_skip`) has no support and is scored over the vocabulary.
 
-Cost: 8 bytes per candidate per sampled token in host memory and on the wire, and vLLM's per-token log-prob output, which grows with k (a warning above `top_k: 64`; Qwen3's recommended `top_k: 20` is cheap). The engines are set up for it: the colocated engine and a launched `vllm_server` get `max_logprobs` raised when more than vLLM's 20 are needed; a server you started (`rollout.url`) needs `--logprobs-mode processed_logprobs` and `--max-logprobs`, and pool workers (`rollout.backend: remote`) `--max-logprobs` (checked when the trainer connects). The hf engine records the support itself. Evaluation keeps `train.eval_temperature`, untruncated. Not with `loss.kl_ref` (the reference is scored over the vocabulary) or a multi-role scenario yet. Follows TRL's `AsyncGRPOTrainer` ("Top-k and top-p sampling"), which needs vLLM's `--return-sampling-mask`; here the support comes from the top log-probs every vLLM version returns.
+Cost: 8 bytes per candidate per sampled token in host memory and on the wire, and vLLM's per-token log-prob output, which grows with k (a warning above `top_k: 64`; Qwen3's recommended `top_k: 20` is cheap). The engines are set up for it: the colocated engine and a launched `vllm_server` get `max_logprobs` raised when more than vLLM's 20 are needed; a server you started (`rollout.url`) needs `--logprobs-mode processed_logprobs` and `--max-logprobs`, and pool workers (`rollout.backend: remote`) `--max-logprobs` (checked when the trainer connects). The hf engine records the support itself. On the trainer, scoring the candidates through gathered
+rows of the head returns the head's gradient as one dense vocabulary x hidden fp32 tensor per micro-batch backward, like
+the full-vocabulary path's (2.3 GiB for a 151k x 4096 head; none when the head is frozen, as under LoRA); a micro-batch
+that scores some tokens over the vocabulary as well (think-skip tokens, score centering without top-p / top-k) holds two
+until they are added. Evaluation keeps `train.eval_temperature`, untruncated. Not with `loss.kl_ref` (the reference is scored over the vocabulary) or a multi-role scenario yet. Follows TRL's `AsyncGRPOTrainer` ("Top-k and top-p sampling"), which needs vLLM's `--return-sampling-mask`; here the support comes from the top log-probs every vLLM version returns.
 
 ### Score centering
 
@@ -505,6 +510,13 @@ micro-batch forwards: padded tokens, the trajectories' tokens (`varlen`) or the 
 keeps at most `micro_tokens` trained tokens per micro-batch, the head's work). The `tree` planner sends a trajectory to the
 micro-batch whose trie already holds the longest prefix of it, so a group is not split while it fits.
 
+`micro_tokens` counts a shared prefix once, but each branch's attention reads its whole root-to-branch path, so a layer
+gathers about (trajectories x shared prefix) key / value rows: a 12k-token prompt with 32 completions is ~13k packed
+tokens and ~390k gathered rows. These rows are transient (one layer at a time, forward and backward), and
+`train.packing_gather_tokens` bounds them per micro-batch (0, the default: 8 x `micro_tokens`). A group above the bound is
+spread over several micro-batches, its prefix forwarded once in each: with long prompts and large groups, raise it as far
+as memory allows to keep the whole group in one tree.
+
 How it is computed:
 
 - **Layout.** The trie is cut into segments, runs of tokens that end where trajectories branch or end, laid out level by
@@ -513,11 +525,12 @@ How it is computed:
 - **Attention.** Each segment's queries attend to the keys and values of their root-to-segment path, gathered by index, in
   one variable-length flash call whose causal mask is aligned bottom-right: a query sees every ancestor token and its own
   causal past, nothing of its siblings. The kernel is torch's own FlashAttention-2 (`aten._flash_attention_forward`, the
-  variable-length kernel SFT packing uses): no flash-attn package is needed, and `model.flash_kernel` swaps in
-  FlashAttention-3 / 4 the same way. The backward gathers the paths again instead of saving them, and sums the gradients
-  of shared keys and values in fp32. Because a top-left aligned kernel would silently compute something else, the trainer
+  variable-length kernel SFT packing uses): no flash-attn package is needed. The backward gathers the paths again
+  instead of saving them, and sums the gradients of shared keys and values in fp32. Because a top-left aligned kernel would silently compute something else, the trainer
   checks the tree path against an exact reference at startup and refuses to train if they disagree. Without a flash kernel
   (CPU, fp32) an explicit `[N, N]` ancestor mask computes the same attention (the reference path; memory grows with `N^2`).
+  On a GPU there is no fallback to it: a model whose head dims the kernel does not take (above 256, not a multiple of 8,
+  or query / key dims other than the value's, as in multi-head latent attention) is refused at startup.
 - **Gated DeltaNet** (Qwen3.5, Qwen3-Next). The short convolution of a segment reads the last inputs of its ancestors;
   the chunked delta rule runs once per tree level over the level's segments with the layer's own kernel, each segment
   starting from its parent's final state, and the state's gradient flows back to the parent through autograd. With
@@ -529,14 +542,22 @@ How it is computed:
   multi-turn groups with shared prompts, branching turns and the observation loss). After every packed forward the trainer
   checks that each attention and Gated DeltaNet layer read the packed layout: a layer that ignored it would have mixed the
   trajectories, and the step stops with an error instead.
+- **Validated on a GPU only.** Three paths have no CPU implementation, so the CPU tests run their references instead
+  (the explicit mask, transformers' torch delta rule over padded rows, a plain causal convolution over each segment's
+  halo): the flash tree kernel (gathered paths, bottom-right causal alignment, its hand-written backward),
+  flash-linear-attention's variable-length delta rule with one initial state per segment (and the gradient through that
+  state), and causal-conv1d with `seq_idx` (`varlen` rows). Their equality with the padded path, log-probs and
+  gradients, is what `scripts/gpu_checks/rl_packing.sh` checks on real models; run it on your torch / fla / causal-conv1d
+  versions before turning a packed mode on.
 
 Requirements and incompatibilities, checked at startup: the policy's attention on `sdpa` (the default; palingenesis
 reroutes it), full-attention and Gated DeltaNet layers only (no sliding windows, attention soft-capping, chunked attention,
 Mamba or other recurrent layers), no `model.multimodal`, and with `tree` no `train.prompt_sharing: on` (the tree already
 forwards each prompt once; `auto` leaves it to the tree). FSDP (`train.fsdp`, torchrun), LoRA, scenarios, the KL
-reference and the observation loss work unchanged. MoE policies: router balancing counts a shared token once; routing
-replay takes a shared position's routing from the first trajectory that recorded it (a group's prompt is prefilled once by
-the engine anyway).
+reference and the observation loss work unchanged. MoE policies: router balancing counts a token of a `tree` once per
+trajectory through it, so the expert loads and the balancing losses are those of the padded rows. Routing replay
+(`rollout.routing_replay`) works with `varlen` and is refused with `tree`: a shared prefix is forwarded once and could
+replay only one routing, while the engine routed every rollout by itself.
 
 The default stays `padded` until the GPU measurements below exist. TRL's AsyncGRPOTrainer, whose trie packing (`TreeRow`,
 `tree_attention`) this follows, reports 2.8 to 3x faster training steps than padding-free packing at a packing ratio of 3.4
@@ -571,6 +592,14 @@ goes to the engine with the most room under its cap. The controller follows TRL'
 ([TRL](https://github.com/huggingface/trl), `_init_kv_cap` and `_control_loop`), whose thresholds and factors these
 are; pgs adds the cut on a waiting queue and raises only while the cap binds. Not yet measured against `fixed` on a
 GPU in pgs.
+
+At the gate, requests wait first come, first served per engine, and the later turns of an episode that is already
+running go before requests that start one: a running episode holds an environment and its engine's prefix cache, so a
+cut cap finishes episodes before it starts new ones. A slot is the engine's work, not the caller's wait: the engines
+have no abort, so the request of a rollout that was cancelled (a surplus group, an episode past `scenario.timeout`)
+keeps generating and keeps its slot until the engine finishes it. The wait at the gate is part of the episode's time:
+`scenario.timeout` counts it, so leave room for it when the cap is small (`rollout/gate_wait_s` over
+`rollout/gate_waits` is the mean wait).
 
 | Metric | Meaning |
 |---|---|
