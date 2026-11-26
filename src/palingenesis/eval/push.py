@@ -197,6 +197,11 @@ class PushClient:
                 torch.cuda.synchronize()
         except Exception:  # noqa: BLE001 — a push that cannot be staged is skipped, never a training error
             logger.exception("eval_tasks: the weights of step %d could not be staged", step)
+            # Under FSDP `named` gathers: the other ranks go through every parameter's collective, so this rank
+            # must too, or the next collective pairs with the wrong one and training hangs.
+            with contextlib.suppress(Exception):
+                for _ in named:
+                    pass
             with self.lock:
                 self.sending = False
             self.stats["push_failures"] += 1

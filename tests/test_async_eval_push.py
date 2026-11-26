@@ -309,3 +309,40 @@ def test_rl_trainer_with_a_push_evaluator(tmp_path):
     assert all("eval/async/alive" in m for m in steps)
     log = (tmp_path / "run" / "eval_tasks" / "service.log").read_text()
     assert "Traceback" not in log, log
+
+
+def test_a_staging_failure_still_runs_every_gather(monkeypatch):
+    """Under FSDP the weights' generator gathers: when staging fails on rank 0 the other ranks still go through
+    every parameter's collective, so rank 0 must finish the generator too, or training hangs."""
+    import threading
+    import types
+
+    from palingenesis.eval.push import PushClient
+
+    visited = []
+
+    def named():
+        for i in range(5):
+            visited.append(i)
+            yield f"layer.{i}.weight", torch.ones(4, 4)
+
+    def allocate(index, nbytes):
+        raise RuntimeError("cannot pin host memory")
+
+    def pack(named, bucket_bytes, allocate, dtype, checksums=False):  # fails after the first bucket, mid-way
+        for i, _ in enumerate(named):
+            if i == 1:
+                allocate(0, 1)
+
+    from palingenesis.rl.pool import buckets
+
+    monkeypatch.setattr(buckets, "pack", pack)
+
+    client = types.SimpleNamespace(
+        lock=threading.Lock(), connected=True, sending=False, refused=False,
+        spec=types.SimpleNamespace(final_timeout_s=0), staging=types.SimpleNamespace(pin=False),
+        stats={"push_failures": 0}, _allocate=allocate,
+    )
+    assert PushClient.submit(client, 10, named()) is False
+    assert visited == [0, 1, 2, 3, 4]
+    assert client.sending is False and client.stats["push_failures"] == 1
