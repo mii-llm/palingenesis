@@ -84,12 +84,15 @@ class Buckets:
         return sum(b.numel() for b in self.buffers)
 
 
-def pack(named_tensors, bucket_bytes: int, allocate, wire_dtype: torch.dtype | None = None) -> Buckets:
+def pack(
+    named_tensors, bucket_bytes: int, allocate, wire_dtype: torch.dtype | None = None, checksums: bool = True
+) -> Buckets:
     """Pack (name, tensor) pairs into buckets of about `bucket_bytes` (a larger tensor gets a bucket of its own).
     `allocate(index, nbytes)` returns the 1-d uint8 buffer of bucket `index` (reused between pushes by the caller;
     on the device the buckets are sent from). Floating-point tensors are cast to `wire_dtype` as they are copied
     (one copy: cast and device transfer together). The pairs may be a generator of gathered parameters: at most
-    one bucket's tensors are held at a time."""
+    one bucket's tensors are held at a time. checksums False: none computed here (the caller sums the buffers
+    later, off the thread that packs: palingenesis.eval.push)."""
     out = Buckets()
     pending: list[tuple[str, torch.Tensor, torch.dtype, int]] = []
     used = 0
@@ -106,7 +109,8 @@ def pack(named_tensors, bucket_bytes: int, allocate, wire_dtype: torch.dtype | N
                 buffer[offset : offset + nbytes].view(dtype).view(tensor.shape).copy_(tensor.detach())
             out.manifest.append([name, str(dtype).replace("torch.", ""), list(tensor.shape), index, offset])
         out.buffers.append(buffer)
-        out.sums.append(checksum(buffer))
+        if checksums:
+            out.sums.append(checksum(buffer))
         pending, used = [], 0
 
     for name, tensor in named_tensors:

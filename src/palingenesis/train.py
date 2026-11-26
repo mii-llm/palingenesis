@@ -1170,6 +1170,7 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 seed=config.train.seed,
                 max_model_len=config.data.max_seq_length,
                 checkpoints={"prefix": "step-", "complete": TRAINING_META_FILE},
+                weights_bytes=2 * sum(p.numel() for p in model.parameters()),
             ),
             main=is_main(),
             world=world_size,

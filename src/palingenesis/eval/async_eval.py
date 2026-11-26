@@ -54,6 +54,7 @@ class RunInfo:
     stop_tokens: list = field(default_factory=list)
     seed: int = 0
     max_model_len: int = 8192
+    weights_bytes: int = 0  # the push staging area: 2 bytes per parameter (bfloat16 on the wire)
     base_step: bool = False  # the run's start is evaluated (step 0 of pgs rl / distill, a fresh run)
     checkpoints: dict = field(default_factory=dict)  # {prefix: "step_" | "step-", complete: marker file}
 
@@ -149,7 +150,15 @@ class AsyncEval:
             for s in handoff.results(self.output_dir)
             if (handoff.step_dir(self.output_dir, s) / handoff.LOGGED).exists()
         }
-        handoff.write_json(root / handoff.SPEC, self.spec_json())
+        spec_json = self.spec_json()
+        if self.transport == "push" and self.info.weights_bytes:
+            from palingenesis.eval.config import EvalConfigError
+            from palingenesis.eval.placement import host_memory_error
+
+            error = host_memory_error(self.info.weights_bytes)
+            if error:
+                raise EvalConfigError(error)
+        handoff.write_json(root / handoff.SPEC, spec_json)
         if self.spec.devices:
             self._launch()
         logger.info(
@@ -160,7 +169,7 @@ class AsyncEval:
         if self.transport == "push":
             from palingenesis.eval.push import PushClient
 
-            self.client = PushClient(self.output_dir, self.spec, self.info)
+            self.client = PushClient(self.output_dir, self.spec, self.info, spec_json)
 
     def command(self) -> list[str]:
         mode = "watch" if self.transport == "checkpoint" else "serve"
@@ -256,10 +265,13 @@ class AsyncEval:
             return []
         self.last_poll = time.monotonic()
         self._supervise()
+        arrived = handoff.results(self.output_dir)
         if self.client is not None:
             self.client.poll()
+            for result in self.client.take_results():  # an evaluator without the trainer's file system
+                arrived.setdefault(int(result["step"]), result)
         out = []
-        for result_step, result in sorted(handoff.results(self.output_dir).items()):
+        for result_step, result in sorted(arrived.items()):
             if result_step in self.logged:
                 continue
             self.logged.add(result_step)

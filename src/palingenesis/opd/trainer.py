@@ -948,6 +948,7 @@ class OPDTrainer:
             max_model_len=config.rollout.max_model_len,
             base_step=True,
             checkpoints={"prefix": "step_", "complete": TRAINER_STATE_FILE},
+            weights_bytes=2 * sum(p.numel() for p in self.student.parameters()),
         )
         return make_async_eval(config.eval_tasks, info, main=True, device=self.device)
 
