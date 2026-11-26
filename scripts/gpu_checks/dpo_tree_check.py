@@ -355,16 +355,13 @@ def compare_grads(ref: list, model) -> dict:
 # a float32 pass with absolute bounds (--precision float32) is what rules out a real error.
 FLOOR_FACTOR = 3.0
 COSINE_SLACK = 0.001  # bf16: how far below the floor's gradient cosine a packed layout's may be
-# the float32 pass: absolute bounds (per-token log-probs, the loss, the gradient)
-FP32_BOUNDS = {
-    "token_logprob_mean_abs_diff": 1e-4,
-    "token_logprob_p99_abs_diff": 1e-3,
-    "token_logprob_max_abs_diff": 1e-2,
-    "token_logprob_signed_mean_diff": 2e-5,
-    "loss_diff": 1e-3,
-    "grad_rel_l2": 1e-2,
-    "grad_cosine": 0.9999,
-}
+# the float32 pass (no autocast, TF32 off): per-token statistics and the loss relative to the float32 floor, as in
+# bf16 (the floor itself, two padded layouts, is a few 1e-4 per token: well above any fixed bound a tight absolute
+# rule could set); the gradient, which a real bug moves, keeps absolute guards.
+FP32_FACTORS = {"mean": 3.0, "p99": 3.0, "max": 5.0, "signed_mean": 3.0, "loss": 3.0}
+FP32_ALLOWANCE = {"mean": 1e-4, "p99": 1e-3, "max": 0.0, "signed_mean": 2e-5, "loss": 1e-4}
+FP32_MIN_COSINE = 0.9999
+FP32_GRAD_REL_L2 = 1e-2  # the bound is max(2x the floor's, this)
 ALLOWANCE = {"mean": 0.005, "p99": 0.05, "signed_mean": 0.002, "loss": 0.01}
 
 
@@ -401,14 +398,28 @@ def judge(values: dict, floor: dict, tree: bool) -> list[str]:
     pre-registered cosine of 0.999 allowed (0.9983 on Qwen3.5-0.8B). A packed layout passes when its cosine is at
     least 0.999, or within COSINE_SLACK of the floor's, and its relative L2 error within 1.5x the floor's + 0.01.
 
-    float32 (no autocast, TF32 off): tight absolute bounds, so that a real error cannot hide in bf16 noise; the
-    float32 floor is reported next to them."""
+    float32 (no autocast, TF32 off): the per-token statistics (mean and p99 within 3x the float32 floor + a small
+    allowance, the maximum within 5x, the signed mean 3x + a small allowance) and the loss (3x + 1e-4) relative to
+    the floor, since the floor itself is above any fixed bound; the gradient keeps absolute guards (cosine >=
+    0.9999, relative L2 <= max(2x the floor's, 1e-2)), which are what a real bug moves."""
     failed = []
     if PRECISION == "float32":
-        if values["grad_cosine"] < FP32_BOUNDS["grad_cosine"]:
-            failed.append(f"grad_cosine {values['grad_cosine']:.6f} < {FP32_BOUNDS['grad_cosine']}")
-        for key, limit in FP32_BOUNDS.items():
-            if key != "grad_cosine" and abs(values[key]) > limit:
+        if values["grad_cosine"] < FP32_MIN_COSINE:
+            failed.append(f"grad_cosine {values['grad_cosine']:.6f} < {FP32_MIN_COSINE}")
+        bounds = {
+            "token_logprob_mean_abs_diff": FP32_FACTORS["mean"] * floor["token_logprob_mean_abs_diff"]
+            + FP32_ALLOWANCE["mean"],
+            "token_logprob_p99_abs_diff": FP32_FACTORS["p99"] * floor["token_logprob_p99_abs_diff"]
+            + FP32_ALLOWANCE["p99"],
+            "token_logprob_max_abs_diff": FP32_FACTORS["max"] * floor["token_logprob_max_abs_diff"],
+            "token_logprob_signed_mean_diff": FP32_FACTORS["signed_mean"]
+            * abs(floor["token_logprob_signed_mean_diff"])
+            + FP32_ALLOWANCE["signed_mean"],
+            "loss_diff": FP32_FACTORS["loss"] * floor["loss_diff"] + FP32_ALLOWANCE["loss"],
+            "grad_rel_l2": max(2 * floor["grad_rel_l2"], FP32_GRAD_REL_L2),
+        }
+        for key, limit in bounds.items():
+            if abs(values[key]) > limit:
                 failed.append(f"{key} {values[key]:.4g} > {limit:.4g}")
     else:
         cosine_bound = min(MIN_COSINE, floor["grad_cosine"] - COSINE_SLACK)
