@@ -412,8 +412,7 @@ def judge(values: dict, floor: dict, tree: bool) -> list[str]:
             "token_logprob_p99_abs_diff": FP32_FACTORS["p99"] * floor["token_logprob_p99_abs_diff"]
             + FP32_ALLOWANCE["p99"],
             "token_logprob_max_abs_diff": FP32_FACTORS["max"] * floor["token_logprob_max_abs_diff"],
-            "token_logprob_signed_mean_diff": FP32_FACTORS["signed_mean"]
-            * abs(floor["token_logprob_signed_mean_diff"])
+            "token_logprob_signed_mean_diff": FP32_FACTORS["signed_mean"] * abs(floor["token_logprob_signed_mean_diff"])
             + FP32_ALLOWANCE["signed_mean"],
             "loss_diff": FP32_FACTORS["loss"] * floor["loss_diff"] + FP32_ALLOWANCE["loss"],
             "grad_rel_l2": max(2 * floor["grad_rel_l2"], FP32_GRAD_REL_L2),
