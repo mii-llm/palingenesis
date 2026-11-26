@@ -432,21 +432,17 @@ What it does not cover:
 
 Memory: a packed micro-batch holds `train.packing_tokens` tokens of activations, by default what a padded micro-batch holds at most (`score_micro_seqs` × the longest sequence), so more completions fit a forward. If it does not fit, lower `train.packing_tokens`; `model.gradient_checkpointing` works with packed rows.
 
-**Measured** (`scripts/gpu_checks/opd_tree.sh`: one A100 80GB, Qwen3.5-0.8B student, Qwen3.5-2B teacher, `full_rkl`, 8 prompts per step, median of 3 steps on the same sampled batch). *To be filled from the GPU check; the pre-registered target is a step at least 25% faster at group size 8 with the same dev KL (|Δ| < 0.01), and the mode is not recommended below 10%.*
+**Measured** (`scripts/gpu_checks/opd_tree.sh`: one A100, vLLM rollout, Qwen3.5-0.8B student, Qwen3.5-2B hf teacher, `full_rkl`, prompts of about 630 tokens and completions of about 160, one sampled batch timed in each mode). The pre-registered target was a step at least 25% faster at group size 8 with the same dev KL, and the mode is not recommended below 10%.
 
-| Group size | Mode | Step (s) | Teacher (s) | Student (s) | Trained tokens/s | Teacher share | Peak GiB | Step time vs padded | dev KL Δ |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | padded | TBD | TBD | TBD | TBD | TBD | TBD | — | — |
-| 4 | varlen | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 4 | tree | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 8 | padded | TBD | TBD | TBD | TBD | TBD | TBD | — | — |
-| 8 | varlen | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 8 | tree | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 16 | padded | TBD | TBD | TBD | TBD | TBD | TBD | — | — |
-| 16 | varlen | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 16 | tree | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| Group size | `tree` step time vs padded | `varlen` step time vs padded |
+|---:|---:|---:|
+| 4 | -28% | -7% |
+| 8 | -33% (target: at least 25%, met) | -6% |
+| 16 | -40% | -10% |
 
-What to expect before the numbers: packing shortens the two backbones' passes, by the share of forwarded tokens it removes (a 300-token prompt under eight 300-token completions: 2700 tokens instead of 4800). The rollout and the output-head work of the loss (one projection per completion token, per model) are the same in every mode, so the step gains less than the backbones do, and little when prompts are short next to the completions.
+At group size 8 `tree` cuts the teacher's time by 64% and the student's by 54%; the rest of the step (the rollout, the output-head work) is the same in every mode. `varlen` shares nothing between a prompt's completions, so it gains only the padding it removes. Equality with the padded path on the real models (the teacher's log-probs and top-k, the loss statistics, `dev_kl` and the student's gradients, judged against the noise between two padded layouts) passes for both `varlen` and `tree` with `full_rkl`. The `topk_kl` equality has not been measured on a GPU: the check's second trainer in the same process could not load the student (`load_causal_lm` now handles that case; not rerun on a GPU yet). Absolute step times, peak memory and the dev-KL difference are in the check's `speed` lines. The gain grows with the group size and with the prompt's share of the tokens; with short prompts next to long completions it is smaller.
+
+Why the step gains less than the backbones do: packing shortens the two backbones' passes, by the share of forwarded tokens it removes (a 300-token prompt under eight 300-token completions: 2700 tokens instead of 4800). The rollout and the output-head work of the loss (one projection per completion token, per model) are the same in every mode, so the step gains less than the backbones do, and little when prompts are short next to the completions.
 
 ### Sparse teacher targets and token selection
 

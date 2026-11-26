@@ -286,7 +286,7 @@ With ρ = π_θ/μ the ratio of the trained policy to the sampler on a token, A 
 | `icepop` | S · ρ inside [`icepop_low`, `icepop_high`], zero outside | The sampler and the trainer disagree on a few tokens (MoE routing, quantized rollouts) | Ring-1T (2510.18855, Oct 2025) |
 | `gspo` | one ratio per sequence (geometric mean of ρ), clipped at 1 ± `gspo_eps` | Token ratios are too noisy (long sequences, MoE); aggregation is then fixed per sequence | GSPO (2507.18071, Jul 2025) |
 | `ipo` | S · min(ρ, `is_cap`) where \|π_θ - μ\| ≤ `ipo_eps`, zero outside | Stale or mismatched rollouts where a ratio mask misfires: it drops a rare token moving 0.01 → 0.06 and keeps a likely one falling 0.9 → 0.2. Newer and less tested than the rows above | prime-rl's IPO (its algorithm docs, Oct 2026), after DPPO (2602.04879, Feb 2026); the published form has no cap on ρ, `is_cap` is kept here because a bounded difference does not bound the ratio of a rare token |
-| `decoupled` | S · W(π_prox/μ) · (π_θ/π_prox) inside the clip on π_θ/π_prox, zero outside | Stale rollouts (`max_staleness` 4 to 8): staleness is a weight, the clip is centred on a proximal policy; with `proximal: step` the gradient is `cispo`'s. Tested on CPU only ([Asynchronous RL](#asynchronous-rl-at-high-staleness)) | AReaL (2505.24298, May 2025) |
+| `decoupled` | S · W(π_prox/μ) · (π_θ/π_prox) inside the clip on π_θ/π_prox, zero outside | Stale rollouts (`max_staleness` 4 to 8): staleness is a weight, the clip is centred on a proximal policy; with `proximal: step` the gradient is `cispo`'s. Tested on CPU; one GPU check gave no gain at this scale ([Asynchronous RL](#asynchronous-rl-at-high-staleness)) | AReaL (2505.24298, May 2025) |
 | `reinforce` | S · 1 | On-policy runs where you want the plain score-function estimator, e.g. as a baseline for the others | REINFORCE; with `loss.baseline: leave_one_out`, RLOO (2402.14740, Feb 2024) |
 
 `reinforce` has no ratio, so it is the policy gradient only on samples of the policy being trained. It is refused with `rollout.max_staleness > 0` (older versions sampled part of the batch; `cispo` is the same estimator with the ratio) and with `rollout.think_skip` (a forced token needs its importance weight), and warns with FP8 rollouts. With `max_staleness: 0` every batch is sampled by the weights that train on it, so what it leaves uncorrected is the numerical difference between vLLM and the trainer: `policy/mismatch_k3` still reports it and `loss.seq_mask` still drops the trajectories where it is large. On-policy the other token-level objectives reduce to the same gradient wherever ρ is 1; they differ in what they do with the mismatch. Unclipped REINFORCE on off-policy samples has been reported to collapse (2509.24203, Sep 2025), which is why staleness is an error here and not a warning.
@@ -689,7 +689,8 @@ Measured on Qwen3.5-0.8B, GSM8K, one A100 (32 prompts x 8 rollouts per step): 92
 long reasoning) or engines on other GPUs, the trainer still waits for rollouts most of the time; staleness 4 to 8
 keeps both sides busy, and then four things decide whether the run stays stable and fast. Each is an option; the
 defaults are unchanged. Everything in this section is tested on CPU (`tests/test_rl_async.py`,
-`tests/test_rl_pool_safe.py`); GPU validation is pending: `scripts/gpu_checks/async_rl.sh`.
+`tests/test_rl_pool_safe.py`); the one GPU check so far is [at the end of this section](#measured-on-a-gpu)
+(`scripts/gpu_checks/async_rl.sh`).
 
 ### The decoupled objective
 
@@ -732,9 +733,11 @@ loss:
 Watch `policy/behaviour_weight` (mean capped ω: near 1 when the data is fresh), `policy/behaviour_capped` (share of
 tokens above `is_cap`), `policy/proximal_dev` (mean |u − 1|; 0 with `step`) and `policy/clipped`.
 
-Pre-registered check, not run yet: decoupled at staleness 8 gains at least 1.2× the on-policy run's evaluation
-reward per minute and ends within 1 point of it; if `masked_is` at staleness 8 already does, the objective is not
-needed for that workload (`scripts/gpu_checks/async_rl.sh` reports which).
+Pre-registered check: decoupled at staleness 8 gains at least 1.2x the on-policy run's evaluation reward per
+minute and ends within 1 point of it; if `masked_is` at staleness 8 already does, the objective is not needed
+for that workload (`scripts/gpu_checks/async_rl.sh` reports which). The measurement is [below](#measured-on-a-gpu):
+**decoupled gave no gain at this scale, so it stays opt-in; use it only when you have measured that `masked_is`
+at your staleness falls short.**
 
 ### Generations in flight at an update
 
@@ -762,6 +765,27 @@ version leave the loss (`policy/stale_masked`).
 engine steps; remote: staged and sent at once) instead of when the producer starts its next batch, so the rest of
 the batch being collected samples newer weights. Under FSDP the trainer already pushes after its step but waits
 for the batch being collected to end first (a per-step wait of up to one batch of rollouts); `publish` removes it.
+
+### Measured on a GPU
+
+One A100, Qwen3.5-0.8B on GSM8K, about 40 steps, a single seed per arm; the evaluation's standard error is
+0.021, so differences of a few points between arms are within noise:
+
+| Arm | Evaluation gain per minute | Final evaluation |
+|---|---:|---:|
+| on-policy `masked_is` | 0.0134 | 0.680 |
+| `masked_is`, staleness 8 | 0.0161 (1.20x) | 0.641 |
+| `decoupled` (proximal reference), staleness 8 | 0.0125 | 0.609 |
+| `rollout.inflight: tag`, staleness 8 | 0.0171 (1.27x) | 0.666 |
+
+- Staleness 8 with `masked_is` reaches the 1.2x speed-up target, at a final evaluation 3.9 points below the
+  on-policy run (about two standard errors). `inflight: tag` is a little faster and ends closer (1.4 points).
+- **`decoupled` gave no gain at this scale**: it was slower per minute than the on-policy run and ended lowest.
+  Keep `loss.type: masked_is` as the default for asynchronous runs; `decoupled` stays opt-in.
+- The `vllm_server` arms did not fit on one GPU next to the other jobs on it, so the engine-in-another-process
+  path is unmeasured here.
+- One seed, one model and one task: this shows that staleness 8 pays for itself in wall-clock time on this
+  workload, not that the arms differ from each other beyond noise.
 
 ### Fail-safe weight pushes to engines in other processes
 
