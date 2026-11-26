@@ -806,6 +806,11 @@ class OPDConfig:
             errors.append(f"train.lr_scheduler must be 'cosine' or 'constant', got {self.train.lr_scheduler!r}.")
 
         errors.extend(self.eval_tasks.errors())
+        errors.extend(
+            self.eval_tasks.trainer_errors(
+                save_steps=self.train.save_steps, eval_every=self.train.eval_every, trainer="distill"
+            )
+        )
         if errors:
             raise OPDConfigError(
                 "OPD configuration has incompatible settings:\n" + "\n".join(f"  ✗ {e}" for e in errors)

@@ -1281,6 +1281,13 @@ class RLConfig:
             warnings.append(f"train.learning_rate {t.learning_rate}: RL recipes use 5e-7 to 2e-6.")
 
         errors.extend(self.eval_tasks.errors())
+        errors.extend(
+            self.eval_tasks.trainer_errors(
+                save_steps=self.train.save_steps, eval_every=self.train.eval_every, trainer="rl"
+            )
+        )
+        if self.eval_tasks.is_async and self.scenario.type:
+            errors.append("eval_tasks.placement async is not supported with multi-role scenarios yet.")
         if errors:
             raise RLConfigError("RL configuration has incompatible settings:\n" + "\n".join(f"  ✗ {x}" for x in errors))
         return warnings

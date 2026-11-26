@@ -1098,6 +1098,15 @@ class Config:
             )
 
         errors.extend(self.eval_tasks.errors())
+        errors.extend(
+            self.eval_tasks.trainer_errors(
+                save_steps=self.train.save_steps,
+                eval_every=self.data.eval_every,
+                tp_degree=self.parallel.tp_degree,
+                pp_degree=self.parallel.pp_degree,
+                trainer="train",
+            )
+        )
 
         # ── Raise on errors ───────────────────────────────────────────────
         if errors:

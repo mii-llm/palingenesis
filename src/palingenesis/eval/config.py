@@ -70,6 +70,11 @@ ENGINE_DEFAULTS = {"backend": "vllm", "gpu_memory_utilization": 0.9, "max_model_
 #   speculative_config     vLLM's speculative decoding configuration, passed through
 #   max_logprobs           next-token candidates a loglikelihood request may read at once (default 32)
 EVAL_ENGINE_KEYS = ("replicas", "devices", "tensor_parallel_size", "speculative_config", "max_logprobs")
+# eval_tasks.engine options of an asynchronous evaluator (palingenesis.eval.service)
+ASYNC_ENGINE_KEYS = (
+    "backend", "gpu_memory_utilization", "max_model_len", "max_num_seqs", "prefix_caching", "enforce_eager",
+    "vllm_args", "sglang_args", "kv_cache_dtype", "fp32_head", *EVAL_ENGINE_KEYS,
+)  # fmt: skip
 OUTPUTS = ("generate", "choices")
 TEMPLATES = ("chat", "completion")
 BACKENDS = ("vllm", "sglang", "hf")
@@ -189,16 +194,137 @@ class EvalTasksConfig:
     sampling: dict = field(default_factory=dict)
     save_samples: bool = False
     final: bool = True  # also at the last step
+    # Where the evaluation runs (palingenesis.eval.async_eval). inline: in the trainer, which pauses for it (pgs rl /
+    # distill: on the rollout engine; pgs train: on the model itself, one process only). async: a separate process on
+    # GPUs the trainer does not use (refused on a GPU that trains), fed with the weights; training never waits for it.
+    placement: str = "inline"
+    # async, exactly one of: `devices`, GPUs of rank 0's node (indices in the view of the shell that ran torchrun)
+    # where rank 0 starts the evaluator; `service`, an evaluator started elsewhere: "auto" (found through
+    # <output_dir>/eval_tasks/service.json, `pgs eval serve` / `pgs eval watch`) or "host:port" (`pgs eval serve`).
+    devices: list = field(default_factory=list)
+    service: str = ""
+    # push: the weights in memory, staged in pinned host memory on rank 0 (2 bytes per parameter) and sent over TCP.
+    # checkpoint: the evaluator reads the checkpoints train.save_steps writes (`every` a multiple of save_steps).
+    transport: str = "push"
+    engine: dict = field(default_factory=dict)  # the evaluator's engine: `pgs eval`'s engine: section
+    final_timeout_s: float = 3600.0  # after the last step, how long the trainer waits for its result (0: not at all)
+    push_gbps: float = 0.0  # push: a cap on the send rate in gigabits per second (0: none)
+    # checkpoint: the metric (<task>/<mode>/score) whose best step the evaluator records in best_tasks.json; the
+    # checkpoint purge keeps that step. Never read by the trainer.
+    select: str = ""
+    backlog: str = "latest"  # checkpoint: latest (the newest checkpoint not evaluated) | all (every one, in order)
 
     @property
     def enabled(self) -> bool:
         return bool(self.tasks)
 
+    @property
+    def is_async(self) -> bool:
+        return bool(self.tasks) and self.placement == "async"
+
+    def device_list(self) -> list[int]:
+        devices = self.devices
+        if isinstance(devices, str):
+            devices = [d for d in devices.split(",") if d.strip()]
+        if isinstance(devices, int):
+            devices = [devices]
+        return [int(d) for d in devices or []]
+
+    def placement_errors(self) -> list[str]:
+        """What is wrong with placement / devices / service / transport and the options that go with them."""
+        out = []
+        async_only = {
+            "devices": bool(self.devices),
+            "service": bool(self.service),
+            "engine": bool(self.engine),
+            "transport": self.transport != "push",
+            "push_gbps": bool(self.push_gbps),
+            "select": bool(self.select),
+            "backlog": self.backlog != "latest",
+        }
+        if self.placement not in ("inline", "async"):
+            return [f"eval_tasks.placement must be inline or async, got {self.placement!r}."]
+        if self.placement == "inline":
+            used = [k for k, v in async_only.items() if v]
+            if used:
+                out.append(f"eval_tasks.{', eval_tasks.'.join(used)}: only used with eval_tasks.placement async.")
+            return out
+        if bool(self.devices) == bool(self.service):
+            out.append(
+                "eval_tasks.placement async needs exactly one of eval_tasks.devices (GPUs of this node for an evaluator "
+                "the trainer starts) or eval_tasks.service (auto, or host:port of `pgs eval serve`)."
+            )
+        try:
+            devices = self.device_list()
+            if any(d < 0 for d in devices) or len(set(devices)) != len(devices):
+                out.append(f"eval_tasks.devices must be distinct GPU indices >= 0, got {self.devices!r}.")
+        except (TypeError, ValueError):
+            out.append(f"eval_tasks.devices must be a list of GPU indices, got {self.devices!r}.")
+        if self.service and self.service != "auto":
+            host, _, port = str(self.service).rpartition(":")
+            if not host or not port.isdigit():
+                out.append(f"eval_tasks.service must be auto or host:port, got {self.service!r}.")
+        if self.transport not in ("push", "checkpoint"):
+            out.append(f"eval_tasks.transport must be push or checkpoint, got {self.transport!r}.")
+        if self.service and self.service != "auto" and self.transport == "checkpoint":
+            out.append(
+                "eval_tasks.transport checkpoint finds its evaluator through the output directory: eval_tasks.service "
+                "auto (or devices), not host:port."
+            )
+        if self.final_timeout_s < 0 or self.push_gbps < 0:
+            out.append("eval_tasks.final_timeout_s and eval_tasks.push_gbps must be >= 0.")
+        if self.push_gbps and self.transport != "push":
+            out.append("eval_tasks.push_gbps is only used with eval_tasks.transport push.")
+        if self.backlog not in ("latest", "all"):
+            out.append(f"eval_tasks.backlog must be latest or all, got {self.backlog!r}.")
+        elif self.backlog == "all" and self.transport != "checkpoint":
+            out.append("eval_tasks.backlog all needs eval_tasks.transport checkpoint (pushed weights are not kept).")
+        if self.select:
+            if self.transport != "checkpoint":
+                out.append(
+                    "eval_tasks.select needs eval_tasks.transport checkpoint: the selected step's weights must "
+                    "still exist when its score arrives."
+                )
+            if not re.fullmatch(r"[^/\s]+/[^/\s]+/[^/\s]+", self.select):
+                out.append(
+                    f"eval_tasks.select must be <task>/<mode>/<metric> (e.g. gsm8k/plain/score), got {self.select!r}."
+                )
+        unknown = sorted(set(self.engine) - set(ASYNC_ENGINE_KEYS))
+        if unknown:
+            out.append(
+                f"eval_tasks.engine: unknown option(s) {', '.join(unknown)} (known: {', '.join(ASYNC_ENGINE_KEYS)})."
+            )
+        return out
+
+    def trainer_errors(self, *, save_steps: int, eval_every: int, tp_degree: int = 1, pp_degree: int = 1,
+                       trainer: str = "") -> list[str]:  # fmt: skip
+        """Placement problems that depend on the trainer's own options."""
+        if not self.is_async:
+            return []
+        out = []
+        every = self.every or eval_every
+        if self.transport == "checkpoint":
+            if save_steps <= 0:
+                out.append("eval_tasks.transport checkpoint evaluates saved checkpoints: set train.save_steps > 0.")
+            elif not every or every % save_steps:
+                out.append(
+                    f"eval_tasks.transport checkpoint: eval_tasks.every ({every}) must be a multiple of "
+                    f"train.save_steps ({save_steps}), so every evaluated step has a checkpoint."
+                )
+            if trainer == "train" and tp_degree > 1:
+                out.append(
+                    "eval_tasks.transport checkpoint with parallel.tp_degree > 1: the sharded checkpoints keep some "
+                    "parameters in the ranks' layout; use eval_tasks.transport push."
+                )
+        if pp_degree > 1:
+            out.append("eval_tasks.placement async is not supported with parallel.pp_degree > 1 yet.")
+        return out
+
     def errors(self) -> list[str]:
         """What is wrong with the section (no data is loaded)."""
         if not self.tasks:
             return []
-        out = []
+        out = self.placement_errors()
         if self.every < 0 or self.k < 1 or self.limit < 0:
             out.append("eval_tasks: every and limit must be >= 0 and k >= 1")
         try:
@@ -289,7 +415,9 @@ class EvalConfig:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 errors.append(f"engine.{key} must be an integer >= 0, got {value!r}.")
         if self.engine.get("replicas", 1) > 1 and self.engine.get("tensor_parallel_size", 1) > 1:
-            errors.append("engine: replicas (several engines) and tensor_parallel_size (one engine) exclude each other.")
+            errors.append(
+                "engine: replicas (several engines) and tensor_parallel_size (one engine) exclude each other."
+            )
         for key in self.engine:
             if key in ENGINE_RESERVED:
                 errors.append(f"engine.{key}: set {ENGINE_RESERVED[key]} instead (sampling is per task and mode).")
