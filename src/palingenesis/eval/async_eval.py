@@ -143,8 +143,8 @@ class AsyncEval:
             return
         root = handoff.root(self.output_dir)
         root.mkdir(parents=True, exist_ok=True)
-        for stale in (handoff.RUN_END, handoff.SERVICE):
-            (root / stale).unlink(missing_ok=True)
+        # the last run's end (a resumed run goes on); service.json stays: an evaluator may have started first
+        (root / handoff.RUN_END).unlink(missing_ok=True)
         self.logged = {
             s
             for s in handoff.results(self.output_dir)
@@ -377,6 +377,33 @@ class AsyncEval:
             except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(process.pid, signal.SIGKILL)
+
+
+def full_weights(model, *, fsdp: bool, main: bool, export=None):
+    """(checkpoint name, tensor) of a model's full weights for an evaluator (pgs train, transport push). Under
+    FSDP (and tensor parallelism) the full state is gathered to rank 0's host memory as save_final does: a
+    collective every rank takes part in by iterating this generator (the other ranks get nothing), with the host
+    memory of one full copy of the model on rank 0. export(state): the trainer's export (tensor-parallel layout,
+    plugins). Only the names of the model's parameters are kept (no tied copies, no buffers)."""
+    from palingenesis.checkpoint import hf_state_dict
+    from palingenesis.opd.rollout import checkpoint_named_parameters
+
+    inner = getattr(model, "_orig_mod", model)
+    if fsdp:
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+        state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        if not main:
+            return
+    else:
+        state = {name: tensor.detach() for name, tensor in model.state_dict().items()}
+    state = hf_state_dict(state)
+    if export is not None:
+        state = export(state)
+    names = {name for name, _ in checkpoint_named_parameters(inner)}
+    for name, tensor in checkpoint_named_parameters(inner, state.items()):
+        if name in names:
+            yield name, tensor
 
 
 def broadcast_flag(flag: bool, device) -> bool:

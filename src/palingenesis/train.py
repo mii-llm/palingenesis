@@ -1229,26 +1229,12 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         return export
 
     def _served_weights():
-        """The weights an asynchronous evaluator gets (eval_tasks transport push): the full state as save_final
-        gathers it (under FSDP: to rank 0's host memory, a collective on every rank), through the export (tensor
-        parallel layout, plugins), under the checkpoint names of the model's parameters."""
-        from palingenesis.checkpoint import hf_state_dict
-        from palingenesis.opd.rollout import checkpoint_named_parameters
+        """The weights an asynchronous evaluator gets (eval_tasks transport push): gathered as save_final does,
+        through the export (tensor-parallel layout, plugins); see palingenesis.eval.async_eval.full_weights."""
+        from palingenesis.eval.async_eval import full_weights
 
-        inner = getattr(model, "_orig_mod", model)
-        if is_fsdp and dist.is_initialized():
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
-            state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-            if not is_main():
-                return
-        else:
-            state = {name: tensor.detach() for name, tensor in model.state_dict().items()}
-        state = _export_to(Path(config.train.output_dir) / "eval_tasks" / ".export")(hf_state_dict(state))
-        names = {name for name, _ in checkpoint_named_parameters(inner)}  # what an engine loads (no tied copies)
-        for name, tensor in checkpoint_named_parameters(inner, state.items()):
-            if name in names:
-                yield name, tensor
+        export = _export_to(Path(config.train.output_dir) / "eval_tasks" / ".export")
+        return full_weights(model, fsdp=is_fsdp and dist.is_initialized(), main=is_main(), export=export)
 
     _best_tracker = (
         BestModelTracker(
