@@ -307,23 +307,36 @@ def teacher_diffs(batch, reference: list) -> dict:
 
 
 def equality(args) -> None:
-    import gc
-
+    """One loss per process: vLLM's sleep-mode allocator serves one engine per process, so a second trainer (another
+    loss, or fewer prompts after an out-of-memory error) cannot start its engine here. Every loss but the first, and
+    a retry with half the prompts, re-executes this script."""
     import torch
 
-    for loss in args.losses:
-        prompts, reason = min(args.prompts, 4), ""
-        while prompts >= 1:  # a batch that does not fit the free memory: fewer prompts, then SKIP
-            try:
-                equality_of(args, loss, prompts)
-                break
-            except torch.OutOfMemoryError as error:
-                reason = str(error)[:300]
-                gc.collect()
-                sync(empty=True)
-                prompts //= 2
-        else:
-            emit("equality", "SKIP", loss=loss, reason=f"out of memory at 1 prompt x {TARGET_GROUP} ({reason})")
+    loss, rest = args.losses[0], args.losses[1:]
+    prompts = min(args.prompts, 4)
+    try:
+        equality_of(args, loss, prompts)
+    except torch.OutOfMemoryError as error:
+        if prompts > 1:
+            reexec(args, [loss, *rest], prompts // 2)
+        emit("equality", "SKIP", loss=loss, reason=f"out of memory at 1 prompt x {TARGET_GROUP} ({str(error)[:300]})")
+    if rest:
+        reexec(args, rest, args.prompts)
+
+
+def reexec(args, losses: list[str], prompts: int) -> None:
+    """Replace this process by the equality part for `losses` at `prompts` prompts (a fresh CUDA context and engine)."""
+    sys.stdout.flush()
+    argv = list(sys.argv[1:])
+    for flag in ("--losses", "--prompts"):
+        if flag in argv:
+            i = argv.index(flag)
+            j = i + 1
+            while j < len(argv) and not argv[j].startswith("--"):
+                j += 1
+            del argv[i:j]
+    argv += ["--losses", *losses, "--prompts", str(prompts)]
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *argv])
 
 
 def equality_of(args, loss: str, prompts: int) -> None:
