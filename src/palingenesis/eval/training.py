@@ -76,7 +76,7 @@ class TrainingEval:
             return {}
         self.last_step = step
         try:
-            return self._run(engine, step, client)
+            return self.evaluate(engine, step, client)
         except Exception:  # noqa: BLE001 — an auxiliary evaluation must not stop a training run
             logger.exception("eval_tasks failed at step %d: switched off for the rest of the run", step)
             self.disabled = True
@@ -100,7 +100,9 @@ class TrainingEval:
             return {}
         return self.run(engine, step)
 
-    def _run(self, engine, step: int, client) -> dict[str, float]:
+    def evaluate(self, engine, step: int, client=None) -> dict[str, float]:
+        """Every task and mode with `engine` at `step`, raising what fails (run() catches it; the asynchronous
+        evaluator of palingenesis.eval.service retries or records it)."""
         from palingenesis.eval.runner import Evaluator, format_summary
         from palingenesis.eval.tasks import build_items
 

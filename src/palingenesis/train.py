@@ -349,7 +349,7 @@ def train(config: Config, plugins: list | None = None) -> TrainResult:
 
     plugins: palingenesis.hooks.TrainerPlugin objects (or "module:Class" strings), run after the ones the
     config lists in `plugins.custom`."""
-    run: dict = {"tracker": None, "plugins": plugins, "offloader": None}
+    run: dict = {"tracker": None, "plugins": plugins, "offloader": None, "async_eval": None}
     ok = False
     try:
         result = _train(config, run)
@@ -358,6 +358,8 @@ def train(config: Config, plugins: list | None = None) -> TrainResult:
     finally:
         if run["offloader"] is not None:  # its hooks on the model's layers, its pinned host memory
             run["offloader"].close()
+        if run["async_eval"] is not None:  # the push sender; a started evaluator ends by itself
+            run["async_eval"].close(wait=False)
         if run["tracker"] is not None:
             run["tracker"].finish(exit_code=0 if ok else 1)
         cleanup_distributed()
@@ -1153,7 +1155,28 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
     tracker = Tracker(config, is_main=is_main())
     # eval_tasks: `pgs eval` tasks on the model in training, by generation (palingenesis.eval.training)
     _task_eval = None
-    if config.eval_tasks.enabled and is_main():
+    _async_eval = None  # eval_tasks.placement async: an evaluator of its own (palingenesis.eval.async_eval)
+    if config.eval_tasks.is_async:
+        from palingenesis.eval.async_eval import RunInfo, make_async_eval
+
+        _async_eval = make_async_eval(
+            config.eval_tasks,
+            RunInfo(
+                trainer="train",
+                model=config.model.name_or_path,
+                output_dir=config.train.output_dir,
+                every=config.eval_tasks.every or config.data.eval_every,
+                total_steps=total_steps,
+                seed=config.train.seed,
+                max_model_len=config.data.max_seq_length,
+                checkpoints={"prefix": "step-", "complete": TRAINING_META_FILE},
+            ),
+            main=is_main(),
+            world=world_size,
+            device=device if torch.cuda.is_available() else "cpu",
+        )
+        run["async_eval"] = _async_eval  # train() closes it, also on errors
+    elif config.eval_tasks.enabled and is_main():
         if world_size > 1:
             logger.warning(
                 "eval_tasks: skipped. pgs train runs evaluation tasks on a single process only (they generate with "
@@ -1203,6 +1226,28 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
         if plugin_mgr:
             export.after_save = plugin_mgr.on_export_saved  # files next to the written model (a quantised copy)
         return export
+
+    def _served_weights():
+        """The weights an asynchronous evaluator gets (eval_tasks transport push): the full state as save_final
+        gathers it (under FSDP: to rank 0's host memory, a collective on every rank), through the export (tensor
+        parallel layout, plugins), under the checkpoint names of the model's parameters."""
+        from palingenesis.checkpoint import hf_state_dict
+        from palingenesis.opd.rollout import checkpoint_named_parameters
+
+        inner = getattr(model, "_orig_mod", model)
+        if is_fsdp and dist.is_initialized():
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+            state = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+            if not is_main():
+                return
+        else:
+            state = {name: tensor.detach() for name, tensor in model.state_dict().items()}
+        state = _export_to(Path(config.train.output_dir) / "eval_tasks" / ".export")(hf_state_dict(state))
+        names = {name for name, _ in checkpoint_named_parameters(inner)}  # what an engine loads (no tied copies)
+        for name, tensor in checkpoint_named_parameters(inner, state.items()):
+            if name in names:
+                yield name, tensor
 
     _best_tracker = (
         BestModelTracker(
@@ -2148,6 +2193,10 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         if eval_loss is not None and _best_tracker is not None:
                             _best_tracker.update(eval_loss, global_step, model, tokenizer, is_fsdp)
 
+                    if _async_eval is not None and is_main():  # evaluations that arrived, at their own steps
+                        for evaluated, results in _async_eval.poll(global_step):
+                            tracker.log({f"eval/{k}": v for k, v in results.items()}, step=evaluated)
+                        metrics.update(_async_eval.metrics())
                     tracker.log(metrics, step=global_step)
                     if is_main():
                         eval_str = (
@@ -2182,6 +2231,13 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                 if _grad_release is None:
                     optimizer.zero_grad(set_to_none=True)
 
+                # eval_tasks async, push: a snapshot of this step's weights for the evaluator (every rank: it gathers)
+                if (
+                    _async_eval is not None
+                    and global_step < total_steps
+                    and _async_eval.wants_push(global_step, total_steps)
+                ):
+                    _async_eval.push(global_step, _served_weights())
                 # eval_tasks: generation with the model itself, once the step's gradients are released
                 if _task_eval is not None and _task_eval.due(global_step, total_steps):
                     task_metrics = _task_eval.run_on_model(model, global_step)
@@ -2216,6 +2272,8 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
                         data_ranks=data_world,
                         layout=tp.layout() if tp is not None else None,
                     )
+                    if _async_eval is not None:  # transport checkpoint: leased until the evaluator loaded it
+                        _async_eval.saved(global_step, Path(config.train.output_dir) / f"step-{global_step}")
 
                 # ── Base Model Merge (SFA: anti-forgetting) ───────────
                 if _base_merge is not None and global_step % config.train.base_merge_every == 0:
@@ -2271,6 +2329,14 @@ def _train_on(config: Config, run: dict, extra_plugins, rank: int, world_size: i
             is_fsdp,
             export=_export_to(Path(config.train.output_dir) / "final"),
         )
+    if _async_eval is not None:  # the final evaluation, waited for up to eval_tasks.final_timeout_s
+        last = Path(config.train.output_dir) / f"step-{global_step}"
+        final = (
+            Path(config.train.output_dir) / "final" if config.train.save_final else (last if last.is_dir() else None)
+        )
+        named = _served_weights() if _async_eval.transport == "push" else None
+        for evaluated, results in _async_eval.finish(global_step, str(final) if final else None, named):
+            tracker.log({f"eval/{k}": v for k, v in results.items()}, step=evaluated)
     tracker.log(
         {"train/total_steps": global_step, "train/total_time_s": total_time, "train/tokens_total": tokens_total},
         step=global_step,

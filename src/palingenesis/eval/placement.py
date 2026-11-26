@@ -155,6 +155,8 @@ def child_environment(devices: list[int] | None, environ: dict | None = None) ->
     """The environment of an evaluator process started by a trainer rank: torchrun's variables removed, the
     evaluator's GPUs (indices in this environment's view) as its CUDA_VISIBLE_DEVICES."""
     environ = dict(os.environ if environ is None else environ)
+    if visible_entries(environ) == []:  # no GPU at all (CUDA_VISIBLE_DEVICES=""): a CPU run, the evaluator too
+        devices = []
     visible = [physical_entry(d, environ) for d in devices or []]
     for name in TORCHRUN_VARIABLES:
         environ.pop(name, None)
@@ -187,3 +189,26 @@ def host_memory_error(nbytes: int, available: int | None = None) -> str:
         f"more than {HOST_MEMORY_SHARE:.0%} of the {available / 2**30:.1f} GiB available. Use eval_tasks.transport "
         "checkpoint (the evaluator reads the checkpoints train.save_steps writes; no host staging)."
     )
+
+
+def local_devices_error(devices: list[int], environ: dict | None = None, listing: list[dict] | None = None) -> str:
+    """eval_tasks.devices against the GPUs this node's trainer ranks take (cuda:<LOCAL_RANK> of each torchrun
+    worker, LOCAL_WORLD_SIZE of them): "" when they are disjoint or there is no GPU to check (a CPU run)."""
+    environ = os.environ if environ is None else environ
+    listing = nvidia_devices() if listing is None else listing
+    if not listing:
+        return ""
+    entries = visible_entries(environ)
+    count = len(listing) if entries is None else len(entries)
+    missing = [d for d in devices if d >= count]
+    if missing:
+        return (
+            f"eval_tasks.devices {devices}: GPU {missing[0]} does not exist here ({count} visible"
+            + (f", CUDA_VISIBLE_DEVICES={environ.get('CUDA_VISIBLE_DEVICES')}" if entries is not None else "")
+            + ")."
+        )
+    ranks = int(environ.get("LOCAL_WORLD_SIZE") or 1)
+    training = [dict(rank_gpu(r, environ, listing), label=f"local rank {r} (GPU {r})") for r in range(ranks)]
+    found = uuids(devices, environ, listing)
+    evaluator = [{"uuid": u, "label": f"GPU {d}"} for d, u in found.items()]
+    return overlap_error(training, evaluator, single_gpu=count <= 1)

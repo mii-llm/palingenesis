@@ -137,11 +137,20 @@ class EnginePool:
     """Engine processes on local ports and the client that spreads requests over them.
 
     commands: one worker command per engine (worker_command, with its port); environments: each worker's own
-    environment variables (CUDA_VISIBLE_DEVICES). Closing the pool stops the processes it started, nothing else."""
+    environment variables (CUDA_VISIBLE_DEVICES). Closing the pool stops the processes it started, nothing else.
+    updatable: update_weights sends new weights to every engine and returns when all of them applied them (the
+    asynchronous evaluator of palingenesis.eval.service); otherwise the pool serves the checkpoint it started with."""
 
     version = 0
 
-    def __init__(self, commands: list[list[str]], ports: list[int], environments: list[dict], timeout: float = 1800.0):
+    def __init__(
+        self,
+        commands: list[list[str]],
+        ports: list[int],
+        environments: list[dict],
+        timeout: float = 1800.0,
+        updatable: bool = False,
+    ):
         from palingenesis.rl.pool.client import RemotePool
 
         self.processes: list[subprocess.Popen] = []
@@ -153,7 +162,11 @@ class EnginePool:
                 )
             watcher = threading.Thread(target=self._watch, daemon=True)
             watcher.start()
-            self.pool = RemotePool([f"127.0.0.1:{port}" for port in ports], push_to=[], connect_timeout=timeout)
+            addresses = [f"127.0.0.1:{port}" for port in ports]
+            self.updatable = updatable
+            self.pool = RemotePool(
+                addresses, push_to=None if updatable else [], blocking=updatable, connect_timeout=timeout
+            )
         except BaseException:
             self.close()
             raise
@@ -172,7 +185,10 @@ class EnginePool:
         return self.pool.make_client(merge=merge, adapter=adapter)
 
     def update_weights(self, named_tensors, version: int) -> None:
-        raise NotImplementedError("an evaluation's engine pool serves a fixed checkpoint")
+        if not getattr(self, "updatable", False):
+            raise NotImplementedError("an evaluation's engine pool serves a fixed checkpoint")
+        self.pool.update_weights(named_tensors, version)  # blocking: every engine applied it
+        self.version = version
 
     def sleep(self) -> None:
         pass
@@ -205,9 +221,21 @@ class EnginePool:
         self.processes = []
 
 
-def start_engines(model: str, config, tokenizer, stop_ids, layout: Layout, chat_template_kwargs=None, stop_tokens=()):
-    """The run's engine: one in this process (palingenesis.rl.screen's), or an EnginePool of layout.engines."""
-    if not layout.pooled:
+def start_engines(
+    model: str,
+    config,
+    tokenizer,
+    stop_ids,
+    layout: Layout,
+    chat_template_kwargs=None,
+    stop_tokens=(),
+    pooled: bool = False,
+    updatable: bool = False,
+):
+    """The run's engine: one in this process (palingenesis.rl.screen's), or an EnginePool of layout.engines.
+    pooled: an EnginePool even for one engine (its failures stay in the worker process); updatable: the pool takes
+    weight updates (EnginePool)."""
+    if not (layout.pooled or pooled):
         if layout.devices:
             os.environ["CUDA_VISIBLE_DEVICES"] = _device_name(layout.devices[0])
         from palingenesis.eval.runner import build_engine
@@ -225,7 +253,7 @@ def start_engines(model: str, config, tokenizer, stop_ids, layout: Layout, chat_
         "engine pool: %d engines (%d per GPU, GPUs %s), %.2f of each GPU's memory per engine",
         len(ports), layout.replicas, layout.devices or "default", share,
     )  # fmt: skip
-    return EnginePool(commands, ports, environments)
+    return EnginePool(commands, ports, environments, updatable=updatable)
 
 
 def _device_name(index: int) -> str:
@@ -240,8 +268,8 @@ def _device_name(index: int) -> str:
 class GpuMonitor:
     """GPU utilisation and memory while a block runs, from nvidia-smi (nothing where there is none).
 
-        with GpuMonitor() as gpu: ...
-        gpu.stats()  ->  {"gpu_util_mean": 87.0, "gpu_util_max": 100.0, "gpu_memory_max_gb": 31.2}
+    with GpuMonitor() as gpu: ...
+    gpu.stats()  ->  {"gpu_util_mean": 87.0, "gpu_util_max": 100.0, "gpu_memory_max_gb": 31.2}
     """
 
     def __init__(self, interval: float = 1.0):

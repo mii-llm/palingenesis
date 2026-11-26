@@ -367,7 +367,9 @@ class OPDTrainer:
             self.plugins.load_state(self.resume_path)
         # metrics: wandb, trackio, logging.trackers; the run id is saved with each checkpoint
         self.tracker = Tracker.for_run(config.logging, dataclasses.asdict(config), config.train.output_dir, wandb_id)
-        self.task_eval = self._make_task_eval()  # eval_tasks: `pgs eval` tasks on the rollout engine
+        # eval_tasks: `pgs eval` tasks on the rollout engine (inline), or in an evaluator of their own (async)
+        self.async_eval = self._make_async_eval()
+        self.task_eval = self._make_task_eval() if self.async_eval is None else None
         self.dumps = None  # logging.dump_trajectories: the completions' writer (palingenesis.rollouts)
         if config.logging.dump_trajectories:
             self.dumps = RolloutSink(
@@ -835,6 +837,7 @@ class OPDTrainer:
                 )
                 if dumps is not None:
                     metrics[DROPPED_METRIC] = dumps.dropped
+                self._async_results(step + 1, metrics)
                 if step % config.logging.log_every == 0:
                     metrics.update(self.plugins.metrics(self.student, step + 1))
                     self._log("step", metrics, step + 1)
@@ -847,6 +850,8 @@ class OPDTrainer:
                 self._eval_tasks(step + 1, end)
                 if config.train.save_steps and (step + 1) % config.train.save_steps == 0:
                     self.save(f"step_{step + 1}", step + 1)
+                    if self.async_eval is not None:
+                        self.async_eval.saved(step + 1, Path(config.train.output_dir) / f"step_{step + 1}")
             if end < config.train.steps:  # a chunk of a longer schedule: evaluate and save the stop step, resumable
                 if config.train.eval_every and end % config.train.eval_every and end > self.start_step:
                     self._log("eval", self.evaluate(), end)
@@ -858,8 +863,11 @@ class OPDTrainer:
                     self._log("eval", self.evaluate(), config.train.steps)
                 self.plugins.on_train_end(self.student)
                 self.save("final")
+                self._async_finish(str(Path(config.train.output_dir) / "final"))
             failed = False
         finally:
+            if getattr(self, "async_eval", None) is not None:
+                self.async_eval.close(wait=False)
             self.orchestrator.stop()
             engine = getattr(self.pipeline, "engine", None)
             if isinstance(engine, (SGLangRollout, SGLangServerRollout)):
@@ -920,9 +928,63 @@ class OPDTrainer:
             seed=config.train.seed,
         )
 
+    def _make_async_eval(self):
+        """eval_tasks.placement async (palingenesis.eval.async_eval)."""
+        config = self.config
+        if not config.eval_tasks.is_async:
+            return None
+        from palingenesis.eval.async_eval import RunInfo, make_async_eval
+
+        info = RunInfo(
+            trainer="distill",
+            model=config.model.student,
+            output_dir=config.train.output_dir,
+            every=config.eval_tasks.every or config.train.eval_every,
+            total_steps=config.train.steps,
+            start_step=self.start_step,
+            chat_template_kwargs=config.model.chat_template_kwargs,
+            stop_tokens=config.model.stop_tokens,
+            seed=config.train.seed,
+            max_model_len=config.rollout.max_model_len,
+            base_step=True,
+            checkpoints={"prefix": "step_", "complete": TRAINER_STATE_FILE},
+        )
+        return make_async_eval(config.eval_tasks, info, main=True, device=self.device)
+
+    def _served_weights(self):
+        """The student's weights under their checkpoint names, as the rollout engine gets them."""
+        from palingenesis.opd.rollout import checkpoint_named_parameters
+
+        with self.weights.lock:
+            yield from (
+                self.weights.named() if self.weights.named is not None else checkpoint_named_parameters(self.student)
+            )
+
+    def _async_results(self, step: int, metrics: dict | None = None) -> None:
+        evaluator = getattr(self, "async_eval", None)
+        if evaluator is None:
+            return
+        for evaluated, results in evaluator.poll(step):
+            self._log("eval", results, evaluated)
+        if metrics is not None:
+            metrics.update(evaluator.metrics())
+
+    def _async_finish(self, final: str) -> None:
+        evaluator = getattr(self, "async_eval", None)
+        if evaluator is None:
+            return
+        named = self._served_weights() if evaluator.transport == "push" else None
+        for evaluated, results in evaluator.finish(self.config.train.steps, final, named):
+            self._log("eval", results, evaluated)
+
     def _eval_tasks(self, step: int, end: int) -> None:
         """Run the eval_tasks: tasks when they are due at `step`, with the newest weights in the rollout engine,
         under the pipeline's lock (no training rollout is generated meanwhile)."""
+        evaluator = getattr(self, "async_eval", None)
+        if evaluator is not None:
+            if step < self.config.train.steps and evaluator.wants_push(step, self.config.train.steps):
+                evaluator.push(step, self._served_weights())
+            return
         task_eval = getattr(self, "task_eval", None)  # subclasses with their own __init__
         if task_eval is None or not task_eval.due(step, end):
             return
@@ -1125,8 +1187,14 @@ def prunable_checkpoints(output_dir: str, keep: int) -> list[str]:
     complete = checkpoint_steps(output_dir)
     if keep <= 0 or len(complete) < keep:
         return []
+    from palingenesis.eval.handoff import held
+
     oldest_kept = int(os.path.basename(complete[-keep])[5:])
-    return [p for p in checkpoint_steps(output_dir, complete=False) if int(os.path.basename(p)[5:]) < oldest_kept]
+    return [
+        p
+        for p in checkpoint_steps(output_dir, complete=False)
+        if int(os.path.basename(p)[5:]) < oldest_kept and not held(p, output_dir)  # an evaluator still reads it
+    ]
 
 
 def resolve_resume(resume_from: str, output_dir: str) -> str | None:

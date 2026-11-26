@@ -190,6 +190,12 @@ class EngineWorker:
         self.receiving = False
         self.server: asyncio.AbstractServer | None = None
         self.stopping = asyncio.Event()
+        try:
+            from palingenesis.eval.service import own_gpus
+
+            self.gpus = [g["uuid"] for g in own_gpus()]
+        except Exception:  # noqa: BLE001 — no nvidia-smi: a CPU worker
+            self.gpus = []
 
     @property
     def version(self) -> int:
@@ -305,6 +311,7 @@ class EngineWorker:
             "rejected": self.rejected,
             "restored": self.restored,
             "linked": self.link is not None,
+            "gpus": self.gpus,  # its GPUs' UUIDs: an asynchronous evaluator must not run on them
         }
         # the engine's load, for a trainer's rollout.concurrency kv (palingenesis.rl.concurrency): KV-cache usage,
         # requests waiting and running, KV-cache tokens; engines that cannot tell report nothing

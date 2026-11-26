@@ -5,6 +5,8 @@
     pgs eval --model M --tasks path/to/lm_eval/tasks/gsm8k/gsm8k.yaml  # a task of lm-evaluation-harness, as it is
     pgs eval --config eval.yaml                       # model, engine, run, sampling, modes, tasks
     pgs eval --list                                   # the built-in tasks and suites
+    pgs eval watch runs/sft                           # a training run's eval_tasks, asynchronous: its checkpoints
+    pgs eval serve --dir runs/rl                      # ... or the weights it pushes (palingenesis.eval.service)
 
 Every (task, mode) pair is one result: <out>/<task>.<mode>.jsonl in the `pgs compare` format (plus
 .samples.jsonl and .summary.json), and <out>/summary.json for the run. Compare two checkpoints, or two modes:
@@ -39,7 +41,9 @@ def _parser() -> argparse.ArgumentParser:
         "--tasks", help="comma-separated built-in task names or task YAML files (ours or lm-eval's; globs expand)"
     )
     parser.add_argument("--suite", help="a built-in suite (core, quick, ...; see --list) or a suite YAML file")
-    parser.add_argument("--template", choices=("chat", "completion"), help="every task through the chat template, or as raw text")
+    parser.add_argument(
+        "--template", choices=("chat", "completion"), help="every task through the chat template, or as raw text"
+    )
     parser.add_argument("--num_fewshot", type=int, help="lm-eval tasks: few-shot examples (default: the task's)")
     parser.add_argument("--replicas", type=int, help="engines per GPU (data parallel; small models on a large GPU)")
     parser.add_argument("--devices", help="comma-separated GPU indices, one engine each (default: all visible)")
@@ -243,7 +247,9 @@ def run(config, cli_sampling=None, engine=None, tokenizer=None) -> dict:
                 config.model.stop_tokens,
             )
             engine_seconds = time.perf_counter() - t0
-            logger.info("engine ready in %.1fs (%d engine%s)", engine_seconds, layout.engines, "s"[: layout.engines > 1])
+            logger.info(
+                "engine ready in %.1fs (%d engine%s)", engine_seconds, layout.engines, "s"[: layout.engines > 1]
+            )
         for task in config.tasks:
             for mode in task.modes or r.modes:
                 summary = evaluator.run(
@@ -297,7 +303,12 @@ def main(argv: list[str] | None = None) -> int:
     from palingenesis.eval.config import EvalConfigError
     from palingenesis.logging import setup_logging
 
-    args, overrides = _parser().parse_known_args(sys.argv[1:] if argv is None else argv)
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("watch", "serve"):  # the asynchronous evaluator of a training run's eval_tasks
+        from palingenesis.eval.service import main as service_main
+
+        return service_main(argv)
+    args, overrides = _parser().parse_known_args(argv)
     if args.list:
         return _list_tasks()
     setup_logging(rank=0)

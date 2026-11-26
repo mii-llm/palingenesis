@@ -318,6 +318,12 @@ class EvalTasksConfig:
                 )
         if pp_degree > 1:
             out.append("eval_tasks.placement async is not supported with parallel.pp_degree > 1 yet.")
+        if self.devices and not self.placement_errors():
+            from palingenesis.eval.placement import local_devices_error
+
+            error = local_devices_error(self.device_list())  # checked before any model is loaded
+            if error:
+                out.append(error)
         return out
 
     def errors(self) -> list[str]:

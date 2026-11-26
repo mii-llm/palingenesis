@@ -795,9 +795,11 @@ def _purge_old_checkpoints(output_dir: str, keep_latest_k: int):
     if len(checkpoints) <= keep_latest_k:
         return
 
-    # Sort by step number, delete oldest
+    # Sort by step number, delete oldest (not one an asynchronous evaluator still has to read, or its best step)
+    from palingenesis.eval.handoff import held
+
     checkpoints.sort(key=lambda x: x[0])
-    to_delete = checkpoints[:-keep_latest_k]
+    to_delete = [(n, d) for n, d in checkpoints[:-keep_latest_k] if not held(d, output_dir)]
 
     for step_num, path in to_delete:
         try:
