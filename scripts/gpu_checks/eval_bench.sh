@@ -22,7 +22,7 @@
 # time (prepare_seconds of its report) is added back to its evaluation seconds, so that no harness has its task
 # preparation left out. End-to-end seconds are reported too. All harnesses import torch and vLLM from the environment of PGS_PY:
 # lm-eval and lighteval are installed into a venv under WORK that sees that environment's packages
-# (--system-site-packages) and may not change any of them (pip constraints from its `pip freeze`); no other
+# (a .pth file listing its site-packages) and may not change any of them (pip constraints from its `pip freeze`); no other
 # environment is touched. A harness that cannot be installed or run is a SKIP line with the reason.
 #
 # Pre-registered targets (evaluation seconds):
@@ -211,7 +211,13 @@ VPY="$VENV/bin/python"
 LMEVAL_OK=0
 LIGHTEVAL_OK=0
 if has "$HARNESSES" lmeval || has "$HARNESSES" lighteval; then
-  "$PGS_PY" -m venv --system-site-packages "$VENV" >"$WORK/venv.log" 2>&1
+  # --system-site-packages would expose the BASE interpreter's packages, not PGS_PY's environment (a venv's own
+  # site-packages are not "system" ones): a .pth file appends PGS_PY's site-packages after the new venv's own, so
+  # lm-eval / lighteval resolve from the venv and torch / vLLM from PGS_PY's environment.
+  "$PGS_PY" -m venv "$VENV" >"$WORK/venv.log" 2>&1
+  "$PGS_PY" -c "import sysconfig; print(sysconfig.get_paths()['purelib']); print(sysconfig.get_paths()['platlib'])" \
+    | sort -u >"$("$VPY" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/zz_pgs_environment.pth"
+  "$VPY" -c "import torch, vllm" >>"$WORK/venv.log" 2>&1 || echo "the competitors' venv cannot import torch / vllm" >>"$WORK/venv.log"
   "$PGS_PY" -m pip freeze 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+==' >"$WORK/constraints.txt"
   if has "$HARNESSES" lmeval; then
     if HF_HUB_OFFLINE=0 "$VPY" -m pip install -q -c "$WORK/constraints.txt" "lm-eval==$LMEVAL_VERSION" >"$WORK/pip_lmeval.log" 2>&1 \

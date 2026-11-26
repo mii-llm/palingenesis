@@ -170,16 +170,18 @@ def forward_loglikelihoods(model, pad_id: int, pairs: list[tuple[list[int], list
                     mask[r, : len(row)] = 1
                 with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     logits = model(input_ids=ids.to(device), attention_mask=mask.to(device)).logits
-                logprobs = torch.log_softmax(logits.float(), dim=-1).cpu()
+                # Only the continuation's positions are normalised (in fp32, on the device): a full-vocabulary
+                # log_softmax over every position of the batch is [batch, width, vocab] fp32 (~22 GiB at 8 x 2k x 250k).
                 for r, i in enumerate(chunk):
                     context, continuation = pairs[i]
-                    positions = torch.arange(len(context) - 1, len(context) + len(continuation) - 1)
-                    targets = torch.tensor(continuation)
-                    steps = logprobs[r, positions]
+                    first = len(context) - 1
+                    steps = torch.log_softmax(logits[r, first : first + len(continuation)].float(), dim=-1)
+                    targets = torch.tensor(continuation, device=steps.device)
                     out[i] = (
                         float(steps.gather(1, targets[:, None]).sum()),
                         bool((steps.argmax(-1) == targets).all()),
                     )
+                del logits
     finally:
         model.train(was_training)
     return out
