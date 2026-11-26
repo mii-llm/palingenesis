@@ -8,8 +8,10 @@ Pre-registered criteria (async_eval.sh runs the arms):
   step_time     the wall-clock time per step of `push` over steps 10..STEPS is within 2 % of `none` (the same run
                 without eval_tasks); the snapshot at due steps is included (eval/async/snapshot_seconds, reported)
   snapshot      eval/async/snapshot_seconds <= 1 s for a 0.8B model (INFO for other models)
-  losses        train/loss of `push`, `checkpoint` and `oom` equal `none` step by step: relative difference
-                <= max(1e-6, the floor measured between two `none` runs)
+  losses        train/loss of `push`, `checkpoint` and `oom` is bit-identical to `none` at every step where two
+                `none` runs are (seeded runs agree exactly until a kernel choice differs, e.g. a Triton autotune
+                near-tie on a new shape; async_eval.sh persists autotune choices to remove that); the comparison
+                must cover at least one evaluation (the first divergence of the `none` runs after EVERY)
   refusal       eval_tasks.devices naming the trainer's GPU stops the run before any model loads, with the message
   oom           an evaluator whose every evaluation runs out of memory (PGS_TEST_EVAL_OOM=always; on MIG / two GPUs
                 also a real one, `real_oom`) never stops training: exit 0, every step done, losses as `none`
@@ -79,6 +81,11 @@ def config(arm: str, out: str, base: str, work: str, mode: str) -> None:
     raw.setdefault("model", {})
     if env.get("MODEL"):
         raw["model"]["name_or_path"] = env["MODEL"]
+    if raw["model"].get("attn_implementation") == "flash_attention_2":
+        import importlib.util
+
+        if importlib.util.find_spec("flash_attn") is None and importlib.util.find_spec("kernels") is None:
+            raw["model"]["attn_implementation"] = "sdpa"  # what the trainer would refuse to start without
     raw.setdefault("data", {}).update(
         {"dataset": env["DATA"], "streaming": False, "eval_dataset": "", "eval_every": every}
     )
@@ -152,6 +159,14 @@ def _loss_diff(a: dict, b: dict) -> float | None:
     return max(abs(a[k]["loss"] - b[k]["loss"]) / max(abs(b[k]["loss"]), 1e-12) for k in common)
 
 
+def _first_divergence(a: dict, b: dict) -> int | None:
+    """The first step where the two runs' losses differ in any bit (None: identical wherever both logged)."""
+    for k in sorted(set(a) & set(b)):
+        if a[k]["loss"] != b[k]["loss"]:
+            return k
+    return None
+
+
 def verdict(work: str) -> int:
     work = Path(work)
     steps_wanted = int(os.environ.get("STEPS", "300"))
@@ -165,8 +180,11 @@ def verdict(work: str) -> int:
         return int(path.read_text().strip()) if path.exists() else None
 
     none = _steps(_metrics(work, "none"))
-    floor = _loss_diff(_steps(_metrics(work, "none2")), none) if (work / "none2").exists() else None
-    tolerance = max(1e-6, floor or 0.0)
+    none2 = _steps(_metrics(work, "none2")) if (work / "none2").exists() else {}
+    floor = _loss_diff(none2, none) if none2 else None
+    # steps before the `none` runs' own first divergence are where any difference is the evaluator's
+    reproducible_until = (_first_divergence(none2, none) or steps_wanted + 1) if none2 else steps_wanted + 1
+    every = int(os.environ.get("EVERY", "50"))
     base_time = _per_step(none)
     for arm in ("push", "checkpoint", "oom", "real_oom", "inline"):
         if not (work / arm).exists():
@@ -176,8 +194,11 @@ def verdict(work: str) -> int:
         complete = exit_code(arm) == 0 and done >= steps_wanted
         if arm != "inline":
             diff = _loss_diff(steps, none)
-            ok = complete and diff is not None and diff <= tolerance
-            emit(f"losses/{arm}", "PASS" if ok else "FAIL", max_rel_diff=diff, tolerance=tolerance,
+            diverged = _first_divergence({k: v for k, v in steps.items() if k < reproducible_until}, none)
+            informative = reproducible_until > every
+            ok = complete and diff is not None and diverged is None and informative
+            emit(f"losses/{arm}", "PASS" if ok else "FAIL", bit_identical_through=reproducible_until - 1,
+                 first_divergence=diverged, informative=informative, max_rel_diff=diff,
                  floor_between_none_runs=floor, exit=exit_code(arm), last_step=done)  # fmt: skip
         per_step = _per_step(steps)
         if base_time and per_step:
