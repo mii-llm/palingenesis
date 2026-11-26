@@ -36,7 +36,6 @@ def engine_registration():
     """What vLLM's get_config does for a qwen3_5 checkpoint: AutoConfig.register(model_type, its own class)."""
     from transformers import AutoConfig
     from transformers.models.auto import configuration_auto
-
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 
     text = type("Qwen3_5TextConfig", (Qwen3_5TextConfig,), {"__module__": "vllm.transformers_utils.configs.qwen3_5"})
