@@ -195,6 +195,10 @@ Training issue?
 │   ├── Your own task: a YAML file (dataset, fields, prompt, scorer; env: for agentic tasks, the RL config's
 │   │   section); scorers: exact_match, numeric, mcq, regex_match, json_schema, function_call, ifeval, any RL
 │   │   reward (math, code, judge with judge_validation), module:function (see the Evaluation guide)
+│   ├── Training must not pause for it (spare GPUs / nodes): eval_tasks.placement async + devices: [6, 7] (this
+│   │   node) or service: auto (pgs eval serve / watch elsewhere; Slurm: EVAL_NODES=1 scripts/train_slurm.sh);
+│   │   transport checkpoint for large models; refused on a GPU that trains; watch eval/async/alive, lag_steps;
+│   │   evaluator errors in <output_dir>/eval_tasks/service.log; after training: pgs eval watch <output_dir> --once
 │   ├── During training: eval_tasks: {tasks: [...], every: N, limit: 200} in the pgs train / rl / distill config;
 │   │   watch eval/tasks/<task>/<mode>/score, compare <output_dir>/eval_tasks/step_<n>/ files with pgs compare
 │   └── A gain on a public benchmark only: check the training data for its test items (contamination)

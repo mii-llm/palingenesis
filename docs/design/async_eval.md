@@ -1,6 +1,51 @@
 # Asynchronous in-training evaluation (design)
 
-Status: design, not implemented. Base: main `beb4882`.
+Status: approved with amendments and implemented (CPU-tested; GPU check `scripts/gpu_checks/async_eval.sh` not
+run yet). Base: main `beb4882`.
+
+## 0. Amendments and how it was built (read this first)
+
+Owner's amendments:
+
+1. **`transport: checkpoint` is in v1 and was built first.** `pgs eval watch <output_dir>` evaluates the run's
+   checkpoints. The trainer only leases a due checkpoint (`.eval_pending`). DCP checkpoints are consolidated by the
+   evaluator from the `model.*` keys. Push would need 2 bytes per parameter pinned on rank 0 (140 GB for 70B), so
+   large models have an async path only through checkpoints.
+2. **Cost is stated, never claimed zero.** At a due step, push copies the weights into the staging area on the
+   training thread. In `pgs train` under FSDP it first gathers the full state to rank 0, as `save_final` does. That
+   time is logged as `eval/async/snapshot_seconds` and measured by the GPU check.
+3. **MIG is the only way to share a physical GPU**, with no reserved-budget mode. Metrics stay informational. With
+   `transport: checkpoint`, `eval_tasks.select: <task>/<mode>/<metric>` writes `best_tasks.json` (higher is better)
+   and the purge keeps that step. `final_timeout_s` defaults to 3600, and 0 returns at once. One service per run,
+   with `service*.json` and per-step `result.json` left open to several. The host-memory refusal points to
+   `transport: checkpoint`.
+4. **One GPU:** async is refused with the message of section 3, which also names `pgs eval watch`.
+
+Where the implementation differs from the sections below:
+
+- **No push receiver refactored out of `EngineWorker`.** The evaluator's receiver is `palingenesis.eval.push.Receiver`
+  (two host areas, newest wins). `EngineWorker` only reports its GPU UUIDs (`state()["gpus"]`).
+- **No tee of the per-step gather in `pgs rl` under FSDP.** A due step gathers once more (`_served_weights`, the
+  same path as `_push_weights`).
+- **No side-stream overlap of the copy.** The snapshot is synchronous at due steps (`snapshot_seconds`). The overlap
+  stays a possible optimisation if the GPU check shows the cost matters.
+- **Results reach the trainer two ways:** from `step_<n>/result.json` on a shared file system, and as `result`
+  frames over the push connection without one. The spec travels in the push `hello`, so `pgs eval serve` needs no
+  training config.
+- **The evaluator's engine runs in `rl.pool.worker` processes** (`EnginePool(updatable=True)`) for vLLM / SGLang,
+  and in-process for `hf`. An OOM restarts it smaller twice, then the step fails; three failed steps in a row stop
+  the evaluator.
+- **Not built yet:** multi-role `role:` (async is refused with scenarios), several services per run, a per-rank shard
+  push, and the NCCL link.
+- **Prior art:** only the verified citations went into the public guide (TRL server mode, LLM Foundry `AsyncEval`,
+  W&B `define_metric`). Section 13 below is the unverified design-time list.
+
+Files as built: `eval/placement.py`, `eval/handoff.py`, `eval/service.py` (`watch`, `EvalService`),
+`eval/push.py` (`serve`, `PushClient`, `Receiver`), `eval/async_eval.py` (`AsyncEval`, `full_weights`). Changes
+are in `eval/config.py`, `eval/engines.py`, `eval/cli.py`, `rl/trainer.py`, `opd/trainer.py`, `train.py`,
+`checkpoint.py`, `opd/trainer.py:prunable_checkpoints`, `rl/pool/buckets.py` and `rl/pool/worker.py`, plus
+`scripts/train_slurm.sh` (`EVAL_NODES`) and `scripts/eval_slurm.sh`. Tests: `tests/test_async_eval_placement.py`,
+`tests/test_async_eval.py`, `tests/test_async_eval_push.py` and `tests/test_async_eval_distributed.py`.
 
 ## 1. Problem and goals
 

@@ -13,6 +13,10 @@
 # GPUs per node come from the allocation (--gpus-per-node); NGPUS overrides them:
 #   sbatch --gpus-per-node=4 scripts/train_slurm.sh my_config.yaml
 #
+# Asynchronous evaluation on the last node (eval_tasks.placement async, eval_tasks.service auto):
+#   EVAL_NODES=1 sbatch --nodes=3 scripts/train_slurm.sh my_config.yaml      # 2 nodes train, 1 evaluates
+# or in an allocation of its own: sbatch scripts/eval_slurm.sh <train.output_dir> [watch | serve]
+#
 # Requirements:
 #   - SLURM cluster with GPU nodes
 #   - A filesystem shared by every node for train.output_dir, data.pretokenize_path,
@@ -85,7 +89,57 @@ echo "└───────────────────────�
 # Do not start the workers with srun directly (srun python -m palingenesis.train):
 # without torchrun's RANK / WORLD_SIZE every task trains alone.
 
-srun --nodes="$NNODES" --ntasks="$NNODES" --ntasks-per-node=1 --kill-on-bad-exit=1 \
+
+# ── Asynchronous evaluation on nodes of their own (EVAL_NODES, default 0) ────────
+# The last EVAL_NODES node of the allocation runs the run's evaluator (eval_tasks.placement async,
+# eval_tasks.service auto) instead of training: `pgs eval watch` (transport checkpoint) or `pgs eval serve`
+# (transport push), found by the trainer through <train.output_dir>/eval_tasks/service.json.
+EVAL_NODES="${EVAL_NODES:-0}"
+if (( EVAL_NODES > 0 )); then
+    if (( EVAL_NODES != 1 )); then
+        echo "EVAL_NODES: one evaluator node per run for now" >&2
+        exit 1
+    fi
+    if (( NNODES < 2 )); then
+        echo "EVAL_NODES=1 needs at least 2 nodes (one trains, one evaluates)" >&2
+        exit 1
+    fi
+    EVAL_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | tail -n 1)
+    read -r OUTPUT_DIR EVAL_MODE < <(python -c '
+import sys
+from palingenesis.config import Config
+c = Config.from_yaml(sys.argv[1])
+args = sys.argv[2:]
+for i, a in enumerate(args):  # --train.output_dir X overrides
+    if a == "--train.output_dir" and i + 1 < len(args):
+        c.train.output_dir = args[i + 1]
+e = c.eval_tasks
+if not (e.is_async and e.service == "auto"):
+    sys.exit("EVAL_NODES needs eval_tasks.placement async and eval_tasks.service auto in the config")
+print(c.train.output_dir, "watch" if e.transport == "checkpoint" else "serve")
+' "$CONFIG" "$@")
+    if [[ -z "${OUTPUT_DIR:-}" ]]; then
+        echo "EVAL_NODES: could not read train.output_dir / eval_tasks from $CONFIG" >&2
+        exit 1
+    fi
+    NNODES=$((NNODES - 1))
+    TRAIN_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n "$NNODES" | paste -sd, -)
+    if [[ "$EVAL_MODE" == "watch" ]]; then
+        EVAL_ARGS=(watch "$OUTPUT_DIR" --poll 30)
+    else
+        EVAL_ARGS=(serve --dir "$OUTPUT_DIR")
+    fi
+    echo "evaluator: $EVAL_NODE (pgs eval ${EVAL_ARGS[*]}); training: $TRAIN_NODES"
+    srun --nodes=1 --ntasks=1 --nodelist="$EVAL_NODE" \
+        python -m palingenesis.eval.service "${EVAL_ARGS[@]}" > "slurm-${SLURM_JOB_ID}.eval.out" 2>&1 &
+    EVAL_PID=$!
+    trap 'kill "$EVAL_PID" 2>/dev/null || true' EXIT
+    NODELIST=(--nodelist="$TRAIN_NODES")
+else
+    NODELIST=()
+fi
+
+srun --nodes="$NNODES" --ntasks="$NNODES" --ntasks-per-node=1 --kill-on-bad-exit=1 ${NODELIST[@]+"${NODELIST[@]}"} \
     torchrun \
         --nnodes="$NNODES" \
         --nproc_per_node="$NGPUS" \

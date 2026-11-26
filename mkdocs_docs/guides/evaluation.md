@@ -321,6 +321,51 @@ pgs compare runs/rl/eval_tasks/step_0/gsm8k.plain.jsonl runs/rl/eval_tasks/step_
 
 The tasks run every `every` steps and at the last step (`final: false` to skip it); `pgs rl` and `pgs distill` also run them before the first step, which gives the baseline to compare with. They take training time: on an RL run the engine evaluates instead of sampling, so keep `limit` small and the full evaluation for checkpoints. An evaluation that fails (a dataset that cannot be loaded, an environment error) is logged and switched off; it never stops the run. Multi-role scenario runs skip `eval_tasks`.
 
+### Asynchronous evaluation on GPUs of its own
+
+With spare GPUs or nodes, `placement: async` runs the tasks in a separate evaluator process on GPUs that do not train. Training never pauses for it, and `pgs train` evaluates under FSDP and tensor parallelism too. The default, `placement: inline`, is the behaviour described above.
+
+```yaml
+eval_tasks:
+  tasks: [gsm8k, ifeval]
+  every: 200
+  placement: async
+  devices: [6, 7]          # GPUs of rank 0's node: the trainer starts the evaluator there
+  # service: auto          # ... or an evaluator started elsewhere (pgs eval serve / watch, another node, Slurm)
+  transport: push          # push: the weights in memory | checkpoint: the checkpoints train.save_steps writes
+  engine: {backend: vllm, gpu_memory_utilization: 0.9, replicas: 1}
+  final_timeout_s: 3600    # after the last step, how long the trainer waits for the final result (0: not at all)
+```
+
+| Setup | Config and command |
+|---|---|
+| One GPU | refused: the evaluator would take memory and compute from the trainer. Use `placement: inline`, split the GPU with MIG (the evaluator on the second instance), or evaluate after training: `pgs eval watch <output_dir> --once` |
+| One node, 8 GPUs | `devices: [6, 7]`, `torchrun --nproc_per_node 6 ...` (the ranks take GPUs 0-5) |
+| Two nodes | `service: auto`; on the evaluator node `pgs eval serve --dir <output_dir>` (push) or `pgs eval watch <output_dir>` (checkpoint), with `<output_dir>` on the shared file system |
+| Slurm, one allocation | `service: auto`; `EVAL_NODES=1 sbatch --nodes=3 scripts/train_slurm.sh config.yaml` (the last node evaluates) |
+| Slurm, a separate job | `service: auto`; `sbatch scripts/eval_slurm.sh <output_dir> [serve \| watch]`, before or after the training job |
+| No shared file system | `service: host:port` and `pgs eval serve --dir <local dir> --port <port>` (push only; the results come back over the connection) |
+
+**Never on a GPU that trains.** GPUs are compared by UUID: the trainer ranks' GPUs, and the GPUs of `rollout.backend: remote` engines. `devices:` is checked before any model loads, and an evaluator started elsewhere checks the trainer's GPUs in `spec.json` before it loads anything. A clash stops the run (`devices:`) or the evaluator (`service:`), with a message naming the GPU. MIG instances count as separate GPUs.
+
+**Transports and what they cost the trainer.** Both costs arise at due steps only.
+
+| | `push` (default) | `checkpoint` |
+|---|---|---|
+| What travels | the weights in memory, in bfloat16 over TCP, checksummed | nothing: the evaluator reads `step_<n>` / `step-<n>` (FSDP `pgs train`: the sharded checkpoint, whose model weights it consolidates) |
+| On the training thread | a copy of the weights into one pinned host staging area on rank 0. Under FSDP, `pgs train` first gathers the full weights to rank 0, as a final save does (`pgs rl` gathers them for its rollout engine anyway). Logged as `eval/async/snapshot_seconds` | a lease file per evaluated checkpoint |
+| Host memory on rank 0 | 2 bytes per parameter, pinned (refused above half of the available memory: use `checkpoint`); FSDP `pgs train` also holds the gathered state while it is copied | none |
+| Cadence | any `every` | a multiple of `train.save_steps` |
+| Large models (70B: 140 GB of staging) | | the transport to use |
+
+A due step whose previous push is still on its way is skipped before anything is gathered or copied (`eval/async/push_skipped`): the evaluator always gets the newest weights it can take. With `checkpoint`, `backlog: latest` evaluates the newest checkpoint not evaluated yet and records the older ones as skipped, and `backlog: all` evaluates every one. A checkpoint waiting for the evaluator is not purged by `train.keep_checkpoints` (for at most two hours). `push_gbps` caps the send rate where the link also carries the training's NCCL traffic.
+
+**Results.** They land in the same `eval_tasks/step_<n>/` files as inline evaluation, plus `result.json` (`done`, `failed` or `skipped`). The trainer logs the metrics under the same names at the step they belong to, even though they arrive later (W&B plots them against `train/global_step`). Each step's line also carries `eval/async/alive`, `lag_steps`, `done`, `skipped`, `failed` and push statistics. No trainer decision reads these metrics. With `transport: checkpoint`, `select: gsm8k/plain/score` makes the evaluator record the best step in `eval_tasks/best_tasks.json`, and the purge keeps that checkpoint.
+
+**Failures stay in the evaluator.** If the evaluator runs out of memory, its engine restarts with half the `max_num_seqs`, then with 5 points less `gpu_memory_utilization`, and the step is retried. A step that still fails is recorded as failed. After three failed steps in a row the evaluator stops. An evaluator that dies is restarted, at most three times, when the trainer started it. A remote one is reconnected every 10 s. A lost node costs the evaluation in flight. In none of these cases does training stop or wait. A resumed run keeps the results already written. After the last step the trainer sends the final weights (or names the final checkpoint) and waits up to `final_timeout_s`.
+
+Prior art: TRL's server mode runs vLLM on GPUs apart from the trainer and pushes the weights to it after each step (`vllm_mode="server"`); `rollout.backend: remote` and the push transport do the same for this library's engines. LLM Foundry's `AsyncEval` callback launches separate evaluation runs on saved checkpoints, as `transport: checkpoint` does.
+
 ## Pitfalls
 
 **Contamination.** A benchmark's test split that is in the training data measures memory. Before trusting a gain, check the training sets for the benchmark's items: exact and near-duplicate questions, and derived sets (many public instruction and reasoning datasets contain GSM8K, MATH or MMLU items, sometimes paraphrased or translated). `pgs prepare --mode pretrain` has n-gram decontamination for raw text; for chat data, compare normalised questions. A model that scores far above its size class on one public benchmark and not on a fresh set of the same kind is the usual sign. Keep a private task of your own next to the public ones: it cannot leak.

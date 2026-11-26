@@ -142,6 +142,17 @@ srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --kill
         -m palingenesis.train --config "$CONFIG"
 ```
 
+### Evaluation on a node of its own
+
+With `eval_tasks.placement: async` and `eval_tasks.service: auto` in the config, `EVAL_NODES=1` gives the allocation's last node to the run's evaluator instead of training. That node runs `pgs eval serve` for `transport: push`, or `pgs eval watch` for `transport: checkpoint`. The trainer finds it through `<train.output_dir>/eval_tasks/service.json` and never waits for it ([Evaluation guide](evaluation.md#asynchronous-evaluation-on-gpus-of-its-own)):
+
+```bash
+EVAL_NODES=1 sbatch --nodes=3 scripts/train_slurm.sh config.yaml    # 2 nodes train, 1 evaluates
+sbatch scripts/eval_slurm.sh runs/my_run serve                       # or: an allocation of its own
+```
+
+For a large model, use `transport: checkpoint`: a push stages 2 bytes per parameter in rank 0's pinned host memory. Push traffic shares the network with the training's NCCL traffic, and `eval_tasks.push_gbps` caps it.
+
 ---
 
 ## Bare-metal / cloud VMs

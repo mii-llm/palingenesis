@@ -485,8 +485,17 @@ Evaluation tasks during training ([Evaluation guide](../guides/evaluation.md#dur
 | `sampling` | dict | `{}` | `temperature`, `top_p`, `top_k`, `presence_penalty`, `max_tokens`, `max_completion_tokens`, over each task's own. |
 | `save_samples` | bool | `false` | Also write every completion (`<task>.<mode>.samples.jsonl`). |
 | `final` | bool | `true` | Also evaluate at the last step. |
+| `placement` | str | `inline` | `inline`: in the trainer, which pauses for it. `async`: a separate evaluator on GPUs that do not train ([guide](../guides/evaluation.md#asynchronous-evaluation-on-gpus-of-its-own)). |
+| `devices` | list | `[]` | async: GPUs of rank 0's node (indices in the launching shell's view) where the trainer starts the evaluator. |
+| `service` | str | `""` | async: `auto` (an evaluator found through `<output_dir>/eval_tasks/service.json`) or `host:port` (`pgs eval serve`). Exactly one of `devices` / `service`. |
+| `transport` | str | `push` | async: `push` (the weights in memory, pinned staging on rank 0, 2 bytes per parameter) or `checkpoint` (the checkpoints `train.save_steps` writes; `every` a multiple of it). |
+| `engine` | dict | `{}` | async: the evaluator's engine (`backend`, `gpu_memory_utilization`, `max_model_len`, `max_num_seqs`, `replicas`, `tensor_parallel_size`, `vllm_args`, ...). |
+| `final_timeout_s` | float | `3600` | async: after the last step, the seconds the trainer waits for the final result (0: none). |
+| `push_gbps` | float | `0` | async push: a cap on the send rate in Gbit/s (0: none). |
+| `select` | str | `""` | async checkpoint: `<task>/<mode>/<metric>`; the evaluator records the best step in `eval_tasks/best_tasks.json` and the purge keeps it. |
+| `backlog` | str | `latest` | async checkpoint: `latest` (the newest checkpoint not evaluated) or `all` (every one, in order). |
 
-Logged as `eval/tasks/<task>/<mode>/score`, `pass@k`, `truncated`, `loops`, `tokens`; result files in `<output_dir>/eval_tasks/step_<n>/` (the `pgs compare` format). `pgs rl` and `pgs distill` evaluate on their rollout engine with the newest weights; `pgs train` generates with the model itself, on a single process (multi-GPU runs skip the tasks with a warning).
+Logged as `eval/tasks/<task>/<mode>/score`, `pass@k`, `truncated`, `loops`, `tokens`; result files in `<output_dir>/eval_tasks/step_<n>/` (the `pgs compare` format). Inline, `pgs rl` and `pgs distill` evaluate on their rollout engine with the newest weights; `pgs train` generates with the model itself, on a single process (multi-GPU runs skip the tasks with a warning; use `placement: async`). Async adds `eval/async/*` (alive, lag_steps, done, skipped, failed, snapshot_seconds, push statistics) to the step metrics.
 
 ---
 
