@@ -360,7 +360,7 @@ The machine has one GPU, and sharing it is refused, so the script picks the spli
 - **One GPU without MIG** (the usual shared box): the service runs the `hf` engine on CPU. Every trainer-side cost
   (snapshot, staging, sender thread, results) is the same; only the evaluator's own speed differs. Measured on one
   A100 with 16 host cores: the CPU evaluator itself slows a 0.8B trainer (0.28 s steps) by 12.8 % with 16 threads and
-  6.1 % with `OMP_NUM_THREADS=4`, although niced; the step-time criterion is meant for an evaluator on its own GPU.
+  6.1 % and 14.3 % in two runs with `OMP_NUM_THREADS=4`, although niced; the step-time criterion is meant for an evaluator on its own GPU.
 
 Arms (Qwen3.5-0.8B, fixed seed, 300 steps, `every: 50`): `pgs train` SFT and `pgs rl` (colocated vLLM), each with no
 `eval_tasks`, `inline`, `async`. Pre-registered pass criteria:
@@ -369,8 +369,8 @@ Arms (Qwen3.5-0.8B, fixed seed, 300 steps, `every: 50`): `pgs train` SFT and `pg
   most the logged `snapshot_seconds`, and that is ≤ 1 s for 0.8B;
 - the training losses of `async` equal those of no evaluation step by step, bitwise, at every step where two runs
   without evaluation are bitwise equal (seeded runs agree exactly until a kernel choice differs: on the first A100
-  run every arm, both runs without evaluation included, left bitwise equality at the same step 96, a new batch
-  shape; the check persists Triton autotune choices, `TRITON_CACHE_AUTOTUNING=1`, to remove that), and that range
+  run every arm, both runs without evaluation included, left bitwise equality at the same step 96, also with Triton
+  autotune choices persisted across runs, so the cause is not autotuning; cause not identified), and that range
   covers at least one evaluation: evaluation must not touch the trainer's state or random streams;
 - refusal: `devices` naming the trainer's GPU fails before any model load, with the message of section 3;
 - OOM: the service with `PGS_TEST_EVAL_OOM=always` (fault injection in `generate`), and on MIG / a second GPU a real

@@ -9,8 +9,8 @@ Pre-registered criteria (async_eval.sh runs the arms):
                 without eval_tasks); the snapshot at due steps is included (eval/async/snapshot_seconds, reported)
   snapshot      eval/async/snapshot_seconds <= 1 s for a 0.8B model (INFO for other models)
   losses        train/loss of `push`, `checkpoint` and `oom` is bit-identical to `none` at every step where two
-                `none` runs are (seeded runs agree exactly until a kernel choice differs, e.g. a Triton autotune
-                near-tie on a new shape; async_eval.sh persists autotune choices to remove that); the comparison
+                `none` runs are (seeded runs agree exactly until a kernel's result differs between runs; on an A100
+                both `none` runs left equality at step 96, with or without persisted autotune choices); the comparison
                 must cover at least one evaluation (the first divergence of the `none` runs after EVERY)
   refusal       eval_tasks.devices naming the trainer's GPU stops the run before any model loads, with the message
   oom           an evaluator whose every evaluation runs out of memory (PGS_TEST_EVAL_OOM=always; on MIG / two GPUs

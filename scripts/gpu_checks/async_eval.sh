@@ -42,9 +42,7 @@ export PYTHONPATH="$PGS_SRC${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export CONFIG="${CONFIG:-$REPO/configs/qwen35_08b.yaml}" MODEL="${MODEL:-Qwen/Qwen3.5-0.8B}"
 export STEPS="${STEPS:-300}" EVERY="${EVERY:-50}" DATA EVAL_DATA
-# TRITON_CACHE_AUTOTUNING: every arm reuses the first run's autotune choices (a near-tie on a new shape would
-# otherwise pick another kernel in another run and end bit-identical losses at that step)
-export TMPDIR="$WORK/tmp" TRITON_CACHE_DIR="$WORK/triton" TORCHINDUCTOR_CACHE_DIR="$WORK/inductor" TRITON_CACHE_AUTOTUNING=1
+export TMPDIR="$WORK/tmp" TRITON_CACHE_DIR="$WORK/triton" TORCHINDUCTOR_CACHE_DIR="$WORK/inductor"
 export VLLM_CACHE_ROOT="$WORK/vllm_cache"
 mkdir -p "$TMPDIR"
 RESULTS="$WORK/results.jsonl"
