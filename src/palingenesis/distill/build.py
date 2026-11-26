@@ -329,7 +329,12 @@ def build_cache(
         # serving default (256) does not fit next to a large teacher.
         options.setdefault("max_num_seqs", 16)
         options = {key: v for key, v in options.items() if v}
-        llm = LLM(model=spec.model, tokenizer=spec.tokenizer or spec.model, max_logprobs=k, dtype=spec.dtype, **options)
+        try:
+            llm = LLM(model=spec.model, tokenizer=spec.tokenizer or spec.model, max_logprobs=k, dtype=spec.dtype, **options)
+        finally:
+            from palingenesis.hf_configs import restore_native_configs
+
+            restore_native_configs()  # vLLM's AutoConfig registrations would break later Hugging Face loads
 
     def score(batch):
         if llm is not None:

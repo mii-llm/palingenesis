@@ -50,6 +50,7 @@ import torch
 from torch import Tensor, nn
 
 from palingenesis.accelerator import is_rocm
+from palingenesis.hf_configs import restore_native_configs
 
 if TYPE_CHECKING:
     import numpy as np
@@ -599,20 +600,25 @@ class VLLMColocateRollout:
         self.sleep_mode = sleep_mode
 
         def engine(max_num_seqs):
-            return vllm.LLM(
-                model=model,
-                dtype="bfloat16",
-                gpu_memory_utilization=gpu_memory_utilization,
-                max_model_len=max_model_len,
-                enforce_eager=enforce_eager,
-                seed=seed,
-                enable_sleep_mode=sleep_mode,
-                logprobs_mode="processed_logprobs",
-                enable_prefix_caching=prefix_caching,
-                max_num_seqs=max_num_seqs,
-                **({"distributed_executor_backend": "external_launcher"} if external_launcher else {}),
-                **(engine_kwargs or {}),
-            )
+            try:
+                return vllm.LLM(
+                    model=model,
+                    dtype="bfloat16",
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    max_model_len=max_model_len,
+                    enforce_eager=enforce_eager,
+                    seed=seed,
+                    enable_sleep_mode=sleep_mode,
+                    logprobs_mode="processed_logprobs",
+                    enable_prefix_caching=prefix_caching,
+                    max_num_seqs=max_num_seqs,
+                    **({"distributed_executor_backend": "external_launcher"} if external_launcher else {}),
+                    **(engine_kwargs or {}),
+                )
+            finally:
+                # vLLM registered its own config classes with AutoConfig for the model's type: give later
+                # Hugging Face loads in this process transformers' classes back (palingenesis.hf_configs).
+                restore_native_configs()
 
         try:
             self.llm = engine(max_num_seqs)
