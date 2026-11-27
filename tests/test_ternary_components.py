@@ -187,7 +187,12 @@ def test_plugin_rejects_unknown_components():
     [
         {"scale": "mse"},
         {"scale": "twn", "ste": "clipped"},
-        {"scale": "absmax", "scale_mode": "frozen", "ste": "tanh", "ste_sharpness": {"start_value": 2.0, "end_value": 8.0}},
+        {
+            "scale": "absmax",
+            "scale_mode": "frozen",
+            "ste": "tanh",
+            "ste_sharpness": {"start_value": 2.0, "end_value": 8.0},
+        },
         {"scale": "mse", "scale_mode": "learned", "scale_lr": 1e-3, "quantizer": "stochastic"},
     ],
 )

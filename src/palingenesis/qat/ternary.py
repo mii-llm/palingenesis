@@ -18,7 +18,7 @@ and an argument of `palingenesis.qat:TernaryQAT`:
                   identity    d W_q / d W = 1                                    (Bengio et al., arXiv:1308.3432)
                   clipped     1 where |w| <= clip * alpha, else 0                (hard-tanh window)
                   tanh        the slope of a smooth staircase through the same levels, sharpened over training
-                              (large near the thresholds, small in the flat parts: ReSTE-like, arXiv:2303.06859)
+                              (large near the thresholds, small in the flat parts)
 
 `scale_mode` (in TernaryQAT) says when the scheme is evaluated: every forward from the current latent weights
 ("dynamic"), once before the first step ("frozen"), or once and then trained with LSQ gradients ("learned",

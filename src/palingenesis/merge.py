@@ -714,7 +714,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lam", type=float, default=1.0, help="ties with --base: base + lam * merged change")
     p.add_argument("--min-agree", type=float, default=0.0, help="consensus: weight share that must back a change")
     p.add_argument("--no-refit", action="store_true", help="mean of the sources' scales instead of a least-squares fit")
-    p.add_argument("--check", metavar="MODEL", default=None, help="only verify that MODEL's ternary tensors are ternary")
+    p.add_argument(
+        "--check", metavar="MODEL", default=None, help="only verify that MODEL's ternary tensors are ternary"
+    )
     p.add_argument("-o", "--out", default=None)
     p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default=None)
     p.add_argument("--overwrite", action="store_true")

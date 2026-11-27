@@ -435,7 +435,9 @@ class TernaryQAT(TrainerPlugin):
         return g, alpha, m.spec.codes(g, alpha, delta)
 
     def on_train_start(self, model: nn.Module, ctx: PluginContext) -> None:
-        unsupported = (not m._default and (m.scale_mode != "dynamic" or m.group_size == 0) for m in self.modules.values())
+        unsupported = (
+            not m._default and (m.scale_mode != "dynamic" or m.group_size == 0) for m in self.modules.values()
+        )
         if ctx.is_fsdp and any(unsupported):
             raise ValueError(
                 "ternary_qat: under FSDP, frozen / learned scales and per-tensor scales of a scheme other than "

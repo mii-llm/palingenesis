@@ -127,6 +127,7 @@ nav:
     - On-Policy Distillation: guides/distillation.md
     - Off-Policy Distillation: guides/offpolicy-distillation.md
     - Quantisation-Aware Training (FP4 / FP8): guides/qat.md
+    - Ternary QAT (1.58-bit): guides/ternary-qat.md
     - Preference Optimization (DPO): guides/dpo.md
     - LoRA: guides/lora.md
     - Multimodal (Images): guides/multimodal.md

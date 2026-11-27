@@ -73,7 +73,9 @@ def guess_layout(ck: Checkpoint, group_size: int, include: str = r".*", exclude:
 
 def _spec_from(layout: dict, group_size: int, scale: str | None) -> TernarySpec:
     q = dict(layout.get("quantizer") or {})
-    return TernarySpec(group_size, scale or q.get("scale", "absmean"), scale_args=None if scale else q.get("scale_args"))
+    return TernarySpec(
+        group_size, scale or q.get("scale", "absmean"), scale_args=None if scale else q.get("scale_args")
+    )
 
 
 # ─────────────────────────────────────────────────────────────── per-tensor merges
@@ -261,7 +263,10 @@ def merge_ternary(
     out_layout = {**layout, "tensors": tensors, "export": "folded"}
     (Path(report.out) / TERNARY_CONFIG).write_text(json.dumps(out_layout, indent=2))
     n = max(stats.get("total", 0), 1)
-    summary = {"ternary_tensors": len(tensors), **{f"{k}_share": round(v / n, 6) for k, v in stats.items() if k != "total"}}
+    summary = {
+        "ternary_tensors": len(tensors),
+        **{f"{k}_share": round(v / n, 6) for k, v in stats.items() if k != "total"},
+    }
     if verify:
         check = check_ternary(report.out)
         summary["ternary_verified"] = check["ok"]
