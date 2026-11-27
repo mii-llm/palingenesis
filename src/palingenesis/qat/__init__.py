@@ -10,7 +10,11 @@ Ternary quantisation-aware training, as a trainer plugin:
       custom:
         - class: palingenesis.qat:TernaryQAT
           args:
-            group_size: 128                 # absmean scale per 128 input weights (0: per tensor, -1: per row)
+            group_size: 128                 # one scale per 128 input weights (0: per tensor, -1: per row)
+            scale: absmean                  # absmean | absmax | twn | mse    (palingenesis.qat.ternary)
+            scale_mode: dynamic             # dynamic (from the latents, every forward) | frozen | learned (LSQ)
+            quantizer: round                # round | stochastic (training forwards sample the codes)
+            ste: identity                   # identity | clipped | tanh (ste_args: {clip: 1.0} / {sharpness: 4.0})
             exclude: ["lm_head", "embed"]   # nn.Linear names kept in full precision (regular expressions)
             quantize_embedding: false       # also the input embedding (and a tied head through it)
             quantize_head: false            # also the output head
@@ -42,13 +46,22 @@ values are exactly ternary times a scale), "latent" writes the latent weights an
 In pgs distill with a rollout engine (vLLM, SGLang), the engine is given W_eff at every weight push
 (rollout_weights), so it samples from the policy the trainer scores.
 
-This plugin is a starting point, not a recipe: its defaults are not tuned for any model.
+The quantiser is assembled from three registries of palingenesis.qat.ternary (`scale`, `quantizer`, `ste`): a new
+scheme is one function added to a registry. `scale_mode: frozen` computes the scales once from the loaded weights;
+`learned` also trains a log-factor per scale in its own optimizer group (`scale_lr`). Frozen and learned scales live
+in buffers / parameters next to each weight (`scale_alpha`, `scale_delta`, `log_scale`): single process only (not
+FSDP), dropped from the folded export. Every export gets a `ternary_config.json` (which tensors are ternary, their
+group size and quantiser), which `pgs merge ternary` and `palingenesis.qat.merge.check_ternary` read.
+
+Defaults are BitNet b1.58's (absmean, round, identity). They are a starting point, not a recipe tuned for a model.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -56,6 +69,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from palingenesis.hooks import FeatureSpec, PluginContext, Ramp, TrainerPlugin
+from palingenesis.qat.ternary import TernarySpec, group_view, lsq_grad_scale
+
+TERNARY_CONFIG = "ternary_config.json"
+SCALE_MODES = ("dynamic", "frozen", "learned")
+_AUX_KEYS = ("scale_alpha", "scale_delta", "log_scale")
 
 logger = logging.getLogger(__name__)
 
@@ -99,27 +117,80 @@ def quantize_activations(x: Tensor, bits: int = 8) -> Tensor:
 
 
 class _TernaryMixin:
-    def _init_quant(self, group_size: int, activation_bits: int):
+    def _init_quant(self, group_size: int, activation_bits: int, spec: TernarySpec | None = None, scale_mode="dynamic"):
         self.group_size = group_size
         self.activation_bits = activation_bits
-        # a buffer (not a Python float): changing it never makes torch.compile recompile
+        self.spec = spec if spec is not None else TernarySpec(group_size)
+        self.scale_mode = scale_mode
+        # the BitNet default keeps its original code path (and its FSDP support)
+        self._default = scale_mode == "dynamic" and self.spec.describe() == TernarySpec(group_size).describe()
+        # buffers (not Python floats): changing them never makes torch.compile recompile
         self.register_buffer("strength", torch.ones(()), persistent=False)
+        sharpness = float(self.spec.ste_args.get("sharpness", 4.0))
+        self.register_buffer("sharpness", torch.full((), sharpness), persistent=False)
+        if scale_mode != "dynamic":
+            alpha, delta = self.spec.scales(group_view(self.weight.detach(), group_size))
+            self.register_buffer("scale_alpha", alpha.clone())
+            self.register_buffer("scale_delta", delta.clone())
+        if scale_mode == "learned":
+            self.log_scale = nn.Parameter(torch.zeros_like(self.scale_alpha))
+            n = self.weight.numel() // self.scale_alpha.numel()
+            self.log_scale.register_hook(lambda grad, k=lsq_grad_scale(n): grad * k)
+
+    def fixed_scales(self) -> tuple[Tensor, Tensor] | None:
+        """(alpha, delta) of frozen / learned scales, the learned factor applied; None when dynamic."""
+        if self.scale_mode == "dynamic":
+            return None
+        alpha, delta = self.scale_alpha, self.scale_delta
+        if self.scale_mode == "learned":
+            factor = self.log_scale.detach().exp().to(alpha.dtype)
+            alpha, delta = alpha * factor, delta * factor
+        return alpha, delta
+
+    @torch.no_grad()
+    def quantize(self, w: Tensor) -> Tensor:
+        """The ternary weight alpha * code of `w` (this module's weight, on any device), deterministic."""
+        if self._default:
+            return quantize_weight(w, self.group_size)
+        fixed = self.fixed_scales()
+        if fixed is not None:
+            fixed = tuple(t.to(device=w.device, dtype=w.dtype) for t in fixed)
+        return self.spec.quantize(w, fixed)
 
     def effective_weight(self) -> Tensor:
         w = self.weight
-        w_q = quantize_weight(w, self.group_size)
-        return w + self.strength.to(w.dtype) * (w_q - w).detach()
+        if self._default:
+            w_q = quantize_weight(w, self.group_size)
+            return w + self.strength.to(w.dtype) * (w_q - w).detach()
+        fixed = None
+        if self.scale_mode != "dynamic":
+            fixed = (self.scale_alpha.to(w.dtype), self.scale_delta.to(w.dtype))
+        return self.spec.effective(
+            w,
+            self.strength,
+            fixed=fixed,
+            log_scale=self.log_scale if self.scale_mode == "learned" else None,
+            sample=self.training and self.spec.quantizer == "stochastic",
+            sharpness=self.sharpness.to(w.dtype) if self.spec.ste == "tanh" else None,
+        )
 
 
 class TernaryLinear(_TernaryMixin, nn.Module):
     """nn.Linear with ternary weights in the forward and a full-precision latent weight."""
 
-    def __init__(self, linear: nn.Linear, group_size: int = 128, activation_bits: int = 0):
+    def __init__(
+        self,
+        linear: nn.Linear,
+        group_size: int = 128,
+        activation_bits: int = 0,
+        spec: TernarySpec | None = None,
+        scale_mode: str = "dynamic",
+    ):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.weight = linear.weight  # the same Parameter: names, ties and optimizer state carry over
         self.bias = linear.bias
-        self._init_quant(group_size, activation_bits)
+        self._init_quant(group_size, activation_bits, spec, scale_mode)
 
     def forward(self, x: Tensor) -> Tensor:
         if self.activation_bits:
@@ -133,12 +204,18 @@ class TernaryLinear(_TernaryMixin, nn.Module):
 class TernaryEmbedding(_TernaryMixin, nn.Module):
     """nn.Embedding whose rows are ternary (scales per group of the embedding dimension)."""
 
-    def __init__(self, embedding: nn.Embedding, group_size: int = 128):
+    def __init__(
+        self,
+        embedding: nn.Embedding,
+        group_size: int = 128,
+        spec: TernarySpec | None = None,
+        scale_mode: str = "dynamic",
+    ):
         super().__init__()
         self.num_embeddings, self.embedding_dim = embedding.num_embeddings, embedding.embedding_dim
         self.padding_idx = embedding.padding_idx
         self.weight = embedding.weight
-        self._init_quant(group_size, 0)
+        self._init_quant(group_size, 0, spec, scale_mode)
 
     def forward(self, ids: Tensor) -> Tensor:
         return F.embedding(ids, self.effective_weight(), self.padding_idx)
@@ -196,6 +273,14 @@ class TernaryQAT(TrainerPlugin):
         quantize_embedding: bool = False,
         quantize_head: bool = False,
         activation_bits: int = 0,
+        scale: str = "absmean",
+        scale_mode: str = "dynamic",
+        scale_args: dict | None = None,
+        scale_lr: float = 0.0,
+        quantizer: str = "round",
+        ste: str = "identity",
+        ste_args: dict | None = None,
+        ste_sharpness=None,
         strength=1.0,
         grid_weight=0.0,
         latent_lr: float = 0.0,
@@ -212,6 +297,13 @@ class TernaryQAT(TrainerPlugin):
             raise ValueError(f"activation_bits must be 0, 4 or 8 (got {activation_bits})")
         if export not in ("folded", "latent"):
             raise ValueError(f"export must be folded or latent (got {export!r})")
+        if scale_mode not in SCALE_MODES:
+            raise ValueError(f"scale_mode must be one of {SCALE_MODES} (got {scale_mode!r})")
+        TernarySpec(group_size, scale, quantizer, ste, scale_args, ste_args)  # validates the names
+        self.scale, self.scale_mode, self.scale_args, self.scale_lr = scale, scale_mode, scale_args, scale_lr
+        self.quantizer, self.ste, self.ste_args = quantizer, ste, ste_args
+        # tanh estimator: its sharpness over training (a number or a ramp; default: ste_args' value, constant)
+        self.ste_sharpness = Ramp.parse(ste_sharpness) if ste_sharpness is not None else None
         self.group_size = group_size
         self.include = [re.compile(p) for p in (include or [r".*"])]
         self.exclude = [re.compile(p) for p in (exclude if exclude is not None else [r"lm_head", r"embed"])]
@@ -234,6 +326,9 @@ class TernaryQAT(TrainerPlugin):
 
     # -- model
 
+    def _spec(self, group_size: int) -> TernarySpec:
+        return TernarySpec(group_size, self.scale, self.quantizer, self.ste, self.scale_args, self.ste_args)
+
     def _group_size_for(self, name: str, cols: int) -> int:
         g = self.group_size
         if g > 0 and cols % g:
@@ -249,18 +344,20 @@ class TernaryQAT(TrainerPlugin):
             if module is head:
                 if self.quantize_head and isinstance(module, nn.Linear):
                     g = self._group_size_for(name, module.in_features)
-                    replacements.append((name, TernaryLinear(module, g, 0)))
+                    replacements.append((name, TernaryLinear(module, g, 0, self._spec(g), self.scale_mode)))
                 continue
             if module is embed:
                 if self.quantize_embedding and isinstance(module, nn.Embedding):
                     g = self._group_size_for(name, module.embedding_dim)
-                    replacements.append((name, TernaryEmbedding(module, g)))
+                    replacements.append((name, TernaryEmbedding(module, g, self._spec(g), self.scale_mode)))
                 continue
             if type(module) is nn.Linear and any(p.search(name) for p in self.include):
                 if any(p.search(name) for p in self.exclude):
                     continue
                 g = self._group_size_for(name, module.in_features)
-                replacements.append((name, TernaryLinear(module, g, self.activation_bits)))
+                replacements.append(
+                    (name, TernaryLinear(module, g, self.activation_bits, self._spec(g), self.scale_mode))
+                )
         if not replacements:
             raise ValueError("ternary_qat: no module matched (check include / exclude)")
         for name, new in replacements:
@@ -306,7 +403,13 @@ class TernaryQAT(TrainerPlugin):
             override["lr"] = self.latent_lr
         if self.latent_eps:
             override["eps"] = self.latent_eps
-        return [override]
+        groups = [override]
+        if self.scale_mode == "learned":
+            scales = {"params": [m.log_scale for m in self.modules.values()], "weight_decay": 0.0}
+            if self.scale_lr:
+                scales["lr"] = self.scale_lr
+            groups.append(scales)
+        return groups
 
     def _unique_modules(self) -> list[nn.Module]:
         seen, out = set(), []
@@ -318,10 +421,25 @@ class TernaryQAT(TrainerPlugin):
 
     # -- training
 
+    @staticmethod
+    def _codes(m) -> tuple[Tensor, Tensor, Tensor]:
+        """(weight in group layout, alpha, codes) of a module's local rows, deterministic."""
+        if m._default:
+            return _local_codes(m.weight, m.group_size)
+        g = group_view(_local(m.weight.detach()), m.group_size)
+        alpha, delta = m.fixed_scales() or m.spec.scales(g)
+        return g, alpha, m.spec.codes(g, alpha, delta)
+
     def on_train_start(self, model: nn.Module, ctx: PluginContext) -> None:
+        unsupported = (not m._default and (m.scale_mode != "dynamic" or m.group_size == 0) for m in self.modules.values())
+        if ctx.is_fsdp and any(unsupported):
+            raise ValueError(
+                "ternary_qat: under FSDP, frozen / learned scales and per-tensor scales of a scheme other than "
+                "absmean are not supported (use group_size > 0 or -1 with scale_mode: dynamic)"
+            )
         self._set_strength(ctx)
         for name, m in self.modules.items():
-            _, _, codes = _local_codes(m.weight, m.group_size)
+            _, _, codes = self._codes(m)
             # A resumed run has loaded the codes it started from (load_state_dict runs before
             # this hook): keep them, so codes_changed continues instead of restarting at 0.
             # Several ranks each hold their own shard and only the main rank's codes are
@@ -332,8 +450,11 @@ class TernaryQAT(TrainerPlugin):
 
     def _set_strength(self, ctx: PluginContext) -> None:
         value = float(self.strength(ctx.progress))
+        sharp = float(self.ste_sharpness(ctx.progress)) if self.ste_sharpness is not None else None
         for m in self.modules.values():
             m.strength.fill_(value)
+            if sharp is not None:
+                m.sharpness.fill_(sharp)
 
     def on_forward_start(self, model: nn.Module, batch: dict, ctx: PluginContext) -> None:
         self._set_strength(ctx)
@@ -349,7 +470,7 @@ class TernaryQAT(TrainerPlugin):
             p = m.weight
             if p.grad is None:
                 continue
-            g, scale, codes = _local_codes(p, m.group_size)
+            g, scale, codes = self._codes(m)
             residual = g - codes * scale  # W - W_q
             _local(p.grad).add_((2.0 * lam * residual).reshape(_local(p.grad).shape).to(p.grad.dtype))
             value += lam * float(residual.float().pow(2).sum())
@@ -360,7 +481,7 @@ class TernaryQAT(TrainerPlugin):
         if self.clamp <= 0:
             return
         for m in self._unique_modules():
-            g, scale, _ = _local_codes(m.weight, m.group_size)
+            g, scale, _ = self._codes(m)
             if g.numel():
                 bound = self.clamp * scale
                 g.copy_(torch.maximum(torch.minimum(g, bound), -bound))
@@ -373,7 +494,7 @@ class TernaryQAT(TrainerPlugin):
             return out
         changed = zeros = total = 0
         for name, m in self.modules.items():
-            _, _, codes = _local_codes(m.weight, m.group_size)
+            _, _, codes = self._codes(m)
             start = self._initial_codes.get(name)
             if start is not None and start.shape == codes.shape:
                 changed += int((codes.to(torch.int8).cpu() != start).sum())
@@ -407,18 +528,19 @@ class TernaryQAT(TrainerPlugin):
             with torch.no_grad():
                 w = tensor.detach()
                 strength = module.strength.to(device=w.device, dtype=w.dtype)
-                yield name, w + strength * (quantize_weight(w, module.group_size) - w)
+                yield name, w + strength * (module.quantize(w) - w)
 
     # -- export and resume
 
     def export_state_dict(self, state: dict, model: nn.Module, ctx: PluginContext) -> dict:
         if self.export == "latent":
             return state
-        out = dict(state)
+        aux = {f"{name}.{key}" for name in self.modules for key in _AUX_KEYS}
+        out = {k: v for k, v in state.items() if k not in aux}
         names = {f"{name}.weight": m for name, m in self.modules.items()}
         for key, m in names.items():
             if key in state:
-                out[key] = quantize_weight(state[key].float(), m.group_size).to(state[key].dtype)
+                out[key] = m.quantize(state[key].float()).to(state[key].dtype)
         # tied embedding / head: both keys get the quantised matrix (the trained model used one tensor)
         if self._tied_keys:
             a, b = self._tied_keys
@@ -428,6 +550,23 @@ class TernaryQAT(TrainerPlugin):
                     if key in out:
                         out[key] = out[source]
         return out
+
+    def describe(self) -> dict:
+        """What `ternary_config.json` records: the ternary tensors (state-dict key -> group size) and the quantiser."""
+        tensors = {f"{name}.weight": m.group_size for name, m in self.modules.items()}
+        if self._tied_keys:
+            sizes = [tensors[k] for k in self._tied_keys if k in tensors]
+            if sizes:
+                tensors.update({k: sizes[0] for k in self._tied_keys})
+        return {
+            "tensors": tensors,
+            "export": self.export,
+            "scale_mode": self.scale_mode,
+            "quantizer": self._spec(self.group_size).describe(),
+        }
+
+    def on_export_saved(self, path, ctx: PluginContext) -> None:
+        (Path(path) / TERNARY_CONFIG).write_text(json.dumps(self.describe(), indent=2))
 
     def state_dict(self) -> dict:
         return {"initial_codes": self._initial_codes}

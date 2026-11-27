@@ -13,6 +13,8 @@ interpolation back, soups), task arithmetic, and materializing partial checkpoin
     ram(base, models, out)                       per element: a change made by one model only is kept whole, a change made
                                                  by several is averaged over them (|W_i - base| > eps counts as a change)
                                                  (RAM, Yuan et al. 2026, arXiv 2601.13572: RL task vectors are sparse)
+    palingenesis.qat.merge.merge_ternary(...)    ternary models merged into a ternary model (code-space vote, sign
+                                                 election, consensus on a shared start, or mean + re-ternarisation)
     materialize(checkpoint, template, out)       a partial checkpoint (e.g. a text-only training save) completed with the
                                                  template's other tensors and files, so it loads like the template
 
@@ -36,6 +38,7 @@ rounding to a 16-bit dtype a projection below 0.5 is logged as a warning.
     pgs merge task-arithmetic --base Qwen/Qwen3.5-0.8B agent:1 expert:0.3 -o out/
     pgs merge model-stock --base runs/start runs/a runs/b runs/c -o out/
     pgs merge ram --base runs/start runs/agent runs/web -o out/
+    pgs merge ternary runs/a/final runs/b/final runs/c/final --method vote -o out/
     pgs merge materialize runs/x/step-200/model --template runs/x/final -o out/
 """
 
@@ -203,7 +206,7 @@ def _combine(
     seed: int = 0,
 ) -> MergeReport:
     """out = base + sum_i c_i (W_i - base) when base is given, else sum_i c_i W_i; tensor set and layout = template's.
-    per_tensor(name, base, [W_i]) -> merged float32 tensor replaces the fixed-coefficient sum (base required).
+    per_tensor(name, base or None, [W_i]) -> merged float32 tensor replaces the fixed-coefficient sum.
     rounding: how the float32 result is cast to the output dtype ("nearest" or "stochastic", per-tensor seed from
     `seed` and the name); template copies are cast the same way."""
     if rounding not in ROUNDINGS:
@@ -261,7 +264,8 @@ def _combine(
                     written += 1
                     continue
                 if per_tensor is not None:
-                    acc = per_tensor(name, base.tensor(name).float(), [c.tensor(name).float() for c, _ in terms])
+                    start = base.tensor(name).float() if base is not None else None
+                    acc = per_tensor(name, start, [c.tensor(name).float() for c, _ in terms])
                 else:
                     acc = base.tensor(name).float() if base is not None else torch.zeros(ref.shape, dtype=torch.float32)
                     b = acc.clone() if base is not None else None
@@ -599,6 +603,46 @@ def _model_weights(specs: list[str]) -> tuple[list[str], list[float]]:
     return models, weights
 
 
+def _ternary_main(a) -> int:
+    import sys
+
+    from palingenesis.qat.merge import check_ternary, merge_ternary
+
+    try:
+        if a.check:
+            result = check_ternary(a.check)
+            print(json.dumps(result, indent=2))
+            return 0 if result["ok"] else 1
+        if not a.out or len(a.models) < 2:
+            raise MergeError("ternary: at least two models and -o OUT (or --check MODEL)")
+        if all(":" in m and m.rpartition(":")[2].replace(".", "", 1).isdigit() for m in a.models):
+            models, weights = _model_weights(a.models)
+        else:
+            models, weights = a.models, None
+        report = merge_ternary(
+            models,
+            a.out,
+            method=a.method,
+            weights=weights,
+            base=a.base,
+            group_size=a.group_size,
+            scale=a.scale,
+            tie=a.tie,
+            min_share=a.min_share,
+            density=a.density,
+            lam=a.lam,
+            min_agree=a.min_agree,
+            refit=not a.no_refit,
+            dtype=a.dtype,
+            overwrite=a.overwrite,
+        )
+    except MergeError as e:
+        print(f"pgs merge: {e}", file=sys.stderr)
+        return 1
+    print(report)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import sys
@@ -658,11 +702,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("models", nargs="+")
     p.add_argument("--eps", type=float, default=1e-5, help="|W_i - base| above this counts as a change")
     common(p)
+    p = sub.add_parser("ternary", help="merge ternary models into a ternary model (palingenesis.qat.merge)")
+    p.add_argument("models", nargs="*", metavar="MODEL[:WEIGHT]")
+    p.add_argument("--method", choices=("requantize", "vote", "ties", "consensus"), default="vote")
+    p.add_argument("--base", default=None, help="the shared start: required by consensus, optional for ties")
+    p.add_argument("--group-size", type=int, default=None, help="default: the models' ternary_config.json")
+    p.add_argument("--scale", default=None, help="scale scheme of re-ternarisation (default: the models')")
+    p.add_argument("--tie", choices=("zero", "sign"), default="zero", help="vote: a sign that ties with zero")
+    p.add_argument("--min-share", type=float, default=0.0, help="vote: weight share a sign needs to be kept")
+    p.add_argument("--density", type=float, default=1.0, help="ties: share of each tensor kept before the election")
+    p.add_argument("--lam", type=float, default=1.0, help="ties with --base: base + lam * merged change")
+    p.add_argument("--min-agree", type=float, default=0.0, help="consensus: weight share that must back a change")
+    p.add_argument("--no-refit", action="store_true", help="mean of the sources' scales instead of a least-squares fit")
+    p.add_argument("--check", metavar="MODEL", default=None, help="only verify that MODEL's ternary tensors are ternary")
+    p.add_argument("-o", "--out", default=None)
+    p.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default=None)
+    p.add_argument("--overwrite", action="store_true")
     p = sub.add_parser("materialize", help="complete a partial checkpoint from a full export")
     p.add_argument("checkpoint")
     p.add_argument("--template", required=True)
     common(p, template=False)
     a = ap.parse_args(argv if argv is not None else sys.argv[1:])
+    if a.cmd == "ternary":
+        return _ternary_main(a)
     kw = {"dtype": a.dtype, "overwrite": a.overwrite, "rounding": a.rounding, "seed": a.seed}
     if a.cmd != "materialize":
         kw.update(template=a.template, missing=a.missing)
