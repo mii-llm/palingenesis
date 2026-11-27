@@ -246,7 +246,7 @@ def test_plugin_variants_export_ternary_weights(args, tmp_path):
 
 def test_variant_trains_through_the_trainer_and_resumes(tmp_path):
     tok = H.tokenizer()
-    H.save_model(tmp_path / "student", tok, seed=0)
+    H.save_model(tmp_path / "student", tok, seed=0, tie=True)
     data = H.write_rows(tmp_path / "rows.jsonl")
     c = H.cpu_config(tmp_path, tmp_path / "student", data, steps=4)
     c.train.save_steps = 2

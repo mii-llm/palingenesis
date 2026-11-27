@@ -553,8 +553,7 @@ class TernaryQAT(TrainerPlugin):
         out = {k: v for k, v in state.items() if k not in aux}
         names = {f"{name}.weight": m for name, m in self.modules.items()}
         if self.save_latent:
-            tied = set(self._tied_keys or ())
-            self._latent_state = {k: v for k, v in state.items() if k in names or k in aux or k in tied}
+            self._latent_state = {k: v for k, v in state.items() if k in names or k in aux}
         for key, m in names.items():
             if key in state:
                 out[key] = m.quantize(state[key].float()).to(state[key].dtype)
@@ -606,8 +605,9 @@ class TernaryQAT(TrainerPlugin):
                 for key in tensors:
                     if key in extra:
                         tensors[key] = extra.pop(key).to(tensors[key].dtype).contiguous()
-                if i == len(shards) - 1:  # scale buffers / parameters have no slot in the folded files
-                    tensors.update({k: v.contiguous() for k, v in extra.items()})
+                if i == len(shards) - 1:  # scale buffers / parameters have no slot in the folded files (a weight
+                    # left over is the second name of a tied tensor, which the model file stores once)
+                    tensors.update({k: v.contiguous() for k, v in extra.items() if k.endswith(_AUX_KEYS)})
                 save_file(tensors, str(target / shard.name), metadata={"format": "pt"})
             (target / TERNARY_CONFIG).write_text(json.dumps({**self.describe(), "export": "latent"}, indent=2))
         finally:
