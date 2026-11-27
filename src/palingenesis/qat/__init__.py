@@ -21,6 +21,7 @@ Ternary quantisation-aware training, as a trainer plugin:
             strength: {start: 0.0, end: 0.2}            # quantisation ramp: 0 = full precision, 1 = ternary
             grid_weight: {start: 0.0, end: 1.0, start_value: 0.0, end_value: 1.0e-4}
             latent_lr: 1.0e-4               # optimizer group of the latent weights (0: train.learning_rate)
+            latent_lr_relative: false       # true: latent_lr is in units of each tensor's mean |W| (code units)
             latent_eps: 1.0e-12             # Adam eps of that group (0: the optimizer's)
             clamp: 1.5                      # after each step, |w| <= clamp * scale (0: off)
             hidden_layers: [-1]             # match these decoder layers' outputs to the teacher's (MSE)
@@ -285,6 +286,7 @@ class TernaryQAT(TrainerPlugin):
         strength=1.0,
         grid_weight=0.0,
         latent_lr: float = 0.0,
+        latent_lr_relative: bool = False,
         latent_eps: float = 0.0,
         latent_weight_decay: float = 0.0,
         clamp: float = 1.5,
@@ -315,6 +317,9 @@ class TernaryQAT(TrainerPlugin):
         self.strength = Ramp.parse(strength)
         self.grid_weight = Ramp.parse(grid_weight)
         self.latent_lr, self.latent_eps, self.latent_weight_decay = latent_lr, latent_eps, latent_weight_decay
+        if latent_lr_relative and not latent_lr:
+            raise ValueError("latent_lr_relative needs latent_lr (the step in units of mean |W|)")
+        self.latent_lr_relative = latent_lr_relative
         self.clamp = clamp
         self.hidden_layers = list(hidden_layers or [])
         self.hidden_weight = Ramp.parse(hidden_weight)
@@ -402,12 +407,15 @@ class TernaryQAT(TrainerPlugin):
         latents = [m.weight for m in self._unique_modules() if m.weight.requires_grad]
         if not latents:
             return []
-        override = {"params": latents, "weight_decay": self.latent_weight_decay}
-        if self.latent_lr:
-            override["lr"] = self.latent_lr
+        common = {"weight_decay": self.latent_weight_decay}
         if self.latent_eps:
-            override["eps"] = self.latent_eps
-        groups = [override]
+            common["eps"] = self.latent_eps
+        if self.latent_lr_relative:
+            # Adam moves a weight by about lr per step whatever its gradient: a step that is a fixed fraction of the
+            # tensor's own scale crosses rounding thresholds at the same rate in every tensor (and in every model)
+            groups = [{"params": [p], "lr": self.latent_lr * float(_scale_local(p, 0)), **common} for p in latents]
+        else:
+            groups = [{"params": latents, **({"lr": self.latent_lr} if self.latent_lr else {}), **common}]
         if self.scale_mode == "learned":
             scales = {"params": [m.log_scale for m in self.modules.values()], "weight_decay": 0.0}
             if self.scale_lr:

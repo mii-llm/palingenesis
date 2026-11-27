@@ -176,6 +176,23 @@ def test_learned_scale_gets_the_lsq_gradient():
 # ─────────────────────────────────────────────────────────────── the plugin with each component
 
 
+def test_relative_latent_lr_is_in_units_of_each_tensors_mean_magnitude():
+    plugin = TernaryQAT(group_size=16, latent_lr=0.01, latent_lr_relative=True, latent_eps=1e-12)
+    model = plugin.transform_model(H.tiny_llama(64, hidden=32), _ctx())
+    with torch.no_grad():
+        model.model.layers[0].mlp.up_proj.weight.mul_(10.0)
+    groups = plugin.param_groups(model, _ctx())
+    assert len(groups) == len(plugin.modules)
+    for g in groups:
+        [p] = g["params"]
+        assert g["lr"] == pytest.approx(0.01 * float(p.detach().abs().mean())) and g["eps"] == 1e-12
+    lrs = {id(g["params"][0]): g["lr"] for g in groups}
+    up, down = model.model.layers[0].mlp.up_proj.weight, model.model.layers[1].mlp.up_proj.weight
+    assert lrs[id(up)] > 5 * lrs[id(down)]
+    with pytest.raises(ValueError, match="latent_lr_relative"):
+        TernaryQAT(latent_lr_relative=True)
+
+
 def test_plugin_rejects_unknown_components():
     for kw in ({"scale": "nope"}, {"quantizer": "nope"}, {"ste": "nope"}, {"scale_mode": "nope"}):
         with pytest.raises(ValueError, match="must be one of"):
