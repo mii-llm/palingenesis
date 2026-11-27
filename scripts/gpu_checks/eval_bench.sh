@@ -359,6 +359,9 @@ pair() {
     if [ "$arg" = "--" ]; then seen=1; continue; fi
     if [ "$seen" -eq 0 ]; then full+=("$arg"); else start+=("$arg"); fi
   done
+  # a discarded 1-item run first: the first run of a harness fills the compile and CUDA-graph caches, which would
+  # otherwise be charged to the start-up run alone (it came out slower than the full run)
+  attempt "$name.warm" "${start[@]}" || return 1
   attempt "$name.start" "${start[@]}" || return 1
   attempt "$name" "${full[@]}"
 }
