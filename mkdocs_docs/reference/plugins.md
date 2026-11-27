@@ -7,7 +7,7 @@ This page has two parts: the built-in switches under `plugins:` (DEFT, SymNoise,
 | Plugin | Entry point | What it does | Guide |
 |---|---|---|---|
 | `palingenesis.lora:LoRA` | `lora` | low-rank adapters on a frozen base, folded export and PEFT adapter | [LoRA](../guides/lora.md) |
-| `palingenesis.qat:TernaryQAT` | `ternary-qat` | ternary quantisation-aware training | [Off-Policy Distillation](../guides/offpolicy-distillation.md#quantisation-aware-training-while-distilling) |
+| `palingenesis.qat:TernaryQAT` | `ternary-qat` | ternary quantisation-aware training (scale scheme, code rule, estimator and scale mode chosen in the config) | [Ternary QAT](../guides/ternary-qat.md), [Off-Policy Distillation](../guides/offpolicy-distillation.md#quantisation-aware-training-while-distilling) |
 | `palingenesis.qat:FloatQAT` | `float-qat` | FP4 / FP8 quantisation-aware training (NVFP4, MXFP4, FP8), checkpoints for vLLM | [Quantisation-Aware Training](../guides/qat.md) |
 
 ---

@@ -73,6 +73,10 @@ changes are. On our 0.8B RL runs from one base (LR 1e-6, 100–250 steps):
 
 A merge cannot remove a regression that an expert already has: check each expert alone before merging.
 
+### Ternary models
+
+A linear merge of ternary models is not ternary. `pgs merge ternary` (`requantize`, `vote`, `ties`, `consensus`) writes a ternary model and verifies it: see [Ternary QAT: merging](ternary-qat.md#merging-ternary-models).
+
 ## Guarantees
 
 - **Tensors are matched by name**, so checkpoints sharded differently merge correctly. Every shape must match.
