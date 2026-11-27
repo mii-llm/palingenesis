@@ -465,6 +465,8 @@ from palingenesis.eval import conformance
 work, mc_name = sys.argv[1], sys.argv[2]
 TARGETS = {"gsm8k": 2.0, "mc": 3.0}
 LM_TASK = {"gsm8k": ("gsm8k", "exact_match,strict-match"), "mc": (mc_name, "acc"), "ifeval": ("ifeval", "prompt_level_strict_acc")}
+# how per-item results pair up: pgs ids IFEval by its key column; lm-eval splits MMLU into one file per subject
+ID_FIELD, GROUP_FIELD = {"ifeval": "key"}, ({"mc": "category"} if mc_name == "mmlu" else {})
 
 
 def seconds(name):
@@ -490,7 +492,7 @@ def pgs_result(harness, task):
 
 def lmeval_result(task):
     name, metric = LM_TASK[task]
-    aggregate, docs = conformance.lmeval_results(os.path.join(work, "lmeval", task), name, metric)
+    aggregate, docs = conformance.lmeval_results(os.path.join(work, "lmeval", task), name, metric, ID_FIELD.get(task, ""))
     items = None
     for path in glob.glob(os.path.join(work, "lmeval", task, "**", "results*.json"), recursive=True):
         counts = json.load(open(path)).get("n-samples") or {}
@@ -545,7 +547,7 @@ for task in ("gsm8k", "mc", "ifeval"):
         print(json.dumps(line))
     if "lmeval" in rows and rows["pgs"].get("results"):
         name, metric = LM_TASK[task]
-        ours = conformance.pgs_scores(rows["pgs"]["results"], metric)
+        ours = conformance.pgs_scores(rows["pgs"]["results"], metric, GROUP_FIELD.get(task, ""))
         report = conformance.compare(ours, rows["lmeval"]["accuracy"], rows["lmeval"]["_docs"] or {}, max_se=1.0)
         gated = task in TARGETS
         print(json.dumps({"check": f"agreement/{task}", "status": ("PASS" if report["within"] else "FAIL") if gated else "INFO",

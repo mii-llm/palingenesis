@@ -256,6 +256,31 @@ def test_conformance_report(tmp_path, capsys):
     assert conformance.main(["--pgs", str(ours), "--lmeval", str(tmp_path), "--task", "nope"]) == 1
 
 
+
+def test_conformance_pairs_subtasks_and_id_columns(tmp_path):
+    ours = tmp_path / "mmlu.default.jsonl"  # global row ids, subjects concatenated: a/0 a/1 b/0, listed out of order
+    rows = [("mmlu/2", "b", 1), ("mmlu/0", "a", 0), ("mmlu/10", "b", 0), ("mmlu/1", "a", 1)]
+    ours.write_text("".join(json.dumps({"id": i, "category": c, "scores": [s]}) + "\n" for i, c, s in rows))
+    lm = tmp_path / "lm" / "model"
+    lm.mkdir(parents=True)
+    for name, stamp, values in (("mmlu_a", "2026-01", [1, 1]), ("mmlu_a", "2026-02", [0, 1]), ("mmlu_b", "2026-02", [1, 0])):
+        samples = "".join(json.dumps({"doc_id": i, "acc": v}) + "\n" for i, v in enumerate(values))
+        (lm / f"samples_{name}_{stamp}.jsonl").write_text(samples)
+    _, docs = conformance.lmeval_results(tmp_path / "lm", "mmlu", "acc")
+    assert docs == {"a/0": 0.0, "a/1": 1.0, "b/0": 1.0, "b/1": 0.0}  # the newest file of each subject only
+    report = conformance.compare(conformance.pgs_scores(ours, group_field="category"), None, docs)
+    assert (report["paired_items"], report["same_items"]) == (4, 4)
+    with pytest.raises(ValueError, match="subject"):
+        conformance.pgs_scores(ours, group_field="subject")
+    keyed = tmp_path / "ifeval.plain.jsonl"
+    keyed.write_text("".join(json.dumps({"id": f"ifeval/{k}", "scores": [s]}) + "\n" for k, s in ((1000, 1), (1005, 0))))
+    (lm / "samples_ifeval_2026-02.jsonl").write_text("".join(
+        json.dumps({"doc_id": i, "doc": {"key": k}, "prompt_level_strict_acc": s}) + "\n" for i, (k, s) in enumerate(((1000, 1), (1005, 1)))
+    ))  # fmt: skip
+    _, docs = conformance.lmeval_results(tmp_path / "lm", "ifeval", "prompt_level_strict_acc", id_field="key")
+    report = conformance.compare(conformance.pgs_scores(keyed), None, docs)
+    assert (report["paired_items"], report["same_items"]) == (2, 1)
+
 def test_lmeval_task_end_to_end_in_completion_mode(tmp_path, monkeypatch):
     from palingenesis.eval.runner import Evaluator
     from palingenesis.opd.rollout import Rollout
