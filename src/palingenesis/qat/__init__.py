@@ -26,6 +26,7 @@ Ternary quantisation-aware training, as a trainer plugin:
             hidden_layers: [-1]             # match these decoder layers' outputs to the teacher's (MSE)
             hidden_weight: 1.0
             export: folded                  # final model: ternary values in the original layout (or latent)
+            save_latent: false              # with export: folded, also write <export>-latent/ (the latent weights)
 
     distill:
       enabled: true
@@ -291,6 +292,7 @@ class TernaryQAT(TrainerPlugin):
         hidden_weight=1.0,
         hidden_loss: str = "mse",
         export: str = "folded",
+        save_latent: bool = False,
         metrics_every: int = 50,
     ):
         if activation_bits not in (0, 4, 8):
@@ -318,6 +320,8 @@ class TernaryQAT(TrainerPlugin):
         self.hidden_weight = Ramp.parse(hidden_weight)
         self.hidden_loss = hidden_loss
         self.export = export
+        self.save_latent = save_latent
+        self._latent_state: dict[str, Tensor] = {}
         self.metrics_every = max(1, metrics_every)
         self.modules: dict[str, nn.Module] = {}
         self._initial_codes: dict[str, Tensor] = {}
@@ -538,6 +542,9 @@ class TernaryQAT(TrainerPlugin):
         aux = {f"{name}.{key}" for name in self.modules for key in _AUX_KEYS}
         out = {k: v for k, v in state.items() if k not in aux}
         names = {f"{name}.weight": m for name, m in self.modules.items()}
+        if self.save_latent:
+            tied = set(self._tied_keys or ())
+            self._latent_state = {k: v for k, v in state.items() if k in names or k in aux or k in tied}
         for key, m in names.items():
             if key in state:
                 out[key] = m.quantize(state[key].float()).to(state[key].dtype)
@@ -566,7 +573,36 @@ class TernaryQAT(TrainerPlugin):
         }
 
     def on_export_saved(self, path, ctx: PluginContext) -> None:
-        (Path(path) / TERNARY_CONFIG).write_text(json.dumps(self.describe(), indent=2))
+        path = Path(path)
+        (path / TERNARY_CONFIG).write_text(json.dumps(self.describe(), indent=2))
+        if not self._latent_state:
+            return
+        # the same model directory with the latent weights (and frozen / learned scales) in place of the ternary ones:
+        # what a later QAT stage or a latent-space merge starts from
+        import shutil
+
+        from safetensors.torch import load_file, save_file
+
+        target = path.parent / f"{path.name}-latent"
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            shards = sorted(path.glob("*.safetensors"))
+            for f in path.iterdir():
+                if f.is_file() and f not in shards:
+                    shutil.copy(f, target / f.name)
+            extra = dict(self._latent_state)
+            for i, shard in enumerate(shards):
+                tensors = load_file(str(shard))
+                for key in tensors:
+                    if key in extra:
+                        tensors[key] = extra.pop(key).to(tensors[key].dtype).contiguous()
+                if i == len(shards) - 1:  # scale buffers / parameters have no slot in the folded files
+                    tensors.update({k: v.contiguous() for k, v in extra.items()})
+                save_file(tensors, str(target / shard.name), metadata={"format": "pt"})
+            (target / TERNARY_CONFIG).write_text(json.dumps({**self.describe(), "export": "latent"}, indent=2))
+        finally:
+            self._latent_state = {}
+        logger.info(f"ternary_qat: latent weights -> {target}")
 
     def state_dict(self) -> dict:
         return {"initial_codes": self._initial_codes}

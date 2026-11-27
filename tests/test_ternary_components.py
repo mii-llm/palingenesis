@@ -242,6 +242,7 @@ def test_variant_trains_through_the_trainer_and_resumes(tmp_path):
                 "ste": "tanh",
                 "ste_sharpness": {"start_value": 2.0, "end_value": 8.0},
                 "latent_lr": 2e-3,
+                "save_latent": True,
                 "metrics_every": 1,
             },
         }
@@ -250,6 +251,18 @@ def test_variant_trains_through_the_trainer_and_resumes(tmp_path):
     assert "plugins/ternary_qat/codes_changed" in result.metrics
     final = Path(c.train.output_dir) / "final"
     assert check_ternary(final)["ok"]
+    # the latent copy next to it: same files, latent weights and the learned scales, not ternary
+    from safetensors.torch import load_file
+
+    latent = Path(c.train.output_dir) / "final-latent"
+    assert (latent / "config.json").exists() and not check_ternary(latent)["ok"]
+    assert json.loads((latent / "ternary_config.json").read_text())["export"] == "latent"
+    lat, fold = load_file(str(latent / "model.safetensors")), load_file(str(final / "model.safetensors"))
+    key = "model.layers.1.self_attn.o_proj.weight"
+    alpha = lat[key.replace("weight", "scale_alpha")] * lat[key.replace("weight", "log_scale")].exp()
+    spec = TernarySpec(16, "mse")
+    torch.testing.assert_close(spec.quantize(lat[key], (alpha, alpha / 2)), fold[key], rtol=1e-5, atol=1e-7)
+    assert not [k for k in fold if k.endswith("log_scale")]
     c.train.resume_from = str(Path(c.train.output_dir) / "step-2")
     assert H.run_cpu(c).global_step == 4
 
