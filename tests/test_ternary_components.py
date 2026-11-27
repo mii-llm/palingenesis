@@ -193,6 +193,33 @@ def test_relative_latent_lr_is_in_units_of_each_tensors_mean_magnitude():
         TernaryQAT(latent_lr_relative=True)
 
 
+def test_layout_and_latent_copy_follow_the_names_in_the_written_files(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    from palingenesis.qat import saved_names
+
+    disk = ["model.language_model.layers.0.mlp.up_proj.weight", "model.language_model.embed_tokens.weight", "x.weight"]
+    keys = ["model.layers.0.mlp.up_proj.weight", "model.embed_tokens.weight", "lm_head.weight", "x.weight"]
+    assert saved_names(keys, disk) == {keys[0]: disk[0], keys[1]: disk[1], "x.weight": "x.weight"}
+    assert saved_names(["a.q_proj.weight"], ["m.0.q_proj.weight", "m.1.q_proj.weight"]) == {}  # ambiguous
+    # an export stored under prefixed names: the layout and the latent copy use the stored names
+    plugin = TernaryQAT(group_size=16, scale="mse", save_latent=True)
+    model = plugin.transform_model(H.tiny_llama(64, hidden=32), _ctx())
+    state = plugin.export_state_dict(dict(model.state_dict()), model, _ctx())
+    out = tmp_path / "final"
+    out.mkdir()
+    stored = {k.replace("model.", "model.language_model.", 1): v.contiguous() for k, v in state.items()}
+    save_file(stored, str(out / "model.safetensors"))
+    plugin.on_export_saved(out, _ctx())
+    layout = json.loads((out / "ternary_config.json").read_text())
+    assert len(layout["tensors"]) == len(plugin.modules) and all(k in stored for k in layout["tensors"])
+    assert check_ternary(out)["ok"]
+    latent = load_file(str(tmp_path / "final-latent" / "model.safetensors"))
+    key = "model.language_model.layers.0.mlp.up_proj.weight"
+    torch.testing.assert_close(latent[key], model.model.layers[0].mlp.up_proj.weight.detach())
+    assert set(latent) == set(stored) and not check_ternary(tmp_path / "final-latent")["ok"]
+
+
 def test_plugin_rejects_unknown_components():
     for kw in ({"scale": "nope"}, {"quantizer": "nope"}, {"ste": "nope"}, {"scale_mode": "nope"}):
         with pytest.raises(ValueError, match="must be one of"):

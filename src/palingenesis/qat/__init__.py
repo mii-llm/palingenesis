@@ -259,6 +259,36 @@ def _local_codes(p: Tensor, group_size: int) -> tuple[Tensor, Tensor, Tensor]:
     return g, scale, (g / scale).round().clamp(-1, 1)
 
 
+def saved_names(keys, saved) -> dict[str, str]:
+    """{training-time key: name in the written model files}. An export may be written under other names than the
+    trained model's (a text tower trained as `model.layers...` and stored as `model.language_model.layers...`):
+    a key maps to itself when present, else to the one saved name sharing the longest run of trailing name
+    components (at least two). Keys without a counterpart (the second name of a tied tensor) are left out."""
+    saved = list(saved)
+    present = set(saved)
+    tails = [(name, name.split(".")[::-1]) for name in saved]
+    out = {}
+    for key in keys:
+        if key in present:
+            out[key] = key
+            continue
+        parts = key.split(".")[::-1]
+        best, best_n, unique = None, 1, False
+        for name, rev in tails:
+            n = 0
+            for a, b in zip(parts, rev):
+                if a != b:
+                    break
+                n += 1
+            if n > best_n:
+                best, best_n, unique = name, n, True
+            elif n == best_n and best is not None:
+                unique = False
+        if best is not None and unique:
+            out[key] = best
+    return out
+
+
 # ─────────────────────────────────────────────────────────────── the plugin
 
 
@@ -582,8 +612,16 @@ class TernaryQAT(TrainerPlugin):
         }
 
     def on_export_saved(self, path, ctx: PluginContext) -> None:
+        from safetensors import safe_open
+
         path = Path(path)
-        (path / TERNARY_CONFIG).write_text(json.dumps(self.describe(), indent=2))
+        shards = sorted(path.glob("*.safetensors"))
+        on_disk = [k for shard in shards for k in safe_open(str(shard), "pt").keys()]
+        layout = self.describe()
+        if on_disk:  # the layout names tensors as the files do
+            names = saved_names(layout["tensors"], on_disk)
+            layout["tensors"] = {names[k]: g for k, g in layout["tensors"].items() if k in names}
+        (path / TERNARY_CONFIG).write_text(json.dumps(layout, indent=2))
         if not self._latent_state:
             return
         # the same model directory with the latent weights (and frozen / learned scales) in place of the ternary ones:
@@ -595,11 +633,11 @@ class TernaryQAT(TrainerPlugin):
         target = path.parent / f"{path.name}-latent"
         target.mkdir(parents=True, exist_ok=True)
         try:
-            shards = sorted(path.glob("*.safetensors"))
             for f in path.iterdir():
                 if f.is_file() and f not in shards:
                     shutil.copy(f, target / f.name)
-            extra = dict(self._latent_state)
+            renamed = saved_names(self._latent_state, on_disk)
+            extra = {renamed.get(k, k): v for k, v in self._latent_state.items()}
             for i, shard in enumerate(shards):
                 tensors = load_file(str(shard))
                 for key in tensors:
@@ -609,7 +647,7 @@ class TernaryQAT(TrainerPlugin):
                     # left over is the second name of a tied tensor, which the model file stores once)
                     tensors.update({k: v.contiguous() for k, v in extra.items() if k.endswith(_AUX_KEYS)})
                 save_file(tensors, str(target / shard.name), metadata={"format": "pt"})
-            (target / TERNARY_CONFIG).write_text(json.dumps({**self.describe(), "export": "latent"}, indent=2))
+            (target / TERNARY_CONFIG).write_text(json.dumps({**layout, "export": "latent"}, indent=2))
         finally:
             self._latent_state = {}
         logger.info(f"ternary_qat: latent weights -> {target}")
