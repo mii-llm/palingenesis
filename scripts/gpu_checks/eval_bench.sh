@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Benchmark of `pgs eval` against lm-evaluation-harness and lighteval: the same tasks, model, sampling, GPU and
 # vLLM build in all three; wall-clock, items per second and accuracy per harness, and the agreement of pgs with
-# lm-eval. One NVIDIA GPU (written for an A100 80GB; torch 2.11 cu129, vLLM 0.26), no network for models and
-# datasets (HF_HUB_OFFLINE=1: they come from the Hugging Face cache); PyPI is needed once, for the two harnesses.
+# lm-eval. One NVIDIA GPU (written for an A100 80GB; torch 2.11 cu129, vLLM 0.26). The timed runs are offline
+# (HF_HUB_OFFLINE=1: models and datasets come from the caches); the network is needed once, for the two harnesses
+# (PyPI) and to build the datasets into the work directory's datasets cache (WARM_DATASETS).
 #
 #   PGS_PY=/path/to/venv/bin/python PGS_SRC=/path/to/palingenesis/src bash scripts/gpu_checks/eval_bench.sh [WORK]
 #
@@ -43,6 +44,7 @@
 #   HARNESSES=pgs,lmeval,lighteval   which harnesses
 #   MC_LIMIT=2000                    MMLU-Pro fallback: the first N questions (0 = all 12,032)
 #   GSM8K_LIMIT=0                    the first N GSM8K items (0 = all 1,319; smaller for a smoke test)
+#   WARM_DATASETS=1                  build the datasets once with the network before the offline runs (0 = skip)
 #   MAX_MODEL_LEN=4096               the engines' context (5-shot MMLU prompts are under 3,000 tokens)
 #   MEMORY_MARGIN_GB=3               left free on the GPU beyond what others hold now
 #   PGS_REPLICAS=0                   also time pgs with this many engines on the GPU (INFO lines; 0 = skip)
@@ -63,6 +65,7 @@ TASKS="${TASKS:-gsm8k,mc,ifeval}"
 HARNESSES="${HARNESSES:-pgs,lmeval,lighteval}"
 MC_LIMIT="${MC_LIMIT:-2000}"
 GSM8K_LIMIT="${GSM8K_LIMIT:-0}"
+WARM_DATASETS="${WARM_DATASETS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MEMORY_MARGIN_GB="${MEMORY_MARGIN_GB:-3}"
 PGS_REPLICAS="${PGS_REPLICAS:-0}"
@@ -290,6 +293,28 @@ YAML
 fi
 mkdir -p "$WORK/lmeval_tasks"
 cp "$REPO/configs/eval/mmlu_pro_mc.yaml" "$WORK/lmeval_tasks/mmlu_pro_mc.yaml"
+# Datasets are built once into $HF_DATASETS_CACHE with the network on (WARM_DATASETS=0 skips this): offline, `datasets`
+# does not build a dataset from the hub cache into an empty datasets cache, which made every lm-eval run a SKIP. pgs
+# builds its four tasks; lm-eval builds its own gsm8k, mmlu and ifeval with its no-model backend (one item each), so
+# the revisions and configurations it reads are its own. Nothing here is timed.
+if [ "$WARM_DATASETS" = 1 ]; then
+  HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0 "$PGS_PY" - "$GSM8K_YAML" "$WORK/lmeval_tasks/mmlu_pro_mc.yaml" >"$WORK/warm_pgs.log" 2>&1 <<'PY'
+import sys
+
+from palingenesis.eval.config import load_task
+from palingenesis.eval.tasks import build_items
+
+for ref in (sys.argv[1], "mmlu", sys.argv[2], "ifeval"):
+    try:
+        build_items(load_task(ref), limit=1, head=True)
+    except Exception as e:  # noqa: BLE001 — reported by the offline dataset check below
+        print(f"{ref}: {type(e).__name__}: {e}"[:400])
+PY
+  WARM_LM=SKIP
+  if [ "$LMEVAL_OK" -eq 1 ] && HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0 "$VPY" -m lm_eval --model dummy --tasks gsm8k,mmlu,ifeval \
+      --limit 1 --output_path "$WORK/warm_lmeval" >"$WORK/warm_lmeval.log" 2>&1; then WARM_LM=PASS; fi
+  emit "{\"check\": \"datasets/warm\", \"status\": \"INFO\", \"lmeval\": \"$WARM_LM\", \"pgs_log_tail\": $(json_tail "$WORK/warm_pgs.log")}"
+fi
 "$PGS_PY" - "$GSM8K_YAML" "$WORK/lmeval_tasks/mmlu_pro_mc.yaml" >"$WORK/datasets.out" 2>"$WORK/datasets.log" <<'PY'
 import json
 import sys
