@@ -594,22 +594,31 @@ class TernaryQAT(TrainerPlugin):
         out = {"strength": float(self.strength(ctx.progress)), "grid_reg": self._grid_value}
         if ctx.step % self.metrics_every and ctx.step != ctx.total_steps:
             return out
-        changed = zeros = total = 0
+        changed = zeros = total = bound = 0
+        scale_sum = 0.0
         for name, m in self.modules.items():
-            _, _, codes = self._codes(m)
+            g, alpha, codes = self._codes(m)
             start = self._initial_codes.get(name)
             if start is not None and start.shape == codes.shape:
                 changed += int((codes.to(torch.int8).cpu() != start).sum())
             zeros += int((codes == 0).sum())
             total += codes.numel()
-        counts = torch.tensor([changed, zeros, total], dtype=torch.float64)
+            if g.numel():
+                # latents sitting at the clamp bound, and the mean scale: together they show whether clamping to a
+                # multiple of a scale that is recomputed from the clamped weights is compressing the tensors
+                if self.clamp > 0:
+                    bound += int((g.abs() >= self.clamp * alpha * (1 - 1e-6)).sum())
+                scale_sum += float(alpha.float().mean()) * codes.numel()
+        counts = torch.tensor([changed, zeros, total, bound, scale_sum], dtype=torch.float64)
         if dist.is_available() and dist.is_initialized() and ctx.is_fsdp:
             counts = counts.to(ctx.device)
             dist.all_reduce(counts)
             counts = counts.cpu()
-        changed, zeros, total = counts.tolist()
+        changed, zeros, total, bound, scale_sum = counts.tolist()
         out["codes_changed"] = changed / max(total, 1)
         out["zero_share"] = zeros / max(total, 1)
+        out["at_bound"] = bound / max(total, 1)
+        out["scale_mean"] = scale_sum / max(total, 1)
         return out
 
     # -- rollout engines (pgs distill, pgs rl)

@@ -141,6 +141,9 @@ def test_param_groups_and_metrics():
     plugin.on_train_start(model, _ctx())
     first = plugin.metrics(model, _ctx(0.0))
     assert first["codes_changed"] == 0.0 and 0 < first["zero_share"] < 1
+    assert first["scale_mean"] > 0 and 0 <= first["at_bound"] < 0.5
+    plugin.on_after_optimizer_step(model, None, _ctx())  # the clamp puts the tail of every group at the bound
+    assert plugin.metrics(model, _ctx(0.0))["at_bound"] > 0.01
     with torch.no_grad():
         for m in plugin.modules.values():
             m.weight.neg_()
