@@ -220,6 +220,62 @@ def test_layout_and_latent_copy_follow_the_names_in_the_written_files(tmp_path):
     assert set(latent) == set(stored) and not check_ternary(tmp_path / "final-latent")["ok"]
 
 
+def test_cached_quantised_weights_match_the_per_forward_path():
+    """One W_q per optimizer step: same outputs and gradients as quantising in every forward, the tied embedding and
+    head share one buffer, and a changed weight is picked up at the next forward or optimizer step."""
+
+    def build(cache):
+        plugin = TernaryQAT(
+            group_size=16, scale="mse", quantize_embedding=True, quantize_head=True, cache_quantized=cache
+        )
+        model = plugin.transform_model(H.tiny_llama(64, hidden=32, tie=True, seed=3), _ctx())
+        plugin.on_train_start(model, _ctx())
+        return plugin, model
+
+    (cached, a), (plain, b) = build(True), build(False)
+    lin = a.model.layers[0].mlp.up_proj
+    assert lin._wq is not None and b.model.layers[0].mlp.up_proj._wq is None
+    assert a.lm_head._wq is a.model.embed_tokens._wq  # one buffer for the tied tensor
+    ids = torch.randint(0, 64, (2, 9))
+    opt_a, opt_b = (torch.optim.AdamW(m.parameters(), lr=1e-2) for m in (a, b))
+    for step in range(3):
+        for plugin, model, opt in ((cached, a, opt_a), (plain, b, opt_b)):
+            plugin.on_forward_start(model, {}, _ctx())
+            out = model(input_ids=ids).logits
+            out.float().pow(2).mean().backward()
+            plugin.on_before_optimizer_step(model, opt, _ctx())
+            opt.step()
+            opt.zero_grad()
+            plugin.on_after_optimizer_step(model, opt, _ctx())
+        torch.testing.assert_close(a(input_ids=ids).logits, b(input_ids=ids).logits, rtol=1e-5, atol=1e-6)
+        for (n, p), (_, q) in zip(a.named_parameters(), b.named_parameters()):
+            torch.testing.assert_close(p, q, rtol=1e-5, atol=1e-7, msg=n)
+    buffer = lin._wq
+    torch.testing.assert_close(buffer, lin.quantize(lin.weight))
+    # a weight changed outside the optimizer: stale until the next forward start, then refreshed in the same buffer
+    with torch.no_grad():
+        lin.weight.mul_(-1.0)
+    assert not torch.allclose(lin._wq, lin.quantize(lin.weight))
+    cached.on_forward_start(a, {}, _ctx())
+    assert lin._wq is buffer
+    torch.testing.assert_close(lin._wq, lin.quantize(lin.weight))
+    # a write that does not move the version counter is caught by the forced refresh after the optimizer step
+    lin.weight.data.mul_(-1.0)
+    cached.on_forward_start(a, {}, _ctx())
+    assert not torch.allclose(lin._wq, lin.quantize(lin.weight))
+    cached.on_after_optimizer_step(a, opt_a, _ctx())
+    torch.testing.assert_close(lin._wq, lin.quantize(lin.weight))
+    # not cached: learned scales, stochastic codes, other estimators; and nothing is cached after training ends
+    for kw in ({"scale_mode": "learned"}, {"quantizer": "stochastic"}, {"ste": "clipped"}):
+        p = TernaryQAT(group_size=16, **kw)
+        m = p.transform_model(H.tiny_llama(64, hidden=32), _ctx())
+        p.on_train_start(m, _ctx())
+        assert all(mod._wq is None for mod in p.modules.values())
+    cached.on_train_end(a, _ctx())
+    assert lin._wq is None and "_wq" not in a.state_dict()
+    torch.testing.assert_close(lin.effective_weight(), lin.quantize(lin.weight))
+
+
 def test_plugin_rejects_unknown_components():
     for kw in ({"scale": "nope"}, {"quantizer": "nope"}, {"ste": "nope"}, {"scale_mode": "nope"}):
         with pytest.raises(ValueError, match="must be one of"):

@@ -28,6 +28,7 @@ Ternary quantisation-aware training, as a trainer plugin:
             hidden_weight: 1.0
             export: folded                  # final model: ternary values in the original layout (or latent)
             save_latent: false              # with export: folded, also write <export>-latent/ (the latent weights)
+            cache_quantized: true           # quantise each weight once per optimizer step, not once per forward
 
     distill:
       enabled: true
@@ -128,6 +129,9 @@ class _TernaryMixin:
         self._default = scale_mode == "dynamic" and self.spec.describe() == TernarySpec(group_size).describe()
         # buffers (not Python floats): changing them never makes torch.compile recompile
         self.register_buffer("strength", torch.ones(()), persistent=False)
+        # W_q cached between optimizer steps (a plain attribute: not in the state dict, refreshed by the plugin)
+        self._wq: Tensor | None = None
+        self._wq_version = -1
         sharpness = float(self.spec.ste_args.get("sharpness", 4.0))
         self.register_buffer("sharpness", torch.full((), sharpness), persistent=False)
         if scale_mode != "dynamic":
@@ -159,8 +163,33 @@ class _TernaryMixin:
             fixed = tuple(t.to(device=w.device, dtype=w.dtype) for t in fixed)
         return self.spec.quantize(w, fixed)
 
+    def cacheable(self) -> bool:
+        """Whether W_q is a function of the latent weight alone (and of frozen scales): then it changes only when
+        the optimizer steps, and one copy serves every forward in between (micro-batches of an accumulation window,
+        the recomputation of activation checkpointing, the two uses of a tied embedding / head)."""
+        return self.spec.quantizer == "round" and self.spec.ste == "identity" and self.scale_mode != "learned"
+
+    @torch.no_grad()
+    def refresh_quantized(self, shared: Tensor | None = None, force: bool = False) -> Tensor:
+        """Recompute the cached W_q if the latent weight changed since the last call (in place: a compiled forward
+        keeps reading the same buffer). `shared`: the buffer of another module with the same weight and quantiser."""
+        w = self.weight
+        if shared is not None:
+            self._wq, self._wq_version = shared, w._version
+        elif self._wq is None or self._wq.shape != w.shape or self._wq.device != w.device or self._wq.dtype != w.dtype:
+            self._wq, self._wq_version = self.quantize(w.detach()), w._version
+        elif force or self._wq_version != w._version:
+            self._wq.copy_(self.quantize(w.detach()))
+            self._wq_version = w._version
+        return self._wq
+
+    def drop_quantized(self) -> None:
+        self._wq, self._wq_version = None, -1
+
     def effective_weight(self) -> Tensor:
         w = self.weight
+        if self._wq is not None:
+            return w + self.strength.to(w.dtype) * (self._wq - w).detach()
         if self._default:
             w_q = quantize_weight(w, self.group_size)
             return w + self.strength.to(w.dtype) * (w_q - w).detach()
@@ -220,6 +249,10 @@ class TernaryEmbedding(_TernaryMixin, nn.Module):
         self._init_quant(group_size, 0, spec, scale_mode)
 
     def forward(self, ids: Tensor) -> Tensor:
+        if self._wq is not None:  # only the looked-up rows are mixed, not the whole table
+            rows = F.embedding(ids, self.weight, self.padding_idx)
+            rows_q = F.embedding(ids, self._wq, self.padding_idx)
+            return rows + self.strength.to(rows.dtype) * (rows_q - rows).detach()
         return F.embedding(ids, self.effective_weight(), self.padding_idx)
 
 
@@ -325,6 +358,7 @@ class TernaryQAT(TrainerPlugin):
         hidden_loss: str = "mse",
         export: str = "folded",
         save_latent: bool = False,
+        cache_quantized: bool = True,
         metrics_every: int = 50,
     ):
         if activation_bits not in (0, 4, 8):
@@ -356,6 +390,8 @@ class TernaryQAT(TrainerPlugin):
         self.hidden_loss = hidden_loss
         self.export = export
         self.save_latent = save_latent
+        self.cache_quantized = cache_quantized
+        self._caching = False
         self._latent_state: dict[str, Tensor] = {}
         self.metrics_every = max(1, metrics_every)
         self.modules: dict[str, nn.Module] = {}
@@ -482,6 +518,9 @@ class TernaryQAT(TrainerPlugin):
                 "absmean are not supported (use group_size > 0 or -1 with scale_mode: dynamic)"
             )
         self._set_strength(ctx)
+        # sharded weights (FSDP) keep the per-forward path: a full-size buffer would not follow the shards
+        self._caching = self.cache_quantized and not ctx.is_fsdp and ctx.world_size == 1
+        self._refresh_cache()
         for name, m in self.modules.items():
             _, _, codes = self._codes(m)
             # A resumed run has loaded the codes it started from (load_state_dict runs before
@@ -500,8 +539,21 @@ class TernaryQAT(TrainerPlugin):
             if sharp is not None:
                 m.sharpness.fill_(sharp)
 
+    def _refresh_cache(self, force: bool = False) -> None:
+        """Bring every cached W_q up to date with its latent weight (a no-op for weights that did not change;
+        `force`: recompute whatever the version counters say, e.g. after an optimizer that writes through kernels)."""
+        if not self._caching:
+            return
+        owners: dict[tuple, Tensor] = {}
+        for m in self.modules.values():
+            if not m.cacheable():
+                continue
+            key = (id(m.weight), m.group_size)
+            owners[key] = m.refresh_quantized(owners.get(key), force and key not in owners)
+
     def on_forward_start(self, model: nn.Module, batch: dict, ctx: PluginContext) -> None:
         self._set_strength(ctx)
+        self._refresh_cache()
 
     @torch.no_grad()
     def on_before_optimizer_step(self, model: nn.Module, optimizer, ctx: PluginContext) -> None:
@@ -522,14 +574,20 @@ class TernaryQAT(TrainerPlugin):
 
     @torch.no_grad()
     def on_after_optimizer_step(self, model: nn.Module, optimizer, ctx: PluginContext) -> None:
-        if self.clamp <= 0:
-            return
-        for m in self._unique_modules():
-            g, scale, _ = self._codes(m)
-            if g.numel():
-                bound = self.clamp * scale
-                g.copy_(torch.maximum(torch.minimum(g, bound), -bound))
-                _local(m.weight.data).copy_(g.reshape(_local(m.weight.data).shape))
+        if self.clamp > 0:
+            for m in self._unique_modules():
+                g, scale, _ = self._codes(m)
+                if g.numel():
+                    bound = self.clamp * scale
+                    g.copy_(torch.maximum(torch.minimum(g, bound), -bound))
+                    _local(m.weight.data).copy_(g.reshape(_local(m.weight.data).shape))
+        # the weights are final for this step: whatever runs next (an evaluation, the next forward) reads fresh W_q
+        self._refresh_cache(force=True)
+
+    def on_train_end(self, model: nn.Module, ctx: PluginContext) -> None:
+        for m in self.modules.values():
+            m.drop_quantized()
+        self._caching = False
 
     @torch.no_grad()
     def metrics(self, model: nn.Module, ctx: PluginContext) -> dict[str, float]:
