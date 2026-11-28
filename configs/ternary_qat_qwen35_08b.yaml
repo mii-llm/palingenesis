@@ -4,8 +4,9 @@
 #   pgs train --config configs/ternary_qat_qwen35_08b.yaml
 #   pgs merge ternary --check runs/ternary/final        # the export is ternary: exit 0
 #
-# The baseline is the plugin's default quantiser (BitNet b1.58: absmean scale, round, identity estimator). Each
-# variant is one changed line under plugins.custom[0].args or distill (see the Ternary QAT guide).
+# The baseline: least-squares scales recomputed from the latent weights, rounding, the identity estimator, forward KL
+# to the full-precision model. Each variant is one changed line under plugins.custom[0].args or distill (see the
+# Ternary QAT guide; `scale: absmean` is BitNet b1.58's quantiser).
 model:
   name_or_path: Qwen/Qwen3.5-0.8B
   torch_dtype: float32              # fp32 latent weights; the forward runs in bf16 (train.bf16)
@@ -19,7 +20,7 @@ data:
   streaming: false
 train:
   output_dir: runs/ternary
-  max_steps: 763                    # x 32,768 tokens per step = 25M tokens
+  max_steps: 888                    # x 32 rows of about 880 tokens = 25M tokens
   per_device_batch_size: 16
   gradient_accumulation_steps: 2
   learning_rate: 5.0e-5             # norms and other full-precision parameters
@@ -40,13 +41,14 @@ plugins:
     - class: palingenesis.qat:TernaryQAT
       args:
         group_size: 128             # 0: one scale per tensor, -1: per output row
-        scale: absmean              # absmean | absmax | twn | mse
+        scale: mse                  # absmean | absmax | twn | mse
         scale_mode: dynamic         # dynamic | frozen | learned (+ scale_lr)
         quantizer: round            # round | stochastic
         ste: identity               # identity | clipped | tanh (+ ste_sharpness ramp)
         quantize_embedding: true
         quantize_head: true
-        latent_lr: 1.0e-4
+        latent_lr: 0.016
+        latent_lr_relative: true    # in units of each tensor's mean |W|
         latent_eps: 1.0e-12
         clamp: 1.5
         export: folded
